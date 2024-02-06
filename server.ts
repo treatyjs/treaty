@@ -1,56 +1,107 @@
+import '@angular/compiler';
+
+import { Elysia, t } from 'elysia';
+import { join } from 'path';
+
+import { Surreal } from 'surrealdb.node';
+
 import { APP_BASE_HREF } from '@angular/common';
 import { CommonEngine } from '@angular/ssr';
-import express from 'express';
-import { fileURLToPath } from 'node:url';
-import { dirname, join, resolve } from 'node:path';
 import bootstrap from './src/main.server';
 
-// The Express app is exported so that it can be used by serverless Functions.
-export function app(): express.Express {
-  const server = express();
-  const serverDistFolder = dirname(fileURLToPath(import.meta.url));
-  const browserDistFolder = resolve(serverDistFolder, '../browser');
-  const indexHtml = join(serverDistFolder, 'index.server.html');
+const db = new Surreal();
+await db.connect('memory');
+await db.use({ ns: 'test', db: 'test' });
 
-  const commonEngine = new CommonEngine();
+const port = process.env['PORT'] || 4201;
+const serverDistFolder = import.meta.url.split(':')[1];
 
-  server.set('view engine', 'html');
-  server.set('views', browserDistFolder);
+const browserDistFolder = join(serverDistFolder, '../dist/treaty/browser');
+const indexHtml = join(
+  serverDistFolder,
+  '../dist/treaty/browser/',
+  'index.html'
+);
 
-  // Example Express Rest API endpoints
-  // server.get('/api/**', (req, res) => { });
-  // Serve static files from /browser
-  server.get('*.*', express.static(browserDistFolder, {
-    maxAge: '1y'
-  }));
+const commonEngine = new CommonEngine();
 
-  // All regular routes use the Angular engine
-  server.get('*', (req, res, next) => {
-    const { protocol, originalUrl, baseUrl, headers } = req;
+const app = new Elysia()
+  .derive(({ request: { url } }) => {
+    const _url = new URL(url);
 
-    commonEngine
-      .render({
+    return {
+      protocol: _url.protocol.split(':')[0],
+      originalUrl: _url.pathname + _url.search,
+      baseUrl: '',
+    };
+  })
+  .group('/api', (api) => {
+    return api
+      .get('/id/:id', ({ params: { id } }) => `Post with id: ${id}`)
+      .get('/example', () => `just an example`)
+      .post('/form', ({ body }) => body, {
+        body: t.Object({
+          strField: t.String(),
+          numbField: t.Number(),
+        }),
+      });
+  })
+  .get('*.*', async ({ originalUrl }) => {
+    const file = Bun.file(`${browserDistFolder}${originalUrl}`);
+
+    return new Response(Buffer.from(await file.arrayBuffer()), {
+      headers: {
+        'Content-Type': file.type,
+      },
+    });
+  })
+  .get('*', async ({ originalUrl, baseUrl, protocol, headers }) => {
+    if (originalUrl.includes('.')) {
+      const file = Bun.file(`${browserDistFolder}${originalUrl}`);
+
+      return new Response(Buffer.from(await file.arrayBuffer()), {
+        headers: {
+          'Content-Type': file.type,
+        },
+      });
+    }
+
+    const cacheHit = await db.select(`url:\`${originalUrl}\``);
+
+    if (cacheHit) {
+      return new Response(cacheHit.content, {
+        headers: {
+          'Content-Type': 'text/html',
+        },
+      });
+    }
+
+    try {
+      const _html = await commonEngine.render({
         bootstrap,
         documentFilePath: indexHtml,
-        url: `${protocol}://${headers.host}${originalUrl}`,
+        url: `${protocol}://${headers['host']}${originalUrl}`,
         publicPath: browserDistFolder,
         providers: [{ provide: APP_BASE_HREF, useValue: baseUrl }],
-      })
-      .then((html) => res.send(html))
-      .catch((err) => next(err));
-  });
+      });
 
-  return server;
-}
+      await db.create(`url:\`${originalUrl}\``, {
+        content: _html,
+      });
 
-function run(): void {
-  const port = process.env['PORT'] || 4000;
+      return new Response(_html, {
+        headers: {
+          'Content-Type': 'text/html',
+        },
+      });
+    } catch (error) {
+      return 'Missing page';
+    }
+  })
+  .listen(port);
 
-  // Start up the Node server
-  const server = app();
-  server.listen(port, () => {
-    console.log(`Node Express server listening on http://localhost:${port}`);
-  });
-}
+console.log(
+  `🦊 Elysia is running at ${app.server?.hostname}:${app.server?.port}`
+);
 
-run();
+export type App = typeof app;
