@@ -37,6 +37,7 @@ export default class PostComponent {
   private id = input.required<string>();
   private api = inject(ApiService);
 
+  title = 'treaty';
   post = computedAsync(() => this.api.client.id[this.id()].get());
 
   form = fb.group({
