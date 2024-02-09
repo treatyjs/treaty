@@ -15,18 +15,16 @@ describe('PostComponent', () => {
     }).compileComponents();
 
     fixture = TestBed.createComponent(PostComponent);
-    component = fixture.componentInstance;
     fixture.componentRef.setInput('id', 'test');
+    component = fixture.componentInstance;
     await fixture.whenStable();
   });
 
   test('should create the app', () => {
-    const app = fixture.componentInstance;
-    expect(app).toBeTruthy();
+    expect(component).toBeTruthy();
   });
 
   test(`should have as title 'treaty'`, () => {
-    const app = fixture.componentInstance;
-    expect(app.title).toEqual('treaty');
+    expect(component.title).toEqual('treaty');
   });
 });
