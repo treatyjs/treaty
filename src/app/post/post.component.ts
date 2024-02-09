@@ -34,8 +34,8 @@ const fb = new FormBuilder();
   changeDetection: ChangeDetectionStrategy.OnPush,
 })
 export default class PostComponent {
-  private id = input.required<string>();
   private api = inject(ApiService);
+  id = input.required<string>();
 
   title = 'treaty';
   post = computedAsync(() => this.api.client.id[this.id()].get());

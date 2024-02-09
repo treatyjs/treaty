@@ -1,24 +1,28 @@
 import { GlobalRegistrator } from '@happy-dom/global-registrator';
+import { afterEach, beforeEach } from 'bun:test';
 
 GlobalRegistrator.register();
 
-import { TestBed } from '@angular/core/testing';
+import { ɵprovideZonelessChangeDetection } from '@angular/core';
+import { getTestBed } from '@angular/core/testing';
 import {
   BrowserDynamicTestingModule,
   platformBrowserDynamicTesting,
 } from '@angular/platform-browser-dynamic/testing';
 
-TestBed.initTestEnvironment(
+const testBed = getTestBed();
+
+testBed.initTestEnvironment(
   [BrowserDynamicTestingModule],
   platformBrowserDynamicTesting()
 );
-// beforeAll(async () => {
 
-//   // TestBed.configureTestingModule({
-//   //   providers: [
-//   //     ɵprovideZonelessChangeDetection(),
-//   //     provideRouter(routes, withComponentInputBinding()),
-//   //     provideClientHydration(),
-//   //   ],
-//   // });
-// });
+beforeEach(() => {
+  testBed.configureTestingModule({
+    providers: [ɵprovideZonelessChangeDetection()],
+  });
+});
+
+afterEach(() => {
+  testBed.resetTestingModule();
+});

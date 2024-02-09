@@ -1,6 +1,5 @@
-import { ɵprovideZonelessChangeDetection } from '@angular/core';
-import { ComponentFixture, TestBed } from '@angular/core/testing';
-import { provideRouter } from '@angular/router';
+import { input } from '@angular/core';
+import { ComponentFixture, TestBed, getTestBed } from '@angular/core/testing';
 import { beforeEach, describe, expect, test } from 'bun:test';
 import PostComponent from './post.component';
 
@@ -9,14 +8,26 @@ describe('PostComponent', () => {
   let fixture: ComponentFixture<PostComponent>;
 
   beforeEach(async () => {
-    await TestBed.configureTestingModule({
-      imports: [PostComponent],
-      providers: [provideRouter([]), ɵprovideZonelessChangeDetection()],
-    }).compileComponents();
+    await getTestBed()
+      .configureTestingModule({
+        imports: [PostComponent],
+      })
+      .compileComponents();
 
     fixture = TestBed.createComponent(PostComponent);
-    fixture.componentRef.setInput('id', 'test');
+    // fixture.componentRef.setInput('id', 'test');
     component = fixture.componentInstance;
+    component.id = input('test');
+    (component as any).api = {
+      client: {
+        id: {
+          test: {
+            get: async () => ({ data: 'test' }),
+          },
+        },
+      },
+    };
+
     await fixture.whenStable();
   });
 
