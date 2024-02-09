@@ -15,9 +15,10 @@ describe('PostComponent', () => {
       .compileComponents();
 
     fixture = TestBed.createComponent(PostComponent);
-    // fixture.componentRef.setInput('id', 'test');
     component = fixture.componentInstance;
     component.id = input('test');
+
+    // Could use some improved mocking of treaty here
     (component as any).api = {
       client: {
         id: {
