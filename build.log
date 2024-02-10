@@ -70,8 +70,8 @@ Odd numbered Node.js versions will not enter LTS status and should not be used f
 [SYS] openat(-2, /Users/simon/Documents/dev/treaty/node_modules/symbol-observable/lib/ponyfill.js) = 4
 [fs] openat([invalid_fd], /Users/simon/Documents/dev/treaty/node_modules/symbol-observable/lib/ponyfill.js) = 4
 [fs] close(4[/Users/simon/Documents/dev/treaty/node_modules/symbol-observable/lib/ponyfill.js])
-[alloc] new() = src.bun.js.node.node_fs_binding.NodeJSFS@11a008200
-[alloc] new() = src.bun.js.node.node_fs_binding.NodeJSFS@11a008800
+[alloc] new() = src.bun.js.node.node_fs_binding.NodeJSFS@13e008200
+[alloc] new() = src.bun.js.node.node_fs_binding.NodeJSFS@13e008800
 [SYS] openat(4[/Users/simon/Documents/dev/treaty/node_modules/semver], package.json) = 6
 [fs] openat(4[/Users/simon/Documents/dev/treaty/node_modules/semver], /Users/simon/Documents/dev/treaty/node_modules/semver/package.json) = 6
 [fs] close(6[/Users/simon/Documents/dev/treaty/node_modules/semver/package.json])
@@ -402,9 +402,9 @@ Odd numbered Node.js versions will not enter LTS status and should not be used f
 [fs] close(6[/Users/simon/Library/Caches/bun/@t@/b4c885818a0391c1.debug.pile])
 [cache] get("/Users/simon/Documents/dev/treaty/node_modules/uri-js/dist/es5/uri.all.js") = 43825 bytes, ignored for debug build
 [cache] filename to put into: '/Users/simon/Library/Caches/bun/@t@/b4c885818a0391c1.debug.pile'
-[SYS] openat(6[/Users/simon/Library/Caches/bun/@t@], .d7b3338fc7efdeb4-00000000..pile) = 7
-[SYS] pwritev(7[/Users/simon/Library/Caches/bun/@t@/.d7b3338fc7efdeb4-00000000..pile], 70283) = 70283
-[SYS] renameat(6[/Users/simon/Library/Caches/bun/@t@], .d7b3338fc7efdeb4-00000000..pile, 6[/Users/simon/Library/Caches/bun/@t@], b4c885818a0391c1.debug.pile) = 0
+[SYS] openat(6[/Users/simon/Library/Caches/bun/@t@], .d7b37f8ba5cffdbc-00000000..pile) = 7
+[SYS] pwritev(7[/Users/simon/Library/Caches/bun/@t@/.d7b37f8ba5cffdbc-00000000..pile], 70283) = 70283
+[SYS] renameat(6[/Users/simon/Library/Caches/bun/@t@], .d7b37f8ba5cffdbc-00000000..pile, 6[/Users/simon/Library/Caches/bun/@t@], b4c885818a0391c1.debug.pile) = 0
 [fs] close(7[/Users/simon/Library/Caches/bun/@t@/b4c885818a0391c1.debug.pile])
 [fs] close(6[/Users/simon/Library/Caches/bun/@t@])
 [cache] put() = 43825 bytes
@@ -1521,9 +1521,9 @@ Odd numbered Node.js versions will not enter LTS status and should not be used f
 [fs] close(6[/Users/simon/Library/Caches/bun/@t@/f652693c912f70b8.debug.pile])
 [cache] get("/Users/simon/Documents/dev/treaty/node_modules/yargs/build/index.cjs") = 83074 bytes, ignored for debug build
 [cache] filename to put into: '/Users/simon/Library/Caches/bun/@t@/f652693c912f70b8.debug.pile'
-[SYS] openat(6[/Users/simon/Library/Caches/bun/@t@], .bff23f9d7c7bfff6-00000001..pile) = 7
-[SYS] pwritev(7[/Users/simon/Library/Caches/bun/@t@/.bff23f9d7c7bfff6-00000001..pile], 157994) = 157994
-[SYS] renameat(6[/Users/simon/Library/Caches/bun/@t@], .bff23f9d7c7bfff6-00000001..pile, 6[/Users/simon/Library/Caches/bun/@t@], f652693c912f70b8.debug.pile) = 0
+[SYS] openat(6[/Users/simon/Library/Caches/bun/@t@], .bff27f9b3df9fef6-00000001..pile) = 7
+[SYS] pwritev(7[/Users/simon/Library/Caches/bun/@t@/.bff27f9b3df9fef6-00000001..pile], 157994) = 157994
+[SYS] renameat(6[/Users/simon/Library/Caches/bun/@t@], .bff27f9b3df9fef6-00000001..pile, 6[/Users/simon/Library/Caches/bun/@t@], f652693c912f70b8.debug.pile) = 0
 [fs] close(7[/Users/simon/Library/Caches/bun/@t@/f652693c912f70b8.debug.pile])
 [fs] close(6[/Users/simon/Library/Caches/bun/@t@])
 [cache] put() = 83074 bytes
@@ -1630,7 +1630,7 @@ Odd numbered Node.js versions will not enter LTS status and should not be used f
 [fs] close(4[/Users/simon/Documents/dev/treaty])
 [SYS] openat(-2, /Users/simon/Documents/dev/treaty/package.json) = 4
 [SYS] fstat(4[/Users/simon/Documents/dev/treaty/package.json]) = 0
-[SYS] read(4[/Users/simon/Documents/dev/treaty/package.json], 1060) = 1044 (0.006ms)
+[SYS] read(4[/Users/simon/Documents/dev/treaty/package.json], 1085) = 1069 (0.008ms)
 [SYS] read(4[/Users/simon/Documents/dev/treaty/package.json], 16) = 0 (0.002ms)
 [fs] close(4[/Users/simon/Documents/dev/treaty/package.json])
 [SYS] openat(-2, /Users/simon/Documents/dev/treaty/yargs/) = -1
@@ -1952,13 +1952,13 @@ Odd numbered Node.js versions will not enter LTS status and should not be used f
 [Loop] sub 2 - 1 = 1
 [SYS] openat(-2, /Users/simon/Documents/dev/treaty/angular.json) = 4
 [SYS] fstat(4[/Users/simon/Documents/dev/treaty/angular.json]) = 0
-[SYS] read(4[/Users/simon/Documents/dev/treaty/angular.json], 2756) = 2740 (0.012ms)
+[SYS] read(4[/Users/simon/Documents/dev/treaty/angular.json], 2756) = 2740 (0.006ms)
 [SYS] read(4[/Users/simon/Documents/dev/treaty/angular.json], 16) = 0 (0.002ms)
-[Loop] ref
 [fs] close(4[/Users/simon/Documents/dev/treaty/angular.json])
+[Loop] ref
+[Loop] sub 2 - 1 = 1
 [SYS] openat(-2, /Users/simon/.angular-config.json) = 4
 [SYS] fstat(4[/Users/simon/.angular-config.json]) = 0
-[Loop] sub 2 - 1 = 1
 [SYS] read(4[/Users/simon/.angular-config.json], 123) = 107 (0.004ms)
 [SYS] read(4[/Users/simon/.angular-config.json], 16) = 0 (0.002ms)
 [fs] close(4[/Users/simon/.angular-config.json])
@@ -1968,7 +1968,7 @@ Odd numbered Node.js versions will not enter LTS status and should not be used f
 [fs] close(4[/Users/simon/Documents/dev/treaty])
 [SYS] openat(-2, /Users/simon/Documents/dev/treaty/package.json) = 4
 [SYS] fstat(4[/Users/simon/Documents/dev/treaty/package.json]) = 0
-[SYS] read(4[/Users/simon/Documents/dev/treaty/package.json], 1060) = 1044 (0.006ms)
+[SYS] read(4[/Users/simon/Documents/dev/treaty/package.json], 1085) = 1069 (0.009ms)
 [SYS] read(4[/Users/simon/Documents/dev/treaty/package.json], 16) = 0 (0.002ms)
 [fs] close(4[/Users/simon/Documents/dev/treaty/package.json])
 [SYS] openat(-2, /Users/simon/Documents/dev/treaty/node_modules/@angular/cli/src/commands/build/) = 4
@@ -2079,7 +2079,7 @@ Odd numbered Node.js versions will not enter LTS status and should not be used f
 [SYS] stat(/Users/simon/Documents/dev/treaty/node_modules/yargs/locales/en.json) = 0
 [SYS] openat(-2, /Users/simon/Documents/dev/treaty/node_modules/yargs/locales/en.json) = 4
 [SYS] fstat(4[/Users/simon/Documents/dev/treaty/node_modules/yargs/locales/en.json]) = 0
-[SYS] read(4[/Users/simon/Documents/dev/treaty/node_modules/yargs/locales/en.json], 2035) = 2019 (0.006ms)
+[SYS] read(4[/Users/simon/Documents/dev/treaty/node_modules/yargs/locales/en.json], 2035) = 2019 (0.004ms)
 [SYS] read(4[/Users/simon/Documents/dev/treaty/node_modules/yargs/locales/en.json], 16) = 0 (0.002ms)
 [fs] close(4[/Users/simon/Documents/dev/treaty/node_modules/yargs/locales/en.json])
 [SYS] openat(-2, /Users/simon/Documents/dev/treaty/@angular-devkit/build-angular/) = -1
@@ -2123,9 +2123,9 @@ Odd numbered Node.js versions will not enter LTS status and should not be used f
 [fs] close(6[/Users/simon/Library/Caches/bun/@t@/b37374ddc21ec632.debug.pile])
 [cache] get("/Users/simon/Documents/dev/treaty/node_modules/esbuild/lib/main.js") = 88650 bytes, ignored for debug build
 [cache] filename to put into: '/Users/simon/Library/Caches/bun/@t@/b37374ddc21ec632.debug.pile'
-[SYS] openat(6[/Users/simon/Library/Caches/bun/@t@], .37f63fcfddfd7fb3-00000002..pile) = 7
-[SYS] pwritev(7[/Users/simon/Library/Caches/bun/@t@/.37f63fcfddfd7fb3-00000002..pile], 138846) = 138846
-[SYS] renameat(6[/Users/simon/Library/Caches/bun/@t@], .37f63fcfddfd7fb3-00000002..pile, 6[/Users/simon/Library/Caches/bun/@t@], b37374ddc21ec632.debug.pile) = 0
+[SYS] openat(6[/Users/simon/Library/Caches/bun/@t@], .37f67ecbfff77ff3-00000002..pile) = 7
+[SYS] pwritev(7[/Users/simon/Library/Caches/bun/@t@/.37f67ecbfff77ff3-00000002..pile], 138846) = 138846
+[SYS] renameat(6[/Users/simon/Library/Caches/bun/@t@], .37f67ecbfff77ff3-00000002..pile, 6[/Users/simon/Library/Caches/bun/@t@], b37374ddc21ec632.debug.pile) = 0
 [fs] close(7[/Users/simon/Library/Caches/bun/@t@/b37374ddc21ec632.debug.pile])
 [fs] close(6[/Users/simon/Library/Caches/bun/@t@])
 [cache] put() = 88650 bytes
@@ -2742,9 +2742,9 @@ Odd numbered Node.js versions will not enter LTS status and should not be used f
 [fs] close(6[/Users/simon/Library/Caches/bun/@t@/3a0a5eef701591ab.debug.pile])
 [cache] get("/Users/simon/Documents/dev/treaty/node_modules/critters/dist/critters.js") = 36611 bytes, ignored for debug build
 [cache] filename to put into: '/Users/simon/Library/Caches/bun/@t@/3a0a5eef701591ab.debug.pile'
-[SYS] openat(6[/Users/simon/Library/Caches/bun/@t@], .bfb3357dff7e9aba-00000003..pile) = 7
-[SYS] pwritev(7[/Users/simon/Library/Caches/bun/@t@/.bfb3357dff7e9aba-00000003..pile], 58429) = 58429
-[SYS] renameat(6[/Users/simon/Library/Caches/bun/@t@], .bfb3357dff7e9aba-00000003..pile, 6[/Users/simon/Library/Caches/bun/@t@], 3a0a5eef701591ab.debug.pile) = 0
+[SYS] openat(6[/Users/simon/Library/Caches/bun/@t@], .bfb37d7befdfbafa-00000003..pile) = 7
+[SYS] pwritev(7[/Users/simon/Library/Caches/bun/@t@/.bfb37d7befdfbafa-00000003..pile], 58429) = 58429
+[SYS] renameat(6[/Users/simon/Library/Caches/bun/@t@], .bfb37d7befdfbafa-00000003..pile, 6[/Users/simon/Library/Caches/bun/@t@], 3a0a5eef701591ab.debug.pile) = 0
 [fs] close(7[/Users/simon/Library/Caches/bun/@t@/3a0a5eef701591ab.debug.pile])
 [fs] close(6[/Users/simon/Library/Caches/bun/@t@])
 [cache] put() = 36611 bytes
@@ -3480,16 +3480,16 @@ Odd numbered Node.js versions will not enter LTS status and should not be used f
 [Loop] ref
 [SYS] openat(-2, /Users/simon/Documents/dev/treaty) = 4
 [SYS] openat(-2, /Users/simon/Documents/dev/treaty) = 6
-[fs] close(6[/Users/simon/Documents/dev/treaty])
 [fs] close(4[/Users/simon/Documents/dev/treaty])
+[fs] close(6[/Users/simon/Documents/dev/treaty])
 [Loop] sub 2 - 1 = 1
 [Loop] sub 1 - 1 = 0
 [Loop] ref
 [Loop] ref
-[SYS] openat(-2, /Users/simon/Documents/dev/treaty) = 4
 [SYS] openat(-2, /Users/simon/Documents/dev/treaty) = 6
-[fs] close(4[/Users/simon/Documents/dev/treaty])
+[SYS] openat(-2, /Users/simon/Documents/dev/treaty) = 4
 [fs] close(6[/Users/simon/Documents/dev/treaty])
+[fs] close(4[/Users/simon/Documents/dev/treaty])
 [Loop] sub 2 - 1 = 1
 [Loop] sub 1 - 1 = 0
 [Loop] ref
@@ -3510,13 +3510,13 @@ Odd numbered Node.js versions will not enter LTS status and should not be used f
 [SYS] stat(/Users/simon/Documents/dev/treaty/package.json) = 0
 [SYS] openat(-2, /Users/simon/Documents/dev/treaty/package.json) = 4
 [SYS] fstat(4[/Users/simon/Documents/dev/treaty/package.json]) = 0
-[SYS] read(4[/Users/simon/Documents/dev/treaty/package.json], 1060) = 1044 (0.010ms)
+[SYS] read(4[/Users/simon/Documents/dev/treaty/package.json], 1085) = 1069 (0.006ms)
 [SYS] read(4[/Users/simon/Documents/dev/treaty/package.json], 16) = 0 (0.002ms)
 [fs] close(4[/Users/simon/Documents/dev/treaty/package.json])
 [SYS] stat(/Users/simon/package.json) = 0
 [SYS] openat(-2, /Users/simon/package.json) = 4
 [SYS] fstat(4[/Users/simon/package.json]) = 0
-[SYS] read(4[/Users/simon/package.json], 157) = 141 (0.004ms)
+[SYS] read(4[/Users/simon/package.json], 157) = 141 (0.003ms)
 [SYS] read(4[/Users/simon/package.json], 16) = 0 (0.002ms)
 [fs] close(4[/Users/simon/package.json])
 [SYS] openat(-2, /Users/simon/Documents/dev/treaty/caniuse-lite/data/features/) = -1
@@ -3533,11 +3533,11 @@ Odd numbered Node.js versions will not enter LTS status and should not be used f
 [fs] close(6[/Users/simon/Documents/dev/treaty/node_modules/@esbuild/darwin-arm64])
 [SYS] openat(-2, /Users/simon/Documents/dev/treaty/node_modules/@esbuild/darwin-arm64/bin/) = 4
 [fs] close(4[/Users/simon/Documents/dev/treaty/node_modules/@esbuild/darwin-arm64/bin])
-[SYS] posix_spawn(/Users/simon/Documents/dev/treaty/node_modules/@esbuild/darwin-arm64/bin/esbuild) = 0 (49474)
+[SYS] posix_spawn(/Users/simon/Documents/dev/treaty/node_modules/@esbuild/darwin-arm64/bin/esbuild) = 0 (51424)
 [fs] close(4)
 [fs] close(8)
 [FilePoll] register: writable (6)
-[FilePoll] register: process (49474)
+[FilePoll] register: process (51424)
 [Loop] add 0 + 1 = 1
 [FilePoll] register: readable (7)
 [bun] poll(7) readable: false (0)
@@ -3569,7 +3569,7 @@ Odd numbered Node.js versions will not enter LTS status and should not be used f
 [FileSink] Wrote 82 bytes (fd: 6, head: 0, 0/3872)
 [FilePoll] register: readable (7)
 [bun] poll(7) readable: true (1)
-[SYS] read(7, 16384) = 166 (0.003ms)
+[SYS] read(7, 16384) = 166 (0.002ms)
 [bun] poll(7) readable: false (0)
 [fs] close(8[/Users/simon/Documents/dev/treaty/node_modules/piscina/dist/src/worker.js])
 [SYS] write(6, 137) = 137
@@ -3589,11 +3589,11 @@ Odd numbered Node.js versions will not enter LTS status and should not be used f
 [FilePoll] readable
 [FilePoll] onUpdate kevent (fd: 7) FIFO
 [FIFO] FIFO ready
-[SYS] read(7, 16384) = 192 (0.003ms)
+[SYS] read(7, 16384) = 192 (0.004ms)
 [Loop] ref
 [SYS] openat(-2, /Users/simon/Documents/dev/treaty/src/styles.scss) = 8
 [SYS] fstat(8[/Users/simon/Documents/dev/treaty/src/styles.scss]) = 0
-[SYS] read(8[/Users/simon/Documents/dev/treaty/src/styles.scss], 96) = 80 (0.004ms)
+[SYS] read(8[/Users/simon/Documents/dev/treaty/src/styles.scss], 96) = 80 (0.005ms)
 [SYS] read(8[/Users/simon/Documents/dev/treaty/src/styles.scss], 16) = 0 (0.002ms)
 [fs] close(8[/Users/simon/Documents/dev/treaty/src/styles.scss])
 [FilePoll] register: readable (7)
@@ -3696,23 +3696,15 @@ Odd numbered Node.js versions will not enter LTS status and should not be used f
 [fs] close(11[/Users/simon/Library/Caches/bun/@t@/727e73f59f7120d2.debug.pile])
 [cache] get("/Users/simon/Documents/dev/treaty/node_modules/typescript/lib/typescript.js") = 8078471 bytes, ignored for debug build
 [cache] filename to put into: '/Users/simon/Library/Caches/bun/@t@/dbfb466bd84108e8.debug.pile'
-[SYS] openat(11[/Users/simon/Library/Caches/bun/@t@], .ffba71ddffd6ffdb-00000004..pile) = 12
-[SYS] pwritev(12[/Users/simon/Library/Caches/bun/@t@/.ffba71ddffd6ffdb-00000004..pile], 8121748) = 8121748
-[SYS] renameat(11[/Users/simon/Library/Caches/bun/@t@], .ffba71ddffd6ffdb-00000004..pile, 11[/Users/simon/Library/Caches/bun/@t@], dbfb466bd84108e8.debug.pile) = 0
+[SYS] openat(11[/Users/simon/Library/Caches/bun/@t@], .ffba7ddbeb57fbfb-00000004..pile) = 12
+[SYS] pwritev(12[/Users/simon/Library/Caches/bun/@t@/.ffba7ddbeb57fbfb-00000004..pile], 8121748) = 8121748
+[SYS] renameat(11[/Users/simon/Library/Caches/bun/@t@], .ffba7ddbeb57fbfb-00000004..pile, 11[/Users/simon/Library/Caches/bun/@t@], dbfb466bd84108e8.debug.pile) = 0
 [fs] close(12[/Users/simon/Library/Caches/bun/@t@/dbfb466bd84108e8.debug.pile])
 [fs] close(11[/Users/simon/Library/Caches/bun/@t@])
 [cache] put() = 5264709 bytes
-[FilePoll] readable
-[FilePoll] onUpdate kevent (fd: 7) FIFO
-[FIFO] FIFO ready
-[SYS] read(7, 16384) = 33 (0.004ms)
 [fs] close(9[/Users/simon/Documents/dev/treaty/node_modules/sass/sass.dart.js])
-[SYS] write(6, 13) = 13
-[FileSink] Wrote 13 bytes (fd: 6, head: 0, 0/4035)
-[FilePoll] register: readable (7)
-[bun] poll(7) readable: false (0)
-[alloc] new() = src.bun.js.node.node_fs_binding.NodeJSFS@126008200
-[alloc] new() = src.bun.js.node.node_fs_binding.NodeJSFS@126008800
+[alloc] new() = src.bun.js.node.node_fs_binding.NodeJSFS@13e008e00
+[alloc] new() = src.bun.js.node.node_fs_binding.NodeJSFS@13e009400
 [SYS] openat(9[/Users/simon/Documents/dev/treaty/node_modules/immutable], package.json) = 11
 [fs] openat(9[/Users/simon/Documents/dev/treaty/node_modules/immutable], /Users/simon/Documents/dev/treaty/node_modules/immutable/package.json) = 11
 [fs] close(11[/Users/simon/Documents/dev/treaty/node_modules/immutable/package.json])
@@ -3724,10 +3716,18 @@ Odd numbered Node.js versions will not enter LTS status and should not be used f
 [SYS] openat(-2, /Users/simon/Library/Caches/bun/@t@/e7a9abb162196ec7.debug.pile) = 11
 [fs] close(11[/Users/simon/Library/Caches/bun/@t@/e7a9abb162196ec7.debug.pile])
 [cache] get("/Users/simon/Documents/dev/treaty/node_modules/immutable/dist/immutable.js") = 153988 bytes, ignored for debug build
+[FilePoll] readable
+[FilePoll] onUpdate kevent (fd: 7) FIFO
+[FIFO] FIFO ready
+[SYS] read(7, 16384) = 33 (0.004ms)
+[SYS] write(6, 13) = 13
+[FileSink] Wrote 13 bytes (fd: 6, head: 0, 0/4035)
+[FilePoll] register: readable (7)
+[bun] poll(7) readable: false (0)
 [cache] filename to put into: '/Users/simon/Library/Caches/bun/@t@/e7a9abb162196ec7.debug.pile'
-[SYS] openat(11[/Users/simon/Library/Caches/bun/@t@], .d7fe396eb7afa9f7-00000005..pile) = 12
-[SYS] pwritev(12[/Users/simon/Library/Caches/bun/@t@/.d7fe396eb7afa9f7-00000005..pile], 249585) = 249585
-[SYS] renameat(11[/Users/simon/Library/Caches/bun/@t@], .d7fe396eb7afa9f7-00000005..pile, 11[/Users/simon/Library/Caches/bun/@t@], e7a9abb162196ec7.debug.pile) = 0
+[SYS] openat(11[/Users/simon/Library/Caches/bun/@t@], .d7fe7d6bfbbbadff-00000005..pile) = 12
+[SYS] pwritev(12[/Users/simon/Library/Caches/bun/@t@/.d7fe7d6bfbbbadff-00000005..pile], 249585) = 249585
+[SYS] renameat(11[/Users/simon/Library/Caches/bun/@t@], .d7fe7d6bfbbbadff-00000005..pile, 11[/Users/simon/Library/Caches/bun/@t@], e7a9abb162196ec7.debug.pile) = 0
 [fs] close(12[/Users/simon/Library/Caches/bun/@t@/e7a9abb162196ec7.debug.pile])
 [fs] close(11[/Users/simon/Library/Caches/bun/@t@])
 [cache] put() = 153988 bytes
@@ -3744,9 +3744,9 @@ Odd numbered Node.js versions will not enter LTS status and should not be used f
 [fs] close(9[/Users/simon/Documents/dev/treaty/node_modules/@angular-devkit/build-angular/src/tools/sass/lexer.js])
 [Loop] refConcurrently (1, 1)
 [cache] filename to put into: '/Users/simon/Library/Caches/bun/@t@/727e73f59f7120d2.debug.pile'
-[SYS] openat(9[/Users/simon/Library/Caches/bun/@t@], .d7b2719fffffff7a-00000006..pile) = 11
-[SYS] pwritev(11[/Users/simon/Library/Caches/bun/@t@/.d7b2719fffffff7a-00000006..pile], 11903682) = 11903682
-[SYS] renameat(9[/Users/simon/Library/Caches/bun/@t@], .d7b2719fffffff7a-00000006..pile, 9[/Users/simon/Library/Caches/bun/@t@], 727e73f59f7120d2.debug.pile) = 0
+[SYS] openat(9[/Users/simon/Library/Caches/bun/@t@], .d7b27d9fff737e7a-00000006..pile) = 11
+[SYS] pwritev(11[/Users/simon/Library/Caches/bun/@t@/.d7b27d9fff737e7a-00000006..pile], 11903682) = 11903682
+[SYS] renameat(9[/Users/simon/Library/Caches/bun/@t@], .d7b27d9fff737e7a-00000006..pile, 9[/Users/simon/Library/Caches/bun/@t@], 727e73f59f7120d2.debug.pile) = 0
 [fs] close(11[/Users/simon/Library/Caches/bun/@t@/727e73f59f7120d2.debug.pile])
 [fs] close(9[/Users/simon/Library/Caches/bun/@t@])
 [cache] put() = 8078471 bytes
@@ -3756,14 +3756,14 @@ Odd numbered Node.js versions will not enter LTS status and should not be used f
 [FilePoll] readable
 [FilePoll] onUpdate kevent (fd: 7) FIFO
 [FIFO] FIFO ready
-[SYS] read(7, 16384) = 829 (0.005ms)
+[SYS] read(7, 16384) = 829 (0.008ms)
 [FilePoll] register: readable (7)
 [bun] poll(7) readable: false (0)
 [SYS] openat(-2, /Users/simon/Documents/dev/treaty/node_modules/typescript/lib/node_modules/@microsoft/) = -1
 [Resolver] Bust /Users/simon/Documents/dev/treaty/node_modules/typescript/lib/node_modules/@microsoft/
 [SYS] openat(-2, /Users/simon/Documents/dev/treaty/node_modules/typescript/lib/node_modules/@microsoft/) = -1
-[alloc] new() = src.bun.js.node.node_fs_binding.NodeJSFS@126808200
-[alloc] new() = src.bun.js.node.node_fs_binding.NodeJSFS@126808800
+[alloc] new() = src.bun.js.node.node_fs_binding.NodeJSFS@148808200
+[alloc] new() = src.bun.js.node.node_fs_binding.NodeJSFS@148808800
 [SYS] stat(/uSERS/SIMON/dOCUMENTS/DEV/TREATY/NODE_MODULES/TYPESCRIPT/LIB/TYPESCRIPT.JS) = 0
 [SYS] openat(-2, /Users/simon/Documents/dev/treaty/node_modules/@angular-devkit/build-angular/src/tools/esbuild/profiling.js) = 9
 [fs] openat([invalid_fd], /Users/simon/Documents/dev/treaty/node_modules/@angular-devkit/build-angular/src/tools/esbuild/profiling.js) = 9
@@ -3870,10 +3870,10 @@ Odd numbered Node.js versions will not enter LTS status and should not be used f
 [fs] close(9[/Users/simon/Documents/dev/treaty/node_modules/@angular/compiler/fesm2022])
 [compile] transpile(/Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-KYE5EYIK.js)
 [Loop] ref
-[SYS] openat(-2, /Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-KYE5EYIK.js) = 9
-[fs] openat(0, /Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-KYE5EYIK.js) = 9
 [compile] transpile(/Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-JIFH6OZK.js)
 [Loop] ref
+[SYS] openat(-2, /Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-KYE5EYIK.js) = 9
+[fs] openat(0, /Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-KYE5EYIK.js) = 9
 [SYS] openat(-2, /Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-JIFH6OZK.js) = 10
 [fs] openat(0, /Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-JIFH6OZK.js) = 10
 [compile] transpile(/Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-6VEEN3ZS.js)
@@ -3882,110 +3882,119 @@ Odd numbered Node.js versions will not enter LTS status and should not be used f
 [Loop] ref
 [compile] transpile(/Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-CVK4HV4K.js)
 [Loop] ref
-[SYS] openat(-2, /Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-6VEEN3ZS.js) = 11
-[fs] openat(0, /Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-6VEEN3ZS.js) = 11
 [compile] transpile(/Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-64JBPJBS.js)
 [Loop] ref
 [compile] transpile(/Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-LYJKWJUC.js)
 [Loop] ref
+[SYS] openat(-2, /Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-6VEEN3ZS.js) = 11
+[fs] openat(0, /Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-6VEEN3ZS.js) = 11
+[SYS] openat(-2, /Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-LYJKWJUC.js) = 12
+[fs] openat(0, /Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-LYJKWJUC.js) = 12
+[SYS] openat(-2, /Users/simon/Library/Caches/bun/@t@/cfbb01826a362b49.debug.pile) = 13
+[fs] close(11[/Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-6VEEN3ZS.js])
+[SYS] openat(-2, /Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-CVK4HV4K.js) = 11
+[fs] openat(0, /Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-CVK4HV4K.js) = 11
+[fs] close(13[/Users/simon/Library/Caches/bun/@t@/cfbb01826a362b49.debug.pile])
+[cache] get("/Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-JIFH6OZK.js") = 332959 bytes, ignored for debug build
+[SYS] openat(-2, /Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-PQBKKYRL.js) = 14
+[fs] openat(0, /Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-PQBKKYRL.js) = 14
+[SYS] openat(-2, /Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-64JBPJBS.js) = 17
+[fs] openat(0, /Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-64JBPJBS.js) = 17
+[fs] close(12[/Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-LYJKWJUC.js])
+[SYS] openat(-2, /Users/simon/Library/Caches/bun/@t@/528d6e7168670330.debug.pile) = 12
+[SYS] openat(-2, /Users/simon/Library/Caches/bun/@t@/94410c87ae33fff9.debug.pile) = 16
+[fs] close(12[/Users/simon/Library/Caches/bun/@t@/528d6e7168670330.debug.pile])
+[cache] get("/Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-PQBKKYRL.js") = 324612 bytes, ignored for debug build
+[fs] close(16[/Users/simon/Library/Caches/bun/@t@/94410c87ae33fff9.debug.pile])
+[cache] get("/Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-CVK4HV4K.js") = 95174 bytes, ignored for debug build
 [compile] transpile(/Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-UM6JO3VZ.js)
 [Loop] ref
-[SYS] openat(-2, /Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-CVK4HV4K.js) = 12
-[fs] openat(0, /Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-CVK4HV4K.js) = 12
-[SYS] openat(-2, /Users/simon/Library/Caches/bun/@t@/cfbb01826a362b49.debug.pile) = 13
+[SYS] openat(-2, /Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-UM6JO3VZ.js) = 12
+[fs] openat(0, /Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-UM6JO3VZ.js) = 12
+[fs] close(17[/Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-64JBPJBS.js])
 [compile] transpile(/Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-XI2RTGAL.js)
 [Loop] ref
 [compile] transpile(/Users/simon/Documents/dev/treaty/node_modules/@angular/compiler/fesm2022/compiler.mjs)
-[SYS] openat(-2, /Users/simon/Library/Caches/bun/@t@/94410c87ae33fff9.debug.pile) = 14
-[fs] close(14[/Users/simon/Library/Caches/bun/@t@/94410c87ae33fff9.debug.pile])
-[cache] get("/Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-CVK4HV4K.js") = 95174 bytes, ignored for debug build
-[SYS] openat(-2, /Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-UM6JO3VZ.js) = 16
-[fs] close(13[/Users/simon/Library/Caches/bun/@t@/cfbb01826a362b49.debug.pile])
 [Loop] ref
-[fs] close(11[/Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-6VEEN3ZS.js])
-[SYS] openat(-2, /Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-PQBKKYRL.js) = 11
-[fs] openat(0, /Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-PQBKKYRL.js) = 11
-[fs] openat(0, /Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-UM6JO3VZ.js) = 16
 [SYS] openat(-2, /Users/simon/Documents/dev/treaty/node_modules/@angular/compiler/fesm2022/compiler.mjs) = 13
 [fs] openat(0, /Users/simon/Documents/dev/treaty/node_modules/@angular/compiler/fesm2022/compiler.mjs) = 13
-[SYS] openat(-2, /Users/simon/Library/Caches/bun/@t@/528d6e7168670330.debug.pile) = 14
-[Loop] sub 13 - 1 = 12
-[fs] close(14[/Users/simon/Library/Caches/bun/@t@/528d6e7168670330.debug.pile])
-[cache] get("/Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-JIFH6OZK.js") = 332959 bytes, ignored for debug build
-[cache] get("/Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-PQBKKYRL.js") = 324612 bytes, ignored for debug build
-[SYS] openat(-2, /Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-XI2RTGAL.js) = 14
-[fs] openat(0, /Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-XI2RTGAL.js) = 14
-[SYS] openat(-2, /Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-LYJKWJUC.js) = 15
-[fs] openat(0, /Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-LYJKWJUC.js) = 15
-[fs] close(16[/Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-UM6JO3VZ.js])
-[SYS] openat(-2, /Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-64JBPJBS.js) = 16
-[fs] openat(0, /Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-64JBPJBS.js) = 16
-[Loop] sub 12 - 1 = 11
+[SYS] openat(-2, /Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-XI2RTGAL.js) = 15
+[fs] openat(0, /Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-XI2RTGAL.js) = 15
 [fs] close(9[/Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-KYE5EYIK.js])
-[fs] close(14[/Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-XI2RTGAL.js])
-[compile] transpile(/Users/simon/Documents/dev/treaty/node_modules/typescript/lib/typescript.js)
-[Loop] ref
+[Loop] sub 13 - 1 = 12
+[Loop] sub 12 - 1 = 11
+[fs] close(15[/Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-XI2RTGAL.js])
 [SYS] openat(-2, /Users/simon/Library/Caches/bun/@t@/8f8012524cd74fc5.debug.pile) = 9
-[SYS] openat(-2, /Users/simon/Documents/dev/treaty/node_modules/typescript/lib/typescript.js) = 18
-[fs] openat(0, /Users/simon/Documents/dev/treaty/node_modules/typescript/lib/typescript.js) = 18
-[fs] close(15[/Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-LYJKWJUC.js])
-[fs] close(16[/Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-64JBPJBS.js])
+[fs] close(12[/Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-UM6JO3VZ.js])
 [fs] close(9[/Users/simon/Library/Caches/bun/@t@/8f8012524cd74fc5.debug.pile])
 [cache] get("/Users/simon/Documents/dev/treaty/node_modules/@angular/compiler/fesm2022/compiler.mjs") = 980206 bytes, ignored for debug build
-[Loop] sub 12 - 1 = 11
 [Loop] sub 11 - 1 = 10
 [Loop] sub 10 - 1 = 9
+[compile] transpile(/Users/simon/Documents/dev/treaty/node_modules/typescript/lib/typescript.js)
+[Loop] ref
+[Loop] sub 10 - 1 = 9
+[SYS] openat(-2, /Users/simon/Documents/dev/treaty/node_modules/typescript/lib/typescript.js) = 9
+[fs] openat(0, /Users/simon/Documents/dev/treaty/node_modules/typescript/lib/typescript.js) = 9
 [Loop] sub 9 - 1 = 8
-[SYS] openat(-2, /Users/simon/Library/Caches/bun/@t@/727e73f59f7120d2.debug.pile) = 9
+[SYS] openat(-2, /Users/simon/Library/Caches/bun/@t@/727e73f59f7120d2.debug.pile) = 12
 [cache] filename to put into: '/Users/simon/Library/Caches/bun/@t@/94410c87ae33fff9.debug.pile'
-[SYS] openat(14[/Users/simon/Library/Caches/bun/@t@], .ffff33aebf7d639c-00000007..pile) = 15
-[SYS] pwritev(15[/Users/simon/Library/Caches/bun/@t@/.ffff33aebf7d639c-00000007..pile], 150716) = 150716
-[SYS] renameat(14[/Users/simon/Library/Caches/bun/@t@], .ffff33aebf7d639c-00000007..pile, 14[/Users/simon/Library/Caches/bun/@t@], 94410c87ae33fff9.debug.pile) = 0
-[fs] close(15[/Users/simon/Library/Caches/bun/@t@/94410c87ae33fff9.debug.pile])
-[fs] close(14[/Users/simon/Library/Caches/bun/@t@])
+[SYS] openat(15[/Users/simon/Library/Caches/bun/@t@], .ffff7faff71e79fc-00000007..pile) = 16
+[SYS] pwritev(16[/Users/simon/Library/Caches/bun/@t@/.ffff7faff71e79fc-00000007..pile], 150716) = 150716
+[SYS] renameat(15[/Users/simon/Library/Caches/bun/@t@], .ffff7faff71e79fc-00000007..pile, 15[/Users/simon/Library/Caches/bun/@t@], 94410c87ae33fff9.debug.pile) = 0
+[fs] close(16[/Users/simon/Library/Caches/bun/@t@/94410c87ae33fff9.debug.pile])
+[fs] close(15[/Users/simon/Library/Caches/bun/@t@])
 [cache] put() = 95174 bytes
-[fs] close(12[/Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-CVK4HV4K.js])
+[fs] close(11[/Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-CVK4HV4K.js])
 [Loop] sub 8 - 1 = 7
-[fs] close(9[/Users/simon/Library/Caches/bun/@t@/727e73f59f7120d2.debug.pile])
-[cache] get("/Users/simon/Documents/dev/treaty/node_modules/typescript/lib/typescript.js") = 8078471 bytes, ignored for debug build
 [SYS] openat(-2, /Users/simon/Documents/dev/treaty/@angular/) = -1
-[FilePoll] readable
-[FilePoll] onUpdate kevent (fd: 7) FIFO
-[FIFO] FIFO ready
-[SYS] read(7, 16384) = 33 (0.005ms)
-[SYS] write(6, 13) = 13
-[FileSink] Wrote 13 bytes (fd: 6, head: 0, 0/4276)
-[FilePoll] register: readable (7)
-[bun] poll(7) readable: false (0)
+[fs] close(12[/Users/simon/Library/Caches/bun/@t@/727e73f59f7120d2.debug.pile])
+[cache] get("/Users/simon/Documents/dev/treaty/node_modules/typescript/lib/typescript.js") = 8078471 bytes, ignored for debug build
 [cache] filename to put into: '/Users/simon/Library/Caches/bun/@t@/528d6e7168670330.debug.pile'
-[SYS] openat(9[/Users/simon/Library/Caches/bun/@t@], .37b3776e7dffed72-00000008..pile) = 12
-[SYS] pwritev(12[/Users/simon/Library/Caches/bun/@t@/.37b3776e7dffed72-00000008..pile], 506058) = 506058
-[SYS] renameat(9[/Users/simon/Library/Caches/bun/@t@], .37b3776e7dffed72-00000008..pile, 9[/Users/simon/Library/Caches/bun/@t@], 528d6e7168670330.debug.pile) = 0
+[SYS] openat(11[/Users/simon/Library/Caches/bun/@t@], .37b37f6bf7feafda-00000008..pile) = 12
+[SYS] pwritev(12[/Users/simon/Library/Caches/bun/@t@/.37b37f6bf7feafda-00000008..pile], 506058) = 506058
+[SYS] renameat(11[/Users/simon/Library/Caches/bun/@t@], .37b37f6bf7feafda-00000008..pile, 11[/Users/simon/Library/Caches/bun/@t@], 528d6e7168670330.debug.pile) = 0
 [fs] close(12[/Users/simon/Library/Caches/bun/@t@/528d6e7168670330.debug.pile])
-[fs] close(9[/Users/simon/Library/Caches/bun/@t@])
+[fs] close(11[/Users/simon/Library/Caches/bun/@t@])
 [cache] put() = 324612 bytes
-[fs] close(11[/Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-PQBKKYRL.js])
+[fs] close(14[/Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-PQBKKYRL.js])
 [Loop] sub 7 - 1 = 6
 [cache] filename to put into: '/Users/simon/Library/Caches/bun/@t@/cfbb01826a362b49.debug.pile'
-[SYS] openat(9[/Users/simon/Library/Caches/bun/@t@], .5fbb376ebeb3ffcf-00000009..pile) = 11
-[SYS] pwritev(11[/Users/simon/Library/Caches/bun/@t@/.5fbb376ebeb3ffcf-00000009..pile], 528134) = 528134
-[SYS] renameat(9[/Users/simon/Library/Caches/bun/@t@], .5fbb376ebeb3ffcf-00000009..pile, 9[/Users/simon/Library/Caches/bun/@t@], cfbb01826a362b49.debug.pile) = 0
-[fs] close(11[/Users/simon/Library/Caches/bun/@t@/cfbb01826a362b49.debug.pile])
-[fs] close(9[/Users/simon/Library/Caches/bun/@t@])
+[SYS] openat(11[/Users/simon/Library/Caches/bun/@t@], .5fbb7e6bf7bbfbdf-00000009..pile) = 12
+[SYS] pwritev(12[/Users/simon/Library/Caches/bun/@t@/.5fbb7e6bf7bbfbdf-00000009..pile], 528134) = 528134
+[SYS] renameat(11[/Users/simon/Library/Caches/bun/@t@], .5fbb7e6bf7bbfbdf-00000009..pile, 11[/Users/simon/Library/Caches/bun/@t@], cfbb01826a362b49.debug.pile) = 0
+[fs] close(12[/Users/simon/Library/Caches/bun/@t@/cfbb01826a362b49.debug.pile])
+[fs] close(11[/Users/simon/Library/Caches/bun/@t@])
 [cache] put() = 332959 bytes
 [fs] close(10[/Users/simon/Documents/dev/treaty/node_modules/@angular/compiler-cli/bundles/chunk-JIFH6OZK.js])
 [SYS] openat(-2, /Users/simon/Documents/dev/treaty/@angular/) = -1
 [Loop] sub 6 - 1 = 5
 [SYS] openat(-2, /Users/simon/Documents/dev/treaty/@angular/) = -1
 [cache] filename to put into: '/Users/simon/Library/Caches/bun/@t@/8f8012524cd74fc5.debug.pile'
-[SYS] openat(9[/Users/simon/Library/Caches/bun/@t@], .d7fff74e575eb58f-0000000A..pile) = 10
-[SYS] pwritev(10[/Users/simon/Library/Caches/bun/@t@/.d7fff74e575eb58f-0000000A..pile], 1600978) = 1600978
-[SYS] renameat(9[/Users/simon/Library/Caches/bun/@t@], .d7fff74e575eb58f-0000000A..pile, 9[/Users/simon/Library/Caches/bun/@t@], 8f8012524cd74fc5.debug.pile) = 0
-[fs] close(10[/Users/simon/Library/Caches/bun/@t@/8f8012524cd74fc5.debug.pile])
-[fs] close(9[/Users/simon/Library/Caches/bun/@t@])
+[SYS] openat(10[/Users/simon/Library/Caches/bun/@t@], .d7ffff4c523ef7ff-0000000A..pile) = 11
+[SYS] pwritev(11[/Users/simon/Library/Caches/bun/@t@/.d7ffff4c523ef7ff-0000000A..pile], 1600978) = 1600978
+[SYS] renameat(10[/Users/simon/Library/Caches/bun/@t@], .d7ffff4c523ef7ff-0000000A..pile, 10[/Users/simon/Library/Caches/bun/@t@], 8f8012524cd74fc5.debug.pile) = 0
+[fs] close(11[/Users/simon/Library/Caches/bun/@t@/8f8012524cd74fc5.debug.pile])
+[fs] close(10[/Users/simon/Library/Caches/bun/@t@])
 [cache] put() = 980206 bytes
 [fs] close(13[/Users/simon/Documents/dev/treaty/node_modules/@angular/compiler/fesm2022/compiler.mjs])
 [Loop] sub 5 - 1 = 4
+[FilePoll] readable
+[FilePoll] onUpdate kevent (fd: 7) FIFO
+[FIFO] FIFO ready
+[SYS] read(7, 16384) = 33 (0.004ms)
+[SYS] write(6, 13) = 13
+[FileSink] Wrote 13 bytes (fd: 6, head: 0, 0/4276)
+[FilePoll] register: readable (7)
+[bun] poll(7) readable: false (0)
+[cache] filename to put into: '/Users/simon/Library/Caches/bun/@t@/727e73f59f7120d2.debug.pile'
+[SYS] openat(10[/Users/simon/Library/Caches/bun/@t@], .d7b27d9ffdfb7e72-0000000B..pile) = 11
+[SYS] pwritev(11[/Users/simon/Library/Caches/bun/@t@/.d7b27d9ffdfb7e72-0000000B..pile], 11903682) = 11903682
+[SYS] renameat(10[/Users/simon/Library/Caches/bun/@t@], .d7b27d9ffdfb7e72-0000000B..pile, 10[/Users/simon/Library/Caches/bun/@t@], 727e73f59f7120d2.debug.pile) = 0
+[fs] close(11[/Users/simon/Library/Caches/bun/@t@/727e73f59f7120d2.debug.pile])
+[fs] close(10[/Users/simon/Library/Caches/bun/@t@])
+[cache] put() = 8078471 bytes
+[fs] close(9[/Users/simon/Documents/dev/treaty/node_modules/typescript/lib/typescript.js])
+[Loop] sub 4 - 1 = 3
 [FilePoll] readable
 [FilePoll] onUpdate kevent (fd: 7) FIFO
 [FIFO] FIFO ready
@@ -3994,33 +4003,24 @@ Odd numbered Node.js versions will not enter LTS status and should not be used f
 [FileSink] Wrote 13 bytes (fd: 6, head: 0, 0/4289)
 [FilePoll] register: readable (7)
 [bun] poll(7) readable: false (0)
-[cache] filename to put into: '/Users/simon/Library/Caches/bun/@t@/727e73f59f7120d2.debug.pile'
-[SYS] openat(9[/Users/simon/Library/Caches/bun/@t@], .d7b2719ff77b7ff2-0000000B..pile) = 10
-[SYS] pwritev(10[/Users/simon/Library/Caches/bun/@t@/.d7b2719ff77b7ff2-0000000B..pile], 11903682) = 11903682
-[SYS] renameat(9[/Users/simon/Library/Caches/bun/@t@], .d7b2719ff77b7ff2-0000000B..pile, 9[/Users/simon/Library/Caches/bun/@t@], 727e73f59f7120d2.debug.pile) = 0
-[fs] close(10[/Users/simon/Library/Caches/bun/@t@/727e73f59f7120d2.debug.pile])
-[fs] close(9[/Users/simon/Library/Caches/bun/@t@])
-[cache] put() = 8078471 bytes
-[fs] close(18[/Users/simon/Documents/dev/treaty/node_modules/typescript/lib/typescript.js])
-[Loop] sub 4 - 1 = 3
 [SYS] openat(-2, /Users/simon/Documents/dev/treaty/tsconfig.app.json) = 9
 [SYS] fstat(9[/Users/simon/Documents/dev/treaty/tsconfig.app.json]) = 0
-[SYS] read(9[/Users/simon/Documents/dev/treaty/tsconfig.app.json], 297) = 281 (0.007ms)
+[SYS] read(9[/Users/simon/Documents/dev/treaty/tsconfig.app.json], 297) = 281 (0.009ms)
 [SYS] read(9[/Users/simon/Documents/dev/treaty/tsconfig.app.json], 16) = 0 (0.002ms)
 [fs] close(9[/Users/simon/Documents/dev/treaty/tsconfig.app.json])
 [SYS] openat(-2, /Users/simon/Documents/dev/treaty/tsconfig.app.json) = 9
 [SYS] fstat(9[/Users/simon/Documents/dev/treaty/tsconfig.app.json]) = 0
-[SYS] read(9[/Users/simon/Documents/dev/treaty/tsconfig.app.json], 297) = 281 (0.006ms)
-[SYS] read(9[/Users/simon/Documents/dev/treaty/tsconfig.app.json], 16) = 0 (0.005ms)
+[SYS] read(9[/Users/simon/Documents/dev/treaty/tsconfig.app.json], 297) = 281 (0.004ms)
+[SYS] read(9[/Users/simon/Documents/dev/treaty/tsconfig.app.json], 16) = 0 (0.002ms)
 [fs] close(9[/Users/simon/Documents/dev/treaty/tsconfig.app.json])
 [SYS] openat(-2, /Users/simon/Documents/dev/treaty/tsconfig.json) = 9
 [SYS] fstat(9[/Users/simon/Documents/dev/treaty/tsconfig.json]) = 0
-[SYS] read(9[/Users/simon/Documents/dev/treaty/tsconfig.json], 849) = 833 (0.011ms)
+[SYS] read(9[/Users/simon/Documents/dev/treaty/tsconfig.json], 849) = 833 (0.005ms)
 [SYS] read(9[/Users/simon/Documents/dev/treaty/tsconfig.json], 16) = 0 (0.002ms)
 [fs] close(9[/Users/simon/Documents/dev/treaty/tsconfig.json])
 [SYS] openat(-2, /Users/simon/Documents/dev/treaty/tsconfig.json) = 9
 [SYS] fstat(9[/Users/simon/Documents/dev/treaty/tsconfig.json]) = 0
-[SYS] read(9[/Users/simon/Documents/dev/treaty/tsconfig.json], 849) = 833 (0.006ms)
+[SYS] read(9[/Users/simon/Documents/dev/treaty/tsconfig.json], 849) = 833 (0.007ms)
 [SYS] read(9[/Users/simon/Documents/dev/treaty/tsconfig.json], 16) = 0 (0.002ms)
 [fs] close(9[/Users/simon/Documents/dev/treaty/tsconfig.json])
 [SYS] openat(-2, /Users/simon/Documents/dev/treaty) = 9
@@ -4046,7 +4046,7 @@ Odd numbered Node.js versions will not enter LTS status and should not be used f
 [FilePoll] readable
 [FilePoll] onUpdate kevent (fd: 7) FIFO
 [FIFO] FIFO ready
-[SYS] read(7, 16384) = 33 (0.025ms)
+[SYS] read(7, 16384) = 33 (0.030ms)
 [SYS] write(6, 13) = 13
 [FileSink] Wrote 13 bytes (fd: 6, head: 0, 0/4302)
 [FilePoll] register: readable (7)
@@ -4054,7 +4054,7 @@ Odd numbered Node.js versions will not enter LTS status and should not be used f
 [FilePoll] readable
 [FilePoll] onUpdate kevent (fd: 7) FIFO
 [FIFO] FIFO ready
-[SYS] read(7, 16384) = 33 (0.017ms)
+[SYS] read(7, 16384) = 33 (0.029ms)
 [SYS] write(6, 13) = 13
 [FileSink] Wrote 13 bytes (fd: 6, head: 0, 0/4315)
 [FilePoll] register: readable (7)
@@ -4062,7 +4062,7 @@ Odd numbered Node.js versions will not enter LTS status and should not be used f
 [FilePoll] readable
 [FilePoll] onUpdate kevent (fd: 7) FIFO
 [FIFO] FIFO ready
-[SYS] read(7, 16384) = 33 (0.023ms)
+[SYS] read(7, 16384) = 33 (0.026ms)
 [SYS] write(6, 13) = 13
 [FileSink] Wrote 13 bytes (fd: 6, head: 0, 0/4328)
 [FilePoll] register: readable (7)
@@ -4070,7 +4070,7 @@ Odd numbered Node.js versions will not enter LTS status and should not be used f
 [FilePoll] readable
 [FilePoll] onUpdate kevent (fd: 7) FIFO
 [FIFO] FIFO ready
-[SYS] read(7, 16384) = 33 (0.017ms)
+[SYS] read(7, 16384) = 33 (0.027ms)
 [SYS] write(6, 13) = 13
 [FileSink] Wrote 13 bytes (fd: 6, head: 0, 0/4341)
 [FilePoll] register: readable (7)
@@ -4086,7 +4086,7 @@ Odd numbered Node.js versions will not enter LTS status and should not be used f
 [FilePoll] readable
 [FilePoll] onUpdate kevent (fd: 7) FIFO
 [FIFO] FIFO ready
-[SYS] read(7, 16384) = 33 (0.015ms)
+[SYS] read(7, 16384) = 33 (0.070ms)
 [SYS] write(6, 13) = 13
 [FileSink] Wrote 13 bytes (fd: 6, head: 0, 0/4367)
 [FilePoll] register: readable (7)
@@ -4094,7 +4094,7 @@ Odd numbered Node.js versions will not enter LTS status and should not be used f
 [FilePoll] readable
 [FilePoll] onUpdate kevent (fd: 7) FIFO
 [FIFO] FIFO ready
-[SYS] read(7, 16384) = 33 (0.014ms)
+[SYS] read(7, 16384) = 33 (0.021ms)
 [SYS] write(6, 13) = 13
 [FileSink] Wrote 13 bytes (fd: 6, head: 0, 0/4380)
 [FilePoll] register: readable (7)
@@ -4102,7 +4102,7 @@ Odd numbered Node.js versions will not enter LTS status and should not be used f
 [FilePoll] readable
 [FilePoll] onUpdate kevent (fd: 7) FIFO
 [FIFO] FIFO ready
-[SYS] read(7, 16384) = 33 (0.009ms)
+[SYS] read(7, 16384) = 33 (0.025ms)
 [SYS] write(6, 13) = 13
 [FileSink] Wrote 13 bytes (fd: 6, head: 0, 0/4393)
 [FilePoll] register: readable (7)
@@ -4110,7 +4110,7 @@ Odd numbered Node.js versions will not enter LTS status and should not be used f
 [FilePoll] readable
 [FilePoll] onUpdate kevent (fd: 7) FIFO
 [FIFO] FIFO ready
-[SYS] read(7, 16384) = 33 (0.009ms)
+[SYS] read(7, 16384) = 33 (0.010ms)
 [SYS] write(6, 13) = 13
 [FileSink] Wrote 13 bytes (fd: 6, head: 0, 0/4406)
 [FilePoll] register: readable (7)
@@ -4118,7 +4118,7 @@ Odd numbered Node.js versions will not enter LTS status and should not be used f
 [FilePoll] readable
 [FilePoll] onUpdate kevent (fd: 7) FIFO
 [FIFO] FIFO ready
-[SYS] read(7, 16384) = 33 (0.009ms)
+[SYS] read(7, 16384) = 33 (0.049ms)
 [SYS] write(6, 13) = 13
 [FileSink] Wrote 13 bytes (fd: 6, head: 0, 0/4419)
 [FilePoll] register: readable (7)
@@ -4126,7 +4126,7 @@ Odd numbered Node.js versions will not enter LTS status and should not be used f
 [FilePoll] readable
 [FilePoll] onUpdate kevent (fd: 7) FIFO
 [FIFO] FIFO ready
-[SYS] read(7, 16384) = 33 (0.010ms)
+[SYS] read(7, 16384) = 33 (0.021ms)
 [SYS] write(6, 13) = 13
 [FileSink] Wrote 13 bytes (fd: 6, head: 0, 0/4432)
 [FilePoll] register: readable (7)
@@ -4134,7 +4134,7 @@ Odd numbered Node.js versions will not enter LTS status and should not be used f
 [FilePoll] readable
 [FilePoll] onUpdate kevent (fd: 7) FIFO
 [FIFO] FIFO ready
-[SYS] read(7, 16384) = 33 (0.024ms)
+[SYS] read(7, 16384) = 33 (0.018ms)
 [SYS] write(6, 13) = 13
 [FileSink] Wrote 13 bytes (fd: 6, head: 0, 0/4445)
 [FilePoll] register: readable (7)
@@ -4142,7 +4142,7 @@ Odd numbered Node.js versions will not enter LTS status and should not be used f
 [FilePoll] readable
 [FilePoll] onUpdate kevent (fd: 7) FIFO
 [FIFO] FIFO ready
-[SYS] read(7, 16384) = 33 (0.022ms)
+[SYS] read(7, 16384) = 33 (0.099ms)
 [SYS] write(6, 13) = 13
 [FileSink] Wrote 13 bytes (fd: 6, head: 0, 0/4458)
 [FilePoll] register: readable (7)
@@ -4150,7 +4150,7 @@ Odd numbered Node.js versions will not enter LTS status and should not be used f
 [FilePoll] readable
 [FilePoll] onUpdate kevent (fd: 7) FIFO
 [FIFO] FIFO ready
-[SYS] read(7, 16384) = 33 (0.019ms)
+[SYS] read(7, 16384) = 33 (0.024ms)
 [SYS] write(6, 13) = 13
 [FileSink] Wrote 13 bytes (fd: 6, head: 0, 0/4471)
 [FilePoll] register: readable (7)
@@ -4158,176 +4158,8 @@ Odd numbered Node.js versions will not enter LTS status and should not be used f
 [FilePoll] readable
 [FilePoll] onUpdate kevent (fd: 7) FIFO
 [FIFO] FIFO ready
-[SYS] read(7, 16384) = 33 (0.017ms)
-[SYS] write(6, 13) = 13
-[FileSink] Wrote 13 bytes (fd: 6, head: 0, 0/4484)
-[FilePoll] register: readable (7)
-[bun] poll(7) readable: false (0)
-[FilePoll] readable
-[FilePoll] onUpdate kevent (fd: 7) FIFO
-[FIFO] FIFO ready
-[SYS] read(7, 16384) = 33 (0.027ms)
-[SYS] write(6, 13) = 13
-[FileSink] Wrote 13 bytes (fd: 6, head: 0, 0/4497)
-[FilePoll] register: readable (7)
-[bun] poll(7) readable: false (0)
-[FilePoll] readable
-[FilePoll] onUpdate kevent (fd: 7) FIFO
-[FIFO] FIFO ready
-[SYS] read(7, 16384) = 33 (0.049ms)
-[SYS] write(6, 13) = 13
-[FileSink] Wrote 13 bytes (fd: 6, head: 0, 0/4510)
-[FilePoll] register: readable (7)
-[bun] poll(7) readable: false (0)
-[FilePoll] readable
-[FilePoll] onUpdate kevent (fd: 7) FIFO
-[FIFO] FIFO ready
-[SYS] read(7, 16384) = 33 (0.018ms)
-[SYS] write(6, 13) = 13
-[FileSink] Wrote 13 bytes (fd: 6, head: 0, 0/4523)
-[FilePoll] register: readable (7)
-[bun] poll(7) readable: false (0)
-[FilePoll] readable
-[FilePoll] onUpdate kevent (fd: 7) FIFO
-[FIFO] FIFO ready
-[SYS] read(7, 16384) = 33 (0.022ms)
-[SYS] write(6, 13) = 13
-[FileSink] Wrote 13 bytes (fd: 6, head: 0, 0/4536)
-[FilePoll] register: readable (7)
-[bun] poll(7) readable: false (0)
-[FilePoll] readable
-[FilePoll] onUpdate kevent (fd: 7) FIFO
-[FIFO] FIFO ready
-[SYS] read(7, 16384) = 33 (0.024ms)
-[SYS] write(6, 13) = 13
-[FileSink] Wrote 13 bytes (fd: 6, head: 0, 0/4549)
-[FilePoll] register: readable (7)
-[bun] poll(7) readable: false (0)
-[FilePoll] readable
-[FilePoll] onUpdate kevent (fd: 7) FIFO
-[FIFO] FIFO ready
-[SYS] read(7, 16384) = 33 (0.020ms)
-[SYS] write(6, 13) = 13
-[FileSink] Wrote 13 bytes (fd: 6, head: 0, 0/4562)
-[FilePoll] register: readable (7)
-[bun] poll(7) readable: false (0)
-[FilePoll] readable
-[FilePoll] onUpdate kevent (fd: 7) FIFO
-[FIFO] FIFO ready
-[SYS] read(7, 16384) = 33 (0.013ms)
-[SYS] write(6, 13) = 13
-[FileSink] Wrote 13 bytes (fd: 6, head: 0, 0/4575)
-[FilePoll] register: readable (7)
-[bun] poll(7) readable: false (0)
-[FilePoll] readable
-[FilePoll] onUpdate kevent (fd: 7) FIFO
-[FIFO] FIFO ready
-[SYS] read(7, 16384) = 33 (0.024ms)
-[SYS] write(6, 13) = 13
-[FileSink] Wrote 13 bytes (fd: 6, head: 0, 0/4588)
-[FilePoll] register: readable (7)
-[bun] poll(7) readable: false (0)
-[FilePoll] readable
-[FilePoll] onUpdate kevent (fd: 7) FIFO
-[FIFO] FIFO ready
-[SYS] read(7, 16384) = 33 (0.025ms)
-[SYS] write(6, 13) = 13
-[FileSink] Wrote 13 bytes (fd: 6, head: 0, 0/4601)
-[FilePoll] register: readable (7)
-[bun] poll(7) readable: false (0)
-[FilePoll] readable
-[FilePoll] onUpdate kevent (fd: 7) FIFO
-[FIFO] FIFO ready
-[SYS] read(7, 16384) = 33 (0.026ms)
-[SYS] write(6, 13) = 13
-[FileSink] Wrote 13 bytes (fd: 6, head: 0, 0/4614)
-[FilePoll] register: readable (7)
-[bun] poll(7) readable: false (0)
-[FilePoll] readable
-[FilePoll] onUpdate kevent (fd: 7) FIFO
-[FIFO] FIFO ready
-[SYS] read(7, 16384) = 33 (0.027ms)
-[SYS] write(6, 13) = 13
-[FileSink] Wrote 13 bytes (fd: 6, head: 0, 0/4627)
-[FilePoll] register: readable (7)
-[bun] poll(7) readable: false (0)
-[FilePoll] readable
-[FilePoll] onUpdate kevent (fd: 7) FIFO
-[FIFO] FIFO ready
-[SYS] read(7, 16384) = 33 (0.026ms)
-[SYS] write(6, 13) = 13
-[FileSink] Wrote 13 bytes (fd: 6, head: 0, 0/4640)
-[FilePoll] register: readable (7)
-[bun] poll(7) readable: false (0)
-[FilePoll] readable
-[FilePoll] onUpdate kevent (fd: 7) FIFO
-[FIFO] FIFO ready
-[SYS] read(7, 16384) = 33 (0.010ms)
-[SYS] write(6, 13) = 13
-[FileSink] Wrote 13 bytes (fd: 6, head: 0, 0/4653)
-[FilePoll] register: readable (7)
-[bun] poll(7) readable: false (0)
-[FilePoll] readable
-[FilePoll] onUpdate kevent (fd: 7) FIFO
-[FIFO] FIFO ready
-[SYS] read(7, 16384) = 33 (0.018ms)
-[SYS] write(6, 13) = 13
-[FileSink] Wrote 13 bytes (fd: 6, head: 0, 0/4666)
-[FilePoll] register: readable (7)
-[bun] poll(7) readable: false (0)
-[FilePoll] readable
-[FilePoll] onUpdate kevent (fd: 7) FIFO
-[FIFO] FIFO ready
-[SYS] read(7, 16384) = 33 (0.251ms)
-[SYS] write(6, 13) = 13
-[FileSink] Wrote 13 bytes (fd: 6, head: 0, 0/4679)
-[FilePoll] register: readable (7)
-[bun] poll(7) readable: false (0)
-[FilePoll] readable
-[FilePoll] onUpdate kevent (fd: 7) FIFO
-[FIFO] FIFO ready
-[SYS] read(7, 16384) = 33 (0.022ms)
-[SYS] write(6, 13) = 13
-[FileSink] Wrote 13 bytes (fd: 6, head: 0, 0/4692)
-[FilePoll] register: readable (7)
-[bun] poll(7) readable: false (0)
-[FilePoll] readable
-[FilePoll] onUpdate kevent (fd: 7) FIFO
-[FIFO] FIFO ready
-[SYS] read(7, 16384) = 33 (0.024ms)
-[SYS] write(6, 13) = 13
-[FileSink] Wrote 13 bytes (fd: 6, head: 0, 0/4705)
-[FilePoll] register: readable (7)
-[bun] poll(7) readable: false (0)
-[FilePoll] readable
-[FilePoll] onUpdate kevent (fd: 7) FIFO
-[FIFO] FIFO ready
 [SYS] read(7, 16384) = 33 (0.011ms)
 [SYS] write(6, 13) = 13
-[FileSink] Wrote 13 bytes (fd: 6, head: 0, 0/4718)
-[FilePoll] register: readable (7)
-[bun] poll(7) readable: false (0)
-[FilePoll] readable
-[FilePoll] onUpdate kevent (fd: 7) FIFO
-[FIFO] FIFO ready
-[SYS] read(7, 16384) = 33 (0.031ms)
-[SYS] write(6, 13) = 13
-[FileSink] Wrote 13 bytes (fd: 6, head: 0, 0/4731)
-[FilePoll] register: readable (7)
-[bun] poll(7) readable: false (0)
-[FilePoll] readable
-[FilePoll] onUpdate kevent (fd: 7) FIFO
-[FIFO] FIFO ready
-[SYS] read(7, 16384) = 33 (0.013ms)
-[SYS] write(6, 13) = 13
-[FileSink] Wrote 13 bytes (fd: 6, head: 0, 0/4744)
-[FilePoll] register: readable (7)
-[bun] poll(7) readable: false (0)
-[FilePoll] readable
-[FilePoll] onUpdate kevent (fd: 7) FIFO
-[FIFO] FIFO ready
-[SYS] read(7, 16384) = 33 (0.010ms)
-[SYS] write(6, 13) = 13
-[FileSink] Wrote 13 bytes (fd: 6, head: 0, 0/4757)
+[FileSink] Wrote 13 bytes (fd: 6, head: 0, 0/4484)
 [FilePoll] register: readable (7)
 [bun] poll(7) readable: false (0)
