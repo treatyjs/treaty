@@ -2,8 +2,8 @@ import { JsonPipe } from '@angular/common';
 import {
   ChangeDetectionStrategy,
   Component,
-  Input,
   inject,
+  input,
 } from '@angular/core';
 import { FormBuilder, ReactiveFormsModule, Validators } from '@angular/forms';
 import { ActivatedRouteSnapshot } from '@angular/router';
@@ -52,10 +52,10 @@ export const resolvePost = {
 })
 export default class PostComponent {
   private api = inject(ApiService);
-  // @Input() post: any;
-  // post = input.required();
 
-  @Input('post') post: any;
+  post = input.required();
+  // @Input('post') post: any;
+
   // id = input.required<string>();
 
   title = 'treaty';
