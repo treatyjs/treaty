@@ -1,4 +1,3 @@
-import { input } from '@angular/core';
 import { ComponentFixture, TestBed, getTestBed } from '@angular/core/testing';
 import { beforeEach, describe, expect, test } from 'bun:test';
 import PostComponent from './post.component';
@@ -16,7 +15,7 @@ describe('PostComponent', () => {
 
     fixture = TestBed.createComponent(PostComponent);
     component = fixture.componentInstance;
-    component.id = input('test');
+    // component.post = input('test');
 
     // Could use some improved mocking of treaty here
     (component as any).api = {
@@ -28,6 +27,8 @@ describe('PostComponent', () => {
         },
       },
     };
+
+    // component.post = input('test');
 
     await fixture.whenStable();
   });

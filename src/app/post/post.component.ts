@@ -2,14 +2,26 @@ import { JsonPipe } from '@angular/common';
 import {
   ChangeDetectionStrategy,
   Component,
+  Input,
   inject,
-  input,
 } from '@angular/core';
 import { FormBuilder, ReactiveFormsModule, Validators } from '@angular/forms';
-import { computedAsync } from 'ngxtension/computed-async';
+import { ActivatedRouteSnapshot } from '@angular/router';
 import { ApiService } from '../api.service';
 
 const fb = new FormBuilder();
+
+export const resolvePost = {
+  post: async (route: ActivatedRouteSnapshot) => {
+    const res = await inject(ApiService).client.id[route.params['id']].get();
+
+    console.log(' ');
+    console.log('Post resolver', res.data);
+    console.log(' ');
+
+    return res.data;
+  },
+};
 
 @Component({
   selector: 'app-post',
@@ -17,13 +29,18 @@ const fb = new FormBuilder();
   imports: [JsonPipe, ReactiveFormsModule],
   template: `
     <h1>Post</h1>
-    @if (post()) {
+    @if (post !== null) {
+    {{ post | json }}
+    } @else {
+    <p>Loading....</p>
+    }
+    <!-- @if (post()) {
     <pre>{{ post() | json }}</pre>
 
     <p>{{ post()?.data }}</p>
     } @else {
     <p>Loading....</p>
-    }
+    } -->
 
     <form [formGroup]="form" (submit)="submit()">
       <input type="text" formControlName="strField" />
@@ -35,10 +52,13 @@ const fb = new FormBuilder();
 })
 export default class PostComponent {
   private api = inject(ApiService);
-  id = input.required<string>();
+  // @Input() post: any;
+  // post = input.required();
+
+  @Input('post') post: any;
+  // id = input.required<string>();
 
   title = 'treaty';
-  post = computedAsync(() => this.api.client.id[this.id()].get());
 
   form = fb.group({
     strField: fb.control('', Validators.required),

@@ -14,16 +14,13 @@ await db.connect('memory');
 await db.use({ ns: 'test', db: 'test' });
 
 const port = process.env['PORT'] || 4201;
-const serverDistFolder = import.meta.url.split(':')[1];
+const serverDistFolder = import.meta.dirname;
 
-const browserDistFolder = join(serverDistFolder, '../dist/treaty/browser');
-const indexHtml = join(
-  serverDistFolder,
-  '../dist/treaty/browser/',
-  'index.html'
-);
-
-const commonEngine = new CommonEngine();
+const browserDistFolder = join(serverDistFolder, 'dist/treaty/browser');
+const indexHtml = join(serverDistFolder, 'dist/treaty/browser/index.html');
+const commonEngine = new CommonEngine({
+  enablePerformanceProfiler: true,
+});
 
 const app = new Elysia()
   .derive(({ request: { url } }) => {
@@ -77,13 +74,17 @@ const app = new Elysia()
     }
 
     try {
+      console.log(`${protocol}://${headers['host']}${originalUrl}`);
+
       const _html = await commonEngine.render({
         bootstrap,
         documentFilePath: indexHtml,
         url: `${protocol}://${headers['host']}${originalUrl}`,
         publicPath: browserDistFolder,
-        providers: [{ provide: APP_BASE_HREF, useValue: baseUrl }],
+        providers: [{ provide: APP_BASE_HREF, useValue: '' }],
       });
+
+      console.log(_html);
 
       await db.create(`url:\`${originalUrl}\``, {
         content: _html,
@@ -95,6 +96,8 @@ const app = new Elysia()
         },
       });
     } catch (error) {
+      console.log(error);
+
       return 'Missing page';
     }
   })

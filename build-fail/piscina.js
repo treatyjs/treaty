@@ -702,7 +702,7 @@ class ThreadPool {
       (err, result) => {
         this.completed++;
         if (taskInfo.started) {
-          this.runTime.record(0); //toHistogramIntegerNano(perf_hooks_1.performance.now() - taskInfo.started));
+          // this.runTime.record(0); //toHistogramIntegerNano(perf_hooks_1.performance.now() - taskInfo.started));
         }
         if (err !== null) {
           reject(err);

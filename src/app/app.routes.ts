@@ -1,4 +1,5 @@
 import { Routes } from '@angular/router';
+import { resolvePost } from './post/post.component';
 
 export const routes: Routes = [
   {
@@ -9,5 +10,8 @@ export const routes: Routes = [
   {
     path: 'post/:id',
     loadComponent: () => import('./post/post.component'),
+    resolve: {
+      ...resolvePost,
+    },
   },
 ];
