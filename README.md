@@ -2,10 +2,17 @@
 
 Is Angular in perfect harmony in the Bun runtime using Elysia.js and Surrealdb
 
-- Angular v17.1
+- Angular v17.2.0-rc.1
 - Bun 1.0.26
-- Elysia 0.8
 - Surrealdb.node 0.3
+- Elysia 0.8
+
+## Extra features
+
+- Custom elysia (eden/treaty) that uses httpClient under the hood
+- It's Zoneless together with SSR
+- Server running with bun
+- Tests running with bun
 
 ## Getting started
 
@@ -17,5 +24,9 @@ Is Angular in perfect harmony in the Bun runtime using Elysia.js and Surrealdb
 
 - `bun run watch` - Known bottleneck it takes roughly 1s to build per change
 - `bun run --watch server.ts`
+
+## Unit testing
+
+- `bun test`
 
 ### This is still very much POC dont use in production
