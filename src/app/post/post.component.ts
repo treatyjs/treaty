@@ -6,20 +6,20 @@ import {
   input} from '@angular/core';
 import { FormBuilder, ReactiveFormsModule, Validators } from '@angular/forms';
 import { HttpClient } from '@angular/common/http';
-import { map } from 'rxjs';
 import { ActivatedRouteSnapshot } from '@angular/router';
+import { ApiService } from '../api.service';
+import { map } from 'rxjs';
 
 const fb = new FormBuilder();
 export const resolvePost = {
   post: (route: ActivatedRouteSnapshot) => {
-    
-    const res =  inject(HttpClient).get<{data: string}>('/api/id/' + route.params['id']).pipe(map(res => {
+    const res = inject(ApiService).client.id[route.params['id']].get({}).pipe(map(test=> {
       console.log(' ');
-      console.log('Post resolver', res.data);
+      console.log('Post resolver', test);
       console.log(' ');
-        return res.data;
-      }))
-    
+  
+      return test.data;
+    }))
 
     return res;
   },
