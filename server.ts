@@ -1,4 +1,6 @@
 import '@angular/compiler';
+import './src/mock-zone'
+
 
 import { Elysia, t } from 'elysia';
 import { join } from 'path';
@@ -34,7 +36,7 @@ const app = new Elysia()
   })
   .group('/api', (api) => {
     return api
-      .get('/id/:id', ({ params: { id } }) => `Post with id: ${id}`)
+      .get('/id/:id', ({ params: { id } }) => ({ data: `Post with id: ${id}` }))
       .get('/example', () => `just an example`)
       .post('/form', ({ body }) => body, {
         body: t.Object({

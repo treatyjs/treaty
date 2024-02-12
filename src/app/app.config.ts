@@ -9,11 +9,12 @@ import {
   withHttpTransferCacheOptions,
 } from '@angular/platform-browser';
 import { routes } from './app.routes';
+import { provideHttpClient, withFetch } from '@angular/common/http';
 
 export const appConfig: ApplicationConfig = {
   providers: [
     provideZonelessChangeDetection(),
-    // provideHttpClient(withFetch()),
+    provideHttpClient(withFetch()),
     provideRouter(routes, withComponentInputBinding()),
     provideClientHydration(
       withHttpTransferCacheOptions({
@@ -22,3 +23,4 @@ export const appConfig: ApplicationConfig = {
     ),
   ],
 };
+

@@ -3,23 +3,25 @@ import {
   ChangeDetectionStrategy,
   Component,
   inject,
-  input,
-} from '@angular/core';
+  input} from '@angular/core';
 import { FormBuilder, ReactiveFormsModule, Validators } from '@angular/forms';
+import { HttpClient } from '@angular/common/http';
+import { map } from 'rxjs';
 import { ActivatedRouteSnapshot } from '@angular/router';
-import { ApiService } from '../api.service';
 
 const fb = new FormBuilder();
-
 export const resolvePost = {
-  post: async (route: ActivatedRouteSnapshot) => {
-    const res = await inject(ApiService).client.id[route.params['id']].get();
+  post: (route: ActivatedRouteSnapshot) => {
+    
+    const res =  inject(HttpClient).get<{data: string}>('/api/id/' + route.params['id']).pipe(map(res => {
+      console.log(' ');
+      console.log('Post resolver', res.data);
+      console.log(' ');
+        return res.data;
+      }))
+    
 
-    console.log(' ');
-    console.log('Post resolver', res.data);
-    console.log(' ');
-
-    return res.data;
+    return res;
   },
 };
 
@@ -29,18 +31,12 @@ export const resolvePost = {
   imports: [JsonPipe, ReactiveFormsModule],
   template: `
     <h1>Post</h1>
+    {{ post() }}
     @if (post !== null) {
-    {{ post | json }}
+      {{ post() }}
     } @else {
-    <p>Loading....</p>
+      <p>Loading....</p>
     }
-    <!-- @if (post()) {
-    <pre>{{ post() | json }}</pre>
-
-    <p>{{ post()?.data }}</p>
-    } @else {
-    <p>Loading....</p>
-    } -->
 
     <form [formGroup]="form" (submit)="submit()">
       <input type="text" formControlName="strField" />
@@ -51,12 +47,10 @@ export const resolvePost = {
   changeDetection: ChangeDetectionStrategy.OnPush,
 })
 export default class PostComponent {
-  private api = inject(ApiService);
+  private api = inject(HttpClient)
 
-  post = input.required();
-  // @Input('post') post: any;
-
-  // id = input.required<string>();
+  post = input();
+  
 
   title = 'treaty';
 
@@ -68,13 +62,11 @@ export default class PostComponent {
   async submit() {
     if (this.form.invalid) return;
 
-    const res = await this.api.client.form.post(
+    const res = this.api.post('/api/form',
       this.form.value as {
         strField: string;
         numbField: number;
       }
-    );
-
-    console.log('res: ', res);
+    ).subscribe(res => console.log('res: ', res));
   }
 }
