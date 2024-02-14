@@ -1,6 +1,6 @@
 import '@angular/compiler';
-import './src/mock-zone'
-
+import './treaty-utilities/mock-create-histogram';
+import './treaty-utilities/mock-zone';
 
 import { Elysia, t } from 'elysia';
 import { join } from 'path';

@@ -1,2 +1,5 @@
+preload = ["./treaty-utilities/mock-create-histogram.ts"]
+
+
 [test]
-preload = ["./src/setup-tests.ts"]
+preload = ["./treaty-utilities/setup-tests.ts"]
