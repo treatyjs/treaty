@@ -2,7 +2,7 @@
 
 Is Angular in perfect harmony in the Bun runtime using Elysia.js and Surrealdb
 
-- Angular v17.2.0-rc.1
+- Angular v17.2.0
 - Bun 1.0.26
 - Surrealdb.node 0.3
 - Elysia 0.8
