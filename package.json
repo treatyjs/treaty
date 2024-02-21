@@ -6,7 +6,8 @@
     "start": "bunx --bun vite build --watch & bun run --watch server.ts",
     "build": "ng build",
     "watch": "ng build --watch --configuration development",
-    "dev": "bunx --bun vite"
+    "dev": "bunx --bun vite dev",
+    "viteBuild": "bunx --bun vite build"
   },
   "dependencies": {
     "@angular/animations": "^17.2.1",
