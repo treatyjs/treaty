@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::any::Any;
 use std::fmt::Debug;
+use std::rc::Rc;
 use swc_core::ecma::ast::{ExprOrSpread};
 use swc_ecma_ast::Class;
 use crate::classes::{
@@ -11,15 +12,85 @@ use crate::classes::{
     pipe::PipeHandler
 };
 
+
+pub trait Type<T>: Any {}
+
+pub enum SchemaMetadata {
+    NoErrorsSchema,
+    CustomElementsSchema,
+}
+
+pub enum Provider {
+    Value { provide: String, useValue: Rc<dyn Any> },
+    Class { provide: String, useClass: Rc<dyn Any> },
+    Factory { provide: String, useFactory: Rc<dyn Any>, deps: Vec<Rc<dyn Any>> },
+    Existing { provide: String, useExisting: String },
+}
+
+impl Provider {
+    // Utility methods to create different types of providers
+    pub fn value(provide: String, use_value: Rc<dyn Any>) -> Self {
+        Provider::Value { provide, useValue: use_value }
+    }
+
+    pub fn class(provide: String, use_class: Rc<dyn Any>) -> Self {
+        Provider::Class { provide, useClass: use_class }
+    }
+
+    pub fn factory(provide: String, use_factory: Rc<dyn Any>, deps: Vec<Rc<dyn Any>>) -> Self {
+        Provider::Factory { provide, useFactory: use_factory, deps }
+    }
+
+    pub fn existing(provide: String, use_existing: String) -> Self {
+        Provider::Existing { provide, useExisting: use_existing }
+    }
+}
+pub enum Declaration {
+    Component(Rc<dyn Any>),
+    Directive(Rc<dyn Any>),
+    Pipe(Rc<dyn Any>),
+}
+
+pub enum Import {
+    Module(Rc<NgModuleMeta>),
+}
+
+pub enum Export {
+    Component(Rc<dyn Any>),
+    Directive(Rc<dyn Any>),
+    Pipe(Rc<dyn Any>),
+    Module(Rc<NgModuleMeta>),
+}
+
 pub enum ChangeDetectionStrategy {
     OnPush,
     Default,
+}
+
+impl ChangeDetectionStrategy {
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "OnPush" => Some(ChangeDetectionStrategy::OnPush),
+            "Default" => Some(ChangeDetectionStrategy::Default),
+            _ => Some(ChangeDetectionStrategy::Default),
+        }
+    }
 }
 
 pub enum ViewEncapsulation {
     Emulated,
     None,
     ShadowDom,
+}
+impl ViewEncapsulation {
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "Emulated" => Some(Self::Emulated),
+            "None" => Some(Self::None),
+            "ShadowDom" => Some(Self::ShadowDom),
+            _ => None,
+        }
+    }
 }
 
 
@@ -38,7 +109,7 @@ pub enum NgTraitMeta {
     Component(ComponentMeta),
     Injectable(InjectableMeta),
     Pipe(PipeMeta),
-    NgModule(ModuleMeta),
+    NgModule(NgModuleMeta),
 }
 
 pub struct PipeMeta {
@@ -103,16 +174,21 @@ enum HostDirective {
         outputs: Option<Vec<String>>,
     },
 }
-pub struct ModuleMeta {
-    pub imports: Vec<Box<dyn Any>>,
-    pub declare: Vec<Box<dyn Any>>,
+pub struct NgModuleMeta {
+    pub bootstrap: Vec<Rc<dyn Type<dyn Any>>>,
+    pub declarations: Vec<Declaration>,
+    pub imports: Vec<Import>,
+    pub exports: Vec<Export>,
+    pub providers: Vec<Provider>,
+    pub id: Option<String>,
+    pub schemas: Vec<SchemaMetadata>,
 }
 
 pub struct DirectiveMeta {
     pub selector: String,
     pub inputs: HashMap<String, DirectiveInputValue>,
     pub outputs: Vec<String>,
-    pub providers: Vec<Box<dyn Any>>,
+    pub providers: Vec<Provider>,
     pub export_as: Option<String>,
     pub queries: HashMap<String, Box<dyn Any>>,
     pub host: HashMap<String, String>,
