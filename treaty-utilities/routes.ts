@@ -4,10 +4,7 @@ import { AngularRoutingPlugin, AngularRouting, routes } from '../tools/vite/rout
 export const AngularRoutesRunTime: BunPlugin = {
   name: "Angular Bun routing loader",
   setup(build) {
-    console.log('JORDAN')
-  
-      build.module("virtual:angular-routing:bun", () => {
-        console.log('loading')
+    build.module("virtual:angular-routing:bun", () => {
         const router = new Bun.FileSystemRouter({
             style: "nextjs",
             dir: "src/app/pages",
@@ -16,8 +13,6 @@ export const AngularRoutesRunTime: BunPlugin = {
           const routingMapper: RoutingMapper = {imports: [], routes:[]} 
 
           Object.keys(router.routes).forEach((key, index) => {
-            console.log('index', index)
-            console.log('__dirname', __dirname)
             routingMapper.imports.push(`import {RouterMeta as r${index}} from '${router.routes[key]}'`);
             routingMapper.routes.push(`{
                 path: '${key.replace(/\[(.*?)\]/g, ':$1').substring(1)}',
@@ -52,7 +47,6 @@ export const AngularRoutesBuild:(routingInfo?: AngularRouting) => BunPlugin = (r
     const routePath = routingInfo.filePath ?? 'src/app/app.routes.ts'
     const pagesPath = routingInfo.pagesPath ?? 'src/app/pages';
     build.onLoad({filter: new RegExp(routePath, 'i') }, (args) => {
-      console.log('JORDAN')
       return {
         contents: routes({
           ...routingInfo,

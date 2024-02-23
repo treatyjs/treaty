@@ -6,5 +6,5 @@ import { edenClient } from '../libs/edenclient';
   providedIn: 'root',
 })
 export class ApiService {
-  client = edenClient<App>('http://localhost:4201').api;
+  client = edenClient<App>('http://localhost:5555').api;
 }

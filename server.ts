@@ -1,9 +1,9 @@
 import '@angular/compiler';
-import './treaty-utilities/mock-create-histogram';
+// import './treaty-utilities/mock-create-histogram';
 import './treaty-utilities/mock-zone';
 
 import { Elysia, t } from 'elysia';
-import { join } from 'path';
+import { IndexHtmlTransform } from 'vite';
 
 import { Surreal } from 'surrealdb.node';
 
@@ -15,11 +15,8 @@ const db = new Surreal();
 await db.connect('memory');
 await db.use({ ns: 'test', db: 'test' });
 
-const port = process.env['PORT'] || 4201;
-const serverDistFolder = import.meta.dirname;
+const port = process.env['PORT'] || 5555;
 
-const browserDistFolder = join(serverDistFolder, 'dist');
-const indexHtml = join(serverDistFolder, 'dist/index.html');
 const commonEngine = new CommonEngine({
   enablePerformanceProfiler: true,
 });
@@ -46,7 +43,7 @@ const app = new Elysia()
       });
   })
   .get('*.*', async ({ originalUrl }) => {
-    const file = Bun.file(`${browserDistFolder}${originalUrl}`);
+    const file = Bun.file(`./src/${originalUrl}`);
 
     return new Response(Buffer.from(await file.arrayBuffer()), {
       headers: {
@@ -56,7 +53,7 @@ const app = new Elysia()
   })
   .get('*', async ({ originalUrl, baseUrl, protocol, headers }) => {
     if (originalUrl.includes('.')) {
-      const file = Bun.file(`${browserDistFolder}${originalUrl}`);
+      const file = Bun.file(`./src/${originalUrl}`);
 
       return new Response(Buffer.from(await file.arrayBuffer()), {
         headers: {
@@ -77,12 +74,12 @@ const app = new Elysia()
 
     try {
       console.log(`${protocol}://${headers['host']}${originalUrl}`);
-
+      let template = await Bun.file('./' + 'index.html').text()
       const _html = await commonEngine.render({
         bootstrap,
-        documentFilePath: indexHtml,
+        document: template,
         url: `${protocol}://${headers['host']}${originalUrl}`,
-        publicPath: browserDistFolder,
+        publicPath: './src',
         providers: [{ provide: APP_BASE_HREF, useValue: '' }],
       });
 
@@ -100,13 +97,13 @@ const app = new Elysia()
     } catch (error) {
       console.log(error);
 
-      return 'Missing page';
+      return new Response('Missing page', {
+        headers: {
+          'Content-Type': 'text/html',
+        },
+      });
     }
   })
-  .listen(port);
-
-console.log(
-  `🦊 Elysia is running at ${app.server?.hostname}:${app.server?.port}`
-);
 
 export type App = typeof app;
+export default app;

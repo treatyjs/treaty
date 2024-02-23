@@ -85,7 +85,6 @@ const createProxy = (
             };
 
             const errorHandler = catchError((error: HttpErrorResponse) => {
-                console.log('JORDAN-----' + error.message)
                 return of(new EdenFetchError(error.status, error.message))
             })
 
