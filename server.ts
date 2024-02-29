@@ -53,7 +53,7 @@ const app = new Elysia()
   })
   .get('*', async ({ originalUrl, baseUrl, protocol, headers }) => {
     if (originalUrl.includes('.')) {
-      const file = Bun.file(`./src/${originalUrl}`);
+      const file = Bun.file(`.78src/${originalUrl}`);
 
       return new Response(Buffer.from(await file.arrayBuffer()), {
         headers: {
