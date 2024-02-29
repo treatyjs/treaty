@@ -1,0 +1,9 @@
+{
+  "name": "@treaty/httpclient",
+  "version": "0.0.3",
+	"license": "IDGAF-1.0",
+	"description": "Alysia eden HTTP client for Angular",
+  "exports": {
+    ".": "./mod.ts"
+  }
+}

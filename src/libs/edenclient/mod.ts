@@ -1,14 +1,31 @@
-import type { Elysia } from 'elysia'
-import { EdenClient } from './types'
-import { catchError, config, of } from 'rxjs'
-import { EdenFetchError } from './error'
-import { HttpClient, HttpErrorResponse, HttpHeaders, HttpParams } from '@angular/common/http'
-import { assertInInjectionContext, inject } from '@angular/core'
-import { composePath } from './utils/other'
+/**
+ * @module
+ *
+ * This module implements a client for the Elysia framework, providing utilities for creating observable-based API clients with TypeScript. It includes type-safe utilities for handling files, making HTTP requests, and processing responses. It leverages RxJS for observables and integrates with Angular's HttpClient for HTTP requests. Key features include type-safe route definition, detailed error handling, and support for file uploads.
+ *
+ * Example usage:
+ * ```ts
+ * import { edenClient } from "@treaty/httpclient@0.0";
+ * const client = edenClient<MyAppSchema>('http://api.example.com');
+ * ```
+ */
+
+import type { Elysia } from 'npm:elysia@^0.8.17'
+import { EdenClient } from './types.ts'
+import { catchError, of } from 'npm:rxjs@~7.8.0'
+import { EdenFetchError } from './error.ts'
+import { HttpClient, HttpErrorResponse, HttpHeaders } from 'npm:@angular/common@^17.2.1/http'
+import { assertInInjectionContext, inject } from 'npm:@angular/core@^17.2.1'
+import { composePath } from './utils/other.ts'
 
 // @ts-ignore
 const isServer = typeof FileList === 'undefined'
 
+/**
+ * Determines if the provided value is a File or FileList, facilitating the handling of file inputs.
+ * @param v The value to check.
+ * @returns A boolean indicating whether the value is a File or FileList.
+ */
 const isFile = (v: any) => {
     // @ts-ignore
     if (isServer) {
@@ -19,7 +36,12 @@ const isFile = (v: any) => {
     }
 }
 
-// FormData is 1 level deep
+/**
+ * Checks if the given object contains a File or FileList, aiding in detecting file inputs within objects.
+ * FormData is 1 level deep
+ * @param obj The object to check.
+ * @returns A boolean indicating if the object contains a File or FileList.
+ */
 const hasFile = (obj: Record<string, any>) => {
     if (!obj) return false
 
@@ -35,6 +57,12 @@ const hasFile = (obj: Record<string, any>) => {
     return false
 }
 
+
+/**
+ * Creates a new File instance from a given File, useful in environments where FileList is not defined.
+ * @param v The File to convert.
+ * @returns A Promise resolving to a File.
+ */
 // @ts-ignore
 const createNewFile = (v: File) =>
     isServer
@@ -55,6 +83,13 @@ const createNewFile = (v: File) =>
         })
 
 
+/**
+* Creates a proxy for making HTTP requests to a specified domain, utilizing Angular's HttpClient.
+* @param domain The base domain for the API.
+* @param path Initial path segment for the API endpoint.
+* @param httpClient An instance of Angular's HttpClient.
+* @returns A proxy object for making API requests.
+*/
 const createProxy = (
     domain: string,
     path = '',
@@ -104,6 +139,11 @@ const createProxy = (
     });
 };
 
+/**
+ * Initializes an EdenClient for interacting with an Elysia-based API.
+ * @param domain The base URL of the API.
+ * @returns An instance of EdenClient configured for the specified Elysia application.
+ */
 export const edenClient = <App extends Elysia<any, any, any, any, any, any>>(
     domain: string,
 ): EdenClient.Create<App> => {
