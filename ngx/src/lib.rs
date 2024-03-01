@@ -1,9 +1,8 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
-use treaty_authoring::{treaty_authoring, Config}
 use swc_common::{SourceMapper, Spanned};
 use swc_core::{
     common::FileName,
-    ecma::{ast::Program, visit::VisitMutWith},
+    ecma::ast::Program,
     plugin::{
         metadata::TransformPluginMetadataContextKind,
         plugin_transform,
@@ -12,13 +11,8 @@ use swc_core::{
 };
 
 #[plugin_transform]
-fn swc_treaty_authoring(program: Program, data: TransformPluginProgramMetadata) -> Program {
-    let config = serde_json::from_str::<Config>(
-        &data
-            .get_transform_plugin_config()
-            .expect("failed to get plugin config for Treaty Authoring"),
-    )
-    .expect("invalid config for Treaty Authoring");
+fn treaty_authoring(program: Program, data: TransformPluginProgramMetadata) -> Program {
+
 
     let file_name = match data.get_context(&TransformPluginMetadataContextKind::Filename) {
         Some(s) => FileName::Real(s.into()),
@@ -29,7 +23,7 @@ fn swc_treaty_authoring(program: Program, data: TransformPluginProgramMetadata) 
     let hash = pos.file.src_hash;
 
     let mut pass =
-        treaty_authoring(file_name, hash, config, PluginCommentsProxy);
+        treaty_authoring::treaty_authoring(file_name, hash, PluginCommentsProxy);
 
     // program.visit_mut_with(&mut pass);
 
