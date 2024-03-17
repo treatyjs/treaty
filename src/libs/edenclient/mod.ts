@@ -10,13 +10,13 @@
  * ```
  */
 
-import type { Elysia } from 'npm:elysia@^0.8.17'
-import { EdenClient } from './types.ts'
-import { catchError, of } from 'npm:rxjs@~7.8.0'
-import { EdenFetchError } from './error.ts'
-import { HttpClient, HttpErrorResponse, HttpHeaders } from 'npm:@angular/common@^17.2.1/http'
-import { assertInInjectionContext, inject } from 'npm:@angular/core@^17.2.1'
-import { composePath } from './utils/other.ts'
+import type { Elysia } from 'elysia'
+import { EdenClient } from './types'
+import { catchError, of } from 'rxjs'
+import { EdenFetchError } from './error'
+import { HttpClient, HttpErrorResponse, HttpHeaders } from '@angular/common/http'
+import { assertInInjectionContext, inject } from '@angular/core'
+import { composePath } from './utils/other'
 
 // @ts-ignore
 const isServer = typeof FileList === 'undefined'

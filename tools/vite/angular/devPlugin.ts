@@ -7,7 +7,7 @@ const DevelopmentPlugin: Plugin = {
   name: 'vite-plugin-angular-dev',
   enforce: 'pre',
   apply(_, env) {
-    return env.command === 'serve';
+    return env.command === 'build';
   },
   config() {
     return {

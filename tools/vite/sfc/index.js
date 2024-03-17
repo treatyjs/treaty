@@ -1,7 +1,7 @@
 import { parseAsync } from 'oxc-parser';
 
 
-const scf = ` 
+const scf = `
 ---
 import MyComponent from "../components/MyComponent.astro"
 
@@ -86,7 +86,7 @@ function processFunctionBody(body, propertyNames, methodNames) {
     } else if (statement.type === 'VariableDeclaration') {
       const varNames = statement.declarations.map(d => d.id.kind.name);
       propertyNames = [...propertyNames].filter(name => !varNames.includes(name));
-    } 
+    }
     processedBody += adjustIdentifierReferences(statement, propertyNames, methodNames) + '\n';
   });
 
@@ -145,6 +145,7 @@ async function parseAstroSFCToAngular(content) {
 
   const scriptSection = scriptMatch ? scriptMatch[1].trim() : '';
   const stylesSection = styleMatch ? styleMatch[1].trim() : '';
+
 
   const AST = await parseAsync(scriptSection, { sourceType: 'unambiguous' });
 
