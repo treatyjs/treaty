@@ -1,0 +1,17 @@
+{
+  "name": "@treaty/authoring-node-linux-arm-gnueabihf",
+  "version": "0.0.0",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm"
+  ],
+  "main": "authoring_node.linux-arm-gnueabihf.node",
+  "files": [
+    "authoring_node.linux-arm-gnueabihf.node"
+  ],
+  "engines": {
+    "node": ">= 10"
+  }
+}

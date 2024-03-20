@@ -1,5 +1,6 @@
-preload = ["./treaty-utilities/mock-create-histogram.ts"]
+logLevel = "debug"
 
+preload = ["./treaty-utilities/mock-create-histogram.ts", "./treaty-utilities/routes.ts"]
 
 [test]
 preload = ["./treaty-utilities/setup-tests.ts"]

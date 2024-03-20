@@ -1,0 +1,17 @@
+{
+  "name": "@treaty/authoring-node-win32-ia32-msvc",
+  "version": "0.0.0",
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "ia32"
+  ],
+  "main": "authoring_node.win32-ia32-msvc.node",
+  "files": [
+    "authoring_node.win32-ia32-msvc.node"
+  ],
+  "engines": {
+    "node": ">= 10"
+  }
+}

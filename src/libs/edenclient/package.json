@@ -1,0 +1,17 @@
+{
+  "name": "@treaty/httpclient",
+  "version": "0.0.3",
+  "description": "Alysia eden HTTP client for Angular",
+  "main": "./mod.ts",
+  "exports": "./mod.ts",
+  "author": "Jordan Hall",
+  "license": "IDGAF-1.0",
+  "dependencies": {
+    "elysia": "^0.8.17",
+    "rxjs": "~7.8.0"
+  },
+  "peerDependencies": {
+    "@angular/common": "^17.2.1",
+    "@angular/core": "^17.2.1"
+  }
+}

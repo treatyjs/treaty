@@ -1,0 +1,45 @@
+{
+  "name": "authoring_node",
+  "$schema": "../../../node_modules/nx/schemas/project-schema.json",
+  "projectType": "library",
+  "sourceRoot": "libs/authoring/node/src",
+  "targets": {
+    "build": {
+      "executor": "@monodon/rust:napi",
+      "options": {
+        "dist": "libs/authoring/node",
+        "jsFile": "index.js"
+      },
+      "configurations": {
+        "production": {
+          "dist": "dist/authoring_node",
+          "release": true
+        }
+      }
+    },
+    "test": {
+      "executor": "@monodon/rust:test",
+      "outputs": [
+        "{options.target-dir}"
+      ],
+      "options": {
+        "target-dir": "dist/target/authoring_node"
+      },
+      "configurations": {
+        "production": {
+          "release": true
+        }
+      }
+    },
+    "lint": {
+      "executor": "@monodon/rust:lint",
+      "outputs": [
+        "{options.target-dir}"
+      ],
+      "options": {
+        "target-dir": "dist/target/authoring_node"
+      }
+    }
+  },
+  "tags": []
+}

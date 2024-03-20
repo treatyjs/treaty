@@ -1,0 +1,17 @@
+{
+  "name": "@treaty/authoring-node-darwin-arm64",
+  "version": "0.0.0",
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "main": "authoring_node.darwin-arm64.node",
+  "files": [
+    "authoring_node.darwin-arm64.node"
+  ],
+  "engines": {
+    "node": ">= 10"
+  }
+}

@@ -1,12 +1,14 @@
 const originalPerfHooks = require('perf_hooks');
-
 // Your custom implementation of createHistogram
 function _customCreateHistogram(options: any) {
   // Implement your polyfill logic here
   return {
     // Mock or polyfill methods as needed
     record: (value: any) => console.log(`Recorded value: ${value}`),
-    // Other necessary methods...
+    recordDelta: () => {},
+    add: (other: any) => { console.log('add:', other)},
+    reset: () => {},
+    percentile: (percentile: number) => { console.log('percentile:', percentile)}
   };
 }
 
