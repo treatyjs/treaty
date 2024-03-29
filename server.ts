@@ -1,25 +1,22 @@
 import '@angular/compiler';
-import './treaty-utilities/mock-create-histogram';
+// import './treaty-utilities/mock-create-histogram';
 import './treaty-utilities/mock-zone';
 
 import { Elysia, t } from 'elysia';
-import { join } from 'path';
+import { IndexHtmlTransform } from 'vite';
 
-import { Surreal } from 'surrealdb.node';
+// import { Surreal } from 'surrealdb.node';
 
 import { APP_BASE_HREF } from '@angular/common';
 import { CommonEngine } from '@angular/ssr';
 import bootstrap from './src/main.server';
 
-const db = new Surreal();
-await db.connect('memory');
-await db.use({ ns: 'test', db: 'test' });
+// const db = new Surreal();
+// await db.connect('memory');
+// await db.use({ ns: 'test', db: 'test' });
 
-const port = process.env['PORT'] || 4201;
-const serverDistFolder = import.meta.dirname;
+// const port = process.env['PORT'] || 5555;
 
-const browserDistFolder = join(serverDistFolder, 'dist/treaty/browser');
-const indexHtml = join(serverDistFolder, 'dist/treaty/browser/index.html');
 const commonEngine = new CommonEngine({
   enablePerformanceProfiler: true,
 });
@@ -46,7 +43,7 @@ const app = new Elysia()
       });
   })
   .get('*.*', async ({ originalUrl }) => {
-    const file = Bun.file(`${browserDistFolder}${originalUrl}`);
+    const file = Bun.file(`./src/${originalUrl}`);
 
     return new Response(Buffer.from(await file.arrayBuffer()), {
       headers: {
@@ -56,7 +53,7 @@ const app = new Elysia()
   })
   .get('*', async ({ originalUrl, baseUrl, protocol, headers }) => {
     if (originalUrl.includes('.')) {
-      const file = Bun.file(`${browserDistFolder}${originalUrl}`);
+      const file = Bun.file(`.78src/${originalUrl}`);
 
       return new Response(Buffer.from(await file.arrayBuffer()), {
         headers: {
@@ -65,32 +62,32 @@ const app = new Elysia()
       });
     }
 
-    const cacheHit = await db.select(`url:\`${originalUrl}\``);
+    // const cacheHit = await db.select(`url:\`${originalUrl}\``);
 
-    if (cacheHit) {
-      return new Response(cacheHit.content, {
-        headers: {
-          'Content-Type': 'text/html',
-        },
-      });
-    }
+    // if (cacheHit) {
+    //   return new Response(cacheHit.content, {
+    //     headers: {
+    //       'Content-Type': 'text/html',
+    //     },
+    //   });
+    // }
 
     try {
       console.log(`${protocol}://${headers['host']}${originalUrl}`);
-
+      let template = await Bun.file('./' + 'index.html').text()
       const _html = await commonEngine.render({
         bootstrap,
-        documentFilePath: indexHtml,
+        document: template,
         url: `${protocol}://${headers['host']}${originalUrl}`,
-        publicPath: browserDistFolder,
+        publicPath: './src',
         providers: [{ provide: APP_BASE_HREF, useValue: '' }],
       });
 
       console.log(_html);
 
-      await db.create(`url:\`${originalUrl}\``, {
-        content: _html,
-      });
+      // await db.create(`url:\`${originalUrl}\``, {
+      //   content: _html,
+      // });
 
       return new Response(_html, {
         headers: {
@@ -100,13 +97,13 @@ const app = new Elysia()
     } catch (error) {
       console.log(error);
 
-      return 'Missing page';
+      return new Response('Missing page', {
+        headers: {
+          'Content-Type': 'text/html',
+        },
+      });
     }
   })
-  .listen(port);
-
-console.log(
-  `🦊 Elysia is running at ${app.server?.hostname}:${app.server?.port}`
-);
 
 export type App = typeof app;
+export default app;

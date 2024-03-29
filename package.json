@@ -1,11 +1,14 @@
 {
   "name": "treaty",
   "version": "0.0.1",
+  "type": "module",
   "scripts": {
     "ng": "ng",
-    "start": "ng serve",
+    "start": "bunx --bun vite build --watch & bun run --watch server.ts",
     "build": "ng build",
-    "watch": "ng build --watch --configuration development"
+    "watch": "ng build --watch --configuration development",
+    "dev": "bunx --bun vite dev",
+    "viteBuild": "bunx --bun vite build"
   },
   "dependencies": {
     "@angular/animations": "^17.2.1",
@@ -19,8 +22,7 @@
     "@angular/router": "^17.2.1",
     "@angular/ssr": "^17.2.0",
     "@elysiajs/eden": "^0.8.1",
-    "elysia": "^0.8.16",
-    "ngxtension": "^2.0.0",
+    "elysia": "^0.8.17",
     "rxjs": "~7.8.0",
     "surrealdb.node": "^0.3.0",
     "tslib": "^2.3.0"
@@ -28,9 +30,18 @@
   "devDependencies": {
     "@angular-devkit/build-angular": "^17.2.0",
     "@angular/cli": "^17.2.0",
-    "@angular/compiler-cli": "^17.2.0",
+    "@angular/compiler-cli": "^17.2.1",
+    "@astrojs/compiler": "^2.6.0",
+    "@babel/core": "^7.23.9",
+    "@chialab/esbuild-plugin-html": "^0.18.0",
     "@happy-dom/global-registrator": "^13.3.8",
+    "@swc/core": "^1.4.1",
+    "@types/babel__core": "^7.20.5",
     "@types/bun": "^1.0.5",
-    "typescript": "~5.3.2"
+    "minimatch": "^9.0.3",
+    "oxc-parser": "^0.5.0",
+    "swc-ast-helpers": "^0.3.1",
+    "typescript": "~5.3.2",
+    "vite": "^5.1.4"
   }
 }

@@ -1,0 +1,33 @@
+[package]
+description = "Treaty plugin for https://swc.rs"
+edition = "2021"
+name = "treay_authoring"
+publish = false
+version = "0.0.1"
+
+# [lib]
+# doctest = false
+
+[dependencies]
+oxc = "0.8.0"
+oxc_allocator = "0.8.0"
+oxc_parser = "0.8.0"
+oxc_span = "0.8.0"
+swc_visit = "0.5.3"
+swc_html_ast = "0.33.17"
+swc_css = "0.157.37"
+oxc_ast    = { version = "0.8.0", features = ["serde"] }
+assert-unchecked = { version = "0.1.2" }
+bitflags         = { version = "2.4.2" }
+rustc-hash       = { version = "1.1.0" }
+num-bigint       = { version = "0.4.4" }
+seq-macro        = { version = "0.3.5" }
+serde_json = { version = "1.0.114" }
+regex = "1"
+memchr = "2.7.1"
+cargo-watch = "8.5.2"
+
+[dev-dependencies]
+
+miette     = { version = "7.1.0", features = ["fancy-no-backtrace"] }
+ouroboros  = "0.18.3"

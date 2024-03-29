@@ -1,0 +1,11 @@
+
+[workspace]
+resolver = '2'
+members = [
+	'libs/authoring/node',
+	'libs/authoring/treaty_authoring',
+	'apps/rust/authoring',
+]
+
+[profile.release]
+lto = true

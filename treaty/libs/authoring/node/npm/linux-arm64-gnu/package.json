@@ -1,0 +1,20 @@
+{
+  "name": "@treaty/authoring-node-linux-arm64-gnu",
+  "version": "0.0.0",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "main": "authoring_node.linux-arm64-gnu.node",
+  "files": [
+    "authoring_node.linux-arm64-gnu.node"
+  ],
+  "engines": {
+    "node": ">= 10"
+  },
+  "libc": [
+    "glibc"
+  ]
+}

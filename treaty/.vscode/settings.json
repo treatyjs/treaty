@@ -1,0 +1,8 @@
+{
+	"rust-analyzer.linkedProjects": [
+		".\\apps\\rust\\authoring\\Cargo.toml",
+		".\\apps\\rust\\authoring\\Cargo.toml",
+		".\\apps\\rust\\authoring\\Cargo.toml",
+		".\\apps\\rust\\authoring\\Cargo.toml"
+	]
+}
