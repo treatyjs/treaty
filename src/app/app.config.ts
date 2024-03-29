@@ -8,7 +8,7 @@ import {
   provideClientHydration,
   withHttpTransferCacheOptions,
 } from '@angular/platform-browser';
-import { routes } from './app.routes';
+import { routes } from './app.routes.ts';
 import { provideHttpClient, withFetch } from '@angular/common/http';
 
 export const appConfig: ApplicationConfig = {

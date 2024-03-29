@@ -1,4 +1,4 @@
-preload = ["./treaty-utilities/mock-create-histogram.ts"]
+preload = [ "./treaty-utilities/mock-zone.ts", "./treaty-utilities/mock-create-histogram.ts", "./treaty-utilities/angular.ts"]
 
 
 [test]

@@ -1,6 +1,6 @@
 import { ComponentFixture, TestBed, getTestBed } from '@angular/core/testing';
 import { beforeEach, describe, expect, test } from 'bun:test';
-import PostComponent from './post.component';
+import PostComponent from './post.component.ts';
 
 describe('PostComponent', () => {
   let component: PostComponent;

@@ -18,8 +18,8 @@ await db.use({ ns: 'test', db: 'test' });
 const port = process.env['PORT'] || 4201;
 const serverDistFolder = import.meta.dirname;
 
-const browserDistFolder = join(serverDistFolder, 'dist/treaty/browser');
-const indexHtml = join(serverDistFolder, 'dist/treaty/browser/index.html');
+const browserDistFolder = join(serverDistFolder, 'src');
+const indexHtml = join(serverDistFolder, 'src/index.html');
 const commonEngine = new CommonEngine({
   enablePerformanceProfiler: true,
 });

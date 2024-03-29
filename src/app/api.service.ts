@@ -1,6 +1,6 @@
 import { Injectable } from '@angular/core';
-import { App } from 'server';
-import { edenClient } from '../libs/edenclient';
+import { App } from 'server.ts';
+import { edenClient } from './treaty/index.ts';
 
 @Injectable({
   providedIn: 'root',

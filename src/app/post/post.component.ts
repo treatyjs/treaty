@@ -10,7 +10,7 @@ import {
 import { FormBuilder, ReactiveFormsModule, Validators } from '@angular/forms';
 import { ActivatedRouteSnapshot } from '@angular/router';
 import { map } from 'rxjs';
-import { ApiService } from '../api.service';
+import { ApiService } from '../api.service.ts';
 
 const fb = new FormBuilder();
 export const resolvePost = {
