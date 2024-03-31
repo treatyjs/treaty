@@ -1,4 +1,6 @@
-use crate::html::{DomNode, HtmlTokenizer, Parser};
+
+
+use crate::html::{DomNode, HtmlTokenizer, Parser, Position};
 use std::fmt;
 #[derive(Debug, PartialEq, Clone)]
 pub enum ControlFlowContent {
@@ -311,7 +313,10 @@ impl<'a> Lexer<'a> {
                     if block_depth == 0 {
                         let content = self.input[block_start..self.pos].trim().to_string();
                         if !content.is_empty() {
-                            block_contents.push(HtmlContent::Node(DomNode::Text(content)));
+                            block_contents.push(HtmlContent::Node(DomNode::Text(content, Position {
+                    line: 1,
+                    col: 1,
+                })));
                         }
                         self.advance(1);
                         break;

@@ -1,18 +1,20 @@
-use super::tokenizer::{Attribute, Token};
+use super::tokenizer::{Attribute, Position, Token, TokenKind};
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum DomNode {
     Element(ElementNode),
-    Text(String),
-    Comment(String),
+    Text(String, Position),
+    Comment(String, Position),
 }
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ElementNode {
-    // And this
     pub tag_name: String,
     pub attributes: Vec<Attribute>,
     pub children: Vec<DomNode>,
+    pub pos: Position,
+    pub is_self_closing: bool,
 }
 
 impl fmt::Display for ElementNode {
@@ -40,8 +42,8 @@ impl fmt::Display for DomNode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             DomNode::Element(element) => write!(f, "{}", element),
-            DomNode::Text(text) => write!(f, "Text(\"{}\")", text),
-            DomNode::Comment(comment) => write!(f, "Comment(\"{}\")", comment),
+            DomNode::Text(text, _) => write!(f, "Text(\"{}\")", text),
+            DomNode::Comment(comment, _) => write!(f, "Comment(\"{}\")", comment),
         }
     }
 }
@@ -57,70 +59,69 @@ impl Parser {
     }
 
     pub fn parse(&mut self) -> Vec<DomNode> {
-        let mut nodes = Vec::new();
+    let mut nodes = Vec::new();
 
-        while self.current < self.tokens.len() {
-            match &self.tokens[self.current] {
-                Token::Text(text) => {
-                    nodes.push(DomNode::Text(text.clone()));
-                    self.current += 1;
+    while self.current < self.tokens.len() {
+        let (kind, pos) = {
+            let token = &self.tokens[self.current];
+            (token.kind.clone(), token.pos.clone())
+        };
+
+        match kind {
+            TokenKind::Text(content) => {
+                nodes.push(DomNode::Text(content, pos));
+                self.current += 1;
+            },
+            TokenKind::Comment(content) => {
+                nodes.push(DomNode::Comment(content, pos));
+                self.current += 1;
+            },
+            TokenKind::StartTag { name, attributes, is_self_closing } => {
+                if let Some(node) = self.parse_element(&name, &attributes, is_self_closing) {
+                    nodes.push(node);
                 }
-                Token::Comment(comment) => {
-                    nodes.push(DomNode::Comment(comment.clone()));
-                    self.current += 1;
-                }
-                Token::StartTag(_, _) | Token::SelfClosingTag(_, _) => {
-                    if let Some(node) = self.parse_element() {
-                        nodes.push(node);
-                    }
-                }
-                _ => self.current += 1,
-            }
+            },
+            _ => self.current += 1,
         }
-
-        nodes
     }
-    fn parse_element(&mut self) -> Option<DomNode> {
-        if let Some(token) = self.tokens.get(self.current).cloned() {
-            match token {
-                Token::StartTag(tag_name, attributes)
-                | Token::SelfClosingTag(tag_name, attributes) => {
-                    self.current += 1;
 
-                    let mut children = Vec::new();
-                    while self.current < self.tokens.len() {
-                        match &self.tokens[self.current] {
-                            Token::EndTag(ref end_tag) if end_tag == &tag_name => {
-                                self.current += 1;
-                                break;
-                            }
-                            Token::Text(_) => {
-                                if let Some(token) = self.tokens.get(self.current).cloned() {
-                                    if let Token::Text(text) = token {
-                                        children.push(DomNode::Text(text));
-                                    }
-                                }
-                                self.current += 1;
-                            }
-                            _ => {
-                                if let Some(child) = self.parse_element() {
-                                    children.push(child);
-                                } else {
-                                    self.current += 1;
-                                }
-                            }
-                        }
+    nodes
+}
+
+    fn parse_element(
+        &mut self,
+        tag_name: &str,
+        attributes: &Vec<Attribute>,
+        is_self_closing: bool,
+    ) -> Option<DomNode> {
+        let start_pos = self.tokens[self.current].pos.clone();
+
+        let mut children = Vec::new();
+        if !is_self_closing {
+            self.current += 1;
+
+            while self.current < self.tokens.len() {
+                match self.tokens[self.current].kind {
+                    TokenKind::EndTag(ref name) if name == tag_name => {
+                        self.current += 1;
+                        break;
                     }
-
-                    return Some(DomNode::Element(ElementNode {
-                        tag_name,
-                        attributes,
-                        children,
-                    }));
+                    _ => {
+                        let child = self.parse();
+                        children.extend(child);
+                    }
                 }
-                _ => self.current += 1,
             }
+        } else {
+            self.current += 1;
         }
-        None
+
+        Some(DomNode::Element(ElementNode {
+            tag_name: tag_name.to_string(),
+            attributes: attributes.clone(),
+            children,
+            pos: start_pos,
+            is_self_closing,
+        }))
     }
 }

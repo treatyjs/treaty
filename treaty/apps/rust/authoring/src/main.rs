@@ -74,4 +74,3 @@ fn main() {
     let mut file = File::create(gen_path).expect("Failed to create file");
     file.write_all(printed.as_bytes()).unwrap();
 }
-
