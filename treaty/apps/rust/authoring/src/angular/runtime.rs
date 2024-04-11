@@ -10,7 +10,6 @@ pub enum Identifier {
     Element,
     ElementEnd,
     ElementStart,
-
     Template,
     Text,
     TextInterpolate,

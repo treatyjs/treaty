@@ -1,6 +1,7 @@
 use oxc::syntax::operator::LogicalOperator;
 use oxc_span::SPAN;
 use std::rc::Rc;
+use swc_visit::Optional;
 
 use oxc_ast::{ast::*, AstBuilder, AstKind};
 
@@ -8,7 +9,10 @@ use super::ParamDecorator;
 
 use super::TopLevelDecorator;
 
-use super::{context::{AngularCtx, AngularContext}, InjectableOptions};
+use super::{
+    context::{AngularContext, AngularCtx},
+    InjectableOptions,
+};
 
 pub struct DependencyInjection<'a> {
     ast: Rc<AstBuilder<'a>>,
@@ -95,9 +99,9 @@ impl<'a> DependencyInjection<'a> {
                     }
 
                     if !found_param_decorator {
-                        if let Some(type_name) = self
-                            .extract_type_name_from_type_annotation(&param.pattern.type_annotation.as_ref())
-                        {
+                        if let Some(type_name) = self.extract_type_name_from_type_annotation(
+                            &param.pattern.type_annotation.as_ref(),
+                        ) {
                             self.constructor_params
                                 .push(ParamDecorator::Inject(type_name));
                         }
@@ -124,23 +128,39 @@ impl<'a> DependencyInjection<'a> {
                     };
 
                 if let Some(name) = identifier_name {
-                    if let Some(TopLevelDecorator::Injectable { options }) = TopLevelDecorator::from_str(name, decorator) {
-                        // Process the Injectable decorator
-                        println!("Processing Injectable decorator with options: {:?}", options);
-                        let property_definition = self.ng_factory_builder(&options, factory_name.clone());
-                        class.body.body.insert(0, property_definition);
-                        class.decorators.remove(index);
-                        continue;
+                    match TopLevelDecorator::from_str(name, decorator) {
+                        Some(TopLevelDecorator::Injectable { options }) => {
+                            // Process the Injectable decorator
+                            println!(
+                                "Processing Injectable decorator with options: {:?}",
+                                options
+                            );
+                            let property_definition =
+                                self.ng_factory_builder(factory_name.clone(), Some(&options));
+                            class.body.body.insert(0, property_definition);
+                            class.decorators.remove(index);
+                            continue;
+                        }
+                        Some(_) => {
+                            let property_definition =
+                                self.ng_factory_builder(factory_name.clone(), None);
+                            class.body.body.insert(0, property_definition);
+                            class.decorators.remove(index);
+                            continue;
+                        }
+                        None => {
+                            continue;
+                        }
                     }
                 }
-               index += 1;
+                index += 1;
             }
         }
     }
 
     fn extract_type_name_from_type_annotation(
         &self,
-        type_annotation:  &Option<&oxc_allocator::Box<oxc_ast::ast::TSTypeAnnotation>>
+        type_annotation: &Option<&oxc_allocator::Box<oxc_ast::ast::TSTypeAnnotation>>,
     ) -> Option<String> {
         type_annotation.as_ref().and_then(|ta| {
             match &ta.type_annotation {
@@ -153,7 +173,6 @@ impl<'a> DependencyInjection<'a> {
             }
         })
     }
-
 
     fn extract_type_name_from_tstype_name(&self, tstype_name: &TSTypeName) -> Option<String> {
         match tstype_name {
@@ -171,8 +190,8 @@ impl<'a> DependencyInjection<'a> {
 
     fn ng_factory_builder(
         &self,
-        injectable_options: &InjectableOptions,
         factory_name: String,
+        injectable_options: Option<&InjectableOptions>,
     ) -> ClassElement<'a> {
         let identifier_name = self.ast.new_atom("ɵfac");
         let identifier_span = SPAN;

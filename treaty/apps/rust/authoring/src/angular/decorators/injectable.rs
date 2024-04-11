@@ -105,7 +105,7 @@ impl InjectableOptions {
                 if let ObjectPropertyKind::ObjectProperty(boxed_property) = property_kind {
                     match boxed_property.key {
                         PropertyKey::Identifier(ref identifier)
-                            if identifier.name == Self::PROVIDED_IN_KEY =>
+                        if identifier.name == Self::PROVIDED_IN_KEY =>
                         {
                             match &boxed_property.value {
                                 Expression::StringLiteral(literal) => {

@@ -1,4 +1,4 @@
-import { Injectable, inject, signal, } from '@angular/core';
+import { Injectable, inject, signal, Component } from '@angular/core';
 
 @Injectable()
 export class LoggerService4 {
@@ -7,6 +7,26 @@ export class LoggerService4 {
 	}
 	logMessage() {
 		console.log('Hello world!')
+	}
+}
+
+
+
+@Component({
+	selector: 'app-home',
+	standalone: true,
+	providers: [TestService],
+})
+export default class HomeComponent {
+
+	constructor(private testService: LoggerService4) {
+		testService.logMessage();
+	}
+
+	count = 0;
+
+	increment() {
+		this.count++;
 	}
 }
 
