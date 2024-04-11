@@ -1,18 +1,12 @@
+use crate::angular::context::AngularContext;
+use crate::angular::TopLevelDecorator;
 use oxc::syntax::operator::LogicalOperator;
 use oxc_span::SPAN;
 use std::rc::Rc;
-use swc_visit::Optional;
 
 use oxc_ast::{ast::*, AstBuilder, AstKind};
 
-use super::ParamDecorator;
-
-use super::TopLevelDecorator;
-
-use super::{
-    context::{AngularContext, AngularCtx},
-    InjectableOptions,
-};
+use crate::angular::{context::AngularCtx, InjectableOptions, ParamDecorator};
 
 pub struct DependencyInjection<'a> {
     ast: Rc<AstBuilder<'a>>,
@@ -32,7 +26,7 @@ impl<'a> DependencyInjection<'a> {
         })
     }
 
-    pub fn transform_class(&mut self, class: &mut Class<'a>) {
+    pub fn transform_class(&mut self, class: &mut Class<'a>, top_level_decorators: Vec<(TopLevelDecorator, usize)>) {
         let has_decorator = !class.decorators.is_empty();
         let class_name = if has_decorator {
             class
@@ -112,49 +106,21 @@ impl<'a> DependencyInjection<'a> {
         }
 
         let factory_name = format!("factory{}", class_name.unwrap_or_default());
-        if has_decorator {
-            let mut index = 0;
-            while index < class.decorators.len() {
-                let decorator = &class.decorators[index];
-                let identifier_name =
-                    if let Expression::CallExpression(boxed_expr) = &decorator.expression {
-                        if let Expression::Identifier(identifier) = &boxed_expr.callee {
-                            Some(identifier.name.as_str())
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-
-                if let Some(name) = identifier_name {
-                    match TopLevelDecorator::from_str(name, decorator) {
-                        Some(TopLevelDecorator::Injectable { options }) => {
-                            // Process the Injectable decorator
-                            println!(
-                                "Processing Injectable decorator with options: {:?}",
-                                options
-                            );
-                            let property_definition =
-                                self.ng_factory_builder(factory_name.clone(), Some(&options));
-                            class.body.body.insert(0, property_definition);
-                            class.decorators.remove(index);
-                            continue;
-                        }
-                        Some(_) => {
-                            let property_definition =
-                                self.ng_factory_builder(factory_name.clone(), None);
-                            class.body.body.insert(0, property_definition);
-                            class.decorators.remove(index);
-                            continue;
-                        }
-                        None => {
-                            continue;
-                        }
-                    }
+        // Iterate over top_level_decorators and remove processed decorators
+        for (decorator, index) in top_level_decorators.into_iter() {
+            match decorator {
+                TopLevelDecorator::Injectable { options } => {
+                    println!("Processing Injectable decorator with options: {:?}", options);
+                    let property_definition = self.ng_factory_builder(factory_name.clone(), Some(&options));
+                    class.body.body.insert(0, property_definition);
                 }
-                index += 1;
+                _ => {
+                    let property_definition = self.ng_factory_builder(factory_name.clone(), None);
+                    class.body.body.insert(0, property_definition);
+                }
             }
+            // Remove the processed decorator from class.decorators
+            class.decorators.remove(index);
         }
     }
 

@@ -10,8 +10,6 @@ export class LoggerService4 {
 	}
 }
 
-
-
 @Component({
 	selector: 'app-home',
 	standalone: true,

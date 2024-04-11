@@ -9,13 +9,15 @@ use oxc_diagnostics::Error;
 use oxc_semantic::Semantic;
 use oxc_span::SourceType;
 use super::context::{AngularCtx, AngularContext};
-use super::DependencyInjection;
+use super::transformers::DependencyInjection;
+use super::TopLevelDecorator;
 
 
 #[derive()]
 pub struct Angular<'a> {
     ctx: AngularCtx<'a>,
     dependency_injection: Option<DependencyInjection<'a>>,
+
 }
 
 impl<'a> Angular<'a> {
@@ -63,7 +65,20 @@ impl<'a> VisitMut<'a> for Angular<'a> {
     }
 
     fn visit_class(&mut self, class: &mut Class<'a>) {
-        self.dependency_injection.as_mut().map(|t: &mut DependencyInjection<'_>| t.transform_class(class));
+        let mut top_level_decorators: Vec<(TopLevelDecorator, usize)> = Vec::new();
+        for (index, decorator) in class.decorators.iter().enumerate() {
+            if let Expression::CallExpression(boxed_expr) = &decorator.expression {
+                if let Expression::Identifier(identifier) = &boxed_expr.callee {
+                    if let Some(top_level_decorator) = TopLevelDecorator::from_str(&identifier.name, decorator) {
+                        top_level_decorators.push((top_level_decorator, index));
+                    }
+                }
+            }
+        }
+
+
+
+        self.dependency_injection.as_mut().map(|t: &mut DependencyInjection<'_>| t.transform_class(class, top_level_decorators));
     }
 
     fn visit_statements(&mut self, stmts: &mut oxc_allocator::Vec<'a, Statement<'a>>) {
