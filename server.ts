@@ -10,7 +10,6 @@ import { IndexHtmlTransform } from 'vite';
 import { APP_BASE_HREF } from '@angular/common';
 import { CommonEngine } from '@angular/ssr';
 import bootstrap from './src/main.server';
-
 // const db = new Surreal();
 // await db.connect('memory');
 // await db.use({ ns: 'test', db: 'test' });

@@ -1,17 +1,18 @@
 #![allow(clippy::wildcard_imports, clippy::option_map_unit_fn)]
 
-use std::fmt::Debug;
+
 use std::{cell::RefCell, rc::Rc, sync::Arc};
 
 use oxc_allocator::Allocator;
 use oxc_ast::{ast::*, AstBuilder, AstKind, VisitMut};
 use oxc_diagnostics::Error;
-use oxc_semantic::{ScopeFlags, Semantic};
+use oxc_semantic::Semantic;
 use oxc_span::SourceType;
-use super::context::AngularCtx;
+use super::context::{AngularCtx, AngularContext};
 use super::DependencyInjection;
 
 
+#[derive()]
 pub struct Angular<'a> {
     ctx: AngularCtx<'a>,
     dependency_injection: Option<DependencyInjection<'a>>,

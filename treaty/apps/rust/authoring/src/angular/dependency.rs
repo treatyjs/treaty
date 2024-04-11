@@ -1,16 +1,14 @@
 use oxc::syntax::operator::LogicalOperator;
 use oxc_span::SPAN;
-use std::borrow::Borrow;
-use std::borrow::BorrowMut;
 use std::rc::Rc;
 
-use oxc_ast::{ast::*, AstBuilder, AstKind, VisitMut};
+use oxc_ast::{ast::*, AstBuilder, AstKind};
 
 use super::ParamDecorator;
 
 use super::TopLevelDecorator;
 
-use super::{context::AngularCtx, InjectableOptions};
+use super::{context::{AngularCtx, AngularContext}, InjectableOptions};
 
 pub struct DependencyInjection<'a> {
     ast: Rc<AstBuilder<'a>>,
@@ -79,10 +77,10 @@ impl<'a> DependencyInjection<'a> {
                                 ParamDecorator::from_str(name, param, decorator)
                             {
                                 match &param_decorator {
-                                    ParamDecorator::Inject(ref name)
-                                    | ParamDecorator::ASelf(ref name)
-                                    | ParamDecorator::Optional(ref name)
-                                    | ParamDecorator::SkipSelf(ref name) => {
+                                    ParamDecorator::Inject(ref _name)
+                                    | ParamDecorator::ASelf(ref _name)
+                                    | ParamDecorator::Optional(ref _name)
+                                    | ParamDecorator::SkipSelf(ref _name) => {
                                         found_param_decorator = true;
                                         self.constructor_params.push(param_decorator);
                                         decorators_to_remove.push(index);
@@ -126,30 +124,16 @@ impl<'a> DependencyInjection<'a> {
                     };
 
                 if let Some(name) = identifier_name {
-                    if let Some(top_level_decorator) = TopLevelDecorator::from_str(name, decorator)
-                    {
-                        match top_level_decorator {
-                            TopLevelDecorator::Injectable { options } => {
-                                // Process the Injectable decorator
-                                println!(
-                                    "Processing Injectable decorator with options: {:?}",
-                                    options
-                                );
-
-                                let property_definition =
-                                    self.ng_factory_builder(&options, factory_name.clone());
-
-                                class.body.body.insert(0, property_definition);
-
-                                class.decorators.remove(index);
-
-                                continue;
-                            }
-                            _ => {}
-                        }
+                    if let Some(TopLevelDecorator::Injectable { options }) = TopLevelDecorator::from_str(name, decorator) {
+                        // Process the Injectable decorator
+                        println!("Processing Injectable decorator with options: {:?}", options);
+                        let property_definition = self.ng_factory_builder(&options, factory_name.clone());
+                        class.body.body.insert(0, property_definition);
+                        class.decorators.remove(index);
+                        continue;
                     }
                 }
-                index += 1;
+               index += 1;
             }
         }
     }
@@ -170,6 +154,7 @@ impl<'a> DependencyInjection<'a> {
         })
     }
 
+
     fn extract_type_name_from_tstype_name(&self, tstype_name: &TSTypeName) -> Option<String> {
         match tstype_name {
             TSTypeName::IdentifierReference(identifier_ref) => {
@@ -179,8 +164,7 @@ impl<'a> DependencyInjection<'a> {
             TSTypeName::QualifiedName(qualified_name) => {
                 // For QualifiedName, handle the left and right parts
                 let left_name = self.extract_type_name_from_tstype_name(&qualified_name.left)?;
-                let right_name = &qualified_name.right.name;
-                Some(format!("{}.{}", left_name, right_name))
+                Some(format!("{}.{}", left_name, qualified_name.right.name))
             }
         }
     }

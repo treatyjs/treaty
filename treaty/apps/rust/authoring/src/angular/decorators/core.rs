@@ -1,7 +1,5 @@
-use std::rc::Rc;
-
 use oxc_ast::ast::{
-    Argument, CallExpression, ClassBody, Decorator, Expression, FormalParameter, ObjectPropertyKind, PropertyKey
+    Argument, Decorator, Expression, FormalParameter
 };
 
 use super::injectable::InjectableOptions;

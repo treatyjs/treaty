@@ -10,48 +10,65 @@ use oxc_semantic::{ScopeId, ScopeTree, Semantic, SymbolId, SymbolTable};
 use oxc_span::{CompactString, SourceType};
 
 #[derive(Clone)]
-pub struct AngularCtx<'a> {
-    pub ast: Rc<AstBuilder<'a>>,
-    semantic: Rc<RefCell<Semantic<'a>>>,
-    errors: Rc<RefCell<Vec<Error>>>,
+pub struct AngularCtx<'a>(pub Rc<AstBuilder<'a>>, Rc<RefCell<Semantic<'a>>>, Rc<RefCell<Vec<Error>>>);
+
+pub trait AngularContext<'a> {
+    fn new(ast: Rc<AstBuilder<'a>>, semantic: Rc<RefCell<Semantic<'a>>>) -> Self;
+
+    fn semantic(&self) -> Ref<'_, Semantic<'a>>;
+
+    fn symbols(&self) -> Ref<'_, SymbolTable>;
+
+    fn scopes(&self) -> Ref<'_, ScopeTree>;
+
+    fn scopes_mut(&self) -> RefMut<'_, ScopeTree>;
+
+    fn add_binding(&self, name: CompactString);
+
+    fn source_type(&self) -> Ref<'_, SourceType>;
+
+    fn errors(&self) -> Vec<Error>;
+
+    /// Push a Transform Error
+    fn error<T: Into<Error>>(&mut self, error: T);
 }
 
-impl<'a> AngularCtx<'a> {
-    pub fn new(ast: Rc<AstBuilder<'a>>, semantic: Rc<RefCell<Semantic<'a>>>) -> Self {
-        Self { ast, semantic, errors: Rc::new(RefCell::new(vec![])) }
+impl<'a> AngularContext<'a> for AngularCtx<'a> {
+    fn new(ast: Rc<AstBuilder<'a>>, semantic: Rc<RefCell<Semantic<'a>>>) -> Self {
+        Self(ast, semantic, Rc::new(RefCell::new(vec![])))
     }
 
-    pub fn semantic(&self) -> Ref<'_, Semantic<'a>> {
-        self.semantic.borrow()
+    fn semantic(&self) -> Ref<'_, Semantic<'a>> {
+        self.1.borrow()
     }
 
-    pub fn symbols(&self) -> Ref<'_, SymbolTable> {
-        Ref::map(self.semantic.borrow(), |semantic| semantic.symbols())
+    fn symbols(&self) -> Ref<'_, SymbolTable> {
+        Ref::map(self.1.borrow(), |semantic| semantic.symbols())
     }
 
-    pub fn scopes(&self) -> Ref<'_, ScopeTree> {
-        Ref::map(self.semantic.borrow(), |semantic| semantic.scopes())
+    fn scopes(&self) -> Ref<'_, ScopeTree> {
+        Ref::map(self.1.borrow(), |semantic| semantic.scopes())
     }
 
-    pub fn scopes_mut(&self) -> RefMut<'_, ScopeTree> {
-        RefMut::map(self.semantic.borrow_mut(), |semantic| semantic.scopes_mut())
+    fn scopes_mut(&self) -> RefMut<'_, ScopeTree> {
+        RefMut::map(self.1.borrow_mut(), |semantic| semantic.scopes_mut())
     }
 
-    pub fn add_binding(&self, name: CompactString) {
+    fn add_binding(&self, name: CompactString) {
         // TODO: use the correct scope and symbol id
         self.scopes_mut().add_binding(ScopeId::new(0), name, SymbolId::new(0));
     }
 
-    pub fn source_type(&self) -> Ref<'_, SourceType> {
-        Ref::map(self.semantic.borrow(), |semantic| semantic.source_type())
+    fn source_type(&self) -> Ref<'_, SourceType> {
+        Ref::map(self.1.borrow(), |semantic| semantic.source_type())
     }
 
-    pub fn errors(&self) -> Vec<Error> {
-        mem::take(&mut self.errors.borrow_mut())
+    fn errors(&self) -> Vec<Error> {
+        mem::take(&mut self.2.borrow_mut())
     }
 
     /// Push a Transform Error
-    pub fn error<T: Into<Error>>(&mut self, error: T) {
-        self.errors.borrow_mut().push(error.into());
+    fn error<T: Into<Error>>(&mut self, error: T) {
+        self.2.borrow_mut().push(error.into());
     }
 }

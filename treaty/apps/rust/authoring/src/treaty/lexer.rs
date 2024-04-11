@@ -1,5 +1,3 @@
-
-
 use crate::html::{DomNode, HtmlTokenizer, Parser};
 use std::fmt;
 #[derive(Debug, PartialEq, Clone)]

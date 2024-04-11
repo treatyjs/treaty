@@ -8,7 +8,7 @@ pub struct ParsedContent {
     pub javascript: Vec<String>,
 }
 
-pub fn parse_mixed_content<'a>(input: &'a str) -> ParsedContent {
+pub fn parse_mixed_content(input: &str) -> ParsedContent {
     let mut lexer = Lexer::new(input);
     let mut parsed_content = ParsedContent { html: Vec::new(), css: Vec::new(), javascript: Vec::new(), };
 
