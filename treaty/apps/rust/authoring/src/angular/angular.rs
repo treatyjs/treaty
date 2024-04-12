@@ -92,17 +92,14 @@ impl<'a> VisitMut<'a> for Angular<'a> {
         }
     }
 
-    // let top_level_decorators_copy = std::mem::replace(&mut top_level_decorators, Vec::new());
-
-
     self.dependency_injection
         .as_mut()
-        .map(|t: &mut DependencyInjection<'_>| t.transform_class(class, top_level_decorators));
+        .map(|t: &mut DependencyInjection<'_>| t.transform_class(class, &top_level_decorators));
 
-    // self.injectable_creator
-    //     .as_mut()
-    //     .map(|t: &mut InjectableCreator<'_>| t.transform_class(class, top_level_decorators_copy));
-}
+    self.injectable_creator
+        .as_mut()
+        .map(|t: &mut InjectableCreator<'_>| t.transform_class(class, &top_level_decorators));
+    }
 
 
     fn visit_import_declaration(&mut self, decl: &mut ImportDeclaration<'a>) {

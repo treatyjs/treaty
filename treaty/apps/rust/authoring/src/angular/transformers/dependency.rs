@@ -30,7 +30,7 @@ impl<'a> DependencyInjection<'a> {
         vec!["inject"]
     }
 
-    pub fn transform_class(&mut self, class: &mut Class<'a>, top_level_decorators: Vec<(TopLevelDecorator, usize)>) {
+    pub fn transform_class(&mut self, class: &mut Class<'a>, top_level_decorators: &Vec<(TopLevelDecorator, usize)>) {
         let has_decorator = !class.decorators.is_empty();
         let class_name = if has_decorator {
             class

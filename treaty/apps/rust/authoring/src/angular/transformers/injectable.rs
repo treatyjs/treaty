@@ -32,13 +32,13 @@ impl<'a> InjectableCreator<'a> {
     pub fn transform_class(
         &mut self,
         class: &mut Class<'a>,
-        top_level_decorators: Vec<(TopLevelDecorator, usize)>,
+        top_level_decorators: &Vec<(TopLevelDecorator, usize)>,
     ) {
         let class_name = if top_level_decorators.len() > 0 {
             class
                 .id
                 .clone()
-                .map(|id| self.context.scopes().generate_uid(&id.name))
+                .map(|id| id.name.to_compact_string())
                 .or_else(|| Some(self.context.scopes().generate_uid("class")))
         } else {
             None
@@ -46,7 +46,7 @@ impl<'a> InjectableCreator<'a> {
         for (decorator, index) in top_level_decorators {
             match decorator {
                 TopLevelDecorator::Injectable { options } => {
-                    class.decorators.remove(index);
+                    class.decorators.remove(*index);
                     let property_definition = self.ng_factory_builder(
                         class_name.clone().unwrap_or_default().to_string(),
                         &options,
