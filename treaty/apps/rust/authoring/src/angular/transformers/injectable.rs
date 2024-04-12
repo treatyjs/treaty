@@ -51,7 +51,7 @@ impl<'a> InjectableCreator<'a> {
                         class_name.clone().unwrap_or_default().to_string(),
                         &options,
                     );
-                    class.body.body.insert(0, property_definition);
+                    class.body.body.insert(1, property_definition);
                 }
                 _ => (),
             }
