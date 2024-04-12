@@ -57,6 +57,7 @@ pub enum ProviderScope {
     Root,
     Platform,
     Any,
+    None
 }
 impl ProviderScope {
     pub fn from_str(name: &str) -> Option<Self> {
@@ -68,6 +69,16 @@ impl ProviderScope {
         }
     }
 }
+impl ToString for ProviderScope {
+    fn to_string(&self) -> String {
+        match self {
+            ProviderScope::Root => String::from("root"),
+            ProviderScope::Platform => String::from("platform"),
+            ProviderScope::Any => String::from("any"),
+            ProviderScope::None => String::from("none"),
+        }
+    }
+}
 #[derive(Debug)]
 pub struct InjectableOptions {
     pub provided_in: ProviderScope,
@@ -76,7 +87,7 @@ pub struct InjectableOptions {
 impl Default for InjectableOptions {
     fn default() -> Self {
         InjectableOptions {
-            provided_in: ProviderScope::Root,
+            provided_in: ProviderScope::None,
             detail: InjectableProvider::None
         }
     }

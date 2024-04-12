@@ -26,6 +26,10 @@ impl<'a> DependencyInjection<'a> {
         })
     }
 
+    pub fn specifier_to_remove() -> Vec<&'a str> {
+        vec!["inject"]
+    }
+
     pub fn transform_class(&mut self, class: &mut Class<'a>, top_level_decorators: Vec<(TopLevelDecorator, usize)>) {
         let has_decorator = !class.decorators.is_empty();
         let class_name = if has_decorator {
@@ -107,7 +111,7 @@ impl<'a> DependencyInjection<'a> {
 
         let factory_name = format!("factory{}", class_name.unwrap_or_default());
         // Iterate over top_level_decorators and remove processed decorators
-        for (decorator, index) in top_level_decorators.into_iter() {
+        for (decorator, _) in top_level_decorators.into_iter() {
             match decorator {
                 TopLevelDecorator::Injectable { options } => {
                     println!("Processing Injectable decorator with options: {:?}", options);
@@ -119,8 +123,6 @@ impl<'a> DependencyInjection<'a> {
                     class.body.body.insert(0, property_definition);
                 }
             }
-            // Remove the processed decorator from class.decorators
-            class.decorators.remove(index);
         }
     }
 
