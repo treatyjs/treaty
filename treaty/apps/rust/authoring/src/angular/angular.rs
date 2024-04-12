@@ -94,11 +94,11 @@ impl<'a> VisitMut<'a> for Angular<'a> {
 
     self.dependency_injection
         .as_mut()
-        .map(|t: &mut DependencyInjection<'_>| t.transform_class(class, top_level_decorators));
+        .map(|t: &mut DependencyInjection<'_>| t.transform_class(class, &top_level_decorators));
 
     self.injectable_creator
         .as_mut()
-        .map(|t: &mut InjectableCreator<'_>| t.transform_class(class, top_level_decorators));
+        .map(|t: &mut InjectableCreator<'_>| t.transform_class(class, &top_level_decorators));
     }
 
 
