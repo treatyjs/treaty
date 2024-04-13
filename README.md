@@ -1,32 +1,25 @@
 # Treaty
 
-Is Angular in perfect harmony in the Bun runtime using Elysia.js and Surrealdb
-
-- Angular v17.2.0
-- Bun 1.0.26
-- Surrealdb.node 0.3
-- Elysia 0.8
-
-## Extra features
-
-- Custom elysia (eden/treaty) that uses httpClient under the hood
-- It's Zoneless together with SSR
-- Server running with bun
-- Tests running with bun
-
-## Getting started
-
-- `bun i`
-- `bun run build`
-- `bun run server.ts`
-
-## Getting started watching
-
-- `bun run watch` - Known bottleneck it takes roughly 1s to build per change
-- `bun run --watch server.ts`
-
-## Unit testing
-
-- `bun test`
-
-### This is still very much POC dont use in production
+| Feature/Tool                                                                                          | Analog     | Treaty |
+| ----------------------------------------------------------------------------------------------------- | --------------- | ------------- |
+| Vite support                                                                                   | ✅              | ✅            |
+| First class bun support                                                          | ❌              | ✅            |
+| Node Support                                                                                  | ✅              | ❌            |
+| SSR                                                                           | ✅              | ✅            |
+| SSG                                                                                      | ✅              | 🚧 (Planned)            |
+| File base routing                                                                      | ✅              | ✅ |
+| Flexible File routing                                                                     | ❌              | ✅ |
+| Custom Authoring - functional                                                                   | ✅ (.analog  - svelte inspired)           | ✅ (.treaty - custom  & astro inspired) |
+| Authoring - Class                                                                  | ✅  (standard angular )        | ✅ (Enhanced Angular authoring ) |
+| deconstruction of objects to inputs                                                                  | ❌ | ✅ Supports Singal objects |
+| Authoring to Ivy| ❌ (transpiles into Angular class for angular NGTCC to handle)        | ✅ (Direct to Ivy compile) |
+| Strongly typed HTTP Client                                                    | ❌        | ✅ [@treaty/httpclient](https://jsr.io/@treaty/httpclient) |
+| Server side function in component                                                    | ❌        | 🚧 (Planned)   |
+| function chunking                                                         | ❌        | 🏗️ (work underway) |
+| First class Module federation                                                                  | ❌        | 🏗️ (work underway) |
+| Zoneless first                                                                | ❌        | ✅ |
+| Signal components                                                                | ❌        | ✅ |
+| Build to deploy                                                                  |  ❌               | 🚧 (Planned -self hosted and Treaty cloud)            |
+| Bun Test                                                                 |  ❌               | ✅            |
+| [Vitest](https://vitest.dev/)|  ✅               |  (not checked)           |
+| compiler                                                                 |  Angular CLI               |  Enhanced with Rust          |

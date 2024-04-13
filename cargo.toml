@@ -1,4 +1,0 @@
-[workspace]
-resolver = "2"
-members  = ["crates/*", "ngx/*"]
-exclude  = ["tasks/lint_rules"]
