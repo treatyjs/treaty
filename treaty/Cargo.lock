@@ -438,9 +438,9 @@ dependencies = [
 
 [[package]]
 name = "cc"
-version = "1.0.88"
+version = "1.0.92"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02f341c093d19155a6e41631ce5971aac4e9a868262212153124c15fa22d1cdc"
+checksum = "2678b2e3449475e95b0aa6f9b506a28e61b3dc8996592b983695e8ebb58a8b41"
 
 [[package]]
 name = "cfg-if"
@@ -2338,6 +2338,8 @@ dependencies = [
  "swc_css",
  "swc_html_ast",
  "swc_visit",
+ "tree-sitter",
+ "tree-sitter-angular",
 ]
 
 [[package]]
@@ -3081,6 +3083,36 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c06d3da6113f116aaee68e4d601191614c9053067f9ab7f6edbcb161237daa54"
 dependencies = [
  "once_cell",
+]
+
+[[package]]
+name = "tree-sitter"
+version = "0.20.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e747b1f9b7b931ed39a548c1fae149101497de3c1fc8d9e18c62c1a66c683d3d"
+dependencies = [
+ "cc",
+ "regex",
+]
+
+[[package]]
+name = "tree-sitter-angular"
+version = "0.0.1"
+source = "git+https://github.com/dlvandenberg/tree-sitter-angular#b7a7167762e3863b3d6247c708b7f9bca1ca7bea"
+dependencies = [
+ "cc",
+ "tree-sitter",
+ "tree-sitter-html",
+]
+
+[[package]]
+name = "tree-sitter-html"
+version = "0.20.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "017822b6bd42843c4bd67fabb834f61ce23254e866282dd93871350fd6b7fa1d"
+dependencies = [
+ "cc",
+ "tree-sitter",
 ]
 
 [[package]]

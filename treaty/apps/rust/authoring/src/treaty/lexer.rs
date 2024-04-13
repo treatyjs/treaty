@@ -1,5 +1,9 @@
 use crate::html::{DomNode, HtmlTokenizer, Parser};
-use std::fmt;
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+};
+
 #[derive(Debug, PartialEq, Clone)]
 pub enum ControlFlowContent {
     IfElse(String, Vec<HtmlContent>, Option<Box<ControlFlowContent>>),
@@ -47,13 +51,15 @@ pub enum Token {
 pub struct Lexer<'a> {
     input: &'a str,
     pos: usize,
+    three_parser: tree_sitter::Parser,
 }
 
 impl<'a> Lexer<'a> {
-    pub fn new(input: &'a str, ) -> Self {
+    pub fn new(input: &'a str) -> Self {
         Lexer {
             input,
             pos: 0,
+            three_parser: tree_sitter::Parser::new(),
         }
     }
 
@@ -124,6 +130,166 @@ impl<'a> Lexer<'a> {
         None
     }
 
+   fn generate_ivy_code(&mut self, node: tree_sitter::Node, source: &[u8], ivy_code: &mut String) {
+    let mut decls_count = 0;
+    let mut vars_count = 0;
+    let mut consts_count = 0;
+    let mut elements_code = String::new();
+    let mut interpolations_code = String::new();
+    let mut consts_array = Vec::new();
+
+    // Traverse the AST nodes and accumulate counts, generated Ivy code, and consts array
+    self.traverse_ast(&node, source, &mut decls_count, &mut vars_count, &mut consts_count, &mut elements_code, &mut interpolations_code, &mut consts_array);
+
+    // Generate the final Ivy code using the accumulated counts, generated code, and consts array
+    *ivy_code += &format!(
+        "static {{ this.ɵcmp = /*@__PURE__*/ i0.ɵɵdefineComponent({{ type: HomeComponent, selectors: [[\"app-home\"]], standalone: true, features: [i0.ɵɵStandaloneFeature], decls: {}, vars: {}, consts: {:?}, template: function HomeComponent_Template(rf, ctx) {{\n{}\n{}\n}} }}); }}",
+        decls_count, vars_count, consts_array, elements_code, interpolations_code
+    );
+}
+
+fn traverse_ast(&mut self, node: &tree_sitter::Node, source: &[u8], decls_count: &mut u32, vars_count: &mut u32, consts_count: &mut u32, elements_code: &mut String, interpolations_code: &mut String, consts_array: &mut Vec<Vec<String>>) {
+    match node.kind() {
+        "fragment" => {
+            // Traverse child nodes recursively
+            for i in 0..node.child_count() {
+                let child = node.child(i).unwrap();
+                self.traverse_ast(&child, source, decls_count, vars_count, consts_count, elements_code, interpolations_code, consts_array);
+            }
+        }
+        "element" | "start_tag" | "end_tag" => {
+            // Generate Ivy code for the element
+            self.generate_element_ivy_code(node, source, decls_count, vars_count, consts_array);
+
+            // Traverse child nodes recursively
+            for i in 0..node.child_count() {
+                let child = node.child(i).unwrap();
+                self.traverse_ast(&child, source, decls_count, vars_count, consts_count, elements_code, interpolations_code, consts_array);
+            }
+        }
+        // Count constants
+        "const" => {
+            *consts_count += 1;
+            // Extract const values and add them to the consts array
+            let const_value = node.utf8_text(source).unwrap();
+            consts_array.push(vec![const_value.to_string()]);
+        }
+        // Generate Ivy code for interpolations
+        "interpolation" => {
+            for i in 0..node.child_count() {
+                let expression_node = node.child(i).unwrap();
+                if expression_node.kind() == "expression" {
+                    for j in 0..expression_node.child_count() {
+                        let identifier_node = expression_node.child(j).unwrap();
+                        if identifier_node.kind() == "identifier" {
+                            let identifier = identifier_node.utf8_text(source).unwrap();
+                            *interpolations_code += &format!("i0.ɵɵtextInterpolate({});\n", identifier);
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn generate_element_ivy_code(&mut self, node: &tree_sitter::Node, source: &[u8], decls_count: &mut u32, vars_count: &mut u32, consts_array: &mut Vec<Vec<String>>) {
+    // Increment decls count for each element
+    *decls_count += 1;
+
+    let mut element_consts = Vec::new();
+
+    // Extract attributes and their values
+    for i in 0..node.child_count() {
+        let child = node.child(i).unwrap(); 
+        if child.kind() == "start_tag" {
+            for j in 0..child.child_count() {
+                let attribute = child.child(j).unwrap();
+                if attribute.kind() == "attribute" {
+                    let name_node = attribute.child(0).unwrap();
+                    let value_node = attribute.child(1).unwrap();
+                    let attribute_name = name_node.utf8_text(source).unwrap();
+                    let attribute_value = value_node.utf8_text(source).unwrap();
+                    element_consts.push(attribute_name.to_string());
+                    element_consts.push(attribute_value.to_string());
+                }
+            }
+        }
+    }
+
+    // Add the element's consts to the consts array
+    if !element_consts.is_empty() {
+        consts_array.push(element_consts);
+    }
+
+    // Increment vars count for each structural directive
+    if node.utf8_text(source).unwrap() == "ng-template" {
+        *vars_count += 1;
+    }
+}
+
+    
+    
+
+    // fn generate_ivy_code(&mut self, node: tree_sitter::Node, source: &[u8], ivy_code: &mut String) {
+    //     println!("Node Kind: {}", node.kind());
+    //     // for i in 0..node.named_child_count() {
+    //     //     let child = node.named_child(i).unwrap(); // unwrap is safe here assuming the AST is correct
+    //     //     println!("Field: {}", child.kind());
+    //     // }
+    //     // for child in node.children(&mut node.walk()) {
+    //     //     self.generate_ivy_code(child, source, ivy_code);
+    //     // }
+    //     match node.kind() {
+    //         "fragment" => {
+    //             // Traverse child nodes recursively
+    //             for child in node.children(&mut node.walk()) {
+    //                 self.generate_ivy_code(child, source, ivy_code);
+    //             }
+    //         }
+    //         "element" | "start_tag" | "end_tag" => {
+    //             // Iterate over named children
+    //             for i in 0..node.named_child_count() {
+    //                 let child = node.named_child(i).unwrap(); // Unwrap is safe here assuming the AST is correct
+    //                 if child.kind() == "tag_name" {
+    //                     let tag_name = child.utf8_text(source).unwrap();
+    //                     if node.kind() == "start_tag" {
+    //                         *ivy_code += &format!("i0.ɵɵelementStart(0, \"{}\")", tag_name);
+    //                     } else if node.kind() == "end_tag" {
+    //                         *ivy_code += &format!("i0.ɵɵelementEnd(); // End tag for {}", tag_name);
+    //                     }
+    //                     *ivy_code += ";\n";
+    //                     break; // Break after processing the tag name
+    //                 }
+    //             }
+        
+    //             // Generate Ivy code for attributes
+    //             if let Some(attributes_node) = node.child_by_field_name("attributes") {
+    //                 for attribute_node in attributes_node.children(&mut attributes_node.walk()) {
+    //                     if attribute_node.kind() == "attribute" {
+    //                         if let (Some(name_node), Some(value_node)) =
+    //                             (attribute_node.child_by_field_name("attribute_name"), attribute_node.child_by_field_name("quoted_attribute_value"))
+    //                         {
+    //                             let attribute_name = name_node.utf8_text(source).unwrap();
+    //                             let attribute_value = value_node.utf8_text(source).unwrap();
+    //                             *ivy_code += &format!("i0.ɵɵattribute(\"{}\", \"{}\")", attribute_name, attribute_value);
+    //                             *ivy_code += ";\n";
+    //                         }
+    //                     }
+    //                 }
+    //             }
+        
+    //             // Traverse child nodes recursively
+    //             for child in node.children(&mut node.walk()) {
+    //                 self.generate_ivy_code(child, source, ivy_code);
+    //             }
+    //         }
+    //         _ => {}
+    //     }
+        
+        
+    // }
+
     fn parse_html_segment(&mut self) -> Option<Token> {
         let mut tag_depth = 0;
         let mut start = self.pos;
@@ -158,6 +324,45 @@ impl<'a> Lexer<'a> {
 
         let html_content = &self.input[start..end];
         println!("Processing HTML segment: {}", html_content);
+        self.three_parser
+            .set_language(tree_sitter_angular::language())
+            .expect("Error loading Rust grammar");
+
+        let replace_kinds: HashSet<&str> =
+            ["call_expression", "identifier"].iter().cloned().collect();
+        let replacement = "ctx.";
+
+        let html = r#"
+        <div>
+            <a href="https://analogjs.org/" target="_blank">
+                <img alt="Analog Logo" class="logo analog" src="/analog.svg" />
+            </a>
+        </div>
+
+        <h2>Analog</h2>
+
+        <h3>The fullstack meta-framework for Angular!</h3>
+
+        <div class="card">
+            <button type="button" (click)="increment()">Count {{ count }}</button>
+        </div>
+
+        <p class="read-the-docs">
+            For guides on how to customize this project, visit the
+            <a href="https://analogjs.org" target="_blank">Analog documentation</a>
+        </p>
+    "#;
+        let tree = self.three_parser.parse(html, None).unwrap();
+        let root_node = tree.root_node();
+        // Print the whole tree (for demonstration purposes)
+        println!("{}", root_node.to_sexp());
+        println!("Root node kind: {:?}", root_node.kind());
+
+        let mut ivy_code = String::new();
+
+        self.generate_ivy_code(tree.root_node(), html.as_bytes(), &mut ivy_code);
+
+        println!("IVY CODE: {}", ivy_code);
 
         let mut html_tokens = HtmlTokenizer::new(html_content);
         let mut tokens = Vec::new();
@@ -394,7 +599,6 @@ impl<'a> Lexer<'a> {
         let text = &self.input[start..self.pos];
         Some(Token::JavaScript(text.trim().to_owned()))
     }
-
 
     fn peek(&self) -> Option<char> {
         self.input.get(self.pos..).and_then(|s| s.chars().next())

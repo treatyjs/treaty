@@ -1,13 +1,13 @@
 import {signal,Component} from '@angular/core';
 export class LoggerService4 {
+	static ɵfac=function factory_LoggerService4(t) {
+		return new (t || factory_LoggerService4)(i0.ɵɵinject(MY_SERVICE_TOKEN), i0.ɵɵinject(MY_SERVICE_TOKEN3), i0.ɵɵinject(MyService5));
+	};
+
 	static ɵprov=i0.ɵɵdefineInjectable({
 		token:LoggerService4,
 		factory:LoggerService4.ɵfac
 	});
-
-	static ɵfac=function factory_LoggerService4(t) {
-		return new (t || factory_LoggerService4)(i0.ɵɵinject(MY_SERVICE_TOKEN), i0.ɵɵinject(MY_SERVICE_TOKEN3), i0.ɵɵinject(MyService5));
-	};
 
 	constructor(myServiceToken, myServiceToken2, myServiceToken5){
 		myServiceToken.lol();

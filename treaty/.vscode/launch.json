@@ -18,6 +18,10 @@
 				"filter": {
 					"name": "authoring_treaty_authoring",
 					"kind": "lib"
+				},
+				,
+				"env": {
+					"RUST_BACKTRACE": "1",
 				}
 			},
 			"args": [],
@@ -36,6 +40,9 @@
 				"filter": {
 					"name": "rust_authoring",
 					"kind": "bin"
+				},
+				"env": {
+					"RUST_BACKTRACE": "1",
 				}
 			},
 			"args": ["${workspaceFolder}/apps/rust/authoring/src/test.ts"],
@@ -55,6 +62,10 @@
 				"filter": {
 					"name": "rust_authoring",
 					"kind": "bin"
+				}
+				,
+				"env": {
+					"RUST_BACKTRACE": "1",
 				}
 			},
 			"args": [],
