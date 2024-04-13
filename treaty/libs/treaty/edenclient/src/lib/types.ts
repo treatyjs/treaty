@@ -1,6 +1,6 @@
 import type { Elysia } from 'elysia';
 import { Observable } from 'rxjs';
-import type { IsUnknown, UnionToIntersect } from './utils/typesafe.ts';
+import type { IsUnknown, UnionToIntersect } from './utils/typesafe.js';
 
 /**
  * Represents a list of files, typically obtained from an `<input type="file">` element.

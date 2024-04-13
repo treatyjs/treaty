@@ -1,0 +1,26 @@
+{
+  "name": "eden-client",
+  "$schema": "../../../node_modules/nx/schemas/project-schema.json",
+  "sourceRoot": "libs/treaty/edenclient/src",
+  "prefix": "treaty",
+  "tags": [],
+  "projectType": "library",
+  "targets": {
+    "build": {
+      "executor": "@nx/angular:package",
+      "outputs": ["{workspaceRoot}/dist/{projectRoot}"],
+      "options": {
+        "project": "libs/treaty/edenclient/ng-package.json"
+      },
+      "configurations": {
+        "production": {
+          "tsConfig": "libs/treaty/edenclient/tsconfig.lib.prod.json"
+        },
+        "development": {
+          "tsConfig": "libs/treaty/edenclient/tsconfig.lib.json"
+        }
+      },
+      "defaultConfiguration": "production"
+    }
+  }
+}

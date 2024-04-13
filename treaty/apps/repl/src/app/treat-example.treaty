@@ -1,0 +1,18 @@
+import { signal, input } from '@angular/core';
+
+<style>
+  h1 {
+		background-color: black;
+		color: white;
+	}
+</style>
+const counter = signal(0);
+const val = input('Counter');
+<h1>{{ val() }} {{ counter() }}</h1>
+
+
+function increase() {
+	counter.update(v => v + 1);
+}
+
+<button (click)="increase()"> Increase value </button>

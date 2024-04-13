@@ -10,20 +10,17 @@
     "importHelpers": true,
     "target": "es2015",
     "module": "esnext",
-    "lib": [
-      "es2020",
-      "dom"
-    ],
+    "lib": ["es2020", "dom"],
+    "composite": true,
     "skipLibCheck": true,
     "skipDefaultLibCheck": true,
     "baseUrl": ".",
-    "paths": {},
-    "types": [
-      "bun-types"
-    ]
+    "paths": {
+      "@treaty/httpclient": ["libs/treaty/edenclient/src/index.ts"],
+      "@treaty/ts-vite": ["libs/typescript/vite/src/index.ts"],
+      "@treaty/ts-compiler": ["libs/typescript/compiler/src/index.ts"]
+    },
+    "types": ["bun-types"]
   },
-  "exclude": [
-    "node_modules",
-    "tmp"
-  ]
+  "exclude": ["node_modules", "tmp"]
 }
