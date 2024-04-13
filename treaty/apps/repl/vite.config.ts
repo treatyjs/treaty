@@ -2,8 +2,8 @@
 import { defineConfig } from 'vite';
 
 import { nxViteTsPaths } from '@nx/vite/plugins/nx-tsconfig-paths.plugin';
-import { treatySFC } from '@treaty/ts-compiler'
-import { angular } from '@treaty/ts-vite'
+import { treatySFC } from './src/tools/treaty-sfc/compiler'
+import { angular } from './src/tools/angular'
 
 
 export default defineConfig({

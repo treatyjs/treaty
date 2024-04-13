@@ -2,7 +2,7 @@
   "name": "@treaty/ts-compiler",
   "version": "0.0.1",
   "dependencies": {
-    "@angular/compiler": "^17.3.4",
+    "@angular/compiler": "^17.2.1",
     "@swc/helpers": "~0.5.2"
   },
   "type": "commonjs",

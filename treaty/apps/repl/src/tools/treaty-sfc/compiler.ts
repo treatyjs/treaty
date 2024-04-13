@@ -16,10 +16,10 @@ function extractFileName(filePath: string) {
 
 	const lastFolderName = basename(dirPath);
 
-	if (lastFolderName !== "pages") {
+	// if (lastFolderName !== "pages") {
 
-	  return `${lastFolderName}-${fileName}`;
-	}
+	//   return `${lastFolderName}-${fileName}`;
+	// }
 
 	return fileName;
 }
