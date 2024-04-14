@@ -1,7 +1,7 @@
 import type { Node, HtmlParser } from '@angular/compiler';
 import { loadEsmModule } from '@angular-devkit/build-angular/src/utils/load-esm.js';
 
-class HtmlTokenizer {
+class TreatyTokenizer {
   private input: string;
   private pos: number;
   private htmlParser?: HtmlParser;
@@ -443,12 +443,12 @@ export type Token =
     };
 
 export function parseTreaty(input: string) {
-  const htmlTokenizer = new HtmlTokenizer(input);
+  const htmlTokenizer = new TreatyTokenizer(input);
   return htmlTokenizer.parse();
 }
 
 export async function parseTreatyAndGroup(input: string) {
-  const htmlTokenizer = new HtmlTokenizer(input);
+  const htmlTokenizer = new TreatyTokenizer(input);
   const tokens: Token[] = await htmlTokenizer.parse();
 
   const styleTokens: Token[] = [];
