@@ -1,11 +1,10 @@
-import type { Node, HtmlParser } from '@angular/compiler'
+import type { Node, HtmlParser } from '@angular/compiler';
 import { loadEsmModule } from '@angular-devkit/build-angular/src/utils/load-esm.js';
-
 
 class HtmlTokenizer {
   private input: string;
   private pos: number;
-  private htmlParser?: HtmlParser
+  private htmlParser?: HtmlParser;
 
   constructor(input: string) {
     this.input = input;
@@ -14,15 +13,15 @@ class HtmlTokenizer {
 
   async setup() {
     if (!this.htmlParser) {
-      const { HtmlParser} = await loadEsmModule<
-            typeof import('@angular/compiler')
-          >('@angular/compiler')
-      this.htmlParser = new HtmlParser()
+      const { HtmlParser } = await loadEsmModule<
+        typeof import('@angular/compiler')
+      >('@angular/compiler');
+      this.htmlParser = new HtmlParser();
     }
   }
 
-  private peek(): string | undefined {
-    return this.input[this.pos];
+  private peek(offset = 0): string | undefined {
+    return this.input[this.pos + offset];
   }
 
   private lookahead(expected: string): boolean {
@@ -228,8 +227,8 @@ class HtmlTokenizer {
               tokenizeExpansionForms: true,
               // Explicitly disable blocks so that their characters are treated as plain text.
               tokenizeBlocks: false,
-            })
-        
+            });
+
             blockContents.push({
               type: 'html',
               value: result.rootNodes,
@@ -250,7 +249,6 @@ class HtmlTokenizer {
 
     return blockContents;
   }
-
 
   private advanceWhile(condition: (char: string) => boolean) {
     while (this.peek()) {
@@ -281,7 +279,7 @@ class HtmlTokenizer {
             end = this.pos;
             break;
           }
-        } else if (this.lookahead('/>') || this.lookahead('>')) {
+        } else if (this.lookahead('/>') || this.isSelfClosing(this.peekTagName())) {
           if (tagDepth === 0) {
             end = this.pos + 1;
             this.advance(1);
@@ -309,20 +307,53 @@ class HtmlTokenizer {
 
     const htmlContent = this.input.slice(start, end);
     console.log(`Processing HTML segment: ${htmlContent}`);
-    await this.setup()
+    await this.setup();
     const result = this.htmlParser!.parse(htmlContent, 'template', {
       // Allows for ICUs to be parsed.
       tokenizeExpansionForms: true,
       // Explicitly disable blocks so that their characters are treated as plain text.
       tokenizeBlocks: false,
-    })
+    });
 
     return {
       type: 'html',
       value: result.rootNodes,
     };
   }
+  
+  private peekTagName(): string | undefined {
+    let tagName = '';
+    let i = this.pos + 1; // skip '<'
+    while (i < this.input.length) {
+      const char = this.input[i];
+      if (char === '/' || char === '>' || char === ' ') {
+        break;
+      }
+      tagName += char;
+      i++;
+    }
+    return tagName.toLowerCase();
+  }
 
+
+  private isSelfClosing(tagName: string): boolean {
+    const selfClosingTags = [
+      'img',
+      'br',
+      'input',
+      'meta',
+      'link',
+      'hr',
+      'area',
+      'base',
+      'col',
+      'embed',
+      'param',
+      'source',
+      'track',
+    ];
+    return selfClosingTags.includes(tagName.toLowerCase());
+  }
 
   private parseTemplateExpression(): string | undefined {
     const start = this.pos;
@@ -354,9 +385,8 @@ class HtmlTokenizer {
         case '{':
           if (this.lookahead('{{')) {
             this.advance(2);
-            const result =  this.parseTemplateExpression();
+            const result = this.parseTemplateExpression();
             if (result) {
-             
             }
           } else {
             //TODO: add back in control flow
@@ -398,7 +428,6 @@ class HtmlTokenizer {
   }
 }
 
-
 export type Token =
   | {
       type: 'style';
@@ -418,41 +447,50 @@ export function parseTreaty(input: string) {
   return htmlTokenizer.parse();
 }
 
-
 export async function parseTreatyAndGroup(input: string) {
-    const htmlTokenizer = new HtmlTokenizer(input);
-    const tokens: Token[] = await htmlTokenizer.parse();
+  const htmlTokenizer = new HtmlTokenizer(input);
+  const tokens: Token[] = await htmlTokenizer.parse();
 
-    const styleTokens: Token[] = [];
-    const javascriptTokens: Token[] = [];
-    const htmlTokens: Node[][] = [];
+  const styleTokens: Token[] = [];
+  const javascriptTokens: Token[] = [];
+  const htmlTokens: Node[][] = [];
 
-    for (const token of tokens) {
-        switch (token.type) {
-            case 'style':
-                styleTokens.push(token);
-                break;
-            case 'javascript':
-                javascriptTokens.push(token);
-                break;
-            case 'html':
-                htmlTokens.push(token.value);
-                break;
-            default:
-                break;
-        }
+  for (const token of tokens) {
+    switch (token.type) {
+      case 'style':
+        styleTokens.push(token);
+        break;
+      case 'javascript':
+        javascriptTokens.push(token);
+        break;
+      case 'html':
+        htmlTokens.push(token.value);
+        break;
+      default:
+        break;
     }
+  }
 
-    const styleString = styleTokens.map(token => (token.value as string).replaceAll('\n', '').replaceAll('\t', '') as string);
-    const javascriptString = javascriptTokens.map(token => token.value).join('\n');
-    const htmlString = htmlTokens.map(content => content.map(c => {
-      return c.sourceSpan.toString()
-    }).join('\n'));
+  const styleString = styleTokens.map(
+    (token) =>
+      (token.value as string)
+        .replaceAll('\n', '')
+        .replaceAll('\t', '') as string
+  );
+  const javascriptString = javascriptTokens
+    .map((token) => token.value)
+    .join('\n');
+  const htmlString = htmlTokens.map((content) =>
+    content
+      .map((c) => {
+        return c.sourceSpan.toString();
+      })
+      .join('\n')
+  );
 
-    return {
-      style: styleString,
-      javascript: javascriptString,
-      html:  htmlString
-    }
+  return {
+    style: styleString,
+    javascript: javascriptString,
+    html: htmlString,
+  };
 }
-

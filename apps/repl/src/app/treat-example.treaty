@@ -29,7 +29,7 @@
   <div id="left">
     <div class="header left-container">
       <a id="logo" href="https://oxc-project.github.io">
-      <img height="100%" width="20" src="https://raw.githubusercontent.com/Boshen/oxc-assets/main/oxc.ico" alt="logo" />
+        <img height="100%" width="20" src="https://raw.githubusercontent.com/Boshen/oxc-assets/main/oxc.ico" alt="logo" />
         <span>Oxc</span>
       </a>
       <div>
@@ -52,6 +52,26 @@
   <div id="right">
     <div class="header controls">
       
+      <div>
+        <button type="button" id="ast">AST</button>s
+        <button type="button" id="codegen">Codegen</button>
+        <button type="button" id="ir">IR</button>
+        <button type="button" id="prettier-ir">Prettier IR</button>
+        <button type="button" id="prettier">Format (Prettier)</button>
+        <button type="button" id="scope">Scope</button>
+        <button type="button" id="symbol">Symbol</button>
+        <button type="button" id="ir-copy">Copy IR to clipboard</button>
+      </div>
+      <div id="codegen-controls">
+        <label id="transform">Transform<input id="transform-checkbox" type="checkbox"></label>z
+        <label id="codegen-ts">TS<input id="codegen-ts-checkbox" type="checkbox"></label>
+        <label>| Minify: </label>
+        <label id="whitespace">whitespace<input id="whitespace-checkbox" type="checkbox"></label>
+        <label id="mangle">mangle<input id="mangle-checkbox" type="checkbox"></label>
+        <label id="compress">compress<input id="compress-checkbox" type="checkbox"> </label>
+        <div id="duration" title="Execution Time"></div>
+      </div>
+
     </div>
     <div id="viewer"></div>
   </div>
