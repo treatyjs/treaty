@@ -6,5 +6,5 @@
     "composite": true,
   },
   "exclude": ["src/**/*.spec.ts", "src/**/*.test.ts"],
-  "include": ["src/**/*.ts"]
+  "include": ["src/**/*.ts", "src/app/app.treaty"]
 }

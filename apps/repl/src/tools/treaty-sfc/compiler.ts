@@ -2,6 +2,7 @@ import { R3InputMetadata } from '@angular/compiler';
 import { Printer } from './printer'
 import { basename, dirname, extname } from 'path';
 import type { Plugin } from 'vite';
+import { parseTreaty, parseTreatyAndGroup } from './treaty/parser';
 
 export function loadEsmModule<T>(modulePath: string | URL): Promise<T> {
 	return new Function('modulePath', `return import(modulePath);`)(
@@ -147,7 +148,8 @@ function replaceSpreadWithBindings(htmlStrings: string[], objectName: string, ke
 	});
 }
 
-function findInputAndOutputAssignments(code: string) {
+async function findInputAndOutputAssignments(code: string) {
+
 	// Check for 'input' and 'output' imports
 	const importCheck = /import\s+{[^}]*\b(input|output)\b[^}]*}\s+from\s+['"]@angular\/core['"]/;
 	const hasImport = importCheck.test(code);
@@ -210,28 +212,14 @@ export const treatySFC: () => Plugin = () => {
 				esbuild: false,
 			};
 		},
-		transform(code, id) {
+		async transform(code, id) {
 
 			if (id.endsWith('.treaty')) {
 
-				const cssContent: string[] = [];
-				let htmlContent: string[] = [];
+				
 
-				const cssRegex = /<style(?:\s+lang="(css|scss)")?[^>]*>([\s\S]*?)<\/style>/g;
-				const angularHtmlRegex = /<([A-Za-z0-9\-_]+)(\s+[^>]*?(\{\{.*?\}\}|[\[\(]\(?.+?\)?[\]\)]|[\*\#][A-Za-z0-9\-_]+=".*?"))*[\s\S]*?<\/\1>/g;
-
-				const jsTsContent = code.replace(cssRegex, (match, lang, css) => {
-					cssContent.push(css.replace(/\/\*[\s\S]*?\*\//g, '')
-						.replace(/\s*[\n\r]+\s*/g, '')
-						.replace(/\s*([{}:;,])\s*/g, '$1')
-						.replace(/\s+/g, ' ')
-						.trim());
-					return '';
-				}).replace(angularHtmlRegex, (match) => {
-					htmlContent.push(match);
-					return '';
-				});
-
+				let { html: htmlContent, javascript: jsTsContent, style: cssContent } = await parseTreatyAndGroup(code)
+				console.log(cssContent)
 				const importRegex = /import\s+(?:\{\s*([^}]+)\s*\}|\* as (\w+)|(\w+))(?:\s+from\s+)?(?:".*?"|'.*?')[\s]*?(?:;|$)/g;
 				let match;
 				const imports = [];
@@ -244,7 +232,7 @@ export const treatySFC: () => Plugin = () => {
 
 				const addToDeclatoration: any[] = []
 				imports.forEach(importName => {
-					const tagStartRegex = new RegExp(`<${importName}\\s`, 'g');
+					const tagStartRegex = new RegExp(`<${importName}`, 'g');
 					const tagEndRegex = new RegExp(`</${importName}>`, 'g');
 					if (tagStartRegex.test(modifiedCode)) {
 						if (!addToDeclatoration.includes(importName)) {
@@ -272,7 +260,7 @@ export const treatySFC: () => Plugin = () => {
 
 				const angularTemplate = compiler.parseTemplate(updatedHtmlStrings.join('\n'), id)
 
-				const { inputs, outputs } = findInputAndOutputAssignments(jsTsContent)
+				const { inputs, outputs } = await findInputAndOutputAssignments(jsTsContent)
 
 				const constantPool = new compiler.ConstantPool();
 				const out = compiler.compileComponentFromMetadata(
@@ -287,6 +275,7 @@ export const treatySFC: () => Plugin = () => {
 							specialAttributes: {},
 							useTemplatePipeline: true,
 						},
+						rawImports: addToDeclatoration as any,
 						inputs,
 						outputs: outputs,
 						lifecycle: {
