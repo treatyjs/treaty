@@ -1,0 +1,33 @@
+on: push
+name: 🚀 Deploy website on push
+jobs:
+  web-deploy:
+    name: 🎉 Deploy
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Setup Node.js for use with actions
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: 🚚 Get latest code
+        uses: actions/checkout@v4
+
+      - name: Clean install dependencies
+        run: npm install
+
+      - name: Build app
+        run: npx nx run repl:build
+
+      - name: Rewrite base href
+        uses: SteveSandersonMS/ghaction-rewrite-base-href@v1
+        with:
+          html_path: ./dist/apps/repl/index.html
+          base_href: /treaty/
+
+      - name: deploy
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./dist/apps/repl/index.html
