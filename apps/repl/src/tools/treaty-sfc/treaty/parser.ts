@@ -1,23 +1,14 @@
 import type { Node, HtmlParser } from '@angular/compiler';
-import { loadEsmModule } from '@angular-devkit/build-angular/src/utils/load-esm.js';
 
 class TreatyTokenizer {
   private input: string;
   private pos: number;
   private htmlParser?: HtmlParser;
 
-  constructor(input: string) {
+  constructor(input: string, compiler: typeof import('@angular/compiler')) {
+    this.htmlParser = new compiler.HtmlParser();
     this.input = input;
     this.pos = 0;
-  }
-
-  async setup() {
-    if (!this.htmlParser) {
-      const { HtmlParser } = await loadEsmModule<
-        typeof import('@angular/compiler')
-      >('@angular/compiler');
-      this.htmlParser = new HtmlParser();
-    }
   }
 
   private peek(offset = 0): string | undefined {
@@ -221,7 +212,6 @@ class TreatyTokenizer {
         if (blockDepth === 0) {
           const content = this.input.slice(blockStart, this.pos).trim();
           if (content) {
-            await this.setup();
             const result = this.htmlParser!.parse(content, 'template', {
               // Allows for ICUs to be parsed.
               tokenizeExpansionForms: true,
@@ -279,7 +269,7 @@ class TreatyTokenizer {
             end = this.pos;
             break;
           }
-        } else if (this.lookahead('/>') || this.isSelfClosing(this.peekTagName())) {
+        } else if (this.lookahead('/>') || this.isSelfClosing(this.peekTagName()!)) {
           if (tagDepth === 0) {
             end = this.pos + 1;
             this.advance(1);
@@ -307,7 +297,6 @@ class TreatyTokenizer {
 
     const htmlContent = this.input.slice(start, end);
     console.log(`Processing HTML segment: ${htmlContent}`);
-    await this.setup();
     const result = this.htmlParser!.parse(htmlContent, 'template', {
       // Allows for ICUs to be parsed.
       tokenizeExpansionForms: true,
@@ -442,13 +431,13 @@ export type Token =
       value: Node[];
     };
 
-export function parseTreaty(input: string) {
-  const htmlTokenizer = new TreatyTokenizer(input);
+export function parseTreaty(input: string,  compiler: typeof import('@angular/compiler')) {
+  const htmlTokenizer = new TreatyTokenizer(input, compiler)
   return htmlTokenizer.parse();
 }
 
-export async function parseTreatyAndGroup(input: string) {
-  const htmlTokenizer = new TreatyTokenizer(input);
+export async function parseTreatyAndGroup(input: string, compiler: typeof import('@angular/compiler')) {
+  const htmlTokenizer = new TreatyTokenizer(input, compiler);
   const tokens: Token[] = await htmlTokenizer.parse();
 
   const styleTokens: Token[] = [];

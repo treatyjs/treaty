@@ -21,8 +21,8 @@ export default defineConfig({
     host: 'localhost',
   },
 
+  assetsInclude: ["**/*.grammar"],
 
-  optimizeDeps: { exclude: ["treaty.grammar"] },
 
 
   plugins: [
