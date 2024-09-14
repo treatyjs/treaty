@@ -9,7 +9,8 @@ import { requiresLinking } from './requiresLinking';
 const BuildOptimizerPlugin: Plugin = {
   name: 'vite-plugin-angular-optimizer',
   apply(config, env) {
-    return env.command === 'build';
+    // return env.command === 'build';
+    return false
   },
   enforce: 'post',
   config() {

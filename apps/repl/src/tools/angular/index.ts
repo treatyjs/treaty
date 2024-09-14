@@ -11,7 +11,7 @@ function angular(): Plugin[] {
     ...ConfigPlugin,
     DirImporterPlugin,
     DevelopmentPlugin,
-    ...BuildPlugin(),
+    // ...BuildPlugin(),
   ];
   return plugins;
 }

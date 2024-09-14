@@ -74,7 +74,8 @@ const BuildPlugin = (): Plugin[] => {
       name: 'vite-plugin-angular-prod-post',
       enforce: 'post',
       apply(config, env) {
-        return env.command === 'serve';
+        // return env.command === 'serve';
+        return true
       },
       async config(_userConfig, env) {
         complierCli = await loadEsmModule<
@@ -112,7 +113,8 @@ const BuildPlugin = (): Plugin[] => {
       name: 'vite-plugin-angular-prod',
       enforce: 'pre',
       apply(config, env) {
-        return env.command === 'build';
+        // return env.command === 'build';
+    return false
       },
       async transform(code, id) {
         if (id.includes('node_modules')) {
