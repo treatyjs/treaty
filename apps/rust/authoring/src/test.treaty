@@ -1,0 +1,26 @@
+import { TestService } from '../../test.service';
+const test = inject(TestService);
+test.sayHello();
+	<style>
+  h1 {
+	background - color: black;
+	color: white;
+}
+</style>
+const counter = signal(0);
+<h1>{{ counter() }} - {{ test.sayHello() }} </h1>
+
+const test = "<div>test</div>"
+const test2 = '<div>test2</div>'
+const test3 = `
+<div>
+  test3
+</div>
+`
+
+
+function increase() {
+	counter.update(v => v + 1);
+}
+
+<button (click)="increase()" > Increase value </button>

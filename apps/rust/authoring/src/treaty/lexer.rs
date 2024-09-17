@@ -1,410 +1,427 @@
-use crate::html::{DomNode, HtmlTokenizer, Parser};
-use std::fmt;
-#[derive(Debug, PartialEq, Clone)]
-pub enum ControlFlowContent {
-    IfElse(String, Vec<HtmlContent>, Option<Box<ControlFlowContent>>),
-    For(String, Vec<HtmlContent>, Option<Vec<HtmlContent>>),
-    Switch(
-        String,
-        Vec<(String, Vec<HtmlContent>)>,
-        Option<Vec<HtmlContent>>,
-    ),
-}
+use crate::treaty::token::{Token, TokenKind};
+use std::str::Chars;
 
-#[derive(Debug, PartialEq, Clone)]
-pub enum HtmlContent {
-    Node(DomNode),
-    TemplateExpression(String),
-    ControlFlow(ControlFlowContent),
-}
-impl HtmlContent {
-    fn into_control_flow_content(self) -> Option<ControlFlowContent> {
-        match self {
-            HtmlContent::ControlFlow(content) => Some(content),
-            _ => None,
-        }
-    }
-}
+use super::token::{ControlFlowKind, DeferKind};
 
-impl fmt::Display for HtmlContent {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            HtmlContent::Node(node) => write!(f, "{}", node),
-            HtmlContent::TemplateExpression(expression) => {
-                write!(f, "TemplateExpression({})", expression)
-            }
-            HtmlContent::ControlFlow(content) => write!(f, "ControlFlow({:?})", content),
-        }
-    }
-}
-
-pub enum Token {
-    Style(String),
-    JavaScript(String),
-    HTML(Vec<HtmlContent>),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LexerState {
+    Default,
+    JavaScript,
+    HTML,
+    CSS,
+    TemplateExpression,
+    ControlFlow,
 }
 
 pub struct Lexer<'a> {
     input: &'a str,
+    chars: Chars<'a>,
     pos: usize,
+    current_char: Option<char>,
+    state: LexerState,
+    state_stack: Vec<LexerState>, // Stack to keep track of parent states
 }
 
 impl<'a> Lexer<'a> {
-    pub fn new(input: &'a str, ) -> Self {
+    pub fn new(input: &'a str) -> Self {
+        let mut chars = input.chars();
+        let current_char = chars.next();
         Lexer {
             input,
+            chars,
             pos: 0,
-        }
-    }
-
-    pub fn for_each_token<F>(&mut self, mut callback: F)
-    where
-        F: FnMut(Token),
-    {
-        while let Some(token) = self.next_token() {
-            callback(token);
+            current_char,
+            state: LexerState::Default,
+            state_stack: Vec::new(), // Initialize the state stack
         }
     }
 
     pub fn next_token(&mut self) -> Option<Token> {
-        while let Some(current_char) = self.peek() {
-            match current_char {
-                '<' if self.lookahead("<style>") => {
-                    self.advance(7); // Skip past <style>
-                    return self.parse_style();
+        self.consume_whitespace();
+
+        match self.state {
+            LexerState::Default => self.lex_default_state(),
+            LexerState::JavaScript => self.parse_javascript(),
+            LexerState::HTML => self.parse_html(),
+            LexerState::CSS => self.parse_style(),
+            LexerState::TemplateExpression => self.parse_template_expression(),
+            LexerState::ControlFlow => self.parse_control_flow(),
+        }
+    }
+
+    /// Advances the lexer by one character.
+    fn advance(&mut self) {
+        self.pos += self.current_char.unwrap_or('\0').len_utf8();
+        self.current_char = self.chars.next();
+    }
+
+    /// Consumes characters while the condition is true.
+    fn consume_while<F>(&mut self, mut condition: F) -> String
+    where
+        F: FnMut(char) -> bool,
+    {
+        let mut result = String::new();
+        while let Some(ch) = self.current_char {
+            if condition(ch) {
+                result.push(ch);
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        result
+    }
+
+    /// Consumes whitespace characters.
+    fn consume_whitespace(&mut self) {
+        self.consume_while(|ch| ch.is_whitespace());
+    }
+
+    /// Retrieves the next token.
+    fn lex_default_state(&mut self) -> Option<Token> {
+        let current_char = self.current_char?;
+
+        match current_char {
+            '<' if self.starts_with("<style>") => {
+                self.advance_by("<style>".len());
+                self.push_state(LexerState::CSS);
+                self.parse_style()
+            }
+            '<' => {
+                self.push_state(LexerState::HTML);
+                self.parse_html()
+            }
+            '{' if self.starts_with("{{") => {
+                self.advance_by(2); // Skip '{{'
+                self.push_state(LexerState::TemplateExpression);
+                self.parse_template_expression()
+            }
+            '@' => self.parse_control_flow(),
+            _ => {
+                self.push_state(LexerState::JavaScript);
+                self.parse_javascript()
+            }
+        }
+    }
+
+    /// Parses a JavaScript block.
+    fn parse_javascript(&mut self) -> Option<Token> {
+        let start_pos = self.pos;
+        while let Some(ch) = self.current_char {
+            match ch {
+                // Handle string literals
+                '\'' | '"' | '`' => {
+                    self.consume_string(ch);
                 }
-                '<' => {
-                    return self.parse_html_segment();
+
+                // Handle comments
+                '/' => {
+                    if self.starts_with("//") {
+                        self.consume_line_comment();
+                    } else if self.starts_with("/*") {
+                        self.consume_block_comment();
+                    } else {
+                        self.advance();
+                    }
                 }
-                '{' if self.lookahead("{{") => {
-                    self.advance(2); // Skip past {{
-                    let expression = self.parse_template_expression()?;
-                    return Some(Token::HTML(vec![HtmlContent::TemplateExpression(
-                        expression,
-                    )]));
+                '\n' | '\r' | '\u{000C}' | ';' => {
+                    self.advance();
+                    break;
                 }
+                '<' if (self.starts_with("<style>") || self.starts_with("</")) => break,
+                '{' if self.starts_with("{{") => break,
                 '@' => {
-                    let control_flow = self.parse_control_flow()?;
-                    return Some(Token::HTML(vec![control_flow]));
+                    // Handle the '@' character and transition to control flow state
+                    self.push_state(LexerState::ControlFlow);
+                    break;
                 }
-                '-' if self.lookahead("---") => {
-                    // this is 100% javascript/Typescript
-                    self.advance(3); // Skip past ---
-
-                    return self.parse_javascript();
-                }
-                _ => {
-                    // Handles mix files
-                    return self.parse_text();
-                }
+                // Handle other cases
+                _ => self.advance(),
             }
         }
-        None
+
+        let end_pos = self.pos;
+        let value = self.input[start_pos..end_pos].to_string();
+        self.pop_state(); // Return to the previous state
+        Some(Token::new(TokenKind::JavaScript(value), start_pos, end_pos))
     }
 
-    fn parse_control_flow(&mut self) -> Option<HtmlContent> {
-        match self.peek_keyword().as_deref() {
-            Some("if") => self.parse_if(),
-            Some("for") => self.parse_for(),
-            Some("switch") => self.parse_switch(),
-            _ => None,
-        }
-    }
+    /// Parses a style block.
+    fn parse_style(&mut self) -> Option<Token> {
+        let start_pos = self.pos;
 
-    fn parse_template_expression(&mut self) -> Option<String> {
-        let start = self.pos;
-        while let Some(ch) = self.peek() {
-            if ch == '}' && self.lookahead("}}") {
-                let expression = &self.input[start..self.pos];
-                self.advance(2);
-                return Some(expression.trim().to_string());
+        while let Some(ch) = self.current_char {
+            if self.starts_with("</style>") {
+                break;
             }
-            self.advance(1);
+            match ch {
+                '/' if self.starts_with("/*") => self.consume_block_comment(),
+                '{' => self.advance(), // Advance over '{', you might want to handle nested blocks
+                '}' => self.advance(), // Advance over '}', matching any opened '{'
+                _ => self.advance(),
+            }
         }
-        None
+
+        let end_pos = self.pos;
+        let value = self.input[start_pos..end_pos].to_string();
+
+        if self.starts_with("</style>") {
+            self.advance_by("</style>".len());
+        }
+
+        self.pop_state(); // Return to the previous state
+        Some(Token::new(TokenKind::Style(value), start_pos, end_pos))
     }
 
-    fn parse_html_segment(&mut self) -> Option<Token> {
-        let mut tag_depth = 0;
-        let mut start = self.pos;
-        let mut end = self.pos;
-        let mut is_in_tag = false;
+    /// Parses an HTML segment.
+    fn parse_html(&mut self) -> Option<Token> {
+        let start_pos = self.pos;
+        let mut tag_stack = Vec::new();
 
-        while let Some(ch) = self.peek() {
+        while let Some(ch) = self.current_char {
             if ch == '<' {
-                is_in_tag = true;
-                if self.lookahead("</") {
-                    tag_depth -= 1;
-                    if tag_depth == 0 {
-                        self.advance_while(|c| c != '>');
-                        self.advance(1);
-                        end = self.pos;
+                if self.starts_with("<!--") {
+                    self.consume_html_comment();
+                    continue;
+                } else if self.starts_with("</") {
+                    self.advance_by(2); // Skip '</'
+                    let tag_name = self.consume_tag_name();
+                    if let Some(expected_tag) = tag_stack.pop() {
+                        if tag_name != expected_tag {
+                            // Handle mismatched tag (optional)
+                        }
+                    } else {
                         break;
                     }
-                } else {
-                    if tag_depth == 0 {
-                        start = self.pos;
+                    self.consume_until('>'); // Skip until '>'
+                    self.advance(); // Skip '>'
+                    if tag_stack.is_empty() {
+                        break;
                     }
-                    tag_depth += 1;
+                } else if self.starts_with("<") {
+                    self.advance(); // Skip '<'
+                    let tag_name = self.consume_tag_name();
+                    tag_stack.push(tag_name);
+                    self.consume_attributes(); // Handle attributes (optional)
+                    self.advance(); // Skip '>'
+                } else {
+                    self.advance();
                 }
-            } else if ch == '>' && is_in_tag {
-                is_in_tag = false;
-            }
-            self.advance(1);
-            if tag_depth == 0 && !is_in_tag {
-                end = self.pos;
+            } else if ch == '{' && self.starts_with("{{") {
+                break;
+            } else {
+                self.advance();
             }
         }
 
-        let html_content = &self.input[start..end];
-        println!("Processing HTML segment: {}", html_content);
+        let end_pos = self.pos;
+        let value = self.input[start_pos..end_pos].to_string();
+        self.pop_state(); // Return to the previous state
+        Some(Token::new(TokenKind::HTML(value), start_pos, end_pos))
+    }
 
-        let mut html_tokens = HtmlTokenizer::new(html_content);
-        let mut tokens = Vec::new();
-        while let Some(token) = html_tokens.next_token() {
-            tokens.push(token);
+    /// Parses a template expression.
+    fn parse_template_expression(&mut self) -> Option<Token> {
+        let start_pos = self.pos;
+        let mut brace_count = 0;
+
+        while let Some(ch) = self.current_char {
+            if ch == '{' {
+                brace_count += 1;
+            } else if ch == '}' {
+                brace_count -= 1;
+                if brace_count == -2 {
+                    // We've found the closing '}}'
+                    break;
+                }
+            } else if ch == '\'' || ch == '"' || ch == '`' {
+                self.consume_string(ch);
+                continue;
+            }
+            self.advance();
         }
-        let mut html_parser = Parser::new(tokens);
-        let dom_nodes = html_parser.parse();
 
-        Some(Token::HTML(
-            dom_nodes.into_iter().map(HtmlContent::Node).collect(),
+        if self.starts_with("}}") {
+            self.advance_by(2); // Skip '}}'
+        }
+
+        let end_pos = self.pos;
+        let value = self.input[start_pos..end_pos].to_string();
+        self.pop_state(); // Return to the previous state
+        Some(Token::new(
+            TokenKind::TemplateExpression(value.trim().to_string()),
+            start_pos,
+            end_pos,
         ))
     }
 
-    fn advance_while<F>(&mut self, condition: F)
-    where
-        F: Fn(char) -> bool,
-    {
-        while let Some(ch) = self.peek() {
-            if condition(ch) {
-                self.advance(1);
-            } else {
-                break;
-            }
-        }
-    }
+    /// Parses control flow statements (@if, @for, etc.).
+    fn parse_control_flow(&mut self) -> Option<Token> {
+        let start_pos = self.pos;
 
-    fn parse_if(&mut self) -> Option<HtmlContent> {
-        self.consume_keyword("if");
-        let condition = self.capture_until('{');
-        self.advance(1);
-        let content = self.capture_block();
-        self.advance(1);
-
-        let mut else_content: Option<Box<ControlFlowContent>> = None;
-        if self.lookahead("@else") {
-            self.advance(5);
-            if self.lookahead(" if") {
-                // Check for @else if
-                self.advance(3);
-                else_content = Some(Box::new(
-                    self.parse_if()?.into_control_flow_content().unwrap(),
-                ));
-            } else {
-                self.advance(1);
-                let else_block = self.capture_block();
-                self.advance(1);
-                else_content = Some(Box::new(ControlFlowContent::IfElse(
-                    "".to_string(),
-                    else_block,
-                    None,
-                )));
-            }
-        }
-
-        Some(HtmlContent::ControlFlow(ControlFlowContent::IfElse(
-            condition,
-            content,
-            else_content,
-        )))
-    }
-
-    fn parse_for(&mut self) -> Option<HtmlContent> {
-        self.consume_keyword("for");
-        let iterator = self.capture_until('{');
-        self.advance(1);
-        let content = self.capture_block();
-        self.advance(1);
-
-        let empty_content = if self.lookahead("@empty") {
-            self.consume_keyword("empty");
-            Some(self.capture_block())
+        if self.starts_with("@if") {
+            self.advance_by("@if".len());
+            return Some(Token::new(TokenKind::ControlFlow(ControlFlowKind::If), start_pos, self.pos));
+        } else if self.starts_with("@else if") {
+            self.advance_by("@else if".len());
+            return Some(Token::new(TokenKind::ControlFlow(ControlFlowKind::ElseIf), start_pos, self.pos));
+        } else if self.starts_with("@else") {
+            self.advance_by("@else".len());
+            return Some(Token::new(TokenKind::ControlFlow(ControlFlowKind::Else), start_pos, self.pos));
+        } else if self.starts_with("@for") {
+            self.advance_by("@for".len());
+            return Some(Token::new(TokenKind::ControlFlow(ControlFlowKind::For), start_pos, self.pos));
+        } else if self.starts_with("@empty") {
+            self.advance_by("@empty".len());
+            return Some(Token::new(TokenKind::ControlFlow(ControlFlowKind::Empty), start_pos, self.pos));
+        } else if self.starts_with("@switch") {
+            self.advance_by("@switch".len());
+            return Some(Token::new(TokenKind::ControlFlow(ControlFlowKind::Switch), start_pos, self.pos));
+        } else if self.starts_with("@case") {
+            self.advance_by("@case".len());
+            return Some(Token::new(TokenKind::ControlFlow(ControlFlowKind::Case), start_pos, self.pos));
+        } else if self.starts_with("@default") {
+            self.advance_by("@default".len());
+            return Some(Token::new(TokenKind::ControlFlow(ControlFlowKind::Default), start_pos, self.pos));
+        } else if self.starts_with("@defer") {
+            self.advance_by("@defer".len());
+            return Some(Token::new(TokenKind::Defer(DeferKind::Defer), start_pos, self.pos));
+        } else if self.starts_with("@placeholder") {
+            self.advance_by("@placeholder".len());
+            return Some(Token::new(TokenKind::Defer(DeferKind::Placeholder), start_pos, self.pos));
+        } else if self.starts_with("@loading") {
+            self.advance_by("@loading".len());
+            return Some(Token::new(TokenKind::Defer(DeferKind::Loading), start_pos, self.pos));
+        } else if self.starts_with("@error") {
+            self.advance_by("@error".len());
+            return Some(Token::new(TokenKind::Defer(DeferKind::Error), start_pos, self.pos));
         } else {
-            None
-        };
-
-        Some(HtmlContent::ControlFlow(ControlFlowContent::For(
-            iterator,
-            content,
-            empty_content,
-        )))
+            // If not a recognized control flow, assume it's JavaScript
+            self.state = LexerState::JavaScript;
+            self.advance(); // Ensure we advance the position to avoid infinite loop
+            self.parse_javascript()
+        }
     }
 
-    fn parse_switch(&mut self) -> Option<HtmlContent> {
-        self.consume_keyword("switch");
-        let expression = self.capture_until('{');
-        self.advance(1);
+    /// Checks if the upcoming characters match the given string.
+    fn starts_with(&self, s: &str) -> bool {
+        self.input[self.pos..].starts_with(s)
+    }
 
-        let mut cases = Vec::new();
-        let mut default_case: Option<Vec<HtmlContent>> = None;
-        while let Some(keyword) = self.peek_keyword() {
-            match keyword.as_str() {
-                "case" => {
-                    self.consume_keyword("case");
-                    let case_expr = self.capture_until('{');
-                    self.advance(1);
-                    let case_content = self.capture_block();
-                    self.advance(1);
-                    cases.push((case_expr, case_content));
+    /// Advances the lexer by a given number of bytes.
+    fn advance_by(&mut self, n: usize) {
+        for _ in 0..n {
+            self.advance();
+        }
+    }
+
+    /// Consumes a string literal, handling escaped characters.
+    fn consume_string(&mut self, delimiter: char) {
+        self.advance(); // Skip the opening quote
+        while let Some(ch) = self.current_char {
+            match ch {
+                '\\' => {
+                    self.advance(); // Skip the backslash
+                    self.advance(); // Skip the escaped character
                 }
-                "default" => {
-                    self.consume_keyword("default");
-                    self.advance(1);
-                    default_case = Some(self.capture_block());
-                    self.advance(1);
+                ch if ch == delimiter => {
+                    self.advance(); // Skip the closing quote
                     break;
                 }
-                _ => break,
+                _ => self.advance(),
             }
         }
-
-        Some(HtmlContent::ControlFlow(ControlFlowContent::Switch(
-            expression,
-            cases,
-            default_case,
-        )))
     }
 
-    fn capture_until(&mut self, until: char) -> String {
-        let start_pos = self.pos;
-        while let Some(current_char) = self.peek() {
-            if current_char == until {
+    /// Consumes a line comment.
+    fn consume_line_comment(&mut self) {
+        while let Some(ch) = self.current_char {
+            if ch == '\n' {
                 break;
             }
-            self.advance(1);
-        }
-        self.input[start_pos..self.pos].to_string()
-    }
-
-    fn consume_keyword(&mut self, keyword: &str) {
-        let len = keyword.len();
-        if self.input[self.pos..].starts_with(keyword) {
-            self.pos += len; // Move past the keyword
-            self.consume_whitespace(); // Consume any following whitespace
+            self.advance();
         }
     }
 
-    fn capture_block(&mut self) -> Vec<HtmlContent> {
-        let mut block_contents = Vec::new();
-        let mut block_depth = 1;
-        let block_start = self.pos;
-
-        while let Some(ch) = self.peek() {
-            match ch {
-                '{' => {
-                    block_depth += 1;
-                    self.advance(1);
-                }
-                '}' => {
-                    block_depth -= 1;
-                    if block_depth == 0 {
-                        let content = self.input[block_start..self.pos].trim().to_string();
-                        if !content.is_empty() {
-                            block_contents.push(HtmlContent::Node(DomNode::Text(content)));
-                        }
-                        self.advance(1);
-                        break;
-                    }
-                    self.advance(1);
-                }
-                _ => self.advance(1),
+    /// Consumes a block comment.
+    fn consume_block_comment(&mut self) {
+        self.advance_by(2); // Skip '/*'
+        while let Some(ch) = self.current_char {
+            if self.starts_with("*/") {
+                self.advance_by(2); // Skip '*/'
+                break;
             }
+            self.advance();
         }
-
-        if block_depth != 0 {
-            panic!("Unmatched braces in block content");
-        }
-
-        block_contents
     }
 
-    fn consume_whitespace(&mut self) {
-        while let Some(current_char) = self.peek() {
-            if current_char.is_whitespace() {
-                self.advance(1);
+    /// Consumes an HTML comment.
+    fn consume_html_comment(&mut self) {
+        self.advance_by("<!--".len());
+        while let Some(ch) = self.current_char {
+            if self.starts_with("-->") {
+                self.advance_by("-->".len());
+                break;
+            }
+            self.advance();
+        }
+    }
+
+    fn consume_tag_name(&mut self) -> String {
+        let mut tag_name = String::new();
+        while let Some(ch) = self.current_char {
+            if ch.is_alphanumeric() {
+                tag_name.push(ch);
+                self.advance();
             } else {
                 break;
             }
         }
+        tag_name
     }
 
-    fn peek_keyword(&mut self) -> Option<String> {
-        let current_pos = self.pos;
-        let mut keyword = String::new();
-        while let Some(ch) = self.peek() {
-            if ch.is_whitespace() || !ch.is_alphanumeric() {
+    fn consume_attributes(&mut self) -> bool {
+        let mut self_closing = false;
+        while let Some(ch) = self.current_char {
+            match ch {
+                '>' => {
+                    self.advance();
+                    break;
+                }
+                '/' if self.peek() == Some('>') => {
+                    // Self-closing tag
+                    self.advance_by(2); // Skip '/>'
+                    self_closing = true;
+                    break;
+                }
+                '\'' | '"' => self.consume_string(ch),
+                _ => self.advance(),
+            }
+        }
+        self_closing
+    }
+
+    fn consume_until(&mut self, target: char) {
+        while let Some(ch) = self.current_char {
+            if ch == target {
                 break;
             }
-            keyword.push(ch);
-            self.advance(1);
-        }
-        self.pos = current_pos;
-        if !keyword.is_empty() {
-            Some(keyword)
-        } else {
-            None
+            self.advance();
         }
     }
-
-    fn parse_style(&mut self) -> Option<Token> {
-        let start = self.pos;
-        while let Some(ch) = self.peek() {
-            if ch == '<' && self.lookahead("</style>") {
-                break;
-            }
-            self.advance(1);
-        }
-        let style_content = &self.input[start..self.pos];
-        self.advance(8);
-        Some(Token::Style(style_content.to_string()))
-    }
-
-    fn parse_javascript(&mut self) -> Option<Token> {
-        let start = self.pos;
-        while let Some(ch) = self.peek() {
-            if ch == '-' && self.lookahead("---") {
-                break;
-            }
-            self.advance(1);
-        }
-        let javascript_content = &self.input[start..self.pos];
-        self.advance(3);
-        Some(Token::JavaScript(javascript_content.trim().to_owned()))
-    }
-
-    fn parse_text(&mut self) -> Option<Token> {
-        let start = self.pos;
-        while let Some(ch) = self.peek() {
-            if ch == '<' || (ch == '{' && self.lookahead("{{")) {
-                break;
-            }
-            self.advance(1);
-        }
-        let text = &self.input[start..self.pos];
-        Some(Token::JavaScript(text.trim().to_owned()))
-    }
-
 
     fn peek(&self) -> Option<char> {
-        self.input.get(self.pos..).and_then(|s| s.chars().next())
+        self.chars.clone().next()
     }
 
-    fn lookahead(&self, expected: &str) -> bool {
-        self.input[self.pos..].starts_with(expected)
+    fn push_state(&mut self, state: LexerState) {
+        self.state_stack.push(self.state);
+        self.state = state;
     }
 
-    fn advance(&mut self, by: usize) {
-        self.pos += by;
+    fn pop_state(&mut self) {
+        if let Some(state) = self.state_stack.pop() {
+            self.state = state;
+        }
     }
 }

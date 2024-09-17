@@ -1,77 +1,63 @@
-use std::{
-    env,
-    fs::File,
-    io::Write,
-    path::{Path, PathBuf},
-};
-mod angular;
-mod html;
-mod parser;
+use std::env;
+use std::path::PathBuf;
+
 mod treaty;
+use treaty::lexer::Lexer;
+use treaty::parser::Parser;
+use treaty::token::TokenKind;
 
-use self::angular::Angular;
-use oxc_allocator::Allocator;
-use oxc_codegen::{Codegen, CodegenOptions};
-use oxc_parser::Parser;
-use oxc_semantic::SemanticBuilder;
-use oxc_span::SourceType;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let default_path = "apps/rust/authoring/src/test.treaty";
+    let file_path = env::args().nth(1).unwrap_or_else(|| default_path.to_string());
 
-use crate::parser::parse_mixed_content;
+    let path = PathBuf::from(&file_path);
+    println!("Reading file: {}", path.display());
 
-fn main() {
-    let name = env::args().nth(1).unwrap_or_else(|| "test.ts".to_string());
-    let path: &Path = Path::new(&name);
-    let source_text = std::fs::read_to_string(path).expect("{name} not found");
+    let source_text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("Error reading {}: {}", path.display(), e))?;
 
-    let parse_content = parse_mixed_content(&source_text);
+    println!("Lexing source text...");
+    let mut lexer = Lexer::new(&source_text);
+    let mut tokens = Vec::new();
 
-    println!("Parsed HTML Content:");
-    parse_content.html.into_iter().for_each(|node| {
-        println!("{}", node);
-    });
-    println!("CSS Content:\n{}", parse_content.css.join("\n"));
-
-    let javascript = parse_content.javascript.join("\n");
-
-    let allocator = Allocator::default();
-    let source_type = SourceType::from_path(path).unwrap();
-
-    let ret = Parser::new(&allocator, &javascript, source_type).parse();
-
-    if !ret.errors.is_empty() {
-        for error in ret.errors {
-            let error = error.with_source_code(javascript.clone());
-            println!("{error:?}");
-        }
-        return;
+    while let Some(token) = lexer.next_token() {
+        tokens.push(token);
     }
 
-    println!("Original:\n");
-    println!("{javascript}\n");
+    let mut javascript_chunks = Vec::new();
+    let mut html_chunks = Vec::new();
+    let mut css_chunks = Vec::new();
 
-     let semantic = SemanticBuilder::new(&javascript, source_type)
-        .with_trivias(ret.trivias)
-        .build_module_record(PathBuf::new(), &ret.program)
-        .build(&ret.program)
-        .semantic;
+    for token in &tokens {
+        match &token.kind {
+            TokenKind::JavaScript(code) => javascript_chunks.push(code.clone()),
+            TokenKind::HTML(content) => html_chunks.push(content.clone()),
+            TokenKind::Style(style) => css_chunks.push(style.clone()),
+            _ => {}
+        }
+    }
 
-    let program = allocator.alloc(ret.program);
-    Angular::new(&allocator, source_type, semantic)
-        .build(program)
-        .unwrap();
+    println!("JavaScript Chunks:");
+    for chunk in &javascript_chunks {
+        println!("{}", chunk);
+    }
 
-    let printed = Codegen::<false>::new(&javascript, CodegenOptions::default())
-        .build(program)
-        .source_text;
-    println!("Transformed:\n");
-    println!("{printed}");
-    let gen_path = path.with_file_name(format!(
-        "{}_gen{}",
-        path.file_stem().unwrap_or_default().to_string_lossy(),
-        path.extension()
-            .map_or("".into(), |ext| format!(".{}", ext.to_string_lossy()))
-    ));
-    let mut file = File::create(gen_path).expect("Failed to create file");
-    file.write_all(printed.as_bytes()).unwrap();
+    println!("\nHTML Chunks:");
+    for chunk in &html_chunks {
+        println!("{}", chunk);
+    }
+
+    println!("\nCSS Chunks:");
+    for chunk in &css_chunks {
+        println!("{}", chunk);
+    }
+
+    println!("\nParsing tokens...");
+    let mut parser = Parser::new(tokens);
+    let ast = parser.parse();
+
+    println!("AST:");
+    println!("{:#?}", ast);
+
+    Ok(())
 }
-
