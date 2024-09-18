@@ -28,22 +28,27 @@ import { viewChild, ElementRef, effect } from '@angular/core';
 import {EditorView, basicSetup} from "codemirror"
 import {javascript} from "@codemirror/lang-javascript"
 import { treaty } from './lang-treaty/treatyjs'
+import { formatAngularTemplate, formatJs } from './utils/prettier'
+import { highlighter } from './utils/highlighter';
+
 
 const editor = viewChild('editor');
 const viewer = viewChild('viewer');
 
-
-effect(() => {
-  if (editor()?.nativeElement) {
-    window.view = new EditorView({
-      doc: `<style>
+const defaultDoc = formatAngularTemplate(`<style>
     #logo { display: flex; justify-content: center; cursor: pointer; color: white; text-decoration: inherit; }
   #logo > img { margin-right: .5em; }
 </style>
 <a id="logo" href="https://treaty.github.io">
     <img height="100%" width="20" src="https://avatars.githubusercontent.com/u/164577633?s=400&u=ea01b5a6a19737bdfe3f597f2c406456210c3058&v=4" alt="logo" />
     <span>TreatyJs</span>
-</a>`,
+</a>`)
+
+effect(async () => {
+  if (editor()?.nativeElement) {
+    debugger;
+    window.view = new EditorView({
+      doc: await defaultDoc,
       extensions: [
         basicSetup,
         javascript(),
@@ -89,6 +94,11 @@ import * as ng from '@angular/compiler';
  
 const onClick = async (viwer) => {
   const result = await treatyToIvy(window.view.state.doc.toLocaleString(), 'example.treat', ng, () => 'example')
-  viwer.innerHTML = result;
+  const formatted = await formatJs(result);
+  const highlighted = highlighter.codeToHtml(formatted, {
+    lang: 'javascript',
+    theme: 'github-dark',
+  });
+  viwer.innerHTML = highlighted;
   console.log(result);
 }
