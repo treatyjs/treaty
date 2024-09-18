@@ -41,9 +41,16 @@ const defaultDoc = formatAngularTemplate(`
 </style>
 
 import { input } from '@angular/core'
+import { ExampleComponent } from './example'
 const name = input('name')
-<div class="name">{{ name }}</div>
+
+const example = { hello: 'hello', world: 'world'}
+<div>
+  <div class="name">{{ name }}</div>
+  <ExampleComponent {...example}></ExampleComponent>
+</div>
 console.log('hello')
+
 `)
 
 effect(async () => {
