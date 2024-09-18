@@ -38,19 +38,27 @@ function toHyphenCase(fileName: string): string {
         .replace(/-+/g, '-');
 }
 
-function extractImportStrings(code: string) {
-    const regex = /import\s+?(?:(?:(?:[\w*\s{},]*)\s+from\s+?)|)(?:(?:".*?")|(?:'.*?'))[\s]*?(?:;|$|)/g;
-    const matches = code.match(regex);
-    return matches || [];
+function extractImportStrings(sourceFile: ts.SourceFile) {
+    const imports: string[] = [];
+    function visit(node: ts.Node) {
+        if (ts.isImportDeclaration(node)) {
+            const importText = node.getText(sourceFile);
+            imports.push(importText);
+        }
+        ts.forEachChild(node, visit);
+    }
+    visit(sourceFile);
+    return imports;
 }
 
-function removeImportsFromCode(code: string) {
-    const regex = /import\s+?(?:(?:(?:[\w*\s{},]*)\s+from\s+?)|)(?:(?:".*?")|(?:'.*?'))[\s]*?(?:;|$|)/g;
-    return code.replace(regex, '').trim();
+function removeImportsFromCode(sourceFile: ts.SourceFile) {
+    const statements = sourceFile.statements.filter(statement => !ts.isImportDeclaration(statement));
+    const printer = ts.createPrinter();
+    const newSourceFile = ts.factory.updateSourceFile(sourceFile, statements);
+    return printer.printFile(newSourceFile);
 }
 
-function createWrapper(wrapperName: string, code: string, strExpression: string, constantDeclarations: string) {
-    const sourceFile = ts.createSourceFile('temp.ts', code, ts.ScriptTarget.Latest, true);
+function createWrapper(wrapperName: string, sourceFile: ts.SourceFile, strExpression: string, constantDeclarations: string) {
     const names = new Set<string>();
 
     function isTopLevelNode(node: ts.Node): boolean {
@@ -71,18 +79,17 @@ function createWrapper(wrapperName: string, code: string, strExpression: string,
         ts.forEachChild(node, visit);
     }
 
-
     visit(sourceFile);
 
     const returnObjectString = `return { ${Array.from(names).join(', ')} };`;
 
     const wrappedFunction = `
-  ${extractImportStrings(code).join('\n')}
+  ${extractImportStrings(sourceFile).join('\n')}
   import * as i0 from "@angular/core";
   import * as i1 from "@angular/common";
   ${constantDeclarations}
   function ${wrapperName}() {
-  ${removeImportsFromCode(code)}
+  ${removeImportsFromCode(sourceFile)}
   ${returnObjectString}
 }
 
@@ -106,18 +113,56 @@ export class LiteralMapEntry {
     }
 }
 
-function extractKeysFromJS(jsString: string, objectName: string) {
-    const objectPattern = new RegExp(`const ${objectName} = {([^}]+)}`);
-    const objectMatch = jsString.match(objectPattern);
-    if (!objectMatch) {
-        console.log(`Object "${objectName}" not found in the JS string.`);
-        return [];
+function extractKeysFromJS(sourceFile: ts.SourceFile, objectName: string) {
+    const keys: string[] = [];
+
+    function visit(node: ts.Node) {
+        if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.name.text === objectName) {
+            if (node.initializer && ts.isObjectLiteralExpression(node.initializer)) {
+                node.initializer.properties.forEach(property => {
+                    if (ts.isPropertyAssignment(property) && ts.isIdentifier(property.name)) {
+                        keys.push(property.name.text);
+                    }
+                });
+            } else if (node.initializer && ts.isCallExpression(node.initializer)) {
+                const returnType = getReturnType(node.initializer);
+                if (returnType) {
+                    keys.push(...returnType);
+                }
+            }
+        } else if (ts.isFunctionDeclaration(node) && node.name && node.name.text === objectName) {
+            const returnType = getReturnType(node);
+            if (returnType) {
+                keys.push(...returnType);
+            }
+        }
+        ts.forEachChild(node, visit);
     }
-    const objectContent = objectMatch[1];
-    return objectContent.split(',').map(property => {
-        const [key] = property.split(':').map(part => part.trim());
-        return key;
-    });
+
+    function getReturnType(node: ts.Node): string[] | null {
+        if (ts.isCallExpression(node)) {
+            const typeChecker = ts.createProgram(['temp.ts'], {}).getTypeChecker();
+            const signature = typeChecker.getResolvedSignature(node);
+            if (signature) {
+                const returnType = typeChecker.getReturnTypeOfSignature(signature);
+                if (returnType.isUnion()) {
+                    return returnType.types.map(type => typeChecker.typeToString(type));
+                }
+            }
+        } else if (ts.isFunctionDeclaration(node) && node.body) {
+            const returnStatements = node.body.statements.filter(ts.isReturnStatement);
+            if (returnStatements.length > 0) {
+                const returnType = returnStatements[0].expression;
+                if (returnType && ts.isObjectLiteralExpression(returnType)) {
+                    return returnType.properties.map(property => (property.name as ts.Identifier).text);
+                }
+            }
+        }
+        return null;
+    }
+
+    visit(sourceFile);
+    return keys;
 }
 
 function replaceSpreadWithBindings(htmlStrings: string[], objectName: string, keys: string[]) {
@@ -132,8 +177,7 @@ function replaceSpreadWithBindings(htmlStrings: string[], objectName: string, ke
     });
 }
 
-async function findInputAndOutputAssignments(code: string) {
-    const sourceFile = ts.createSourceFile('temp.ts', code, ts.ScriptTarget.Latest, true);
+async function findInputAndOutputAssignments(sourceFile: ts.SourceFile) {
     const assignments = {
         inputs: {} as { [field: string]: R3InputMetadata },
         outputs: {} as { [field: string]: string }
@@ -176,8 +220,7 @@ async function findInputAndOutputAssignments(code: string) {
     return assignments;
 }
 
-async function findViewChildAndContentQueries(code: string) {
-    const sourceFile = ts.createSourceFile('temp.ts', code, ts.ScriptTarget.Latest, true);
+async function findViewChildAndContentQueries(sourceFile: ts.SourceFile) {
     const queries = {
         viewQueries: [] as R3QueryMetadata[],
         contentQueries: [] as R3QueryMetadata[],
@@ -281,13 +324,9 @@ export const treatyToIvy = async (code: string, id: string, compiler: typeof imp
     const jsTsContent = javascriptChunks.join('')
     console.log('jsTsContent', jsTsContent)
     console.log('html', htmlChunks)
-    const importRegex = /import\s+(?:\{\s*([^}]+)\s*\}|\* as (\w+)|(\w+))(?:\s+from\s+)?(?:".*?"|'.*?')[\s]*?(?:;|$)/g;
-    let match;
-    const imports = [];
-    while ((match = importRegex.exec(jsTsContent))) {
-        const matchedImport = match[1] || match[2] || match[3];
-        imports.push(...matchedImport.split(',').map(name => name.trim()));
-    }
+
+    const sourceFile = ts.createSourceFile('temp.ts', jsTsContent, ts.ScriptTarget.Latest, true);
+    const imports = extractImportStrings(sourceFile);
 
     let modifiedCode = code;
 
@@ -316,7 +355,7 @@ export const treatyToIvy = async (code: string, id: string, compiler: typeof imp
         const spreadMatch = htmlString.match(spreadPattern);
         if (spreadMatch) {
             const objectName = spreadMatch[1];
-            const keys = extractKeysFromJS(jsTsContent, objectName);
+            const keys = extractKeysFromJS(sourceFile, objectName);
             updatedHtmlStrings = replaceSpreadWithBindings(updatedHtmlStrings, objectName, keys);
         }
     });
@@ -327,8 +366,8 @@ export const treatyToIvy = async (code: string, id: string, compiler: typeof imp
     const CMP_NAME = toCamelCase(fileName)
     console.log(updatedHtmlStrings, updatedHtmlStrings)
     const angularTemplate = compiler.parseTemplate(updatedHtmlStrings.join(''), id)
-    const { inputs, outputs } = await findInputAndOutputAssignments(jsTsContent)
-    const { viewQueries, contentQueries, constantDeclarations } = await findViewChildAndContentQueries(jsTsContent)
+    const { inputs, outputs } = await findInputAndOutputAssignments(sourceFile)
+    const { viewQueries, contentQueries, constantDeclarations } = await findViewChildAndContentQueries(sourceFile)
 
     const constantPool = new compiler.ConstantPool();
     const out = compiler.compileComponentFromMetadata(
@@ -392,6 +431,6 @@ export const treatyToIvy = async (code: string, id: string, compiler: typeof imp
         new printer.Printer(),
         new printer.Context(false)
     );
-    const treatyIvy = createWrapper(toCamelCase(fileName), jsTsContent || '', strExpression, constantDeclarations.join('\n'))
+    const treatyIvy = createWrapper(toCamelCase(fileName), sourceFile, strExpression, constantDeclarations.join('\n'))
     return treatyIvy;
 }

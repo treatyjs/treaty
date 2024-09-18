@@ -35,7 +35,7 @@ import { highlighter } from './utils/highlighter';
 const editor = viewChild('editor');
 const viewer = viewChild('viewer');
 
-const defaultDoc = formatAngularTemplate(`
+const defaultDoc = `
 <style>
   .name { display: flex; justify-content: center; cursor: pointer; color: purple; text-decoration: inherit; }
 </style>
@@ -51,7 +51,7 @@ const example = { hello: 'hello', world: 'world'}
 </div>
 console.log('hello')
 
-`)
+`
 
 effect(async () => {
   if (editor()?.nativeElement) {
