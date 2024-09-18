@@ -179,6 +179,7 @@ impl<'a> Lexer<'a> {
         let mut tag_stack = Vec::new();
 
         while let Some(ch) = self.current_char {
+            self.consume_whitespace();
             if ch == '<' {
                 if self.starts_with("<!--") {
                     self.consume_html_comment();
@@ -203,7 +204,6 @@ impl<'a> Lexer<'a> {
                     let tag_name = self.consume_tag_name();
                     tag_stack.push(tag_name);
                     self.consume_attributes(); // Handle attributes (optional)
-                    self.advance(); // Skip '>'
                 } else {
                     self.advance();
                 }

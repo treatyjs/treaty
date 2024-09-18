@@ -1,5 +1,5 @@
 <style>
-  button { cursor: pointer }
+  button { cursor: pointer; }
   label { display: inline-flex; align-items: center; cursor: pointer; user-select: none; }
   .cm-editor { height: 100%; }
   #loading { position: fixed; top: 0; left: 0; right: 0; bottom: 0; z-index: 1; display: flex; justify-content: center; align-items: center; }
@@ -36,7 +36,14 @@ const viewer = viewChild('viewer');
 effect(() => {
   if (editor()?.nativeElement) {
     window.view = new EditorView({
-      doc: `// write code here`,
+      doc: `<style>
+    #logo { display: flex; justify-content: center; cursor: pointer; color: white; text-decoration: inherit; }
+  #logo > img { margin-right: .5em; }
+</style>
+<a id="logo" href="https://treaty.github.io">
+    <img height="100%" width="20" src="https://avatars.githubusercontent.com/u/164577633?s=400&u=ea01b5a6a19737bdfe3f597f2c406456210c3058&v=4" alt="logo" />
+    <span>TreatyJs</span>
+</a>`,
       extensions: [
         basicSetup,
         javascript(),
@@ -79,7 +86,7 @@ effect(() => {
 
 import { treatyToIvy } from '../tools/treaty-sfc/treat-to-ivy'
 import * as ng from '@angular/compiler';
-
+ 
 const onClick = async (viwer) => {
   const result = await treatyToIvy(window.view.state.doc.toLocaleString(), 'example.treat', ng, () => 'example')
   viwer.innerHTML = result;

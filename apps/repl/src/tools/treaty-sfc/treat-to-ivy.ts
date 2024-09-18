@@ -1,7 +1,9 @@
-import type { R3InputMetadata, R3QueryMetadata } from '@angular/compiler';
-import { parseTreatyAndGroup } from './treaty/parser';
+import { type R3InputMetadata, type R3QueryMetadata } from '@angular/compiler';
 import ts from 'typescript';
 import { Printer } from './printer';
+import { Lexer } from './treaty/lexer';
+import { Parser } from './treaty/parser';
+import { TokenType } from './treaty/token';
 
 function toPascalCase(fileName: string): string {
     return fileName
@@ -56,16 +58,16 @@ function createWrapper(wrapperName: string, code: string, strExpression: string,
     }
 
     function visit(node: ts.Node) {
-		if (ts.isVariableStatement(node)) {
-			if (!isTopLevelNode(node)) return
-			node.declarationList.declarations.forEach(declaration => {
-				if (ts.isIdentifier(declaration.name)) {
-					names.add(declaration.name.text);
-				}
-			});
-		} else if (ts.isFunctionDeclaration(node) && node.name) {
-			names.add(node.name.text);
-		}
+        if (ts.isVariableStatement(node)) {
+            if (!isTopLevelNode(node)) return
+            node.declarationList.declarations.forEach(declaration => {
+                if (ts.isIdentifier(declaration.name)) {
+                    names.add(declaration.name.text);
+                }
+            });
+        } else if (ts.isFunctionDeclaration(node) && node.name) {
+            names.add(node.name.text);
+        }
         ts.forEachChild(node, visit);
     }
 
@@ -187,7 +189,7 @@ async function findViewChildAndContentQueries(code: string) {
     function addQuery(variableName: string, predicate: string, isViewQuery: boolean, isMulti: boolean) {
         const constantName = `_c${constantIndex++}`;
         queries.constantDeclarations.push(`const ${constantName} = [${predicate}];`);
-        
+
         const query: R3QueryMetadata = {
             propertyName: variableName,
             predicate: [constantName],
@@ -243,9 +245,43 @@ async function findViewChildAndContentQueries(code: string) {
 }
 
 export const treatyToIvy = async (code: string, id: string, compiler: typeof import('@angular/compiler'), extractFileName?: (file: string) => string, printer?: ReturnType<typeof Printer>) => {
-	printer = printer ?? Printer(compiler);
-    let { html: htmlContent, javascript: jsTsContent, style: cssContent } = await parseTreatyAndGroup(code, compiler)
-    console.log(cssContent)
+    printer = printer ?? Printer(compiler);
+    const lexer = new Lexer(code);
+    const tokens: Token[] = [];
+    let token;
+    while ((token = lexer.nextToken())) {
+        tokens.push(token);
+    }
+    const javascriptChunks: string[] = [];
+    const htmlChunks: string[] = [];
+    const cssChunks: string[] = [];
+    let htmlContent: string[] = []
+    const parser = new Parser(tokens)
+    const ast = parser.parse();
+    ast
+    for (const node of ast.nodes) {
+        switch (node.type) {
+            case TokenType.JavaScript:
+                javascriptChunks.push(node.value);
+                break;
+            case TokenType.HTML:
+                htmlChunks.push(node.value);
+                break;
+            case TokenType.Style:
+                cssChunks.push(node.value);
+                break;
+            default:
+                break;
+        }
+    }
+    const cssContent = cssChunks.map(
+        (token) =>
+          (token)
+            .replaceAll('\n', '')
+            .replaceAll('\t', '') as string)
+    const jsTsContent = javascriptChunks.join('\n')
+    console.log('jsTsContent', jsTsContent)
+    console.log('html', htmlChunks)
     const importRegex = /import\s+(?:\{\s*([^}]+)\s*\}|\* as (\w+)|(\w+))(?:\s+from\s+)?(?:".*?"|'.*?')[\s]*?(?:;|$)/g;
     let match;
     const imports = [];
@@ -257,16 +293,22 @@ export const treatyToIvy = async (code: string, id: string, compiler: typeof imp
     let modifiedCode = code;
 
     const addToDeclatoration: any[] = []
-    imports.forEach(importName => {
-        const tagStartRegex = new RegExp(`<${importName}`, 'g');
-        const tagEndRegex = new RegExp(`</${importName}>`, 'g');
-        if (tagStartRegex.test(modifiedCode)) {
-            if (!addToDeclatoration.includes(importName)) {
-                addToDeclatoration.push(importName)
+    if (imports.length) {
+        imports.forEach(importName => {
+            const tagStartRegex = new RegExp(`<${importName}`, 'g');
+            const tagEndRegex = new RegExp(`</${importName}>`, 'g');
+            if (tagStartRegex.test(modifiedCode)) {
+                if (!addToDeclatoration.includes(importName)) {
+                    addToDeclatoration.push(importName)
+                }
+                htmlContent = htmlChunks.map((code) => code.replace(tagStartRegex, `<${toHyphenCase(importName)} `).replace(tagEndRegex, `</${toHyphenCase(importName)}>`).replaceAll('\n', '')
+                        .replaceAll('\t', '') as string);
             }
-            htmlContent = htmlContent.map((code) => code.replace(tagStartRegex, `<${toHyphenCase(importName)} `).replace(tagEndRegex, `</${toHyphenCase(importName)}>`));
-        }
-    });
+        });
+    } else {
+        htmlContent = htmlChunks.map((code) => code.replaceAll('\n', '')
+                        .replaceAll('\t', '') as string);
+    }
 
     const fileName = extractFileName!(id);
     const selector = `${toHyphenCase(fileName)}, ${toCamelCase(fileName)}, ${toPascalCase(fileName)}`
@@ -283,9 +325,8 @@ export const treatyToIvy = async (code: string, id: string, compiler: typeof imp
     });
 
     const CMP_NAME = toCamelCase(fileName)
-
+    console.log(updatedHtmlStrings, updatedHtmlStrings)
     const angularTemplate = compiler.parseTemplate(updatedHtmlStrings.join('\n'), id)
-
     const { inputs, outputs } = await findInputAndOutputAssignments(jsTsContent)
     const { viewQueries, contentQueries, constantDeclarations } = await findViewChildAndContentQueries(jsTsContent)
 
