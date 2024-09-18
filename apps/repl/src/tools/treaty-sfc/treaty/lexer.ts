@@ -74,7 +74,6 @@ class Lexer {
                 return this.parseHTML();
             }
         } else if (this.currentChar === '{' && this.startsWith('{{')) {
-            this.advanceBy(2);
             this.pushState(LexerState.TemplateExpression);
             return this.parseTemplateExpression();
         } else if (this.currentChar === '@') {
@@ -144,6 +143,7 @@ class Lexer {
     private parseHTML(): Token {
         const startPos = this.pos;
         const tagStack: string[] = [];
+
         while (this.currentChar !== null) {
             this.consumeWhitespace();
             if (this.currentChar === '<') {
@@ -154,6 +154,7 @@ class Lexer {
                     const tagName = this.consumeTagName();
                     const expectedTag = tagStack.pop();
                     if (expectedTag !== undefined && tagName !== expectedTag) {
+                      debugger;
                         // Handle mismatched tag (optional)
                     }
                     this.consumeUntil('>');
@@ -165,14 +166,23 @@ class Lexer {
                     this.advance();
                     const tagName = this.consumeTagName();
                     tagStack.push(tagName);
-                    this.consumeAttributes();
+                    if (this.consumeAttributes()) {
+                      tagStack.pop();
+                      if (tagStack.length === 0) {
+                        break;
+                    }
+
+                    }
                     // this.advance();
                 } else {
                     this.advance();
                 }
-            } else if (this.currentChar === '{' && this.startsWith('{{')) {
-                break;
-            } else {
+            } 
+            // for now deal with only top level so it doesnt just skip break the html check and we dont care about this for now
+            // else if (this.currentChar === '{' && this.startsWith('{{')) {
+            //     break;
+            // }
+            else {
                 this.advance();
             }
         }
@@ -305,6 +315,17 @@ class Lexer {
         while (this.currentChar !== null) {
             if (this.startsWith('-->')) {
                 this.advanceBy('-->'.length);
+                break;
+            }
+            this.advance();
+        }
+    }
+
+    private consumeTemplateExpression(): void {
+        this.advanceBy('{{'.length);
+        while (this.currentChar !== null) {
+            if (this.startsWith('}}')) {
+                this.advanceBy('}}'.length);
                 break;
             }
             this.advance();

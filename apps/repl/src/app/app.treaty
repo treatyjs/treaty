@@ -36,17 +36,17 @@ const editor = viewChild('editor');
 const viewer = viewChild('viewer');
 
 const defaultDoc = formatAngularTemplate(`<style>
-    #logo { display: flex; justify-content: center; cursor: pointer; color: white; text-decoration: inherit; }
-  #logo > img { margin-right: .5em; }
+    .name { display: flex; justify-content: center; cursor: pointer; color: purple; text-decoration: inherit; }
 </style>
-<a id="logo" href="https://treaty.github.io">
-    <img height="100%" width="20" src="https://avatars.githubusercontent.com/u/164577633?s=400&u=ea01b5a6a19737bdfe3f597f2c406456210c3058&v=4" alt="logo" />
-    <span>TreatyJs</span>
-</a>`)
+
+import { input } from '@angular/core';
+const name = input('name')
+<div class="name"> {{ name }} </div>
+console.log('hello')
+`)
 
 effect(async () => {
   if (editor()?.nativeElement) {
-    debugger;
     window.view = new EditorView({
       doc: await defaultDoc,
       extensions: [

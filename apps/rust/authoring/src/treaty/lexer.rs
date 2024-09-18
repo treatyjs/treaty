@@ -207,9 +207,12 @@ impl<'a> Lexer<'a> {
                 } else {
                     self.advance();
                 }
-            } else if ch == '{' && self.starts_with("{{") {
-                break;
-            } else {
+            }
+            // lets deal with html as we only have top level support for break down on lexer
+            // else if ch == '{' && self.starts_with("{{") {
+            //     break;
+            // }
+             else {
                 self.advance();
             }
         }

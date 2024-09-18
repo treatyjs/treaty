@@ -3,7 +3,7 @@ import ts from 'typescript';
 import { Printer } from './printer';
 import { Lexer } from './treaty/lexer';
 import { Parser } from './treaty/parser';
-import { TokenType } from './treaty/token';
+import { Token, TokenType } from './treaty/token';
 
 function toPascalCase(fileName: string): string {
     return fileName
@@ -255,7 +255,6 @@ export const treatyToIvy = async (code: string, id: string, compiler: typeof imp
     const javascriptChunks: string[] = [];
     const htmlChunks: string[] = [];
     const cssChunks: string[] = [];
-    let htmlContent: string[] = []
     const parser = new Parser(tokens)
     const ast = parser.parse();
     ast
@@ -279,7 +278,7 @@ export const treatyToIvy = async (code: string, id: string, compiler: typeof imp
           (token)
             .replaceAll('\n', '')
             .replaceAll('\t', '') as string)
-    const jsTsContent = javascriptChunks.join('\n')
+    const jsTsContent = javascriptChunks.join('')
     console.log('jsTsContent', jsTsContent)
     console.log('html', htmlChunks)
     const importRegex = /import\s+(?:\{\s*([^}]+)\s*\}|\* as (\w+)|(\w+))(?:\s+from\s+)?(?:".*?"|'.*?')[\s]*?(?:;|$)/g;
@@ -292,6 +291,8 @@ export const treatyToIvy = async (code: string, id: string, compiler: typeof imp
 
     let modifiedCode = code;
 
+    let htmlContent = htmlChunks;
+
     const addToDeclatoration: any[] = []
     if (imports.length) {
         imports.forEach(importName => {
@@ -301,13 +302,9 @@ export const treatyToIvy = async (code: string, id: string, compiler: typeof imp
                 if (!addToDeclatoration.includes(importName)) {
                     addToDeclatoration.push(importName)
                 }
-                htmlContent = htmlChunks.map((code) => code.replace(tagStartRegex, `<${toHyphenCase(importName)} `).replace(tagEndRegex, `</${toHyphenCase(importName)}>`).replaceAll('\n', '')
-                        .replaceAll('\t', '') as string);
+                htmlContent = htmlContent.map((code) => code.replace(tagStartRegex, `<${toHyphenCase(importName)} `).replace(tagEndRegex, `</${toHyphenCase(importName)}>`))
             }
         });
-    } else {
-        htmlContent = htmlChunks.map((code) => code.replaceAll('\n', '')
-                        .replaceAll('\t', '') as string);
     }
 
     const fileName = extractFileName!(id);
@@ -324,9 +321,12 @@ export const treatyToIvy = async (code: string, id: string, compiler: typeof imp
         }
     });
 
+    htmlContent = htmlContent.map((code) => code.replaceAll('\n', '').replaceAll('\r', '')
+                        .replaceAll('\t', '').toString());
+
     const CMP_NAME = toCamelCase(fileName)
     console.log(updatedHtmlStrings, updatedHtmlStrings)
-    const angularTemplate = compiler.parseTemplate(updatedHtmlStrings.join('\n'), id)
+    const angularTemplate = compiler.parseTemplate(updatedHtmlStrings.join(''), id)
     const { inputs, outputs } = await findInputAndOutputAssignments(jsTsContent)
     const { viewQueries, contentQueries, constantDeclarations } = await findViewChildAndContentQueries(jsTsContent)
 
