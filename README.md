@@ -18,7 +18,7 @@
 | function chunking                                                         | ❌        | 🏗️ (work underway) |
 | First class Module federation                                                                  | ❌        | 🏗️ (work underway) |
 | Zoneless first                                                                | ❌        | ✅ |
-| Signal components                                                                | ❌        | ✅ |
+
 | Build to deploy                                                                  |  ❌               | 🚧 (Planned -self hosted and Treaty cloud)            |
 | Bun Test                                                                 |  ❌               | ✅            |
 | [Vitest](https://vitest.dev/)|  ✅               |  (not checked)           |
