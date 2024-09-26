@@ -1,0 +1,16 @@
+{
+	"name": "@treatyjs/language-server",
+	"version": "0.0.1",
+	"main": "out/index.js",
+	"license": "MIT",
+	"files": [
+		"out/**/*.js",
+		"out/**/*.d.ts"
+	],
+	"bin": {
+		"treatyjs-language-server": "./bin/treatyjs-language-server.js"
+	},
+	"dependencies": {
+	
+	}
+}

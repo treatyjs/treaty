@@ -1,0 +1,13 @@
+id: treaty/source
+language: javascript
+platform: node
+tasks:
+  local-registry:
+    command: js verdaccio
+    args:
+    - --port
+    - '4873'
+    - --config
+    - $workspaceRoot/.verdaccio/config.yml
+    - --storage
+    - $workspaceRoot/tmp/local-registry/storage

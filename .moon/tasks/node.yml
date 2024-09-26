@@ -1,0 +1,30 @@
+fileGroups:
+  default:
+  - '**/*'
+  production:
+  - '!.eslintrc.json'
+  - '!eslint.config.js'
+  - '!**/?(*.)+(spec|test).[jt]s?(x)?(.snap)'
+  - '!tsconfig.spec.json'
+  - '!jest.config.[jt]s'
+  - '!src/test-setup.[jt]s'
+  - '!test-setup.[jt]s'
+  - '!cypress/**/*'
+  - '!**/*.cy.[jt]s?(x)'
+  - '!cypress.config.[jt]s'
+tasks:
+  angular-devkit/build-angular.application:
+    deps:
+    - ^:build
+    inputs:
+    - '@group(production)'
+  nx/angular.package:
+    deps:
+    - ^:build
+    inputs:
+    - '@group(production)'
+  nx/js.swc:
+    deps:
+    - ^:build
+    inputs:
+    - '@group(production)'

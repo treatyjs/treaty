@@ -1,0 +1,31 @@
+id: authoring_treaty_authoring
+language: javascript
+platform: node
+tags: []
+tasks:
+  build:
+    command: rust check
+    args:
+    - --target-dir
+    - $workspaceRoot/dist/target/authoring_treaty_authoring
+    outputs:
+    - '{options.target-dir}'
+  lint:
+    command: rust lint
+    args:
+    - --target-dir
+    - $workspaceRoot/dist/target/authoring_treaty_authoring
+    outputs:
+    - '{options.target-dir}'
+  test:
+    command: rust test
+    args:
+    - --target-dir
+    - $workspaceRoot/dist/target/authoring_treaty_authoring
+    outputs:
+    - '{options.target-dir}'
+  test.production:
+    extends: test
+    args:
+    - --release
+type: library

@@ -1,0 +1,23 @@
+id: vite
+language: typescript
+platform: node
+tags: []
+tasks:
+  build:
+    command: js swc
+    args:
+    - --outputPath
+    - $workspaceRoot/dist/libs/typescript/vite
+    - --assets
+    - '[]'
+    - --main
+    - $workspaceRoot/libs/typescript/vite/src/index.ts
+    - --tsConfig
+    - $workspaceRoot/libs/typescript/vite/tsconfig.lib.json
+    outputs:
+    - '{options.outputPath}'
+  publish:
+    command: node tools/scripts/publish.mjs vite {args.ver} {args.tag}
+    deps:
+    - ~:build
+type: library
