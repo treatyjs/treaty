@@ -24,7 +24,7 @@
 </style>
 
 import logo from './component/logo.treaty';
-import { viewChild, ElementRef, effect, signal } from '@angular/core';
+import { viewChild, ElementRef, effect } from '@angular/core';
 import {EditorView, basicSetup} from "codemirror"
 import {javascript} from "@codemirror/lang-javascript"
 import { treaty } from './lang-treaty/treatyjs'
@@ -53,7 +53,6 @@ console.log('hello')
 
 `
 
-
 effect(async () => {
   if (editor()?.nativeElement) {
     window.view = new EditorView({
@@ -66,8 +65,6 @@ effect(async () => {
       lineWrapping: true,
       parent: editor()?.nativeElement
     })
-    onClick(viewer());
-    window.view.focus();
   }
 });
 
@@ -88,11 +85,6 @@ effect(async () => {
       </div>
     </div>
     <div #editor id="editor"></div>
-    <div id="panel">
-      @if (viewer) {
-        <div> LOADING </div>
-      }
-    </div>
   </div>
   <div id="divider"></div>
   <div #right id="right">

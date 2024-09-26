@@ -1,0 +1,37 @@
+id: authoring_node
+language: javascript
+platform: node
+tags: []
+tasks:
+  build:
+    command: rust napi
+    args:
+    - --jsFile
+    - $workspaceRoot/index.js
+    - --dist
+    - $workspaceRoot/libs/authoring/node
+  build.production:
+    extends: build
+    args:
+    - --release
+    - --dist
+    - $workspaceRoot/dist/authoring_node
+  lint:
+    command: rust lint
+    args:
+    - --target-dir
+    - $workspaceRoot/dist/target/authoring_node
+    outputs:
+    - '{options.target-dir}'
+  test:
+    command: rust test
+    args:
+    - --target-dir
+    - $workspaceRoot/dist/target/authoring_node
+    outputs:
+    - '{options.target-dir}'
+  test.production:
+    extends: test
+    args:
+    - --release
+type: library

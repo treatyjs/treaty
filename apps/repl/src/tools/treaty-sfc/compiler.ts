@@ -40,7 +40,7 @@ export const treatySFC: () => Plugin = () => {
 		async transform(code, id) {
 
 			if (id.endsWith('.treaty')) {
-				return treatyToIvy(code, id, compiler, extractFileName);
+				return treatyToIvy(code, id, compiler, extractFileName, printer);
 				
 			}
 			return code;

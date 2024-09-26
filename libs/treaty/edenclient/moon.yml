@@ -1,0 +1,23 @@
+id: eden-client
+language: typescript
+platform: node
+tags: []
+tasks:
+  build:
+    command: angular package
+    args:
+    - --project
+    - $workspaceRoot/libs/treaty/edenclient/ng-package.json
+    outputs:
+    - /dist/$projectRoot
+  build.development:
+    extends: build
+    args:
+    - --tsConfig
+    - $workspaceRoot/libs/treaty/edenclient/tsconfig.lib.json
+  build.production:
+    extends: build
+    args:
+    - --tsConfig
+    - $workspaceRoot/libs/treaty/edenclient/tsconfig.lib.prod.json
+type: library

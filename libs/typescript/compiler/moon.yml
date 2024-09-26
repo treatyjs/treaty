@@ -1,0 +1,23 @@
+id: compiler
+language: typescript
+platform: node
+tags: []
+tasks:
+  build:
+    command: js swc
+    args:
+    - --outputPath
+    - $workspaceRoot/dist/libs/typescript/compiler
+    - --assets
+    - '[]'
+    - --main
+    - $workspaceRoot/libs/typescript/compiler/src/index.ts
+    - --tsConfig
+    - $workspaceRoot/libs/typescript/compiler/tsconfig.lib.json
+    outputs:
+    - '{options.outputPath}'
+  publish:
+    command: node tools/scripts/publish.mjs compiler {args.ver} {args.tag}
+    deps:
+    - ~:build
+type: library

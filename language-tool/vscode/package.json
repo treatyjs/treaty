@@ -1,0 +1,42 @@
+{
+	"private": true,
+	"name": "vscode-treatyjs",
+	"version": "0.0.1",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/volarjs/starter.git",
+		"directory": "packages/vscode"
+	},
+	"categories": [
+		"Programming Languages"
+	],
+	"displayName": "Treatyjs Language Features",
+	"description": "Treaty Language Features",
+	"author": "volarjs",
+	"publisher": "volarjs",
+	"engines": {
+		"vscode": "^1.82.0"
+	},
+	"activationEvents": [
+		"onLanguage:treaty"
+	],
+	"main": "./dist/client.js",
+	"contributes": {
+		"languages": [
+			{
+				"id": "treaty",
+				"extensions": [
+					".treaty"
+				]
+			}
+		]
+	},
+	"scripts": {
+		"build": "node scripts/build -- --minify",
+		"watch": "npm run build -- --watch",
+		"pack": "npm run build && vsce package --pre-release",
+		"release": "npm run build && vsce publish --pre-release"
+	},
+	"devDependencies": {
+	}
+}

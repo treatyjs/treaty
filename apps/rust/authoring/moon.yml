@@ -1,0 +1,46 @@
+id: rust_authoring
+language: javascript
+platform: node
+tags: []
+tasks:
+  build:
+    command: rust build
+    args:
+    - --target-dir
+    - $workspaceRoot/dist/target/rust_authoring
+    outputs:
+    - '{options.target-dir}'
+  build.production:
+    extends: build
+    args:
+    - --release
+  lint:
+    command: rust lint
+    args:
+    - --target-dir
+    - $workspaceRoot/dist/target/rust_authoring
+    outputs:
+    - '{options.target-dir}'
+  run:
+    command: rust run
+    args:
+    - --target-dir
+    - $workspaceRoot/dist/target/rust_authoring
+    outputs:
+    - '{options.target-dir}'
+  run.production:
+    extends: run
+    args:
+    - --release
+  test:
+    command: rust test
+    args:
+    - --target-dir
+    - $workspaceRoot/dist/target/rust_authoring
+    outputs:
+    - '{options.target-dir}'
+  test.production:
+    extends: test
+    args:
+    - --release
+type: application

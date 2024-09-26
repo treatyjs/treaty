@@ -23,6 +23,47 @@
 				"reveal": "always",
 				"panel": "shared"
 			}
+		},
+		{
+			"type": "npm",
+			"script": "compile",
+			"group": "build",
+			"presentation": {
+				"panel": "dedicated",
+				"reveal": "never"
+			},
+			"problemMatcher": {
+				"pattern": {
+					"regexp": "__________"
+				},
+				"background": {
+					"beginsPattern": "building\\.\\.\\.",
+					"endsPattern": "finished\\."
+				}
+			}
+		},
+		{
+			"type": "npm",
+			"script": "watch",
+			"isBackground": true,
+			"group": {
+				"kind": "build",
+				"isDefault": true
+			},
+			"presentation": {
+				"panel": "dedicated",
+				"reveal": "never"
+			},
+			"problemMatcher": {
+				"pattern": {
+					"regexp": "__________"
+				},
+				"background": {
+					"activeOnStart": true,
+					"beginsPattern": "building\\.\\.\\.",
+					"endsPattern": "watching\\.\\.\\."
+				}
+			}
 		}
 	]
 }

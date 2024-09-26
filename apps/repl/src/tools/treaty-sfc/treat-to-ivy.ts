@@ -235,7 +235,7 @@ async function findViewChildAndContentQueries(sourceFile: ts.SourceFile) {
 
         const query: R3QueryMetadata = {
             propertyName: variableName,
-            predicate: [constantName],
+            predicate: [predicate],
             descendants: true,
             first: !isMulti,
             read: null,
@@ -259,7 +259,7 @@ async function findViewChildAndContentQueries(sourceFile: ts.SourceFile) {
                     const callExpression = declaration.initializer;
                     if (ts.isIdentifier(callExpression.expression)) {
                         const functionName = callExpression.expression.text;
-                        const predicate = callExpression.arguments[0]?.getText();
+                        const predicate = (callExpression.arguments[0] as any)?.text;
                         if (predicate) {
                             switch (functionName) {
                                 case 'viewChild':
@@ -380,7 +380,6 @@ export const treatyToIvy = async (code: string, id: string, compiler: typeof imp
                 listeners: {},
                 properties: {},
                 specialAttributes: {},
-                useTemplatePipeline: true,
             },
             rawImports: addToDeclatoration as any,
             inputs,
@@ -391,17 +390,17 @@ export const treatyToIvy = async (code: string, id: string, compiler: typeof imp
             hostDirectives: null,
             declarations: [],
             declarationListEmitMode: 0,
-            deferBlockDepsEmitMode: 1,
-            deferBlocks: new Map(),
-            deferrableDeclToImportDecl: new Map(),
+            defer: {
+                dependenciesFn: null,
+                mode: 1,
+              },
             deps: [],
             animations: null,
-            deferrableTypes: new Map(),
             i18nUseExternalIds: false,
             interpolation: compiler.DEFAULT_INTERPOLATION_CONFIG,
             isSignal: true,
             providers: null,
-            queries: [...contentQueries],
+            queries: [...contentQueries, ...viewQueries],
             styles: cssContent,
             template: angularTemplate,
             encapsulation: compiler.ViewEncapsulation.Emulated,
@@ -415,7 +414,6 @@ export const treatyToIvy = async (code: string, id: string, compiler: typeof imp
             },
             typeArgumentCount: 0,
             typeSourceSpan: null!,
-            useTemplatePipeline: true,
             usesInheritance: false,
             viewProviders: null,
             viewQueries: viewQueries,
@@ -427,10 +425,20 @@ export const treatyToIvy = async (code: string, id: string, compiler: typeof imp
     (out.expression as any).args[0].entries.push(new LiteralMapEntry('dependencies', new compiler.LiteralArrayExpr(
         addToDeclatoration.map(val => new compiler.WrappedNodeExpr(val))) as any, false))
 
-    const strExpression = out.expression.visitExpression(
-        new printer.Printer(),
+    const printerIntance = new printer.Printer();
+    let strExpression = out.expression.visitExpression(
+        printerIntance,
         new printer.Context(false)
     );
-    const treatyIvy = createWrapper(toCamelCase(fileName), sourceFile, strExpression, constantDeclarations.join('\n'))
+    
+
+      for (const stmt of constantPool.statements) {
+        const strStmt = stmt.visitStatement(printerIntance, new printer.Context(false));
+    
+        strExpression += `\n\n${strStmt}`;
+      }
+
+    // const treatyIvy = createWrapper(toCamelCase(fileName), sourceFile, strExpression, constantDeclarations.join('\n'))
+    const treatyIvy = createWrapper(toCamelCase(fileName), sourceFile, strExpression, '')
     return treatyIvy;
 }
