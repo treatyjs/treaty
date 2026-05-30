@@ -111,6 +111,14 @@ multi-thread and parallelize everywhere it is sound, since file-by-file compiles
 Cross-cutting (NAPI + render3 + authoring + core) → runs AFTER Wave 1 (it touches crates the
 compliance + bundler workflows are editing). Goal: beat ngtsc on cold + incremental builds.
 
+**J. Delete the legacy TypeScript compiler (GATED — user 2026-05-30)** — once the Rust compiler is
+fully working "how we want" INCLUDING all authoring, DELETE the old TS compiler entirely. Targets:
+`apps/repl/src/tools/treaty-sfc/treat-to-ivy.ts` + `printer.ts`, `libs/typescript/compiler/`, and the
+TS `treatyToIvy` fallback in the REPL's `rust-compiler-loader.ts`. **Gate (all must hold):** NAPI
+exposes ALL authoring incl. bare-JSX `.tsx` + the full render3 surface (workstream B); the REPL runs
+end-to-end on the Rust path with the TS fallback removed; oracle/compliance parity holds. This is the
+headline instance of the "dead code + file deletion" goal — do NOT delete before the gate is met.
+
 ## Harness
 - **File-by-file harness**: compile a corpus of individual `.treaty`/`.tsx`/`.ts` files through `@treaty/compiler`
   and assert each emits valid Ivy + round-trips through each bundler plugin; measure per-file time
