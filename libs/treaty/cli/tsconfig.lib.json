@@ -1,0 +1,30 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "inlineSources": true,
+    "composite": false,
+    "lib": ["es2022"],
+    "types": ["node"],
+    "baseUrl": ".",
+    "paths": {
+      "@treaty/compiler": ["../../../libs/treaty/compiler/dist/index.d.ts"],
+      "@treaty/module-federation": [
+        "../../../libs/treaty/module-federation/dist/index.d.ts"
+      ],
+      "@treaty/vite": ["../../../libs/treaty/vite/dist/index.d.ts"],
+      "@treaty/rspack": ["../../../libs/treaty/rspack/dist/index.d.ts"],
+      "@treaty/rspack/plugin": [
+        "../../../libs/treaty/rspack/dist/plugin.d.ts"
+      ]
+    }
+  },
+  "exclude": ["src/**/*.spec.ts", "dist"],
+  "include": ["src/**/*.ts"]
+}

@@ -1,0 +1,43 @@
+{
+  "name": "@treaty/module-federation",
+  "version": "0.0.1",
+  "description": "Automatic, zero-config Module Federation for Treaty apps. Generates a normalized federation config (host + remotes, @angular/* shared singletons) from project structure / simple options, plus adapters that turn it into plugin-ready options for @module-federation/enhanced (Rspack/webpack) and @module-federation/vite (Vite). Every Treaty app is a Module Federation host automatically — the developer configures nothing.",
+  "author": "Jordan Hall",
+  "license": "IDGAF-1.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    "./package.json": {
+      "default": "./package.json"
+    },
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./rspack": {
+      "types": "./dist/rspack.d.ts",
+      "default": "./dist/rspack.js"
+    },
+    "./vite": {
+      "types": "./dist/vite.d.ts",
+      "default": "./dist/vite.js"
+    }
+  },
+  "sideEffects": false,
+  "peerDependencies": {
+    "@module-federation/enhanced": ">=0.9",
+    "@module-federation/vite": ">=1.2"
+  },
+  "peerDependenciesMeta": {
+    "@module-federation/enhanced": {
+      "optional": true
+    },
+    "@module-federation/vite": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=20.19"
+  }
+}

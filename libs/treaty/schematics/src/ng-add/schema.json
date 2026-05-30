@@ -1,0 +1,31 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema",
+  "$id": "TreatyNgAdd",
+  "title": "Treaty ng-add options",
+  "type": "object",
+  "properties": {
+    "project": {
+      "type": "string",
+      "description": "The project to convert to the Treaty builders. Defaults to the workspace default / sole application.",
+      "$default": {
+        "$source": "projectName"
+      }
+    },
+    "host": {
+      "type": "boolean",
+      "description": "Wire the converted project as a Module Federation host that consumes remotes.",
+      "default": true
+    },
+    "remote": {
+      "type": "string",
+      "description": "Name of the sample remote to scaffold and wire into the host. Pass an empty string to skip scaffolding a sample remote.",
+      "default": "remote"
+    },
+    "skipRemote": {
+      "type": "boolean",
+      "description": "Do not scaffold or wire a sample remote; convert builders only.",
+      "default": false
+    }
+  },
+  "required": []
+}

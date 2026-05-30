@@ -21,6 +21,11 @@ import {
 	type TreatyCompiler,
 	type TreatyCompilerOptions,
 } from '@treaty/compiler'
+import {
+	toViteFederation,
+	type MfOptions,
+	type ViteFederationOptions,
+} from '@treaty/module-federation'
 import type { Plugin } from 'vite'
 
 /** Public options for {@link treaty}. */
@@ -53,7 +58,30 @@ export interface PluginOptions extends TreatyCompilerOptions {
 	 * dev rebuilds regardless of this option).
 	 */
 	readonly prewarm?: readonly string[]
+	/**
+	 * Automatic Module Federation. Every Treaty app is a Module Federation host
+	 * by default — Treaty generates the federation config from these options so
+	 * the developer writes no `federation()`/`ModuleFederationPlugin` by hand.
+	 *
+	 *   - `true` / omitted via {@link treatyWithFederation}: enable with defaults
+	 *     (the app is a host that shares the Angular runtime as eager singletons).
+	 *   - an {@link MfOptions} object: configure the app name, the remotes it
+	 *     consumes, the modules it exposes, and extra shared deps.
+	 *   - `false`: disable federation entirely.
+	 *
+	 * The base {@link treaty} factory does not apply federation (so existing
+	 * single-plugin usage is unchanged); use {@link treatyWithFederation} to get
+	 * the Treaty plugin and the auto-generated federation plugin together.
+	 */
+	readonly moduleFederation?: MfOptions | boolean
 }
+
+/**
+ * The `@module-federation/vite` `federation()` factory, declared structurally so
+ * `@treaty/vite` typechecks (and the base plugin runs) without the peer package
+ * installed. The real default export is assignable to this.
+ */
+type ViteFederationFactory = (options: ViteFederationOptions) => Plugin
 
 /** The plugin name surfaced in Vite logs and the plugin pipeline. */
 const PLUGIN_NAME = 'treaty:vite'
@@ -218,5 +246,61 @@ export default function treaty(options: PluginOptions = {}): Plugin {
 	}
 }
 
+/**
+ * Resolve the user's `moduleFederation` option to the concrete
+ * {@link MfOptions} when federation is enabled, or `null` when it is disabled.
+ * `true` (and the default within {@link treatyWithFederation}) ⇒ defaults `{}`.
+ */
+function resolveMfOptions(value: MfOptions | boolean | undefined): MfOptions | null {
+	if (value === false) return null
+	if (value === true || value === undefined) return {}
+	return value
+}
+
+/**
+ * Build the auto-generated `@module-federation/vite` plugin for the given
+ * Treaty options. Returns a promise so the optional peer is loaded lazily — the
+ * Treaty plugin itself never depends on `@module-federation/vite` being present
+ * unless federation is actually used. Vite accepts a `Promise<Plugin>` entry in
+ * its `plugins` array, so the returned value can be placed there directly.
+ */
+async function createFederationPlugin(mf: MfOptions): Promise<Plugin> {
+	const options = toViteFederation(mf)
+	// Loaded by specifier so bundlers do not eagerly require the optional peer.
+	const mod: { default?: unknown; federation?: unknown } = await import(
+		'@module-federation/vite'
+	)
+	const factory = (mod.federation ?? mod.default) as ViteFederationFactory | undefined
+	if (typeof factory !== 'function') {
+		throw new Error(
+			'@treaty/vite: Module Federation is enabled but "@module-federation/vite" ' +
+				'did not export a federation() factory. Install @module-federation/vite to use auto-MF.'
+		)
+	}
+	return factory(options)
+}
+
+/**
+ * Treaty's Vite integration **with automatic Module Federation**: returns the
+ * Treaty authoring plugin plus the auto-generated `@module-federation/vite`
+ * plugin, so every Treaty app is a federation host with zero config. Pass
+ * `moduleFederation` to declare remotes/exposes/shared; omit it to get the
+ * defaults (host that shares the Angular runtime as eager singletons). Set
+ * `moduleFederation: false` to opt out (equivalent to plain {@link treaty}).
+ *
+ * The federation plugin entry is a `Promise<Plugin>` (Vite supports this), so
+ * the optional `@module-federation/vite` peer is only loaded when MF is on.
+ */
+export function treatyWithFederation(
+	options: PluginOptions = {}
+): Array<Plugin | Promise<Plugin>> {
+	const mf = resolveMfOptions(options.moduleFederation ?? true)
+	const plugins: Array<Plugin | Promise<Plugin>> = [treaty(options)]
+	if (mf !== null) plugins.push(createFederationPlugin(mf))
+	return plugins
+}
+
+export { toViteFederation, generateMfConfig } from '@treaty/module-federation'
+export type { MfOptions, NormalizedMfConfig } from '@treaty/module-federation'
 export { createTreatyCompiler } from '@treaty/compiler'
 export type { TreatyCompilerOptions } from '@treaty/compiler'

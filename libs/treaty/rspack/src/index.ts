@@ -26,3 +26,16 @@ export {
 	DEFAULT_TEST,
 } from './options.js'
 export type { TreatyLoaderOptions, TreatyPluginOptions } from './options.js'
+
+// Re-export the Module Federation surface so callers can generate or inspect the
+// federation config the plugin wires automatically (Treaty is a compiler: this
+// is generated, never hand-written).
+export {
+	toRspackModuleFederation,
+	generateMfConfig,
+} from '@treaty/module-federation'
+export type {
+	MfOptions,
+	NormalizedMfConfig,
+	RspackModuleFederationOptions,
+} from '@treaty/module-federation'

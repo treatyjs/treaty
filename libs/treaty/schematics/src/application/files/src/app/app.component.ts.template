@@ -1,0 +1,16 @@
+import { Component } from '@angular/core'
+import { RouterOutlet } from '@angular/router'
+
+// Treaty is selectorless, standalone, and signal by default — the compiler fills
+// all three in during compilation, so scaffolds carry no `selector`, no
+// `standalone: true`, and no `signal()` ceremony.
+@Component({
+	imports: [RouterOutlet],
+	template: `
+		<h1>{{ title }}</h1>
+		<router-outlet></router-outlet>
+	`,
+})
+export class <%= classify(name) %>Component {
+	title = '<%= dasherize(name) %>'
+}

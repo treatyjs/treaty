@@ -1,0 +1,27 @@
+id: treaty-build
+language: typescript
+platform: node
+type: library
+tags: []
+tasks:
+  build:
+    command: tsc
+    args:
+    - -p
+    - $projectRoot/tsconfig.lib.json
+    inputs:
+    - src/**/*
+    - tsconfig.json
+    - tsconfig.lib.json
+    outputs:
+    - dist
+  typecheck:
+    command: tsc
+    args:
+    - --noEmit
+    - -p
+    - $projectRoot/tsconfig.lib.json
+    inputs:
+    - src/**/*
+    - tsconfig.json
+    - tsconfig.lib.json

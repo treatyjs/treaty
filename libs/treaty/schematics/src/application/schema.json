@@ -1,0 +1,28 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema",
+  "$id": "TreatyApplication",
+  "title": "Treaty application options",
+  "type": "object",
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "The name of the new application.",
+      "$default": {
+        "$source": "argv",
+        "index": 0
+      },
+      "x-prompt": "What name would you like to use for the application?"
+    },
+    "host": {
+      "type": "boolean",
+      "description": "Wire the app as a Module Federation host that consumes remotes. When false the app is a pure exposable remote. Every Treaty app is exposable either way.",
+      "default": true
+    },
+    "prefix": {
+      "type": "string",
+      "description": "The component selector prefix for the application.",
+      "default": "app"
+    }
+  },
+  "required": ["name"]
+}

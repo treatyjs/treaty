@@ -1,0 +1,22 @@
+import type { Routes } from '@angular/router'
+<% if (host) { %>
+/**
+ * Treaty HOST routes. Remotes declared in federation.config.json are consumed
+ * here with a plain dynamic `import('<alias>/routes')` — the Treaty build
+ * builders resolve the federated module at runtime, so no MF plugin code or
+ * remote URL wiring lives in your source. Uncomment and rename to consume the
+ * sample remote scaffolded by `ng add`:
+ *
+ *   {
+ *     path: 'remote',
+ *     loadChildren: () => import('remote/routes').then((m) => m.routes),
+ *   },
+ */
+export const routes: Routes = []
+<% } else { %>
+/**
+ * Treaty REMOTE routes. This array is exposed as `<%= dasherize(name) %>/routes`
+ * (see federation.config.json) so a host can lazy-load it with zero MF config.
+ */
+export const routes: Routes = []
+<% } %>

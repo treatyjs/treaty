@@ -1,0 +1,7 @@
+import { Component } from '@angular/core'
+
+// Selectorless + standalone by default — the compiler fills them in.
+@Component({
+	template: `<p><%= dasherize(name) %> works</p>`,
+})
+export class <%= classify(name) %>Component {}

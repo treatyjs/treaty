@@ -14,7 +14,10 @@
     "types": ["node"],
     "baseUrl": ".",
     "paths": {
-      "@treaty/compiler": ["../../../libs/treaty/compiler/dist/index.d.ts"]
+      "@treaty/compiler": ["../../../libs/treaty/compiler/dist/index.d.ts"],
+      "@treaty/module-federation": [
+        "../../../libs/treaty/module-federation/dist/index.d.ts"
+      ]
     }
   },
   "exclude": ["src/**/*.spec.ts", "dist"],

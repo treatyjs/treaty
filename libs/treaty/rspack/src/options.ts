@@ -7,6 +7,7 @@
  */
 
 import type { TreatyCompilerOptions } from '@treaty/compiler'
+import type { MfOptions } from '@treaty/module-federation'
 
 /**
  * Options understood by both the Treaty Rspack loader and plugin. These are the
@@ -27,6 +28,20 @@ export interface TreatyPluginOptions extends TreatyCompilerOptions {
 	 * default it matches Treaty's owned extensions; override to narrow or widen it.
 	 */
 	readonly test?: RegExp
+	/**
+	 * Automatic Module Federation. Every Treaty app is a Module Federation host
+	 * by default — when this is enabled the plugin generates the federation
+	 * config and adds the `@module-federation/enhanced` `ModuleFederationPlugin`
+	 * automatically, so the developer writes no federation config by hand.
+	 *
+	 *   - `true` (the default): enable with the zero-config defaults (a host that
+	 *     shares the Angular runtime as eager singletons).
+	 *   - an {@link MfOptions} object: declare the app name, the remotes it
+	 *     consumes, the modules it exposes, and extra shared deps.
+	 *   - `false`: disable federation entirely (the loader/resolve wiring is
+	 *     unaffected — fully backward compatible).
+	 */
+	readonly moduleFederation?: MfOptions | boolean
 }
 
 /** The authoring extensions Treaty owns and the plugin resolves by default. */

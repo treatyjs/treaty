@@ -1,0 +1,9 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "outDir": "../../out-tsc/<%= dasherize(name) %>",
+    "declaration": true,
+    "types": []
+  },
+  "include": ["src/**/*.ts"]
+}
