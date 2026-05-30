@@ -24,7 +24,15 @@
       "@treaty/ts-vite": ["libs/typescript/vite/src/index.ts"],
       "@treaty/ts-compiler": ["libs/typescript/compiler/src/index.ts"],
       "@treaty/lsp": ["libs/treaty/lsp/src/index.ts"],
-      "@treaty/lsp/plugins": ["libs/treaty/lsp/src/plugins.ts"]
+      "@treaty/lsp/plugins": ["libs/treaty/lsp/src/plugins.ts"],
+      "@treaty/compiler": ["libs/treaty/compiler/src/index.ts"],
+      "@treaty/vite": ["libs/treaty/vite/src/index.ts"],
+      "@treaty/rslib": ["libs/treaty/rslib/src/index.ts"],
+      "@treaty/rspack": ["libs/treaty/rspack/src/index.ts"],
+      "@treaty/rspack/loader": ["libs/treaty/rspack/src/loader.ts"],
+      "@treaty/rspack/plugin": ["libs/treaty/rspack/src/plugin.ts"],
+      "@treaty/rsbuild": ["libs/treaty/rsbuild/src/index.ts"],
+      "@treaty/rsbuild/loader": ["libs/treaty/rsbuild/src/loader.ts"]
     },
     "types": ["bun-types"]
   },

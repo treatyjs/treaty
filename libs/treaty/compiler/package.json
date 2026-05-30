@@ -1,0 +1,26 @@
+{
+  "name": "@treaty/compiler",
+  "version": "0.0.1",
+  "description": "File-by-file Treaty compiler core: extension routing, incremental cache, and tree-shaking metadata shared by every Treaty bundler plugin. Backed by the Rust authoring compiler.",
+  "author": "Jordan Hall",
+  "license": "IDGAF-1.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    "./package.json": {
+      "default": "./package.json"
+    },
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "sideEffects": false,
+  "dependencies": {
+    "@treaty/authoring-node": "*"
+  },
+  "engines": {
+    "node": ">=20.19"
+  }
+}

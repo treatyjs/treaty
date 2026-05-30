@@ -1,0 +1,177 @@
+/**
+ * @module
+ *
+ * `@treaty/vite` — the Vite plugin for Treaty authoring formats. It wires the
+ * framework-agnostic {@link TreatyCompiler} core from `@treaty/compiler` into
+ * Vite's plugin lifecycle so that `.treaty`, `.tsx`, `.tjsx`, and Angular
+ * `@Component` `.ts` files are lowered to Ivy JS during dev and build.
+ *
+ * Treaty is a compiler, not a host: this plugin does not reimplement any
+ * lowering. It delegates every owned file to the core's `transform`, which in
+ * turn routes through the Rust authoring compiler. The plugin's job is purely
+ * Vite integration: extension ownership, esbuild/resolve configuration, the
+ * incremental cache, and hot-update / deletion handling.
+ */
+
+import {
+	createTreatyCompiler,
+	classify,
+	type TreatyCompiler,
+	type TreatyCompilerOptions,
+} from '@treaty/compiler'
+import type { Plugin } from 'vite'
+
+/** Public options for {@link treaty}. */
+export interface PluginOptions extends TreatyCompilerOptions {
+	/**
+	 * Emit a JSON source map alongside the transformed code when the core
+	 * produces one. Defaults to `true`. When `false`, a null map is returned so
+	 * Vite skips source-map work for Treaty modules.
+	 */
+	readonly sourceMap?: boolean
+	/**
+	 * Force `esbuild` to treat the listed extensions with the given loader so
+	 * Vite's dependency optimizer and esbuild passes do not choke on the JSX
+	 * authoring extensions this plugin owns. Defaults to mapping `.tjsx` to the
+	 * `tsx` loader (`.tsx` is already known to esbuild).
+	 */
+	readonly esbuildLoaders?: Readonly<Record<string, 'ts' | 'tsx' | 'js' | 'jsx'>>
+}
+
+/** The plugin name surfaced in Vite logs and the plugin pipeline. */
+const PLUGIN_NAME = 'treaty:vite'
+
+/** Default esbuild loader assignments for Treaty's JSX authoring extensions. */
+const DEFAULT_ESBUILD_LOADERS: Readonly<Record<string, 'ts' | 'tsx' | 'js' | 'jsx'>> = {
+	'.tjsx': 'tsx',
+}
+
+/** Strip a bundler-appended query/hash suffix (`?foo`, `#bar`) from an id. */
+function cleanId(id: string): string {
+	return id.replace(/[?#].*$/, '')
+}
+
+/**
+ * Whether the resolved id is one this plugin should attempt to transform. We
+ * rely on the core's {@link classify} so ownership stays in one place; a plain
+ * `.ts` is only fully claimed by the core's `transform` (which screens for an
+ * `@Component` decorator and returns `null` otherwise).
+ */
+function isCandidate(id: string): boolean {
+	return classify(cleanId(id)) !== null
+}
+
+/**
+ * Create the Treaty Vite plugin. Returns a single {@link Plugin} object that
+ * delegates all lowering to the shared {@link TreatyCompiler} core.
+ */
+export default function treaty(options: PluginOptions = {}): Plugin {
+	const emitSourceMap = options.sourceMap ?? true
+	const esbuildLoaders = options.esbuildLoaders ?? DEFAULT_ESBUILD_LOADERS
+
+	const compiler: TreatyCompiler = createTreatyCompiler(options)
+
+	return {
+		name: PLUGIN_NAME,
+		// Run before Vite's core TS/esbuild handling so authoring files reach the
+		// Treaty compiler as their original source rather than esbuild output.
+		enforce: 'pre',
+
+		/**
+		 * Teach esbuild about Treaty's JSX authoring extensions. Without this the
+		 * dependency optimizer / esbuild transform pass would not know how to read
+		 * `.tjsx` files; `.treaty` files are never handed to esbuild because this
+		 * plugin transforms them first.
+		 */
+		config() {
+			return {
+				optimizeDeps: {
+					esbuildOptions: {
+						loader: { ...esbuildLoaders },
+					},
+				},
+			}
+		},
+
+		/**
+		 * Capture whether we are building so the cache can be left enabled in dev
+		 * (where re-transforms are common) and the core's defaults otherwise.
+		 */
+		configResolved(resolved) {
+			// One-shot production builds gain nothing from the in-memory cache; clear
+			// it so a fresh build never serves a stale dev entry.
+			if (resolved.command === 'build') compiler.clearCache()
+		},
+
+		/**
+		 * Resolve bare/relative `.treaty` (and other owned) imports so that an
+		 * importing module's `import x from './foo.treaty'` keeps a stable id that
+		 * this plugin's `transform` then owns. We only intervene for ids that carry
+		 * an owned extension and are not already absolute/virtual, deferring the
+		 * actual path resolution to Vite via `this.resolve`.
+		 */
+		async resolveId(source, importer, resolveOptions) {
+			if (!isCandidate(source)) return null
+			// Avoid infinite recursion: skip ids we have already resolved.
+			const resolved = await this.resolve(source, importer, {
+				...resolveOptions,
+				skipSelf: true,
+			})
+			return resolved ? resolved.id : null
+		},
+
+		/**
+		 * The heart of the plugin: hand owned files to the core compiler and return
+		 * Vite's `{ code, map }` shape. Files the core does not own (it returns
+		 * `null`) fall through to Vite's normal pipeline untouched.
+		 */
+		transform(code, id) {
+			if (!isCandidate(id)) return null
+			const result = compiler.transform(cleanId(id), code)
+			if (result === null) return null
+			return {
+				code: result.code,
+				map: emitSourceMap && result.map !== undefined ? result.map : null,
+			}
+		},
+
+		/**
+		 * Re-transform changed authoring files and propagate deletions through the
+		 * core's `onDelete`. On a normal change we invalidate the incremental cache
+		 * entry so the next `transform` recompiles; on a delete we evict the file
+		 * and additionally invalidate every module that imported it so Vite picks
+		 * up the now-broken (or changed) reference.
+		 */
+		async handleHotUpdate(ctx) {
+			const file = cleanId(ctx.file)
+			if (!isCandidate(file)) return
+
+			let exists = true
+			try {
+				await ctx.read()
+			} catch {
+				// `read()` throwing signals the file is gone (deleted/renamed).
+				exists = false
+			}
+
+			if (!exists) {
+				const dependents = compiler.onDelete(file)
+				const affected = [...ctx.modules]
+				const graph = ctx.server.moduleGraph
+				for (const depId of dependents) {
+					for (const mod of graph.getModulesByFile(depId) ?? []) {
+						affected.push(mod)
+					}
+				}
+				return affected
+			}
+
+			// Changed-in-place: drop the stale cache entry so the reload recompiles.
+			compiler.invalidate(file)
+			return ctx.modules
+		},
+	}
+}
+
+export { createTreatyCompiler } from '@treaty/compiler'
+export type { TreatyCompilerOptions } from '@treaty/compiler'

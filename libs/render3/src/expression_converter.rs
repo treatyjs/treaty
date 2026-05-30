@@ -136,6 +136,34 @@ pub trait PipeSlotAllocator {
     fn allocate_arrow_slot(&self) -> Option<usize> {
         None
     }
+
+    /// Reserve the binding (var) slots a hoisted `ɵɵpureFunctionN` consumes and return its
+    /// var offset (`PureFunctionExpr.varOffset`). A pure function uses `1 + num_args` var slots
+    /// (Angular `varsUsedByOp` for `PureFunctionExpr` — `var_counting.ts:180`).
+    ///
+    /// Defaulted to `None` so the existing view-builder pipe registry need not change: the
+    /// converter then falls back to a self-contained counter (value-correct, but the host's
+    /// `vars` total and exact slot indices are the builder's job — Angular assigns pure-function
+    /// offsets in a deferred second pass *after* every non-pure binding/pipe/arrow in the view,
+    /// which only the builder that owns the whole view's var pool can reproduce). A builder that
+    /// owns the var pool overrides this to draw `1 + num_args` slots from the shared cursor.
+    fn allocate_pure_function_slot(&self, _num_args: usize) -> Option<usize> {
+        None
+    }
+
+    /// Intern a pure-function/arrow-function *factory* expression into the const pool and return
+    /// the reference name (`$c0$`, `$arrowFn0$`, …) the live `ɵɵpureFunctionN`/`ɵɵarrowFunction`
+    /// call should pass as its factory argument. Mirrors Angular's
+    /// `ConstantPool.getSharedConstant` / `getSharedFunctionReference` (`pure_function_extraction.ts`
+    /// + `reify.ts:844`), which hoist the factory to a module-level `const` and reference it by name.
+    ///
+    /// Defaulted to `None` so the existing view-builder pipe registry need not change: the converter
+    /// then emits the factory *inline* as the call argument (value-correct, but not byte-identical to
+    /// Angular, which hoists it — hoisting requires the builder's const pool, which it owns). A
+    /// builder wired to its const pool overrides this to intern `factory` and return its name.
+    fn intern_pure_function_factory(&self, _factory: &Expr) -> Option<String> {
+        None
+    }
 }
 
 /// Default [`LocalResolver`]: every implicit-receiver read roots at a single
@@ -212,6 +240,14 @@ fn binary_expr(op: BinaryOperator, lhs: Expr, rhs: Expr) -> Expr {
         lhs: Box::new(lhs),
         rhs: Box::new(rhs),
     })
+}
+
+/// A pure-function factory parameter reference `a{idx}` — the placeholder a non-constant literal
+/// entry is replaced by in the factory body, supplied as a live `ɵɵpureFunctionN` argument. Mirrors
+/// Angular's `ir.PureFunctionParameterExpr(idx)` (rewritten to `o.variable('a' + idx)` when the
+/// factory is materialised — `pure_function_extraction.ts:60`).
+fn pure_param(idx: usize) -> Expr {
+    o::variable(format!("a{idx}"), None)
 }
 
 fn map_literal_value(v: &ELit) -> OLit {
@@ -379,6 +415,9 @@ pub fn convert_property_binding_with_pipes<R: LocalResolver, P: PipeSlotAllocato
     // `generateArrowFunctions` rewrites), so a top-level user arrow here is hoisted
     // into a const-pool factory and emitted as `ɵɵarrowFunction(slot, factory, ctx)`.
     cx.hoist_arrows = true;
+    // The property/interpolation binding path is the one Angular's pure-literal-structures phase
+    // runs on, so literal arrays/maps here are extracted into const-pool `ɵɵpureFunctionN` factories.
+    cx.extract_pure = true;
     ConvertedBinding::pure(cx.convert(expr))
 }
 
@@ -574,6 +613,27 @@ struct Converter<'r, R: LocalResolver> {
     /// advanced once per hoisted arrow so multiple arrows in one binding get distinct
     /// offsets. When the host *does* expose the pool the real offset is used instead.
     arrow_slot_fallback: std::cell::Cell<usize>,
+    /// Whether literal arrays/maps in this binding should be extracted into const-pool pure
+    /// functions (`ɵɵpureFunctionN(slot, factory, …args)`), faithful to Angular's
+    /// `generatePureLiteralStructures` + `extractPureFunctions` phases. Enabled only on the
+    /// property/interpolation binding entry point ([`convert_property_binding_with_pipes`]) — the
+    /// only path Angular's pure-literal phase runs on; the plain (non-pipe) and action entry points
+    /// keep literals verbatim so their callers (`@for` trackBy lowering, event handlers) are
+    /// unaffected.
+    extract_pure: bool,
+    /// Depth of enclosing user arrow-function bodies under conversion. Angular's
+    /// `generatePureLiteralStructures` skips any literal reached with the `InChildOperation` flag —
+    /// literals *inside* an arrow body are NOT pure-extracted (they live in the factory body and are
+    /// rebuilt on each call) — see `pure_literal_structures.ts:19`. While `> 0`, the literal arms
+    /// keep the verbatim literal. This is what keeps `(a => ({foo: a, bar: ctx.componentProp}))` from
+    /// pure-extracting its returned object literal ("should not produce pure functions for arrow
+    /// function return values").
+    in_child_operation: usize,
+    /// Running fallback counter for a hoisted pure function's `varOffset` when the host does not
+    /// expose its binding-slot pool ([`PipeSlotAllocator::allocate_pure_function_slot`] returns
+    /// `None`). Like [`Self::arrow_slot_fallback`] a self-contained stand-in; the real offset (and
+    /// the matching `vars` growth) is the view builder's job.
+    pure_slot_fallback: std::cell::Cell<usize>,
 }
 
 impl<'r, R: LocalResolver> Converter<'r, R> {
@@ -585,6 +645,9 @@ impl<'r, R: LocalResolver> Converter<'r, R> {
             arrow_params: Vec::new(),
             hoist_arrows: false,
             arrow_slot_fallback: std::cell::Cell::new(1),
+            extract_pure: false,
+            in_child_operation: 0,
+            pure_slot_fallback: std::cell::Cell::new(0),
         }
     }
 
@@ -678,10 +741,18 @@ impl<R: LocalResolver> Converter<'_, R> {
             // LiteralPrimitive.
             EK::LiteralPrimitive { value } => literal(map_literal_value(value), None),
 
-            // LiteralArray.
+            // LiteralArray. In a binding context (outside any arrow body) it is extracted into a
+            // const-pool pure function — `ɵɵpureFunctionN(slot, factory, …nonConstantArgs)` — by
+            // [`Self::extract_literal_array`] (Angular `generatePureLiteralStructures`); otherwise it
+            // stays a verbatim array literal.
             EK::LiteralArray { expressions } => {
-                let entries = expressions.iter().map(|x| self.convert(x)).collect();
-                literal_arr(entries, None)
+                let entries: Vec<Expr> = expressions.iter().map(|x| self.convert(x)).collect();
+                let array = literal_arr(entries, None);
+                if self.should_extract_pure() {
+                    self.extract_literal_array(array)
+                } else {
+                    array
+                }
             }
 
             // SpreadElement.
@@ -711,10 +782,17 @@ impl<R: LocalResolver> Converter<'_, R> {
                         }
                     })
                     .collect();
-                Expr::bare(ExprKind::LiteralMap {
+                let map = Expr::bare(ExprKind::LiteralMap {
                     entries,
                     value_type: None,
-                })
+                });
+                // Like `LiteralArray`: extracted into a const-pool pure function in a binding
+                // context (outside any arrow body), otherwise kept verbatim.
+                if self.should_extract_pure() {
+                    self.extract_literal_map(map)
+                } else {
+                    map
+                }
             }
 
             // Interpolation appearing as a *sub-expression* (rare; an interpolation is
@@ -828,7 +906,13 @@ impl<R: LocalResolver> Converter<'_, R> {
                     };
                     self.arrow_params.push(bound);
                 }
+                // The arrow body is an `InChildOperation`: literal arrays/maps inside it are NOT
+                // pure-extracted (they live in the factory body), so bump the depth across the body
+                // conversion. Tracked independently of `arrow_params` because a zero-parameter arrow
+                // (`() => [3]`) pushes no params yet still guards its body.
+                self.in_child_operation += 1;
                 let body = self.convert(body);
+                self.in_child_operation -= 1;
                 self.arrow_params.truncate(scope_base);
                 let inline_arrow = o::arrow_fn(params, ArrowBody::Expr(Box::new(body)), None);
 
@@ -969,12 +1053,172 @@ impl<R: LocalResolver> Converter<'_, R> {
             None,
         );
 
+        // The factory argument: a const-pool reference (`$arrowFn0$`) when the host's pool is wired
+        // (Angular `getSharedFunctionReference`), else the factory emitted inline (value-correct).
+        let factory_arg = self.intern_factory(factory);
+
         // ɵɵarrowFunction(slot, factory, ctx)
         let ctx_capture = o::variable("ctx", None);
         o::import_expr(R3::ArrowFunction.reference(), None).call_fn(
-            vec![literal(OLit::Number(slot as f64), None), factory, ctx_capture],
+            vec![literal(OLit::Number(slot as f64), None), factory_arg, ctx_capture],
             false,
         )
+    }
+
+    /// Whether literal arrays/maps reached here should be extracted into const-pool pure functions:
+    /// only in a binding context ([`Self::extract_pure`]) and only when *not* inside an arrow body
+    /// (`InChildOperation`). Mirrors the guard in Angular `generatePureLiteralStructures`.
+    fn should_extract_pure(&self) -> bool {
+        self.extract_pure && self.in_child_operation == 0
+    }
+
+    /// `transformLiteralArray` (`pure_literal_structures.ts:37`) + pure-function reify: split a
+    /// lowered array literal's entries into *constant* entries (kept verbatim in the factory body)
+    /// and *non-constant* entries (replaced by positional parameters `a0, a1, …`, supplied as live
+    /// arguments), build the factory `(a0, …) => [ …derived… ]`, and emit
+    /// `ɵɵpureFunctionN(slot, factory, …args)`.
+    fn extract_literal_array(&mut self, array: Expr) -> Expr {
+        let ExprKind::LiteralArray(entries) = array.kind else {
+            return array;
+        };
+        let mut derived: Vec<Expr> = Vec::with_capacity(entries.len());
+        let mut args: Vec<Expr> = Vec::new();
+        for entry in entries {
+            match entry.kind {
+                // A spread element `...x`: the spread *inner* is what is constant-tested; the spread
+                // wrapper is preserved in both the factory body and (when non-constant) the arg slot.
+                ExprKind::Spread(inner) => {
+                    if inner.is_constant() {
+                        derived.push(Expr::bare(ExprKind::Spread(inner)));
+                    } else {
+                        let idx = args.len();
+                        args.push(*inner);
+                        derived.push(Expr::bare(ExprKind::Spread(Box::new(pure_param(idx)))));
+                    }
+                }
+                _ => {
+                    if entry.is_constant() {
+                        derived.push(entry);
+                    } else {
+                        let idx = args.len();
+                        let param = pure_param(idx);
+                        args.push(entry);
+                        derived.push(param);
+                    }
+                }
+            }
+        }
+        let body = literal_arr(derived, None);
+        self.emit_pure_function(body, args)
+    }
+
+    /// `transformLiteralMap` (`pure_literal_structures.ts:63`) + pure-function reify: the literal-map
+    /// analogue of [`Self::extract_literal_array`]. Constant entry values stay in the factory body;
+    /// non-constant ones become parameters supplied as live arguments.
+    fn extract_literal_map(&mut self, map: Expr) -> Expr {
+        let ExprKind::LiteralMap { entries, .. } = map.kind else {
+            return map;
+        };
+        let mut derived: Vec<o::LiteralMapEntry> = Vec::with_capacity(entries.len());
+        let mut args: Vec<Expr> = Vec::new();
+        for entry in entries {
+            match entry {
+                o::LiteralMapEntry::Spread { expression } => {
+                    if expression.is_constant() {
+                        derived.push(o::LiteralMapEntry::Spread { expression });
+                    } else {
+                        let idx = args.len();
+                        args.push(expression);
+                        derived.push(o::LiteralMapEntry::Spread {
+                            expression: pure_param(idx),
+                        });
+                    }
+                }
+                o::LiteralMapEntry::Property { key, value, quoted } => {
+                    if value.is_constant() {
+                        derived.push(o::LiteralMapEntry::Property { key, value, quoted });
+                    } else {
+                        let idx = args.len();
+                        let param = pure_param(idx);
+                        args.push(value);
+                        derived.push(o::LiteralMapEntry::Property {
+                            key,
+                            value: param,
+                            quoted,
+                        });
+                    }
+                }
+            }
+        }
+        let body = Expr::bare(ExprKind::LiteralMap {
+            entries: derived,
+            value_type: None,
+        });
+        self.emit_pure_function(body, args)
+    }
+
+    /// Build the factory `(a0, …, a{n-1}) => <body>` (the const-pool constant) and the live
+    /// `ɵɵpureFunctionN(slot, factory, …args)` / `ɵɵpureFunctionV(slot, factory, [args])` call that
+    /// references it. Mirrors `PureFunctionConstant.toSharedConstantDeclaration` (factory shape) +
+    /// `instruction.ts pureFunction` (arity selection, ≤8 ⇒ `pureFunction{N}`, else `pureFunctionV`).
+    fn emit_pure_function(&mut self, body: Expr, args: Vec<Expr>) -> Expr {
+        let num_args = args.len();
+
+        // Var offset: from the host pool when wired, else the self-contained fallback.
+        let slot = match self.pipes.and_then(|p| p.allocate_pure_function_slot(num_args)) {
+            Some(offset) => offset,
+            None => {
+                let next = self.pure_slot_fallback.get();
+                self.pure_slot_fallback.set(next + 1 + num_args);
+                next
+            }
+        };
+
+        // factory = (a0, …, a{n-1}) => <body>
+        let params: Vec<FnParam> = (0..num_args)
+            .map(|i| FnParam::new(format!("a{i}"), Some(dynamic_type())))
+            .collect();
+        let factory = o::arrow_fn(params, ArrowBody::Expr(Box::new(body)), None);
+        let factory_arg = self.intern_factory(factory);
+
+        let slot_lit = literal(OLit::Number(slot as f64), None);
+        if num_args < 9 {
+            let reference = match num_args {
+                0 => R3::PureFunction0,
+                1 => R3::PureFunction1,
+                2 => R3::PureFunction2,
+                3 => R3::PureFunction3,
+                4 => R3::PureFunction4,
+                5 => R3::PureFunction5,
+                6 => R3::PureFunction6,
+                7 => R3::PureFunction7,
+                _ => R3::PureFunction8,
+            };
+            let mut call_args = Vec::with_capacity(num_args + 2);
+            call_args.push(slot_lit);
+            call_args.push(factory_arg);
+            call_args.extend(args);
+            o::import_expr(reference.reference(), None).call_fn(call_args, false)
+        } else {
+            // ɵɵpureFunctionV(slot, factory, [args])
+            let arr = literal_arr(args, None);
+            o::import_expr(R3::PureFunctionV.reference(), None)
+                .call_fn(vec![slot_lit, factory_arg, arr], false)
+        }
+    }
+
+    /// Intern a factory expression into the host const pool and return the reference to pass as the
+    /// `ɵɵpureFunctionN`/`ɵɵarrowFunction` factory argument. When the host exposes its pool
+    /// ([`PipeSlotAllocator::intern_pure_function_factory`]) the factory is hoisted and referenced
+    /// by name (`$c0$`/`$arrowFn0$`); otherwise it is emitted inline (value-correct).
+    fn intern_factory(&self, factory: Expr) -> Expr {
+        match self
+            .pipes
+            .and_then(|p| p.intern_pure_function_factory(&factory))
+        {
+            Some(name) => o::variable(name, None),
+            None => factory,
+        }
     }
 
     /// Expand a safe-navigation access (`a?.b`, `a?.[k]`, `f?.(args)`) into a
@@ -1441,7 +1685,8 @@ mod tests {
         let r = convert_action_binding(&arrow, ctx(), "0");
         let out = emit_expression(&r.expr);
         assert!(!out.contains("arrowFunction"), "action arrow should stay inline, got: {out}");
-        assert!(out.contains("(value) => value + 1"), "got: {out}");
+        // Single simple-identifier param is unparenthesized, matching Angular's emitter.
+        assert!(out.contains("value => value + 1"), "got: {out}");
     }
 
     #[test]
@@ -1465,7 +1710,7 @@ mod tests {
         let out = emit_expression(&r.expr);
         // Exactly one arrowFunction instruction (the outer), inner stays a plain arrow.
         assert_eq!(out.matches("\u{0275}\u{0275}arrowFunction(").count(), 1, "got: {out}");
-        assert!(out.contains("(a) => (b) => a + b"), "nested arrow body wrong, got: {out}");
+        assert!(out.contains("a => b => a + b"), "nested arrow body wrong, got: {out}");
     }
 
     #[test]
@@ -1595,13 +1840,13 @@ mod tests {
 
     #[test]
     fn arrow_function() {
-        // (p) => x  -> a body read of a NON-parameter resolves to `ctx.x`.
+        // p => x  -> a body read of a NON-parameter resolves to `ctx.x`.
         let body = prop("x");
         let n = node(EK::ArrowFunction {
             parameters: vec![arrow_id_param("p")],
             body: Box::new(body),
         });
-        assert_eq!(emit(&n), "(p) => ctx.x;\n");
+        assert_eq!(emit(&n), "p => ctx.x;\n");
     }
 
     #[test]
@@ -1616,7 +1861,7 @@ mod tests {
             parameters: vec![arrow_id_param("value")],
             body: Box::new(body),
         });
-        assert_eq!(emit(&n), "(value) => value + 1;\n");
+        assert_eq!(emit(&n), "value => value + 1;\n");
     }
 
     #[test]
@@ -1636,7 +1881,7 @@ mod tests {
             parameters: vec![arrow_id_param("a")],
             body: Box::new(body),
         });
-        assert_eq!(emit(&n), "(a) => a + 1 + ctx.componentProp;\n");
+        assert_eq!(emit(&n), "a => a + 1 + ctx.componentProp;\n");
     }
 
     #[test]
@@ -1655,7 +1900,7 @@ mod tests {
             parameters: vec![arrow_id_param("a")],
             body: Box::new(inner),
         });
-        assert_eq!(emit(&outer), "(a) => (b) => a + b;\n");
+        assert_eq!(emit(&outer), "a => b => a + b;\n");
     }
 
     #[test]
@@ -1671,7 +1916,7 @@ mod tests {
             right: Box::new(prop("a")),
         });
         // The second `a` is outside the arrow's scope, so it resolves to `ctx.a`.
-        assert_eq!(emit(&n), "((a) => a) + ctx.a;\n");
+        assert_eq!(emit(&n), "(a => a) + ctx.a;\n");
     }
 
     #[test]

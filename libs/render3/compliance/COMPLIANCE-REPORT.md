@@ -14,11 +14,11 @@ This harness runs Treaty's Rust/OXC Angular compiler (`render3` crate, via the
 | --- | --- |
 | Total compliance cases | 642 |
 | Compiled (runnable) | 98 |
-| PASS | 14 |
-| DIFF | 84 |
+| PASS | 15 |
+| DIFF | 83 |
 | Skipped (un-runnable) | 544 |
-| **Pass-rate (of runnable subset)** | **14.3%** (14/98) |
-| Pass-rate (of full corpus) | 2.2% (14/642) |
+| **Pass-rate (of runnable subset)** | **15.3%** (15/98) |
+| Pass-rate (of full corpus) | 2.3% (15/642) |
 
 ### How a case is run and matched
 
@@ -43,7 +43,7 @@ from our output. Top entry = implement first to raise the score.
 
 | Count | Category (instruction / shape at first missing fragment) |
 | --- | --- |
-| 20 | `ɵɵtext` |
+| 19 | `ɵɵtext` |
 | 9 | `misc-shape` |
 | 9 | `ɵɵdeclareLet` |
 | 9 | `ɵɵdomElementStart` |
@@ -64,7 +64,7 @@ from our output. Top entry = implement first to raise the score.
 
 ### Sample diverging cases
 
-- **`ɵɵtext`** (20):
+- **`ɵɵtext`** (19):
   - r3_view_compiler_listener/should not generate restore/reset view when listener does not use @let in the same scope
     - near: `onstID=123;ɵɵadvance();ɵɵtextInter`
   - r3_view_compiler_let/should create a simple @let declaration
@@ -115,11 +115,11 @@ from our output. Top entry = implement first to raise the score.
     - near: `sts:()=>{leti18n_0;if(typeofngI18n`
 - **`ɵɵgetCurrentView`** (3):
   - r3_view_compiler_listener/local refs in listeners defined before the local refs
-    - near: `s:[["user",""],[AM,"click"]],templ`
+    - near: `"],[AM,"click"]],template:function`
   - r3_view_compiler_let/should be able to use let declarations in event listeners
     - near: `onstID=ɵɵgetCurrentView();ɵɵdeclar`
   - r3_view_compiler_let/should not remove let declarations that are only used in an event listener
-    - near: `&1){constID=ɵɵgetCurrentView();ɵɵt`
+    - near: `onstID=ɵɵgetCurrentView();ɵɵtext(0`
 - **`ɵɵi18nPostprocess`** (3):
   - r3_view_compiler_let/should handle an @let referenced inside i18n and in a child view
     - near: `cls:4,vars:2,consts:()=>{letID;if(`
@@ -188,7 +188,7 @@ error-expectation cases).
 
 ## Passing cases
 
-14 runnable compliance cases match Angular's golden `ɵɵdefineComponent` block:
+15 runnable compliance cases match Angular's golden `ɵɵdefineComponent` block:
 
 - model_inputs/should capture input/output pair in a component definition
 - output_function/should generate an output mapping for the component
@@ -197,6 +197,7 @@ error-expectation cases).
 - r3_compiler_compliance/components_and_directives/value_composition/should support dollar escape in template
 - r3_compiler_compliance/elements/should bind to class and style names
 - r3_view_compiler/animations/should not generate animate leave when using 'animate' as a binding prefix
+- r3_view_compiler_arrow_functions/should handle arrow functions that do not depend on context
 - r3_view_compiler_input_outputs/should declare inputs/outputs on a component
 - r3_view_compiler_let/should remove a single unused let declaration
 - r3_view_compiler_providers/should not emit the ProvidersFeature feature when no providers

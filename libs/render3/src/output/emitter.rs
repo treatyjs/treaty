@@ -187,7 +187,8 @@ impl<'a> Lowerer<'a> {
             self.ast.vec(),  // directives
             body,
         );
-        Codegen::new().build(&program).code
+        let code = Codegen::new().build(&program).code;
+        drop_single_param_arrow_parens(&code)
     }
 
     // -- helpers ----------------------------------------------------------
@@ -224,8 +225,8 @@ impl<'a> Lowerer<'a> {
             }
             StmtKind::DeclareVar { name, value, .. } => {
                 // `const` if Final modifier set, else `let` (matches Angular's
-                // visitDeclareVarStmt; the JS emitter forces `var` — not modelled
-                // here, see notes).
+                // visitDeclareVarStmt; the JS emitter forces `var`, which this lowering
+                // intentionally does not model).
                 let kind = if stmt.meta.modifiers.has_modifier(StmtModifier::FINAL) {
                     VariableDeclarationKind::Const
                 } else {
@@ -846,6 +847,162 @@ impl<'a> Lowerer<'a> {
 }
 
 // ---------------------------------------------------------------------------
+// Single-parameter arrow parenthesization.
+//
+// `oxc_codegen` always parenthesizes an arrow's parameter list (it only drops the
+// parens around a lone simple binding identifier when `minify` is enabled). Angular's
+// own emitter prints `value => value + 1` — no parens around a single simple
+// identifier parameter. This post-pass rewrites `(<ident>) =>` back to `<ident> =>`
+// for exactly one bare identifier parameter (no default, no destructuring, no rest,
+// no type annotation), matching Angular's golden output. String / template-literal
+// and comment spans are skipped so literal text is never rewritten.
+// ---------------------------------------------------------------------------
+
+/// Is `b` a byte that may appear in a JS identifier? (ASCII fast-path plus any
+/// non-ASCII byte, since identifiers may contain Unicode letters and our emitted
+/// runtime names use the `ɵ` prefix.)
+fn is_ident_byte(b: u8) -> bool {
+    b == b'_' || b == b'$' || b.is_ascii_alphanumeric() || b >= 0x80
+}
+
+/// Rewrite `(<ident>) =>` to `<ident> =>` for a single bare-identifier arrow
+/// parameter. Walks the source byte-wise, skipping string, template and comment
+/// spans, so only real code is considered. Any param list that is not exactly one
+/// simple identifier (commas, defaults, destructuring, rest, annotations) keeps its
+/// parens because the inner scan would hit a non-identifier byte before the `)`.
+fn drop_single_param_arrow_parens(code: &str) -> String {
+    let bytes = code.as_bytes();
+    let n = bytes.len();
+    let mut out: Vec<u8> = Vec::with_capacity(n);
+    let mut i = 0usize;
+    while i < n {
+        let c = bytes[i];
+        match c {
+            // String literals: copy verbatim until the matching unescaped quote.
+            b'"' | b'\'' => {
+                let quote = c;
+                out.push(c);
+                i += 1;
+                while i < n {
+                    let b = bytes[i];
+                    out.push(b);
+                    i += 1;
+                    if b == b'\\' && i < n {
+                        out.push(bytes[i]);
+                        i += 1;
+                    } else if b == quote {
+                        break;
+                    }
+                }
+            }
+            // Template literals: copy verbatim until the matching unescaped backtick.
+            // (Interpolation contents are copied too; an arrow inside `${...}` is rare
+            // in emitted Ivy and not worth a nested parser here.)
+            b'`' => {
+                out.push(c);
+                i += 1;
+                while i < n {
+                    let b = bytes[i];
+                    out.push(b);
+                    i += 1;
+                    if b == b'\\' && i < n {
+                        out.push(bytes[i]);
+                        i += 1;
+                    } else if b == b'`' {
+                        break;
+                    }
+                }
+            }
+            // Comments: copy verbatim to end-of-line / `*/`.
+            b'/' if i + 1 < n && bytes[i + 1] == b'/' => {
+                while i < n && bytes[i] != b'\n' {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            b'/' if i + 1 < n && bytes[i + 1] == b'*' => {
+                out.push(bytes[i]);
+                out.push(bytes[i + 1]);
+                i += 2;
+                while i < n {
+                    if bytes[i] == b'*' && i + 1 < n && bytes[i + 1] == b'/' {
+                        out.push(bytes[i]);
+                        out.push(bytes[i + 1]);
+                        i += 2;
+                        break;
+                    }
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            // Candidate arrow-param list: `(` <ident> `)` optional-ws `=>`.
+            b'(' => {
+                if let Some(next) = try_single_param_arrow(bytes, i) {
+                    let (ident_start, ident_end, after_paren) = next;
+                    // Emit the identifier (dropping the surrounding parens), then resume
+                    // scanning at the byte after `)` so the ` =>` is copied normally.
+                    out.extend_from_slice(&bytes[ident_start..ident_end]);
+                    i = after_paren;
+                } else {
+                    out.push(c);
+                    i += 1;
+                }
+            }
+            _ => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    // `out` only ever contains bytes copied from valid UTF-8 `code` (whole `(`/ident/
+    // string spans), so it is valid UTF-8.
+    String::from_utf8(out).unwrap_or(code.to_string())
+}
+
+/// If `bytes[open]` is a `(` that begins a single bare-identifier arrow parameter
+/// list — `(ident) =>` — return `(ident_start, ident_end, index_after_close_paren)`.
+/// Returns `None` for anything else (empty parens, multiple params, defaults,
+/// destructuring, rest, type annotations, or a non-arrow `(...)` group).
+fn try_single_param_arrow(bytes: &[u8], open: usize) -> Option<(usize, usize, usize)> {
+    let n = bytes.len();
+    debug_assert_eq!(bytes[open], b'(');
+    let ident_start = open + 1;
+    // First identifier byte must be a non-digit identifier start. Reject `(0` etc. so
+    // we never strip parens off a parenthesized expression like `(0, fn)(...)`.
+    let mut j = ident_start;
+    if j >= n {
+        return None;
+    }
+    let first = bytes[j];
+    if !(first == b'_' || first == b'$' || first.is_ascii_alphabetic() || first >= 0x80) {
+        return None;
+    }
+    j += 1;
+    while j < n && is_ident_byte(bytes[j]) {
+        j += 1;
+    }
+    let ident_end = j;
+    // The very next byte must be the closing `)` — no spaces, commas, `=`, `:`, etc.
+    // oxc emits arrow params with no inner padding, so a tight `)` is the simple-param
+    // signature; anything else means a more complex list we must leave parenthesized.
+    if j >= n || bytes[j] != b')' {
+        return None;
+    }
+    let after_paren = j + 1;
+    // After `)` (skipping whitespace) must come `=>` to confirm this is an arrow head
+    // and not a call/group. This rules out `foo(x)` (followed by `.`/`;`/etc.).
+    let mut k = after_paren;
+    while k < n && (bytes[k] == b' ' || bytes[k] == b'\t' || bytes[k] == b'\n' || bytes[k] == b'\r') {
+        k += 1;
+    }
+    if k + 1 < n && bytes[k] == b'=' && bytes[k + 1] == b'>' {
+        Some((ident_start, ident_end, after_paren))
+    } else {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Operator mapping tables (mirror BINARY_OPERATORS in abstract_emitter.ts §3.3).
 // ---------------------------------------------------------------------------
 
@@ -1209,6 +1366,54 @@ mod tests {
         let out = emit_expression(&arrow);
         assert!(out.contains("=>"), "got: {out}");
         assert!(out.contains("a"), "got: {out}");
+        // A single simple-identifier parameter is printed WITHOUT parens, matching
+        // Angular's emitter (`a => a + 1`), not oxc's default `(a) => a + 1`.
+        assert!(out.contains("a =>"), "expected unparenthesized single param; got: {out}");
+        assert!(!out.contains("(a) =>"), "single param should not be parenthesized; got: {out}");
+    }
+
+    #[test]
+    fn multi_param_arrow_keeps_parens() {
+        // Two params must stay parenthesized: `(a, b) => a + b`.
+        let arrow = o::arrow_fn(
+            vec![FnParam::new("a", None), FnParam::new("b", None)],
+            ArrowBody::Expr(Box::new(variable("a", None).plus(variable("b", None)))),
+            None,
+        );
+        let out = emit_expression(&arrow);
+        assert!(out.contains("(a, b) =>"), "multi-param must keep parens; got: {out}");
+    }
+
+    #[test]
+    fn zero_param_arrow_keeps_parens() {
+        // No params must stay as `() => ...`.
+        let arrow = o::arrow_fn(vec![], ArrowBody::Expr(Box::new(num(1.0))), None);
+        let out = emit_expression(&arrow);
+        assert!(out.contains("() =>"), "zero-param must keep parens; got: {out}");
+    }
+
+    #[test]
+    fn single_param_arrow_inside_call_drops_parens() {
+        // `sig.update(value => value + 1)` — the listener-handler shape from the
+        // arrow-functions compliance cases. The `(value)` parens must be stripped even
+        // though the arrow sits inside a call argument list.
+        let arrow = o::arrow_fn(
+            vec![FnParam::new("value", None)],
+            ArrowBody::Expr(Box::new(variable("value", None).plus(num(1.0)))),
+            None,
+        );
+        let call = variable("update", None).call_fn(vec![arrow], false);
+        let out = emit_expression(&call);
+        assert!(out.contains("value => value + 1"), "got: {out}");
+        assert!(!out.contains("(value) =>"), "got: {out}");
+    }
+
+    #[test]
+    fn arrow_param_parens_not_stripped_inside_string_literal() {
+        // A string literal that happens to contain `(x) =>` must be left untouched.
+        let s = str_lit("(x) => y");
+        let out = emit_expression(&s);
+        assert!(out.contains("(x) => y"), "string content must be preserved; got: {out}");
     }
 
     #[test]
