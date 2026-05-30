@@ -2,5 +2,7 @@ $schema: https://moonrepo.dev/schemas/workspace.json
 projects:
 - apps/*
 - packages/*
+- libs/*
+- libs/*/*
 vcs:
   defaultBranch: master

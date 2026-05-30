@@ -22,7 +22,9 @@
         "libs/treaty/edenclient/src/resources.ts"
       ],
       "@treaty/ts-vite": ["libs/typescript/vite/src/index.ts"],
-      "@treaty/ts-compiler": ["libs/typescript/compiler/src/index.ts"]
+      "@treaty/ts-compiler": ["libs/typescript/compiler/src/index.ts"],
+      "@treaty/lsp": ["libs/treaty/lsp/src/index.ts"],
+      "@treaty/lsp/plugins": ["libs/treaty/lsp/src/plugins.ts"]
     },
     "types": ["bun-types"]
   },
