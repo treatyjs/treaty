@@ -37,6 +37,15 @@ an **incremental cache** (hash→output), a **deleted-file** hook, and **dead-co
 (emit `/*#__PURE__*/`, `sideEffects:false`, drop unused server-fn client bindings). Fast per file; the
 core compliance (A) guarantees correctness. Territory: `libs/treaty/compiler` (new).
 
+**Covers ALL authoring, including plain Angular itself (user, 2026-05-30):** the per-file transform
+applies to `.treaty`, JSX (`.tsx`/`.tjsx`), AND **standard Angular `.ts`** — so a dev using plain
+Angular still benefits from Treaty's fast direct-to-Ivy file-by-file compile + dead-code/file-deletion.
+It must handle **every Angular decorator kind** found in a `.ts` (`@Component`, `@Directive`, `@Pipe`,
+`@Injectable`, `@NgModule`), compiling each to Ivy, and **pass through non-Angular TS unchanged**
+(return null so the bundler's normal TS handling applies). Follow-up if the NAPI only exposes
+`@Component`: wire the render3 pipe/module/injector/directive compilers + DI (`angular.rs`) into a
+single per-file Angular entry point.
+
 **C. Bundler plugins** — each a new package consuming B:
 `@treaty/vite`, `@treaty/rspack`, `@treaty/rsbuild`, `@treaty/rslib`. Per-file transform + HMR/watch +
 handle file deletion + production build (build-to-deploy output). Territory: `libs/treaty/{vite,rspack,rsbuild,rslib}` (new, disjoint per package).
@@ -57,6 +66,19 @@ example, with plugin output viewers. **Depends on B/C/D** (wave 2).
 
 **G. Remaining README features** — SSG (prerender via Nova macros at build), build-to-deploy (bundler
 production outputs), function chunking (lazy server-fn/route code-split). Mostly fall out of B/C.
+
+**H. Performance / parallelism (first-class goal: the FASTEST compiler, user 2026-05-30)** —
+multi-thread and parallelize everywhere it is sound, since file-by-file compiles are independent:
+- **Rust**: `rayon` parallel iteration to compile independent files/components across cores; keep
+  internals thread-safe (per-file `oxc_allocator::Allocator`/arena, no shared mutable global state).
+- **NAPI**: a `compileMany(files: {id,code}[]) -> results[]` batch entry that fans the work across a
+  thread pool (rayon / napi AsyncTask) and returns all results in ONE call — avoids per-file JS↔Rust
+  round-trips. Bundlers/the core call this for cold builds.
+- **JS**: `@treaty/compiler` + bundler plugins use the batch API / a worker pool instead of serial
+  per-file calls; keep the incremental cache for warm rebuilds.
+- Benchmark harness: compile a large fixture project, compare serial vs parallel wall-clock.
+Cross-cutting (NAPI + render3 + authoring + core) → runs AFTER Wave 1 (it touches crates the
+compliance + bundler workflows are editing). Goal: beat ngtsc on cold + incremental builds.
 
 ## Harness
 - **File-by-file harness**: compile a corpus of individual `.treaty`/`.tsx`/`.ts` files through `@treaty/compiler`
