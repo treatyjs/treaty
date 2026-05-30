@@ -208,6 +208,110 @@ fn extract_io(
     }
 }
 
+/// Pieces extracted from the component-body JS chunk for module assembly.
+///
+/// Mirrors `createWrapper`/`extractImportStrings`/`removeImportsFromCode` in
+/// `apps/repl/src/tools/treaty-sfc/treat-to-ivy.ts`:
+///   * `imports` — the import declarations, sliced verbatim from the source.
+///   * `body`    — the JS chunk with its import declarations removed.
+///   * `bindings`— top-level `const`/`function` declaration names, for the returned object.
+#[derive(Default)]
+struct WrapperParts {
+    imports: Vec<String>,
+    body: String,
+    bindings: Vec<String>,
+}
+
+/// Parse the component-body JS chunk and collect import statements (verbatim), the body with
+/// imports stripped, and the top-level `const`/`function` declaration names.
+fn extract_wrapper_parts(javascript: &str) -> WrapperParts {
+    let mut parts = WrapperParts::default();
+    if javascript.trim().is_empty() {
+        return parts;
+    }
+
+    let allocator = Allocator::default();
+    let source_type = SourceType::default().with_typescript(true);
+    let ret = JsParser::new(&allocator, javascript, source_type).parse();
+
+    // Byte ranges of import declarations, to splice out of the body.
+    let mut import_ranges: Vec<(usize, usize)> = Vec::new();
+
+    for stmt in &ret.program.body {
+        match stmt {
+            oxc_ast::ast::Statement::ImportDeclaration(import) => {
+                let start = import.span.start as usize;
+                let end = import.span.end as usize;
+                parts.imports.push(javascript[start..end].to_string());
+                import_ranges.push((start, end));
+            }
+            oxc_ast::ast::Statement::VariableDeclaration(decl) => {
+                for declarator in &decl.declarations {
+                    if let Some(name) = declarator.id.get_identifier_name() {
+                        parts.bindings.push(name.to_string());
+                    }
+                }
+            }
+            oxc_ast::ast::Statement::FunctionDeclaration(func) => {
+                if let Some(id) = &func.id {
+                    parts.bindings.push(id.name.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Body = source with the import declaration byte ranges removed.
+    if import_ranges.is_empty() {
+        parts.body = javascript.to_string();
+    } else {
+        let mut body = String::with_capacity(javascript.len());
+        let mut cursor = 0usize;
+        for (start, end) in &import_ranges {
+            body.push_str(&javascript[cursor..*start]);
+            cursor = *end;
+        }
+        body.push_str(&javascript[cursor..]);
+        parts.body = body;
+    }
+
+    parts
+}
+
+/// Assemble the full runnable ES module string, mirroring the TS `createWrapper`.
+///
+/// `render3`'s `emit_expression` prefixes the defineComponent expression with its own
+/// `import * as i0 from "@angular/core";` line; the module emits that import once at the top, so
+/// any such leading prefix is stripped from the `.ɵcmp` value here.
+fn build_module(class_name: &str, javascript: &str, cmp_expression: &str) -> String {
+    const I0_IMPORT: &str = "import * as i0 from \"@angular/core\";";
+    let cmp_expression = cmp_expression
+        .strip_prefix(I0_IMPORT)
+        .map(str::trim_start)
+        .unwrap_or(cmp_expression);
+
+    let parts = extract_wrapper_parts(javascript);
+
+    let mut module = String::new();
+    module.push_str("import * as i0 from \"@angular/core\";\n");
+    for import in &parts.imports {
+        module.push_str(import);
+        module.push('\n');
+    }
+    module.push_str(&format!("function {class_name}() {{\n"));
+    module.push_str(parts.body.trim());
+    module.push_str(&format!(
+        "\nreturn {{ {} }};\n}}\n",
+        parts.bindings.join(", ")
+    ));
+    module.push_str(&format!(
+        "{class_name}.\u{0275}fac = function {class_name}_Factory(t) {{ return (t || {class_name})(); }};\n"
+    ));
+    module.push_str(&format!("{class_name}.\u{0275}cmp = {cmp_expression};\n"));
+    module.push_str(&format!("export default {class_name};\n"));
+    module
+}
+
 fn class_ref(class_name: &str) -> R3Reference {
     R3Reference {
         value: o::variable(class_name, None),
@@ -215,11 +319,21 @@ fn class_ref(class_name: &str) -> R3Reference {
     }
 }
 
-/// Compile a `.treaty` SFC source into its Ivy `ɵɵdefineComponent` definition.
+/// Compile a `.treaty` SFC source into a full runnable ES module.
 ///
 /// `file_name` derives the component class name (PascalCase of the stem). The component is
 /// standalone, selectorless (class-name based), with the HTML chunk as its template and the CSS
 /// chunk as its styles.
+///
+/// The emitted module mirrors the TS `createWrapper` (Treaty's runtime is a *function* component):
+/// ```text
+/// import * as i0 from "@angular/core";
+/// <verbatim import statements from the JS chunk>
+/// function <Comp>() { <JS chunk body, imports stripped> return { <const/function names> }; }
+/// <Comp>.ɵfac = function <Comp>_Factory(t) { return (t || <Comp>)(); };
+/// <Comp>.ɵcmp = ɵɵdefineComponent({ ... });
+/// export default <Comp>;
+/// ```
 pub fn compile_treaty_file(source: &str, file_name: &str) -> CompiledComponent {
     let chunks = split_chunks(source);
     let class_name = to_pascal_case(file_name);
@@ -322,7 +436,8 @@ pub fn compile_treaty_file(source: &str, file_name: &str) -> CompiledComponent {
         &mut pool_statements,
     );
 
-    let code = emit_expression(&compiled.expression);
+    let cmp_expression = emit_expression(&compiled.expression);
+    let code = build_module(&class_name, &javascript, &cmp_expression);
     CompiledComponent { code, errors }
 }
 
@@ -362,6 +477,58 @@ mod tests {
             "no interpolation instruction; got: {code}"
         );
         assert!(code.contains("ctx.name"), "did not bind ctx.name; got: {code}");
+    }
+
+    #[test]
+    fn emits_full_runnable_module() {
+        let source = "import { foo } from './foo';\nconst name = 'World';\nfunction greet() {}\n<div>{{ name }}</div>";
+        let out = compile_treaty_file(source, "greeting.treaty");
+
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+
+        // i0 core import is always present.
+        assert!(
+            code.contains("import * as i0 from \"@angular/core\";"),
+            "no i0 import; got: {code}"
+        );
+        // The user's import statement is emitted verbatim.
+        assert!(
+            code.contains("import { foo } from './foo';"),
+            "verbatim import missing; got: {code}"
+        );
+        // The function component wrapper.
+        assert!(
+            code.contains("function Greeting() {"),
+            "no function component; got: {code}"
+        );
+        // The body is present with imports stripped.
+        assert!(code.contains("const name = 'World';"), "body const missing; got: {code}");
+        assert!(code.contains("function greet() {}"), "body fn missing; got: {code}");
+        assert!(
+            !code.contains("function Greeting() {\nimport"),
+            "import leaked into body; got: {code}"
+        );
+        // Top-level const/function names are returned as the bindings object.
+        assert!(
+            code.contains("return { name, greet };"),
+            "bindings return missing; got: {code}"
+        );
+        // ɵfac factory.
+        assert!(
+            code.contains("Greeting.\u{0275}fac = function Greeting_Factory(t) { return (t || Greeting)(); };"),
+            "no ɵfac; got: {code}"
+        );
+        // ɵcmp = the ɵɵdefineComponent expression.
+        assert!(
+            code.contains(&format!("Greeting.\u{0275}cmp = i0.{DEFINE}")),
+            "no ɵcmp = defineComponent; got: {code}"
+        );
+        // export default.
+        assert!(
+            code.contains("export default Greeting;"),
+            "no export default; got: {code}"
+        );
     }
 
     #[test]
