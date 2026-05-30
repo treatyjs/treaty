@@ -14,8 +14,18 @@
 //!
 //! Nova evaluates synchronously and has no built-in event loop; `async`/`await` and promise
 //! draining are a documented follow-up and are not exercised here.
+//!
+//! On top of the raw [`JsRuntime::eval`] surface, this crate exposes the render-time execution
+//! paths shared across Treaty: [`run_macro`] transpiles a TypeScript macro to JavaScript and runs
+//! it against an injected input (the static prerender path, also reusable per request for dynamic
+//! prerender), and [`run_server_fn`] executes a TypeScript server-function body against its JSON
+//! arguments. Both reuse the same Nova engine and the same TS->JS step.
 
 use std::fmt;
+
+mod transpile;
+
+pub use transpile::{transpile_ts, TranspileError};
 
 use nova_vm::{
     ecmascript::{DefaultHostHooks, GcAgent, String as JsString, parse_script, script_evaluation},
@@ -87,12 +97,14 @@ impl JsRuntime {
         self.eval_with_input(source, &JsonValue::Null)
     }
 
-    /// Evaluate `source` with `input` injected as the globals `input` and `__args`, returning the
-    /// completion value as a [`serde_json::Value`].
+    /// Evaluate `source` with `input` injected as the globals `input`, `__args` and `args`,
+    /// returning the completion value as a [`serde_json::Value`].
     ///
     /// `input` is serialized to JSON and spliced into the script as a literal, so the executed
-    /// code can read it directly (e.g. `input.x`). Any JSON value is accepted; passing
-    /// [`JsonValue::Null`] is equivalent to [`JsRuntime::eval`].
+    /// code can read it directly (e.g. `input.x`). The same value is also bound to `args`, the
+    /// conventional name a server function reads positional arguments from (the caller passes a
+    /// JSON array there). Any JSON value is accepted; passing [`JsonValue::Null`] is equivalent to
+    /// [`JsRuntime::eval`].
     pub fn eval_with_input(
         &mut self,
         source: &str,
@@ -173,6 +185,220 @@ impl Default for JsRuntime {
     }
 }
 
+/// The value a macro produced for injection, captured as JSON.
+///
+/// A macro runs server-side at render time and yields a single value (its default export, an
+/// explicit `return`, or a trailing expression). That value is serialized to JSON so it can be
+/// spliced into the rendered output. Values with no JSON form (`undefined`, functions, symbols)
+/// are represented as [`JsonValue::Null`], matching [`JsRuntime::eval`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct MacroOutput {
+    /// The macro's produced value, as JSON.
+    pub value: JsonValue,
+}
+
+impl MacroOutput {
+    /// Borrow the produced value.
+    pub fn value(&self) -> &JsonValue {
+        &self.value
+    }
+
+    /// Consume the output, yielding the produced value.
+    pub fn into_value(self) -> JsonValue {
+        self.value
+    }
+}
+
+/// Execute a Treaty macro and capture the value it produces for injection.
+///
+/// `ts_source` is the TypeScript body of a macro (the top-of-file fenced block in a `.treaty`
+/// file). It is transpiled to JavaScript (TypeScript syntax stripped) and then run in a fresh Nova
+/// isolate with `input_json` injected as the globals `input` and `__args`.
+///
+/// The macro produces its value in any of the natural forms:
+///   * `export default <expr>;`  — the default export (rewritten to a `return`),
+///   * `return <expr>;`          — an explicit return from the macro body,
+///   * a trailing expression     — the value of the body's final expression.
+///
+/// This is the **static prerender** path: call it once at build time. It is equally the
+/// **dynamic prerender** entry — calling it again with a different `input_json` re-runs the same
+/// macro per request, since each call uses an isolated runtime and re-injects the input.
+///
+/// Returns [`RuntimeError::Parse`] if the source is not valid TypeScript / cannot be transpiled,
+/// or [`RuntimeError::Runtime`] if the macro throws while executing.
+pub fn run_macro(ts_source: &str, input_json: &JsonValue) -> Result<MacroOutput, RuntimeError> {
+    let js = transpile_macro_to_js(ts_source)?;
+    let mut rt = JsRuntime::new();
+    let value = rt.eval_with_input(&js, input_json)?;
+    Ok(MacroOutput { value })
+}
+
+/// Execute a Treaty server function and return its result as JSON.
+///
+/// `ts_source` is the TypeScript body of a server function; `args_json` is injected as the globals
+/// `args` (an array of positional arguments) and `__args`. The body is transpiled to JavaScript and
+/// executed in a fresh Nova isolate using the same engine as [`run_macro`]. The function's result
+/// is the value it `return`s (or its trailing expression when `return` is omitted).
+///
+/// This is the serverless server-function execution path: one call per invocation.
+///
+/// Returns [`RuntimeError::Parse`] on a transpile failure, or [`RuntimeError::Runtime`] if the
+/// function throws.
+pub fn run_server_fn(ts_source: &str, args_json: &JsonValue) -> Result<JsonValue, RuntimeError> {
+    let js = transpile_macro_to_js(ts_source)?;
+    let mut rt = JsRuntime::new();
+    // Server functions read positional arguments from `args`; `input`/`__args` are also bound by
+    // `eval_with_input`, so a server fn may equally read `__args`.
+    rt.eval_with_input(&js, args_json)
+}
+
+/// Shared TS->JS preparation for [`run_macro`] and [`run_server_fn`].
+///
+/// The macro / server-fn body is render-time code that produces a single value via a default
+/// export, an explicit `return`, or a trailing expression. To make all three forms legal and
+/// capturable, the body is first wrapped in a function (so top-level `return` and `export default`
+/// — once rewritten — are valid statements), then transpiled to JavaScript. Wrapping *before*
+/// transpiling matters: a bare top-level `return` is a parse error in a script, so it must already
+/// sit inside a function when the parser runs.
+///
+/// The produced JavaScript is a single immediately-invoked function expression; its result is the
+/// macro's value, ready to hand to [`JsRuntime::eval_with_input`].
+fn transpile_macro_to_js(ts_source: &str) -> Result<String, RuntimeError> {
+    // `export default <expr>` -> `return <expr>`, and ensure a trailing expression becomes a
+    // `return`. These are syntax-level rewrites that operate equally on TypeScript source.
+    let body = rewrite_default_export(ts_source);
+    let body = ensure_trailing_return(&body);
+
+    // Wrap in a function so `return` is legal, with a fallthrough `return undefined` so a body that
+    // never returns yields `undefined` (-> JSON null) rather than leaking a completion value.
+    let wrapped_ts = format!("(function () {{\n{body}\nreturn undefined;\n}})()");
+
+    transpile_ts(&wrapped_ts).map_err(|e| RuntimeError::Parse(e.0))
+}
+
+/// Rewrite a leading `export default <expr>` into `return <expr>` so a macro's default export is
+/// captured as its produced value when run as a function body.
+///
+/// Scripts evaluated via `eval` cannot contain `export`, so the (transpiled) `export default` form
+/// is converted to a `return`. Only the `export default` keyword prefix is rewritten; the trailing
+/// expression is left intact, including its terminating semicolon if present.
+fn rewrite_default_export(js: &str) -> String {
+    let trimmed = js.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("export default ") {
+        // Preserve any leading whitespace that `trim_start` removed so spans/line counts in error
+        // messages stay close to the original.
+        let lead_len = js.len() - trimmed.len();
+        let lead = &js[..lead_len];
+        format!("{lead}return {rest}")
+    } else {
+        js.to_owned()
+    }
+}
+
+/// Ensure the body ends in a `return` so a trailing expression statement is captured.
+///
+/// If the body already contains a `return` at statement level the body is returned unchanged
+/// (the explicit `return` wins). Otherwise, when the body's final non-empty, non-comment segment
+/// looks like a bare expression statement, it is prefixed with `return `. This is a deliberately
+/// conservative textual heuristic for the supported subset: bodies that need richer control flow
+/// should use an explicit `return`, which always takes precedence.
+fn ensure_trailing_return(body: &str) -> String {
+    let trimmed = body.trim_end();
+    let trimmed = trimmed.strip_suffix(';').unwrap_or(trimmed).trim_end();
+
+    // An explicit top-level `return` is authoritative — never second-guess it.
+    if contains_top_level_return(trimmed) {
+        return body.to_owned();
+    }
+
+    // Find the start of the final statement: the character after the last top-level `;` or `}`.
+    let split_at = last_top_level_statement_boundary(trimmed);
+    let (head, tail) = trimmed.split_at(split_at);
+    let tail_trimmed = tail.trim_start();
+
+    // Only treat the tail as a value-producing expression when it does not begin a statement that
+    // already has its own semantics (declarations, control flow, blocks). For those, falling through
+    // to `return undefined` is correct.
+    if tail_trimmed.is_empty() || starts_statement_keyword(tail_trimmed) || tail_trimmed.starts_with('{') {
+        return body.to_owned();
+    }
+
+    format!("{head}return {tail_trimmed};")
+}
+
+/// True when `body` contains a `return` token at the top brace/paren level (not nested inside a
+/// function literal). Used so an explicit `return` is never overridden by the trailing-expression
+/// heuristic.
+fn contains_top_level_return(body: &str) -> bool {
+    let bytes = body.as_bytes();
+    let mut depth: i32 = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' | b'(' | b'[' => depth += 1,
+            b'}' | b')' | b']' => depth -= 1,
+            // Match the keyword `return` on a word boundary at the top level.
+            b'r' if depth == 0
+                && body[i..].starts_with("return")
+                && !preceded_by_ident_char(bytes, i)
+                && !followed_by_ident_char(bytes, i + "return".len()) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Byte index just past the last top-level statement separator (`;` or `}`), i.e. the start of the
+/// final statement. Zero when there is no separator (single-statement body).
+fn last_top_level_statement_boundary(body: &str) -> usize {
+    let bytes = body.as_bytes();
+    let mut depth: i32 = 0;
+    let mut boundary = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'{' | b'(' | b'[' => depth += 1,
+            b')' | b']' => depth -= 1,
+            // A closing brace that returns to the top level ends a block statement (e.g. a function
+            // or `if` body), so the next statement starts after it. Closing parens/brackets only
+            // finish a sub-expression and must not be treated as statement boundaries.
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    boundary = i + 1;
+                }
+            }
+            b';' if depth == 0 => boundary = i + 1,
+            _ => {}
+        }
+    }
+    boundary
+}
+
+/// True when `tail` begins with a statement keyword whose completion value must not be `return`ed.
+fn starts_statement_keyword(tail: &str) -> bool {
+    const KEYWORDS: [&str; 14] = [
+        "var ", "let ", "const ", "function", "class ", "if ", "if(", "for ", "for(", "while ",
+        "while(", "switch ", "switch(", "throw ",
+    ];
+    KEYWORDS.iter().any(|kw| tail.starts_with(kw))
+}
+
+fn preceded_by_ident_char(bytes: &[u8], i: usize) -> bool {
+    i > 0 && is_ident_char(bytes[i - 1])
+}
+
+fn followed_by_ident_char(bytes: &[u8], i: usize) -> bool {
+    i < bytes.len() && is_ident_char(bytes[i])
+}
+
+fn is_ident_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
+}
+
 /// Build the script actually handed to Nova.
 ///
 /// The wrapper:
@@ -193,9 +419,13 @@ fn wrap_source(source: &str, input: &JsonValue) -> Result<String, RuntimeError> 
     let source_literal = serde_json::to_string(source)
         .map_err(|e| RuntimeError::Conversion(format!("could not encode source: {e}")))?;
 
+    // `input` / `__args` expose the injected value to macros; `args` is the same value, provided as
+    // the conventional name a server function reads its positional arguments from (the caller passes
+    // a JSON array there). All three are plain `var`s so the user body can read them directly.
     Ok(format!(
         "var input = {input_literal};\n\
          var __args = input;\n\
+         var args = input;\n\
          var __treaty_result = (0, eval)({source_literal});\n\
          JSON.stringify({{ v: __treaty_result }});\n"
     ))
@@ -317,5 +547,125 @@ mod tests {
         let mut rt = JsRuntime::new();
         assert_eq!(rt.eval("globalThis.counter = 1; counter").unwrap(), json!(1));
         assert_eq!(rt.eval("counter += 1; counter").unwrap(), json!(2));
+    }
+
+    // --- macro / server-fn render-time paths -------------------------------------------------
+
+    #[test]
+    fn macro_computes_data_from_injected_input() {
+        // A TypeScript macro that reads its injected input, with type annotations the transpile
+        // step must strip, and produces a returned object.
+        let src = r#"
+            const count: number = input.count;
+            const label: string = input.label;
+            return { doubled: count * 2, greeting: `hello ${label}` };
+        "#;
+        let out = run_macro(src, &json!({ "count": 21, "label": "world" })).unwrap();
+        assert_eq!(
+            out.value,
+            json!({ "doubled": 42, "greeting": "hello world" })
+        );
+    }
+
+    #[test]
+    fn macro_supports_export_default() {
+        // The canonical macro shape: a default export of the produced value.
+        let src = "export default { ok: true, n: input.n + 1 };";
+        let out = run_macro(src, &json!({ "n": 9 })).unwrap();
+        assert_eq!(out.value, json!({ "ok": true, "n": 10 }));
+    }
+
+    #[test]
+    fn macro_supports_trailing_expression() {
+        // No explicit return: the trailing expression is the produced value.
+        let src = "const xs: number[] = input.xs; xs.map((x: number) => x + 1)";
+        let out = run_macro(src, &json!({ "xs": [1, 2, 3] })).unwrap();
+        assert_eq!(out.value, json!([2, 3, 4]));
+    }
+
+    #[test]
+    fn macro_uses_array_object_and_string_ops() {
+        let src = r#"
+            const items: string[] = input.items;
+            const joined = items.map(s => s.toUpperCase()).join(", ");
+            const total = items.reduce((acc, s) => acc + s.length, 0);
+            return { joined, total, first: items[0].slice(0, 1) };
+        "#;
+        let out = run_macro(src, &json!({ "items": ["ab", "cde"] })).unwrap();
+        assert_eq!(
+            out.value,
+            json!({ "joined": "AB, CDE", "total": 5, "first": "a" })
+        );
+    }
+
+    #[test]
+    fn macro_is_reusable_per_request_with_different_input() {
+        // The dynamic-prerender contract: the same macro source re-run with fresh input.
+        let src = "return { id: input.id, squared: input.id * input.id };";
+        let a = run_macro(src, &json!({ "id": 3 })).unwrap();
+        let b = run_macro(src, &json!({ "id": 5 })).unwrap();
+        assert_eq!(a.value, json!({ "id": 3, "squared": 9 }));
+        assert_eq!(b.value, json!({ "id": 5, "squared": 25 }));
+    }
+
+    #[test]
+    fn throwing_macro_returns_err_with_message() {
+        let src = "if (input.bad) { throw new Error('macro blew up'); } return 1;";
+        let err = run_macro(src, &json!({ "bad": true })).expect_err("expected an error");
+        match &err {
+            RuntimeError::Runtime(msg) => {
+                assert!(msg.contains("macro blew up"), "got: {msg}")
+            }
+            other => panic!("expected RuntimeError::Runtime, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn macro_with_invalid_typescript_returns_parse_error() {
+        let err = run_macro("const = ;", &JsonValue::Null).expect_err("expected an error");
+        assert!(matches!(err, RuntimeError::Parse(_)), "got: {err:?}");
+        assert!(!err.message().is_empty());
+    }
+
+    #[test]
+    fn server_fn_executes_body_with_args() {
+        // A server function reading positional arguments from `args`, with TS annotations stripped.
+        let src = r#"
+            const a: number = args[0];
+            const b: number = args[1];
+            return a + b;
+        "#;
+        let result = run_server_fn(src, &json!([4, 38])).unwrap();
+        assert_eq!(result, json!(42));
+    }
+
+    #[test]
+    fn server_fn_returns_object_result() {
+        let src = r#"
+            const [name, count]: [string, number] = args;
+            return { name, count, ok: count > 0 };
+        "#;
+        let result = run_server_fn(src, &json!(["widget", 7])).unwrap();
+        assert_eq!(
+            result,
+            json!({ "name": "widget", "count": 7, "ok": true })
+        );
+    }
+
+    #[test]
+    fn throwing_server_fn_returns_err() {
+        let src = "throw new Error('server fn failed');";
+        let err = run_server_fn(src, &json!([])).expect_err("expected an error");
+        assert!(err.message().contains("server fn failed"), "got: {}", err.message());
+    }
+
+    #[test]
+    fn server_fn_reuses_same_engine_as_macro() {
+        // Both paths run on the same Nova engine; a value that round-trips through one round-trips
+        // through the other identically.
+        let macro_out = run_macro("return input.v * 10;", &json!({ "v": 2 })).unwrap();
+        let fn_out = run_server_fn("return args[0] * 10;", &json!([2])).unwrap();
+        assert_eq!(macro_out.value, fn_out);
+        assert_eq!(fn_out, json!(20));
     }
 }

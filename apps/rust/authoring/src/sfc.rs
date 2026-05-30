@@ -392,7 +392,27 @@ pub fn compile_treaty_file(source: &str, file_name: &str) -> CompiledComponent {
     let class_name = to_pascal_case(file_name);
 
     let template_html = chunks.html.join("");
-    let javascript = chunks.javascript.join("");
+    let mut javascript = chunks.javascript.join("");
+
+    let mut macro_errors: Vec<String> = Vec::new();
+
+    // Execute any top-of-file macro block (server-side render-time code, like Astro frontmatter /
+    // RSC) and inject the produced data into the component. The macro is TypeScript; it is run
+    // through `treaty_runtime::run_macro`, which transpiles it to JS and evaluates it on the Nova
+    // engine. This is the STATIC prerender path: an empty (`null`) input is passed at compile time.
+    //
+    // The macro's value is injected as a `const $macro = <json>;` declaration prepended to the
+    // component-body JS. Because it is a top-level `const`, it is (a) visible to the rest of the
+    // body and (b) collected into the component's returned bindings object by
+    // `extract_wrapper_parts`, so the template can bind it directly (e.g. `{{ $macro.title }}`).
+    // The macro SOURCE itself is never emitted — only its computed data is.
+    if let Some(literal) = run_and_encode_macros(&chunks.macros, &mut macro_errors) {
+        javascript = if javascript.trim().is_empty() {
+            literal
+        } else {
+            format!("{literal}\n{javascript}")
+        };
+    }
 
     let mut style_errors: Vec<String> = Vec::new();
 
@@ -424,22 +444,67 @@ pub fn compile_treaty_file(source: &str, file_name: &str) -> CompiledComponent {
         }
     }
 
-    // Macro chunks are captured (raw) for a later execution phase; binding the field here keeps
-    // them explicitly out of the runtime JS/template/CSS output without being silently discarded.
-    let _macros: &[String] = &chunks.macros;
-
     // The resolved CSS chunks join into a single `styles` string for the shared render3 backend.
     // Current `.treaty` sources carry at most one style chunk, so this round-trips byte-identically.
     let styles = styles.join("");
 
     let mut compiled = compile_from_parts(&class_name, &javascript, &template_html, &styles, file_name);
-    // Surface any sass diagnostics ahead of the template diagnostics from the backend.
-    if !style_errors.is_empty() {
-        let mut errors = style_errors;
+    // Surface macro and sass diagnostics ahead of the template diagnostics from the backend.
+    if !macro_errors.is_empty() || !style_errors.is_empty() {
+        let mut errors = macro_errors;
+        errors.extend(style_errors);
         errors.extend(compiled.errors);
         compiled.errors = errors;
     }
     compiled
+}
+
+/// Run the captured macro block(s) and encode their combined output as a single injectable JS
+/// `const` declaration, or `None` when there are no macros.
+///
+/// Each macro is server-side render-time TypeScript (the top-of-file fenced block). It is executed
+/// via [`treaty_runtime::run_macro`] with an empty compile-time input ([`serde_json::Value::Null`])
+/// — the static-prerender path. The produced JSON value is injected as `const $macro = <json>;`
+/// (or `$macro0` / `$macro1` / … when a file carries more than one macro block) so the component
+/// body and template can reference the data. A macro that fails to transpile or throws records its
+/// message in `errors` and contributes no binding; the rest of the component still compiles.
+///
+/// Returns the declaration text to prepend to the component-body JS, or `None` when no macro
+/// produced an injectable value.
+fn run_and_encode_macros(macros: &[String], errors: &mut Vec<String>) -> Option<String> {
+    if macros.is_empty() {
+        return None;
+    }
+
+    // The static-prerender input. A `.treaty` macro reads request data via `input`; at build time
+    // there is no request, so an empty input is supplied. (The dynamic-prerender path re-runs the
+    // same macro per request with real input — handled by the runtime layer, not the compiler.)
+    let input = serde_json::Value::Null;
+
+    let mut decls: Vec<String> = Vec::new();
+    for (idx, macro_src) in macros.iter().enumerate() {
+        // A single macro binds plain `$macro`; multiple blocks are disambiguated by index.
+        let name = if macros.len() == 1 {
+            "$macro".to_string()
+        } else {
+            format!("$macro{idx}")
+        };
+        match treaty_runtime::run_macro(macro_src, &input) {
+            Ok(output) => {
+                // `serde_json::to_string` of any JSON value is a valid JS expression literal, so
+                // the splice is injection-safe.
+                let literal = serde_json::to_string(output.value()).unwrap_or_else(|_| "null".to_string());
+                decls.push(format!("const {name} = {literal};"));
+            }
+            Err(e) => errors.push(format!("macro: {e}")),
+        }
+    }
+
+    if decls.is_empty() {
+        None
+    } else {
+        Some(decls.join("\n"))
+    }
 }
 
 /// Compile a component from already-split parts into the `ɵɵdefineComponent` ES module.
@@ -926,9 +991,10 @@ function onClick(user) { return save(user); }\n\
     }
 
     #[test]
-    fn captures_macro_block_without_breaking_compilation() {
-        // A top-level fenced macro block is captured (not executed) and must not leak into the
-        // JS body or the template; the component still compiles.
+    fn executes_macro_block_without_breaking_compilation() {
+        // A top-level fenced macro block is EXECUTED (its computed value injected); the macro
+        // SOURCE itself must not leak into the JS body or the template. This statement-only macro
+        // produces no value, so it injects `const $macro = null;` and the component still compiles.
         let source = "```\nconst x = 1;\n```\nconst name = 'World';\n<div>{{ name }}</div>";
         let out = compile_treaty_file(source, "withmacro.treaty");
         assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
@@ -937,13 +1003,80 @@ function onClick(user) { return save(user); }\n\
         // Component still compiles.
         assert!(code.contains(DEFINE), "no defineComponent; got: {code}");
         assert!(code.contains("function Withmacro() {"), "no fn wrapper; got: {code}");
-        // The macro body is NOT emitted into the module (not treated as JS/template).
+        // The macro SOURCE is NOT emitted into the module — only its computed value is.
         assert!(
             !code.contains("const x = 1;"),
-            "macro body leaked into output; got: {code}"
+            "macro source leaked into output; got: {code}"
         );
+        // The macro injected its (empty) result as `$macro`.
+        assert!(code.contains("const $macro = null;"), "macro value not injected; got: {code}");
         // The real component body and template are intact.
         assert!(code.contains("const name = 'World';"), "body const missing; got: {code}");
         assert!(code.contains("ctx.name"), "template did not bind ctx.name; got: {code}");
+    }
+
+    #[test]
+    fn macro_data_is_injected_and_bindable_in_template() {
+        // A macro that produces data: its computed value is injected as `const $macro = {...};`,
+        // exposed as a component binding, and bindable in the template — while the macro SOURCE
+        // (the `title`/`count` computation) never reaches the emitted module.
+        let source = "```\n\
+const title: string = 'Hello from macro';\n\
+const count: number = 2 * 21;\n\
+return { title, count };\n\
+```\n\
+<h1>{{ $macro.title }}</h1>\n";
+        let out = compile_treaty_file(source, "page.treaty");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+
+        // The component compiled.
+        assert!(code.contains(DEFINE), "no defineComponent; got: {code}");
+
+        // The macro's computed value is injected as a JSON object literal `const`. The macro ran
+        // the arithmetic and string ops, so the literal carries the RESULTS, not the source. (Key
+        // order in the JSON encoding is not significant, so each field is checked individually.)
+        assert!(code.contains("const $macro = {"), "macro data literal not injected; got: {code}");
+        assert!(
+            code.contains("\"title\":\"Hello from macro\""),
+            "macro `title` result not injected; got: {code}"
+        );
+        assert!(
+            code.contains("\"count\":42"),
+            "macro `count` result not injected; got: {code}"
+        );
+
+        // The macro SOURCE never leaks (no `return { title, count }`, no `2 * 21`).
+        assert!(!code.contains("2 * 21"), "macro source leaked; got: {code}");
+        assert!(
+            !code.contains("return { title, count }"),
+            "macro source leaked; got: {code}"
+        );
+        assert!(
+            !code.contains(": string") && !code.contains(": number"),
+            "macro TS annotations leaked; got: {code}"
+        );
+
+        // `$macro` is collected into the component's returned bindings, so the template context
+        // sees it.
+        assert!(
+            code.contains("$macro"),
+            "macro binding not returned to component context; got: {code}"
+        );
+        // The template binds the macro data against the component context.
+        assert!(
+            code.contains("ctx.$macro") || code.contains("ctx.$macro.title"),
+            "template did not bind macro data; got: {code}"
+        );
+
+        // The emitted module is valid, parseable JS.
+        let allocator = Allocator::default();
+        let module_type = SourceType::default().with_module(true);
+        let parsed = JsParser::new(&allocator, code, module_type).parse();
+        assert!(
+            parsed.errors.is_empty(),
+            "module did not parse as valid JS: {:?}\n--- code ---\n{code}",
+            parsed.errors
+        );
     }
 }

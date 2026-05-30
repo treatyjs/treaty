@@ -9,3 +9,13 @@ edition = "2024"
 # which keeps itself compiling.
 nova_vm = { git = "https://github.com/trynova/nova", rev = "bece61ac" }
 serde_json = "1.0.150"
+
+# TypeScript -> JavaScript transpilation for the macro / server-fn render-time path. The macro
+# fenced block in a `.treaty` file is TypeScript; Nova only executes JavaScript, so type
+# annotations and other TS-only syntax must be stripped before evaluation.
+oxc_allocator = "0.133.0"
+oxc_parser = "0.133.0"
+oxc_span = "0.133.0"
+oxc_semantic = "0.133.0"
+oxc_transformer = "0.133.0"
+oxc_codegen = "0.133.0"
