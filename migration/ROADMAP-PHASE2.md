@@ -42,9 +42,16 @@ applies to `.treaty`, JSX (`.tsx`/`.tjsx`), AND **standard Angular `.ts`** — s
 Angular still benefits from Treaty's fast direct-to-Ivy file-by-file compile + dead-code/file-deletion.
 It must handle **every Angular decorator kind** found in a `.ts` (`@Component`, `@Directive`, `@Pipe`,
 `@Injectable`, `@NgModule`), compiling each to Ivy, and **pass through non-Angular TS unchanged**
-(return null so the bundler's normal TS handling applies). Follow-up if the NAPI only exposes
-`@Component`: wire the render3 pipe/module/injector/directive compilers + DI (`angular.rs`) into a
-single per-file Angular entry point.
+(return null so the bundler's normal TS handling applies).
+
+**Expose render3 directly via NAPI (user 2026-05-30):** the current addon (`libs/authoring/node`) wraps
+`apps/rust/authoring`'s three entry points and uses `render3` only transitively. Add a **render3 NAPI
+binding** (a `libs/render3/node` crate, or extend the authoring addon) that exposes render3's FULL Ivy
+compiler surface — component/directive/pipe/injector/module compilers + DI (`angular.rs`) — behind a
+single per-file Angular entry point, so `@treaty/compiler` drives the complete render3 package for full
+all-decorator Angular file-by-file, not just the three authoring functions. Verified already: all
+bundler plugins route through `@treaty/compiler` → `@treaty/authoring-node` → the Rust compiler (no TS
+reimplementation). Sequenced with H (touches NAPI + render3 + core; after Wave 1).
 
 **C. Bundler plugins** — each a new package consuming B:
 `@treaty/vite`, `@treaty/rspack`, `@treaty/rsbuild`, `@treaty/rslib`. Per-file transform + HMR/watch +
