@@ -5,6 +5,7 @@ members = [
 	'libs/authoring/treaty_authoring',
 	'libs/render3',
 	'apps/rust/authoring',
+	'libs/runtime',
 ]
 
 [profile.release]

@@ -1,0 +1,10 @@
+[package]
+name = "treaty_runtime"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Pure-Rust JS engine. The 1.0.0 release is broken both ways (temporal-on pulls a broken
+# temporal_rs 0.1.2; temporal-off leaves ungated Temporal intrinsic refs), so track git main,
+# which keeps itself compiling.
+nova_vm = { git = "https://github.com/trynova/nova", rev = "bece61ac" }
