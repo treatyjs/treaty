@@ -18,9 +18,12 @@
 use std::collections::HashMap;
 
 use oxc_allocator::Allocator;
-use oxc_ast::ast::Statement;
+use oxc_ast::ast::{Expression, Statement};
 use oxc_parser::Parser as JsParser;
 use oxc_span::{GetSpan, SourceType};
+
+/// The two-word directive that marks a top-level function as server-only.
+const USE_SERVER_DIRECTIVE: &str = "use server";
 
 mod elysia;
 pub use elysia::ElysiaEdenPlugin;
@@ -139,24 +142,86 @@ impl Default for PluginRegistry {
 /// When no top-level `server { … }` block is present the source is returned unchanged with an empty
 /// `server_fns` list.
 pub fn extract_server_block(source: &str) -> ServerExtraction {
-    let Some((block_start, body_start, body_end, block_end)) = find_server_block(source) else {
-        return ServerExtraction {
-            client_source: source.to_string(),
-            server_fns: Vec::new(),
+    // 1. Lift any explicit `server { … }` block first.
+    let (mut client_source, mut server_fns) =
+        if let Some((block_start, body_start, body_end, block_end)) = find_server_block(source) {
+            // The function declarations live in the brace body (exclusive of the braces themselves).
+            let body = &source[body_start..body_end];
+            let fns = parse_server_fns(body);
+
+            // Client source = everything outside the `server { … }` block.
+            let mut client = String::with_capacity(source.len());
+            client.push_str(&source[..block_start]);
+            client.push_str(&source[block_end..]);
+            (client, fns)
+        } else {
+            (source.to_string(), Vec::new())
         };
-    };
 
-    // The function declarations live in the brace body (exclusive of the braces themselves).
-    let body = &source[body_start..body_end];
-    let server_fns = parse_server_fns(body);
-
-    // Client source = everything outside the `server { … }` block. Trim the now-dangling blank line
-    // the removal can leave behind, but keep it minimal so surrounding code is untouched.
-    let mut client_source = String::with_capacity(source.len());
-    client_source.push_str(&source[..block_start]);
-    client_source.push_str(&source[block_end..]);
+    // 2. Lift the remaining top-level marker forms (`'use server'` directive, `name$$` suffix) from
+    //    whatever client source survived step 1, removing their declarations as we go.
+    let (rewritten, marker_fns) = extract_marker_fns(&client_source);
+    client_source = rewritten;
+    server_fns.extend(marker_fns);
 
     ServerExtraction { client_source, server_fns }
+}
+
+/// Scan top-level declarations of `source` for the two marker conventions that do not use an explicit
+/// `server { … }` wrapper, lift them out, and return the source with their declarations removed.
+///
+/// A top-level declaration is a server fn when it is either:
+///   * a `function` / `const NAME = (…) => …` whose body's first statement is the bare
+///     `'use server'` string directive (the directive statement is stripped from the lifted source), or
+///   * a `function` / `const NAME = (…) => …` whose **name** ends in two `$` characters.
+///
+/// The scan parses `source` once with OXC and removes the matched declarations by byte span (highest
+/// span first so earlier offsets stay valid). Only program-top-level declarations are considered.
+fn extract_marker_fns(source: &str) -> (String, Vec<ServerFn>) {
+    if source.trim().is_empty() {
+        return (source.to_string(), Vec::new());
+    }
+
+    let allocator = Allocator::default();
+    let source_type = SourceType::default().with_typescript(true);
+    let ret = JsParser::new(&allocator, source, source_type).parse();
+
+    let mut fns = Vec::new();
+    // Byte spans of the top-level declarations we remove from the client source.
+    let mut removals: Vec<(usize, usize)> = Vec::new();
+
+    for stmt in &ret.program.body {
+        if let Some((server_fn, span)) = server_fn_from_statement(source, stmt) {
+            removals.push(span);
+            fns.push(server_fn);
+        }
+    }
+
+    let client_source = strip_spans(source, &mut removals);
+    (client_source, fns)
+}
+
+/// Remove each `(start, end)` byte span from `source`. Also swallows one trailing newline after each
+/// removed span so a lifted declaration does not leave a dangling blank line.
+fn strip_spans(source: &str, removals: &mut Vec<(usize, usize)>) -> String {
+    if removals.is_empty() {
+        return source.to_string();
+    }
+    // Remove from the back so earlier byte offsets remain valid.
+    removals.sort_by(|a, b| b.0.cmp(&a.0));
+    let bytes = source.as_bytes();
+    let mut out = source.to_string();
+    for &(start, end) in removals.iter() {
+        let mut end = end;
+        if end < bytes.len() && bytes[end] == b'\r' {
+            end += 1;
+        }
+        if end < bytes.len() && bytes[end] == b'\n' {
+            end += 1;
+        }
+        out.replace_range(start..end, "");
+    }
+    out
 }
 
 /// Locate a top-level `server { … }` block. Returns `(block_start, body_start, body_end, block_end)`
@@ -358,10 +423,12 @@ fn skip_template(bytes: &[u8], i: usize) -> usize {
     bytes.len()
 }
 
-/// Parse `function`-declared server functions from the `server { … }` body text via OXC.
+/// Parse server functions from the `server { … }` body text via OXC.
 ///
-/// Only top-level `function` declarations are lifted (the v1 convention). For each, we capture the
-/// verbatim source slice, name, params (name + optional type text), return type text, and async flag.
+/// Every top-level declaration inside the block is a server fn, regardless of marker: both
+/// `function` declarations and `const NAME = (…) => …` arrow-consts are lifted. For each we capture
+/// the verbatim source slice, name, params (name + optional type text), return type text, and async
+/// flag.
 fn parse_server_fns(body: &str) -> Vec<ServerFn> {
     let mut fns = Vec::new();
     if body.trim().is_empty() {
@@ -373,47 +440,171 @@ fn parse_server_fns(body: &str) -> Vec<ServerFn> {
     let ret = JsParser::new(&allocator, body, source_type).parse();
 
     for stmt in &ret.program.body {
-        let Statement::FunctionDeclaration(func) = stmt else {
-            continue;
-        };
-        let Some(id) = &func.id else { continue };
-        let name = id.name.to_string();
-
-        let source = body[func.span.start as usize..func.span.end as usize].to_string();
-
-        let mut params = Vec::new();
-        for param in &func.params.items {
-            let name = param
-                .pattern
-                .get_identifier_name()
-                .map(|n| n.to_string())
-                .unwrap_or_default();
-            let ty = param.type_annotation.as_ref().map(|ann| {
-                body[ann.type_annotation.span().start as usize
-                    ..ann.type_annotation.span().end as usize]
-                    .trim()
-                    .to_string()
-            });
-            params.push(ServerParam { name, ty });
+        // Inside an explicit `server { … }` block, every declaration is server-only, so we do not
+        // gate on a marker — `require_marker = false`.
+        if let Some((server_fn, _span)) = build_server_fn(body, stmt, false) {
+            fns.push(server_fn);
         }
-
-        let return_type = func.return_type.as_ref().map(|ann| {
-            body[ann.type_annotation.span().start as usize
-                ..ann.type_annotation.span().end as usize]
-                .trim()
-                .to_string()
-        });
-
-        fns.push(ServerFn {
-            name,
-            source,
-            params,
-            return_type,
-            is_async: func.r#async,
-        });
     }
 
     fns
+}
+
+/// Decide whether a program-top-level statement is a marker-based server fn (`'use server'`
+/// directive or a `$$`-suffixed name) and, if so, build it. Returns the [`ServerFn`] plus the byte
+/// span of the whole declaration (so the caller can remove it from the client source).
+fn server_fn_from_statement(source: &str, stmt: &Statement) -> Option<(ServerFn, (usize, usize))> {
+    build_server_fn(source, stmt, true)
+}
+
+/// Build a [`ServerFn`] from a `function` declaration or a single-declarator `const NAME = (…) => …`
+/// arrow-const statement. Handles both forms uniformly.
+///
+/// When `require_marker` is true the statement is only treated as a server fn if it carries one of
+/// the markers: a `$$`-suffixed name, or a `'use server'` directive as the first body statement
+/// (which is then stripped from the emitted source). When false (inside a `server { … }` block) the
+/// declaration is always lifted and any leading `'use server'` directive is still stripped.
+///
+/// Returns the built fn and the byte span `(start, end)` of the full statement in `source`.
+fn build_server_fn(
+    source: &str,
+    stmt: &Statement,
+    require_marker: bool,
+) -> Option<(ServerFn, (usize, usize))> {
+    match stmt {
+        Statement::FunctionDeclaration(func) => {
+            let id = func.id.as_ref()?;
+            let name = id.name.to_string();
+
+            let directive = func
+                .body
+                .as_deref()
+                .and_then(|body| leading_use_server_span(source, body));
+            let has_marker = name.ends_with("$$") || directive.is_some();
+            if require_marker && !has_marker {
+                return None;
+            }
+
+            let span = (func.span.start as usize, func.span.end as usize);
+            let src = strip_directive(source, span, directive);
+
+            let params = collect_params(source, &func.params);
+            let return_type = func.return_type.as_ref().map(|ann| span_text(source, ann.type_annotation.span()));
+
+            Some((
+                ServerFn { name, source: src, params, return_type, is_async: func.r#async },
+                span,
+            ))
+        }
+        Statement::VariableDeclaration(decl) => {
+            // Only a single-declarator `const NAME = (…) => …` is a server-fn candidate.
+            if decl.declarations.len() != 1 {
+                return None;
+            }
+            let declarator = decl.declarations.first()?;
+            let name = declarator.id.get_identifier_name()?.to_string();
+            let Some(Expression::ArrowFunctionExpression(arrow)) = &declarator.init else {
+                return None;
+            };
+
+            let directive = leading_use_server_span(source, &arrow.body);
+            let has_marker = name.ends_with("$$") || directive.is_some();
+            if require_marker && !has_marker {
+                return None;
+            }
+
+            let span = (decl.span.start as usize, decl.span.end as usize);
+            let src = strip_directive(source, span, directive);
+
+            let params = collect_params(source, &arrow.params);
+            let return_type = arrow.return_type.as_ref().map(|ann| span_text(source, ann.type_annotation.span()));
+
+            Some((
+                ServerFn { name, source: src, params, return_type, is_async: arrow.r#async },
+                span,
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// If the function/arrow body begins with the bare `'use server'` string directive, return its byte
+/// span (`start..end`) in `source` so the caller can excise it from the lifted function text.
+///
+/// OXC parses leading string-literal statements as `FunctionBody::directives`, so we inspect the
+/// first directive there.
+fn leading_use_server_span(
+    _source: &str,
+    body: &oxc_ast::ast::FunctionBody,
+) -> Option<(usize, usize)> {
+    let directive = body.directives.first()?;
+    if directive.expression.value.as_str() == USE_SERVER_DIRECTIVE {
+        let span = directive.span;
+        Some((span.start as usize, span.end as usize))
+    } else {
+        None
+    }
+}
+
+/// Slice the declaration `span` out of `source` and, if a `directive` span is present, remove that
+/// directive statement (plus any trailing `;`, surrounding whitespace, and one newline) from the
+/// resulting text so the lifted function no longer carries the `'use server'` marker.
+fn strip_directive(
+    source: &str,
+    span: (usize, usize),
+    directive: Option<(usize, usize)>,
+) -> String {
+    let (start, end) = span;
+    let mut text = source[start..end].to_string();
+    let Some((d_start, d_end)) = directive else {
+        return text;
+    };
+    // Translate the directive span into offsets relative to the sliced declaration text.
+    let mut rel_start = d_start - start;
+    let mut rel_end = d_end - start;
+    let bytes = text.as_bytes();
+    // Swallow a trailing `;` then trailing whitespace up to and including one newline.
+    if rel_end < bytes.len() && bytes[rel_end] == b';' {
+        rel_end += 1;
+    }
+    while rel_end < bytes.len() && (bytes[rel_end] == b' ' || bytes[rel_end] == b'\t') {
+        rel_end += 1;
+    }
+    if rel_end < bytes.len() && bytes[rel_end] == b'\r' {
+        rel_end += 1;
+    }
+    if rel_end < bytes.len() && bytes[rel_end] == b'\n' {
+        rel_end += 1;
+    }
+    // Also pull back over the indentation that preceded the directive on its line.
+    while rel_start > 0 && (bytes[rel_start - 1] == b' ' || bytes[rel_start - 1] == b'\t') {
+        rel_start -= 1;
+    }
+    text.replace_range(rel_start..rel_end, "");
+    text
+}
+
+/// Extract the parameter list (name + optional verbatim type text) for a function/arrow signature.
+fn collect_params(source: &str, params: &oxc_ast::ast::FormalParameters) -> Vec<ServerParam> {
+    let mut out = Vec::new();
+    for param in &params.items {
+        let name = param
+            .pattern
+            .get_identifier_name()
+            .map(|n| n.to_string())
+            .unwrap_or_default();
+        let ty = param
+            .type_annotation
+            .as_ref()
+            .map(|ann| span_text(source, ann.type_annotation.span()));
+        out.push(ServerParam { name, ty });
+    }
+    out
+}
+
+/// Verbatim, trimmed text of a span in `source`.
+fn span_text(source: &str, span: oxc_span::Span) -> String {
+    source[span.start as usize..span.end as usize].trim().to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -606,5 +797,66 @@ const greeting = 'hi';\n";
         assert_eq!(registry.default_plugin().map(|p| p.name()), Some("elysia-eden"));
         assert!(registry.get("elysia-eden").is_some());
         assert!(registry.get("nope").is_none());
+    }
+
+    #[test]
+    fn extract_marker_use_server_directive_lifts_and_strips() {
+        let source = "function loadUser(id: number) {\n\
+  'use server';\n\
+  return db.users.find(id);\n\
+}\nconst x = 1;\n";
+        let extraction = extract_server_block(source);
+
+        assert_eq!(extraction.server_fns.len(), 1, "expected one marker fn");
+        let f = &extraction.server_fns[0];
+        assert_eq!(f.name, "loadUser");
+        assert!(
+            !f.source.contains("use server"),
+            "'use server' directive not stripped from lifted source; got: {}",
+            f.source
+        );
+        assert!(
+            !extraction.client_source.contains("function loadUser"),
+            "marker fn not removed from client; got: {}",
+            extraction.client_source
+        );
+        assert!(extraction.client_source.contains("const x = 1;"));
+    }
+
+    #[test]
+    fn extract_marker_dollar_suffix_arrow_const_lifts() {
+        let source = "const doThing$$ = async (n: number) => { return n + 1; };\nconst keep = 2;\n";
+        let extraction = extract_server_block(source);
+
+        assert_eq!(extraction.server_fns.len(), 1, "expected one $$-suffixed fn");
+        let f = &extraction.server_fns[0];
+        assert_eq!(f.name, "doThing$$");
+        assert!(f.is_async, "arrow should be async");
+        assert_eq!(f.params.len(), 1);
+        assert!(
+            !extraction.client_source.contains("doThing$$"),
+            "marker fn not removed from client; got: {}",
+            extraction.client_source
+        );
+        assert!(extraction.client_source.contains("const keep = 2;"));
+    }
+
+    #[test]
+    fn extract_server_block_lifts_arrow_const() {
+        let source = "server {\n\
+  const save = async (user: User) => { return db.insert(user); };\n\
+}\nconst c = 1;\n";
+        let extraction = extract_server_block(source);
+
+        assert_eq!(extraction.server_fns.len(), 1, "arrow-const in block not lifted");
+        let f = &extraction.server_fns[0];
+        assert_eq!(f.name, "save");
+        assert!(f.is_async);
+        assert!(extraction.client_source.contains("const c = 1;"));
+        assert!(
+            !extraction.client_source.contains("db.insert"),
+            "server body leaked into client; got: {}",
+            extraction.client_source
+        );
     }
 }
