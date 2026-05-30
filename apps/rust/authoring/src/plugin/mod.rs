@@ -25,7 +25,10 @@ use oxc_span::{GetSpan, SourceType};
 /// The two-word directive that marks a top-level function as server-only.
 const USE_SERVER_DIRECTIVE: &str = "use server";
 
+mod axum_backend;
 mod elysia;
+mod ts_to_rust;
+pub use axum_backend::AxumBackendPlugin;
 pub use elysia::ElysiaEdenPlugin;
 
 // ---------------------------------------------------------------------------
@@ -52,7 +55,14 @@ pub struct ServerFn {
     pub params: Vec<ServerParam>,
     pub return_type: Option<String>,
     pub is_async: bool,
+    /// The target language for this fn, so the registry can dispatch by language. Sourced from the
+    /// optional `server:IDENT { … }` block tag (e.g. `rust`, `ts`, `php`); defaults to `rust` for a
+    /// bare `server { … }` block and for both top-level marker forms.
+    pub lang: String,
 }
+
+/// The default target language when no `server:IDENT` tag is given.
+const DEFAULT_LANG: &str = "rust";
 
 /// The result of [`extract_server_block`]: the client source with the `server { … }` block removed,
 /// plus the functions that were declared inside it. When no block is present, `client_source` is the
@@ -87,7 +97,7 @@ pub trait BackendPlugin {
 /// A registry of available backend plugins with a default selection.
 ///
 /// The first plugin registered becomes the default; [`PluginRegistry::with_defaults`] seeds it with
-/// the reference [`ElysiaEdenPlugin`].
+/// the default [`AxumBackendPlugin`] followed by the opt-in reference [`ElysiaEdenPlugin`].
 pub struct PluginRegistry {
     plugins: Vec<Box<dyn BackendPlugin>>,
 }
@@ -98,9 +108,12 @@ impl PluginRegistry {
         Self { plugins: Vec::new() }
     }
 
-    /// A registry preloaded with the reference [`ElysiaEdenPlugin`] as the default backend.
+    /// A registry preloaded with the default [`AxumBackendPlugin`] (so a developer who never touches
+    /// Rust still gets a working axum service) plus the opt-in reference [`ElysiaEdenPlugin`]
+    /// (selectable by name). The first plugin registered is the default, so the axum backend is it.
     pub fn with_defaults() -> Self {
         let mut registry = Self::new();
+        registry.register(Box::new(AxumBackendPlugin));
         registry.register(Box::new(ElysiaEdenPlugin));
         registry
     }
@@ -142,21 +155,30 @@ impl Default for PluginRegistry {
 /// When no top-level `server { … }` block is present the source is returned unchanged with an empty
 /// `server_fns` list.
 pub fn extract_server_block(source: &str) -> ServerExtraction {
-    // 1. Lift any explicit `server { … }` block first.
-    let (mut client_source, mut server_fns) =
-        if let Some((block_start, body_start, body_end, block_end)) = find_server_block(source) {
-            // The function declarations live in the brace body (exclusive of the braces themselves).
-            let body = &source[body_start..body_end];
-            let fns = parse_server_fns(body);
+    // 1. Lift every explicit `server[:LANG] { … }` block first. Multiple blocks are supported; each
+    //    keeps its own language tag (bare `server { … }` defaults to `rust`).
+    let mut client_source = String::with_capacity(source.len());
+    let mut server_fns: Vec<ServerFn> = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(block) = find_server_block(&source[cursor..]) {
+        let ServerBlock { block_start, body_start, body_end, block_end, lang } = block;
+        // Translate the block-relative offsets back to absolute positions in `source`.
+        let block_start = cursor + block_start;
+        let body_start = cursor + body_start;
+        let body_end = cursor + body_end;
+        let block_end = cursor + block_end;
 
-            // Client source = everything outside the `server { … }` block.
-            let mut client = String::with_capacity(source.len());
-            client.push_str(&source[..block_start]);
-            client.push_str(&source[block_end..]);
-            (client, fns)
-        } else {
-            (source.to_string(), Vec::new())
-        };
+        // The function declarations live in the brace body (exclusive of the braces themselves).
+        let body = &source[body_start..body_end];
+        let lang = lang.unwrap_or_else(|| DEFAULT_LANG.to_string());
+        server_fns.extend(parse_server_fns(body, &lang));
+
+        // Carry forward the text that precedes this block; resume scanning after it.
+        client_source.push_str(&source[cursor..block_start]);
+        cursor = block_end;
+    }
+    // Whatever remains after the last block (or the whole source if there were no blocks).
+    client_source.push_str(&source[cursor..]);
 
     // 2. Lift the remaining top-level marker forms (`'use server'` directive, `name$$` suffix) from
     //    whatever client source survived step 1, removing their declarations as we go.
@@ -224,10 +246,21 @@ fn strip_spans(source: &str, removals: &mut Vec<(usize, usize)>) -> String {
     out
 }
 
-/// Locate a top-level `server { … }` block. Returns `(block_start, body_start, body_end, block_end)`
-/// where `block_start..block_end` is the full block (`server` keyword through the closing `}`,
-/// including a trailing newline if present) and `body_start..body_end` is the brace *interior*.
-fn find_server_block(source: &str) -> Option<(usize, usize, usize, usize)> {
+/// A located top-level `server[:LANG] { … }` block. `block_start..block_end` is the full block
+/// (`server` keyword through the closing `}`, including a trailing newline if present) and
+/// `body_start..body_end` is the brace *interior*. `lang` is the optional `:IDENT` tag text.
+struct ServerBlock {
+    block_start: usize,
+    body_start: usize,
+    body_end: usize,
+    block_end: usize,
+    lang: Option<String>,
+}
+
+/// Locate a top-level `server[:LANG] { … }` block, optionally tagged with a language as in
+/// `server:ts { … }`. The bare `server { … }` form yields `lang = None` (the caller defaults it to
+/// `rust`).
+fn find_server_block(source: &str) -> Option<ServerBlock> {
     let bytes = source.as_bytes();
     let mut i = 0usize;
 
@@ -242,12 +275,34 @@ fn find_server_block(source: &str) -> Option<(usize, usize, usize, usize)> {
         }
 
         if scanner.depth == 0 && matches_keyword(source, i, "server") {
-            // After `server`, allow whitespace, then require a `{`.
+            // After `server`, allow whitespace, an optional `:IDENT` language tag, more whitespace,
+            // then require a `{`.
             let after_kw = i + "server".len();
             let mut j = after_kw;
             while j < bytes.len() && bytes[j].is_ascii_whitespace() {
                 j += 1;
             }
+
+            let mut lang = None;
+            if j < bytes.len() && bytes[j] == b':' {
+                // Parse the language identifier after the colon.
+                let mut k = j + 1;
+                while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                    k += 1;
+                }
+                let ident_start = k;
+                while k < bytes.len() && is_ident_byte(bytes[k]) {
+                    k += 1;
+                }
+                if k > ident_start {
+                    lang = Some(source[ident_start..k].to_string());
+                    j = k;
+                    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                }
+            }
+
             if j < bytes.len() && bytes[j] == b'{' {
                 let body_start = j + 1;
                 let body_end = match_close_brace(source, body_start)?;
@@ -260,7 +315,13 @@ fn find_server_block(source: &str) -> Option<(usize, usize, usize, usize)> {
                 if block_end < bytes.len() && bytes[block_end] == b'\n' {
                     block_end += 1;
                 }
-                return Some((i, body_start, body_end, block_end));
+                return Some(ServerBlock {
+                    block_start: i,
+                    body_start,
+                    body_end,
+                    block_end,
+                    lang,
+                });
             }
         }
 
@@ -429,7 +490,7 @@ fn skip_template(bytes: &[u8], i: usize) -> usize {
 /// `function` declarations and `const NAME = (…) => …` arrow-consts are lifted. For each we capture
 /// the verbatim source slice, name, params (name + optional type text), return type text, and async
 /// flag.
-fn parse_server_fns(body: &str) -> Vec<ServerFn> {
+fn parse_server_fns(body: &str, lang: &str) -> Vec<ServerFn> {
     let mut fns = Vec::new();
     if body.trim().is_empty() {
         return fns;
@@ -441,8 +502,8 @@ fn parse_server_fns(body: &str) -> Vec<ServerFn> {
 
     for stmt in &ret.program.body {
         // Inside an explicit `server { … }` block, every declaration is server-only, so we do not
-        // gate on a marker — `require_marker = false`.
-        if let Some((server_fn, _span)) = build_server_fn(body, stmt, false) {
+        // gate on a marker — `require_marker = false`. Each lifted fn inherits the block's `lang`.
+        if let Some((server_fn, _span)) = build_server_fn(body, stmt, false, lang) {
             fns.push(server_fn);
         }
     }
@@ -454,7 +515,8 @@ fn parse_server_fns(body: &str) -> Vec<ServerFn> {
 /// directive or a `$$`-suffixed name) and, if so, build it. Returns the [`ServerFn`] plus the byte
 /// span of the whole declaration (so the caller can remove it from the client source).
 fn server_fn_from_statement(source: &str, stmt: &Statement) -> Option<(ServerFn, (usize, usize))> {
-    build_server_fn(source, stmt, true)
+    // Top-level marker forms (`'use server'` directive, `$$` suffix) always target `rust`.
+    build_server_fn(source, stmt, true, DEFAULT_LANG)
 }
 
 /// Build a [`ServerFn`] from a `function` declaration or a single-declarator `const NAME = (…) => …`
@@ -470,6 +532,7 @@ fn build_server_fn(
     source: &str,
     stmt: &Statement,
     require_marker: bool,
+    lang: &str,
 ) -> Option<(ServerFn, (usize, usize))> {
     match stmt {
         Statement::FunctionDeclaration(func) => {
@@ -492,7 +555,14 @@ fn build_server_fn(
             let return_type = func.return_type.as_ref().map(|ann| span_text(source, ann.type_annotation.span()));
 
             Some((
-                ServerFn { name, source: src, params, return_type, is_async: func.r#async },
+                ServerFn {
+                    name,
+                    source: src,
+                    params,
+                    return_type,
+                    is_async: func.r#async,
+                    lang: lang.to_string(),
+                },
                 span,
             ))
         }
@@ -520,7 +590,14 @@ fn build_server_fn(
             let return_type = arrow.return_type.as_ref().map(|ann| span_text(source, ann.type_annotation.span()));
 
             Some((
-                ServerFn { name, source: src, params, return_type, is_async: arrow.r#async },
+                ServerFn {
+                    name,
+                    source: src,
+                    params,
+                    return_type,
+                    is_async: arrow.r#async,
+                    lang: lang.to_string(),
+                },
                 span,
             ))
         }
@@ -792,9 +869,11 @@ const greeting = 'hi';\n";
     }
 
     #[test]
-    fn registry_default_is_elysia() {
+    fn registry_default_is_axum() {
         let registry = PluginRegistry::with_defaults();
-        assert_eq!(registry.default_plugin().map(|p| p.name()), Some("elysia-eden"));
+        // The axum backend is the default; elysia-eden stays registered but is opt-in by name.
+        assert_eq!(registry.default_plugin().map(|p| p.name()), Some("axum"));
+        assert!(registry.get("axum").is_some());
         assert!(registry.get("elysia-eden").is_some());
         assert!(registry.get("nope").is_none());
     }
@@ -858,5 +937,79 @@ const greeting = 'hi';\n";
             "server body leaked into client; got: {}",
             extraction.client_source
         );
+    }
+
+    #[test]
+    fn bare_server_block_defaults_lang_to_rust() {
+        let source = "server {\n\
+  function f() { return 1; }\n\
+}\n";
+        let extraction = extract_server_block(source);
+        assert_eq!(extraction.server_fns.len(), 1);
+        assert_eq!(extraction.server_fns[0].lang, "rust");
+    }
+
+    #[test]
+    fn tagged_server_block_sets_ts_lang() {
+        let source = "server:ts {\n\
+  function f() { return 1; }\n\
+}\n";
+        let extraction = extract_server_block(source);
+        assert_eq!(extraction.server_fns.len(), 1);
+        assert_eq!(extraction.server_fns[0].name, "f");
+        assert_eq!(extraction.server_fns[0].lang, "ts");
+    }
+
+    #[test]
+    fn tagged_server_block_sets_php_lang() {
+        let source = "server:php {\n\
+  function f() { return 1; }\n\
+}\n";
+        let extraction = extract_server_block(source);
+        assert_eq!(extraction.server_fns.len(), 1);
+        assert_eq!(extraction.server_fns[0].lang, "php");
+    }
+
+    #[test]
+    fn dollar_marker_fn_defaults_lang_to_rust() {
+        let source = "const doThing$$ = async (n: number) => { return n + 1; };\n";
+        let extraction = extract_server_block(source);
+        assert_eq!(extraction.server_fns.len(), 1);
+        assert_eq!(extraction.server_fns[0].lang, "rust");
+    }
+
+    #[test]
+    fn use_server_marker_fn_defaults_lang_to_rust() {
+        let source = "function loadUser(id: number) {\n\
+  'use server';\n\
+  return db.users.find(id);\n\
+}\n";
+        let extraction = extract_server_block(source);
+        assert_eq!(extraction.server_fns.len(), 1);
+        assert_eq!(extraction.server_fns[0].lang, "rust");
+    }
+
+    #[test]
+    fn multiple_server_blocks_each_keep_their_lang() {
+        let source = "server:ts {\n\
+  function a() { return 1; }\n\
+}\n\
+const mid = 1;\n\
+server:php {\n\
+  function b() { return 2; }\n\
+}\n";
+        let extraction = extract_server_block(source);
+        assert_eq!(extraction.server_fns.len(), 2, "both blocks should lift");
+        let a = extraction.server_fns.iter().find(|f| f.name == "a").expect("fn a");
+        let b = extraction.server_fns.iter().find(|f| f.name == "b").expect("fn b");
+        assert_eq!(a.lang, "ts");
+        assert_eq!(b.lang, "php");
+        assert!(
+            extraction.client_source.contains("const mid = 1;"),
+            "code between blocks lost; got: {}",
+            extraction.client_source
+        );
+        assert!(!extraction.client_source.contains("function a"));
+        assert!(!extraction.client_source.contains("function b"));
     }
 }
