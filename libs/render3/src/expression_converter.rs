@@ -120,6 +120,22 @@ pub trait PipeSlotAllocator {
     /// Register one pipe usage (`name`, with `total_args` lowered arguments) and
     /// return its allocated [`PipeSlots`].
     fn allocate_pipe(&self, name: &str, total_args: usize) -> PipeSlots;
+
+    /// Reserve the single binding (var) slot a hoisted template arrow function
+    /// consumes (`ɵɵarrowFunction`'s `varOffset`; Angular `varsUsedByOp` returns `1`
+    /// for an `ArrowFunction` IR expression — `var_counting.ts:186`), returning the
+    /// var offset it was assigned.
+    ///
+    /// Defaulted so the only out-of-tree implementor (the view builder's pipe
+    /// registry) need not be changed: the default returns `None`, signalling that no
+    /// host var-slot pool is available, in which case [`Converter`] falls back to a
+    /// self-contained slot counter rooted at the conventional first nested-binding
+    /// offset (1). A builder that owns the var pool overrides this to draw the slot
+    /// from the shared binding-slot cursor (so `vars` grows by one per hoisted arrow,
+    /// matching Angular).
+    fn allocate_arrow_slot(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// Default [`LocalResolver`]: every implicit-receiver read roots at a single
@@ -212,6 +228,113 @@ fn is_implicit_receiver(node: &AstNode) -> bool {
     matches!(node.kind, EK::ImplicitReceiver | EK::ThisReceiver)
 }
 
+/// Whether a lowered expression reads an embedded-view local — an ancestor shared-context
+/// variable (`ctx_r<level>`) or a generated `@for` loop local (`item_r1`, `$index_r2`, …),
+/// both of which carry the `_r<digits>` suffix Angular's `BindingScope` /
+/// `variable_optimization` naming produces. Such reads mean the (would-be hoisted) arrow
+/// depends on the embedded view's restored context, which the const-pool factory can only
+/// reach via the deeper `ɵɵrestoreView`/`ɵɵnextContext` relocation the view builder owns;
+/// until that lands we keep those arrows inline (value-correct) rather than emit a factory
+/// that captures only the top-level `ctx`. Safe-navigation temporaries (`tmp_0`, `tmp_1`, …)
+/// carry a `_<digit>` suffix but never `_r<digit>`, so they are not mistaken for view locals.
+fn references_view_local(expr: &Expr) -> bool {
+    fn name_is_view_local(name: &str) -> bool {
+        // Match a trailing `_r<digits>` segment (e.g. `ctx_r3`, `item_r1`, `$index_r2`).
+        if let Some(idx) = name.rfind("_r") {
+            let tail = &name[idx + 2..];
+            return !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit());
+        }
+        false
+    }
+    let mut found = false;
+    visit_read_var_names(expr, &mut |name| {
+        if name_is_view_local(name) {
+            found = true;
+        }
+    });
+    found
+}
+
+/// Walk every `ReadVar` name reachable from `expr`, invoking `f` for each. Covers the
+/// expression shapes the binding converter produces (the arrow factory guard only needs to
+/// see variable reads; statements inside function bodies are not produced on this path).
+fn visit_read_var_names(expr: &Expr, f: &mut impl FnMut(&str)) {
+    match &expr.kind {
+        ExprKind::ReadVar { name } => f(name),
+        ExprKind::Unary { expr, .. } => visit_read_var_names(expr, f),
+        ExprKind::Not(inner)
+        | ExprKind::Typeof(inner)
+        | ExprKind::Void(inner)
+        | ExprKind::Parenthesized(inner)
+        | ExprKind::Spread(inner) => visit_read_var_names(inner, f),
+        ExprKind::Binary { lhs, rhs, .. } => {
+            visit_read_var_names(lhs, f);
+            visit_read_var_names(rhs, f);
+        }
+        ExprKind::ReadProp { receiver, .. } => visit_read_var_names(receiver, f),
+        ExprKind::ReadKey { receiver, index, .. } => {
+            visit_read_var_names(receiver, f);
+            visit_read_var_names(index, f);
+        }
+        ExprKind::Conditional {
+            condition,
+            true_case,
+            false_case,
+        } => {
+            visit_read_var_names(condition, f);
+            visit_read_var_names(true_case, f);
+            if let Some(fc) = false_case {
+                visit_read_var_names(fc, f);
+            }
+        }
+        ExprKind::Invoke { callee, args, .. } => {
+            visit_read_var_names(callee, f);
+            for a in args {
+                visit_read_var_names(a, f);
+            }
+        }
+        ExprKind::New { class_expr, args } => {
+            visit_read_var_names(class_expr, f);
+            for a in args {
+                visit_read_var_names(a, f);
+            }
+        }
+        ExprKind::LiteralArray(entries) => {
+            for e in entries {
+                visit_read_var_names(e, f);
+            }
+        }
+        ExprKind::LiteralMap { entries, .. } => {
+            for entry in entries {
+                match entry {
+                    o::LiteralMapEntry::Property { value, .. } => visit_read_var_names(value, f),
+                    o::LiteralMapEntry::Spread { expression } => visit_read_var_names(expression, f),
+                }
+            }
+        }
+        ExprKind::Comma(parts) => {
+            for p in parts {
+                visit_read_var_names(p, f);
+            }
+        }
+        ExprKind::Arrow { body, .. } => match body {
+            ArrowBody::Expr(e) => visit_read_var_names(e, f),
+            ArrowBody::Block(_) => {}
+        },
+        ExprKind::TemplateLiteral { expressions, .. } => {
+            for e in expressions {
+                visit_read_var_names(e, f);
+            }
+        }
+        ExprKind::TaggedTemplate { tag, template } => {
+            visit_read_var_names(tag, f);
+            visit_read_var_names(template, f);
+        }
+        // Leaves / shapes with no nested binding-expression children to inspect.
+        _ => {}
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public entry points.
 // ---------------------------------------------------------------------------
@@ -252,6 +375,10 @@ pub fn convert_property_binding_with_pipes<R: LocalResolver, P: PipeSlotAllocato
     pipes: &P,
 ) -> ConvertedBinding {
     let mut cx = Converter::new(resolver).with_pipes(pipes);
+    // This is the property/interpolation binding path (the only one Angular's
+    // `generateArrowFunctions` rewrites), so a top-level user arrow here is hoisted
+    // into a const-pool factory and emitted as `ɵɵarrowFunction(slot, factory, ctx)`.
+    cx.hoist_arrows = true;
     ConvertedBinding::pure(cx.convert(expr))
 }
 
@@ -430,6 +557,23 @@ struct Converter<'r, R: LocalResolver> {
     /// implicit-receiver-resolution phase runs. Names accumulate across nested
     /// arrows (an inner arrow's params join the set), exactly as the pipeline does.
     arrow_params: Vec<String>,
+    /// Whether a *user* arrow function written in this binding should be hoisted into
+    /// a const-pool `(ctx, view) => …` factory and emitted as
+    /// `ɵɵarrowFunction(slot, factory, ctx)` (Angular `generateArrowFunctions` +
+    /// `reify.ts` `ArrowFunction`). Only the binding/interpolation entry point
+    /// ([`convert_property_binding_with_pipes`]) enables this; event-handler actions
+    /// keep arrows inline (Angular skips `Listener`/`TwoWayListener` ops because the
+    /// handler needs `$event` and is never stored — `generate_arrow_functions.ts:19`),
+    /// and the plain (non-pipe) entry points keep the historic inline form so their
+    /// callers (e.g. `@for` trackBy lowering) are unaffected.
+    hoist_arrows: bool,
+    /// Running fallback counter for a hoisted arrow's `varOffset` when the host does
+    /// not expose its binding-slot pool (`PipeSlotAllocator::allocate_arrow_slot`
+    /// returns `None`). Seeded at `1` — the offset of the first *nested* binding when
+    /// the consuming interpolation/property op has already reserved slot `0` — and
+    /// advanced once per hoisted arrow so multiple arrows in one binding get distinct
+    /// offsets. When the host *does* expose the pool the real offset is used instead.
+    arrow_slot_fallback: std::cell::Cell<usize>,
 }
 
 impl<'r, R: LocalResolver> Converter<'r, R> {
@@ -439,6 +583,8 @@ impl<'r, R: LocalResolver> Converter<'r, R> {
             next_temp: 0,
             pipes: None,
             arrow_params: Vec::new(),
+            hoist_arrows: false,
+            arrow_slot_fallback: std::cell::Cell::new(1),
         }
     }
 
@@ -666,6 +812,13 @@ impl<R: LocalResolver> Converter<'_, R> {
                 // arrows; we restore the prior scope length when this arrow's body
                 // is done so a sibling arrow does not see these params.
                 let scope_base = self.arrow_params.len();
+                // An *outermost* arrow (no enclosing arrow params yet) in a binding
+                // context is the one Angular hoists; a *nested* arrow stays inside the
+                // factory body verbatim (the `InChildOperation` guard in
+                // `generate_arrow_functions.ts`). We capture this before pushing this
+                // arrow's params so the inner `self.convert` recursion sees `arrow_params`
+                // non-empty and therefore never tries to hoist a nested arrow.
+                let is_outermost = scope_base == 0;
                 for p in parameters {
                     let bound = match p {
                         e::ArrowFunctionParameter::Identifier(id) => id.name.clone(),
@@ -677,7 +830,19 @@ impl<R: LocalResolver> Converter<'_, R> {
                 }
                 let body = self.convert(body);
                 self.arrow_params.truncate(scope_base);
-                o::arrow_fn(params, ArrowBody::Expr(Box::new(body)), None)
+                let inline_arrow = o::arrow_fn(params, ArrowBody::Expr(Box::new(body)), None);
+
+                // Hoist into a const-pool `ɵɵarrowFunction` factory when this is the
+                // outermost arrow of a property/interpolation binding and the arrow only
+                // captures the top-level component context (no ancestor `ɵɵnextContext`
+                // context or embedded-view local — those need the deeper
+                // restoreView/nextContext relocation the view builder performs, which we
+                // leave inline rather than emit incorrectly).
+                if self.hoist_arrows && is_outermost && !references_view_local(&inline_arrow) {
+                    self.hoist_arrow_function(inline_arrow)
+                } else {
+                    inline_arrow
+                }
             }
 
             // TemplateLiteral `` `a${x}b` ``.
@@ -764,6 +929,52 @@ impl<R: LocalResolver> Converter<'_, R> {
                 }
             }
         }
+    }
+
+    /// Hoist a (already-lowered) user arrow into a const-pool factory and return the
+    /// `ɵɵarrowFunction(slot, factory, ctx)` call that references it. Mirrors Angular's
+    /// `generateArrowFunctions` (which moves the arrow into `unit.functions`) +
+    /// `reify.ts`'s `ArrowFunction` case + `getArrowFunctionFactory`:
+    ///
+    /// - the factory is `(ctx, view) => <userArrow>` (`getArrowFunctionFactory` wraps the
+    ///   arrow in a two-parameter `contextName`/`currentViewName` outer arrow);
+    /// - the call is `ɵɵarrowFunction(varOffset, factory, ctx)` — the var offset is the
+    ///   single binding slot the arrow consumes (`varsUsedByOp` ⇒ `1`), `factory` is the
+    ///   hoisted reference, and the lone captured context argument is the component `ctx`
+    ///   (`reify.ts:845` passes `o.variable(CONTEXT_NAME)`).
+    ///
+    /// The factory body already roots its implicit-receiver reads at `ctx` (this path is
+    /// only taken when the arrow captures the top-level context — see the
+    /// [`references_view_local`] guard), and the factory's first parameter is named `ctx`,
+    /// so the captured `ctx` argument flows straight through with no rewriting needed.
+    fn hoist_arrow_function(&mut self, inline_arrow: Expr) -> Expr {
+        // The factory's binding (var) slot: drawn from the host's binding-slot pool when
+        // the allocator exposes it, else a self-contained counter (see field docs).
+        let slot = match self.pipes.and_then(|p| p.allocate_arrow_slot()) {
+            Some(offset) => offset,
+            None => {
+                let next = self.arrow_slot_fallback.get();
+                self.arrow_slot_fallback.set(next + 1);
+                next
+            }
+        };
+
+        // factory = (ctx, view) => <userArrow>
+        let factory = o::arrow_fn(
+            vec![
+                FnParam::new("ctx", Some(dynamic_type())),
+                FnParam::new("view", Some(dynamic_type())),
+            ],
+            ArrowBody::Expr(Box::new(inline_arrow)),
+            None,
+        );
+
+        // ɵɵarrowFunction(slot, factory, ctx)
+        let ctx_capture = o::variable("ctx", None);
+        o::import_expr(R3::ArrowFunction.reference(), None).call_fn(
+            vec![literal(OLit::Number(slot as f64), None), factory, ctx_capture],
+            false,
+        )
     }
 
     /// Expand a safe-navigation access (`a?.b`, `a?.[k]`, `f?.(args)`) into a
@@ -1128,6 +1339,133 @@ mod tests {
                 var_offset: 100 + n,
             }
         }
+    }
+
+    /// A [`PipeSlotAllocator`] that additionally hands out a fixed arrow var slot, so the
+    /// hoisting path can be exercised with a host-provided offset.
+    struct ArrowPipes {
+        arrow_slot: usize,
+    }
+    impl PipeSlotAllocator for ArrowPipes {
+        fn allocate_pipe(&self, _name: &str, _total_args: usize) -> PipeSlots {
+            PipeSlots {
+                slot: 0,
+                var_offset: 0,
+            }
+        }
+        fn allocate_arrow_slot(&self) -> Option<usize> {
+            Some(self.arrow_slot)
+        }
+    }
+
+    #[test]
+    fn arrow_hoisted_to_factory_in_binding_context() {
+        // (param) => param + value + 1, lowered through the binding (pipes) path, hoists into a
+        // `(ctx, view) => …` factory and emits `ɵɵarrowFunction(slot, factory, ctx)`.
+        let body = node(EK::Binary {
+            operation: BinaryOperation::Add,
+            left: Box::new(node(EK::Binary {
+                operation: BinaryOperation::Add,
+                left: Box::new(prop("param")),
+                right: Box::new(prop("value")),
+            })),
+            right: Box::new(num(1.0)),
+        });
+        let arrow = node(EK::ArrowFunction {
+            parameters: vec![arrow_id_param("param")],
+            body: Box::new(body),
+        });
+        let pipes = ArrowPipes { arrow_slot: 1 };
+        let r = convert_property_binding_with_pipes(&arrow, &CtxResolver::ctx(), &pipes);
+        let out = emit_expression(&r.expr);
+        assert!(out.contains("\u{0275}\u{0275}arrowFunction("), "no arrowFunction, got: {out}");
+        // The single binding slot (varOffset) the host allocated.
+        assert!(out.contains("arrowFunction(1,"), "wrong slot, got: {out}");
+        // Factory wraps the user arrow in a `(ctx, view) => …` outer arrow.
+        assert!(out.contains("(ctx, view) =>"), "no factory wrapper, got: {out}");
+        // Captured context argument is `ctx`; the body's `value` read becomes `ctx.value`.
+        assert!(out.contains("ctx.value"), "body not ctx-rooted, got: {out}");
+        // The bound parameter is NOT rewritten to `ctx.param`.
+        assert!(out.contains("param + ctx.value + 1"), "param shadowing broke, got: {out}");
+    }
+
+    #[test]
+    fn arrow_hoist_falls_back_to_local_slot_without_host_offset() {
+        // Without a host-provided arrow slot (`allocate_arrow_slot` → None, the default), the
+        // factory still emits with a self-contained slot counter rooted at 1.
+        let arrow = node(EK::ArrowFunction {
+            parameters: vec![arrow_id_param("a")],
+            body: Box::new(prop("a")),
+        });
+        let pipes = MockPipes::new();
+        let r = convert_property_binding_with_pipes(&arrow, &CtxResolver::ctx(), &pipes);
+        let out = emit_expression(&r.expr);
+        assert!(out.contains("arrowFunction(1,"), "fallback slot wrong, got: {out}");
+        // No pipe was registered for the arrow.
+        assert!(pipes.log.borrow().is_empty(), "arrow registered a pipe: {:?}", pipes.log.borrow());
+    }
+
+    #[test]
+    fn arrow_referencing_view_local_stays_inline() {
+        // An arrow whose body reads an ancestor shared-context var (`ctx_r3.x`) is NOT hoisted —
+        // it needs the deeper restoreView/nextContext relocation, so it stays inline.
+        struct NestedRes;
+        impl LocalResolver for NestedRes {
+            fn resolve_implicit_receiver(&self) -> Expr {
+                o::variable("ctx_r3", None)
+            }
+        }
+        let arrow = node(EK::ArrowFunction {
+            parameters: vec![],
+            body: Box::new(prop("x")),
+        });
+        let pipes = ArrowPipes { arrow_slot: 1 };
+        let r = convert_property_binding_with_pipes(&arrow, &NestedRes, &pipes);
+        let out = emit_expression(&r.expr);
+        assert!(!out.contains("arrowFunction"), "should stay inline, got: {out}");
+        assert!(out.contains("ctx_r3.x"), "got: {out}");
+    }
+
+    #[test]
+    fn arrow_in_action_context_stays_inline() {
+        // Event-handler actions keep arrows inline (Angular skips Listener ops in
+        // generateArrowFunctions), so the action path must not hoist.
+        let arrow = node(EK::ArrowFunction {
+            parameters: vec![arrow_id_param("value")],
+            body: Box::new(node(EK::Binary {
+                operation: BinaryOperation::Add,
+                left: Box::new(prop("value")),
+                right: Box::new(num(1.0)),
+            })),
+        });
+        let r = convert_action_binding(&arrow, ctx(), "0");
+        let out = emit_expression(&r.expr);
+        assert!(!out.contains("arrowFunction"), "action arrow should stay inline, got: {out}");
+        assert!(out.contains("(value) => value + 1"), "got: {out}");
+    }
+
+    #[test]
+    fn nested_arrow_inside_hoisted_arrow_stays_inline() {
+        // a => b => a + b through the binding path: only the OUTER arrow is hoisted; the inner
+        // arrow remains a plain arrow inside the factory body (Angular's InChildOperation guard).
+        let inner = node(EK::ArrowFunction {
+            parameters: vec![arrow_id_param("b")],
+            body: Box::new(node(EK::Binary {
+                operation: BinaryOperation::Add,
+                left: Box::new(prop("a")),
+                right: Box::new(prop("b")),
+            })),
+        });
+        let outer = node(EK::ArrowFunction {
+            parameters: vec![arrow_id_param("a")],
+            body: Box::new(inner),
+        });
+        let pipes = ArrowPipes { arrow_slot: 2 };
+        let r = convert_property_binding_with_pipes(&outer, &CtxResolver::ctx(), &pipes);
+        let out = emit_expression(&r.expr);
+        // Exactly one arrowFunction instruction (the outer), inner stays a plain arrow.
+        assert_eq!(out.matches("\u{0275}\u{0275}arrowFunction(").count(), 1, "got: {out}");
+        assert!(out.contains("(a) => (b) => a + b"), "nested arrow body wrong, got: {out}");
     }
 
     #[test]

@@ -259,6 +259,21 @@ struct LoopVar {
     local_name: String,
 }
 
+/// A `@let` declaration that reserved a `ɵɵdeclareLet` data slot in some view and is therefore
+/// readable cross-view via `ɵɵreadContextLet(slot)`. Threaded from a view into every descendant
+/// embedded view + listener handler so a read of `name` there can switch to the owner context
+/// (`ɵɵnextContext`) and read the stored value (`generate_variables.ts` `letDeclarations` scope).
+#[derive(Debug, Clone)]
+struct ContextLet {
+    /// The author-written `@let` name.
+    name: String,
+    /// The `ɵɵdeclareLet` data slot in the owner view.
+    slot: usize,
+    /// The owner view's nesting level (`view_level`); the number of `ɵɵnextContext()` hops a
+    /// reader needs is `reader_level - owner_level`.
+    owner_level: usize,
+}
+
 /// A [`LocalResolver`] that roots the implicit receiver at `ctx` (like [`crate::expression_converter::CtxResolver`])
 /// but additionally lowers reads of an embedded view's loop variables to their generated locals
 /// (`x` → `x_r1`), faithful to Angular's `resolve_names` + `variable_optimization` phases.
@@ -315,6 +330,8 @@ impl LocalResolver for NestedViewResolver<'_> {
 /// handler parameter (Angular's `resolveDollarEvent` — `$event` reads must NOT become `ctx.$event`).
 struct ListenerResolver<'a> {
     vars: &'a [LoopVar],
+    /// `@let` source-name → generated readContextLet local, for lets the handler reads cross-view.
+    context_let_locals: &'a [(String, String)],
 }
 
 impl LocalResolver for ListenerResolver<'_> {
@@ -326,10 +343,15 @@ impl LocalResolver for ListenerResolver<'_> {
         if name == EVENT_NAME {
             return Some(o::variable(EVENT_NAME, None));
         }
-        self.vars
+        // A `@let` read in the handler resolves to its `ɵɵreadContextLet` local (loop vars first,
+        // since a `@for` item shadows everything).
+        if let Some(v) = self.vars.iter().find(|v| v.source_name == name) {
+            return Some(o::variable(v.local_name.clone(), None));
+        }
+        self.context_let_locals
             .iter()
-            .find(|v| v.source_name == name)
-            .map(|v| o::variable(v.local_name.clone(), None))
+            .find(|(src, _)| src == name)
+            .map(|(_, local)| o::variable(local.clone(), None))
     }
 }
 
@@ -659,6 +681,25 @@ pub struct TemplateDefinitionBuilder {
     /// Loop variables in scope for this (embedded) view — `@for` item / `$index` / `$count`.
     /// Empty for the root view. Reads of these names lower to their generated locals.
     loop_vars: Vec<LoopVar>,
+    /// `@let` declarations (this view's + every ancestor's) that reserved a `ɵɵdeclareLet` slot and
+    /// are thus readable cross-view via `ɵɵreadContextLet`. Threaded into each embedded view +
+    /// listener handler. When a binding in this view (or a callback) reads a name found here that is
+    /// NOT satisfied by a local of the current view, the read lowers to a generated local fed by a
+    /// prepended `const <name>_r = ɵɵreadContextLet(slot)` (with the appropriate `ɵɵnextContext`
+    /// hops). Mirrors `generate_variables.ts` `Scope.letDeclarations`.
+    context_lets: Vec<ContextLet>,
+    /// The set of `@let` names declared at this view's top level that need cross-view storage
+    /// (external or pipe-bearing). Populated by [`Self::analyze_let_declarations`] before the walk;
+    /// consulted in [`Self::build_let_declaration`]. The boolean is `true` when the let is external
+    /// (storeLet retained), `false` when it only kept its `ɵɵdeclareLet` because of a pipe.
+    external_lets: std::collections::HashMap<String, bool>,
+    /// This view's top-level node list, captured for the duration of the walk so a `@let`'s
+    /// in-view-usage decision can consult its (shadowing-aware) sibling/descendant references.
+    current_nodes: Option<Vec<Node>>,
+    /// The shared `const _r<id> = ɵɵgetCurrentView();` identifier for this view, minted the first
+    /// time a listener handler needs to restore a saved view (because it reads a cross-view `@let`).
+    /// `generate_variables.ts` saves the current view once per view and reuses it across listeners.
+    saved_view_name: Option<String>,
     /// `const <item>_r<id> = ctx.$implicit;` declarations to emit at the head of this view's update
     /// block (generated for the loop variables this view actually references).
     update_prelude: Vec<Stmt>,
@@ -747,6 +788,10 @@ impl TemplateDefinitionBuilder {
             update_code: Vec::new(),
             const_pool: ConstantPool::new(),
             loop_vars: Vec::new(),
+            context_lets: Vec::new(),
+            external_lets: std::collections::HashMap::new(),
+            current_nodes: None,
+            saved_view_name: None,
             update_prelude: Vec::new(),
             hoisted_fns: Vec::new(),
             base_name,
@@ -838,6 +883,18 @@ impl TemplateDefinitionBuilder {
         }
         let name = format!("ctx_r{}", self.view_level);
         *slot = Some(name.clone());
+        name
+    }
+
+    /// The shared saved-view identifier (`_r<id>`) for this view, minted on first use. The matching
+    /// `const _r<id> = ɵɵgetCurrentView();` is prepended to the creation block during finalisation.
+    fn saved_view_var_name(&mut self) -> String {
+        if let Some(name) = &self.saved_view_name {
+            return name.clone();
+        }
+        self.var_counter += 1;
+        let name = format!("_r{}", self.var_counter);
+        self.saved_view_name = Some(name.clone());
         name
     }
 
@@ -946,11 +1003,46 @@ impl TemplateDefinitionBuilder {
     pub fn build_template_function(&mut self, input: &TemplateCompilationInput) -> Expr {
         // Walk the nodes, accumulating creation + update instructions.
         let nodes = input.nodes.clone();
+
+        // Capture the node list for in-view `@let`-usage queries during the walk.
+        self.current_nodes = Some(nodes.clone());
+
+        // Classify every top-level `@let` in this view (external / pipe-bearing) so the inline walk
+        // can decide whether each reserves a `ɵɵdeclareLet` slot + `ɵɵstoreLet`, or inlines as a
+        // plain `const`/bare statement (`optimizeStoreLet` / `optimizeVariables`).
+        self.analyze_let_declarations(&nodes);
+
+        // Bring any ancestor `@let`s that THIS view's own update bindings read into scope as
+        // generated locals, fed by prepended `ɵɵnextContext()` + `const … = ɵɵreadContextLet(slot)`
+        // declarations (`generate_variables.ts`). Must run before the walk so reads of those names
+        // resolve to the generated local rather than `ctx.<name>`.
+        self.bring_ancestor_lets_into_scope(&nodes);
+
         self.visit_all(&nodes);
 
         // Allocate pipe data slots (at the END of the data array), emit their `ɵɵpipe(slot,"name")`
         // creation instructions, and patch the placeholder slots in the update block.
         self.finalize_pipes();
+
+        // When a listener handler in this view restored a saved view (to read a cross-view `@let`),
+        // the creation block opens with `const _r<id> = ɵɵgetCurrentView();` (`generate_variables.ts`
+        // saves the view once per view, ahead of every listener that consumes it).
+        if let Some(saved) = self.saved_view_name.clone() {
+            self.creation_code.insert(
+                0,
+                Stmt::with_modifiers(
+                    StmtKind::DeclareVar {
+                        name: saved,
+                        value: Some(
+                            o::import_expr(R3::GetCurrentView.reference(), None)
+                                .call_fn(vec![], false),
+                        ),
+                        ty: None,
+                    },
+                    StmtModifier::FINAL,
+                ),
+            );
+        }
 
         let mut statements: Vec<Stmt> = Vec::new();
 
@@ -1617,16 +1709,68 @@ impl TemplateDefinitionBuilder {
     /// `LexicalReadExpr` is seen) + `reifyListenerHandler` (which pushes the `$event` `FnParam`
     /// only when `consumesDollarEvent` is set). So `(click)="f()"` emits a no-param handler.
     fn build_listener(&mut self, slot: usize, tag: &str, output: &BoundEvent) {
+        // A `@let` (this view's or an ancestor's) read in the handler is a cross-view read: it
+        // resolves to a `const <name>_r = ɵɵreadContextLet(slot)` prepended to the handler body
+        // (`generate_variables.ts`, `isCallback` ⇒ even this view's own lets are read this way), and
+        // forces the view to be saved/restored (`ɵɵgetCurrentView`/`ɵɵrestoreView`/`ɵɵresetView`).
+        // `context_lets` holds exactly the slot-bearing `@let`s; in a callback EVERY such let in
+        // scope (including this view's own) is read via `ɵɵreadContextLet` rather than its in-view
+        // `ɵɵstoreLet` local (`generate_variables.ts`: `scope.view !== view.xref || isCallback`).
+        let referenced_lets: Vec<ContextLet> = self
+            .context_lets
+            .iter()
+            .filter(|cl| expr_references_implicit(&output.handler, &cl.name))
+            .cloned()
+            .collect();
+
+        let mut context_let_locals: Vec<(String, String)> = Vec::new();
+        let mut let_reads: Vec<Stmt> = Vec::new();
+        for cl in &referenced_lets {
+            self.var_counter += 1;
+            let local_name = format!("{}_r{}", cl.name, self.var_counter);
+            let read = o::import_expr(R3::ReadContextLet.reference(), None)
+                .call_fn(vec![num(cl.slot as f64)], false);
+            let_reads.push(Stmt::with_modifiers(
+                StmtKind::DeclareVar {
+                    name: local_name.clone(),
+                    value: Some(read),
+                    ty: None,
+                },
+                StmtModifier::FINAL,
+            ));
+            context_let_locals.push((cl.name.clone(), local_name));
+        }
+        let needs_view_restore = !referenced_lets.is_empty();
+
         // Lower the handler against a resolver that keeps `$event` a bare parameter read (Angular
-        // `resolveDollarEvent`) and rewrites any in-scope `@for` loop vars to their locals.
+        // `resolveDollarEvent`), rewrites any in-scope `@for` loop vars to their locals, and resolves
+        // cross-view `@let` reads to their `ɵɵreadContextLet` locals.
         let resolver = ListenerResolver {
             vars: &self.loop_vars,
+            context_let_locals: &context_let_locals,
         };
         let converted = convert_action_binding_with(&output.handler, &resolver);
 
-        // Handler body: any leading statements, then `return <final expr>;`.
-        let mut body: Vec<Stmt> = converted.stmts;
-        body.push(o::Stmt::bare(o::StmtKind::Return(converted.expr)));
+        // Handler body, in order: `ɵɵrestoreView(savedView)` (when reading cross-view state), the
+        // `ɵɵreadContextLet` `const`s, any spilled statements, then the `return`. The final value is
+        // wrapped in `ɵɵresetView(...)` when the view was restored.
+        let mut body: Vec<Stmt> = Vec::new();
+        if needs_view_restore {
+            let saved = self.saved_view_var_name();
+            body.push(
+                o::import_expr(R3::RestoreView.reference(), None)
+                    .call_fn(vec![o::variable(saved, None)], false)
+                    .to_stmt(),
+            );
+        }
+        body.extend(let_reads);
+        body.extend(converted.stmts);
+        let ret = if needs_view_restore {
+            o::import_expr(R3::ResetView.reference(), None).call_fn(vec![converted.expr], false)
+        } else {
+            converted.expr
+        };
+        body.push(o::Stmt::bare(o::StmtKind::Return(ret)));
 
         // Angular `naming.ts`: `${unit.fnName}_${tag.replace('-', '_')}_${event}_${slot}_listener`.
         let handler_name = format!(
@@ -1770,6 +1914,9 @@ impl TemplateDefinitionBuilder {
         nested.view_level = self.view_level + 1;
         // Thread the component-global variable counter so nested loop vars get unique `_rN` names.
         nested.var_counter = self.var_counter;
+        // Thread the in-scope cross-view `@let`s so a read in this embedded view can resolve to
+        // `ɵɵreadContextLet(slot)` against the owning ancestor view (`generate_variables.ts`).
+        nested.context_lets = self.context_lets.clone();
         nested.loop_vars = loop_vars;
         nested.update_prelude = update_prelude;
         let tmpl_fn = nested.build_template_function(&nested_input);
@@ -1816,10 +1963,11 @@ impl TemplateDefinitionBuilder {
                 R3::ConditionalBranchCreate
             };
             let tag = single_root_tag(&branch.children);
-            self.creation_code.push(instruction(
-                reference,
-                vec![num(slot as f64), fn_ref, num(decls as f64), num(vars as f64), tag],
-            ));
+            // `instruction.ts` `conditionalCreate`/`conditionalBranchCreate` trim trailing `null`
+            // arguments, so a text-only branch (no element tag) drops the final `null` tag arg.
+            let mut params = vec![num(slot as f64), fn_ref, num(decls as f64), num(vars as f64), tag];
+            trim_trailing_nulls(&mut params);
+            self.creation_code.push(instruction(reference, params));
         }
 
         // Build the selecting test expression (back-to-front, mirroring `generateConditionalExpressions`).
@@ -2142,49 +2290,200 @@ impl TemplateDefinitionBuilder {
         (vars, prelude)
     }
 
-    /// Lower a `@let x = <expr>;` declaration (`ingest.ts` `ingestLetDeclaration` +
-    /// `declareLet`/`storeLet`/`readContextLet` lowering).
+    /// Classify every top-level `@let` of this view, populating [`Self::external_lets`].
     ///
-    /// A `@let` reserves a data slot (the `ɵɵdeclareLet(slot)` TNode created in the creation block)
-    /// and a single binding (var) slot (`varsUsedByOp` for a `StoreLet` op). The update block emits
-    /// `const <name>_r<id> = ɵɵstoreLet(<value>)` after advancing to the let's slot, and every
-    /// implicit-receiver read of `<name>` later in this view lowers to the local `<name>_r<id>`
-    /// (registered as a [`LoopVar`], since an in-view let reference resolves exactly like a loop
-    /// variable: source name → generated local). Reads from a *different* view lower to
-    /// `ɵɵreadContextLet(slot)` instead (`reify.ts` `ContextLetReference`); that cross-view case is
-    /// resolved by the embedded view's own scope, so this method only wires the in-view local.
+    /// A `@let` needs cross-view storage (`ɵɵdeclareLet` slot + `ɵɵstoreLet`) only when its value is
+    /// read from a *different* view — a listener handler in this view, or any descendant embedded
+    /// view (`optimizeStoreLet`: an `external` let). A non-external let whose value uses a pipe keeps
+    /// its `ɵɵdeclareLet` slot (the pipe needs the TNode for DI) but NOT the `ɵɵstoreLet`. Everything
+    /// else inlines as a plain `const` / bare statement with no slot or var. The map value is `true`
+    /// for an external let (storeLet retained) and `false` for a pipe-only-slot let.
+    fn analyze_let_declarations(&mut self, nodes: &[Node]) {
+        for node in nodes {
+            if let Node::LetDeclaration(decl) = node {
+                let external = let_used_externally(nodes, &decl.name);
+                if external || let_value_has_pipe(&decl.value) {
+                    self.external_lets.insert(decl.name.clone(), external);
+                }
+            }
+        }
+    }
+
+    /// Prepend, for each ancestor `@let` whose value THIS view's own update bindings read, a
+    /// `const <name>_r<id> = ɵɵreadContextLet(slot)` declaration plus the `ɵɵnextContext()` hop that
+    /// switches into the owner view, and register the generated local so reads of the name resolve
+    /// to it (`generate_variables.ts` `letDeclarations`). Only ancestor lets actually referenced in
+    /// this view are materialised (`optimizeVariables` drops the unused ones). The current view's own
+    /// lets are read directly via their `ɵɵstoreLet` local, so they are excluded here.
+    fn bring_ancestor_lets_into_scope(&mut self, nodes: &[Node]) {
+        let ancestor_lets: Vec<ContextLet> = self
+            .context_lets
+            .iter()
+            .filter(|cl| cl.owner_level < self.view_level)
+            .cloned()
+            .collect();
+        if ancestor_lets.is_empty() {
+            return;
+        }
+
+        // A name is referenced in this view's update block if any same-view binding reads it (a
+        // bound text, element/template/component input, or control-flow condition). Skip names this
+        // view re-declares (a local let / loop var shadows the ancestor).
+        let mut prelude: Vec<Stmt> = Vec::new();
+        let mut emitted_next_context = false;
+        for cl in &ancestor_lets {
+            if declares_let_at_top(nodes, &cl.name) {
+                continue;
+            }
+            if self.loop_vars.iter().any(|v| v.source_name == cl.name) {
+                continue;
+            }
+            let referenced = nodes
+                .iter()
+                .any(|n| match n {
+                    Node::LetDeclaration(l) => expr_references_implicit(&l.value, &cl.name),
+                    _ => same_view_node_references(n, &cl.name),
+                });
+            if !referenced {
+                continue;
+            }
+
+            // A single `ɵɵnextContext()` switches into the immediately-enclosing view (the common
+            // single-level case shared by all the referenced ancestor lets here).
+            if !emitted_next_context {
+                prelude.push(
+                    o::import_expr(R3::NextContext.reference(), None)
+                        .call_fn(vec![], false)
+                        .to_stmt(),
+                );
+                emitted_next_context = true;
+            }
+
+            self.var_counter += 1;
+            let local_name = format!("{}_r{}", cl.name, self.var_counter);
+            let read = o::import_expr(R3::ReadContextLet.reference(), None)
+                .call_fn(vec![num(cl.slot as f64)], false);
+            prelude.push(Stmt::with_modifiers(
+                StmtKind::DeclareVar {
+                    name: local_name.clone(),
+                    value: Some(read),
+                    ty: None,
+                },
+                StmtModifier::FINAL,
+            ));
+            self.loop_vars.push(LoopVar {
+                source_name: cl.name.clone(),
+                local_name,
+            });
+        }
+
+        // These declarations lead the update block, before the loop-variable prelude and bindings.
+        let mut combined = prelude;
+        combined.append(&mut self.update_prelude);
+        self.update_prelude = combined;
+    }
+
+    /// Lower a `@let x = <expr>;` declaration (`ingest.ts` `ingestLetDeclaration` +
+    /// `declareLet`/`storeLet`/`readContextLet` lowering, post `optimizeStoreLet` /
+    /// `optimizeVariables`).
+    ///
+    /// Three shapes, selected from [`Self::external_lets`]:
+    ///   * **external** (read cross-view) — reserve a `ɵɵdeclareLet(slot)` data slot + one
+    ///     `ɵɵstoreLet` var slot; the update emits `ɵɵstoreLet(<value>)`, captured in a `const` when
+    ///     the value is also read in this view (so in-view reads reuse it) or left bare otherwise.
+    ///     Cross-view reads resolve via `ɵɵreadContextLet(slot)` (see
+    ///     [`Self::bring_ancestor_lets_into_scope`]).
+    ///   * **pipe-only slot** (non-external, value uses a pipe) — reserve the `ɵɵdeclareLet(slot)`
+    ///     for the pipe's DI TNode, but inline the value (no `ɵɵstoreLet`, no var slot).
+    ///   * **inlined** (non-external, no pipe) — no slot, no var; the value lowers to a plain
+    ///     `const <name> = <value>;` when read in this view, or a bare side-effectful `<value>;`
+    ///     statement when unused.
     fn build_let_declaration(&mut self, decl: &LetDeclaration) {
-        // `declareLet` allocates a data slot; the `storeLet` value occupies one var slot.
-        let slot = self.allocate_data_slot();
-        self.creation_code
-            .push(instruction(R3::DeclareLet, vec![num(slot as f64)]));
-        self.allocate_binding_slots(1);
+        let external = self.external_lets.get(&decl.name).copied();
+        let needs_slot = external.is_some(); // external OR pipe-only both reserve a declareLet slot.
+        let is_external = external == Some(true);
 
-        // Update: advance to the let's slot, lower the value expression (against this view's scope —
-        // earlier lets in the same view are already in `loop_vars`, so a let chaining off another
-        // resolves to that local), then bind it via `ɵɵstoreLet`. The result is captured in
-        // `<name>_r<id>` so subsequent references reuse the stored value.
-        self.advance_to(slot);
-        self.current_target_slot = slot;
+        let slot = if needs_slot {
+            let slot = self.allocate_data_slot();
+            self.creation_code
+                .push(instruction(R3::DeclareLet, vec![num(slot as f64)]));
+            Some(slot)
+        } else {
+            None
+        };
+
+        // An external let's `ɵɵstoreLet` reserves one var slot (`var_counting` `StoreLet` => 1).
+        if is_external {
+            self.allocate_binding_slots(1);
+        }
+
+        // Advance to the let's slot before its update binding when it reserved one.
+        if let Some(slot) = slot {
+            self.advance_to(slot);
+            self.current_target_slot = slot;
+        }
+
+        // Whether the value is read by THIS view's own update bindings: drives whether a local
+        // `const` is generated (a used let keeps its declaration; an unused one degrades to a bare
+        // statement that still runs the value for its side effects, the `ɵɵstoreLet` for an external
+        // let, the raw expression otherwise).
+        let used_in_view = self.let_used_in_view_now(&decl.name);
+
+        // If this external let is visible to descendant views, register it as a context-let so their
+        // reads can resolve to `ɵɵreadContextLet(slot)`. (Pipe-only-slot lets are not cross-view.)
+        if is_external {
+            if let Some(slot) = slot {
+                self.context_lets.push(ContextLet {
+                    name: decl.name.clone(),
+                    slot,
+                    owner_level: self.view_level,
+                });
+            }
+        }
+
         let value = self.lower_expr(&decl.value);
-        let store = o::import_expr(R3::StoreLet.reference(), None).call_fn(vec![value], false);
+        let value = if is_external {
+            o::import_expr(R3::StoreLet.reference(), None).call_fn(vec![value], false)
+        } else {
+            value
+        };
 
-        self.var_counter += 1;
-        let local_name = format!("{}_r{}", decl.name, self.var_counter);
-        self.update_code.push(Stmt::with_modifiers(
-            StmtKind::DeclareVar {
-                name: local_name.clone(),
-                value: Some(store),
-                ty: None,
-            },
-            StmtModifier::FINAL,
-        ));
+        if used_in_view {
+            // `const <name>_r<id> = <value-or-storeLet>;` — the in-view local for reads of this let.
+            self.var_counter += 1;
+            let local_name = format!("{}_r{}", decl.name, self.var_counter);
+            self.update_code.push(Stmt::with_modifiers(
+                StmtKind::DeclareVar {
+                    name: local_name.clone(),
+                    value: Some(value),
+                    ty: None,
+                },
+                StmtModifier::FINAL,
+            ));
+            self.loop_vars.push(LoopVar {
+                source_name: decl.name.clone(),
+                local_name,
+            });
+        } else {
+            // Unused in this view: the value runs as a bare statement (for its side effects / the
+            // cross-view `ɵɵstoreLet`), with no `const` binding (`optimizeVariables`).
+            self.update_code.push(value.to_stmt());
+        }
+    }
 
-        // In-view reads of this `@let` now resolve to its generated local.
-        self.loop_vars.push(LoopVar {
-            source_name: decl.name.clone(),
-            local_name,
-        });
+    /// Whether a top-level `@let` named `name` is referenced by this view's own update bindings,
+    /// using the source node tree the walk is processing. Captured at declaration time from the
+    /// current input nodes (stored on `self`); falls back to `false` when unavailable.
+    fn let_used_in_view_now(&self, name: &str) -> bool {
+        if let Some((idx, nodes)) = self
+            .current_nodes
+            .as_ref()
+            .and_then(|nodes| nodes.iter().position(|n| matches!(n, Node::LetDeclaration(l) if l.name == name)).map(|i| (i, nodes)))
+        {
+            let_used_in_view(nodes, idx, name)
+        } else {
+            false
+        }
     }
 }
 
@@ -2515,6 +2814,212 @@ fn expr_references_implicit(node: &AstNode, name: &str) -> bool {
             expressions.iter().any(|e| expr_references_implicit(e, name))
         }
         EK::ArrowFunction { body, .. } => expr_references_implicit(body, name),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `@let` declaration analysis (Angular `optimizeStoreLet` / `optimizeVariables`).
+//
+// For every `@let` declared at a view's top level we must decide, faithfully:
+//   * `external`  — the value is read from a *different* view (a listener handler in
+//                   this view, or any descendant embedded view) and therefore must be
+//                   stored cross-view via `ɵɵdeclareLet` + `ɵɵstoreLet`, read back with
+//                   `ɵɵreadContextLet`.
+//   * `has_pipe`  — the value uses a pipe, which forces the `ɵɵdeclareLet` TNode to be
+//                   retained even when the let is not external (the pipe needs the slot
+//                   for DI).
+//   * `in_view_uses` — whether the let is referenced anywhere in its OWN view's update
+//                   bindings (subsequent let initializers, bound text, element/template
+//                   inputs, control-flow conditions). Drives whether a local `const` is
+//                   generated for it (`generateLocalLetReferences` + `optimizeVariables`
+//                   keep the declaration only when something reads it locally; an unused
+//                   let is reduced to a bare side-effectful statement).
+// Shadowing: a descendant or sibling view that re-declares the same name shadows this
+// one, so references inside the shadowing subtree do not count toward this let.
+// ---------------------------------------------------------------------------
+
+/// Whether `name` is read from a *cross-view* context relative to the view whose top-level
+/// `nodes` are given: inside any element/template/component/directive output handler (a
+/// listener callback) or inside any descendant embedded view (`@if`/`@for`/`@switch`/`@defer`
+/// bodies and `<ng-template>` children). References in the same view's own update bindings do
+/// NOT count. Stops descending into a subtree that re-declares (shadows) `name`.
+fn let_used_externally(nodes: &[Node], name: &str) -> bool {
+    nodes.iter().any(|n| cross_view_node_uses(n, name))
+}
+
+/// Scan a list of children that constitute a SEPARATE (embedded) view: any read of `name` there
+/// (own bindings, listeners, or deeper embedded views) is a cross-view use — unless the embedded
+/// view re-declares the name (shadowing), in which case the outer let is not consumed by it.
+fn embedded_view_uses(children: &[Node], name: &str) -> bool {
+    if declares_let_at_top(children, name) {
+        return false;
+    }
+    children
+        .iter()
+        .any(|n| same_view_node_references(n, name) || cross_view_node_uses(n, name))
+}
+
+/// Whether `node` reaches a cross-view read of `name`: through a listener handler attached at or
+/// beneath it (same view, but the handler is a separate callback) or through an embedded view
+/// beneath it. Plain element/component children remain in the same view, so recurse into them to
+/// reach their listeners and nested blocks.
+fn cross_view_node_uses(node: &Node, name: &str) -> bool {
+    match node {
+        Node::Element(el) => {
+            el.outputs.iter().any(|o| expr_references_implicit(&o.handler, name))
+                || el
+                    .directives
+                    .iter()
+                    .any(|d| d.outputs.iter().any(|o| expr_references_implicit(&o.handler, name)))
+                || el.children.iter().any(|c| cross_view_node_uses(c, name))
+        }
+        Node::Component(c) => {
+            c.outputs.iter().any(|o| expr_references_implicit(&o.handler, name))
+                || c.children.iter().any(|ch| cross_view_node_uses(ch, name))
+        }
+        // `<ng-template>` children form an embedded view; its own outputs are listeners.
+        Node::Template(t) => {
+            t.outputs.iter().any(|o| expr_references_implicit(&o.handler, name))
+                || embedded_view_uses(&t.children, name)
+        }
+        Node::IfBlock(b) => b.branches.iter().any(|br| embedded_view_uses(&br.children, name)),
+        Node::SwitchBlock(b) => b.groups.iter().any(|g| embedded_view_uses(&g.children, name)),
+        Node::ForLoopBlock(b) => {
+            embedded_view_uses(&b.children, name)
+                || b.empty.as_ref().is_some_and(|e| embedded_view_uses(&e.children, name))
+        }
+        Node::DeferredBlock(b) => embedded_view_uses(&b.children, name),
+        Node::DeferredBlockPlaceholder(b) => embedded_view_uses(&b.children, name),
+        Node::DeferredBlockLoading(b) => embedded_view_uses(&b.children, name),
+        Node::DeferredBlockError(b) => embedded_view_uses(&b.children, name),
+        _ => false,
+    }
+}
+
+/// Whether `name` is referenced in the SAME view's own update bindings: the initializers of
+/// later top-level `@let`s, bound text, element/template/component input bindings, and the
+/// expressions of control-flow blocks (`@if` conditions, `@switch`/`@for` expressions). Reads
+/// inside listeners or embedded views are NOT counted (those are cross-view). Used to decide
+/// whether to emit a local `const` for the let.
+fn let_used_in_view(nodes: &[Node], decl_index: usize, name: &str) -> bool {
+    for (i, n) in nodes.iter().enumerate() {
+        match n {
+            Node::LetDeclaration(l) => {
+                // A later sibling let whose initializer reads `name` is an in-view use; but a
+                // later let that *re-declares* `name` shadows this one for everything after it.
+                if i > decl_index {
+                    if expr_references_implicit(&l.value, name) {
+                        return true;
+                    }
+                    if l.name == name {
+                        // Re-declaration shadows the rest of this view.
+                        return false;
+                    }
+                }
+            }
+            _ => {
+                if same_view_node_references(n, name) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Whether a node references `name` through THIS view's own update bindings only (bound text,
+/// inputs, control-flow condition/collection expressions) — NOT through listeners or embedded
+/// views. Plain element children stay in the same view, so recurse into them.
+fn same_view_node_references(node: &Node, name: &str) -> bool {
+    match node {
+        Node::BoundText(bt) => expr_references_implicit(&bt.value, name),
+        Node::Element(el) => {
+            el.inputs.iter().any(|i| expr_references_implicit(&i.value, name))
+                || el.directives.iter().any(|d| {
+                    d.inputs.iter().any(|i| expr_references_implicit(&i.value, name))
+                })
+                || el.children.iter().any(|c| same_view_node_references(c, name))
+        }
+        Node::Component(c) => {
+            c.inputs.iter().any(|i| expr_references_implicit(&i.value, name))
+                || c.children.iter().any(|ch| same_view_node_references(ch, name))
+        }
+        // A `<ng-template>` / control-flow block: only its *own* binding inputs / condition
+        // expressions evaluate in this view; its children are a separate view (handled by
+        // `let_used_externally`).
+        Node::Template(t) => t.inputs.iter().any(|i| expr_references_implicit(&i.value, name)),
+        Node::IfBlock(b) => b.branches.iter().any(|br| {
+            br.expression
+                .as_ref()
+                .is_some_and(|e| expr_references_implicit(e, name))
+        }),
+        Node::SwitchBlock(b) => {
+            expr_references_implicit(&b.expression, name)
+                || b.groups.iter().any(|g| {
+                    g.cases.iter().any(|c| {
+                        c.expression
+                            .as_ref()
+                            .is_some_and(|e| expr_references_implicit(e, name))
+                    })
+                })
+        }
+        Node::ForLoopBlock(b) => {
+            expr_references_implicit(&b.expression.ast, name)
+                || b.track_by.as_ref().is_some_and(|t| expr_references_implicit(&t.ast, name))
+        }
+        _ => false,
+    }
+}
+
+/// Whether the top level of `children` declares a `@let` named `name` (used for shadowing
+/// detection: a view that re-declares the name does not consume the outer one).
+fn declares_let_at_top(children: &[Node], name: &str) -> bool {
+    children
+        .iter()
+        .any(|n| matches!(n, Node::LetDeclaration(l) if l.name == name))
+}
+
+/// Whether a `@let` value expression uses a pipe (`exp | name`). Angular keeps the `ɵɵdeclareLet`
+/// TNode for a non-external let when its value contains a pipe (the pipe needs the slot for DI).
+fn let_value_has_pipe(node: &AstNode) -> bool {
+    use AstExprKind as EK;
+    match &node.kind {
+        EK::BindingPipe { .. } => true,
+        EK::EmptyExpr
+        | EK::ImplicitReceiver
+        | EK::ThisReceiver
+        | EK::LiteralPrimitive { .. }
+        | EK::TemplateLiteralElement { .. }
+        | EK::RegularExpressionLiteral { .. } => false,
+        EK::Chain { expressions }
+        | EK::LiteralArray { expressions }
+        | EK::Interpolation { expressions, .. } => expressions.iter().any(let_value_has_pipe),
+        EK::Conditional { condition, true_exp, false_exp } => {
+            let_value_has_pipe(condition) || let_value_has_pipe(true_exp) || let_value_has_pipe(false_exp)
+        }
+        EK::PropertyRead { receiver, .. } | EK::SafePropertyRead { receiver, .. } => {
+            let_value_has_pipe(receiver)
+        }
+        EK::KeyedRead { receiver, key } | EK::SafeKeyedRead { receiver, key } => {
+            let_value_has_pipe(receiver) || let_value_has_pipe(key)
+        }
+        EK::SpreadElement { expression }
+        | EK::PrefixNot { expression }
+        | EK::TypeofExpression { expression }
+        | EK::VoidExpression { expression }
+        | EK::NonNullAssert { expression }
+        | EK::ParenthesizedExpression { expression } => let_value_has_pipe(expression),
+        EK::LiteralMap { values, .. } => values.iter().any(let_value_has_pipe),
+        EK::Binary { left, right, .. } => let_value_has_pipe(left) || let_value_has_pipe(right),
+        EK::Unary { expr, .. } => let_value_has_pipe(expr),
+        EK::Call { receiver, args, .. } | EK::SafeCall { receiver, args, .. } => {
+            let_value_has_pipe(receiver) || args.iter().any(let_value_has_pipe)
+        }
+        EK::TaggedTemplateLiteral { tag, template } => {
+            let_value_has_pipe(tag) || let_value_has_pipe(template)
+        }
+        EK::TemplateLiteral { expressions, .. } => expressions.iter().any(let_value_has_pipe),
+        EK::ArrowFunction { body, .. } => let_value_has_pipe(body),
     }
 }
 
@@ -2887,7 +3392,7 @@ mod tests {
     }
 
     #[test]
-    fn let_declaration_emits_declare_let_and_store_let() {
+    fn in_view_let_declaration_inlines_as_const_without_slot() {
         use crate::expression::ast::LiteralValue as ELit;
         use crate::template::r3_ast::LetDeclaration;
 
@@ -2919,18 +3424,20 @@ mod tests {
         let func = builder.build_template_function(&input);
         let out = emit_expression(&func);
 
-        // Creation: `ɵɵdeclareLet(0)` for the `@let` (slot 0), then the text placeholder.
-        assert!(out.contains("\u{0275}\u{0275}declareLet"), "got: {out}");
-        // Update: `const x_r1 = ɵɵstoreLet(1)`, capturing the value in the generated local.
-        assert!(out.contains("\u{0275}\u{0275}storeLet"), "got: {out}");
-        assert!(out.contains("x_r1"), "got: {out}");
-        // The interpolation reads the stored let local, NOT `ctx.x`.
+        // A `@let` read only within its own view is NOT external: `optimizeStoreLet` drops the
+        // `ɵɵstoreLet` wrapper and `ɵɵdeclareLet` op entirely, so the value inlines as a plain
+        // `const x_r1 = 1;` in the update block (Angular `simple_let` golden).
+        assert!(!out.contains("\u{0275}\u{0275}declareLet"), "got: {out}");
+        assert!(!out.contains("\u{0275}\u{0275}storeLet"), "got: {out}");
+        assert!(out.contains("const x_r1 = 1"), "got: {out}");
+        // The interpolation reads the inlined let local, NOT `ctx.x`.
         assert!(out.contains("\u{0275}\u{0275}textInterpolate"), "got: {out}");
+        assert!(out.contains("x_r1"), "got: {out}");
         assert!(!out.contains("ctx.x"), "got: {out}");
-        // The `@let` consumes a data slot (`declareLet`) plus the text node = 2 decls; it reserves
-        // one binding (var) slot for the `storeLet`, and the interpolation reserves one more = 2 vars.
-        assert_eq!(builder.data_index(), 2, "decls: {out}");
-        assert_eq!(builder.vars(), 2, "vars: {out}");
+        // No `ɵɵdeclareLet` slot and no `ɵɵstoreLet` var: only the text node (1 decl) and the
+        // interpolation (1 var) remain.
+        assert_eq!(builder.data_index(), 1, "decls: {out}");
+        assert_eq!(builder.vars(), 1, "vars: {out}");
     }
 
     /// `{{ x | name:args }}` as a `BoundText` interpolation node (strings `["",""]`, one expression

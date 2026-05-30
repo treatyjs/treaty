@@ -1277,9 +1277,18 @@ fn map_query_metadata(queries: &[R3QueryMetadata]) -> Vec<crate::view::queries::
 fn base_directive_fields<H: HostBindingsBuilder>(
     meta: &R3DirectiveMetadata,
     host_builder: &mut H,
+    default_selector: Option<&str>,
 ) -> DefinitionMap {
     let mut definition_map = DefinitionMap::new();
-    let selectors = parse_selector_to_r3_selector(meta.selector.as_deref());
+    // Mirror `extractDirectiveMetadata` (compiler-cli directive/shared.ts): the resolved selector
+    // falls back to `defaultSelector` when it is absent or an empty string. Components pass
+    // `getDefaultComponentElementName()` ("ng-component"); directives pass `None`. This is what
+    // produces the synthetic `selectors: [["ng-component"]]` for a selector-less @Component.
+    let selector = match meta.selector.as_deref() {
+        Some(s) if !s.is_empty() => Some(s),
+        _ => default_selector,
+    };
+    let selectors = parse_selector_to_r3_selector(selector);
 
     // e.g. `type: MyDirective`.
     definition_map.set("type", Some(meta.ty.value.clone()));
@@ -1324,7 +1333,7 @@ fn base_directive_fields<H: HostBindingsBuilder>(
     let mut host = meta.host.clone();
     let host_bindings = host_builder.build(
         &mut host,
-        meta.selector.as_deref().unwrap_or(""),
+        selector.unwrap_or(""),
         &meta.name,
         meta.legacy_optional_chaining,
         &mut definition_map,
@@ -1433,7 +1442,7 @@ pub fn compile_directive_from_metadata<H: HostBindingsBuilder>(
     meta: &R3DirectiveMetadata,
     host_builder: &mut H,
 ) -> R3CompiledExpression {
-    let mut definition_map = base_directive_fields(meta, host_builder);
+    let mut definition_map = base_directive_fields(meta, host_builder, None);
     add_features(&mut definition_map, meta, None, None);
     let expression = import_r3(R3::DefineDirective)
         // `.callFn([map], undefined, /*pure*/ true)`.
@@ -1466,7 +1475,9 @@ where
     T: TemplateBuilder,
     H: HostBindingsBuilder,
 {
-    let mut definition_map = base_directive_fields(&meta.base, host_builder);
+    // Components fall back to the default element name (`ng-component`) when they have no selector,
+    // matching `getDefaultComponentElementName()` plumbed through `extractDirectiveMetadata`.
+    let mut definition_map = base_directive_fields(&meta.base, host_builder, Some("ng-component"));
     add_features(
         &mut definition_map,
         &meta.base,

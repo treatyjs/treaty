@@ -8,3 +8,4 @@ edition = "2024"
 # temporal_rs 0.1.2; temporal-off leaves ungated Temporal intrinsic refs), so track git main,
 # which keeps itself compiling.
 nova_vm = { git = "https://github.com/trynova/nova", rev = "bece61ac" }
+serde_json = "1.0.150"

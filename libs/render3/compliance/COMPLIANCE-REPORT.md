@@ -14,11 +14,11 @@ This harness runs Treaty's Rust/OXC Angular compiler (`render3` crate, via the
 | --- | --- |
 | Total compliance cases | 642 |
 | Compiled (runnable) | 98 |
-| PASS | 6 |
-| DIFF | 92 |
+| PASS | 14 |
+| DIFF | 84 |
 | Skipped (un-runnable) | 544 |
-| **Pass-rate (of runnable subset)** | **6.1%** (6/98) |
-| Pass-rate (of full corpus) | 0.9% (6/642) |
+| **Pass-rate (of runnable subset)** | **14.3%** (14/98) |
+| Pass-rate (of full corpus) | 2.2% (14/642) |
 
 ### How a case is run and matched
 
@@ -43,54 +43,55 @@ from our output. Top entry = implement first to raise the score.
 
 | Count | Category (instruction / shape at first missing fragment) |
 | --- | --- |
-| 21 | `ɵɵtext` |
-| 16 | `misc-shape` |
-| 10 | `ɵɵdomElementStart` |
+| 20 | `ɵɵtext` |
+| 9 | `misc-shape` |
 | 9 | `ɵɵdeclareLet` |
+| 9 | `ɵɵdomElementStart` |
 | 7 | `ɵɵelement` |
-| 5 | `def-header-counts` |
 | 4 | `ɵɵconditionalCreate` |
 | 3 | `ɵɵelementStart` |
+| 3 | `ɵɵgetCurrentView` |
 | 3 | `ɵɵi18nPostprocess` |
+| 3 | `nested-fn-shape` |
 | 3 | `ɵɵprojectionDef` |
-| 2 | `ɵɵgetCurrentView` |
 | 2 | `ɵɵrepeaterCreate` |
+| 2 | `ɵɵadvance` |
 | 2 | `ɵɵdomTemplate` |
 | 2 | `ɵɵtemplate` |
 | 1 | `ɵɵcontentQuerySignal` |
-| 1 | `nested-fn-shape` |
+| 1 | `ɵɵreference` |
 | 1 | `ɵɵforeignComponent` |
 
 ### Sample diverging cases
 
-- **`ɵɵtext`** (21):
+- **`ɵɵtext`** (20):
+  - r3_view_compiler_listener/should not generate restore/reset view when listener does not use @let in the same scope
+    - near: `onstID=123;ɵɵadvance();ɵɵtextInter`
   - r3_view_compiler_let/should create a simple @let declaration
-    - near: `cls:1,vars:1,template:functionMyAp`
+    - near: `onstID=ctx.value*2;ɵɵtextInterpola`
   - r3_view_compiler_let/should create multiple @let declarations that depend on each other
-    - near: `cls:1,vars:1,template:functionMyAp`
-  - r3_view_compiler_let/should remove a single unused let declaration
-    - near: `cls:2,vars:2,template:functionMyAp`
-- **`misc-shape`** (16):
-  - r3_view_compiler_styling/style_bindings/should assign a sanitizer instance to the element style allocation instruction if any url-based properties are detected
-    - near: `on:2})`
-  - r3_view_compiler_styling/component_styles/should pass in the component metadata styles into the component definition but skip shimming when style encapsulation is set to shadow dom
-    - near: `on:3})`
+    - near: `onstID=ctx.value+1;constID=ID+1;co`
+- **`misc-shape`** (9):
   - r3_view_compiler_styling/component_animations/should pass in the component metadata animations into the component definition
     - near: `(rf,ID){},encapsulation:2,data:{an`
-- **`ɵɵdomElementStart`** (10):
-  - r3_view_compiler_listener/should not generate restore/reset view when listener does not use @let in the same scope
-    - near: `cls:2,vars:1,consts:[[3,"click"]],`
-  - r3_view_compiler_let/should handle an @let used only directly inside i18n
-    - near: `sts:()=>{letID;if(typeofngI18nClos`
-  - r3_view_compiler_let/should handle an @let referenced inside a child view inside i18n
-    - near: `cls:4,vars:1,consts:()=>{letID;if(`
+  - r3_view_compiler_styling/component_animations/should include animations even if the provided array is empty
+    - near: `(rf,ID){},encapsulation:2,data:{an`
+  - r3_view_compiler_styling/chaining/should chain classProp instruction calls
+    - near: `(rf,ID){`
 - **`ɵɵdeclareLet`** (9):
   - r3_view_compiler_let/should create a let using a pipe
-    - near: `cls:3,vars:3,template:functionMyAp`
+    - near: `ipe(1,"double");ɵɵtext(2);}if(rf&2`
   - r3_view_compiler_let/should share let declarations between parent and child views
     - near: `tx){if(rf&1){ɵɵdeclareLet(0);ɵɵtex`
   - r3_view_compiler_let/should be able to use let declarations in event listeners inside child views
     - near: `tx){if(rf&1){ɵɵdeclareLet(0);ɵɵdom`
+- **`ɵɵdomElementStart`** (9):
+  - r3_view_compiler_let/should handle an @let used only directly inside i18n
+    - near: `sts:()=>{letID;if(typeofngI18nClos`
+  - r3_view_compiler_let/should handle an @let referenced inside a child view inside i18n
+    - near: `cls:4,vars:1,consts:()=>{letID;if(`
+  - r3_view_compiler_let/should handle an @let preceded by an element with i18n
+    - near: `sts:()=>{letID;if(typeofngI18nClos`
 - **`ɵɵelement`** (7):
   - r3_view_compiler_styling/style_bindings/should place initial, multi, singular and application followed by attribute style instructions in the template code in that order
     - near: `ars:7,consts:[[AM,"opacity","1"]],`
@@ -98,18 +99,11 @@ from our output. Top entry = implement first to raise the score.
     - near: `ars:3,template:functionMyComponent`
   - r3_view_compiler_styling/class_bindings/should place initial, multi, singular and application followed by attribute class instructions in the template code in that order
     - near: `ars:7,consts:[[AM,"grape"]],templa`
-- **`def-header-counts`** (5):
-  - r3_view_compiler_let/should be able to use local references in let declarations
-    - near: `cls:5,vars:1,`
-  - r3_view_compiler_let/should be able to use forward references defined after the let declaration
-    - near: `cls:3,vars:1,`
-  - r3_view_compiler_let/should not remove let declarations that are only used in an event listener
-    - near: `cls:4,vars:3,`
 - **`ɵɵconditionalCreate`** (4):
   - r3_view_compiler_let/should be able to use let declarations in child views
-    - near: `tx){if(rf&1){ɵɵconditionalCreate(0`
+    - near: `cls:2,vars:2,template:functionMyAp`
   - r3_view_compiler_let/should give precedence to local @let definition over one from a parent view
-    - near: `cls:1,vars:1,template:functionMyAp`
+    - near: `tx){if(rf&1){ɵɵconditionalCreate(0`
   - r3_view_compiler_arrow_functions/should handle arrow function with optional reads in nested views
     - near: `tx){if(rf&1){ɵɵconditionalCreate(0`
 - **`ɵɵelementStart`** (3):
@@ -119,6 +113,13 @@ from our output. Top entry = implement first to raise the score.
     - near: `sts:()=>{leti18n_0;if(typeofngI18n`
   - r3_view_compiler_i18n/blocks/should support @defer blocks
     - near: `sts:()=>{leti18n_0;if(typeofngI18n`
+- **`ɵɵgetCurrentView`** (3):
+  - r3_view_compiler_listener/local refs in listeners defined before the local refs
+    - near: `s:[["user",""],[AM,"click"]],templ`
+  - r3_view_compiler_let/should be able to use let declarations in event listeners
+    - near: `onstID=ɵɵgetCurrentView();ɵɵdeclar`
+  - r3_view_compiler_let/should not remove let declarations that are only used in an event listener
+    - near: `&1){constID=ɵɵgetCurrentView();ɵɵt`
 - **`ɵɵi18nPostprocess`** (3):
   - r3_view_compiler_let/should handle an @let referenced inside i18n and in a child view
     - near: `cls:4,vars:2,consts:()=>{letID;if(`
@@ -126,23 +127,30 @@ from our output. Top entry = implement first to raise the score.
     - near: `sts:()=>{leti18n_0;if(typeofngI18n`
   - r3_view_compiler_i18n/blocks/should support @switch blocks
     - near: `sts:()=>{leti18n_0;if(typeofngI18n`
+- **`nested-fn-shape`** (3):
+  - r3_compiler_compliance/components_and_directives/value_composition/should support spread elements in array literals
+    - near: `ars:17,template:functionArrayComp_`
+  - r3_compiler_compliance/components_and_directives/value_composition/should support object literals with spread assignments
+    - near: `ars:19,template:functionObjectComp`
+  - r3_compiler_compliance/components_and_directives/value_composition/should support rest arguments in a function call
+    - near: `ars:7,template:functionTestComp_Te`
 - **`ɵɵprojectionDef`** (3):
   - r3_compiler_compliance/components_and_directives/content_projection/should support multi-slot content projection with multiple wildcard slots
-    - near: `({,selectors:[["ng-component"]],st`
+    - near: `ors:ID,decls:3,vars:0,template:fun`
   - r3_compiler_compliance/components_and_directives/content_projection/should capture the node name of ng-content with a structural directive
     - near: `ors:ID,decls:1,vars:1,consts:[[AM,`
   - r3_compiler_compliance/components_and_directives/content_projection/should support fallback content in ng-content
     - near: `ors:ID,decls:7,vars:2,consts:[[4,"`
-- **`ɵɵgetCurrentView`** (2):
-  - r3_view_compiler_listener/local refs in listeners defined before the local refs
-    - near: `s:[["user",""],[AM,"click"]],templ`
-  - r3_view_compiler_let/should be able to use let declarations in event listeners
-    - near: `&1){constID=ɵɵgetCurrentView();ɵɵd`
 - **`ɵɵrepeaterCreate`** (2):
   - r3_view_compiler_let/should be able to use for loop variables in let declarations
     - near: `tx){if(rf&1){ɵɵrepeaterCreate(0,My`
   - r3_view_compiler_arrow_functions/should handle arrow function using loop variables
     - near: `tx){if(rf&1){ɵɵrepeaterCreate(0,Te`
+- **`ɵɵadvance`** (2):
+  - r3_view_compiler_let/should remove a chain of unused let declarations
+    - near: `onstID=ctx.value+1;constID=ID+1;co`
+  - r3_view_compiler_let/should remove only the unused let declarations from the middle of a chain of declarations
+    - near: `onstID=ctx.value+1;constID=ID+1;co`
 - **`ɵɵdomTemplate`** (2):
   - r3_view_compiler_deferred/should generate a deferred block with placeholder block parameters
     - near: `s:[[2000],["src","placeholder.gif"`
@@ -155,10 +163,10 @@ from our output. Top entry = implement first to raise the score.
     - near: `ars:1,consts:[["ngProjectAs",".som`
 - **`ɵɵcontentQuerySignal`** (1):
   - signal_queries/should generate signal based query instructions for a component
-    - near: `contentQueries:functionTestComp`
-- **`nested-fn-shape`** (1):
-  - r3_compiler_compliance/components_and_directives/value_composition/should support rest arguments in a function call
-    - near: `ars:7,template:functionTestComp_Te`
+    - near: `contentQueries:functionTestComp_`
+- **`ɵɵreference`** (1):
+  - r3_view_compiler_let/should be able to use forward references defined after the let declaration
+    - near: `onstID=ɵɵreference(2);constID="Hel`
 - **`ɵɵforeignComponent`** (1):
   - r3_compiler_compliance/components_and_directives/standalone/should properly compile foreign component imports in a standalone component
     - near: `ars:0,template:functionTestCmp_Tem`
@@ -180,11 +188,19 @@ error-expectation cases).
 
 ## Passing cases
 
-6 runnable compliance cases match Angular's golden `ɵɵdefineComponent` block:
+14 runnable compliance cases match Angular's golden `ɵɵdefineComponent` block:
 
 - model_inputs/should capture input/output pair in a component definition
 - output_function/should generate an output mapping for the component
 - r3_compiler_compliance/components_and_directives/value_composition/should convert #my-app selector to ["", "id", "my-app"]
+- r3_compiler_compliance/components_and_directives/value_composition/should not treat ElementRef, ViewContainerRef, or ChangeDetectorRef specially when injecting
+- r3_compiler_compliance/components_and_directives/value_composition/should support dollar escape in template
+- r3_compiler_compliance/elements/should bind to class and style names
+- r3_view_compiler/animations/should not generate animate leave when using 'animate' as a binding prefix
 - r3_view_compiler_input_outputs/should declare inputs/outputs on a component
+- r3_view_compiler_let/should remove a single unused let declaration
+- r3_view_compiler_providers/should not emit the ProvidersFeature feature when no providers
 - r3_view_compiler_styling/class_bindings/should handle bindings to classes with special characters in a template
+- r3_view_compiler_styling/component_styles/should pass in the component metadata styles into the component definition but skip shimming when style encapsulation is set to shadow dom
+- r3_view_compiler_styling/style_bindings/should assign a sanitizer instance to the element style allocation instruction if any url-based properties are detected
 - signal_inputs/should capture signal based input flag in component definition

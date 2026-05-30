@@ -558,8 +558,10 @@ fn compile_program(program: &Program) -> CompiledComponent {
         .map(|e| matches!(e, Expression::BooleanLiteral(b) if b.value))
         .unwrap_or(true);
 
-    // changeDetection (OnPush vs Default; default OnPush keeps output minimal, matching
-    // `crate::compile::compile_component`).
+    // changeDetection (OnPush vs Default). Angular's runtime default is `Default`, which is
+    // OMITTED from the emitted definition; an explicit `OnPush` emits `changeDetection: 0`.
+    // So when the source `@Component` has no `changeDetection` property we default to `Default`
+    // (omitted) — matching the golden — and only emit `OnPush` when explicitly requested.
     let change_detection = obj
         .and_then(|o| find_prop(o, "changeDetection"))
         .and_then(|e| match e {
@@ -567,10 +569,10 @@ fn compile_program(program: &Program) -> CompiledComponent {
             _ => None,
         })
         .map(|name| match name {
-            "Default" => ChangeDetectionStrategy::Default,
-            _ => ChangeDetectionStrategy::OnPush,
+            "OnPush" => ChangeDetectionStrategy::OnPush,
+            _ => ChangeDetectionStrategy::Default,
         })
-        .unwrap_or(ChangeDetectionStrategy::OnPush);
+        .unwrap_or(ChangeDetectionStrategy::Default);
 
     // styles: ['...', ...] — inline component styles. Threaded into the definition `styles:[...]`
     // array (and, for emulated encapsulation, scoped) by the emitter.

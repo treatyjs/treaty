@@ -401,7 +401,16 @@ impl<'b> HtmlAstToIvyAst<'b> {
 
         let mut parsed_element: t::Node = if preparsed.kind == PreparsedElementType::NgContent {
             let selector = preparsed.select_attr.clone();
-            let attrs: Vec<t::TextAttribute> = element.attrs.iter().map(visit_attribute).collect();
+            // The `select` attribute is consumed into the projection slot's selector (and the
+            // component-level `ngContentSelectors`); it is NOT a static TNode attribute. Angular's
+            // TDB `visitContent` reserves it (`NG_CONTENT_SELECT_ATTR`) rather than serializing it
+            // into the projection's const-pool attrs array, so it must be dropped here.
+            let attrs: Vec<t::TextAttribute> = element
+                .attrs
+                .iter()
+                .filter(|a| !a.name.eq_ignore_ascii_case("select"))
+                .map(visit_attribute)
+                .collect();
             self.ng_content_selectors.push(selector.clone());
             t::Node::Content(t::Content {
                 selector,
