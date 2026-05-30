@@ -246,6 +246,8 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
-const { sum } = nativeBinding
+const { compileComponent, compileTreatyFile, compileComponentSource } = nativeBinding
 
-module.exports.sum = sum
+module.exports.compileComponent = compileComponent
+module.exports.compileTreatyFile = compileTreatyFile
+module.exports.compileComponentSource = compileComponentSource

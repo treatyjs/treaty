@@ -91,6 +91,176 @@ fn class_ref(class_name: &str) -> R3Reference {
     }
 }
 
+/// Convert a kebab-case / camelCase element tag (`<foo-bar>`, `<fooBar>`) to its PascalCase class
+/// name (`FooBar`), so a selectorless usage written with the HTML-friendly tag spelling can be
+/// matched back to an imported class identifier. A tag that is already PascalCase round-trips
+/// unchanged.
+fn tag_to_pascal_case(tag: &str) -> String {
+    let mut out = String::with_capacity(tag.len());
+    let mut new_word = true;
+    for ch in tag.chars() {
+        if ch == '-' || ch == '_' {
+            new_word = true;
+            continue;
+        }
+        if new_word && ch.is_ascii_alphabetic() {
+            out.extend(ch.to_ascii_uppercase().to_string().chars());
+            new_word = false;
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// Parse a template HTML string into r3_ast nodes with SELECTORLESS tokenization enabled, so
+/// `<Foo>` / `@Foo` usages surface as real [`crate::template::r3_ast::Node::Component`] /
+/// `Node::Directive` nodes (rather than plain elements). Used purely to drive auto-import
+/// dependency resolution via the selectorless binder; the main template-instruction pipeline keeps
+/// its own non-selectorless parse so its emitted instruction stream is unchanged.
+pub fn parse_template_selectorless(template_html: &str) -> Vec<crate::template::r3_ast::Node> {
+    let options = crate::ml_parser::TokenizeOptions {
+        tokenize_expansion_forms: true,
+        selectorless_enabled: true,
+        ..crate::ml_parser::TokenizeOptions::default()
+    };
+    let parse_result =
+        crate::ml_parser::HtmlParser::parse(template_html, "template.html", &options);
+    let mut binding_parser = BindingParser::new();
+    let r3 = html_ast_to_render3_ast(
+        &parse_result.root_nodes,
+        &mut binding_parser,
+        Render3ParseOptions::default(),
+    );
+    r3.nodes
+}
+
+/// AUTO-IMPORT (import-less / selectorless authoring): resolve the component's template
+/// dependencies *from template usage* instead of a manual `imports`/`declarations` array.
+///
+/// Given the set of identifiers the author imported (and any local component class names), this
+/// registers each candidate name in a selectorless [`crate::binder::SelectorlessMatcher`], binds
+/// the template through [`crate::binder::R3TargetBinder`], and returns one
+/// [`R3TemplateDependencyMetadata`] (`kind: Directive`, `type: <Foo>`) per candidate that the
+/// binder actually matched against a `<Foo>` / `@Foo` selectorless node in the template.
+///
+/// A `<foo>` / `<foo-bar>` element written with the kebab/camel spelling of an imported class is
+/// also matched, by PascalCase-folding element tags before consulting the candidate set; such an
+/// element does not parse as a selectorless `Component` node, so it is resolved here directly.
+///
+/// Imports that are never referenced in the template are NOT emitted — this is the whole point of
+/// the model: `dependencies` reflects real template usage, mirroring how the REPL's
+/// `treat-to-ivy.ts` only added *used* imports to `dependencies`, but here via the AST + binder
+/// rather than regex.
+pub fn resolve_template_dependencies(
+    candidate_names: &[String],
+    nodes: &[crate::template::r3_ast::Node],
+) -> Vec<R3TemplateDependencyMetadata> {
+    use crate::binder::{
+        DirectiveMatcher, DirectiveMeta, R3TargetBinder, SelectorlessMatcher, Target,
+    };
+
+    if candidate_names.is_empty() {
+        return Vec::new();
+    }
+
+    // The candidate set, deduplicated while preserving first-seen order (drives emission order).
+    let mut ordered: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for name in candidate_names {
+        if seen.insert(name.clone()) {
+            ordered.push(name.clone());
+        }
+    }
+
+    // Register every candidate class name in the selectorless matcher (the Angular 22 keystone:
+    // a `<Foo>` node matches an imported symbol iff their class names are equal).
+    let mut matcher = SelectorlessMatcher::<DirectiveMeta>::new();
+    for name in &ordered {
+        matcher.add(name.clone(), DirectiveMeta::new(name.clone(), None, true));
+    }
+
+    let binder = R3TargetBinder::new(Some(DirectiveMatcher::Selectorless(matcher)));
+    let bound = binder.bind(Target {
+        template: Some(nodes),
+        host: None,
+    });
+
+    // Class names the binder matched against `<Foo>` / `@Foo` selectorless nodes.
+    let mut used: std::collections::HashSet<String> = bound
+        .get_used_directives()
+        .into_iter()
+        .map(|d| d.name)
+        .collect();
+
+    // `<foo>` / `<foo-bar>` elements: PascalCase-fold each element tag and treat a hit against the
+    // candidate set as a usage (these parse as `Element`, not selectorless `Component`, nodes).
+    let candidate_set: std::collections::HashSet<&str> =
+        ordered.iter().map(String::as_str).collect();
+    collect_element_tag_usages(nodes, &candidate_set, &mut used);
+
+    // Emit one dependency per matched candidate, in candidate (import) order.
+    ordered
+        .into_iter()
+        .filter(|name| used.contains(name))
+        .map(|name| R3TemplateDependencyMetadata {
+            kind: crate::view::compiler::R3TemplateDependencyKind::Directive,
+            ty: o::variable(name, None),
+        })
+        .collect()
+}
+
+/// Walk the template tree and record any `Element` whose tag — once PascalCase-folded — is in the
+/// candidate class-name set. Mirrors the selectorless match for kebab/camel-spelled usages.
+fn collect_element_tag_usages(
+    nodes: &[crate::template::r3_ast::Node],
+    candidates: &std::collections::HashSet<&str>,
+    used: &mut std::collections::HashSet<String>,
+) {
+    use crate::template::r3_ast::Node;
+    for node in nodes {
+        match node {
+            Node::Element(el) => {
+                let pascal = tag_to_pascal_case(&el.name);
+                if candidates.contains(pascal.as_str()) {
+                    used.insert(pascal);
+                }
+                collect_element_tag_usages(&el.children, candidates, used);
+            }
+            Node::Component(c) => collect_element_tag_usages(&c.children, candidates, used),
+            Node::Template(t) => collect_element_tag_usages(&t.children, candidates, used),
+            Node::Content(c) => collect_element_tag_usages(&c.children, candidates, used),
+            Node::DeferredBlock(b) => collect_element_tag_usages(&b.children, candidates, used),
+            Node::DeferredBlockPlaceholder(b) => {
+                collect_element_tag_usages(&b.children, candidates, used)
+            }
+            Node::DeferredBlockLoading(b) => {
+                collect_element_tag_usages(&b.children, candidates, used)
+            }
+            Node::DeferredBlockError(b) => {
+                collect_element_tag_usages(&b.children, candidates, used)
+            }
+            Node::SwitchBlock(b) => {
+                for g in &b.groups {
+                    collect_element_tag_usages(&g.children, candidates, used);
+                }
+            }
+            Node::ForLoopBlock(b) => {
+                collect_element_tag_usages(&b.children, candidates, used);
+                if let Some(empty) = &b.empty {
+                    collect_element_tag_usages(&empty.children, candidates, used);
+                }
+            }
+            Node::IfBlock(b) => {
+                for branch in &b.branches {
+                    collect_element_tag_usages(&branch.children, candidates, used);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Build a minimal-but-faithful [`R3DirectiveMetadata`] base for a standalone component.
 fn base_metadata(selector: &str, class_name: &str) -> R3DirectiveMetadata {
     R3DirectiveMetadata {

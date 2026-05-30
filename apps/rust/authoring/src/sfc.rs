@@ -208,6 +208,43 @@ fn extract_io(
     }
 }
 
+/// Collect the JS chunk's imported identifier names — the auto-import candidate set. Mirrors
+/// `extractImportStrings` in `treat-to-ivy.ts`, but over the AST: every default, namespace and
+/// named binding introduced by an `import` declaration. A parse failure yields no candidates.
+fn collect_imported_names(javascript: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    if javascript.trim().is_empty() {
+        return names;
+    }
+
+    let allocator = Allocator::default();
+    let source_type = SourceType::default().with_typescript(true);
+    let ret = JsParser::new(&allocator, javascript, source_type).parse();
+
+    for stmt in &ret.program.body {
+        let oxc_ast::ast::Statement::ImportDeclaration(import) = stmt else {
+            continue;
+        };
+        let Some(specifiers) = &import.specifiers else {
+            continue;
+        };
+        for spec in specifiers {
+            match spec {
+                oxc_ast::ast::ImportDeclarationSpecifier::ImportSpecifier(s) => {
+                    names.push(s.local.name.to_string());
+                }
+                oxc_ast::ast::ImportDeclarationSpecifier::ImportDefaultSpecifier(s) => {
+                    names.push(s.local.name.to_string());
+                }
+                oxc_ast::ast::ImportDeclarationSpecifier::ImportNamespaceSpecifier(s) => {
+                    names.push(s.local.name.to_string());
+                }
+            }
+        }
+    }
+    names
+}
+
 /// Pieces extracted from the component-body JS chunk for module assembly.
 ///
 /// Mirrors `createWrapper`/`extractImportStrings`/`removeImportsFromCode` in
@@ -374,6 +411,16 @@ pub fn compile_treaty_file(source: &str, file_name: &str) -> CompiledComponent {
         errors.push(e.msg.clone());
     }
 
+    // 2b. AUTO-IMPORT: resolve template dependencies from usage. The candidate set is the JS
+    // chunk's imported identifiers; those actually referenced as `<Foo>` / `@Foo` / `<foo>` in the
+    // template (via the selectorless binder) become the component's `dependencies`. Unused imports
+    // are not emitted — mirroring `treat-to-ivy.ts`, but via the AST + binder rather than regex.
+    let candidates = collect_imported_names(&javascript);
+    let selectorless_nodes = render3::compile::parse_template_selectorless(&template_html);
+    let declarations =
+        render3::compile::resolve_template_dependencies(&candidates, &selectorless_nodes);
+    let has_directive_dependencies = !declarations.is_empty();
+
     // 3. Standalone, selectorless component metadata.
     let base = R3DirectiveMetadata {
         name: class_name.clone(),
@@ -406,7 +453,7 @@ pub fn compile_treaty_file(source: &str, file_name: &str) -> CompiledComponent {
             ng_content_selectors: r3.ng_content_selectors,
             preserve_whitespaces: None,
         },
-        declarations: Vec::new(),
+        declarations,
         defer: R3ComponentDeferMetadata::PerComponent {
             dependencies_fn: None,
         },
@@ -420,7 +467,7 @@ pub fn compile_treaty_file(source: &str, file_name: &str) -> CompiledComponent {
         i18n_use_external_ids: false,
         change_detection: Some(ChangeDetection::Strategy(ChangeDetectionStrategy::OnPush)),
         relative_template_path: None,
-        has_directive_dependencies: false,
+        has_directive_dependencies,
         raw_imports: None,
         foreign_imports: None,
     };
@@ -599,6 +646,45 @@ console.log('hi')\n";
         assert!(code.contains("ctx.name"), "template did not bind ctx.name; got: {code}");
         assert!(body.contains("console.log('hi')"), "trailing JS missing from body; got: {code}");
         assert!(code.contains("styles"), "no styles emitted; got: {code}");
+    }
+
+    #[test]
+    fn auto_imports_used_component_into_dependencies() {
+        // The author imports `Foo` and uses `<Foo>` in the template, with NO manual imports array.
+        // `Foo` must land in the emitted `dependencies`; the unused `Bar` import must NOT.
+        let source = "import { Foo } from './foo';\n\
+import { Bar } from './bar';\n\
+<div><Foo></Foo></div>";
+        let out = compile_treaty_file(source, "host.treaty");
+
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+
+        assert!(code.contains(DEFINE), "no defineComponent; got: {code}");
+        assert!(code.contains("dependencies"), "no dependencies array; got: {code}");
+        // The dependencies array references Foo (the used import).
+        assert!(
+            code.contains("dependencies: [Foo]") || code.contains("dependencies:[Foo]"),
+            "Foo not in dependencies array; got: {code}"
+        );
+        // Bar is imported verbatim at module top but, being unused, is NOT in dependencies.
+        assert!(
+            !code.contains("[Bar]") && !code.contains("Bar]") && !code.contains("[Foo, Bar"),
+            "unused import Bar leaked into dependencies; got: {code}"
+        );
+    }
+
+    #[test]
+    fn unused_import_not_added_to_dependencies_treaty() {
+        let source = "import { Foo } from './foo';\n<div>hi</div>";
+        let out = compile_treaty_file(source, "host.treaty");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+        assert!(code.contains(DEFINE), "no defineComponent; got: {code}");
+        assert!(
+            !code.contains("dependencies"),
+            "dependencies emitted for an unused import; got: {code}"
+        );
     }
 
     #[test]

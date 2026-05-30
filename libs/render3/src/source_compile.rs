@@ -270,7 +270,38 @@ pub fn compile_component_source(ts_source: &str) -> CompiledComponent {
     compile_program(&ret.program)
 }
 
+/// Collect the file's imported identifier names — the auto-import candidate set. Mirrors
+/// `extractImportStrings` in the REPL's `treat-to-ivy.ts`, but over the AST: every default,
+/// namespace and named binding introduced by an `import` declaration.
+fn collect_imported_names(program: &Program) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for stmt in &program.body {
+        let Statement::ImportDeclaration(import) = stmt else {
+            continue;
+        };
+        let Some(specifiers) = &import.specifiers else {
+            continue;
+        };
+        for spec in specifiers {
+            match spec {
+                oxc_ast::ast::ImportDeclarationSpecifier::ImportSpecifier(s) => {
+                    names.push(s.local.name.to_string());
+                }
+                oxc_ast::ast::ImportDeclarationSpecifier::ImportDefaultSpecifier(s) => {
+                    names.push(s.local.name.to_string());
+                }
+                oxc_ast::ast::ImportDeclarationSpecifier::ImportNamespaceSpecifier(s) => {
+                    names.push(s.local.name.to_string());
+                }
+            }
+        }
+    }
+    names
+}
+
 fn compile_program(program: &Program) -> CompiledComponent {
+    let imported_names = collect_imported_names(program);
+
     // Find all classes (top-level + exported) carrying a recognized decorator.
     let mut decorated: Vec<(&Class, TopLevel, &Decorator)> = Vec::new();
 
@@ -408,9 +439,12 @@ fn compile_program(program: &Program) -> CompiledComponent {
     };
 
     match kind {
-        TopLevel::Component => {
-            compile_component_meta(base, &template_html.unwrap_or_default(), change_detection)
-        }
+        TopLevel::Component => compile_component_meta(
+            base,
+            &template_html.unwrap_or_default(),
+            change_detection,
+            &imported_names,
+        ),
         // Directives reuse the component emitter is NOT correct — directives go through a
         // different define. Not supported by the existing emitter, so bail clearly.
         TopLevel::Directive => {
@@ -424,6 +458,7 @@ fn compile_component_meta(
     base: R3DirectiveMetadata,
     template_html: &str,
     change_detection: ChangeDetectionStrategy,
+    imported_names: &[String],
 ) -> CompiledComponent {
     let mut errors: Vec<String> = Vec::new();
 
@@ -443,6 +478,15 @@ fn compile_component_meta(
         errors.push(e.msg.clone());
     }
 
+    // AUTO-IMPORT: resolve template dependencies from usage (selectorless binder) — the imported
+    // identifiers actually referenced as `<Foo>` / `@Foo` / `<foo>` in the template become the
+    // component's `dependencies`. Unused imports are not emitted.
+    let candidates: Vec<String> = imported_names.to_vec();
+    let selectorless_nodes = crate::compile::parse_template_selectorless(template_html);
+    let declarations =
+        crate::compile::resolve_template_dependencies(&candidates, &selectorless_nodes);
+    let has_directive_dependencies = !declarations.is_empty();
+
     let mut meta: R3ComponentMetadata<R3TemplateDependencyMetadata> = R3ComponentMetadata {
         base,
         template: ComponentTemplate {
@@ -450,7 +494,7 @@ fn compile_component_meta(
             ng_content_selectors: r3.ng_content_selectors,
             preserve_whitespaces: None,
         },
-        declarations: Vec::new(),
+        declarations,
         defer: R3ComponentDeferMetadata::PerComponent {
             dependencies_fn: None,
         },
@@ -464,7 +508,7 @@ fn compile_component_meta(
         i18n_use_external_ids: false,
         change_detection: Some(ChangeDetection::Strategy(change_detection)),
         relative_template_path: None,
-        has_directive_dependencies: false,
+        has_directive_dependencies,
         raw_imports: None,
         foreign_imports: None,
     };
@@ -534,6 +578,47 @@ mod tests {
         assert!(code.contains("outputs"), "no outputs; got: {code}");
         assert!(code.contains("bar"), "missing output bar; got: {code}");
         assert!(code.contains("baz"), "missing output baz; got: {code}");
+    }
+
+    #[test]
+    fn auto_imports_used_component_into_dependencies() {
+        // The author imports `Foo` and uses `<Foo>` in the template, with NO `imports:` array and
+        // NO selector on Foo. `Foo` must land in the emitted `dependencies` array; the unused
+        // `Bar` import must NOT.
+        let src = r#"
+            import { Foo } from "./foo";
+            import { Bar } from "./bar";
+            @Component({selector:"a",template:"<Foo></Foo>"})
+            export class C {}
+        "#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+        assert!(code.contains(ZWS), "no defineComponent; got: {code}");
+        assert!(code.contains("dependencies"), "no dependencies array; got: {code}");
+        assert!(code.contains("Foo"), "Foo not in dependencies; got: {code}");
+        assert!(
+            !code.contains("Bar"),
+            "unused import Bar leaked into output; got: {code}"
+        );
+    }
+
+    #[test]
+    fn unused_import_not_added_to_dependencies() {
+        // No template usage at all -> no dependencies array emitted.
+        let src = r#"
+            import { Foo } from "./foo";
+            @Component({selector:"a",template:"<div></div>"})
+            export class C {}
+        "#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+        assert!(code.contains(ZWS), "no defineComponent; got: {code}");
+        assert!(
+            !code.contains("dependencies"),
+            "dependencies emitted for an unused import; got: {code}"
+        );
     }
 
     #[test]
