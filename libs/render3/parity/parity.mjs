@@ -340,7 +340,30 @@ function makePrinter() {
     }
     visitBinaryOperatorExpr(ast, context) {
       if (!BINARY_OPERATORS.has(ast.operator)) throw new Error(`Unknown binary operator: ${ng.BinaryOperator[ast.operator]}`);
-      return ast.lhs.visitExpression(this, context) + BINARY_OPERATORS.get(ast.operator) + ast.rhs.visitExpression(this, context);
+      // Operand parenthesization: this printer concatenates operands verbatim and is
+      // PRECEDENCE-BLIND, unlike Angular's real ngtsc emitter (TypeScript's printer) and
+      // the Rust oxc_codegen backend, both of which insert parentheses by JS precedence.
+      // The only place that surfaces is `@switch` lowering, which makes an assignment
+      // (`BinaryOperatorExpr` with the `Assign` operator, e.g. `tmp_0_0 = ctx.k`) the LHS
+      // of a `===` comparison. Assignment binds LOOSER than `===`, so the assignment MUST
+      // be wrapped — `(tmp_0_0 = ctx.k) === 1` — for the comparison's left side to be the
+      // assignment (not `tmp_0_0 = (ctx.k === 1)`, which would be a behavioural change).
+      // Real ngc emits `(tmp_0_0 = ctx.k) === 1`; the Rust emitter does too. Without this
+      // wrap the bare-concatenation printer produced `tmp_0_0=ctx.k===1`, a FALSE diff
+      // caused purely by this harness printer ignoring precedence. Wrap an `Assign`
+      // operand of any non-assignment binary operator to match real emit output.
+      const wrap = (operand) => {
+        const s = operand.visitExpression(this, context);
+        if (
+          operand instanceof ng.BinaryOperatorExpr &&
+          operand.operator === ng.BinaryOperator.Assign &&
+          ast.operator !== ng.BinaryOperator.Assign
+        ) {
+          return `(${s})`;
+        }
+        return s;
+      };
+      return wrap(ast.lhs) + BINARY_OPERATORS.get(ast.operator) + wrap(ast.rhs);
     }
     visitReadPropExpr(ast, context) { return ast.receiver.visitExpression(this, context) + '.' + ast.name; }
     visitReadKeyExpr(ast, context) {
