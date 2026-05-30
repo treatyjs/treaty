@@ -48,12 +48,22 @@ use crate::treaty::ast::AstNode;
 use crate::treaty::lexer::Lexer;
 use crate::treaty::parser::Parser;
 
-/// The three source kinds extracted from a `.treaty` file.
+/// A `<style>` chunk: its raw content plus optional preprocessor language (`lang="scss"`).
+#[derive(Debug)]
+struct StyleChunk {
+    content: String,
+    lang: Option<String>,
+}
+
+/// The source kinds extracted from a `.treaty` file.
 #[derive(Debug, Default)]
 struct TreatyChunks {
     javascript: Vec<String>,
     html: Vec<String>,
-    css: Vec<String>,
+    styles: Vec<StyleChunk>,
+    /// Raw bodies of compile-time `Macro` chunks. Captured but NOT executed (macro execution is a
+    /// later phase); kept out of the JS/template/CSS output so they never break compilation.
+    macros: Vec<String>,
 }
 
 /// Lex + parse `source` and bucket its nodes into JavaScript / HTML / CSS chunks.
@@ -75,7 +85,10 @@ fn split_chunks(source: &str) -> TreatyChunks {
         match node {
             AstNode::JavaScript(code) => chunks.javascript.push(code),
             AstNode::Html(html) => chunks.html.push(html),
-            AstNode::Style(style) => chunks.css.push(style),
+            AstNode::Style { content, lang } => chunks.styles.push(StyleChunk { content, lang }),
+            // A compile-time macro block: capture its raw body for a later execution phase. It is
+            // NOT runtime JS/template/CSS, so it never reaches the component output.
+            AstNode::Macro { content, .. } => chunks.macros.push(content),
             // Top-level interpolation/control-flow markers are not standalone template chunks in
             // the common case (they live inside an HTML chunk); the bare markers carry no body and
             // are ignored here.
@@ -376,15 +389,40 @@ pub fn compile_treaty_file(source: &str, file_name: &str) -> CompiledComponent {
     let class_name = to_pascal_case(file_name);
 
     let template_html = chunks.html.join("");
-    // Match the TS pipeline: strip newlines/tabs from collected CSS.
-    let styles: Vec<String> = chunks
-        .css
-        .iter()
-        .map(|s| s.replace(['\n', '\r', '\t'], ""))
-        .filter(|s| !s.is_empty())
-        .collect();
 
     let mut errors: Vec<String> = Vec::new();
+
+    // Build the component styles. A `<style lang="scss">` / `lang="sass"` chunk is compiled to CSS
+    // with the pure-Rust `grass` sass implementation; plain CSS (no lang) passes through unchanged.
+    // A sass compile error is recorded as a component error (never panics) and that chunk is
+    // dropped. Match the TS pipeline: strip newlines/tabs from the resulting CSS.
+    let mut styles: Vec<String> = Vec::new();
+    for chunk in &chunks.styles {
+        let css = match chunk.lang.as_deref() {
+            Some("scss") | Some("sass") => {
+                // Compressed output matches the rest of the pipeline (no superfluous whitespace),
+                // so `.x { color: $c; }` emits `.x{color:red}`.
+                let options =
+                    grass::Options::default().style(grass::OutputStyle::Compressed);
+                match grass::from_string(chunk.content.clone(), &options) {
+                    Ok(css) => css,
+                    Err(e) => {
+                        errors.push(format!("sass: {e}"));
+                        continue;
+                    }
+                }
+            }
+            _ => chunk.content.clone(),
+        };
+        let css = css.replace(['\n', '\r', '\t'], "");
+        if !css.is_empty() {
+            styles.push(css);
+        }
+    }
+
+    // Macro chunks are captured (raw) for a later execution phase; binding the field here keeps
+    // them explicitly out of the runtime JS/template/CSS output without being silently discarded.
+    let _macros: &[String] = &chunks.macros;
 
     // 0. Extract signal inputs/outputs from the component-body JS chunk.
     let mut inputs: OrderedMap<String, R3InputMetadata> = OrderedMap::new();
@@ -695,5 +733,44 @@ import { Bar } from './bar';\n\
         let code = &out.code;
         assert!(code.contains(DEFINE), "no defineComponent; got: {code}");
         assert!(code.contains("styles"), "no styles emitted; got: {code}");
+    }
+
+    #[test]
+    fn compiles_scss_style_to_css() {
+        // `lang="scss"` styles are compiled by grass before being added to the component styles.
+        // The SCSS variable `$c` resolves to `red`, so the emitted CSS contains `color:red`.
+        let source = "<div>hi</div>\n<style lang=\"scss\"> $c: red; .x { color: $c; }</style>";
+        let out = compile_treaty_file(source, "themed.treaty");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+        assert!(code.contains(DEFINE), "no defineComponent; got: {code}");
+        assert!(code.contains("styles"), "no styles emitted; got: {code}");
+        // Compiled SCSS: variable resolved, newlines stripped → `color:red`.
+        assert!(
+            code.contains("color:red"),
+            "scss did not compile to `color:red`; got: {code}"
+        );
+    }
+
+    #[test]
+    fn captures_macro_block_without_breaking_compilation() {
+        // A top-level fenced macro block is captured (not executed) and must not leak into the
+        // JS body or the template; the component still compiles.
+        let source = "```\nconst x = 1;\n```\nconst name = 'World';\n<div>{{ name }}</div>";
+        let out = compile_treaty_file(source, "withmacro.treaty");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+
+        // Component still compiles.
+        assert!(code.contains(DEFINE), "no defineComponent; got: {code}");
+        assert!(code.contains("function Withmacro() {"), "no fn wrapper; got: {code}");
+        // The macro body is NOT emitted into the module (not treated as JS/template).
+        assert!(
+            !code.contains("const x = 1;"),
+            "macro body leaked into output; got: {code}"
+        );
+        // The real component body and template are intact.
+        assert!(code.contains("const name = 'World';"), "body const missing; got: {code}");
+        assert!(code.contains("ctx.name"), "template did not bind ctx.name; got: {code}");
     }
 }

@@ -3,6 +3,39 @@ import { Observable } from 'rxjs';
 import type { IsUnknown, UnionToIntersect } from './utils/typesafe.js';
 
 /**
+ * Extracts the response payload type `T` from an `ObservableResponse<T>` (i.e.
+ * `Observable<DetailedResponse<T>>`). This is the core end-to-end type-safety primitive used
+ * by the `resources` entry point: given the *return type of a client call*, it recovers the
+ * Elysia route's `200` response type so resources can be typed without any manual annotation.
+ *
+ * @example
+ * type Users = InferResponse<ReturnType<typeof client.users.get>>; // User[]
+ */
+export type InferResponse<T> = T extends Observable<
+  EdenClient.DetailedResponse<infer R>
+>
+  ? R
+  : T extends Observable<infer R>
+  ? R
+  : never;
+
+/**
+ * Extracts the response payload type from a *thunk* returning a client call, e.g.
+ * `() => client.users.get()`. Mirrors how Angular's `resource({ loader })` receives a function.
+ */
+export type InferResponseFromThunk<F> = F extends (
+  ...args: any[]
+) => infer Ret
+  ? InferResponse<Ret>
+  : never;
+
+/**
+ * Unwraps a `Promise<T>` to `T`, otherwise leaves the type untouched. Used by the promise-form
+ * resource helpers.
+ */
+export type Awaited2<T> = T extends Promise<infer R> ? R : T;
+
+/**
  * Represents a list of files, typically obtained from an `<input type="file">` element.
  */
 interface FileList {

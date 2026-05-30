@@ -17,6 +17,10 @@
     "baseUrl": ".",
     "paths": {
       "@treaty/httpclient": ["libs/treaty/edenclient/src/index.ts"],
+      "@treaty/httpclient/client": ["libs/treaty/edenclient/src/client.ts"],
+      "@treaty/httpclient/resources": [
+        "libs/treaty/edenclient/src/resources.ts"
+      ],
       "@treaty/ts-vite": ["libs/typescript/vite/src/index.ts"],
       "@treaty/ts-compiler": ["libs/typescript/compiler/src/index.ts"]
     },

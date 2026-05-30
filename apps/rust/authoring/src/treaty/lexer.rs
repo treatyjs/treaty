@@ -11,6 +11,7 @@ enum LexerState {
     CSS,
     TemplateExpression,
     ControlFlow,
+    Macro,
 }
 
 pub struct Lexer<'a> {
@@ -20,6 +21,9 @@ pub struct Lexer<'a> {
     current_char: Option<char>,
     state: LexerState,
     state_stack: Vec<LexerState>, // Stack to keep track of parent states
+    /// True until the first content token is produced. A ```-fenced macro block is only
+    /// recognized while this holds (the macro block must be at the TOP of the file).
+    at_file_top: bool,
 }
 
 impl<'a> Lexer<'a> {
@@ -33,6 +37,7 @@ impl<'a> Lexer<'a> {
             current_char,
             state: LexerState::Default,
             state_stack: Vec::new(), // Initialize the state stack
+            at_file_top: true,
         }
     }
 
@@ -46,6 +51,7 @@ impl<'a> Lexer<'a> {
             LexerState::CSS => self.parse_style(),
             LexerState::TemplateExpression => self.parse_template_expression(),
             LexerState::ControlFlow => self.parse_control_flow(),
+            LexerState::Macro => self.parse_macro(),
         }
     }
 
@@ -81,9 +87,17 @@ impl<'a> Lexer<'a> {
     fn lex_default_state(&mut self) -> Option<Token> {
         let current_char = self.current_char?;
 
+        // A ```-fenced block at the TOP of the file is a compile-time macro block. This is the only
+        // place a macro is recognized; `at_file_top` is cleared once any other token is produced.
+        if self.at_file_top && current_char == '`' && self.starts_with("```") {
+            self.at_file_top = false;
+            self.push_state(LexerState::Macro);
+            return self.parse_macro();
+        }
+        self.at_file_top = false;
+
         match current_char {
-            '<' if self.starts_with("<style>") => {
-                self.advance_by("<style>".len());
+            '<' if self.starts_with_style_open() => {
                 self.push_state(LexerState::CSS);
                 self.parse_style()
             }
@@ -101,6 +115,19 @@ impl<'a> Lexer<'a> {
                 self.push_state(LexerState::JavaScript);
                 self.parse_javascript()
             }
+        }
+    }
+
+    /// True if the input at the cursor opens a `<style` tag (with or without attributes), i.e.
+    /// `<style>` or `<style ...>`. Used so that `<style lang="scss">` is still recognized as CSS.
+    fn starts_with_style_open(&self) -> bool {
+        let rest = &self.input[self.pos..];
+        if let Some(after) = rest.strip_prefix("<style") {
+            // The next char must be whitespace, `>`, or `/` — otherwise it's e.g. `<styled>`.
+            matches!(after.chars().next(), Some(c) if c.is_whitespace() || c == '>' || c == '/')
+                || after.is_empty()
+        } else {
+            false
         }
     }
 
@@ -128,7 +155,7 @@ impl<'a> Lexer<'a> {
                     self.advance();
                     break;
                 }
-                '<' if (self.starts_with("<style>") || self.starts_with("</")) => break,
+                '<' if (self.starts_with_style_open() || self.starts_with("</")) => break,
                 '{' if self.starts_with("{{") => break,
                 '@' => {
                     // Handle the '@' character and transition to control flow state
@@ -146,8 +173,17 @@ impl<'a> Lexer<'a> {
         Some(Token::new(TokenKind::JavaScript(value), start_pos, end_pos))
     }
 
-    /// Parses a style block.
+    /// Parses a `<style …>…</style>` block.
+    ///
+    /// The cursor is positioned at the opening `<style`. The opening tag (and any attributes) is
+    /// consumed first, capturing an optional `lang="…"` preprocessor language; the CSS body then
+    /// runs up to the closing `</style>`.
     fn parse_style(&mut self) -> Option<Token> {
+        // Consume the opening `<style …>` tag and capture the `lang` attribute, if present.
+        debug_assert!(self.starts_with("<style"));
+        self.advance_by("<style".len());
+        let lang = self.consume_style_open_tag();
+
         let start_pos = self.pos;
 
         while let Some(ch) = self.current_char {
@@ -170,7 +206,95 @@ impl<'a> Lexer<'a> {
         }
 
         self.pop_state(); // Return to the previous state
-        Some(Token::new(TokenKind::Style(value), start_pos, end_pos))
+        Some(Token::new(
+            TokenKind::Style { content: value, lang },
+            start_pos,
+            end_pos,
+        ))
+    }
+
+    /// Consumes the rest of a `<style …>` opening tag (the cursor sits just after `<style`),
+    /// stopping after the closing `>`. Returns the value of a `lang="…"`/`lang='…'` attribute if
+    /// one is present.
+    fn consume_style_open_tag(&mut self) -> Option<String> {
+        let mut lang: Option<String> = None;
+        while let Some(ch) = self.current_char {
+            match ch {
+                '>' => {
+                    self.advance(); // Skip '>'
+                    break;
+                }
+                // Capture `lang="scss"` / `lang='sass'` (with optional whitespace around `=`).
+                'l' | 'L' if self.starts_with_ignore_ascii_case("lang") => {
+                    self.advance_by("lang".len());
+                    self.consume_whitespace();
+                    if self.current_char == Some('=') {
+                        self.advance(); // Skip '='
+                        self.consume_whitespace();
+                        if let Some(q @ ('"' | '\'')) = self.current_char {
+                            self.advance(); // Skip opening quote
+                            let value = self.consume_while(|c| c != q);
+                            if self.current_char == Some(q) {
+                                self.advance(); // Skip closing quote
+                            }
+                            let trimmed = value.trim();
+                            if !trimmed.is_empty() {
+                                lang = Some(trimmed.to_string());
+                            }
+                        }
+                    }
+                }
+                '\'' | '"' | '`' => self.consume_string(ch),
+                _ => self.advance(),
+            }
+        }
+        lang
+    }
+
+    /// Parses a ```-fenced macro block at the top of the file.
+    ///
+    /// The cursor is positioned at the opening ```` ``` ````. The opening fence's info string
+    /// (anything on the rest of that line, e.g. ```` ```rsc ````) is captured as `info`; the raw
+    /// body up to the closing ```` ``` ```` fence is captured as `content`.
+    fn parse_macro(&mut self) -> Option<Token> {
+        let token_start = self.pos;
+        self.advance_by("```".len()); // Skip the opening fence
+
+        // The remainder of the opening line is the optional info string.
+        let info_raw = self.consume_while(|c| c != '\n' && c != '\r');
+        let info_trimmed = info_raw.trim();
+        let info = if info_trimmed.is_empty() {
+            None
+        } else {
+            Some(info_trimmed.to_string())
+        };
+        // Skip the newline terminating the opening fence line.
+        if self.current_char == Some('\r') {
+            self.advance();
+        }
+        if self.current_char == Some('\n') {
+            self.advance();
+        }
+
+        let content_start = self.pos;
+        while self.current_char.is_some() {
+            if self.starts_with("```") {
+                break;
+            }
+            self.advance();
+        }
+        let content = self.input[content_start..self.pos].to_string();
+
+        if self.starts_with("```") {
+            self.advance_by("```".len());
+        }
+
+        self.pop_state(); // Return to the previous state
+        Some(Token::new(
+            TokenKind::Macro { content, info },
+            token_start,
+            self.pos,
+        ))
     }
 
     /// Parses an HTML segment.
@@ -312,6 +436,12 @@ impl<'a> Lexer<'a> {
         self.input[self.pos..].starts_with(s)
     }
 
+    /// Like [`Self::starts_with`] but ASCII-case-insensitive (used for attribute names).
+    fn starts_with_ignore_ascii_case(&self, s: &str) -> bool {
+        let rest = &self.input[self.pos..];
+        rest.len() >= s.len() && rest.as_bytes()[..s.len()].eq_ignore_ascii_case(s.as_bytes())
+    }
+
     /// Advances the lexer by a given number of bytes.
     fn advance_by(&mut self, n: usize) {
         for _ in 0..n {
@@ -427,5 +557,129 @@ impl<'a> Lexer<'a> {
         if let Some(state) = self.state_stack.pop() {
             self.state = state;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Drains the lexer into the full list of token kinds.
+    fn lex(input: &str) -> Vec<TokenKind> {
+        let mut lexer = Lexer::new(input);
+        let mut kinds = Vec::new();
+        while let Some(tok) = lexer.next_token() {
+            kinds.push(tok.kind);
+        }
+        kinds
+    }
+
+    #[test]
+    fn style_block_captures_lang_attribute() {
+        let src = "<style lang=\"scss\">.a { color: red; }</style>";
+        let kinds = lex(src);
+        let style = kinds
+            .iter()
+            .find_map(|k| match k {
+                TokenKind::Style { content, lang } => Some((content, lang)),
+                _ => None,
+            })
+            .expect("expected a Style token");
+        assert_eq!(style.1.as_deref(), Some("scss"));
+        assert!(style.0.contains("color: red"), "css body missing; got {:?}", style.0);
+    }
+
+    #[test]
+    fn style_block_single_quoted_sass_lang() {
+        let kinds = lex("<style lang='sass'>.a\n  color: red</style>");
+        assert!(
+            kinds.iter().any(|k| matches!(
+                k,
+                TokenKind::Style { lang, .. } if lang.as_deref() == Some("sass")
+            )),
+            "expected Style with lang=sass; got {:?}",
+            kinds
+        );
+    }
+
+    #[test]
+    fn plain_style_block_has_no_lang() {
+        let kinds = lex("<style>.a { color: red; }</style>");
+        let lang = kinds
+            .iter()
+            .find_map(|k| match k {
+                TokenKind::Style { lang, .. } => Some(lang.clone()),
+                _ => None,
+            })
+            .expect("expected a Style token");
+        assert_eq!(lang, None);
+    }
+
+    #[test]
+    fn top_of_file_fence_is_a_macro_chunk() {
+        let src = "```\nexport const x = 1;\n```\n<div>hi</div>";
+        let kinds = lex(src);
+        let macro_tok = kinds
+            .iter()
+            .find_map(|k| match k {
+                TokenKind::Macro { content, info } => Some((content.clone(), info.clone())),
+                _ => None,
+            })
+            .expect("expected a Macro token");
+        assert_eq!(macro_tok.1, None, "no info string expected");
+        assert!(
+            macro_tok.0.contains("export const x = 1;"),
+            "macro body missing; got {:?}",
+            macro_tok.0
+        );
+        // The HTML that follows the macro is still lexed as HTML.
+        assert!(
+            kinds.iter().any(|k| matches!(k, TokenKind::HTML(h) if h.contains("hi"))),
+            "expected HTML after macro; got {:?}",
+            kinds
+        );
+    }
+
+    #[test]
+    fn macro_fence_captures_info_string() {
+        let kinds = lex("```rsc\nlet a = 1;\n```\n");
+        assert!(
+            kinds.iter().any(|k| matches!(
+                k,
+                TokenKind::Macro { info, .. } if info.as_deref() == Some("rsc")
+            )),
+            "expected Macro with info=rsc; got {:?}",
+            kinds
+        );
+    }
+
+    #[test]
+    fn fence_only_recognized_at_file_top() {
+        // A fence that is NOT at the top of the file is not a macro; it stays JavaScript.
+        let kinds = lex("const a = 1;\n```\nnot a macro\n```");
+        assert!(
+            !kinds.iter().any(|k| matches!(k, TokenKind::Macro { .. })),
+            "fence below file top must not be a Macro; got {:?}",
+            kinds
+        );
+    }
+
+    #[test]
+    fn ts_outside_tags_is_javascript() {
+        // The default: anything not in an HTML tag nor <style> is JavaScript/TypeScript.
+        let kinds = lex("const x: number = 1;");
+        assert!(
+            kinds.iter().any(|k| matches!(k, TokenKind::JavaScript(js) if js.contains("const x"))),
+            "expected JavaScript chunk; got {:?}",
+            kinds
+        );
+        assert!(
+            !kinds.iter().any(|k| matches!(
+                k,
+                TokenKind::HTML(_) | TokenKind::Style { .. } | TokenKind::Macro { .. }
+            )),
+            "TS-by-default leaked into a non-JS chunk; got {:?}",
+            kinds
+        );
     }
 }

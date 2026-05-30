@@ -31,7 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match &token.kind {
             TokenKind::JavaScript(code) => javascript_chunks.push(code.clone()),
             TokenKind::HTML(content) => html_chunks.push(content.clone()),
-            TokenKind::Style(style) => css_chunks.push(style.clone()),
+            TokenKind::Style { content, .. } => css_chunks.push(content.clone()),
             _ => {}
         }
     }

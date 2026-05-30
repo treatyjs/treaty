@@ -31,7 +31,8 @@ impl Parser {
 
         match token_kind {
             TokenKind::JavaScript(code) => AstNode::JavaScript(code),
-            TokenKind::Style(style) => AstNode::Style(style),
+            TokenKind::Style { content, lang } => AstNode::Style { content, lang },
+            TokenKind::Macro { content, info } => AstNode::Macro { content, info },
             TokenKind::HTML(content) => AstNode::Html(content),
             TokenKind::TemplateExpression(expr) => AstNode::TemplateExpression(expr),
             TokenKind::ControlFlow(kind) => self.parse_control_flow_node(&kind),
