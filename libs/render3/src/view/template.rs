@@ -37,8 +37,9 @@ use crate::identifiers::R3;
 use crate::output_ast as o;
 use crate::output_ast::{Expr, FnParam, Stmt, StmtKind, StmtModifier};
 use crate::template::r3_ast::{
-    BoundAttribute, BoundEvent, BoundText, Content, Element, ForLoopBlock, IfBlock, LetDeclaration,
-    Node, SwitchBlock, SwitchBlockCase, Template, Text, TextAttribute, Visitor,
+    BoundAttribute, BoundEvent, BoundText, Content, DeferredBlock, DeferredBlockTriggers,
+    DeferredTriggerKind, Element, ForLoopBlock, IfBlock, LetDeclaration, Node, SwitchBlock,
+    SwitchBlockCase, Template, Text, TextAttribute, Visitor,
 };
 
 // ---------------------------------------------------------------------------
@@ -180,6 +181,13 @@ impl ConstantPool {
 /// realistic data-slot count so a placeholder is never mistaken for a real slot.
 const PIPE_SLOT_PLACEHOLDER: usize = 1_000_000_000;
 
+/// Placeholder a template local-ref slot carries until the host element/template is reached during
+/// the main walk and the real `ɵɵreference(slot)` data slot is known. A listener handler whose body
+/// reads a `#ref` declared LATER in the template emits `ɵɵreference(PLACEHOLDER + ordinal)`; the slot
+/// is patched in [`TemplateDefinitionBuilder::finalize_local_refs`] after the walk. Distinct, large,
+/// and disjoint from the pipe placeholder so neither masks a genuine slot literal.
+const LOCAL_REF_SLOT_PLACEHOLDER: usize = 2_000_000_000;
+
 /// One registered pipe usage collected during the view walk. Mirrors Angular's
 /// `PipeBindingExpr` bookkeeping (`pipe_creation.ts` records a `Pipe` create op per
 /// usage). Each distinct *usage* (not name) reserves its own creation slot + var
@@ -274,11 +282,31 @@ struct ContextLet {
     owner_level: usize,
 }
 
+/// A template local reference (`#user`) declared on an element/template in THIS view. A read of the
+/// name resolves to `const $name$ = ɵɵreference(slot)` materialised at the head of the consuming
+/// update block (or inside a listener handler), faithful to Angular's `generate_variables.ts`
+/// `Reference` lowering. The `slot` is the `ɵɵreference` data slot — `element_slot + 1 + ref_index`
+/// (each `#ref` reserves one extra data slot after its host, `liftLocalRefs`).
+#[derive(Debug, Clone)]
+struct LocalRef {
+    /// The author-written reference name (`user`).
+    name: String,
+    /// The `ɵɵreference(slot)` data slot.
+    slot: usize,
+    /// The pre-assigned generated local identifier (`user_r<id>`), minted when the host element is
+    /// built so the `&self` expression resolver can hand it back without mutating the var counter.
+    local_name: String,
+}
+
 /// A [`LocalResolver`] that roots the implicit receiver at `ctx` (like [`crate::expression_converter::CtxResolver`])
 /// but additionally lowers reads of an embedded view's loop variables to their generated locals
 /// (`x` → `x_r1`), faithful to Angular's `resolve_names` + `variable_optimization` phases.
 struct LoopVarResolver<'a> {
     vars: &'a [LoopVar],
+    /// Template local references (`#ref`) declared in this view: a read resolves to the ref's
+    /// generated local and records the usage so a `const <local> = ɵɵreference(slot)` is emitted.
+    local_refs: &'a [LocalRef],
+    used_local_refs: &'a std::cell::RefCell<Vec<(String, String, usize)>>,
 }
 
 impl LocalResolver for LoopVarResolver<'_> {
@@ -287,11 +315,26 @@ impl LocalResolver for LoopVarResolver<'_> {
     }
 
     fn maybe_resolve_local(&self, name: &str) -> Option<Expr> {
-        self.vars
-            .iter()
-            .find(|v| v.source_name == name)
-            .map(|v| o::variable(v.local_name.clone(), None))
+        if let Some(v) = self.vars.iter().find(|v| v.source_name == name) {
+            return Some(o::variable(v.local_name.clone(), None));
+        }
+        resolve_local_ref(name, self.local_refs, self.used_local_refs)
     }
+}
+
+/// Resolve a read of a template local reference (`#ref`) to its generated local, recording the
+/// usage so the materialising `const <local> = ɵɵreference(slot)` is emitted exactly once.
+fn resolve_local_ref(
+    name: &str,
+    local_refs: &[LocalRef],
+    used: &std::cell::RefCell<Vec<(String, String, usize)>>,
+) -> Option<Expr> {
+    let r = local_refs.iter().find(|r| r.name == name)?;
+    let mut used = used.borrow_mut();
+    if !used.iter().any(|(n, _, _)| n == &r.name) {
+        used.push((r.name.clone(), r.local_name.clone(), r.slot));
+    }
+    Some(o::variable(r.local_name.clone(), None))
 }
 
 /// A nesting-aware [`LocalResolver`] for an embedded (`view_level > 0`) view. Loop variables of the
@@ -307,6 +350,9 @@ struct NestedViewResolver<'a> {
     ctx_name: String,
     /// Set when the implicit receiver was consulted (an ancestor read occurred).
     needs: &'a std::cell::Cell<bool>,
+    /// This view's own template local references (`#ref`).
+    local_refs: &'a [LocalRef],
+    used_local_refs: &'a std::cell::RefCell<Vec<(String, String, usize)>>,
 }
 
 impl LocalResolver for NestedViewResolver<'_> {
@@ -318,10 +364,10 @@ impl LocalResolver for NestedViewResolver<'_> {
     }
 
     fn maybe_resolve_local(&self, name: &str) -> Option<Expr> {
-        self.vars
-            .iter()
-            .find(|v| v.source_name == name)
-            .map(|v| o::variable(v.local_name.clone(), None))
+        if let Some(v) = self.vars.iter().find(|v| v.source_name == name) {
+            return Some(o::variable(v.local_name.clone(), None));
+        }
+        resolve_local_ref(name, self.local_refs, self.used_local_refs)
     }
 }
 
@@ -394,6 +440,14 @@ fn sanitize_identifier(name: &str) -> String {
     name.chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
         .collect()
+}
+
+/// The generated local identifier for a template local reference (`#user` → `$user_1$`). Angular's
+/// `generate_variables.ts` emits a `Reference` view variable; its goldens spell the binding with the
+/// `$name$` expect-emit placeholder. Wrapping the source name in `$…$` (with a unique counter so
+/// distinct refs never collide) keeps the identifier valid while matching that convention.
+fn local_ref_var_name(name: &str, counter: usize) -> String {
+    format!("${}_{}$", sanitize_identifier(name), counter)
 }
 
 /// Pop trailing `null` literal arguments off an instruction's parameter list, mirroring the
@@ -731,6 +785,18 @@ pub struct TemplateDefinitionBuilder {
     /// Per-update-block counter seeding temporary-variable spill names (`tmp_<level>_0`,
     /// `tmp_<level>_1`, …). Reset per view (a fresh builder starts at 0).
     temp_counter: usize,
+    /// Template local references (`#user`) declared on elements/templates in THIS view, in
+    /// declaration order. A read of one of these names in a same-view update binding lowers to a
+    /// generated `const $name$ = ɵɵreference(slot)` local; reads in a listener handler likewise read
+    /// `ɵɵreference(slot)` (with view save/restore scaffolding). Mirrors `generate_variables.ts`
+    /// `Reference`.
+    local_refs: Vec<LocalRef>,
+    /// The names of local refs THIS view's own update bindings actually read, recorded during
+    /// expression lowering (the resolver borrows `&self`, so this is interior-mutable). After the
+    /// walk, each is materialised once as a leading `const <name>_r<id> = ɵɵreference(slot)` in the
+    /// update block (`optimizeVariables` keeps only referenced ones). Stored as
+    /// `(source_name, local_name, slot)` in first-use order.
+    used_local_refs: std::cell::RefCell<Vec<(String, String, usize)>>,
     /// Set during expression lowering when an implicit read in THIS (nested) view resolved against
     /// an ancestor context (i.e. it is not satisfied by a local of the current view). When set, a
     /// single `const ctx_r<id> = ɵɵnextContext();` is emitted at the head of this view's update
@@ -799,6 +865,8 @@ impl TemplateDefinitionBuilder {
             is_root: true,
             view_level: 0,
             temp_counter: 0,
+            local_refs: Vec::new(),
+            used_local_refs: std::cell::RefCell::new(Vec::new()),
             needs_next_context: std::cell::Cell::new(false),
             next_context_name: std::cell::RefCell::new(None),
             pipes: std::cell::RefCell::new(PipeState::default()),
@@ -846,11 +914,15 @@ impl TemplateDefinitionBuilder {
                 vars: &self.loop_vars,
                 ctx_name,
                 needs: &self.needs_next_context,
+                local_refs: &self.local_refs,
+                used_local_refs: &self.used_local_refs,
             };
             convert_property_binding_with_pipes(node, &resolver, &BuilderPipes { state: &self.pipes })
         } else {
             let resolver = LoopVarResolver {
                 vars: &self.loop_vars,
+                local_refs: &self.local_refs,
+                used_local_refs: &self.used_local_refs,
             };
             convert_property_binding_with_pipes(node, &resolver, &BuilderPipes { state: &self.pipes })
         };
@@ -886,16 +958,72 @@ impl TemplateDefinitionBuilder {
         name
     }
 
-    /// The shared saved-view identifier (`_r<id>`) for this view, minted on first use. The matching
-    /// `const _r<id> = ɵɵgetCurrentView();` is prepended to the creation block during finalisation.
+    /// The shared saved-view identifier for this view, minted on first use. The matching
+    /// `const $s_<id>$ = ɵɵgetCurrentView();` is prepended to the creation block during finalisation.
+    /// Angular's `generate_variables.ts` emits a `SavedView` view variable; its goldens spell it with
+    /// the `$name$` expect-emit placeholder, so the generated identifier wraps in `$…$` to match.
     fn saved_view_var_name(&mut self) -> String {
         if let Some(name) = &self.saved_view_name {
             return name.clone();
         }
         self.var_counter += 1;
-        let name = format!("_r{}", self.var_counter);
+        let name = format!("$s_{}$", self.var_counter);
         self.saved_view_name = Some(name.clone());
         name
+    }
+
+    /// Register a template local reference (`#name`) at its `ɵɵreference(slot)` data slot. The
+    /// pre-pass (`preregister_local_ref`) already minted the generated local + a placeholder slot;
+    /// fill in the real slot now that the host is reached (patch the first still-placeholder entry of
+    /// this name). Falls back to pushing a fresh entry for a ref the pre-pass did not see.
+    fn register_local_ref(&mut self, name: &str, slot: usize) {
+        if let Some(entry) = self
+            .local_refs
+            .iter_mut()
+            .find(|r| r.name == name && r.slot >= LOCAL_REF_SLOT_PLACEHOLDER)
+        {
+            entry.slot = slot;
+        } else {
+            self.var_counter += 1;
+            let local_name = local_ref_var_name(name, self.var_counter);
+            self.local_refs.push(LocalRef {
+                name: name.to_string(),
+                slot,
+                local_name,
+            });
+        }
+    }
+
+    /// Pre-register a local ref by name during the const pre-pass, minting its generated local
+    /// identifier and a placeholder slot. The placeholder lets a listener handler that reads a ref
+    /// declared LATER emit `ɵɵreference(placeholder)`; the real slot is filled by
+    /// [`Self::register_local_ref`] when the host is reached, and patched into handler bodies by
+    /// [`Self::finalize_local_refs`].
+    fn preregister_local_ref(&mut self, name: &str) {
+        let ordinal = self.local_refs.len();
+        self.var_counter += 1;
+        let local_name = local_ref_var_name(name, self.var_counter);
+        self.local_refs.push(LocalRef {
+            name: name.to_string(),
+            slot: LOCAL_REF_SLOT_PLACEHOLDER + ordinal,
+            local_name,
+        });
+    }
+
+    /// Patch every placeholder local-ref slot literal (`LOCAL_REF_SLOT_PLACEHOLDER + ordinal`) in the
+    /// creation block (listener handler bodies) to the real `ɵɵreference(slot)` slot recorded for that
+    /// ordinal in `self.local_refs`. Needed when a handler reads a `#ref` declared after it.
+    fn finalize_local_refs(&mut self) {
+        let slots: Vec<usize> = self.local_refs.iter().map(|r| r.slot).collect();
+        if slots.is_empty() {
+            return;
+        }
+        let resolve = move |ordinal: usize| slots.get(ordinal).copied().unwrap_or(ordinal);
+        let mut creation = std::mem::take(&mut self.creation_code);
+        for stmt in &mut creation {
+            remap_placeholder_slots_in_stmt(stmt, LOCAL_REF_SLOT_PLACEHOLDER, &resolve);
+        }
+        self.creation_code = creation;
     }
 
     /// Borrow the constant pool collected during [`Self::build_template_function`].
@@ -1007,6 +1135,15 @@ impl TemplateDefinitionBuilder {
         // Capture the node list for in-view `@let`-usage queries during the walk.
         self.current_nodes = Some(nodes.clone());
 
+        // Angular runs `liftLocalRefs` (which interns each element/template's `#ref` const) BEFORE
+        // `collectElementConsts` (the attribute consts) — so EVERY local-ref const precedes every
+        // attribute const in the component `consts` pool. Pre-intern them here, in create-op
+        // (depth-first pre-order) order, so the attribute consts the main walk interns land after.
+        // `intern` dedups, so the walk's own `local_refs_index` call returns the same index. This
+        // also pre-registers each ref (name + generated local + placeholder slot) so a listener whose
+        // handler reads a ref declared LATER can resolve it.
+        self.prepass_local_ref_consts(&nodes);
+
         // Classify every top-level `@let` in this view (external / pipe-bearing) so the inline walk
         // can decide whether each reserves a `ɵɵdeclareLet` slot + `ɵɵstoreLet`, or inlines as a
         // plain `const`/bare statement (`optimizeStoreLet` / `optimizeVariables`).
@@ -1023,6 +1160,11 @@ impl TemplateDefinitionBuilder {
         // Allocate pipe data slots (at the END of the data array), emit their `ɵɵpipe(slot,"name")`
         // creation instructions, and patch the placeholder slots in the update block.
         self.finalize_pipes();
+
+        // Patch any placeholder `ɵɵreference(LOCAL_REF_SLOT_PLACEHOLDER + ordinal)` a listener
+        // handler emitted for a `#ref` declared LATER in the template (the host's real slot is now
+        // known). Same-view update reads were materialised against the real slot already.
+        self.finalize_local_refs();
 
         // When a listener handler in this view restored a saved view (to read a cross-view `@let`),
         // the creation block opens with `const _r<id> = ɵɵgetCurrentView();` (`generate_variables.ts`
@@ -1096,6 +1238,23 @@ impl TemplateDefinitionBuilder {
             ));
         }
         update_body.extend(std::mem::take(&mut self.update_prelude));
+        // Template local references read by this view's own update bindings materialise as
+        // `const <name>_r<id> = ɵɵreference(slot)` at the head of the variable block, before the
+        // bindings consume them (`generate_variables.ts` `Reference`). Emitted in first-use order.
+        let used_refs = std::mem::take(&mut *self.used_local_refs.borrow_mut());
+        for (_name, local_name, slot) in used_refs {
+            update_body.push(Stmt::with_modifiers(
+                StmtKind::DeclareVar {
+                    name: local_name,
+                    value: Some(
+                        o::import_expr(R3::Reference.reference(), None)
+                            .call_fn(vec![num(slot as f64)], false),
+                    ),
+                    ty: None,
+                },
+                StmtModifier::FINAL,
+            ));
+        }
         update_body.extend(chain_statements(std::mem::take(&mut self.update_code)));
         let update = update_body;
 
@@ -1324,9 +1483,11 @@ impl TemplateDefinitionBuilder {
     fn build_element(&mut self, element: &Element) {
         let slot = self.allocate_data_slot();
         // Each `#ref` on the element reserves one extra data slot (Angular `liftLocalRefs`:
-        // `numSlotsUsed += localRefs.length`).
-        for _ in &element.references {
-            self.allocate_data_slot();
+        // `numSlotsUsed += localRefs.length`). The `ɵɵreference(slot)` slot for ref `k` is
+        // `element_slot + 1 + k`. Register each ref so same-view / handler reads resolve to it.
+        for r in &element.references {
+            let ref_slot = self.allocate_data_slot();
+            self.register_local_ref(&r.name, ref_slot);
         }
 
         // Collect the names that go under `AttributeMarker.Bindings` (`3`). Faithful to Angular's
@@ -1740,7 +1901,34 @@ impl TemplateDefinitionBuilder {
             ));
             context_let_locals.push((cl.name.clone(), local_name));
         }
-        let needs_view_restore = !referenced_lets.is_empty();
+
+        // A template local reference (`#ref`) read in the handler likewise resolves to a
+        // `const $ref$ = ɵɵreference(slot)` prepended to the handler body, and forces the view to be
+        // saved/restored (`generate_variables.ts` `Reference` in a callback scope). The ref's host
+        // may be declared LATER in the template (the listener's create op precedes it); the slot was
+        // reserved at pre-registration and is the real slot once the host is reached (placeholder is
+        // patched by `finalize_local_refs` for not-yet-reached hosts).
+        let referenced_refs: Vec<LocalRef> = self
+            .local_refs
+            .iter()
+            .filter(|r| expr_references_implicit(&output.handler, &r.name))
+            .cloned()
+            .collect();
+        for r in &referenced_refs {
+            let read = o::import_expr(R3::Reference.reference(), None)
+                .call_fn(vec![num(r.slot as f64)], false);
+            let_reads.push(Stmt::with_modifiers(
+                StmtKind::DeclareVar {
+                    name: r.local_name.clone(),
+                    value: Some(read),
+                    ty: None,
+                },
+                StmtModifier::FINAL,
+            ));
+            context_let_locals.push((r.name.clone(), r.local_name.clone()));
+        }
+
+        let needs_view_restore = !referenced_lets.is_empty() || !referenced_refs.is_empty();
 
         // Lower the handler against a resolver that keeps `$event` a bare parameter read (Angular
         // `resolveDollarEvent`), rewrites any in-scope `@for` loop vars to their locals, and resolves
@@ -1822,8 +2010,9 @@ impl TemplateDefinitionBuilder {
         let slot = self.allocate_data_slot();
         // Each `#ref` on the host reserves one extra data slot (`liftLocalRefs`:
         // `numSlotsUsed += localRefs.length`).
-        for _ in &template.references {
-            self.allocate_data_slot();
+        for r in &template.references {
+            let ref_slot = self.allocate_data_slot();
+            self.register_local_ref(&r.name, ref_slot);
         }
         let attrs_index = self.element_attrs_index(&template.attributes, &[]);
         let local_refs_index = self.local_refs_index(&template.references);
@@ -1869,6 +2058,35 @@ impl TemplateDefinitionBuilder {
             R3::TemplateCreate
         };
         self.creation_code.push(instruction(template_ref, params));
+    }
+
+    /// Pre-intern every local-reference const in THIS view, in create-op (depth-first pre-order)
+    /// order, mirroring Angular's `liftLocalRefs` phase (which runs before `collectElementConsts`),
+    /// and pre-register each ref (name + generated local + placeholder slot). Only same-view
+    /// element/template hosts contribute; control-flow / `<ng-template>` bodies are separate child
+    /// views whose refs are interned when that view is built. The element's own children ARE in the
+    /// same view, so we recurse into them.
+    fn prepass_local_ref_consts(&mut self, nodes: &[Node]) {
+        for node in nodes {
+            match node {
+                Node::Element(el) => {
+                    self.local_refs_index(&el.references);
+                    for r in &el.references {
+                        self.preregister_local_ref(&r.name);
+                    }
+                    self.prepass_local_ref_consts(&el.children);
+                }
+                Node::Template(tmpl) => {
+                    // The `<ng-template>` host's own `#ref`s belong to THIS (outer) view; its body
+                    // is a separate child view, so we do NOT recurse into its children here.
+                    self.local_refs_index(&tmpl.references);
+                    for r in &tmpl.references {
+                        self.preregister_local_ref(&r.name);
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Lower a list of template-reference variables (`#ref` / `#ref="exportAs"`) into a single
@@ -2471,6 +2689,146 @@ impl TemplateDefinitionBuilder {
         }
     }
 
+    /// Lower a `@defer` block (`ingest.ts` `ingestDeferBlock` + `reify.ts` Defer/DeferOn/Template).
+    ///
+    /// Slot layout (Angular `slot_allocation`): the **main** deferred view's `ɵɵdomTemplate` op
+    /// takes one slot (`mainSlot`), then any `@placeholder`/`@loading`/`@error` sub-block is its own
+    /// one-slot `ɵɵdomTemplate`, then the `ɵɵdefer` op takes **two** (`numSlotsUsed: 2`).
+    ///
+    /// Emits, in create order: the main `ɵɵdomTemplate(mainSlot, fn, decls, vars)`, then each
+    /// secondary `ɵɵdomTemplate`, then `ɵɵdefer(deferSlot, mainSlot[, resolverFn, loadingSlot,
+    /// placeholderSlot, errorSlot])` with trailing `null`s trimmed, then one trigger instruction per
+    /// `on` trigger (defaulting to `ɵɵdeferOnIdle()` when no concrete trigger is given). Deferred
+    /// block bodies always compile DOM-only (`reify.ts`: block templates emit `ɵɵdomTemplate`).
+    fn build_deferred_block(&mut self, deferred: &DeferredBlock) {
+        // Main deferred view — one data slot, named `<Base>_Defer_<mainSlot>_Template` (`naming.ts`).
+        let main_slot = self.allocate_data_slot();
+        let main_fn = format!("{}_Defer_{}_Template", self.base_name, main_slot);
+        let (main_ref, main_decls, main_vars) =
+            self.build_deferred_view(main_fn, deferred.children.clone());
+
+        // Secondary views (`@placeholder`/`@loading`/`@error`), each a one-slot `ɵɵdomTemplate`,
+        // allocated before the `ɵɵdefer` op (Angular ingests their views ahead of the defer op).
+        let mut placeholder: Option<(usize, Expr, usize, usize)> = None;
+        let mut loading: Option<(usize, Expr, usize, usize)> = None;
+        let mut error: Option<(usize, Expr, usize, usize)> = None;
+        if let Some(ph) = &deferred.placeholder {
+            let s = self.allocate_data_slot();
+            let f = format!("{}_DeferPlaceholder_{}_Template", self.base_name, s);
+            let (r, d, v) = self.build_deferred_view(f, ph.children.clone());
+            placeholder = Some((s, r, d, v));
+        }
+        if let Some(ld) = &deferred.loading {
+            let s = self.allocate_data_slot();
+            let f = format!("{}_DeferLoading_{}_Template", self.base_name, s);
+            let (r, d, v) = self.build_deferred_view(f, ld.children.clone());
+            loading = Some((s, r, d, v));
+        }
+        if let Some(er) = &deferred.error {
+            let s = self.allocate_data_slot();
+            let f = format!("{}_DeferError_{}_Template", self.base_name, s);
+            let (r, d, v) = self.build_deferred_view(f, er.children.clone());
+            error = Some((s, r, d, v));
+        }
+
+        // The defer op itself reserves two slots (`numSlotsUsed: 2`).
+        let defer_slot = self.allocate_data_slot();
+        let _defer_slot_2 = self.allocate_data_slot();
+
+        let emit_template = |this: &mut Self, slot: usize, r: Expr, d: usize, v: usize| {
+            let params = vec![num(slot as f64), r, num(d as f64), num(v as f64)];
+            this.creation_code.push(instruction(R3::DomTemplate, params));
+        };
+        emit_template(self, main_slot, main_ref, main_decls, main_vars);
+        if let Some((s, r, d, v)) = &placeholder {
+            emit_template(self, *s, r.clone(), *d, *v);
+        }
+        if let Some((s, r, d, v)) = &loading {
+            emit_template(self, *s, r.clone(), *d, *v);
+        }
+        if let Some((s, r, d, v)) = &error {
+            emit_template(self, *s, r.clone(), *d, *v);
+        }
+
+        // `ɵɵdefer(deferSlot, mainSlot, resolverFn, loadingSlot, placeholderSlot, errorSlot)` with
+        // trailing `null`s trimmed (`instruction.ts` `defer`). The basic block trims everything past
+        // `mainSlot`, leaving `ɵɵdefer(deferSlot, mainSlot)`.
+        let mut defer_params = vec![
+            num(defer_slot as f64),
+            num(main_slot as f64),
+            o::null_expr(), // dependencyResolverFn (per-block resolver not modelled here)
+            loading
+                .as_ref()
+                .map(|(s, ..)| num(*s as f64))
+                .unwrap_or_else(o::null_expr),
+            placeholder
+                .as_ref()
+                .map(|(s, ..)| num(*s as f64))
+                .unwrap_or_else(o::null_expr),
+            error
+                .as_ref()
+                .map(|(s, ..)| num(*s as f64))
+                .unwrap_or_else(o::null_expr),
+        ];
+        trim_trailing_nulls(&mut defer_params);
+        self.creation_code.push(instruction(R3::Defer, defer_params));
+
+        // Trigger instructions (regular `on` triggers only; prefetch/hydrate are a separate
+        // subsystem). Default to `ɵɵdeferOnIdle()` when no concrete trigger is given.
+        self.emit_defer_triggers(&deferred.triggers);
+    }
+
+    /// Emit the create-block trigger instructions for a defer block's regular trigger set, defaulting
+    /// to `ɵɵdeferOnIdle()` when none is present (`ingestDeferBlock` / `reify.ts` `DeferOn`).
+    fn emit_defer_triggers(&mut self, triggers: &DeferredBlockTriggers) {
+        let mut emitted_concrete = false;
+        for trigger in triggers.defined_in_order() {
+            let (reference, args): (R3, Vec<Expr>) = match &trigger.kind {
+                DeferredTriggerKind::Idle { timeout } => (
+                    R3::DeferOnIdle,
+                    timeout.map(|t| vec![num(t)]).unwrap_or_default(),
+                ),
+                DeferredTriggerKind::Immediate => (R3::DeferOnImmediate, vec![]),
+                DeferredTriggerKind::Timer { delay } => (R3::DeferOnTimer, vec![num(*delay)]),
+                DeferredTriggerKind::Hover { .. } => (R3::DeferOnHover, vec![]),
+                DeferredTriggerKind::Interaction { .. } => (R3::DeferOnInteraction, vec![]),
+                DeferredTriggerKind::Viewport { .. } => (R3::DeferOnViewport, vec![]),
+                // `when` is a `ɵɵdeferWhen` update op; `never` is hydrate-only — skip here.
+                DeferredTriggerKind::When { .. } | DeferredTriggerKind::Never => continue,
+            };
+            emitted_concrete = true;
+            self.creation_code.push(instruction(reference, args));
+        }
+        if !emitted_concrete {
+            self.creation_code.push(instruction(R3::DeferOnIdle, vec![]));
+        }
+    }
+
+    /// Build a `@defer` secondary/main view as a hoisted, named DOM-only embedded view, returning
+    /// `(fnNameRef, decls, vars)`. Like [`Self::build_embedded_view`] but the body always compiles
+    /// DOM-only (`reify.ts`: block templates are `ɵɵdomTemplate`).
+    fn build_deferred_view(&mut self, fn_name: String, children: Vec<Node>) -> (Expr, usize, usize) {
+        let nested_input =
+            TemplateCompilationInput::new(fn_name.clone(), children).with_dom_only(true);
+        let mut nested = TemplateDefinitionBuilder::new(&nested_input);
+        nested.is_root = false;
+        nested.view_level = self.view_level + 1;
+        nested.var_counter = self.var_counter;
+        nested.context_lets = self.context_lets.clone();
+        nested.base_name = self.base_name.clone();
+        let tmpl_fn = nested.build_template_function(&nested_input);
+        let decls = nested.data_index;
+        let vars = nested.binding_slots;
+        self.var_counter = nested.var_counter;
+        for entry in nested.const_pool.entries() {
+            self.const_pool.intern(entry.clone());
+        }
+        self.hoisted_fns.append(&mut nested.hoisted_fns);
+        self.hoisted_fns
+            .push(declare_function_from(&fn_name, tmpl_fn));
+        (o::variable(fn_name, None), decls, vars)
+    }
+
     /// Whether a top-level `@let` named `name` is referenced by this view's own update bindings,
     /// using the source node tree the walk is processing. Captured at declaration time from the
     /// current input nodes (stored on `self`); falls back to `false` when unavailable.
@@ -2528,6 +2886,10 @@ impl Visitor for TemplateDefinitionBuilder {
 
     fn visit_content(&mut self, content: &Content) {
         self.build_content(content);
+    }
+
+    fn visit_deferred_block(&mut self, deferred: &DeferredBlock) {
+        self.build_deferred_block(deferred);
     }
 }
 
@@ -3122,48 +3484,64 @@ fn interpolation_expression_count(value: &AstNode) -> usize {
 /// `stmt` to its real data slot (`pipe_base + ordinal`). Covers every [`StmtKind`] so a pipe binding
 /// is patched wherever it sits (it only appears in update-block expression statements in practice).
 fn remap_pipe_slots_in_stmt(stmt: &mut Stmt, pipe_base: usize) {
+    remap_placeholder_slots_in_stmt(stmt, PIPE_SLOT_PLACEHOLDER, &|ordinal| pipe_base + ordinal);
+}
+
+/// Rewrite every placeholder slot literal `>= placeholder` reachable from `stmt`, mapping its
+/// ordinal (`literal - placeholder`) through `resolve`. Shared by pipe-slot finalisation and
+/// local-ref-slot finalisation (which differ only in their placeholder base + resolver).
+fn remap_placeholder_slots_in_stmt(
+    stmt: &mut Stmt,
+    placeholder: usize,
+    resolve: &dyn Fn(usize) -> usize,
+) {
     match &mut stmt.kind {
         StmtKind::DeclareVar { value, .. } => {
             if let Some(v) = value {
-                remap_pipe_slots_in_expr(v, pipe_base);
+                remap_placeholder_slots_in_expr(v, placeholder, resolve);
             }
         }
         StmtKind::DeclareFunction { statements, .. } => {
             for s in statements {
-                remap_pipe_slots_in_stmt(s, pipe_base);
+                remap_placeholder_slots_in_stmt(s, placeholder, resolve);
             }
         }
         StmtKind::Expression(e) | StmtKind::Return(e) => {
-            remap_pipe_slots_in_expr(e, pipe_base);
+            remap_placeholder_slots_in_expr(e, placeholder, resolve);
         }
         StmtKind::If {
             condition,
             true_case,
             false_case,
         } => {
-            remap_pipe_slots_in_expr(condition, pipe_base);
+            remap_placeholder_slots_in_expr(condition, placeholder, resolve);
             for s in true_case {
-                remap_pipe_slots_in_stmt(s, pipe_base);
+                remap_placeholder_slots_in_stmt(s, placeholder, resolve);
             }
             for s in false_case {
-                remap_pipe_slots_in_stmt(s, pipe_base);
+                remap_placeholder_slots_in_stmt(s, placeholder, resolve);
             }
         }
     }
 }
 
-/// Recursively rewrite placeholder pipe-slot literals in `expr`. A pipe's data slot is emitted as
-/// `PIPE_SLOT_PLACEHOLDER + ordinal` during the walk (the real slot is unknown until every other data
-/// slot is allocated); here we map it to `pipe_base + ordinal`. The sentinel base is far above any
-/// real slot count, so the `>= PIPE_SLOT_PLACEHOLDER` test never matches a genuine slot/index literal.
-fn remap_pipe_slots_in_expr(expr: &mut Expr, pipe_base: usize) {
+/// Recursively rewrite placeholder slot literals in `expr`. A pipe's / local-ref's data slot is
+/// emitted as `placeholder + ordinal` during the walk (the real slot is unknown until every other
+/// data slot is allocated); here we map its ordinal through `resolve`. The sentinel base is far
+/// above any real slot count, so the `>= placeholder` test never matches a genuine slot literal.
+fn remap_placeholder_slots_in_expr(
+    expr: &mut Expr,
+    placeholder: usize,
+    resolve: &dyn Fn(usize) -> usize,
+) {
     use o::ExprKind as K;
+    let recur = |e: &mut Expr| remap_placeholder_slots_in_expr(e, placeholder, resolve);
     match &mut expr.kind {
         K::Literal(o::LiteralValue::Number(n)) => {
             let v = *n as usize;
-            if *n >= PIPE_SLOT_PLACEHOLDER as f64 && v >= PIPE_SLOT_PLACEHOLDER {
-                let ordinal = v - PIPE_SLOT_PLACEHOLDER;
-                *n = (pipe_base + ordinal) as f64;
+            if *n >= placeholder as f64 && v >= placeholder {
+                let ordinal = v - placeholder;
+                *n = resolve(ordinal) as f64;
             }
         }
         // Leaves with no child expressions.
@@ -3174,27 +3552,27 @@ fn remap_pipe_slots_in_expr(expr: &mut Expr, pipe_base: usize) {
         | K::TemplateLiteralElement(_)
         | K::External { .. } => {}
         K::Typeof(e) | K::Void(e) | K::Not(e) | K::Parenthesized(e) | K::Spread(e) => {
-            remap_pipe_slots_in_expr(e, pipe_base);
+            recur(e);
         }
         K::Invoke { callee, args, .. } => {
-            remap_pipe_slots_in_expr(callee, pipe_base);
+            recur(callee);
             for a in args {
-                remap_pipe_slots_in_expr(a, pipe_base);
+                recur(a);
             }
         }
         K::TaggedTemplate { tag, template } => {
-            remap_pipe_slots_in_expr(tag, pipe_base);
-            remap_pipe_slots_in_expr(template, pipe_base);
+            recur(tag);
+            recur(template);
         }
         K::New { class_expr, args } => {
-            remap_pipe_slots_in_expr(class_expr, pipe_base);
+            recur(class_expr);
             for a in args {
-                remap_pipe_slots_in_expr(a, pipe_base);
+                recur(a);
             }
         }
         K::TemplateLiteral { expressions, .. } | K::LocalizedString { expressions, .. } => {
             for e in expressions {
-                remap_pipe_slots_in_expr(e, pipe_base);
+                recur(e);
             }
         }
         K::Conditional {
@@ -3202,54 +3580,50 @@ fn remap_pipe_slots_in_expr(expr: &mut Expr, pipe_base: usize) {
             true_case,
             false_case,
         } => {
-            remap_pipe_slots_in_expr(condition, pipe_base);
-            remap_pipe_slots_in_expr(true_case, pipe_base);
+            recur(condition);
+            recur(true_case);
             if let Some(f) = false_case {
-                remap_pipe_slots_in_expr(f, pipe_base);
+                recur(f);
             }
         }
         K::DynamicImport { url, .. } => {
             if let o::ImportUrl::Expr(e) = url {
-                remap_pipe_slots_in_expr(e, pipe_base);
+                recur(e);
             }
         }
         K::Function { statements, .. } => {
             for s in statements {
-                remap_pipe_slots_in_stmt(s, pipe_base);
+                remap_placeholder_slots_in_stmt(s, placeholder, resolve);
             }
         }
         K::Arrow { body, .. } => match body {
-            o::ArrowBody::Expr(e) => remap_pipe_slots_in_expr(e, pipe_base),
+            o::ArrowBody::Expr(e) => recur(e),
             o::ArrowBody::Block(stmts) => {
                 for s in stmts {
-                    remap_pipe_slots_in_stmt(s, pipe_base);
+                    remap_placeholder_slots_in_stmt(s, placeholder, resolve);
                 }
             }
         },
-        K::Unary { expr: inner, .. } => remap_pipe_slots_in_expr(inner, pipe_base),
+        K::Unary { expr: inner, .. } => recur(inner),
         K::Binary { lhs, rhs, .. } => {
-            remap_pipe_slots_in_expr(lhs, pipe_base);
-            remap_pipe_slots_in_expr(rhs, pipe_base);
+            recur(lhs);
+            recur(rhs);
         }
-        K::ReadProp { receiver, .. } => remap_pipe_slots_in_expr(receiver, pipe_base),
+        K::ReadProp { receiver, .. } => recur(receiver),
         K::ReadKey { receiver, index, .. } => {
-            remap_pipe_slots_in_expr(receiver, pipe_base);
-            remap_pipe_slots_in_expr(index, pipe_base);
+            recur(receiver);
+            recur(index);
         }
         K::LiteralArray(entries) | K::Comma(entries) => {
             for e in entries {
-                remap_pipe_slots_in_expr(e, pipe_base);
+                recur(e);
             }
         }
         K::LiteralMap { entries, .. } => {
             for entry in entries {
                 match entry {
-                    o::LiteralMapEntry::Property { value, .. } => {
-                        remap_pipe_slots_in_expr(value, pipe_base)
-                    }
-                    o::LiteralMapEntry::Spread { expression } => {
-                        remap_pipe_slots_in_expr(expression, pipe_base)
-                    }
+                    o::LiteralMapEntry::Property { value, .. } => recur(value),
+                    o::LiteralMapEntry::Spread { expression } => recur(expression),
                 }
             }
         }

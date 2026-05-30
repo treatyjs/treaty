@@ -1602,6 +1602,164 @@ mod tests {
         }
     }
 
+    /// A [`PipeSlotAllocator`] modelling a host wired to its var pool + const pool: it hands out a
+    /// fixed pure-function var offset and interns each factory under a stable `$cN$` name, so the
+    /// extraction path can be exercised end-to-end (named reference + host slot).
+    struct PureAlloc {
+        slot: usize,
+        next_const: std::cell::Cell<usize>,
+    }
+    impl PureAlloc {
+        fn new(slot: usize) -> Self {
+            PureAlloc {
+                slot,
+                next_const: std::cell::Cell::new(0),
+            }
+        }
+    }
+    impl PipeSlotAllocator for PureAlloc {
+        fn allocate_pipe(&self, _name: &str, _total_args: usize) -> PipeSlots {
+            PipeSlots {
+                slot: 0,
+                var_offset: 0,
+            }
+        }
+        fn allocate_pure_function_slot(&self, _num_args: usize) -> Option<usize> {
+            Some(self.slot)
+        }
+        fn intern_pure_function_factory(&self, _factory: &Expr) -> Option<String> {
+            let n = self.next_const.get();
+            self.next_const.set(n + 1);
+            Some(format!("$c{n}$"))
+        }
+    }
+
+    /// A literal-array node `[ … ]`.
+    fn lit_array(items: Vec<AstNode>) -> AstNode {
+        node(EK::LiteralArray { expressions: items })
+    }
+
+    /// A literal-map node `{ key: value, … }` (all unquoted property keys).
+    fn lit_map(pairs: Vec<(&str, AstNode)>) -> AstNode {
+        let mut keys = Vec::new();
+        let mut values = Vec::new();
+        for (k, v) in pairs {
+            keys.push(LiteralMapKey::Property {
+                key: k.to_string(),
+                quoted: false,
+                span: sp(),
+                source_span: ab(),
+                is_shorthand_initialized: false,
+            });
+            values.push(v);
+        }
+        node(EK::LiteralMap { keys, values })
+    }
+
+    #[test]
+    fn literal_array_extracted_to_pure_function_in_binding_context() {
+        // ['Nancy', customName] in a binding -> ɵɵpureFunction1(slot, factory, ctx.customName)
+        // with factory `a0 => ["Nancy", a0]` (the constant entry stays in the body, the non-constant
+        // becomes parameter `a0`). Faithful to Angular's generatePureLiteralStructures.
+        let n = lit_array(vec![
+            node(EK::LiteralPrimitive { value: ELit::Str("Nancy".into()) }),
+            prop("customName"),
+        ]);
+        let pipes = PureAlloc::new(1);
+        let r = convert_property_binding_with_pipes(&n, &CtxResolver::ctx(), &pipes);
+        let out = emit_expression(&r.expr);
+        assert!(out.contains("\u{0275}\u{0275}pureFunction1("), "got: {out}");
+        // Host-provided var offset.
+        assert!(out.contains("pureFunction1(1,"), "wrong slot, got: {out}");
+        // Interned factory referenced by name (not inline).
+        assert!(out.contains("$c0$"), "factory not interned, got: {out}");
+        // The non-constant entry is the live argument.
+        assert!(out.contains("ctx.customName"), "missing arg, got: {out}");
+    }
+
+    #[test]
+    fn all_constant_literal_array_still_pure_function0() {
+        // [1, 2] in a binding -> ɵɵpureFunction0(slot, factory) (no args, factory holds the literal).
+        // Angular wraps EVERY literal array/map in a pure function, even all-constant ones.
+        let n = lit_array(vec![num(1.0), num(2.0)]);
+        let pipes = PureAlloc::new(3);
+        let r = convert_property_binding_with_pipes(&n, &CtxResolver::ctx(), &pipes);
+        let out = emit_expression(&r.expr);
+        assert!(out.contains("\u{0275}\u{0275}pureFunction0(3,"), "got: {out}");
+        // No extra positional args beyond (slot, factory).
+        assert!(!out.contains("a0"), "spurious param, got: {out}");
+    }
+
+    #[test]
+    fn nested_literals_extract_recursively() {
+        // {foo: {}} -> the inner {} is its own pureFunction0 and, being non-constant (a call), becomes
+        // the outer factory's single argument: pureFunction1(slot, $c1$, pureFunction0(slot, $c0$)).
+        let n = lit_map(vec![("foo", lit_map(vec![]))]);
+        let pipes = PureAlloc::new(5);
+        let r = convert_property_binding_with_pipes(&n, &CtxResolver::ctx(), &pipes);
+        let out = emit_expression(&r.expr);
+        // Two distinct pure functions: inner (0 args) feeds the outer (1 arg).
+        assert!(out.contains("\u{0275}\u{0275}pureFunction0("), "no inner pf, got: {out}");
+        assert!(out.contains("\u{0275}\u{0275}pureFunction1("), "no outer pf, got: {out}");
+    }
+
+    #[test]
+    fn literal_inside_arrow_body_is_not_extracted() {
+        // (a => ({foo: a}))  -> the object literal lives in the arrow body (InChildOperation) and is
+        // NOT pure-extracted: it stays a verbatim object literal inside the hoisted factory.
+        let body = lit_map(vec![("foo", prop("a"))]);
+        let arrow = node(EK::ArrowFunction {
+            parameters: vec![arrow_id_param("a")],
+            body: Box::new(body),
+        });
+        // Use the arrow-only allocator so the factory is emitted inline and its body is inspectable.
+        let pipes = ArrowPipes { arrow_slot: 1 };
+        let r = convert_property_binding_with_pipes(&arrow, &CtxResolver::ctx(), &pipes);
+        let out = emit_expression(&r.expr);
+        // The arrow is hoisted (arrowFunction), but the inner object literal is verbatim — no pure fn.
+        assert!(out.contains("\u{0275}\u{0275}arrowFunction("), "arrow not hoisted, got: {out}");
+        assert!(!out.contains("pureFunction"), "object literal wrongly extracted, got: {out}");
+        assert!(out.contains("foo:"), "object literal missing, got: {out}");
+    }
+
+    #[test]
+    fn literal_array_not_extracted_on_plain_binding_path() {
+        // The plain (non-pipe) entry point keeps literals verbatim so callers like @for trackBy are
+        // unaffected: [1, 2] stays [1, 2].
+        let n = lit_array(vec![num(1.0), num(2.0)]);
+        let r = convert_property_binding(&n, ctx(), "0");
+        let out = emit_expression(&r.expr);
+        assert!(!out.contains("pureFunction"), "should not extract on plain path, got: {out}");
+        assert!(out.contains("[1, 2]"), "got: {out}");
+    }
+
+    #[test]
+    fn spread_in_literal_array_extracted_with_spread_preserved() {
+        // [1, ...foo] -> factory `a0 => [1, ...a0]`, arg ctx.foo. The spread wrapper is preserved on
+        // both the body parameter and the (non-constant) inner.
+        let n = lit_array(vec![
+            num(1.0),
+            node(EK::SpreadElement { expression: Box::new(prop("foo")) }),
+        ]);
+        let pipes = PureAlloc::new(2);
+        let r = convert_property_binding_with_pipes(&n, &CtxResolver::ctx(), &pipes);
+        let out = emit_expression(&r.expr);
+        assert!(out.contains("\u{0275}\u{0275}pureFunction1(2,"), "got: {out}");
+        assert!(out.contains("ctx.foo"), "missing spread arg, got: {out}");
+    }
+
+    #[test]
+    fn pure_function_over_eight_args_uses_variadic() {
+        // A literal array with 9 non-constant entries -> ɵɵpureFunctionV(slot, factory, [args]).
+        let items: Vec<AstNode> = (0..9).map(|_| prop("x")).collect();
+        let n = lit_array(items);
+        let pipes = PureAlloc::new(4);
+        let r = convert_property_binding_with_pipes(&n, &CtxResolver::ctx(), &pipes);
+        let out = emit_expression(&r.expr);
+        assert!(out.contains("\u{0275}\u{0275}pureFunctionV(4,"), "got: {out}");
+        assert!(out.contains('['), "variadic args array missing, got: {out}");
+    }
+
     #[test]
     fn arrow_hoisted_to_factory_in_binding_context() {
         // (param) => param + value + 1, lowered through the binding (pipes) path, hoists into a
