@@ -44,9 +44,11 @@ use render3::view::compiler::{
     R3TemplateDependencyMetadata, StubHostBindingsBuilder, ViewEncapsulation,
 };
 
+use crate::plugin::{extract_server_block, rewrite_call_sites, BackendPlugin, ElysiaEdenPlugin};
 use crate::treaty::ast::AstNode;
 use crate::treaty::lexer::Lexer;
 use crate::treaty::parser::Parser;
+use crate::CompiledAuthoring;
 
 /// A `<style>` chunk: its raw content plus optional preprocessor language (`lang="scss"`).
 #[derive(Debug)]
@@ -526,6 +528,45 @@ pub fn compile_treaty_file(source: &str, file_name: &str) -> CompiledComponent {
     CompiledComponent { code, errors }
 }
 
+/// Compile a `.treaty` SFC, handling a top-level `server { … }` block via the [`plugin`] system.
+///
+/// This is the server-aware wrapper around [`compile_treaty_file`]:
+///   1. [`extract_server_block`] lifts any `server { … }` block out of the source.
+///   2. The cleaned `client_source` compiles through [`compile_treaty_file`].
+///   3. When server functions were present, the reference [`ElysiaEdenPlugin`] emits a server module
+///      + client bindings, and [`rewrite_call_sites`] rewrites free references to each server fn in
+///      the compiled client code to its Eden client call.
+///
+/// When no `server { … }` block is present the source compiles unchanged and `server_module` is
+/// `None`.
+///
+/// [`plugin`]: crate::plugin
+pub fn compile_treaty_authoring(source: &str, file_name: &str) -> CompiledAuthoring {
+    let extraction = extract_server_block(source);
+
+    if extraction.server_fns.is_empty() {
+        let compiled = compile_treaty_file(&extraction.client_source, file_name);
+        return CompiledAuthoring {
+            code: compiled.code,
+            server_module: None,
+            errors: compiled.errors,
+        };
+    }
+
+    // Rewrite free references to each server fn into its Eden client call *in the client source*,
+    // before compilation, so the swap lands on the author's free `save(...)` identifier rather than
+    // a lowered `ctx.save(...)` member access in the emitted output.
+    let emit = ElysiaEdenPlugin.emit(&extraction.server_fns);
+    let client_source = rewrite_call_sites(&extraction.client_source, &emit.client_bindings);
+    let compiled = compile_treaty_file(&client_source, file_name);
+
+    CompiledAuthoring {
+        code: compiled.code,
+        server_module: Some(emit.server_module),
+        errors: compiled.errors,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests.
 // ---------------------------------------------------------------------------
@@ -750,6 +791,53 @@ import { Bar } from './bar';\n\
             code.contains("color:red"),
             "scss did not compile to `color:red`; got: {code}"
         );
+    }
+
+    #[test]
+    fn treaty_server_block_extracts_route_and_rewrites_call() {
+        // A `.treaty` SFC with a server block declaring `save`, a body that calls `save`, and a
+        // template. The compiled client must route the call through the Eden client (not the
+        // original fn), and a server module must carry the Elysia route for `save`.
+        let source = "import { User } from './user';\n\
+server {\n\
+  async function save(user: User) { return db.insert(user); }\n\
+}\n\
+function onClick(user) { return save(user); }\n\
+<div>{{ onClick }}</div>\n";
+
+        let out = compile_treaty_authoring(source, "form.treaty");
+
+        // Server module generated with the Elysia route for `save`.
+        let server_module = out.server_module.expect("expected a server module");
+        assert!(
+            server_module.contains(".post('/__server/save'"),
+            "no save route in server module; got: {server_module}"
+        );
+        assert!(
+            server_module.contains("new Elysia()"),
+            "no Elysia app in server module; got: {server_module}"
+        );
+
+        // The compiled client routes the call through the Eden client, not the original fn.
+        assert!(
+            out.code.contains("client.__server.save.post"),
+            "call not rewritten to eden client; got: {}",
+            out.code
+        );
+        // The server fn body never reaches the client bundle.
+        assert!(
+            !out.code.contains("db.insert"),
+            "server body leaked into client; got: {}",
+            out.code
+        );
+    }
+
+    #[test]
+    fn treaty_without_server_block_has_no_server_module() {
+        let source = "const name = 'World';\n<div>{{ name }}</div>";
+        let out = compile_treaty_authoring(source, "greeting.treaty");
+        assert!(out.server_module.is_none(), "unexpected server module");
+        assert!(out.code.contains(DEFINE), "no defineComponent; got: {}", out.code);
     }
 
     #[test]
