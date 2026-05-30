@@ -53,7 +53,7 @@ export function defineTreatyLib(
 
 	return {
 		lib,
-		plugins: [treatyRsbuildPlugin(options.compiler ?? {})],
+		plugins: [treatyRsbuildPlugin({ ...(options.compiler ?? {}), prewarm: options.prewarm })],
 		output: {
 			externals,
 			target,

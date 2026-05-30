@@ -23,6 +23,7 @@ export {
 
 export type {
 	DefineTreatyLibOptions,
+	TreatyRslibPluginOptions,
 	TreatyRslibConfig,
 	TreatyRsbuildConfigSlice,
 	TreatyLibFormatEntry,

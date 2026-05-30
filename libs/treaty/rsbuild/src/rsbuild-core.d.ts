@@ -88,6 +88,12 @@ declare module '@rsbuild/core' {
 		modifyRsbuildConfig(
 			modifier: (config: RsbuildConfig) => RsbuildConfig | void | Promise<RsbuildConfig | void>
 		): void
+		/**
+		 * Cold-build hook: invoked once before a production build starts (not for
+		 * the dev server). Optional in this declaration so the plugin only batch-
+		 * prewarms when the host's rsbuild actually provides it.
+		 */
+		onBeforeBuild?(callback: () => void | Promise<void>): void
 	}
 
 	/** An Rsbuild plugin: a named object with a `setup(api)` entry point. */

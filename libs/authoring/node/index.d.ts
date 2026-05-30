@@ -7,6 +7,23 @@ export interface CompiledComponent {
   code: string
   errors: string[]
 }
+export interface CompiledAuthoring {
+  code: string
+  serverModule?: string
+  errors: string[]
+}
 export function compileComponent(template: string, selector: string, className: string): CompiledComponent
 export function compileComponentSource(source: string): CompiledComponent
 export function compileTreatyFile(source: string, fileName: string): CompiledComponent
+export function compile(source: string, fileName: string): CompiledAuthoring
+export interface AuthoringFile {
+  id: string
+  code: string
+}
+export interface CompiledAuthoringEntry {
+  id: string
+  code: string
+  serverModule?: string
+  errors: string[]
+}
+export function compileMany(files: Array<AuthoringFile>): Array<CompiledAuthoringEntry>

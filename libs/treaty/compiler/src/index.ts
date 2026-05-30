@@ -13,6 +13,7 @@
 export { TreatyCompiler, createTreatyCompiler, TreatyCompileError, classify } from './compiler.js'
 
 export type {
+	TransformInput,
 	TransformResult,
 	TreatyCompilerOptions,
 	TreatyFileKind,
@@ -29,5 +30,16 @@ export {
 	dropUnusedServerFns,
 } from './treeshake.js'
 
-export type { CompiledComponent } from './addon.js'
-export { compileTreaty, compileSource, compileTemplate } from './addon.js'
+export type {
+	CompiledComponent,
+	CompiledAuthoring,
+	CompiledAuthoringEntry,
+	AuthoringFile,
+} from './addon.js'
+export {
+	compileTreaty,
+	compileSource,
+	compileUnifiedSource,
+	compileMany,
+	compileTemplate,
+} from './addon.js'

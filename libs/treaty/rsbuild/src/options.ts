@@ -36,6 +36,17 @@ export interface TreatyPluginOptions extends TreatyCompilerOptions {
 	 * {@link TREATY_EXTENSIONS}.
 	 */
 	readonly extensions?: readonly string[]
+	/**
+	 * Cold-build prewarm: absolute paths to owned authoring files to batch-compile
+	 * up front via the core's `transformMany` (one parallel round trip through the
+	 * Rust addon). Wired to rsbuild's `onBeforeBuild` cold-build hook when the host
+	 * exposes it, so the per-module loader/transform calls during the build are
+	 * served from the cache. No-op for the dev server or when the list is empty.
+	 *
+	 * rsbuild's transform/loader pipeline is pull-based per module with no hook
+	 * that hands the plugin the full owned-file set, so this batch path is opt-in.
+	 */
+	readonly prewarm?: readonly string[]
 }
 
 /** Split plugin options into the compiler core options it forwards. */

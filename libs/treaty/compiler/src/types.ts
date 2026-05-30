@@ -18,10 +18,27 @@ export interface TransformResult {
 	/** Serialized source map (JSON string), when one is available. */
 	readonly map?: string
 	/**
+	 * Extracted server-side module source, when the authoring file declared
+	 * server functions. Produced by the unified front-end; absent for files with
+	 * no server fns. Bundler plugins may emit this as a sibling module.
+	 */
+	readonly serverModule?: string
+	/**
 	 * Tree-shaking hint for bundlers: pure component modules have no
 	 * import-time side effects, so unused exports may be dropped.
 	 */
 	readonly sideEffects: boolean
+}
+
+/**
+ * One file in a batch transform: its bundler id (path/url) and source text.
+ * Mirrors the two arguments of the per-file `transform(id, code)`.
+ */
+export interface TransformInput {
+	/** Module id (path or url), used for routing, diagnostics, and caching. */
+	readonly id: string
+	/** Full source text of the module. */
+	readonly code: string
 }
 
 /** Options accepted by the {@link TreatyCompiler} factory. */

@@ -20,7 +20,8 @@
  * — it only routes matched modules to `@treaty/compiler`.
  */
 
-import { createTreatyCompiler } from '@treaty/compiler'
+import { readFile } from 'node:fs/promises'
+import { createTreatyCompiler, type TransformInput, type TreatyCompiler } from '@treaty/compiler'
 import type {
 	RsbuildConfig,
 	RsbuildPlugin,
@@ -51,6 +52,23 @@ function mergeExtensions(existing: string[] | undefined, add: readonly string[])
 }
 
 /**
+ * Batch-prewarm the configured cold-build files through `transformMany` so the
+ * per-module transform/loader passes that follow are cache hits. Unreadable
+ * entries are skipped — the per-module path surfaces any real error.
+ */
+async function prewarm(compiler: TreatyCompiler, files: readonly string[]): Promise<void> {
+	const inputs: TransformInput[] = []
+	for (const file of files) {
+		try {
+			inputs.push({ id: file, code: await readFile(file, 'utf8') })
+		} catch {
+			// Missing/unreadable prewarm entry: skip; per-module transform will error.
+		}
+	}
+	if (inputs.length > 0) compiler.transformMany(inputs)
+}
+
+/**
  * Create the Treaty Rsbuild plugin.
  *
  * @param options - Typed plugin options (see {@link TreatyPluginOptions}). All
@@ -61,6 +79,7 @@ export function pluginTreaty(options: TreatyPluginOptions = {}): RsbuildPlugin {
 	const test = options.include ?? DEFAULT_TEST
 	const extensions = options.extensions ?? TREATY_EXTENSIONS
 	const coreOptions = toCompilerOptions(options)
+	const prewarmFiles = options.prewarm ?? []
 
 	return {
 		name: PLUGIN_NAME,
@@ -74,6 +93,10 @@ export function pluginTreaty(options: TreatyPluginOptions = {}): RsbuildPlugin {
 			// Strategy 1: the first-class transform hook.
 			if (typeof api.transform === 'function') {
 				const compiler = createTreatyCompiler(coreOptions)
+				// Cold-build batch prewarm (opt-in), when the host exposes the hook.
+				if (prewarmFiles.length > 0 && typeof api.onBeforeBuild === 'function') {
+					api.onBeforeBuild(() => prewarm(compiler, prewarmFiles))
+				}
 				api.transform({ test }, ({ code, resourcePath }) => {
 					const result = compiler.transform(resourcePath, code)
 					return result ? { code: result.code, map: result.map } : { code }

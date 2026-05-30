@@ -47,7 +47,8 @@ impl AuthoringPlugin for TreatySfcPlugin {
     }
 }
 
-/// The JSX authoring plugin (`.tsx` / `.tjsx`). Delegates to [`crate::jsx::compile`].
+/// The JSX authoring plugin (`.tsx` / `.tjsx`). Delegates to [`crate::jsx::compile`], which handles
+/// both `@Component` JSX and BARE JSX (`export default function App() { return <div/> }`).
 pub struct JsxAuthoringPlugin;
 
 impl AuthoringPlugin for JsxAuthoringPlugin {
@@ -61,6 +62,26 @@ impl AuthoringPlugin for JsxAuthoringPlugin {
 
     fn compile(&self, source: &str, file_name: &str) -> CompiledAuthoring {
         crate::jsx::compile(source, file_name)
+    }
+}
+
+/// The base-Angular `.ts` plugin. Delegates to [`crate::angular_source::compile_angular_source`],
+/// which compiles `@Component` classes to `ɵɵdefineComponent` (server-block aware) and passes
+/// through every other `.ts` shape (`@Directive` / `@Pipe` / `@Injectable` / `@NgModule`, or a plain
+/// non-Angular module) unchanged.
+pub struct AngularSourcePlugin;
+
+impl AuthoringPlugin for AngularSourcePlugin {
+    fn name(&self) -> &str {
+        "angular"
+    }
+
+    fn extensions(&self) -> &[&str] {
+        &["ts"]
+    }
+
+    fn compile(&self, source: &str, file_name: &str) -> CompiledAuthoring {
+        crate::angular_source::compile_angular_source(source, file_name)
     }
 }
 
@@ -84,6 +105,7 @@ impl AuthoringRegistry {
         let mut registry = Self::new();
         registry.register(Box::new(TreatySfcPlugin));
         registry.register(Box::new(JsxAuthoringPlugin));
+        registry.register(Box::new(AngularSourcePlugin));
         registry
     }
 
@@ -119,6 +141,42 @@ impl AuthoringRegistry {
 impl Default for AuthoringRegistry {
     fn default() -> Self {
         Self::with_defaults()
+    }
+}
+
+/// The lowercase file extension of `file_name` (without the leading dot), if any. `"app.component.ts"`
+/// → `"ts"`; `"Counter.tsx"` → `"tsx"`; a name with no `.` → `None`.
+fn extension_of(file_name: &str) -> Option<String> {
+    let base = file_name.rsplit(['/', '\\']).next().unwrap_or(file_name);
+    base.rsplit_once('.')
+        .map(|(_, ext)| ext.to_ascii_lowercase())
+        .filter(|ext| !ext.is_empty())
+}
+
+/// The single unified per-file authoring entry the NAPI addon calls.
+///
+/// Resolves the [`AuthoringPlugin`] that owns `file_name`'s extension via
+/// [`AuthoringRegistry::with_defaults`] and compiles `source` through it:
+///   * `.treaty` → [`TreatySfcPlugin`]
+///   * `.tsx` / `.tjsx` → [`JsxAuthoringPlugin`] (handles BARE JSX as well as `@Component` JSX)
+///   * `.ts` → [`AngularSourcePlugin`] (the base-Angular path)
+///
+/// A file whose extension no plugin claims is treated as opaque source and passed through unchanged
+/// (no compile, no diagnostics) so the bundler always receives a usable module — the same faithful
+/// pass-through the base-Angular path applies to non-Angular `.ts`.
+pub fn compile_file(source: &str, file_name: &str) -> CompiledAuthoring {
+    let registry = AuthoringRegistry::with_defaults();
+    match extension_of(file_name).and_then(|ext| {
+        registry
+            .for_extension(&ext)
+            .map(|plugin| plugin.compile(source, file_name))
+    }) {
+        Some(compiled) => compiled,
+        None => CompiledAuthoring {
+            code: source.to_string(),
+            server_module: None,
+            errors: Vec::new(),
+        },
     }
 }
 
@@ -179,5 +237,51 @@ mod tests {
             .compile(source, "app.tsx");
         assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
         assert!(out.code.contains(DEFINE), "no defineComponent; got: {}", out.code);
+    }
+
+    #[test]
+    fn for_extension_ts_resolves_angular_plugin() {
+        let registry = AuthoringRegistry::with_defaults();
+        assert_eq!(registry.for_extension("ts").map(|p| p.name()), Some("angular"));
+    }
+
+    #[test]
+    fn compile_file_bare_jsx_tsx_compiles_to_define_component() {
+        // The headline gap this closes: BARE JSX (no `@Component`) compiles to a `defineComponent`
+        // through the unified per-file entry by routing `.tsx` to the JSX plugin.
+        let source = "export default function App() {\n  const x = 1;\n  return <div>{x}</div>;\n}\n";
+        let out = compile_file(source, "App.tsx");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        assert!(out.code.contains(DEFINE), "no defineComponent; got: {}", out.code);
+        assert!(out.code.contains("App_Template"), "no template fn; got: {}", out.code);
+    }
+
+    #[test]
+    fn compile_file_treaty_routes_to_treaty_plugin() {
+        // A `.treaty` file routes to the SFC plugin and compiles to a `defineComponent`, matching the
+        // direct `compile_treaty_authoring` output (proving the route is a thin delegation).
+        let source = "const name = 'World';\n<div>{{ name }}</div>";
+        let out = compile_file(source, "greeting.treaty");
+        let direct = crate::sfc::compile_treaty_authoring(source, "greeting.treaty");
+        assert_eq!(out, direct, "compile_file diverged from direct treaty compile");
+        assert!(out.code.contains(DEFINE), "no defineComponent; got: {}", out.code);
+    }
+
+    #[test]
+    fn compile_file_plain_ts_passes_through_unchanged() {
+        // A plain non-Angular `.ts` passes through verbatim, no errors, no server module.
+        let source = "export const greet = (n: string) => `hi ${n}`;\n";
+        let out = compile_file(source, "util.ts");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        assert!(out.server_module.is_none(), "unexpected server module");
+        assert_eq!(out.code, source, "plain .ts was not passed through unchanged");
+    }
+
+    #[test]
+    fn compile_file_unknown_extension_passes_through_unchanged() {
+        let source = "{ \"a\": 1 }\n";
+        let out = compile_file(source, "data.json");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        assert_eq!(out.code, source, "unknown extension was not passed through unchanged");
     }
 }

@@ -11,12 +11,18 @@
  *   5. transform() returns null for files Treaty does not own (plain .js),
  *   6. the config() hook teaches esbuild the .tjsx loader,
  *   7. handleHotUpdate on a deleted owned file returns affected modules and
- *      drives the core onDelete (dependent re-evaluation).
+ *      drives the core onDelete (dependent re-evaluation),
+ *   8. a BARE-JSX .tsx (export default returning JSX, no @Component) lowers to Ivy,
+ *   9. the cold-build prewarm runs transformMany in buildStart so the per-file
+ *      transform that follows is a cache hit (and is a no-op in dev).
  *
  * Run: node libs/treaty/vite/test/vite.smoke.mjs
  */
 
 import assert from 'node:assert/strict'
+import { mkdtempSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import treaty from '../dist/index.js'
 
 let failures = 0
@@ -81,6 +87,14 @@ await check('transform(.tsx @Component) -> defineComponent', () => {
 	assert.ok(out.code.includes('defineComponent'), 'emitted Ivy JS must contain defineComponent')
 })
 
+// 4b. BARE-JSX .tsx (no @Component) now lowers to Ivy via the unified front-end
+await check('transform(bare-JSX .tsx) -> defineComponent', () => {
+	const bare = 'export default function App() {\n  return <h1>bare jsx</h1>\n}\n'
+	const out = runTransform(bare, 'App.tsx')
+	assert.ok(out, 'bare JSX must compile (no longer rejected)')
+	assert.ok(out.code.includes('defineComponent'), 'bare JSX must lower to Ivy JS')
+})
+
 // 5. unowned files return null
 await check('unowned files return null', () => {
 	assert.equal(runTransform('export const a = 1\n', 'util.js'), null, 'plain .js => null')
@@ -132,6 +146,43 @@ await check('handleHotUpdate on delete drives onDelete and returns modules', asy
 		resolved.includes(dependentModule),
 		'the dependent (y.tsx) is reported via core onDelete'
 	)
+})
+
+// 8. cold-build prewarm: buildStart batch-compiles listed files so the
+//    subsequent per-file transform is a cache hit.
+await check('cold-build prewarm warms the cache via transformMany', async () => {
+	const dir = mkdtempSync(join(tmpdir(), 'treaty-vite-prewarm-'))
+	const file = join(dir, 'Warm.tsx')
+	const code = 'export default () => <section>warm</section>\n'
+	writeFileSync(file, code, 'utf8')
+
+	const p = treaty({ prewarm: [file] })
+	// Mark this as a build (cold) so prewarm is allowed to run.
+	p.configResolved.call({}, { command: 'build', mode: 'production' })
+	// buildStart reads the prewarm files and runs transformMany.
+	const started = p.buildStart.call({})
+	if (started instanceof Promise) await started
+
+	// The very first transform of the prewarmed file must come back lowered.
+	const out = p.transform.call({}, code, file)
+	assert.ok(out, 'prewarmed file transforms to a result')
+	assert.ok(out.code.includes('defineComponent'), 'prewarmed bare JSX lowered to Ivy')
+})
+
+// 9. prewarm is a no-op in dev (serve): buildStart does nothing, transform still works.
+await check('prewarm is a no-op for the dev server', async () => {
+	const dir = mkdtempSync(join(tmpdir(), 'treaty-vite-dev-'))
+	const file = join(dir, 'Dev.tsx')
+	const code = 'export default () => <nav>dev</nav>\n'
+	writeFileSync(file, code, 'utf8')
+
+	const p = treaty({ prewarm: [file] })
+	p.configResolved.call({}, { command: 'serve', mode: 'development' })
+	const started = p.buildStart.call({})
+	if (started instanceof Promise) await started
+	// Even without prewarming, the per-file transform still lowers correctly.
+	const out = p.transform.call({}, code, file)
+	assert.ok(out && out.code.includes('defineComponent'), 'dev per-file transform still works')
 })
 
 for (const line of results) console.log(line)

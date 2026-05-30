@@ -10,9 +10,27 @@
  * Rust authoring compiler reached through {@link ./addon}. This module only
  * decides which addon entry point a given file id routes to, caches the result,
  * and applies dead-code annotations.
+ *
+ * Source files (`.tsx`/`.tjsx` and `@Component` `.ts`) route through the unified
+ * authoring front-end, so BARE JSX (`export default` returning JSX with no
+ * `@Component`) lowers to Ivy alongside decorated classes. `.treaty` files keep
+ * their dedicated single-file-component entry point.
+ *
+ * Cold builds can lower a whole batch in one round trip via
+ * {@link TreatyCompiler.transformMany}, which fans the work out across the Rust
+ * addon's parallel `compileMany` and applies the same cache + dead-code metadata
+ * per file (so any already-cached file skips the batch).
  */
 
-import { compileSource, compileTreaty, type CompiledComponent } from './addon.js'
+import {
+	compileMany,
+	compileSource,
+	compileTreaty,
+	compileUnifiedSource,
+	type AuthoringFile,
+	type CompiledAuthoring,
+	type CompiledAuthoringEntry,
+} from './addon.js'
 import { contentHash, IncrementalCache, type CacheStats } from './cache.js'
 import {
 	annotatePureFactories,
@@ -20,7 +38,12 @@ import {
 	PURE_MODULE,
 	type SideEffectsDescriptor,
 } from './treeshake.js'
-import type { TransformResult, TreatyCompilerOptions, TreatyFileKind } from './types.js'
+import type {
+	TransformInput,
+	TransformResult,
+	TreatyCompilerOptions,
+	TreatyFileKind,
+} from './types.js'
 
 /** Error raised when the Rust compiler reports one or more diagnostics. */
 export class TreatyCompileError extends Error {
@@ -51,6 +74,18 @@ export function classify(id: string): TreatyFileKind | null {
  */
 function isAngularComponentSource(code: string): boolean {
 	return /@Component\s*\(/.test(code)
+}
+
+/**
+ * The unified JSX front-end (used for `.tsx`/`.tjsx`) requires the module to
+ * declare a JSX component (a default-export or named function/arrow returning
+ * JSX). A `.tsx` that instead carries a classic `@Component` class with a string
+ * `template` (and no JSX return) produces this specific diagnostic. We detect it
+ * so such files can fall back to the `@Component`-source entry point rather than
+ * failing the build — preserving both bare-JSX and `@Component`-in-`.tsx` support.
+ */
+function isMissingJsxComponentError(errors: readonly string[]): boolean {
+	return errors.some((e) => /no component .*returning JSX.* found/i.test(e))
 }
 
 /** The file-by-file Treaty compiler shared by every bundler plugin. */
@@ -108,29 +143,151 @@ export class TreatyCompiler {
 			throw new TreatyCompileError(id, compiled.errors)
 		}
 
-		const result = this.postProcess(compiled.code)
+		return this.finishLower(id, compiled, code, hash)
+	}
+
+	/**
+	 * Batch transform for COLD builds: lower many files in a single round trip
+	 * through the Rust addon's parallel `compileMany`. Designed for the initial
+	 * build pass where a bundler hands the compiler its whole owned-file set at
+	 * once.
+	 *
+	 * Behaviour mirrors {@link transform} exactly, per file:
+	 *   - files this compiler does not own (extension/`@Component` screen) yield a
+	 *     `null` result in the returned array, in input order;
+	 *   - `.treaty` files are lowered through their dedicated entry point (they are
+	 *     not part of the unified source batch) so routing stays identical to the
+	 *     per-file path;
+	 *   - already-cached files (byte-identical content for the same id) are served
+	 *     from the cache and SKIP the batch entirely;
+	 *   - the same dead-code / pure annotations and dependents indexing are applied;
+	 *   - results are cached so a subsequent {@link transform} is a hit.
+	 *
+	 * @throws {TreatyCompileError} for the first file the Rust compiler reports
+	 *   diagnostics on (matching {@link transform}'s fail-fast contract).
+	 */
+	transformMany(files: readonly TransformInput[]): (TransformResult | null)[] {
+		const out: (TransformResult | null)[] = new Array(files.length).fill(null)
+		// Files to lower through the unified parallel batch, with their slot index.
+		const batch: { index: number; id: string; code: string; hash: string }[] = []
+		const sources: AuthoringFile[] = []
+
+		for (let i = 0; i < files.length; i++) {
+			const { id, code } = files[i]!
+			const kind = classify(id)
+			if (kind === null) continue
+			if (kind === 'component' && !isAngularComponentSource(code)) continue
+
+			const hash = contentHash(code)
+			// Cache hit: serve and skip the batch, exactly like transform().
+			if (this.cacheEnabled) {
+				const cached = this.cache.get(id, hash)
+				if (cached !== undefined) {
+					out[i] = cached
+					continue
+				}
+			}
+
+			if (kind === 'treaty') {
+				// `.treaty` is not part of the unified source batch; lower in place
+				// so routing matches the single-file path.
+				const compiled = this.lower(id, kind, code)
+				if (compiled.errors.length > 0) {
+					throw new TreatyCompileError(id, compiled.errors)
+				}
+				out[i] = this.finishLower(id, compiled, code, hash)
+				continue
+			}
+
+			batch.push({ index: i, id, code, hash })
+			sources.push({ id, code })
+		}
+
+		if (sources.length > 0) {
+			const compiled: CompiledAuthoringEntry[] = compileMany(sources)
+			for (let b = 0; b < batch.length; b++) {
+				const slot = batch[b]!
+				let entry: CompiledAuthoring = compiled[b]!
+				// Mirror the per-file `.tsx` fallback: a batched JSX module that is
+				// really an `@Component` class retries via the `@Component`-source path.
+				if (
+					entry.errors.length > 0 &&
+					isMissingJsxComponentError(entry.errors) &&
+					isAngularComponentSource(slot.code)
+				) {
+					entry = compileSource(slot.code)
+				}
+				if (entry.errors.length > 0) {
+					throw new TreatyCompileError(slot.id, entry.errors)
+				}
+				out[slot.index] = this.finishLower(slot.id, entry, slot.code, slot.hash)
+			}
+		}
+
+		return out
+	}
+
+	/**
+	 * Post-process a freshly lowered result and commit it: apply dead-code
+	 * annotations, record import dependents, and store in the incremental cache.
+	 * Shared by the per-file and batch paths so they stay byte-identical.
+	 */
+	private finishLower(
+		id: string,
+		compiled: CompiledAuthoring,
+		code: string,
+		hash: string
+	): TransformResult {
+		const result = this.postProcess(compiled)
 		this.recordDependents(id, code)
 		if (this.cacheEnabled) this.cache.set(id, hash, result)
 		return result
 	}
 
 	/** Route to the correct addon entry point for the file kind. */
-	private lower(id: string, kind: TreatyFileKind, code: string): CompiledComponent {
+	private lower(id: string, kind: TreatyFileKind, code: string): CompiledAuthoring {
 		switch (kind) {
 			case 'treaty':
 				return compileTreaty(code, id)
 			case 'jsx':
+				// Unified front-end: bare JSX (`export default`/named fn returning
+				// JSX) lowers to Ivy. A `.tsx`/`.tjsx` that is actually a classic
+				// `@Component` class (string template, no JSX) is not a JSX module —
+				// fall back to the `@Component`-source path so it still compiles.
+				return this.lowerJsx(id, code)
 			case 'component':
-				return compileSource(code)
+				// `.ts` `@Component`: the unified front-end routes by extension to the
+				// `@Component` path, so this handles it directly.
+				return compileUnifiedSource(code, id)
 		}
 	}
 
+	/**
+	 * Lower a `.tsx`/`.tjsx` module. Tries the unified JSX front-end first (so
+	 * bare JSX lowers to Ivy); if it reports only the "no JSX component" diagnostic
+	 * and the source carries an `@Component`, retries via the `@Component`-source
+	 * entry point. Any other diagnostic is returned as-is for the caller to throw.
+	 */
+	private lowerJsx(id: string, code: string): CompiledAuthoring {
+		const jsx = compileUnifiedSource(code, id)
+		if (
+			jsx.errors.length > 0 &&
+			isMissingJsxComponentError(jsx.errors) &&
+			isAngularComponentSource(code)
+		) {
+			return compileSource(code)
+		}
+		return jsx
+	}
+
 	/** Apply tree-shaking annotations to emitted Ivy JS. */
-	private postProcess(code: string): TransformResult {
-		let out = code
+	private postProcess(compiled: CompiledAuthoring): TransformResult {
+		let out = compiled.code
 		if (this.dropServerFns) out = dropUnusedServerFns(out)
 		if (this.annotatePure) out = annotatePureFactories(out)
-		return { code: out, sideEffects: false }
+		return compiled.serverModule !== undefined
+			? { code: out, serverModule: compiled.serverModule, sideEffects: false }
+			: { code: out, sideEffects: false }
 	}
 
 	/** Index the importers a module references, for {@link onDelete}. */

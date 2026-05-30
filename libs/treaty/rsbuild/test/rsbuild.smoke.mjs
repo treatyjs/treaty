@@ -8,7 +8,10 @@
  *      api hooks (modifyRsbuildConfig + transform, or the tools.rspack
  *      fallback) and that resolve.extensions gets the Treaty extensions;
  *   2. a direct core transform of a trivial `.treaty` string yields Ivy JS
- *      (contains `defineComponent`) — proving the wired-in compiler works.
+ *      (contains `defineComponent`) — proving the wired-in compiler works;
+ *   3. the transform handler lowers BARE JSX (.tsx with no @Component) to Ivy JS;
+ *   4. the cold-build prewarm wires an onBeforeBuild callback when the host
+ *      exposes it, and is left untouched otherwise.
  *
  * Run: node libs/treaty/rsbuild/test/rsbuild.smoke.mjs
  */
@@ -121,6 +124,53 @@ check('falls back to tools.rspack module rule when transform is absent', () => {
 check('loader lowers .treaty to Ivy JS', () => {
 	const out = treatyLoader.call({ resourcePath: 'logo.treaty' }, '<div>hi</div>\n')
 	assert.ok(out.includes('defineComponent'), 'loader output must contain defineComponent')
+})
+
+// 5b. the transform handler lowers a BARE-JSX .tsx (no @Component) to Ivy JS
+check('transform handler lowers bare-JSX .tsx to Ivy JS', () => {
+	const plugin = pluginTreaty()
+	let handler = null
+	plugin.setup({
+		transform(_descriptor, h) {
+			handler = h
+		},
+		modifyRsbuildConfig() {},
+	})
+	const bare = 'export default function App() {\n  return <main>bare</main>\n}\n'
+	const out = handler({ code: bare, resourcePath: 'App.tsx', resource: 'App.tsx' })
+	assert.ok(out && typeof out.code === 'string', 'handler returns { code } for bare JSX')
+	assert.ok(out.code.includes('defineComponent'), 'bare JSX must lower to Ivy JS')
+})
+
+// 5c. cold-build prewarm registers an onBeforeBuild callback when the host exposes it
+check('prewarm registers an onBeforeBuild cold-build callback', () => {
+	const plugin = pluginTreaty({ prewarm: ['ignored-missing.tsx'] })
+	let beforeBuild = null
+	plugin.setup({
+		transform() {},
+		modifyRsbuildConfig() {},
+		onBeforeBuild(cb) {
+			beforeBuild = cb
+		},
+	})
+	assert.equal(typeof beforeBuild, 'function', 'onBeforeBuild must be wired when prewarm is set')
+	// Running it with a missing file is a safe no-op (unreadable entries are skipped).
+	const ran = beforeBuild()
+	assert.ok(ran instanceof Promise, 'onBeforeBuild callback returns a promise')
+})
+
+// 5d. without prewarm, onBeforeBuild is left untouched
+check('no prewarm => onBeforeBuild is not registered', () => {
+	const plugin = pluginTreaty()
+	let registered = false
+	plugin.setup({
+		transform() {},
+		modifyRsbuildConfig() {},
+		onBeforeBuild() {
+			registered = true
+		},
+	})
+	assert.equal(registered, false, 'onBeforeBuild must not be used when no prewarm files are given')
 })
 
 // 6. direct core transform of a .treaty yields Ivy JS (proves the wiring works)

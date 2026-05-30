@@ -9,6 +9,9 @@
  *   2. options (formats, dts, bundle, target, externals) are honored,
  *   3. the wired rsbuild plugin registers a transform that lowers a .treaty
  *      string to Ivy JS containing `defineComponent`,
+ *   3b. the wired transform also lowers BARE JSX (.tsx with no @Component),
+ *   3c/3d. the cold-build prewarm wires an onBeforeBuild callback (via the plugin
+ *      and via defineTreatyLib),
  *   4. a non-component .ts is passed through unchanged by the transform,
  *   5. a direct core transform of a .treaty string yields Ivy JS.
  *
@@ -90,6 +93,45 @@ check('wired transform lowers .treaty to Ivy JS', () => {
 	const out = handler({ code: TREATY_SOURCE, resource: 'logo.treaty' })
 	assert.ok(out && typeof out === 'object', 'handler returns a transform output object')
 	assert.ok(out.code.includes('defineComponent'), 'emitted Ivy JS must contain defineComponent')
+})
+
+// 3b. the wired transform lowers a BARE-JSX .tsx (no @Component) to Ivy JS.
+check('wired transform lowers bare-JSX .tsx to Ivy JS', () => {
+	const plugin = treatyRsbuildPlugin()
+	let handler = null
+	plugin.setup({ transform(_d, fn) { handler = fn } })
+	const bare = 'export default () => <footer>bare</footer>\n'
+	const out = handler({ code: bare, resource: 'App.tsx' })
+	assert.ok(out && typeof out === 'object', 'bare JSX returns a transform output object')
+	assert.ok(out.code.includes('defineComponent'), 'bare JSX must lower to Ivy JS')
+})
+
+// 3c. prewarm wires an onBeforeBuild cold-build callback when the host exposes it.
+check('prewarm wires onBeforeBuild when available', () => {
+	const plugin = treatyRsbuildPlugin({ prewarm: ['missing.tsx'] })
+	let beforeBuild = null
+	plugin.setup({
+		transform() {},
+		onBeforeBuild(cb) {
+			beforeBuild = cb
+		},
+	})
+	assert.equal(typeof beforeBuild, 'function', 'onBeforeBuild must be wired when prewarm is set')
+	assert.ok(beforeBuild() instanceof Promise, 'callback returns a promise')
+})
+
+// 3d. defineTreatyLib forwards prewarm into the wired plugin.
+check('defineTreatyLib forwards prewarm to the plugin', () => {
+	const cfg = defineTreatyLib({ prewarm: ['x.tsx'] })
+	const plugin = cfg.plugins[0]
+	let beforeBuild = null
+	plugin.setup({
+		transform() {},
+		onBeforeBuild(cb) {
+			beforeBuild = cb
+		},
+	})
+	assert.equal(typeof beforeBuild, 'function', 'prewarm from defineTreatyLib reaches onBeforeBuild')
 })
 
 // 4. non-component .ts is passed through unchanged.

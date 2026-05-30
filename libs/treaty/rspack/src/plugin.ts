@@ -10,6 +10,15 @@
  * The plugin contains no compilation logic of its own — all lowering happens in
  * the loader, which delegates to the Rust authoring compiler via
  * `@treaty/compiler`. Treaty is a compiler, not a host.
+ *
+ * Batch vs. per-file: Rspack/webpack is a loader-based, pull pipeline — the loader
+ * is invoked once per module as the graph is walked, and there is no clean hook
+ * that hands a plugin the full set of owned source files up front. The core's
+ * batch `transformMany` therefore has no natural wiring point here, so this
+ * integration stays on the per-file loader path (which still shares one compiler
+ * instance per option set for incremental-cache reuse across the build). The
+ * batch path is wired in the bundlers that expose a cold-build hook (Vite's
+ * `buildStart`, rsbuild/rslib's `onBeforeBuild`).
  */
 
 import { loaderPath } from './loader.js'

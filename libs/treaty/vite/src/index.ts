@@ -13,9 +13,11 @@
  * incremental cache, and hot-update / deletion handling.
  */
 
+import { readFile } from 'node:fs/promises'
 import {
 	createTreatyCompiler,
 	classify,
+	type TransformInput,
 	type TreatyCompiler,
 	type TreatyCompilerOptions,
 } from '@treaty/compiler'
@@ -36,6 +38,21 @@ export interface PluginOptions extends TreatyCompilerOptions {
 	 * `tsx` loader (`.tsx` is already known to esbuild).
 	 */
 	readonly esbuildLoaders?: Readonly<Record<string, 'ts' | 'tsx' | 'js' | 'jsx'>>
+	/**
+	 * Cold-build prewarm: a list of absolute paths to owned authoring files to
+	 * batch-compile up front via the core's `transformMany` (one parallel round
+	 * trip through the Rust addon). Only runs for a one-shot `build` (not dev),
+	 * during `buildStart`. The results populate the incremental cache, so the
+	 * per-module `transform` calls Vite makes during the build are served as cache
+	 * hits instead of re-entering the compiler one file at a time.
+	 *
+	 * Vite/Rollup is a pull-based pipeline with no hook that hands the plugin the
+	 * full owned-file set, so this batch path is opt-in: pass the entry/owned
+	 * authoring files you want compiled eagerly. When omitted, the plugin uses
+	 * per-file `transform` only (the default, and the path used for incremental
+	 * dev rebuilds regardless of this option).
+	 */
+	readonly prewarm?: readonly string[]
 }
 
 /** The plugin name surfaced in Vite logs and the plugin pipeline. */
@@ -68,8 +85,11 @@ function isCandidate(id: string): boolean {
 export default function treaty(options: PluginOptions = {}): Plugin {
 	const emitSourceMap = options.sourceMap ?? true
 	const esbuildLoaders = options.esbuildLoaders ?? DEFAULT_ESBUILD_LOADERS
+	const prewarmFiles = options.prewarm ?? []
 
 	const compiler: TreatyCompiler = createTreatyCompiler(options)
+	// Set by configResolved; gates the cold-build-only prewarm in buildStart.
+	let isColdBuild = false
 
 	return {
 		name: PLUGIN_NAME,
@@ -98,9 +118,34 @@ export default function treaty(options: PluginOptions = {}): Plugin {
 		 * (where re-transforms are common) and the core's defaults otherwise.
 		 */
 		configResolved(resolved) {
-			// One-shot production builds gain nothing from the in-memory cache; clear
-			// it so a fresh build never serves a stale dev entry.
-			if (resolved.command === 'build') compiler.clearCache()
+			// One-shot production builds gain nothing from a stale in-memory cache;
+			// clear it so a fresh build never serves a stale dev entry. Also record
+			// that this is a cold build so `buildStart` may batch-prewarm.
+			isColdBuild = resolved.command === 'build'
+			if (isColdBuild) compiler.clearCache()
+		},
+
+		/**
+		 * Cold-build batch prewarm. On a one-shot `build`, read the configured
+		 * {@link PluginOptions.prewarm} files and lower them in a single
+		 * `transformMany` round trip so the per-module `transform` calls Vite makes
+		 * during the build are cache hits. No-op in dev or when nothing is listed —
+		 * incremental rebuilds always use per-file `transform`.
+		 */
+		async buildStart() {
+			if (!isColdBuild || prewarmFiles.length === 0) return
+			const inputs: TransformInput[] = []
+			for (const file of prewarmFiles) {
+				const id = cleanId(file)
+				if (!isCandidate(id)) continue
+				try {
+					inputs.push({ id, code: await readFile(file, 'utf8') })
+				} catch {
+					// A missing/unreadable prewarm entry is skipped; the per-file
+					// transform (or Vite's own resolver) will surface any real error.
+				}
+			}
+			if (inputs.length > 0) compiler.transformMany(inputs)
 		},
 
 		/**

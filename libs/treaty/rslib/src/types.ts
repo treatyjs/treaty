@@ -58,6 +58,12 @@ export interface TreatyRsbuildPluginApi {
 		descriptor: TreatyTransformDescriptor,
 		handler: TreatyTransformHandler
 	): void
+	/**
+	 * Optional cold-build hook (rsbuild/rslib `onBeforeBuild`). Declared optional
+	 * so the plugin only batch-prewarms when the host's rsbuild provides it; it is
+	 * absent on the minimal fake api the smoke tests use.
+	 */
+	onBeforeBuild?(callback: () => void | Promise<void>): void
 }
 
 /**
@@ -67,6 +73,21 @@ export interface TreatyRsbuildPluginApi {
 export interface TreatyRsbuildPlugin {
 	readonly name: string
 	setup(api: TreatyRsbuildPluginApi): void
+}
+
+/**
+ * Options accepted by {@link treatyRsbuildPlugin}: the core compiler knobs plus
+ * an optional cold-build prewarm list.
+ */
+export interface TreatyRslibPluginOptions extends TreatyCompilerOptions {
+	/**
+	 * Absolute paths to owned authoring files to batch-compile up front via the
+	 * core's `transformMany` (one parallel round trip through the Rust addon),
+	 * wired to rsbuild/rslib's `onBeforeBuild` cold-build hook when available. The
+	 * per-module transform passes that follow are then cache hits. No-op when the
+	 * list is empty or the host does not expose the hook.
+	 */
+	readonly prewarm?: readonly string[]
 }
 
 /**
@@ -137,4 +158,11 @@ export interface DefineTreatyLibOptions {
 	 * tree-shaking annotations, server-fn dropping).
 	 */
 	readonly compiler?: TreatyCompilerOptions
+	/**
+	 * Absolute paths to owned authoring files to batch-compile up front on a cold
+	 * library build via the core's `transformMany`. Forwarded to
+	 * {@link treatyRsbuildPlugin} and wired to `onBeforeBuild` when the host
+	 * exposes it; the per-module transforms that follow are then cache hits.
+	 */
+	readonly prewarm?: readonly string[]
 }

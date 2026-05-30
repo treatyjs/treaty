@@ -246,8 +246,10 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
-const { compileComponent, compileTreatyFile, compileComponentSource } = nativeBinding
+const { compileComponent, compileTreatyFile, compileComponentSource, compile, compileMany } = nativeBinding
 
 module.exports.compileComponent = compileComponent
 module.exports.compileTreatyFile = compileTreatyFile
 module.exports.compileComponentSource = compileComponentSource
+module.exports.compile = compile
+module.exports.compileMany = compileMany
