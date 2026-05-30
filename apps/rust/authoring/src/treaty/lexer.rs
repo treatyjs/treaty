@@ -176,43 +176,44 @@ impl<'a> Lexer<'a> {
     /// Parses an HTML segment.
     fn parse_html(&mut self) -> Option<Token> {
         let start_pos = self.pos;
-        let mut tag_stack = Vec::new();
+        let mut tag_stack: Vec<String> = Vec::new();
 
-        while let Some(ch) = self.current_char {
+        while self.current_char.is_some() {
             self.consume_whitespace();
+            // Re-read the current character after consuming whitespace; it must not be the value
+            // captured at the top of the loop (that goes stale once whitespace is skipped).
+            let Some(ch) = self.current_char else { break };
             if ch == '<' {
                 if self.starts_with("<!--") {
                     self.consume_html_comment();
-                    continue;
                 } else if self.starts_with("</") {
                     self.advance_by(2); // Skip '</'
                     let tag_name = self.consume_tag_name();
-                    if let Some(expected_tag) = tag_stack.pop() {
-                        if tag_name != expected_tag {
+                    let expected_tag = tag_stack.pop();
+                    if let Some(expected_tag) = &expected_tag {
+                        if &tag_name != expected_tag {
                             // Handle mismatched tag (optional)
                         }
-                    } else {
-                        break;
                     }
                     self.consume_until('>'); // Skip until '>'
                     self.advance(); // Skip '>'
                     if tag_stack.is_empty() {
                         break;
                     }
-                } else if self.starts_with("<") {
+                } else {
                     self.advance(); // Skip '<'
                     let tag_name = self.consume_tag_name();
                     tag_stack.push(tag_name);
-                    self.consume_attributes(); // Handle attributes (optional)
-                } else {
-                    self.advance();
+                    // A self-closing tag (`<img ... />`) closes immediately; mirror the TS lexer
+                    // and pop it back off so it does not keep the HTML region open.
+                    if self.consume_attributes() {
+                        tag_stack.pop();
+                        if tag_stack.is_empty() {
+                            break;
+                        }
+                    }
                 }
-            }
-            // lets deal with html as we only have top level support for break down on lexer
-            // else if ch == '{' && self.starts_with("{{") {
-            //     break;
-            // }
-             else {
+            } else {
                 self.advance();
             }
         }
@@ -349,7 +350,7 @@ impl<'a> Lexer<'a> {
     /// Consumes a block comment.
     fn consume_block_comment(&mut self) {
         self.advance_by(2); // Skip '/*'
-        while let Some(ch) = self.current_char {
+        while self.current_char.is_some() {
             if self.starts_with("*/") {
                 self.advance_by(2); // Skip '*/'
                 break;
@@ -361,7 +362,7 @@ impl<'a> Lexer<'a> {
     /// Consumes an HTML comment.
     fn consume_html_comment(&mut self) {
         self.advance_by("<!--".len());
-        while let Some(ch) = self.current_char {
+        while self.current_char.is_some() {
             if self.starts_with("-->") {
                 self.advance_by("-->".len());
                 break;
@@ -397,7 +398,7 @@ impl<'a> Lexer<'a> {
                     self_closing = true;
                     break;
                 }
-                '\'' | '"' => self.consume_string(ch),
+                '\'' | '"' | '`' => self.consume_string(ch),
                 _ => self.advance(),
             }
         }

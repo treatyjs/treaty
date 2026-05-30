@@ -546,6 +546,62 @@ mod tests {
     }
 
     #[test]
+    fn compiles_realistic_sfc_layout() {
+        // The real REPL `.treaty` layout: a leading <style> CSS block, top-level JS
+        // (imports + const), an HTML template region with {{ }} interpolation, and
+        // trailing JS (console.log).
+        let source = "<style>\n  .name { color: purple; }\n</style>\n\
+import { input } from '@angular/core'\n\
+const name = input('name')\n\
+<div class=\"name\">{{ name() }}</div>\n\
+console.log('hi')\n";
+        let out = compile_treaty_file(source, "treat-example.treaty");
+
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+
+        // Valid, parseable ES module (no stray '<', no EOF errors).
+        let allocator = Allocator::default();
+        let module_type = SourceType::default().with_module(true);
+        let parsed = JsParser::new(&allocator, code, module_type).parse();
+        assert!(
+            parsed.errors.is_empty(),
+            "module did not parse as valid JS: {:?}\n--- code ---\n{code}",
+            parsed.errors
+        );
+
+        // The defineComponent definition is present.
+        assert!(code.contains(DEFINE), "no defineComponent; got: {code}");
+
+        // The user import is emitted at MODULE TOP, before the function wrapper — never inside it.
+        let import_idx = code
+            .find("import { input } from '@angular/core'")
+            .expect("user import missing");
+        let fn_idx = code.find("function TreatExample() {").expect("no fn wrapper");
+        assert!(
+            import_idx < fn_idx,
+            "user import is not above the function wrapper; got: {code}"
+        );
+        assert!(
+            !code.contains("function TreatExample() {\nimport"),
+            "import leaked into the function body; got: {code}"
+        );
+
+        // The JS *body* (inside the function wrapper) must contain no raw template markup.
+        let body = &code[fn_idx..];
+        let body = &body[..body.find("\nreturn {").unwrap_or(body.len())];
+        assert!(
+            !body.contains('<'),
+            "raw template markup leaked into JS body; got body: {body}"
+        );
+
+        // Template markup went to render3, and the trailing JS stayed in the body.
+        assert!(code.contains("ctx.name"), "template did not bind ctx.name; got: {code}");
+        assert!(body.contains("console.log('hi')"), "trailing JS missing from body; got: {code}");
+        assert!(code.contains("styles"), "no styles emitted; got: {code}");
+    }
+
+    #[test]
     fn compiles_treaty_file_with_styles() {
         let source = "<div>hi</div>\n<style>.box {\n color: red;\n}</style>";
         let out = compile_treaty_file(source, "boxed.treaty");
