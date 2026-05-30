@@ -81,6 +81,10 @@ the user has to configure:
 - **Schematics** (`@treaty/schematics`, `@angular-devkit/schematics`): `ng add @treaty` rewrites
   `angular.json` to the Treaty builders and scaffolds projects/libs **pre-wired as MF host + remotes**;
   `ng generate` app/lib schematics keep the federation structure out-of-the-box. Nothing to configure.
+  **Templates MINIMAL (user 2026-05-31):** generated components carry NO `selector`, no `standalone:
+  true`, no `signal()` boilerplate — the COMPILER fills in standalone + signal + selectorless during
+  compilation. Scaffolds rely on the compiler; fix the current schematic templates (they emit a stock
+  `selector`) accordingly.
 - **CLI** (`@treaty/cli`, bin `treaty`): the STANDALONE driver for projects WITHOUT `angular.json`
   (user 2026-05-30) — `treaty dev`/`build`/`generate` drive the bundler plugins + `@treaty/compiler`
   directly, no Angular workspace file. (It is NOT an `ng` wrapper; angular.json projects use `ng`
