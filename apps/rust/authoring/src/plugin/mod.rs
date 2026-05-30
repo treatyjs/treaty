@@ -25,11 +25,16 @@ use oxc_span::{GetSpan, SourceType};
 /// The two-word directive that marks a top-level function as server-only.
 const USE_SERVER_DIRECTIVE: &str = "use server";
 
+/// The directive that marks a server fn as a WebSocket transport (analogous to `'use server'`).
+const USE_WEBSOCKET_DIRECTIVE: &str = "use websocket";
+
 mod axum_backend;
 mod elysia;
+mod express;
 mod ts_to_rust;
 pub use axum_backend::AxumBackendPlugin;
 pub use elysia::ElysiaEdenPlugin;
+pub use express::ExpressBackendPlugin;
 
 // ---------------------------------------------------------------------------
 // Backend-agnostic data model.
@@ -41,6 +46,29 @@ pub use elysia::ElysiaEdenPlugin;
 pub struct ServerParam {
     pub name: String,
     pub ty: Option<String>,
+}
+
+/// How a server function is transported between client and server.
+///
+/// The kind is detected during extraction (see [`build_server_fn`]) and drives per-kind code
+/// generation in each backend:
+///   * [`TransportKind::Api`] — a plain request/response route (the historical default).
+///   * [`TransportKind::Stream`] — a server-push stream (axum SSE / streaming body, elysia stream
+///     handler). Detected when the fn is a generator (`function*` / `async function*`) or its body
+///     yields.
+///   * [`TransportKind::WebSocket`] — a bidirectional WebSocket upgrade. Detected when the fn carries
+///     a leading `'use websocket'` string directive (analogous to `'use server'`) or its name follows
+///     the `ws` convention (a `ws`-prefixed camelCase name such as `wsChat`, or a `ws_`-prefixed
+///     snake_case name such as `ws_chat`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TransportKind {
+    /// Plain request/response (the default).
+    #[default]
+    Api,
+    /// Bidirectional WebSocket upgrade.
+    WebSocket,
+    /// Server-push stream (SSE / streaming body).
+    Stream,
 }
 
 /// A server-only function lifted out of a `server { … }` block.
@@ -59,6 +87,9 @@ pub struct ServerFn {
     /// optional `server:IDENT { … }` block tag (e.g. `rust`, `ts`, `php`); defaults to `rust` for a
     /// bare `server { … }` block and for both top-level marker forms.
     pub lang: String,
+    /// The transport kind for this fn (see [`TransportKind`]), detected during extraction. Defaults
+    /// to [`TransportKind::Api`].
+    pub transport: TransportKind,
 }
 
 /// The default target language when no `server:IDENT` tag is given.
@@ -109,12 +140,15 @@ impl PluginRegistry {
     }
 
     /// A registry preloaded with the default [`AxumBackendPlugin`] (so a developer who never touches
-    /// Rust still gets a working axum service) plus the opt-in reference [`ElysiaEdenPlugin`]
-    /// (selectable by name). The first plugin registered is the default, so the axum backend is it.
+    /// Rust still gets a working axum service), plus the opt-in reference [`ElysiaEdenPlugin`] and
+    /// the opt-in [`ExpressBackendPlugin`] (both selectable by name). The first plugin registered is
+    /// the default, so the axum backend is it; express is registered last and selected by name
+    /// `"express"`.
     pub fn with_defaults() -> Self {
         let mut registry = Self::new();
         registry.register(Box::new(AxumBackendPlugin));
         registry.register(Box::new(ElysiaEdenPlugin));
+        registry.register(Box::new(ExpressBackendPlugin));
         registry
     }
 
@@ -548,8 +582,23 @@ fn build_server_fn(
                 return None;
             }
 
+            let has_ws_directive = func
+                .body
+                .as_deref()
+                .is_some_and(|body| has_leading_directive(body, USE_WEBSOCKET_DIRECTIVE));
+            let body_src = func
+                .body
+                .as_deref()
+                .map(|b| span_text(source, b.span))
+                .unwrap_or_default();
+            let transport =
+                detect_transport(&name, func.generator, has_ws_directive, &body_src);
+
             let span = (func.span.start as usize, func.span.end as usize);
+            // Strip the `'use server'` directive (by span) then the `'use websocket'` directive (by
+            // content) from the lifted source, so neither marker survives into the emitted body.
             let src = strip_directive(source, span, directive);
+            let src = strip_leading_directive_text(&src, USE_WEBSOCKET_DIRECTIVE);
 
             let params = collect_params(source, &func.params);
             let return_type = func.return_type.as_ref().map(|ann| span_text(source, ann.type_annotation.span()));
@@ -562,6 +611,7 @@ fn build_server_fn(
                     return_type,
                     is_async: func.r#async,
                     lang: lang.to_string(),
+                    transport,
                 },
                 span,
             ))
@@ -583,8 +633,15 @@ fn build_server_fn(
                 return None;
             }
 
+            let has_ws_directive = has_leading_directive(&arrow.body, USE_WEBSOCKET_DIRECTIVE);
+            let body_src = span_text(source, arrow.body.span);
+            // Arrow functions cannot be generators (`function*`), so generator detection rests on the
+            // body yielding (an arrow wrapping a generator body) plus the name/directive markers.
+            let transport = detect_transport(&name, false, has_ws_directive, &body_src);
+
             let span = (decl.span.start as usize, decl.span.end as usize);
             let src = strip_directive(source, span, directive);
+            let src = strip_leading_directive_text(&src, USE_WEBSOCKET_DIRECTIVE);
 
             let params = collect_params(source, &arrow.params);
             let return_type = arrow.return_type.as_ref().map(|ann| span_text(source, ann.type_annotation.span()));
@@ -597,6 +654,7 @@ fn build_server_fn(
                     return_type,
                     is_async: arrow.r#async,
                     lang: lang.to_string(),
+                    transport,
                 },
                 span,
             ))
@@ -621,6 +679,116 @@ fn leading_use_server_span(
     } else {
         None
     }
+}
+
+/// Does the function/arrow body begin with the bare `directive` string directive (e.g.
+/// `'use websocket'`)? OXC parses leading string-literal statements as `FunctionBody::directives`.
+fn has_leading_directive(body: &oxc_ast::ast::FunctionBody, directive: &str) -> bool {
+    body.directives
+        .iter()
+        .any(|d| d.expression.value.as_str() == directive)
+}
+
+/// Detect the [`TransportKind`] for a server fn from its name, generator flag, an explicit WebSocket
+/// directive, and its body text.
+///
+/// Precedence: an explicit WebSocket marker (a `'use websocket'` directive or a `ws` name convention)
+/// wins, then a streaming shape (a `function*` / `async function*` generator, or a body that
+/// `yield`s), otherwise [`TransportKind::Api`].
+fn detect_transport(name: &str, is_generator: bool, has_ws_directive: bool, body_src: &str) -> TransportKind {
+    if has_ws_directive || is_ws_name(name) {
+        TransportKind::WebSocket
+    } else if is_generator || body_yields(body_src) {
+        TransportKind::Stream
+    } else {
+        TransportKind::Api
+    }
+}
+
+/// Is `name` a WebSocket-convention name? Either a `ws`-prefixed camelCase name (`ws` followed by an
+/// uppercase letter, e.g. `wsChat`) or a `ws_`-prefixed snake_case name (e.g. `ws_chat`).
+fn is_ws_name(name: &str) -> bool {
+    if let Some(rest) = name.strip_prefix("ws_") {
+        return !rest.is_empty();
+    }
+    if let Some(rest) = name.strip_prefix("ws") {
+        return rest.chars().next().is_some_and(|c| c.is_ascii_uppercase());
+    }
+    false
+}
+
+/// Does `body_src` contain a `yield` keyword as a whole identifier outside strings/comments/templates?
+/// Used to classify an arrow/function body that yields as a [`TransportKind::Stream`] even when the
+/// generator star is not directly visible on the lifted node.
+fn body_yields(body_src: &str) -> bool {
+    let bytes = body_src.as_bytes();
+    let scanner = TextScanner::new(body_src);
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(next) = scanner.skip_noncode(i) {
+            i = next;
+            continue;
+        }
+        if is_ident_start(bytes[i]) && (i == 0 || !is_ident_byte(bytes[i - 1])) {
+            let mut j = i + 1;
+            while j < bytes.len() && is_ident_byte(bytes[j]) {
+                j += 1;
+            }
+            if &body_src[i..j] == "yield" {
+                return true;
+            }
+            i = j;
+            continue;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Remove a leading `'<directive>'` string-directive statement from already-sliced function source.
+///
+/// Operates on the lifted declaration text (not the original `source`), scanning for the first
+/// `{`-delimited body and, if its first non-whitespace statement is the quoted `directive`, excising
+/// that statement plus a trailing `;`, surrounding whitespace, and one newline. A no-op when the
+/// directive is absent.
+fn strip_leading_directive_text(src: &str, directive: &str) -> String {
+    let Some(open) = src.find('{') else {
+        return src.to_string();
+    };
+    let bytes = src.as_bytes();
+    let mut i = open + 1;
+    // Skip whitespace to the first statement.
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let stmt_start = i;
+    // The directive must appear as a single- or double-quoted string literal equal to `directive`.
+    for quote in [b'\'', b'"'] {
+        let lit = format!("{q}{directive}{q}", q = quote as char);
+        if src[stmt_start..].starts_with(&lit) {
+            let mut rel_end = stmt_start + lit.len();
+            if rel_end < bytes.len() && bytes[rel_end] == b';' {
+                rel_end += 1;
+            }
+            while rel_end < bytes.len() && (bytes[rel_end] == b' ' || bytes[rel_end] == b'\t') {
+                rel_end += 1;
+            }
+            if rel_end < bytes.len() && bytes[rel_end] == b'\r' {
+                rel_end += 1;
+            }
+            if rel_end < bytes.len() && bytes[rel_end] == b'\n' {
+                rel_end += 1;
+            }
+            let mut start = stmt_start;
+            while start > 0 && (bytes[start - 1] == b' ' || bytes[start - 1] == b'\t') {
+                start -= 1;
+            }
+            let mut out = src.to_string();
+            out.replace_range(start..rel_end, "");
+            return out;
+        }
+    }
+    src.to_string()
 }
 
 /// Slice the declaration `span` out of `source` and, if a `directive` span is present, remove that
@@ -987,6 +1155,81 @@ const greeting = 'hi';\n";
         let extraction = extract_server_block(source);
         assert_eq!(extraction.server_fns.len(), 1);
         assert_eq!(extraction.server_fns[0].lang, "rust");
+    }
+
+    #[test]
+    fn plain_server_fn_is_classified_api() {
+        let source = "server {\n\
+  async function save(user: User) { return db.insert(user); }\n\
+}\n";
+        let extraction = extract_server_block(source);
+        assert_eq!(extraction.server_fns.len(), 1);
+        assert_eq!(extraction.server_fns[0].transport, TransportKind::Api);
+    }
+
+    #[test]
+    fn async_generator_server_fn_is_classified_stream() {
+        // An `async function*` generator inside a server block is a streaming transport.
+        let source = "server {\n\
+  async function* ticks() { yield 1; yield 2; }\n\
+}\n";
+        let extraction = extract_server_block(source);
+        assert_eq!(extraction.server_fns.len(), 1, "expected one fn");
+        let f = &extraction.server_fns[0];
+        assert_eq!(f.name, "ticks");
+        assert_eq!(f.transport, TransportKind::Stream, "generator should be Stream");
+    }
+
+    #[test]
+    fn yielding_body_is_classified_stream() {
+        // A non-`*` declaration whose body yields is still treated as a stream.
+        let source = "server {\n\
+  function feed() { yield 1; }\n\
+}\n";
+        let extraction = extract_server_block(source);
+        assert_eq!(extraction.server_fns.len(), 1);
+        assert_eq!(extraction.server_fns[0].transport, TransportKind::Stream);
+    }
+
+    #[test]
+    fn use_websocket_directive_is_classified_websocket_and_stripped() {
+        let source = "server {\n\
+  function chat(msg: string) { 'use websocket'; return msg; }\n\
+}\n";
+        let extraction = extract_server_block(source);
+        assert_eq!(extraction.server_fns.len(), 1);
+        let f = &extraction.server_fns[0];
+        assert_eq!(f.transport, TransportKind::WebSocket, "ws directive should classify WebSocket");
+        assert!(
+            !f.source.contains("use websocket"),
+            "'use websocket' directive not stripped from lifted source; got: {}",
+            f.source
+        );
+    }
+
+    #[test]
+    fn ws_name_convention_is_classified_websocket() {
+        // A `ws`-prefixed camelCase name and a `ws_` snake_case name are both WebSocket.
+        let source = "server {\n\
+  function wsChat(msg: string) { return msg; }\n\
+  function ws_feed(n: number) { return n; }\n\
+}\n";
+        let extraction = extract_server_block(source);
+        let chat = extraction.server_fns.iter().find(|f| f.name == "wsChat").expect("wsChat");
+        let feed = extraction.server_fns.iter().find(|f| f.name == "ws_feed").expect("ws_feed");
+        assert_eq!(chat.transport, TransportKind::WebSocket);
+        assert_eq!(feed.transport, TransportKind::WebSocket);
+    }
+
+    #[test]
+    fn ws_substring_name_is_not_websocket() {
+        // `wsa` lowercase-after-prefix and `wash` are not the ws convention.
+        let source = "server {\n\
+  function wash(x: number) { return x; }\n\
+}\n";
+        let extraction = extract_server_block(source);
+        assert_eq!(extraction.server_fns.len(), 1);
+        assert_eq!(extraction.server_fns[0].transport, TransportKind::Api);
     }
 
     #[test]

@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 
-use super::{BackendEmit, BackendPlugin, ServerFn};
+use super::{BackendEmit, BackendPlugin, ServerFn, TransportKind};
 
 /// The URL namespace every lifted server function is mounted under, e.g. `save` -> `/__server/save`.
 const SERVER_ROUTE_PREFIX: &str = "/__server";
@@ -48,26 +48,114 @@ impl BackendPlugin for ElysiaEdenPlugin {
         //    arg, so the call shape matches the author's signature.
         server_module.push_str("export const app = new Elysia()\n");
         for f in fns {
-            let args = call_args(f);
-            server_module.push_str(&format!(
-                "  .post('{prefix}/{name}', ({{ body }}) => {name}({args}))\n",
-                prefix = SERVER_ROUTE_PREFIX,
-                name = f.name,
-            ));
+            match f.transport {
+                TransportKind::Api => {
+                    let args = call_args(f);
+                    server_module.push_str(&format!(
+                        "  .post('{prefix}/{name}', ({{ body }}) => {name}({args}))\n",
+                        prefix = SERVER_ROUTE_PREFIX,
+                        name = f.name,
+                    ));
+                }
+                TransportKind::Stream => {
+                    // A streaming GET route whose handler returns the async generator directly; Elysia
+                    // streams each yielded value to the client.
+                    let args = call_args(f);
+                    server_module.push_str(&format!(
+                        "  .get('{prefix}/{name}', ({{ body }}) => {name}({args}))\n",
+                        prefix = SERVER_ROUTE_PREFIX,
+                        name = f.name,
+                    ));
+                }
+                TransportKind::WebSocket => {
+                    // A ws upgrade route; the author body runs per-message in the `message` handler.
+                    let args = call_args(f);
+                    server_module.push_str(&format!(
+                        "  .ws('{prefix}/{name}', {{ message(ws, body) {{ ws.send({name}({args})); }} }})\n",
+                        prefix = SERVER_ROUTE_PREFIX,
+                        name = f.name,
+                    ));
+                }
+            }
         }
         server_module.push_str("  ;\n\n");
 
         // 3. Export the app type so Eden derives a fully typed client from it.
         server_module.push_str("export type App = typeof app;\n");
 
-        // Client bindings: a free call `save(arg)` becomes `client.__server.save.post(arg)`. The
-        // rewrite is identifier-aware, so it swaps the callee and leaves the argument list intact.
+        // Client bindings: a free call `save(arg)` becomes `client.__server.save.post(arg)` for Api;
+        // Stream fns subscribe via `.get.subscribe`, WebSocket fns open the Eden `.subscribe` socket.
+        // The rewrite is identifier-aware, so it swaps the callee and leaves the argument list intact.
         let mut client_bindings = HashMap::new();
         for f in fns {
-            client_bindings.insert(f.name.clone(), format!("client.__server.{}.post", f.name));
+            let binding = match f.transport {
+                TransportKind::Api => format!("client.__server.{}.post", f.name),
+                TransportKind::Stream => format!("client.__server.{}.get", f.name),
+                TransportKind::WebSocket => format!("client.__server.{}.subscribe", f.name),
+            };
+            client_bindings.insert(f.name.clone(), binding);
         }
 
         BackendEmit { server_module, client_bindings }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plugin::extract_server_block;
+
+    #[test]
+    fn stream_fn_emits_get_stream_route_and_binding() {
+        let source = "server:ts {\n\
+          async function* ticks() { yield 1; }\n\
+        }\n";
+        let extraction = extract_server_block(source);
+        assert_eq!(extraction.server_fns[0].transport, TransportKind::Stream);
+        let emit = ElysiaEdenPlugin.emit(&extraction.server_fns);
+        assert!(
+            emit.server_module.contains(".get('/__server/ticks'"),
+            "no stream GET route; got:\n{}",
+            emit.server_module
+        );
+        assert_eq!(
+            emit.client_bindings.get("ticks").map(String::as_str),
+            Some("client.__server.ticks.get")
+        );
+    }
+
+    #[test]
+    fn websocket_fn_emits_ws_route_and_binding() {
+        let source = "server:ts {\n\
+          function chat(msg: string) { 'use websocket'; return msg; }\n\
+        }\n";
+        let extraction = extract_server_block(source);
+        assert_eq!(extraction.server_fns[0].transport, TransportKind::WebSocket);
+        let emit = ElysiaEdenPlugin.emit(&extraction.server_fns);
+        assert!(
+            emit.server_module.contains(".ws('/__server/chat'"),
+            "no ws route; got:\n{}",
+            emit.server_module
+        );
+        assert_eq!(
+            emit.client_bindings.get("chat").map(String::as_str),
+            Some("client.__server.chat.subscribe")
+        );
+    }
+
+    #[test]
+    fn api_fn_emits_post_route_unchanged() {
+        let source = "server:ts {\n\
+          async function save(user: User) { return db.insert(user); }\n\
+        }\n";
+        let extraction = extract_server_block(source);
+        assert_eq!(extraction.server_fns[0].transport, TransportKind::Api);
+        let emit = ElysiaEdenPlugin.emit(&extraction.server_fns);
+        assert!(emit.server_module.contains(".post('/__server/save', ({ body }) => save(body))"));
+        assert_eq!(
+            emit.client_bindings.get("save").map(String::as_str),
+            Some("client.__server.save.post")
+        );
     }
 }
 

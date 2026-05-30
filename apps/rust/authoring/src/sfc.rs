@@ -45,7 +45,7 @@ use render3::view::compiler::{
     ViewEncapsulation,
 };
 
-use crate::plugin::{extract_server_block, rewrite_call_sites, BackendPlugin, ElysiaEdenPlugin};
+use crate::plugin::{extract_server_block, rewrite_call_sites, BackendEmit, PluginRegistry, ServerFn};
 use crate::treaty::ast::AstNode;
 use crate::treaty::lexer::Lexer;
 use crate::treaty::parser::Parser;
@@ -683,15 +683,33 @@ pub fn compile_from_parts_with_directives(
 /// This is the server-aware wrapper around [`compile_treaty_file`]:
 ///   1. [`extract_server_block`] lifts any `server { … }` block out of the source.
 ///   2. The cleaned `client_source` compiles through [`compile_treaty_file`].
-///   3. When server functions were present, the reference [`ElysiaEdenPlugin`] emits a server module
-///      + client bindings, and [`rewrite_call_sites`] rewrites free references to each server fn in
-///      the compiled client code to its Eden client call.
+///   3. When server functions were present, the active backend plugin — the
+///      [`PluginRegistry`](crate::plugin::PluginRegistry) default (axum + typesafe resource HTTP
+///      client) — emits a server module + per-fn client bindings, and [`rewrite_call_sites`]
+///      rewrites free references to each server fn in the client source to its plugin-provided
+///      binding. The backend is never hardcoded; opting into another (e.g. `elysia-eden`) is a
+///      registry-name lookup via [`compile_treaty_authoring_with`].
 ///
 /// When no `server { … }` block is present the source compiles unchanged and `server_module` is
 /// `None`.
 ///
 /// [`plugin`]: crate::plugin
 pub fn compile_treaty_authoring(source: &str, file_name: &str) -> CompiledAuthoring {
+    let registry = PluginRegistry::with_defaults();
+    let plugin = registry
+        .default_plugin()
+        .expect("registry seeded with a default backend plugin");
+    compile_treaty_authoring_with(source, file_name, |fns| plugin.emit(fns))
+}
+
+/// Like [`compile_treaty_authoring`], but emits server functions through `emit` (the caller's chosen
+/// backend) rather than the registry default. Used to opt into a non-default backend such as
+/// `elysia-eden` (`PluginRegistry::get("elysia-eden")`).
+pub fn compile_treaty_authoring_with(
+    source: &str,
+    file_name: &str,
+    emit: impl FnOnce(&[ServerFn]) -> BackendEmit,
+) -> CompiledAuthoring {
     let extraction = extract_server_block(source);
 
     if extraction.server_fns.is_empty() {
@@ -703,10 +721,12 @@ pub fn compile_treaty_authoring(source: &str, file_name: &str) -> CompiledAuthor
         };
     }
 
-    // Rewrite free references to each server fn into its Eden client call *in the client source*,
-    // before compilation, so the swap lands on the author's free `save(...)` identifier rather than
-    // a lowered `ctx.save(...)` member access in the emitted output.
-    let emit = ElysiaEdenPlugin.emit(&extraction.server_fns);
+    // Rewrite free references to each server fn into its plugin-provided client binding *in the
+    // client source*, before compilation, so the swap lands on the author's free `save(...)`
+    // identifier rather than a lowered `ctx.save(...)` member access in the emitted output. The
+    // binding text comes straight from the active plugin's `client_bindings` map — no backend path
+    // is hardcoded here.
+    let emit = emit(&extraction.server_fns);
     let client_source = rewrite_call_sites(&extraction.client_source, &emit.client_bindings);
     let compiled = compile_treaty_file(&client_source, file_name);
 
@@ -944,10 +964,11 @@ import { Bar } from './bar';\n\
     }
 
     #[test]
-    fn treaty_server_block_extracts_route_and_rewrites_call() {
+    fn treaty_server_block_extracts_route_and_rewrites_call_through_default_axum() {
         // A `.treaty` SFC with a server block declaring `save`, a body that calls `save`, and a
-        // template. The compiled client must route the call through the Eden client (not the
-        // original fn), and a server module must carry the Elysia route for `save`.
+        // template. The DEFAULT backend (axum + typesafe resource HTTP client) is applied via the
+        // PluginRegistry: the client routes the call through the resource binding (not the original
+        // fn, not an eden path) and a Rust/axum server module carries the POST route for `save`.
         let source = "import { User } from './user';\n\
 server {\n\
   async function save(user: User) { return db.insert(user); }\n\
@@ -957,24 +978,71 @@ function onClick(user) { return save(user); }\n\
 
         let out = compile_treaty_authoring(source, "form.treaty");
 
-        // Server module generated with the Elysia route for `save`.
+        // Server module generated as a Rust/axum service with the POST route for `save`.
+        let server_module = out.server_module.expect("expected a server module");
+        assert!(
+            server_module.contains("\"/__server/save\""),
+            "no save route in axum server module; got: {server_module}"
+        );
+        assert!(
+            server_module.contains("pub fn build_router() -> Router"),
+            "no axum router builder in server module; got: {server_module}"
+        );
+        assert!(
+            !server_module.contains("new Elysia()"),
+            "default path should not emit an Elysia app; got: {server_module}"
+        );
+
+        // The compiled client routes the call through the axum typesafe resource client binding.
+        assert!(
+            out.code.contains("edenHttpResource") && out.code.contains("'/__server/save'"),
+            "call not rewritten to axum resource client; got: {}",
+            out.code
+        );
+        assert!(
+            !out.code.contains("client.__server.save.post"),
+            "default path leaked the eden binding; got: {}",
+            out.code
+        );
+        // The server fn body never reaches the client bundle.
+        assert!(
+            !out.code.contains("db.insert"),
+            "server body leaked into client; got: {}",
+            out.code
+        );
+    }
+
+    #[test]
+    fn treaty_server_block_opt_in_elysia_eden_binding() {
+        // Opting into the `elysia-eden` backend by registry name yields the Eden client binding and
+        // an Elysia server module instead of the default axum output.
+        let source = "import { User } from './user';\n\
+server {\n\
+  async function save(user: User) { return db.insert(user); }\n\
+}\n\
+function onClick(user) { return save(user); }\n\
+<div>{{ onClick }}</div>\n";
+
+        let registry = PluginRegistry::with_defaults();
+        let elysia = registry.get("elysia-eden").expect("elysia-eden registered");
+        let out = compile_treaty_authoring_with(source, "form.treaty", |fns| elysia.emit(fns));
+
         let server_module = out.server_module.expect("expected a server module");
         assert!(
             server_module.contains(".post('/__server/save'"),
-            "no save route in server module; got: {server_module}"
+            "no save route in Elysia server module; got: {server_module}"
         );
         assert!(
             server_module.contains("new Elysia()"),
-            "no Elysia app in server module; got: {server_module}"
+            "no Elysia app in opt-in server module; got: {server_module}"
         );
 
-        // The compiled client routes the call through the Eden client, not the original fn.
+        // The compiled client routes the call through the Eden client.
         assert!(
             out.code.contains("client.__server.save.post"),
             "call not rewritten to eden client; got: {}",
             out.code
         );
-        // The server fn body never reaches the client bundle.
         assert!(
             !out.code.contains("db.insert"),
             "server body leaked into client; got: {}",

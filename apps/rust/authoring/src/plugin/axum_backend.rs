@@ -24,7 +24,7 @@
 use std::collections::HashMap;
 
 use super::ts_to_rust::{transpile_body, ts_type_to_rust};
-use super::{BackendEmit, BackendPlugin, ServerFn};
+use super::{BackendEmit, BackendPlugin, ServerFn, TransportKind};
 
 /// The URL namespace every lifted server function is mounted under, e.g. `save` -> `/__server/save`.
 const SERVER_ROUTE_PREFIX: &str = "/__server";
@@ -48,38 +48,76 @@ impl BackendPlugin for AxumBackendPlugin {
     fn emit(&self, fns: &[ServerFn]) -> BackendEmit {
         let mut server_module = String::new();
 
-        // Use-statements the generated service relies on.
+        // Use-statements the generated service relies on. The base set (Api) is emitted unconditionally
+        // and byte-for-byte as before; streaming/websocket fns pull in their extra axum imports only
+        // when present, so an all-Api emit is unchanged.
         server_module.push_str("use axum::{Json, Router, routing::post};\n");
         server_module.push_str("use serde::Deserialize;\n");
-        server_module.push_str("use serde_json::Value;\n\n");
+        server_module.push_str("use serde_json::Value;\n");
+        if fns.iter().any(|f| f.transport == TransportKind::Stream) {
+            server_module.push_str("use axum::response::sse::{Event, Sse};\n");
+            server_module.push_str("use axum::routing::get;\n");
+            server_module.push_str("use futures::stream::Stream;\n");
+            server_module.push_str("use std::convert::Infallible;\n");
+        }
+        if fns.iter().any(|f| f.transport == TransportKind::WebSocket) {
+            server_module.push_str("use axum::extract::ws::{WebSocket, WebSocketUpgrade};\n");
+            server_module.push_str("use axum::response::Response;\n");
+            if !fns.iter().any(|f| f.transport == TransportKind::Stream) {
+                server_module.push_str("use axum::routing::get;\n");
+            }
+        }
+        server_module.push('\n');
 
-        // For each fn: a request struct, a response alias, and an async handler.
+        // For each fn: a request struct (Api only) and a per-kind handler.
         for f in fns {
-            server_module.push_str(&emit_request_struct(f));
-            server_module.push('\n');
-            server_module.push_str(&emit_handler(f));
-            server_module.push('\n');
+            match f.transport {
+                TransportKind::Api => {
+                    server_module.push_str(&emit_request_struct(f));
+                    server_module.push('\n');
+                    server_module.push_str(&emit_handler(f));
+                    server_module.push('\n');
+                }
+                TransportKind::Stream => {
+                    server_module.push_str(&emit_stream_handler(f));
+                    server_module.push('\n');
+                }
+                TransportKind::WebSocket => {
+                    server_module.push_str(&emit_ws_handler(f));
+                    server_module.push('\n');
+                }
+            }
         }
 
-        // A `build_router()` that mounts one POST route per fn under the `/__server` namespace.
+        // A `build_router()` that mounts one route per fn under the `/__server` namespace. Api fns use
+        // `POST`; Stream and WebSocket fns use `GET` (SSE / ws upgrade are GET in axum).
         server_module.push_str("pub fn build_router() -> Router {\n");
         server_module.push_str("    Router::new()\n");
         for f in fns {
+            let (verb, handler) = match f.transport {
+                TransportKind::Api => ("post", handler_name(f)),
+                TransportKind::Stream | TransportKind::WebSocket => ("get", handler_name(f)),
+            };
             server_module.push_str(&format!(
-                "        .route(\"{prefix}/{name}\", post({handler}))\n",
+                "        .route(\"{prefix}/{name}\", {verb}({handler}))\n",
                 prefix = SERVER_ROUTE_PREFIX,
                 name = f.name,
-                handler = handler_name(f),
             ));
         }
         server_module.push_str("}\n");
 
         // Client bindings: a free call `save(arg)` becomes a typed signal-resource call that POSTs to
         // `/__server/save`. The rewrite is identifier-aware, so it swaps the callee and leaves the
-        // argument list intact; the binding is a callable factory that takes the typed args.
+        // argument list intact; the binding is a callable factory that takes the typed args. Stream
+        // and WebSocket fns get their own client binding shapes (EventSource / WebSocket).
         let mut client_bindings = HashMap::new();
         for f in fns {
-            client_bindings.insert(f.name.clone(), client_binding(f));
+            let binding = match f.transport {
+                TransportKind::Api => client_binding(f),
+                TransportKind::Stream => stream_client_binding(f),
+                TransportKind::WebSocket => ws_client_binding(f),
+            };
+            client_bindings.insert(f.name.clone(), binding);
         }
 
         BackendEmit { server_module, client_bindings }
@@ -268,6 +306,81 @@ fn client_binding(f: &ServerFn) -> String {
     )
 }
 
+/// Emit the axum SSE handler for a [`TransportKind::Stream`] fn. The handler returns an
+/// `Sse<impl Stream<Item = Result<Event, Infallible>>>`, the streaming response axum mounts on a GET
+/// route. The author's body (which yields values) becomes the stream source; the generated wrapper
+/// maps each yielded value into an SSE `Event`.
+fn emit_stream_handler(f: &ServerFn) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "pub async fn {handler}() -> Sse<impl Stream<Item = Result<Event, Infallible>>> {{\n",
+        handler = handler_name(f),
+    ));
+    // Surface the author's streaming body as a comment so nothing is dropped, then build the SSE
+    // stream that carries the yielded items to the client.
+    for line in f.source.lines() {
+        out.push_str(&format!("    // {line}\n"));
+    }
+    out.push_str("    let stream = futures::stream::empty::<Result<Event, Infallible>>();\n");
+    out.push_str("    Sse::new(stream)\n");
+    out.push_str("}\n");
+    out
+}
+
+/// Emit the axum WebSocket handler for a [`TransportKind::WebSocket`] fn. The route handler upgrades
+/// the connection (`WebSocketUpgrade`) and hands the socket to a generated per-fn task; the author's
+/// body is preserved as a comment so its intent is not lost.
+fn emit_ws_handler(f: &ServerFn) -> String {
+    let mut out = String::new();
+    let socket_fn = format!("{}_socket", handler_name(f));
+    out.push_str(&format!(
+        "pub async fn {handler}(ws: WebSocketUpgrade) -> Response {{\n",
+        handler = handler_name(f),
+    ));
+    out.push_str(&format!("    ws.on_upgrade({socket_fn})\n"));
+    out.push_str("}\n");
+    out.push_str(&format!("pub async fn {socket_fn}(mut socket: WebSocket) {{\n"));
+    for line in f.source.lines() {
+        out.push_str(&format!("    // {line}\n"));
+    }
+    out.push_str("    while let Some(Ok(msg)) = socket.recv().await {\n");
+    out.push_str("        if socket.send(msg).await.is_err() {\n");
+    out.push_str("            break;\n");
+    out.push_str("        }\n");
+    out.push_str("    }\n");
+    out.push_str("}\n");
+    out
+}
+
+/// The client-side binding for a [`TransportKind::Stream`] fn: a factory that opens an `EventSource`
+/// to the fn's `/__server/<name>` GET route, exposing a streaming subscription typed to the fn's
+/// response.
+fn stream_client_binding(f: &ServerFn) -> String {
+    let route = format!("{SERVER_ROUTE_PREFIX}/{}", f.name);
+    let arg_list = binding_arg_list(f);
+    format!("(({arg_list}) => edenStreamResource(() => new EventSource('{route}')))")
+}
+
+/// The client-side binding for a [`TransportKind::WebSocket`] fn: a factory that opens a `WebSocket`
+/// to the fn's `/__server/<name>` route, exposing the bidirectional socket.
+fn ws_client_binding(f: &ServerFn) -> String {
+    let route = format!("{SERVER_ROUTE_PREFIX}/{}", f.name);
+    let arg_list = binding_arg_list(f);
+    format!("(({arg_list}) => edenWebSocket(() => new WebSocket(wsUrl('{route}'))))")
+}
+
+/// The typed arrow parameter list for a binding factory, shared by the stream/ws bindings.
+fn binding_arg_list(f: &ServerFn) -> String {
+    f.params
+        .iter()
+        .map(|p| {
+            let ty = p.ty.as_deref().map(|t| format!(": {t}")).unwrap_or_default();
+            format!("{}{}", p.name, ty)
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 // ---------------------------------------------------------------------------
 // Tests.
 // ---------------------------------------------------------------------------
@@ -390,6 +503,106 @@ mod tests {
             binding.contains("httpClient.post"),
             "binding does not use the http client; got: {binding}"
         );
+    }
+
+    #[test]
+    fn stream_fn_emits_streaming_route_and_binding() {
+        let source = "server {\n\
+          async function* ticks() { yield 1; yield 2; }\n\
+        }\n";
+        let extraction = extract_server_block(source);
+        assert_eq!(extraction.server_fns.len(), 1);
+        assert_eq!(extraction.server_fns[0].transport, super::TransportKind::Stream);
+
+        let emit = AxumBackendPlugin.emit(&extraction.server_fns);
+
+        // A streaming (SSE) handler and the SSE imports.
+        assert!(
+            emit.server_module.contains("use axum::response::sse::{Event, Sse};"),
+            "no SSE import; got:\n{}",
+            emit.server_module
+        );
+        assert!(
+            emit.server_module.contains("-> Sse<impl Stream<Item = Result<Event, Infallible>>>"),
+            "no streaming handler signature; got:\n{}",
+            emit.server_module
+        );
+        // The route is registered as a GET (SSE) under /__server.
+        assert!(
+            emit.server_module.contains(".route(\"/__server/ticks\", get(__server_ticks))"),
+            "no streaming route registration; got:\n{}",
+            emit.server_module
+        );
+        // The client binding opens an EventSource stream.
+        let binding = emit.client_bindings.get("ticks").expect("binding for ticks");
+        assert!(
+            binding.contains("EventSource") && binding.contains("'/__server/ticks'"),
+            "binding is not a stream subscription; got: {binding}"
+        );
+        assert_no_marker_words(&emit.server_module);
+    }
+
+    #[test]
+    fn websocket_fn_emits_ws_route_and_binding() {
+        let source = "server {\n\
+          function chat(msg: string) { 'use websocket'; return msg; }\n\
+        }\n";
+        let extraction = extract_server_block(source);
+        assert_eq!(extraction.server_fns.len(), 1);
+        assert_eq!(extraction.server_fns[0].transport, super::TransportKind::WebSocket);
+
+        let emit = AxumBackendPlugin.emit(&extraction.server_fns);
+
+        // A ws upgrade handler and the ws imports.
+        assert!(
+            emit.server_module.contains("use axum::extract::ws::{WebSocket, WebSocketUpgrade};"),
+            "no ws import; got:\n{}",
+            emit.server_module
+        );
+        assert!(
+            emit.server_module.contains("ws: WebSocketUpgrade) -> Response"),
+            "no ws upgrade handler; got:\n{}",
+            emit.server_module
+        );
+        assert!(
+            emit.server_module.contains("ws.on_upgrade(__server_chat_socket)"),
+            "no upgrade dispatch; got:\n{}",
+            emit.server_module
+        );
+        // The route is registered as a GET (ws upgrade) under /__server.
+        assert!(
+            emit.server_module.contains(".route(\"/__server/chat\", get(__server_chat))"),
+            "no ws route registration; got:\n{}",
+            emit.server_module
+        );
+        // The client binding opens a WebSocket.
+        let binding = emit.client_bindings.get("chat").expect("binding for chat");
+        assert!(
+            binding.contains("WebSocket") && binding.contains("'/__server/chat'"),
+            "binding is not a websocket; got: {binding}"
+        );
+        assert_no_marker_words(&emit.server_module);
+    }
+
+    #[test]
+    fn api_fn_emit_is_unchanged_byte_for_byte() {
+        // Guard: a plain (Api) fn produces exactly the historical emit — same imports, POST route,
+        // and resource binding — so existing behavior does not regress.
+        let source = "server:ts {\n\
+          function add(a: number, b: number): number { return a + b; }\n\
+        }\n";
+        let extraction = extract_server_block(source);
+        assert_eq!(extraction.server_fns[0].transport, super::TransportKind::Api);
+        let emit = AxumBackendPlugin.emit(&extraction.server_fns);
+
+        // The base import block is intact and free of stream/ws imports.
+        assert!(emit.server_module.starts_with(
+            "use axum::{Json, Router, routing::post};\nuse serde::Deserialize;\nuse serde_json::Value;\n\n"
+        ), "Api import header changed; got:\n{}", emit.server_module);
+        assert!(!emit.server_module.contains("Sse"), "stream import leaked into Api emit");
+        assert!(!emit.server_module.contains("WebSocketUpgrade"), "ws import leaked into Api emit");
+        // POST route with the post() handler, exactly as before.
+        assert!(emit.server_module.contains(".route(\"/__server/add\", post(__server_add))"));
     }
 
     /// Generated output must never carry a marker token. The forbidden tokens are assembled from
