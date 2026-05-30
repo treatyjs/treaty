@@ -164,6 +164,12 @@ const PIPE_SLOT_PLACEHOLDER: usize = 1_000_000_000;
 struct PendingPipe {
     /// The pipe name (`uppercase`, `slice`, …) — the `ɵɵpipe(slot, "name")` argument.
     name: String,
+    /// The data slot of the creation op that *consumes* this pipe (the text/element/anchor the
+    /// owning update binding targets). Angular `pipe_creation.ts` inserts the `Pipe` create op
+    /// immediately after this op (skipping any pipe ops already there), so the `ɵɵpipe(...)` lands
+    /// inside the consuming element's creation block — e.g. between `ɵɵtext` and the element's
+    /// `ɵɵdomElementEnd` — rather than appended at the end of the creation buffer.
+    target_slot: usize,
 }
 
 /// Per-view pipe registry. Lives behind a [`std::cell::RefCell`] on the builder so
@@ -177,6 +183,11 @@ struct PipeState {
     /// `varsUsedByOp` for `PipeBinding`/`PipeBindingVariadic`). Seeded from the
     /// builder's `binding_slots` when lowering begins and flushed back after.
     var_cursor: usize,
+    /// The data slot of the creation op currently being bound (the text/element/anchor the binding
+    /// under lowering targets). Set by [`TemplateDefinitionBuilder::lower_expr`] before each
+    /// conversion so [`BuilderPipes::allocate_pipe`] can record it on the [`PendingPipe`]; that slot
+    /// later drives where the `ɵɵpipe(...)` creation op is inserted (Angular `addPipeToCreationBlock`).
+    current_target_slot: usize,
 }
 
 /// The [`PipeSlotAllocator`] the converter receives while a view's update
@@ -190,8 +201,10 @@ impl PipeSlotAllocator for BuilderPipes<'_> {
     fn allocate_pipe(&self, name: &str, total_args: usize) -> PipeSlots {
         let mut state = self.state.borrow_mut();
         let ordinal = state.pending.len();
+        let target_slot = state.current_target_slot;
         state.pending.push(PendingPipe {
             name: name.to_string(),
+            target_slot,
         });
         // Var slots: one change-detection slot plus one per lowered argument
         // (`1 + args.length`), matching Angular `varsUsedByOp`.
@@ -370,6 +383,38 @@ fn as_call(stmt: &Stmt) -> Option<(&Expr, &[Expr])> {
     None
 }
 
+/// The leading numeric `slot` argument of a creation instruction (`ɵɵtext(slot, …)`,
+/// `ɵɵdomElement(slot, …)`, `ɵɵconditionalCreate(slot, …)`, `ɵɵrepeaterCreate(slot, …)`, …), if it
+/// has one. Used by [`pipe_insertion_index`] to find the create op a pipe should be inserted after.
+fn creation_op_slot(stmt: &Stmt) -> Option<usize> {
+    let (_callee, args) = as_call(stmt)?;
+    match args.first()?.kind {
+        o::ExprKind::Literal(o::LiteralValue::Number(n)) if n >= 0.0 => Some(n as usize),
+        _ => None,
+    }
+}
+
+/// Where to insert a `ɵɵpipe(...)` create op into `creation` for a pipe consumed by the create op at
+/// `target_slot`. Faithful to Angular `pipe_creation.ts::addPipeToCreationBlock`: locate the create
+/// op whose slot is `target_slot`, then skip past any `ɵɵpipe` ops already sitting after it, and
+/// return the index of the first op that is NOT one of those pipes — i.e. the new pipe lands
+/// immediately after the consuming op (after any earlier pipes for the same op) and before the next
+/// non-pipe op (e.g. the element's `ɵɵdomElementEnd`). Returns `None` when no matching op is found,
+/// so the caller can fall back to appending.
+fn pipe_insertion_index(creation: &[Stmt], target_slot: usize) -> Option<usize> {
+    let consumer = creation
+        .iter()
+        .position(|stmt| creation_op_slot(stmt) == Some(target_slot))?;
+    let mut idx = consumer + 1;
+    while idx < creation.len()
+        && as_call(&creation[idx]).and_then(|(callee, _)| callee_wire_name(callee))
+            == Some(R3::Pipe.name())
+    {
+        idx += 1;
+    }
+    Some(idx)
+}
+
 /// The `ɵɵ*` wire name of a callee expression when it is an `ExternalExpr` (`o::import_expr(R3)`).
 /// This is what Angular's `chaining` phase keys its `CHAIN_COMPATIBILITY` map on (`fn.value`).
 fn callee_wire_name(callee: &Expr) -> Option<&str> {
@@ -526,6 +571,10 @@ pub struct TemplateDefinitionBuilder {
     /// the `ɵɵpipe(slot, "name")` creation instructions, and patches the placeholder slots in the
     /// update block. See Angular `pipe_creation.ts` + `slot_allocation.ts`.
     pipes: std::cell::RefCell<PipeState>,
+    /// The data slot of the creation op whose bindings are currently being lowered (the
+    /// text/element/anchor a `lower_expr` call binds into). Pushed into [`PipeState`] by
+    /// [`Self::lower_expr`] so a pipe usage records its consuming op (`addPipeToCreationBlock`).
+    current_target_slot: usize,
 }
 
 impl TemplateDefinitionBuilder {
@@ -555,6 +604,7 @@ impl TemplateDefinitionBuilder {
             needs_next_context: std::cell::Cell::new(false),
             next_context_name: std::cell::RefCell::new(None),
             pipes: std::cell::RefCell::new(PipeState::default()),
+            current_target_slot: 0,
         }
     }
 
@@ -577,8 +627,14 @@ impl TemplateDefinitionBuilder {
     fn lower_expr(&mut self, node: &AstNode) -> Expr {
         // Seed the pipe var cursor at the current binding-slot count: pipe change-detection slots are
         // drawn from the same pool, immediately after the host binding's slots (Angular var_counting
-        // assigns offsets to bindings in op order).
-        self.pipes.borrow_mut().var_cursor = self.binding_slots;
+        // assigns offsets to bindings in op order). Also publish the consuming op's data slot so any
+        // pipe reached here records it (Angular `addPipeToCreationBlock` keys the create-op insertion
+        // point on the owning update op's `target`).
+        {
+            let mut pipes = self.pipes.borrow_mut();
+            pipes.var_cursor = self.binding_slots;
+            pipes.current_target_slot = self.current_target_slot;
+        }
 
         // Embedded (nested) views resolve ancestor-context reads via `ɵɵnextContext()` (`ctx_r<level>`),
         // recording the need in `needs_next_context`; loop locals still resolve to their generated
@@ -688,15 +744,26 @@ impl TemplateDefinitionBuilder {
         let pipe_base = self.data_index;
         self.data_index += pending.len();
 
-        // Emit `ɵɵpipe(slot, "name")` per usage (creation block). Appending here places them after
-        // all element/text creation instructions; chaining will fold the run of `ɵɵpipe` calls.
+        // Insert each `ɵɵpipe(slot, "name")` create op into the creation block at the position
+        // Angular's `addPipeToCreationBlock` picks: immediately after the create op that *consumes*
+        // it (the text/element/anchor the owning update binding targets), skipping past any pipe ops
+        // already inserted after that op. This places the `ɵɵpipe(...)` inside the consuming element's
+        // creation block (e.g. between `ɵɵtext(1)` and the element's `ɵɵdomElementEnd()`) rather than
+        // appended after the whole creation buffer. Pipes are processed in source/ordinal order, so a
+        // later pipe sharing the same consuming op chains after an earlier one. The subsequent
+        // `chain_statements` pass folds any resulting run of adjacent `ɵɵpipe` calls.
+        let mut creation = std::mem::take(&mut self.creation_code);
         for (ordinal, pending_pipe) in pending.iter().enumerate() {
             let slot = pipe_base + ordinal;
-            self.creation_code.push(instruction(
+            let pipe_op = instruction(
                 R3::Pipe,
                 vec![num(slot as f64), str_lit(&pending_pipe.name)],
-            ));
+            );
+            let insert_at =
+                pipe_insertion_index(&creation, pending_pipe.target_slot).unwrap_or(creation.len());
+            creation.insert(insert_at, pipe_op);
         }
+        self.creation_code = creation;
 
         // Patch placeholder slot literals in the update block to their real slots.
         let mut update = std::mem::take(&mut self.update_code);
@@ -896,6 +963,9 @@ impl TemplateDefinitionBuilder {
         // `ɵɵpipeBindN` here too. We pre-lower the expressions through `lower_expr` (which needs
         // `&mut self` for pipe registration), then feed them positionally to `text_interpolation_call`.
         self.advance_to(slot);
+        // The consuming op for any pipe in this interpolation is the text node itself; the
+        // `ɵɵpipe(...)` create op is inserted right after this text op (Angular `addPipeToCreationBlock`).
+        self.current_target_slot = slot;
         let lowered: Vec<Expr> = match &bound.value.kind {
             AstExprKind::Interpolation { expressions, .. } => {
                 expressions.iter().map(|e| self.lower_expr(e)).collect()
@@ -1046,6 +1116,9 @@ impl TemplateDefinitionBuilder {
 
         self.advance_to(slot);
 
+        // The consuming op for any pipe in this binding is the host element; the `ɵɵpipe(...)` create
+        // op is inserted right after the element's create op (Angular `addPipeToCreationBlock`).
+        self.current_target_slot = slot;
         // Lower against this view's scope (`ctx` + any `@for` loop locals).
         let lowered = self.lower_expr(&input.value);
         // NOTE(port): safe-navigation / pipe temporaries are empty for the ported node kinds; once
@@ -1281,6 +1354,8 @@ impl TemplateDefinitionBuilder {
             self.allocate_binding_slots(1);
         }
 
+        // Any pipe in a branch condition is consumed by the conditional anchor op (`addPipeToCreationBlock`).
+        self.current_target_slot = anchor_slot;
         for (idx, branch) in block.branches.iter().enumerate().rev() {
             let Some(cond) = &branch.expression else {
                 continue; // default handled above.
@@ -1367,6 +1442,8 @@ impl TemplateDefinitionBuilder {
             }));
             name
         });
+        // Any pipe in the discriminant or a case expression is consumed by the conditional anchor op.
+        self.current_target_slot = anchor_slot;
         // Lower the discriminant only when a case actually compares against it.
         let discriminant = first_test_idx.map(|_| self.lower_expr(&block.expression));
 
@@ -1458,6 +1535,8 @@ impl TemplateDefinitionBuilder {
             .push(instruction(R3::RepeaterCreate, params));
 
         // Update: `ɵɵrepeater(<collection>)`. The collection lowers against this view's scope.
+        // Any pipe in the collection is consumed by the repeater create op at `slot`.
+        self.current_target_slot = slot;
         let collection = self.lower_expr(&block.expression.ast);
         self.advance_to(slot);
         self.update_code
@@ -2216,7 +2295,10 @@ mod tests {
     #[test]
     fn interpolation_pipe_emits_pipe_creation_and_pipe_bind1() {
         // `<div>{{ x | uppercase }}</div>`:
-        //   creation: ɵɵpipe(N, "uppercase") after the text/element slots
+        //   creation: ɵɵdomElementStart(0,"div"); ɵɵtext(1); ɵɵpipe(2,"uppercase"); ɵɵdomElementEnd();
+        //             — the pipe create op is sequenced right after the text it feeds, INSIDE the
+        //               host element's creation block (before its `ɵɵdomElementEnd`), matching Angular
+        //               `pipe_creation.ts::addPipeToCreationBlock`.
         //   update:   ɵɵpipeBind1(N, varOffset, ctx.x)
         let input =
             TemplateCompilationInput::new("Test_Template", interpolation_with_pipe("uppercase", vec![]));
@@ -2227,6 +2309,19 @@ mod tests {
         // The pipe creation instruction with the pipe name.
         assert!(out.contains("\u{0275}\u{0275}pipe("), "missing ɵɵpipe, got: {out}");
         assert!(out.contains("\"uppercase\""), "missing pipe name, got: {out}");
+
+        // Creation-block ORDERING: domElementStart, then text, then pipe, then domElementEnd. The
+        // `ɵɵpipe(...)` must land INSIDE the element block (before `ɵɵdomElementEnd`), not appended
+        // after it — the bug this fix targets.
+        let pos = |needle: &str| out.find(needle).unwrap_or_else(|| panic!("missing {needle}, got: {out}"));
+        let start = pos("\u{0275}\u{0275}domElementStart");
+        let text = pos("\u{0275}\u{0275}text(");
+        let pipe = pos("\u{0275}\u{0275}pipe(");
+        let end = pos("\u{0275}\u{0275}domElementEnd");
+        assert!(
+            start < text && text < pipe && pipe < end,
+            "expected order domElementStart < text < pipe < domElementEnd, got: {out}"
+        );
         // The update-block pipeBind1 with the piped value.
         assert!(out.contains("\u{0275}\u{0275}pipeBind1("), "missing ɵɵpipeBind1, got: {out}");
         assert!(out.contains("ctx.x"), "missing piped value, got: {out}");
