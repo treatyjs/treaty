@@ -718,8 +718,8 @@ impl TemplateBuilder for StubTemplateBuilder {
 /// `emitHostBindingFunction`). Returns the optional `hostBindings` function and sets
 /// `hostAttrs`/`hostVars` on the definition map.
 ///
-/// NOTE(port): the real pipeline is not yet ported; the default [`StubHostBindingsBuilder`]
-/// emits nothing.
+/// NOTE(port): the full `ingestHostBinding`/`transform`/`emit` pipeline is not yet ported; the
+/// default [`DefaultHostBindingsBuilder`] generates the host-bindings function directly.
 pub trait HostBindingsBuilder {
     /// `createHostBindingsFunction(...)` — returns the host-bindings fn (or `None`) and may set
     /// `hostAttrs`/`hostVars` on the definition map. `host` may be mutated (special attrs folded in).
@@ -733,20 +733,88 @@ pub trait HostBindingsBuilder {
     ) -> Option<Expr>;
 }
 
-/// Default placeholder: folds `style`/`class` special attributes into the attributes map (faithful
-/// to the real fn's side effect) but emits no host-bindings function.
+/// `createHostBindingsFunction(...)` port. Generates the `hostBindings: function(rf, ctx) {…}`
+/// definition field, and as side effects sets `hostAttrs` / `hostVars` on the definition map.
+///
+/// NOTE(port): the real Angular implementation routes through the `ingestHostBinding` →
+/// `transform` → `emitHostBindingFunction` pipeline (which performs slot allocation, advance
+/// insertion, and instruction reification). That pipeline is not yet ported. This is a direct,
+/// faithful-in-shape generator that:
+///   - parses each property/listener value string with [`crate::expression::parser::Parser`],
+///   - lowers it via [`crate::expression_converter`] rooted at the `ctx` param,
+///   - emits the same instruction set the runtime expects (`ɵɵlistener` in CREATE;
+///     `ɵɵdomProperty`/`ɵɵsyntheticHostProperty`/`ɵɵattribute`/`ɵɵclassProp`/`ɵɵstyleProp` in
+///     UPDATE).
+/// What it does NOT yet reproduce: `ɵɵadvance` interleaving, host-property slot indices, pipe
+/// lowering, and the precise binding ordering the transform pipeline computes. Replace with the
+/// real pipeline when it lands.
 #[derive(Debug, Default)]
-pub struct StubHostBindingsBuilder;
+pub struct DefaultHostBindingsBuilder;
 
-impl HostBindingsBuilder for StubHostBindingsBuilder {
+/// `RenderFlags.Create` / `RenderFlags.Update` (mirrors the runtime bitmask phase selector).
+const RENDER_FLAG_CREATE: f64 = 0b01 as f64;
+const RENDER_FLAG_UPDATE: f64 = 0b10 as f64;
+
+const HOST_CONTEXT_NAME: &str = "ctx";
+const HOST_RENDER_FLAGS: &str = "rf";
+const HOST_EVENT_NAME: &str = "$event";
+
+/// `ɵɵfoo(...params)` as an expression statement.
+fn host_instruction(reference: R3, params: Vec<Expr>) -> Stmt {
+    import_r3(reference).call_fn(params, false).to_stmt()
+}
+
+/// `if (rf & flag) { …statements… }` — `renderFlagCheckIfStmt`.
+fn host_render_flag_if(flag: f64, statements: Vec<Stmt>) -> Stmt {
+    o::if_stmt(
+        o::variable(HOST_RENDER_FLAGS, None)
+            .bitwise_and(o::literal(LiteralValue::Number(flag), None)),
+        statements,
+        None,
+    )
+}
+
+/// Parse + lower a host *property* value (a binding expression) rooted at `ctx`.
+fn lower_host_property_value(value: &str) -> crate::expression_converter::ConvertedBinding {
+    let parser = crate::expression::parser::Parser::default();
+    let parsed = parser.parse_binding(
+        value,
+        crate::expression::ast::ParseSourceSpan { start: 0, end: 0 },
+        0,
+    );
+    crate::expression_converter::convert_property_binding(
+        &parsed.ast,
+        o::variable(HOST_CONTEXT_NAME, None),
+        "",
+    )
+}
+
+/// Parse + lower a host *listener* handler (an action) rooted at `ctx`.
+fn lower_host_listener_value(value: &str) -> crate::expression_converter::ConvertedBinding {
+    let parser = crate::expression::parser::Parser::default();
+    let parsed = parser.parse_action(
+        value,
+        crate::expression::ast::ParseSourceSpan { start: 0, end: 0 },
+        0,
+    );
+    crate::expression_converter::convert_action_binding(
+        &parsed.ast,
+        o::variable(HOST_CONTEXT_NAME, None),
+        "",
+    )
+}
+
+impl HostBindingsBuilder for DefaultHostBindingsBuilder {
     fn build(
         &mut self,
         host: &mut R3HostMetadata,
         _selector: &str,
-        _name: &str,
+        name: &str,
         _legacy_optional_chaining: bool,
-        _definition_map: &mut DefinitionMap,
+        definition_map: &mut DefinitionMap,
     ) -> Option<Expr> {
+        // The parser treats `class`/`style` specially — fold them into the attributes map
+        // (faithful to `createHostBindingsFunction`'s side effect).
         if let Some(style) = host.special_attributes.style_attr.clone() {
             host.attributes
                 .insert("style".to_string(), o::literal(LiteralValue::String(style), None));
@@ -755,7 +823,155 @@ impl HostBindingsBuilder for StubHostBindingsBuilder {
             host.attributes
                 .insert("class".to_string(), o::literal(LiteralValue::String(class), None));
         }
-        None
+
+        // hostAttrs — the static attributes array, grouped by AttributeMarker (plain pairs first,
+        // then Classes=1 group, then Styles=2 group). `class`/`style` (folded above) are plain
+        // string-valued attrs, not class/style *bindings*, so they go in the plain group.
+        if let Some(attrs) = host_attrs_array(&host.attributes) {
+            definition_map.set("hostAttrs", Some(attrs));
+        }
+
+        // Build the function body. CREATE: listeners. UPDATE: properties + class/style/attr.
+        let mut create_stmts: Vec<Stmt> = Vec::new();
+        let mut update_stmts: Vec<Stmt> = Vec::new();
+        let mut host_vars: u32 = 0;
+
+        // Listeners → `ɵɵlistener(eventName, HostListenerFn)` (CREATE).
+        for (event, handler_src) in host.listeners.iter() {
+            let converted = lower_host_listener_value(handler_src);
+            let mut body = converted.stmts;
+            body.push(Stmt::bare(StmtKind::Return(converted.expr)));
+            // `naming.ts`: `${name}_${event}_HostBindingHandler`.
+            let handler_name = format!("{name}_{}_HostBindingHandler", event.replace('.', "_"));
+            let handler_fn = o::fn_(
+                vec![FnParam::new(HOST_EVENT_NAME, None)],
+                body,
+                None,
+                Some(handler_name),
+            );
+            create_stmts.push(host_instruction(
+                R3::Listener,
+                vec![o::literal(LiteralValue::String(event.clone()), None), handler_fn],
+            ));
+        }
+
+        // Properties → UPDATE. Route by prefix:
+        //   `attr.X`  → ɵɵattribute('X', value)
+        //   `class.X` → ɵɵclassProp('X', value)
+        //   `style.X` → ɵɵstyleProp('X', value)
+        //   `@X`      → ɵɵsyntheticHostProperty('X', value)
+        //   else      → ɵɵdomProperty('name', value)
+        // Each binding consumes one host var slot.
+        for (prop, value_src) in host.properties.iter() {
+            let converted = lower_host_property_value(value_src);
+            // NOTE(port): lowering that spills temporaries is not yet modelled into the host
+            // update block; the converter currently never spills, so `stmts` is empty.
+            let value = converted.expr;
+            host_vars += 1;
+
+            let stmt = if let Some(attr) = prop.strip_prefix("attr.") {
+                host_instruction(
+                    R3::Attribute,
+                    vec![o::literal(LiteralValue::String(attr.to_string()), None), value],
+                )
+            } else if let Some(cls) = prop.strip_prefix("class.") {
+                host_instruction(
+                    R3::ClassProp,
+                    vec![o::literal(LiteralValue::String(cls.to_string()), None), value],
+                )
+            } else if let Some(sty) = prop.strip_prefix("style.") {
+                host_instruction(
+                    R3::StyleProp,
+                    vec![o::literal(LiteralValue::String(sty.to_string()), None), value],
+                )
+            } else if let Some(synthetic) = prop.strip_prefix('@') {
+                host_instruction(
+                    R3::SyntheticHostProperty,
+                    vec![o::literal(LiteralValue::String(synthetic.to_string()), None), value],
+                )
+            } else {
+                host_instruction(
+                    R3::DomProperty,
+                    vec![o::literal(LiteralValue::String(prop.clone()), None), value],
+                )
+            };
+            update_stmts.push(stmt);
+        }
+
+        // hostVars (only when > 0).
+        if host_vars > 0 {
+            definition_map.set(
+                "hostVars",
+                Some(o::literal(LiteralValue::Number(host_vars as f64), None)),
+            );
+        }
+
+        if create_stmts.is_empty() && update_stmts.is_empty() {
+            return None;
+        }
+
+        let mut body: Vec<Stmt> = Vec::new();
+        if !create_stmts.is_empty() {
+            body.push(host_render_flag_if(RENDER_FLAG_CREATE, create_stmts));
+        }
+        if !update_stmts.is_empty() {
+            body.push(host_render_flag_if(RENDER_FLAG_UPDATE, update_stmts));
+        }
+
+        Some(o::fn_(
+            vec![
+                FnParam::new(HOST_RENDER_FLAGS, None),
+                FnParam::new(HOST_CONTEXT_NAME, None),
+            ],
+            body,
+            None,
+            Some(format!("{name}_HostBindings")),
+        ))
+    }
+}
+
+/// Build the `hostAttrs` consts-style array from the static attributes map, applying
+/// `AttributeMarker` grouping: plain `name, value` pairs first, then a `Classes` (1) group
+/// (class names only), then a `Styles` (2) group (`name, value` pairs).
+///
+/// NOTE(port): the real transform splits `class`/`style` attribute *values* into individual
+/// class names / style key-value pairs under the markers. Here those folded attrs are emitted as
+/// plain `["class", "<value>"]` / `["style", "<value>"]` pairs (the common static-attr case);
+/// dedicated marker splitting can be added with the transform pipeline.
+fn host_attrs_array(attributes: &OrderedMap<String, Expr>) -> Option<Expr> {
+    if attributes.is_empty() {
+        return None;
+    }
+    let mut elements: Vec<Expr> = Vec::new();
+    for (key, value) in attributes.iter() {
+        elements.push(o::literal(LiteralValue::String(key.clone()), None));
+        elements.push(value.clone());
+    }
+    Some(o::literal_arr(elements, None))
+}
+
+/// Backwards-compatible unit struct under the former placeholder name. It is no longer a stub:
+/// it delegates to the real [`DefaultHostBindingsBuilder`]. Kept so existing call sites
+/// (`compile.rs`) keep compiling without churn.
+#[derive(Debug, Default)]
+pub struct StubHostBindingsBuilder;
+
+impl HostBindingsBuilder for StubHostBindingsBuilder {
+    fn build(
+        &mut self,
+        host: &mut R3HostMetadata,
+        selector: &str,
+        name: &str,
+        legacy_optional_chaining: bool,
+        definition_map: &mut DefinitionMap,
+    ) -> Option<Expr> {
+        DefaultHostBindingsBuilder.build(
+            host,
+            selector,
+            name,
+            legacy_optional_chaining,
+            definition_map,
+        )
     }
 }
 
@@ -1886,5 +2102,82 @@ mod tests {
         let errors = validate_no_event_bindings(&parsed);
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("disallowed for security reasons"));
+    }
+
+    // ---------------------------------------------------------------------------
+    // Host-bindings generation (DefaultHostBindingsBuilder).
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn host_property_binding_emits_dom_property_and_host_vars() {
+        // `host: { '[title]': 't' }` → UPDATE block with `ɵɵdomProperty('title', ctx.t)`
+        // and `hostVars: 1`.
+        let mut meta = directive_meta("D", "[d]");
+        meta.host.properties.insert("title".to_string(), "t".to_string());
+        let mut hb = DefaultHostBindingsBuilder;
+        let compiled = compile_directive_from_metadata(&meta, &mut hb);
+        let js = emit_expression(&compiled.expression);
+        assert!(js.contains("hostBindings"), "missing hostBindings fn: {js}");
+        assert!(js.contains("ɵɵdomProperty"), "missing ɵɵdomProperty: {js}");
+        assert!(js.contains("title"), "missing property name: {js}");
+        // Lowered against ctx.
+        assert!(js.contains("ctx.t"), "property value should be lowered to ctx.t: {js}");
+        // hostVars >= 1 (one property binding).
+        assert!(
+            js.contains("hostVars: 1") || js.contains("hostVars:1"),
+            "expected hostVars: 1: {js}"
+        );
+    }
+
+    #[test]
+    fn host_listener_emits_listener_instruction_in_create() {
+        // `host: { '(click)': 'f()' }` → CREATE block with `ɵɵlistener('click', fn)`.
+        let mut meta = directive_meta("D", "[d]");
+        meta.host.listeners.insert("click".to_string(), "f()".to_string());
+        let mut hb = DefaultHostBindingsBuilder;
+        let compiled = compile_directive_from_metadata(&meta, &mut hb);
+        let js = emit_expression(&compiled.expression);
+        assert!(js.contains("hostBindings"), "missing hostBindings fn: {js}");
+        assert!(js.contains("ɵɵlistener"), "missing ɵɵlistener: {js}");
+        assert!(js.contains("click"), "missing event name: {js}");
+        // Handler invokes ctx.f().
+        assert!(js.contains("ctx.f()"), "handler should call ctx.f(): {js}");
+        // A listener alone has no host vars.
+        assert!(!js.contains("hostVars"), "listener-only should not emit hostVars: {js}");
+    }
+
+    #[test]
+    fn host_static_class_attr_emits_host_attrs() {
+        // `host: { 'class': 'x' }` → `hostAttrs: ['class', 'x']`, no hostBindings fn.
+        let mut meta = directive_meta("D", "[d]");
+        meta.host.special_attributes.class_attr = Some("x".to_string());
+        let mut hb = DefaultHostBindingsBuilder;
+        let compiled = compile_directive_from_metadata(&meta, &mut hb);
+        let js = emit_expression(&compiled.expression);
+        assert!(js.contains("hostAttrs"), "missing hostAttrs: {js}");
+        assert!(js.contains("class"), "missing class attr key: {js}");
+        // No dynamic bindings → no hostBindings fn.
+        assert!(!js.contains("hostBindings"), "static-only should not emit hostBindings: {js}");
+    }
+
+    #[test]
+    fn host_attr_class_style_route_to_specialized_instructions() {
+        // `[attr.role]`, `[class.active]`, `[style.width]` route to ɵɵattribute / ɵɵclassProp /
+        // ɵɵstyleProp respectively, and each consumes one host var.
+        let mut meta = directive_meta("D", "[d]");
+        meta.host.properties.insert("attr.role".to_string(), "r".to_string());
+        meta.host.properties.insert("class.active".to_string(), "isActive".to_string());
+        meta.host.properties.insert("style.width".to_string(), "w".to_string());
+        let mut hb = DefaultHostBindingsBuilder;
+        let compiled = compile_directive_from_metadata(&meta, &mut hb);
+        let js = emit_expression(&compiled.expression);
+        assert!(js.contains("ɵɵattribute"), "missing ɵɵattribute: {js}");
+        assert!(js.contains("ɵɵclassProp"), "missing ɵɵclassProp: {js}");
+        assert!(js.contains("ɵɵstyleProp"), "missing ɵɵstyleProp: {js}");
+        // 3 bindings → hostVars: 3.
+        assert!(
+            js.contains("hostVars: 3") || js.contains("hostVars:3"),
+            "expected hostVars: 3: {js}"
+        );
     }
 }
