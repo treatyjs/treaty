@@ -132,6 +132,17 @@ exposes ALL authoring incl. bare-JSX `.tsx` + the full render3 surface (workstre
 end-to-end on the Rust path with the TS fallback removed; oracle/compliance parity holds. This is the
 headline instance of the "dead code + file deletion" goal — do NOT delete before the gate is met.
 
+**K. Rust `treaty` CLI + Rust-native bundler (user 2026-05-31)** — rewrite the standalone `treaty` CLI
+as a NATIVE RUST binary (supersedes the wave-2 TS @treaty/cli; keep TS until Rust replaces it):
+- **Plugin system** so the CLI is extensible (commands / dev-tool backends as plugins).
+- **Configurable dev tool**: choose rspack / rsbuild / vite / … — the CLI drives the chosen bundler
+  plugin (via its config) for `treaty dev`/`build`.
+- **Fallback = a custom RUST-NATIVE bundler + dev-server with federation built in** when no external
+  bundler is chosen — Treaty's own fast bundler.
+- Commands `dev`/`build`/`generate` (selectorless + signal scaffolds, federation-ready by default).
+New crate (e.g. `apps/cli` or `libs/treaty/cli-rs`), depends on render3/authoring → sequence after a
+compliance round (builds against render3). See [[treaty-angular-cli-federation]].
+
 ## Harness
 - **File-by-file harness**: compile a corpus of individual `.treaty`/`.tsx`/`.ts` files through `@treaty/compiler`
   and assert each emits valid Ivy + round-trips through each bundler plugin; measure per-file time
