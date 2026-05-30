@@ -45,6 +45,8 @@ It is **independent of the Rust crate** and never edits `libs/render3` source.
 | `pipe-with-args`      | `<p>{{ x \| slice:1:3 }}</p>`                     | pipe with positional args |
 | `pipe-chained`        | `<p>{{ x \| uppercase \| lowercase }}</p>`        | chained pipes |
 | `pipe-in-binding`     | `<div [title]="t \| uppercase"></div>`            | pipe inside a property binding |
+| `i18n-static`         | `<div i18n>Hello</div>`                           | `i18n` marker, static text |
+| `i18n-interp`         | `<div i18n>Hello {{name}}</div>`                  | `i18n` marker + interpolation |
 
 > The Rust `compile_component` feeds `@angular/compiler` **empty** `inputs`/`outputs`
 > (it does not scan the template for referenced bindings), so the oracle side uses
@@ -65,6 +67,21 @@ It is **independent of the Rust crate** and never edits `libs/render3` source.
 > here likewise registers **no** pipes (`declarations: []`,
 > `hasDirectiveDependencies: false`) — both sides lower the identical
 > `ɵɵpipe`/`ɵɵpipeBindN` stream from the template alone, apples-to-apples.
+
+> The **i18n** fixtures follow the same apples-to-apples principle. The Rust
+> `compile_component` does **not** pass any i18n options, and its template transform
+> leaves i18n handling entirely **inert** (see the `NOTE(port)` in
+> `libs/render3/src/template/template_transform.rs`: "all i18n handling (root
+> detection, ICU expansion) is inert"). It builds metadata with
+> `i18n_use_external_ids: false` and never enters an i18n block, so the `i18n` marker
+> is carried through as an ordinary static attribute — no `ɵɵi18n`/`ɵɵi18nStart`
+> instruction stream and no `$localize` const. To mirror that, the oracle here uses
+> the **same minimal config** it already uses (i18n **not** enabled — no extra
+> `parseTemplate` i18n options, `i18nUseExternalIds: false`). Enabling i18n on the
+> oracle alone would be a false apples-to-oranges diff (and would trip the inline
+> printer's `visitLocalizedString`/`visitTaggedTemplateExpr` "only important for
+> i18n" throws). These fixtures are expected to **DIFF** until the Rust i18n wiring
+> lands — the divergence pinpoints exactly where it is still absent.
 
 ## Normalisation
 

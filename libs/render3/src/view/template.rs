@@ -337,6 +337,17 @@ fn trim_trailing_nulls(params: &mut Vec<Expr>) {
     }
 }
 
+/// The i18n placeholder name for the `n`-th interpolation in a message: `INTERPOLATION` for the
+/// first, then `INTERPOLATION_1`, `INTERPOLATION_2`, … — mirroring Angular's `PlaceholderRegistry`
+/// (`i18n_parser.ts`: base name `INTERPOLATION`, de-duped with a numeric suffix).
+fn i18n_interpolation_name(index: usize) -> String {
+    if index == 0 {
+        "INTERPOLATION".to_string()
+    } else {
+        format!("INTERPOLATION_{index}")
+    }
+}
+
 fn str_lit(s: &str) -> Expr {
     o::literal(o::LiteralValue::String(s.to_string()), None)
 }
@@ -1040,7 +1051,9 @@ impl TemplateDefinitionBuilder {
         // `Pipe` ops are ignored in between). A **Listener** (a creation-block `ɵɵdomListener`) is
         // emitted between the start and end, so it blocks the merge — an element carrying any
         // `(event)` output stays in `elementStart … elementEnd` form even with no children.
-        let needs_end = has_children || !element.outputs.is_empty();
+        // An i18n-marked element always wraps an `ɵɵi18nStart … ɵɵi18nEnd` pair around its content,
+        // so it stays in `elementStart … elementEnd` form even when it has no element children.
+        let needs_end = has_children || !element.outputs.is_empty() || element.i18n.is_some();
 
         // `element`/`elementStart` reify to `(slot, tag, attributes, localRefs, span)`; the
         // trailing `null` attributes / localRefs args are trimmed (Angular `instruction.ts`).
@@ -1079,7 +1092,12 @@ impl TemplateDefinitionBuilder {
             self.build_property(slot, input);
         }
 
-        if has_children {
+        if element.i18n.is_some() {
+            // The element is marked for translation: its content is lowered as an i18n block
+            // (`ɵɵi18nStart`/`ɵɵi18nEnd` + `ɵɵi18nExp`/`ɵɵi18nApply`) rather than the normal
+            // text / bound-text path.
+            self.build_i18n_block(&element.children);
+        } else if has_children {
             let children = element.children.clone();
             self.visit_all(&children);
         }
@@ -1087,6 +1105,169 @@ impl TemplateDefinitionBuilder {
             self.creation_code
                 .push(instruction(R3::DomElementEnd, vec![]));
         }
+    }
+
+    /// Lower the content of an `i18n`-marked element. Builds the [`crate::i18n::Message`] from the
+    /// element's text/interpolation children, allocates a data slot for the i18n block, interns the
+    /// `$localize` message expression into the const pool, and emits:
+    ///
+    ///   - creation: `ɵɵi18nStart(slot, constIndex)` … `ɵɵi18nEnd()`.
+    ///   - update (one per interpolation, in order): `ɵɵi18nExp(<expr>)`, then a single
+    ///     `ɵɵi18nApply(slot)` after an `ɵɵadvance` to the block slot.
+    ///
+    /// SCOPE (common case): static text and `{{ … }}` interpolations only. ICU expansions, nested
+    /// element placeholders, `goog.getMsg` legacy ids, and custom message meaning/description/id are
+    /// NOT handled — see `NOTE(port)` below.
+    fn build_i18n_block(&mut self, children: &[Node]) {
+        use crate::i18n;
+
+        let slot = self.allocate_data_slot();
+
+        // Build the i18n Message AST + collect the interpolation expressions (in source order) that
+        // become `ɵɵi18nExp` operands.
+        let mut nodes: Vec<i18n::Node> = Vec::new();
+        let mut exprs: Vec<AstNode> = Vec::new();
+        let mut interp_index = 0usize;
+        for child in children {
+            match child {
+                Node::Text(t) => {
+                    nodes.push(i18n::Node::Text(i18n::Text {
+                        value: t.value.clone(),
+                    }));
+                }
+                Node::BoundText(bt) => {
+                    // A `BoundText` is an interpolation: `["a", "b", …]` strings interleaved with
+                    // `[expr, …]`. Each literal-string segment becomes an i18n Text node, each
+                    // expression an INTERPOLATION placeholder (numbered after the first, matching
+                    // Angular's `PlaceholderRegistry`).
+                    match &bt.value.kind {
+                        AstExprKind::Interpolation { strings, expressions } => {
+                            for (i, expr) in expressions.iter().enumerate() {
+                                if let Some(s) = strings.get(i) {
+                                    if !s.is_empty() {
+                                        nodes.push(i18n::Node::Text(i18n::Text { value: s.clone() }));
+                                    }
+                                }
+                                let name = i18n_interpolation_name(interp_index);
+                                interp_index += 1;
+                                nodes.push(i18n::Node::Placeholder(i18n::Placeholder {
+                                    // `value` is only used by the UID/digest serializer; the raw
+                                    // interpolation source is the faithful choice when available.
+                                    value: String::new(),
+                                    name,
+                                }));
+                                exprs.push(expr.clone());
+                            }
+                            if let Some(last) = strings.last() {
+                                if !last.is_empty() {
+                                    nodes.push(i18n::Node::Text(i18n::Text { value: last.clone() }));
+                                }
+                            }
+                        }
+                        // A bare `{{ expr }}` (no surrounding text).
+                        _ => {
+                            let name = i18n_interpolation_name(interp_index);
+                            interp_index += 1;
+                            nodes.push(i18n::Node::Placeholder(i18n::Placeholder {
+                                value: String::new(),
+                                name,
+                            }));
+                            exprs.push(bt.value.clone());
+                        }
+                    }
+                }
+                // NOTE(port): nested elements (TagPlaceholder), ICU (Icu/IcuPlaceholder), and
+                // control-flow blocks inside an i18n block are not yet lowered; their content is
+                // skipped here. The common text + interpolation case is fully handled.
+                _ => {}
+            }
+        }
+
+        // NOTE(port): the `i18n` attribute value (`meaning|description@@id`) is not threaded through
+        // the opaque r3_ast `I18nMeta` marker, so meaning/description/customId are empty here. Once
+        // the marker carries the parsed meta, feed it into `Message::new` and `compute_msg_id`.
+        let message = i18n::Message::new(nodes, "", "", "");
+        let const_index = self.intern_i18n_message(&message);
+
+        // Creation block: `ɵɵi18nStart(slot, constIndex)` … `ɵɵi18nEnd()`.
+        self.creation_code.push(instruction(
+            R3::I18nStart,
+            vec![num(slot as f64), num(const_index as f64)],
+        ));
+        self.creation_code.push(instruction(R3::I18nEnd, vec![]));
+
+        // Update block: one `ɵɵi18nExp(<expr>)` per interpolation, then a single `ɵɵi18nApply(slot)`.
+        // Each interpolation reserves one binding (var) slot (Angular `i18nExp` → one var).
+        if !exprs.is_empty() {
+            self.allocate_binding_slots(exprs.len());
+            self.advance_to(slot);
+            self.current_target_slot = slot;
+            for expr in &exprs {
+                let lowered = self.lower_expr(expr);
+                self.update_code
+                    .push(instruction(R3::I18nExp, vec![lowered]));
+            }
+            self.update_code
+                .push(instruction(R3::I18nApply, vec![num(slot as f64)]));
+        }
+    }
+
+    /// Intern an i18n [`crate::i18n::Message`] as the `$localize` message expression and return its
+    /// const-pool index (used as the `constIndex` argument of `ɵɵi18nStart`/`ɵɵi18n`).
+    ///
+    /// The expression is `o::localized_string(meta, messageParts, placeholders, [])`, mirroring
+    /// Angular's `createLocalizeStatements` (minus the hoisted-variable assignment — the const pool
+    /// holds the expression directly). `messageParts` are the literal text segments and
+    /// `placeholders` the `{$NAME}` markers, split out of the message string. The expression list is
+    /// left empty here because the interpolation operands flow through `ɵɵi18nExp`, not the
+    /// `$localize` tagged template (matching the runtime i18n instruction model).
+    fn intern_i18n_message(&mut self, message: &crate::i18n::Message) -> usize {
+        use crate::i18n;
+
+        let id = message.decimal_digest();
+        let meta = o::I18nMeta {
+            description: None,
+            meaning: None,
+            custom_id: Some(id),
+            legacy_ids: Vec::new(),
+        };
+
+        let mut message_parts: Vec<o::LiteralPiece> = Vec::new();
+        let mut placeholders: Vec<o::PlaceholderPiece> = Vec::new();
+        let no_span = o::ParseSourceSpan::new(0, 0);
+
+        // Walk the (flat, common-case) message nodes: Text → a literal part, Placeholder → a
+        // placeholder piece. Two consecutive literals are merged so `messageParts` and
+        // `placeholders` interleave as `$localize` expects (one more part than placeholder).
+        let mut pending = String::new();
+        let mut started = false;
+        for node in &message.nodes {
+            match node {
+                i18n::Node::Text(t) => pending.push_str(&t.value),
+                i18n::Node::Placeholder(ph) => {
+                    message_parts.push(o::LiteralPiece {
+                        text: std::mem::take(&mut pending),
+                        source_span: no_span.clone(),
+                    });
+                    started = true;
+                    placeholders.push(o::PlaceholderPiece {
+                        text: ph.name.clone(),
+                        source_span: no_span.clone(),
+                        associated_message: None,
+                    });
+                }
+                _ => {}
+            }
+        }
+        // Trailing (or sole) literal part. `$localize` always has one more part than placeholder.
+        let _ = started;
+        message_parts.push(o::LiteralPiece {
+            text: pending,
+            source_span: no_span.clone(),
+        });
+
+        let expr = o::localized_string(meta, message_parts, placeholders, Vec::new());
+        self.const_pool.intern(expr)
     }
 
     /// Lower a bound input (`[name]="value"`) into the matching update-block binding instruction,
@@ -3499,5 +3680,134 @@ mod tests {
         let consts = emit_expression(&builder.const_pool().to_const_array().unwrap());
         let flat: String = consts.chars().filter(|c| !c.is_whitespace()).collect();
         assert!(flat.contains("[[\"tpl\",\"\"]]"), "got: {consts}");
+    }
+
+    // -----------------------------------------------------------------------
+    // i18n wiring.
+    // -----------------------------------------------------------------------
+
+    /// `<div i18n>Hello</div>` — a static i18n element (text only, no interpolation).
+    fn i18n_static_div() -> Vec<Node> {
+        use crate::template::r3_ast::I18nMeta;
+        vec![Node::Element(Element {
+            name: "div".to_string(),
+            attributes: vec![],
+            inputs: vec![],
+            outputs: vec![],
+            directives: vec![],
+            children: vec![Node::Text(Text {
+                value: "Hello".to_string(),
+                source_span: t_span(),
+            })],
+            references: vec![],
+            is_self_closing: false,
+            source_span: t_span(),
+            start_source_span: t_span(),
+            end_source_span: None,
+            is_void: false,
+            i18n: Some(I18nMeta),
+        })]
+    }
+
+    /// `<div i18n>Hello {{name}}</div>` — an i18n element with one interpolation.
+    fn i18n_interp_div() -> Vec<Node> {
+        use crate::expression::ast::ExprKind as EK;
+        use crate::template::r3_ast::I18nMeta;
+        let ab = || AbsoluteSourceSpan::new(0, 0);
+        let sp = || ParseSpan::new(0, 0);
+        // `name` implicit-receiver read.
+        let implicit = AstNode::new(sp(), ab(), EK::ImplicitReceiver);
+        let name_read = AstNode::new(
+            sp(),
+            ab(),
+            EK::PropertyRead {
+                name_span: ab(),
+                receiver: Box::new(implicit),
+                name: "name".to_string(),
+            },
+        );
+        let interp = AstNode::new(
+            sp(),
+            ab(),
+            EK::Interpolation {
+                strings: vec!["Hello ".to_string(), "".to_string()],
+                expressions: vec![name_read],
+            },
+        );
+        vec![Node::Element(Element {
+            name: "div".to_string(),
+            attributes: vec![],
+            inputs: vec![],
+            outputs: vec![],
+            directives: vec![],
+            children: vec![Node::BoundText(BoundText {
+                value: interp,
+                source_span: t_span(),
+                i18n: None,
+            })],
+            references: vec![],
+            is_self_closing: false,
+            source_span: t_span(),
+            start_source_span: t_span(),
+            end_source_span: None,
+            is_void: false,
+            i18n: Some(I18nMeta),
+        })]
+    }
+
+    #[test]
+    fn i18n_static_emits_i18n_start_end() {
+        let input = TemplateCompilationInput::new("Test_Template", i18n_static_div());
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let out = emit_expression(&func);
+
+        // The element wrapper plus the i18n block creation instructions.
+        assert!(out.contains("\u{0275}\u{0275}domElementStart"), "got: {out}");
+        assert!(out.contains("\u{0275}\u{0275}i18nStart("), "missing ɵɵi18nStart, got: {out}");
+        assert!(out.contains("\u{0275}\u{0275}i18nEnd("), "missing ɵɵi18nEnd, got: {out}");
+        assert!(out.contains("\u{0275}\u{0275}domElementEnd"), "got: {out}");
+        // No interpolation → no i18nExp / i18nApply.
+        assert!(!out.contains("\u{0275}\u{0275}i18nExp"), "unexpected ɵɵi18nExp, got: {out}");
+        // i18nStart/i18nEnd must land INSIDE the element block.
+        let pos = |n: &str| out.find(n).unwrap_or_else(|| panic!("missing {n}, got: {out}"));
+        assert!(
+            pos("\u{0275}\u{0275}domElementStart")
+                < pos("\u{0275}\u{0275}i18nStart(")
+                && pos("\u{0275}\u{0275}i18nStart(") < pos("\u{0275}\u{0275}i18nEnd(")
+                && pos("\u{0275}\u{0275}i18nEnd(") < pos("\u{0275}\u{0275}domElementEnd"),
+            "expected domElementStart < i18nStart < i18nEnd < domElementEnd, got: {out}"
+        );
+        // Slots: div (0) + i18n block (1). The message is interned into the const pool.
+        assert_eq!(builder.data_index(), 2, "expected element + i18n block slots");
+        assert_eq!(builder.const_pool().entries().len(), 1, "message const");
+        // The const-index argument of i18nStart is the message's const-pool slot (0).
+        assert!(out.contains("\u{0275}\u{0275}i18nStart(1, 0)"), "got: {out}");
+    }
+
+    #[test]
+    fn i18n_interpolation_emits_i18n_exp_and_apply() {
+        let input = TemplateCompilationInput::new("Test_Template", i18n_interp_div());
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let out = emit_expression(&func);
+
+        // Creation: i18nStart/i18nEnd around the element content.
+        assert!(out.contains("\u{0275}\u{0275}i18nStart("), "missing ɵɵi18nStart, got: {out}");
+        assert!(out.contains("\u{0275}\u{0275}i18nEnd("), "missing ɵɵi18nEnd, got: {out}");
+        // Update: i18nExp for the interpolation operand, then i18nApply, with the bound expr on ctx.
+        assert!(out.contains("\u{0275}\u{0275}i18nExp("), "missing ɵɵi18nExp, got: {out}");
+        assert!(out.contains("\u{0275}\u{0275}i18nApply("), "missing ɵɵi18nApply, got: {out}");
+        assert!(out.contains("ctx.name"), "interpolation operand should resolve to ctx, got: {out}");
+        // The normal text-interpolation path must NOT be used for i18n content.
+        assert!(!out.contains("\u{0275}\u{0275}textInterpolate"), "unexpected textInterpolate, got: {out}");
+        // i18nExp precedes i18nApply in the update block.
+        let pos = |n: &str| out.find(n).unwrap_or_else(|| panic!("missing {n}, got: {out}"));
+        assert!(
+            pos("\u{0275}\u{0275}i18nExp(") < pos("\u{0275}\u{0275}i18nApply("),
+            "expected i18nExp before i18nApply, got: {out}"
+        );
+        // One interpolation reserves one var slot.
+        assert_eq!(builder.vars(), 1, "expected one i18nExp var slot");
     }
 }

@@ -239,6 +239,46 @@ const FIXTURES = [
     selector: 'app-pipe-binding',
     className: 'PipeBindingComponent',
   },
+  // -------------------------------------------------------------------------
+  // Fifth batch: i18n. A `<div i18n>...</div>` MARKS the element for translation.
+  // Crucially, the Rust `compile_component` does NOT pass any i18n options and its
+  // template transform leaves i18n handling entirely INERT — see the NOTE(port) in
+  // libs/render3/src/template/template_transform.rs:44 ("all i18n handling (root
+  // detection, ICU expansion) is inert (`None`)") and compile.rs, which builds its
+  // metadata with `i18n_use_external_ids: false` and never enables i18n. The Rust
+  // side therefore treats the `i18n` marker as a PLAIN static attribute named
+  // `i18n` (no message extraction, no `ɵɵi18n`/`ɵɵi18nStart` instruction stream,
+  // no `$localize` tagged-template const).
+  //
+  // To keep the comparison apples-to-apples the oracle here uses the SAME minimal
+  // config it already uses in compileWithOracle: i18n is NOT enabled (no extra
+  // parseTemplate i18n options, `i18nUseExternalIds: false`, unchanged). Because
+  // `compile_component` does not yet pass i18n options, mirroring that minimal
+  // config is exactly what the task calls for — both sides see `<div i18n>` with
+  // `i18n` as an ordinary attribute. (If/when the Rust side starts honoring i18n,
+  // the oracle would flip to enableI18nLegacyMessageIdFormat + the matching flags;
+  // until then enabling it on the oracle alone would be a FALSE apples-to-oranges
+  // diff — and would also trip the printer's `visitLocalizedString` /
+  // `visitTaggedTemplateExpr` "only important for i18n" throws.)
+  //
+  // These fixtures will very likely DIFF: the oracle's `parseTemplate` understands
+  // the `i18n` marker and may drop/relocate it (it is not emitted as a literal
+  // attribute the way a normal attr is), whereas the Rust side carries `i18n`
+  // through as a plain attribute const. That divergence is the informative signal —
+  // it pinpoints exactly where the Rust i18n wiring is still absent.
+  // -------------------------------------------------------------------------
+  {
+    id: 'i18n-static',
+    template: '<div i18n>Hello</div>',
+    selector: 'app-i18n-static',
+    className: 'I18nStaticComponent',
+  },
+  {
+    id: 'i18n-interp',
+    template: '<div i18n>Hello {{name}}</div>',
+    selector: 'app-i18n-interp',
+    className: 'I18nInterpComponent',
+  },
 ];
 
 // ---------------------------------------------------------------------------

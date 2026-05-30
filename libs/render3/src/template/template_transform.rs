@@ -346,8 +346,28 @@ impl<'b> HtmlAstToIvyAst<'b> {
         }
 
         let is_template_element = is_ng_template(&element.name);
-        let prepared = self.prepare_attributes(&element.attrs, is_template_element);
+        let mut prepared = self.prepare_attributes(&element.attrs, is_template_element);
         let directives = self.extract_directives(Some(&element.name), &element.directives);
+
+        // i18n WIRING (common case): an `i18n` attribute marks the element for translation. We
+        // drop the literal `i18n` attribute from the static attribute list and flag the element
+        // with `i18n: Some(I18nMeta)`. The downstream view builder
+        // ([`crate::view::template::TemplateDefinitionBuilder::build_element`]) reconstructs the
+        // [`crate::i18n::Message`] from the element's text/interpolation children and emits the
+        // `ɵɵi18nStart`/`ɵɵi18nEnd` instruction stream.
+        //
+        // NOTE(port): the `i18n` attribute *value* (`meaning|description@@id`), `i18n-<attr>`
+        // attribute translation, and ICU expansions are not yet wired — only the bare `i18n`
+        // marker with text + `{{ }}` interpolation children is handled.
+        let element_is_i18n = element.attrs.iter().any(is_i18n_attribute);
+        if element_is_i18n {
+            prepared.attributes.retain(|a| !is_i18n_attribute_name(&a.name));
+        }
+        let element_i18n: Option<t::I18nMeta> = if element_is_i18n {
+            Some(t::I18nMeta)
+        } else {
+            None
+        };
 
         let children = if preparsed.non_bindable {
             NonBindableVisitor.visit_all(&element.children)
@@ -415,7 +435,7 @@ impl<'b> HtmlAstToIvyAst<'b> {
                 start_source_span: to_offset_span(&element.start_source_span),
                 end_source_span: to_offset_span_opt(&element.end_source_span),
                 is_void: element.is_void,
-                i18n: None,
+                i18n: element_i18n.clone(),
             })
         };
 
@@ -1301,6 +1321,18 @@ fn filter_animation_inputs(inputs: &[t::BoundAttribute]) -> Vec<t::BoundAttribut
         .collect()
 }
 
+/// `isI18nAttribute(name)` (`render3/view/i18n/util.ts`) — the bare `i18n` marker or an
+/// `i18n-<attr>` per-attribute translation marker. NOTE(port): only the bare `i18n` form is
+/// honored downstream; `i18n-<attr>` is detected but currently left as a plain attribute.
+fn is_i18n_attribute_name(name: &str) -> bool {
+    name == "i18n" || name.starts_with("i18n-")
+}
+
+fn is_i18n_attribute(attr: &html::Attribute) -> bool {
+    // Only the bare `i18n` marker triggers element-level i18n wiring for the common case.
+    attr.name == "i18n"
+}
+
 /// `isNgTemplate`. NOTE(port): replace with `crate::ml_parser::tags::is_ng_template`.
 fn is_ng_template(name: &str) -> bool {
     let stripped = name.rsplit(':').next().unwrap_or(name);
@@ -2057,6 +2089,39 @@ mod tests {
         assert_eq!(element.attributes[0].value, "box");
         assert!(element.inputs.is_empty());
         assert!(matches!(element.children[0], t::Node::Text(_)));
+    }
+
+    #[test]
+    fn i18n_attribute_marks_element_and_is_dropped() {
+        let nodes = parse_html(r#"<div i18n>Hello {{ name }}</div>"#);
+        let mut bp = BindingParser::new();
+        let result = html_ast_to_render3_ast(&nodes, &mut bp, Render3ParseOptions::default());
+        let element = match &result.nodes[0] {
+            t::Node::Element(e) => e,
+            other => panic!("expected Element, got {other:?}"),
+        };
+        // The `i18n` marker attribute is consumed (dropped from the static attribute list)…
+        assert!(
+            element.attributes.iter().all(|a| a.name != "i18n"),
+            "i18n attribute should be dropped: {:?}",
+            element.attributes
+        );
+        // …and the element is flagged for translation.
+        assert!(element.i18n.is_some(), "element should be marked i18n");
+        // Content (text + interpolation) is preserved.
+        assert!(matches!(element.children[0], t::Node::BoundText(_)));
+    }
+
+    #[test]
+    fn non_i18n_element_is_not_marked() {
+        let nodes = parse_html(r#"<div class="box">x</div>"#);
+        let mut bp = BindingParser::new();
+        let result = html_ast_to_render3_ast(&nodes, &mut bp, Render3ParseOptions::default());
+        let element = match &result.nodes[0] {
+            t::Node::Element(e) => e,
+            other => panic!("expected Element, got {other:?}"),
+        };
+        assert!(element.i18n.is_none(), "plain element must not be i18n-marked");
     }
 
     #[test]
