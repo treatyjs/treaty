@@ -58,7 +58,13 @@ impl TemplateBuilder for RealTemplateBuilder {
         _all_deferrable_deps_fn: Option<&Expr>,
     ) -> TemplateBuilderResult {
         let name = format!("{}_Template", meta.base.name);
-        let input = TemplateCompilationInput::new(name, meta.template.nodes.clone());
+        // Angular selects the `DomOnly` instruction family (`ɵɵdomElement*`/`ɵɵdomListener`/
+        // `ɵɵdomProperty`/`ɵɵdomTemplate`) iff the component `isStandalone && !hasDirectiveDependencies`
+        // (`render3/view/compiler.ts`), otherwise the classic `Full` family (`ɵɵelement*`/`ɵɵlistener`/
+        // `ɵɵproperty`/`ɵɵtemplate`). Thread that decision into the view builder.
+        let dom_only = meta.base.is_standalone && !meta.has_directive_dependencies;
+        let input =
+            TemplateCompilationInput::new(name, meta.template.nodes.clone()).with_dom_only(dom_only);
         let mut builder = TemplateDefinitionBuilder::new(&input);
         let template_fn = builder.build_template_function(&input);
 

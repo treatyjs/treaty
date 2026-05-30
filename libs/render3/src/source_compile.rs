@@ -22,7 +22,7 @@ use oxc_span::SourceType;
 
 use crate::compile::{CompiledComponent, RealTemplateBuilder};
 use crate::output::emitter::emit_expression;
-use crate::output_ast::{self as o, ParseSourceSpan};
+use crate::output_ast::{self as o, Expr, LiteralValue, ParseSourceSpan};
 use crate::template::template_transform::{
     html_ast_to_render3_ast, BindingParser, Render3ParseOptions,
 };
@@ -103,6 +103,112 @@ fn string_value<'a>(expr: &'a Expression<'a>) -> Option<String> {
     }
 }
 
+/// Reads an array of string literals (used for `styles: [...]`). Returns `None` when the value
+/// is not an array literal; non-string elements are skipped.
+fn string_array_value<'a>(expr: &'a Expression<'a>) -> Option<Vec<String>> {
+    let Expression::ArrayExpression(arr) = expr else {
+        return None;
+    };
+    let mut out = Vec::new();
+    for el in &arr.elements {
+        if let Some(inner) = el.as_expression() {
+            if let Some(s) = string_value(inner) {
+                out.push(s);
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Maps a `ViewEncapsulation.X` member expression (or bare `X`) onto the [`ViewEncapsulation`]
+/// enum. Unknown / non-member values yield `None` (caller keeps the Emulated default, matching
+/// Angular's `null → Emulated` normalization).
+fn encapsulation_value<'a>(expr: &'a Expression<'a>) -> Option<ViewEncapsulation> {
+    let name = match expr {
+        Expression::StaticMemberExpression(m) => m.property.name.as_str(),
+        Expression::Identifier(id) => id.name.as_str(),
+        _ => return None,
+    };
+    match name {
+        "Emulated" => Some(ViewEncapsulation::Emulated),
+        "None" => Some(ViewEncapsulation::None),
+        "ShadowDom" => Some(ViewEncapsulation::ShadowDom),
+        _ => None,
+    }
+}
+
+/// Whether an object key is a valid bare JS identifier (so it can be emitted unquoted).
+fn is_safe_object_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '$' => {
+            chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+        }
+        _ => false,
+    }
+}
+
+/// Best-effort conversion of an oxc `Expression` into an `output_ast` [`Expr`], faithful enough to
+/// re-emit metadata blobs Angular copies through verbatim (notably `animations`, whose array of
+/// trigger objects the component definition reproduces under `data: {animation: [...]}`).
+///
+/// Handles the literal subset that appears in such metadata — string/number/bool/null literals,
+/// array and object literals, identifiers (as variable reads), member access and call
+/// expressions. Anything outside this subset returns `None` so the caller can decline rather than
+/// emit a corrupted blob.
+fn convert_expr<'a>(expr: &'a Expression<'a>) -> Option<Expr> {
+    match expr {
+        Expression::StringLiteral(s) => {
+            Some(o::literal(LiteralValue::String(s.value.to_string()), None))
+        }
+        Expression::TemplateLiteral(t) if t.expressions.is_empty() && t.quasis.len() == 1 => t
+            .quasis[0]
+            .value
+            .cooked
+            .as_ref()
+            .map(|c| o::literal(LiteralValue::String(c.to_string()), None)),
+        Expression::NumericLiteral(n) => Some(o::literal(LiteralValue::Number(n.value), None)),
+        Expression::BooleanLiteral(b) => Some(o::literal(LiteralValue::Bool(b.value), None)),
+        Expression::NullLiteral(_) => Some(o::literal(LiteralValue::Null, None)),
+        Expression::Identifier(id) => Some(o::variable(id.name.to_string(), None)),
+        Expression::ArrayExpression(arr) => {
+            let mut elems = Vec::with_capacity(arr.elements.len());
+            for el in &arr.elements {
+                let inner = el.as_expression()?;
+                elems.push(convert_expr(inner)?);
+            }
+            Some(o::literal_arr(elems, None))
+        }
+        Expression::ObjectExpression(obj) => {
+            let mut entries = Vec::with_capacity(obj.properties.len());
+            for p in &obj.properties {
+                let ObjectPropertyKind::ObjectProperty(op) = p else {
+                    return None;
+                };
+                let key = key_name(&op.key)?;
+                let quoted = !is_safe_object_key(key);
+                entries.push((key.to_string(), quoted, convert_expr(&op.value)?));
+            }
+            Some(o::literal_map(entries, None))
+        }
+        Expression::StaticMemberExpression(m) => {
+            let object = convert_expr(&m.object)?;
+            Some(object.prop(m.property.name.as_str()))
+        }
+        Expression::CallExpression(call) => {
+            let callee = convert_expr(&call.callee)?;
+            let mut args = Vec::with_capacity(call.arguments.len());
+            for a in &call.arguments {
+                let inner = a.as_expression()?;
+                args.push(convert_expr(inner)?);
+            }
+            Some(callee.call_fn(args, false))
+        }
+        Expression::ParenthesizedExpression(p) => convert_expr(&p.expression),
+        _ => None,
+    }
+}
+
 /// Walks an object literal property by name, returning its value expression.
 fn find_prop<'a>(
     obj: &'a oxc_ast::ast::ObjectExpression<'a>,
@@ -121,14 +227,14 @@ fn find_prop<'a>(
 }
 
 /// Recognizes a signal-member initializer call: `input()`, `input.required()`, `model()`,
-/// `model.required()`, `output()`. Returns the base callee identifier (`input`/`model`/`output`)
-/// and whether `.required` was used.
+/// `model.required()`, `output()`, `outputFromObservable()`. Returns the base callee identifier
+/// (`input`/`model`/`output`/`outputFromObservable`) and whether `.required` was used.
 fn signal_call<'a>(expr: &'a Expression<'a>) -> Option<(&'a str, bool)> {
     let Expression::CallExpression(call) = expr else {
         return None;
     };
     match &call.callee {
-        // `input(...)`, `output(...)`, `model(...)`
+        // `input(...)`, `output(...)`, `model(...)`, `outputFromObservable(...)`
         Expression::Identifier(id) => Some((id.name.as_str(), false)),
         // `input.required(...)`, `model.required(...)`
         Expression::StaticMemberExpression(member) => {
@@ -141,6 +247,41 @@ fn signal_call<'a>(expr: &'a Expression<'a>) -> Option<(&'a str, bool)> {
         }
         _ => None,
     }
+}
+
+/// The arguments of a call expression, if `expr` is one.
+fn call_args<'a>(expr: &'a Expression<'a>) -> Option<&'a oxc_allocator::Vec<'a, Argument<'a>>> {
+    if let Expression::CallExpression(call) = expr {
+        Some(&call.arguments)
+    } else {
+        None
+    }
+}
+
+/// The alias from a signal `input`/`model`/`output` options object, i.e. the `alias`
+/// property of the LAST argument when it is an object literal: `input(default, {alias: 'x'})`
+/// / `output({alias: 'x'})`. Returns `None` when no alias option is present.
+fn signal_alias(expr: &Expression) -> Option<String> {
+    let args = call_args(expr)?;
+    let last = args.last()?;
+    let Argument::ObjectExpression(obj) = last else {
+        return None;
+    };
+    let alias_expr = find_prop(obj, "alias")?;
+    string_value(alias_expr)
+}
+
+/// The literal string alias from a property decorator call's first argument:
+/// `@Input('renamedName')` / `@Output('renamedName')`. Returns `None` for the bare `@Input()`.
+fn decorator_string_alias(dec: &Decorator) -> Option<String> {
+    let Expression::CallExpression(call) = &dec.expression else {
+        return None;
+    };
+    let first = call.arguments.first()?;
+    let Argument::StringLiteral(s) = first else {
+        return None;
+    };
+    Some(s.value.to_string())
 }
 
 /// Detected metadata that this front-end refuses to mis-compile. Presence of any of these in the
@@ -185,8 +326,11 @@ fn collect_io(
         };
 
         // Decorator-based @Input/@Output (and rejection of unsupported member decorators).
+        // `@Input('alias')` / `@Output('alias')` carry an optional public-name alias as the
+        // decorator call's first string argument.
         let mut decorated_input = false;
         let mut decorated_output = false;
+        let mut decorator_alias: Option<String> = None;
         for dec in &prop.decorators {
             if let Some(name) = decorator_name(dec) {
                 if UNSUPPORTED_PROPERTY_DECORATORS.contains(&name) {
@@ -195,19 +339,28 @@ fn collect_io(
                     ));
                 }
                 match name {
-                    "Input" => decorated_input = true,
-                    "Output" => decorated_output = true,
+                    "Input" => {
+                        decorated_input = true;
+                        decorator_alias = decorator_string_alias(dec);
+                    }
+                    "Output" => {
+                        decorated_output = true;
+                        decorator_alias = decorator_string_alias(dec);
+                    }
                     _ => {}
                 }
             }
         }
 
         if decorated_input {
+            // A renamed `@Input('public') declared` emits the flag-array form
+            // `[0, "public", "declared"]`; the bare form emits the property name as a string.
+            let public_name = decorator_alias.clone().unwrap_or_else(|| member_name.clone());
             inputs.insert(
                 member_name.clone(),
                 R3InputMetadata {
                     class_property_name: member_name.clone(),
-                    binding_property_name: member_name.clone(),
+                    binding_property_name: public_name,
                     required: false,
                     is_signal: false,
                     transform_function: None,
@@ -216,33 +369,47 @@ fn collect_io(
             continue;
         }
         if decorated_output {
-            outputs.insert(member_name.clone(), member_name.clone());
+            // Outputs key on the property name; the value is the public name (alias or property).
+            let public_name = decorator_alias.unwrap_or_else(|| member_name.clone());
+            outputs.insert(member_name.clone(), public_name);
             continue;
         }
 
-        // Signal-based members: `x = input()` / `input.required()` / `model()` / `output()`.
+        // Signal-based members: `x = input()` / `input.required()` / `model()` / `output()`
+        // / `outputFromObservable()`. The alias (if any) comes from the call's options object.
         if let Some(init) = &prop.value {
             if let Some((base, required)) = signal_call(init) {
                 match base {
                     "input" | "model" => {
+                        let public_name =
+                            signal_alias(init).unwrap_or_else(|| member_name.clone());
                         inputs.insert(
                             member_name.clone(),
                             R3InputMetadata {
                                 class_property_name: member_name.clone(),
-                                binding_property_name: member_name.clone(),
+                                binding_property_name: public_name,
                                 required,
                                 is_signal: true,
                                 transform_function: None,
                             },
                         );
-                        // `model()` also produces a paired output `<name>Change`.
+                        // `model()` also produces a paired output. It keys on the property name
+                        // with value `<publicName>Change` (golden: `counter: "counterChange"`).
                         if base == "model" {
-                            let change = format!("{member_name}Change");
-                            outputs.insert(change.clone(), change);
+                            let output_public = signal_alias(init)
+                                .unwrap_or_else(|| member_name.clone());
+                            outputs.insert(
+                                member_name.clone(),
+                                format!("{output_public}Change"),
+                            );
                         }
                     }
-                    "output" => {
-                        outputs.insert(member_name.clone(), member_name.clone());
+                    // `output()` and `outputFromObservable()` both declare an output keyed on the
+                    // property name; `output({alias})` may rename the public name.
+                    "output" | "outputFromObservable" => {
+                        let public_name =
+                            signal_alias(init).unwrap_or_else(|| member_name.clone());
+                        outputs.insert(member_name.clone(), public_name);
                     }
                     _ => {}
                 }
@@ -405,6 +572,26 @@ fn compile_program(program: &Program) -> CompiledComponent {
         })
         .unwrap_or(ChangeDetectionStrategy::OnPush);
 
+    // styles: ['...', ...] — inline component styles. Threaded into the definition `styles:[...]`
+    // array (and, for emulated encapsulation, scoped) by the emitter.
+    let styles = obj
+        .and_then(|o| find_prop(o, "styles"))
+        .and_then(string_array_value)
+        .unwrap_or_default();
+
+    // encapsulation: ViewEncapsulation.X — defaults to Emulated (Angular's `null → Emulated`).
+    let encapsulation = obj
+        .and_then(|o| find_prop(o, "encapsulation"))
+        .and_then(encapsulation_value)
+        .unwrap_or(ViewEncapsulation::Emulated);
+
+    // animations: [...] — copied through verbatim into `data: {animation: [...]}` by the emitter.
+    // Present-but-empty (`animations: []`) still emits `data: {animation: []}`, so the absence of
+    // the key (None) is distinct from an empty array.
+    let animations = obj
+        .and_then(|o| find_prop(o, "animations"))
+        .and_then(convert_expr);
+
     // inputs / outputs.
     let mut inputs: OrderedMap<String, R3InputMetadata> = OrderedMap::new();
     let mut outputs: OrderedMap<String, String> = OrderedMap::new();
@@ -444,21 +631,28 @@ fn compile_program(program: &Program) -> CompiledComponent {
             &template_html.unwrap_or_default(),
             change_detection,
             &imported_names,
+            styles,
+            encapsulation,
+            animations,
         ),
         // Directives reuse the component emitter is NOT correct — directives go through a
         // different define. Not supported by the existing emitter, so bail clearly.
         TopLevel::Directive => {
-            let _ = change_detection;
+            let _ = (change_detection, styles, encapsulation, animations);
             err("@Directive emission not yet supported (only @Component)".to_string())
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compile_component_meta(
     base: R3DirectiveMetadata,
     template_html: &str,
     change_detection: ChangeDetectionStrategy,
     imported_names: &[String],
+    styles: Vec<String>,
+    encapsulation: ViewEncapsulation,
+    animations: Option<Expr>,
 ) -> CompiledComponent {
     let mut errors: Vec<String> = Vec::new();
 
@@ -499,10 +693,10 @@ fn compile_component_meta(
             dependencies_fn: None,
         },
         declaration_list_emit_mode: DeclarationListEmitMode::Direct,
-        styles: Vec::new(),
+        styles,
         external_styles: None,
-        encapsulation: ViewEncapsulation::Emulated,
-        animations: None,
+        encapsulation,
+        animations,
         view_providers: None,
         relative_context_file_path: String::new(),
         i18n_use_external_ids: false,
@@ -638,6 +832,82 @@ mod tests {
             out.errors.iter().any(|e| e.contains("templateUrl")),
             "expected templateUrl error; got {:?}",
             out.errors
+        );
+    }
+
+    #[test]
+    fn shadow_dom_styles_and_encapsulation_3() {
+        // r3_view_compiler_styling/component_styles: ShadowDom encapsulation passes styles through
+        // un-shimmed and emits `encapsulation: 3`.
+        let src = r#"
+            import {Component, ViewEncapsulation} from '@angular/core';
+            @Component({
+                encapsulation: ViewEncapsulation.ShadowDom,
+                selector: 'my-component',
+                styles: ['div.cool { color: blue; }', ':host.nice p { color: gold; }'],
+                template: '...',
+                standalone: false
+            })
+            export class MyComponent {}
+        "#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let flat: String = out.code.chars().filter(|c| !c.is_whitespace()).collect();
+        // Styles pass through verbatim (NOT shimmed with `_ngcontent-%COMP%`) under ShadowDom.
+        assert!(
+            flat.contains(r#"styles:["div.cool{color:blue;}",":host.nicep{color:gold;}"]"#),
+            "styles array missing/shimmed; got: {}",
+            out.code
+        );
+        assert!(
+            !out.code.contains("_ngcontent-%COMP%"),
+            "ShadowDom styles must not be shimmed; got: {}",
+            out.code
+        );
+        assert!(flat.contains("encapsulation:3"), "encapsulation 3 missing; got: {}", out.code);
+    }
+
+    #[test]
+    fn animations_emit_data_animation() {
+        // r3_view_compiler_styling/component_animations: animations are copied verbatim into
+        // `data: {animation: [...]}`. No styles + default Emulated → downgraded to None (= 2).
+        let src = r#"
+            @Component({
+                selector: 'my-component',
+                animations: [{ name: 'foo123' }, { name: 'trigger123' }],
+                template: '',
+                standalone: false
+            })
+            export class MyComponent {}
+        "#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let flat: String = out.code.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            flat.contains(r#"data:{animation:[{name:"foo123"},{name:"trigger123"}]}"#),
+            "data.animation missing/wrong shape; got: {}",
+            out.code
+        );
+        assert!(flat.contains("encapsulation:2"), "encapsulation 2 missing; got: {}", out.code);
+    }
+
+    #[test]
+    fn empty_animations_still_emit_data_animation() {
+        // Present-but-empty `animations: []` STILL emits `data: {animation: []}`.
+        let src = r#"
+            @Component({
+                selector: 'my-component', animations: [], template: '',
+                standalone: false
+            })
+            export class MyComponent {}
+        "#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let flat: String = out.code.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            flat.contains("data:{animation:[]}"),
+            "empty data.animation missing; got: {}",
+            out.code
         );
     }
 }

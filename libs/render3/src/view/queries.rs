@@ -78,26 +78,60 @@ pub struct MaybeForwardRefExpression {
 // ---------------------------------------------------------------------------
 // `ConstantPool` (from `../../constant_pool`).
 //
-// Query generation only ever calls `get_const_literal(predicate, /*forceShared*/ true)` to
-// (potentially) hoist the selector-predicate array. The caller in `view::compiler` threads a
-// transient pool that it discards — query predicates are therefore emitted inline rather than
-// hoisted into shared `_cN` constants (hoisting would dangle without the pool's statements being
-// collected into the definition). This stand-in models exactly that inline behavior.
+// Query generation only ever calls `get_const_literal(predicate, /*forceShared*/ true)` to hoist
+// the selector-predicate array into a shared module-level constant. Angular's `getConstLiteral`
+// with `forceShared=true` interns the literal (de-duping structurally-equivalent entries) under a
+// generated `_cN` name and returns a `ReadVarExpr` referencing it; the `const _cN = <literal>;`
+// declarations are later prepended to the module by the caller. This stand-in models exactly that:
+// the query functions reference `_c0`, `_c1`, … (matching the golden), and the collected
+// declarations are exposed via [`ConstantPool::statements`] for the caller to hoist.
 // ---------------------------------------------------------------------------
 
-/// Inline `ConstantPool` for query generation. Only `get_const_literal` is modelled.
+/// `CONSTANT_PREFIX` — the shared-constant variable prefix (`'_c'`), from
+/// `render3/constant_pool.ts`.
+const CONSTANT_PREFIX: &str = "_c";
+
+/// Shared-literal `ConstantPool` for query generation. Models `getConstLiteral(literal, true)`:
+/// interns the literal under a `_cN` name and returns a variable reference.
 #[derive(Debug, Clone, Default)]
-pub struct ConstantPool;
+pub struct ConstantPool {
+    /// Interned literals in allocation order; the index is the `_cN` ordinal.
+    literals: Vec<Expr>,
+}
 
 impl ConstantPool {
     pub fn new() -> ConstantPool {
-        ConstantPool
+        ConstantPool::default()
     }
 
-    /// `getConstLiteral(literal, forceShared)` — returns the literal inline (see the module
-    /// comment for why query predicates are not hoisted into shared `_cN` constants here).
+    /// `getConstLiteral(literal, forceShared=true)` — intern the literal into a shared `_cN`
+    /// constant (de-duping structurally-equivalent entries) and return a `_cN` variable reference.
     pub fn get_const_literal(&mut self, literal: Expr, _force_shared: bool) -> Expr {
-        literal
+        let index = self
+            .literals
+            .iter()
+            .position(|e| e.is_equivalent(&literal))
+            .unwrap_or_else(|| {
+                self.literals.push(literal);
+                self.literals.len() - 1
+            });
+        var(&format!("{CONSTANT_PREFIX}{index}"))
+    }
+
+    /// The collected `const _cN = <literal>;` declarations, in allocation order, for the caller to
+    /// prepend to the emitted module.
+    pub fn statements(&self) -> Vec<Stmt> {
+        self.literals
+            .iter()
+            .enumerate()
+            .map(|(index, literal)| {
+                Stmt::bare(StmtKind::DeclareVar {
+                    name: format!("{CONSTANT_PREFIX}{index}"),
+                    value: Some(literal.clone()),
+                    ty: None,
+                })
+            })
+            .collect()
     }
 }
 
@@ -667,24 +701,43 @@ mod tests {
             ExprKind::Invoke { args, .. } => args,
             other => panic!("expected invoke, got {other:?}"),
         };
-        // predicate (literal array), flags = 2 args (no ctx.prop for legacy).
+        // predicate (hoisted `_c0` ref), flags = 2 args (no ctx.prop for legacy).
         assert_eq!(args.len(), 2);
-        // Predicate is a literal array of two trimmed selectors: "ref", "ref1".
+        // The selector array is hoisted into a shared `_c0` constant; the create call references
+        // it by variable (Angular `getConstLiteral(..., /*forceShared*/true)`).
         match &args[0].kind {
-            ExprKind::LiteralArray(entries) => {
-                assert_eq!(entries.len(), 2);
-                match (&entries[0].kind, &entries[1].kind) {
-                    (
-                        ExprKind::Literal(LiteralValue::String(a)),
-                        ExprKind::Literal(LiteralValue::String(b)),
-                    ) => {
-                        assert_eq!(a, "ref");
-                        assert_eq!(b, "ref1");
+            ExprKind::ReadVar { name } => assert_eq!(name, "_c0"),
+            other => panic!("expected hoisted `_c0` predicate ref, got {other:?}"),
+        }
+        // The pool collected the `const _c0 = ["ref", "ref1"];` declaration with the two trimmed
+        // selectors.
+        let consts = pool.statements();
+        assert_eq!(consts.len(), 1);
+        match &consts[0].kind {
+            StmtKind::DeclareVar {
+                name,
+                value: Some(value),
+                ..
+            } => {
+                assert_eq!(name, "_c0");
+                match &value.kind {
+                    ExprKind::LiteralArray(entries) => {
+                        assert_eq!(entries.len(), 2);
+                        match (&entries[0].kind, &entries[1].kind) {
+                            (
+                                ExprKind::Literal(LiteralValue::String(a)),
+                                ExprKind::Literal(LiteralValue::String(b)),
+                            ) => {
+                                assert_eq!(a, "ref");
+                                assert_eq!(b, "ref1");
+                            }
+                            other => panic!("expected two string literals, got {other:?}"),
+                        }
                     }
-                    other => panic!("expected two string literals, got {other:?}"),
+                    other => panic!("expected literal array const, got {other:?}"),
                 }
             }
-            other => panic!("expected literal array predicate, got {other:?}"),
+            other => panic!("expected `const _c0 = [...]`, got {other:?}"),
         }
 
         // Update phase: `let _t;` then the refresh && assign statement.

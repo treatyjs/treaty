@@ -420,6 +420,16 @@ struct Converter<'r, R: LocalResolver> {
     /// `__pipe_<name>(…)` placeholder (the historic behaviour of the non-pipe
     /// entry points).
     pipes: Option<&'r dyn PipeSlotAllocator>,
+    /// Lexical scope of in-scope arrow-function parameter names. When converting
+    /// the body of an `(params) => body` arrow, the parameter names shadow the
+    /// implicit receiver, so a read of `value` inside `value => value + 1`
+    /// resolves to the local `value` (a `ReadVarExpr`) rather than `ctx.value`.
+    /// This mirrors Angular's `updateParameterReferences` (`ingest.ts:1993`),
+    /// which rewrites any `LexicalReadExpr` whose name matches an enclosing
+    /// arrow parameter into a plain `o.variable(name)` before the later
+    /// implicit-receiver-resolution phase runs. Names accumulate across nested
+    /// arrows (an inner arrow's params join the set), exactly as the pipeline does.
+    arrow_params: Vec<String>,
 }
 
 impl<'r, R: LocalResolver> Converter<'r, R> {
@@ -428,7 +438,15 @@ impl<'r, R: LocalResolver> Converter<'r, R> {
             resolver,
             next_temp: 0,
             pipes: None,
+            arrow_params: Vec::new(),
         }
+    }
+
+    /// Whether `name` is bound by an enclosing arrow-function parameter and thus
+    /// shadows the implicit receiver. Mirrors the `parameterNames.has(expr.name)`
+    /// test in `updateParameterReferences`.
+    fn is_arrow_param(&self, name: &str) -> bool {
+        self.arrow_params.iter().any(|p| p == name)
     }
 
     /// Attach a [`PipeSlotAllocator`] so `BindingPipe` nodes lower to real
@@ -464,7 +482,11 @@ impl<R: LocalResolver> Converter<'_, R> {
             // non-implicit receiver, recurse and `.prop`.
             EK::PropertyRead { receiver, name, .. } => {
                 if is_implicit_receiver(receiver) {
-                    if let Some(local) = self.resolver.maybe_resolve_local(name) {
+                    // An enclosing arrow parameter shadows the implicit receiver:
+                    // `value => value + 1` reads the local `value`, not `ctx.value`.
+                    if self.is_arrow_param(name) {
+                        o::variable(name.clone(), None)
+                    } else if let Some(local) = self.resolver.maybe_resolve_local(name) {
                         local
                     } else {
                         self.resolver.resolve_implicit_receiver().prop(name.clone())
@@ -623,7 +645,7 @@ impl<R: LocalResolver> Converter<'_, R> {
 
             // ArrowFunction `(params) => body`.
             EK::ArrowFunction { parameters, body } => {
-                let params = parameters
+                let params: Vec<FnParam> = parameters
                     .iter()
                     .map(|p| match p {
                         e::ArrowFunctionParameter::Identifier(id) => {
@@ -638,7 +660,23 @@ impl<R: LocalResolver> Converter<'_, R> {
                         }
                     })
                     .collect();
+                // Register the bound parameter names so reads of them inside the
+                // body shadow the implicit receiver (Angular's
+                // `updateParameterReferences`). Names accumulate across nested
+                // arrows; we restore the prior scope length when this arrow's body
+                // is done so a sibling arrow does not see these params.
+                let scope_base = self.arrow_params.len();
+                for p in parameters {
+                    let bound = match p {
+                        e::ArrowFunctionParameter::Identifier(id) => id.name.clone(),
+                        // The rest parameter is bound by its bare name in the body
+                        // (`(...rest) => rest[0]`), not the spread-prefixed form.
+                        e::ArrowFunctionParameter::Rest(rest) => rest.name.clone(),
+                    };
+                    self.arrow_params.push(bound);
+                }
                 let body = self.convert(body);
+                self.arrow_params.truncate(scope_base);
                 o::arrow_fn(params, ArrowBody::Expr(Box::new(body)), None)
             }
 
@@ -1208,36 +1246,104 @@ mod tests {
         assert!(out.contains('['), "variadic array missing, got: {out}");
     }
 
+    /// Build an identifier arrow parameter node.
+    fn arrow_id_param(name: &str) -> e::ArrowFunctionParameter {
+        e::ArrowFunctionParameter::Identifier(ArrowFunctionIdentifierParameter {
+            name: name.to_string(),
+            span: sp(),
+            source_span: ab(),
+        })
+    }
+
     #[test]
     fn arrow_function() {
-        // (x) => x  -> (x) => x
-        let body = node(EK::PropertyRead {
-            name_span: ab(),
-            receiver: Box::new(implicit()),
-            name: "x".to_string(),
-        });
+        // (p) => x  -> a body read of a NON-parameter resolves to `ctx.x`.
+        let body = prop("x");
         let n = node(EK::ArrowFunction {
-            parameters: vec![e::ArrowFunctionParameter::Identifier(
-                ArrowFunctionIdentifierParameter {
-                    name: "p".to_string(),
-                    span: sp(),
-                    source_span: ab(),
-                },
-            )],
+            parameters: vec![arrow_id_param("p")],
             body: Box::new(body),
         });
-        let out = emit(&n);
-        assert!(out.contains("=>"), "got {out}");
+        assert_eq!(emit(&n), "(p) => ctx.x;\n");
+    }
+
+    #[test]
+    fn arrow_function_parameter_shadows_implicit_receiver() {
+        // value => value + 1  -> the param `value` resolves to the local, NOT `ctx.value`.
+        let body = node(EK::Binary {
+            operation: BinaryOperation::Add,
+            left: Box::new(prop("value")),
+            right: Box::new(num(1.0)),
+        });
+        let n = node(EK::ArrowFunction {
+            parameters: vec![arrow_id_param("value")],
+            body: Box::new(body),
+        });
+        assert_eq!(emit(&n), "(value) => value + 1;\n");
+    }
+
+    #[test]
+    fn arrow_function_non_parameter_still_reads_ctx() {
+        // a => a + 1 + componentProp  -> `a` is local, `componentProp` resolves to `ctx`.
+        let inner = node(EK::Binary {
+            operation: BinaryOperation::Add,
+            left: Box::new(prop("a")),
+            right: Box::new(num(1.0)),
+        });
+        let body = node(EK::Binary {
+            operation: BinaryOperation::Add,
+            left: Box::new(inner),
+            right: Box::new(prop("componentProp")),
+        });
+        let n = node(EK::ArrowFunction {
+            parameters: vec![arrow_id_param("a")],
+            body: Box::new(body),
+        });
+        assert_eq!(emit(&n), "(a) => a + 1 + ctx.componentProp;\n");
+    }
+
+    #[test]
+    fn arrow_function_nested_accumulates_parameters() {
+        // a => b => a + b  -> both `a` (outer) and `b` (inner) resolve as locals.
+        let inner_body = node(EK::Binary {
+            operation: BinaryOperation::Add,
+            left: Box::new(prop("a")),
+            right: Box::new(prop("b")),
+        });
+        let inner = node(EK::ArrowFunction {
+            parameters: vec![arrow_id_param("b")],
+            body: Box::new(inner_body),
+        });
+        let outer = node(EK::ArrowFunction {
+            parameters: vec![arrow_id_param("a")],
+            body: Box::new(inner),
+        });
+        assert_eq!(emit(&outer), "(a) => (b) => a + b;\n");
+    }
+
+    #[test]
+    fn arrow_function_sibling_parameter_scope_is_restored() {
+        // (a => a) + b  -> after the arrow body, `b` is NOT shadowed and reads `ctx.b`.
+        let arrow = node(EK::ArrowFunction {
+            parameters: vec![arrow_id_param("a")],
+            body: Box::new(prop("a")),
+        });
+        let n = node(EK::Binary {
+            operation: BinaryOperation::Add,
+            left: Box::new(arrow),
+            right: Box::new(prop("a")),
+        });
+        // The second `a` is outside the arrow's scope, so it resolves to `ctx.a`.
+        assert_eq!(emit(&n), "((a) => a) + ctx.a;\n");
     }
 
     #[test]
     fn arrow_function_rest_parameter() {
-        // (...rest) => rest  -> the rest param lowers with a `...rest` name.
+        // (...rest) => rest[0]  -> the rest param lowers with a `...rest` name and the
+        // body read of `rest` resolves to the local (not `ctx.rest`).
         use crate::expression::ast::ArrowFunctionRestParameter;
-        let body = node(EK::PropertyRead {
-            name_span: ab(),
-            receiver: Box::new(implicit()),
-            name: "rest".to_string(),
+        let body = node(EK::KeyedRead {
+            receiver: Box::new(prop("rest")),
+            key: Box::new(num(0.0)),
         });
         let n = node(EK::ArrowFunction {
             parameters: vec![e::ArrowFunctionParameter::Rest(ArrowFunctionRestParameter {
@@ -1247,8 +1353,6 @@ mod tests {
             })],
             body: Box::new(body),
         });
-        let out = emit(&n);
-        assert!(out.contains("=>"), "got {out}");
-        assert!(out.contains("...rest") || out.contains("rest"), "got {out}");
+        assert_eq!(emit(&n), "(...rest) => rest[0];\n");
     }
 }

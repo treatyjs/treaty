@@ -92,6 +92,16 @@ pub struct TemplateCompilationInput {
     pub name: String,
     /// The root template nodes to walk.
     pub nodes: Vec<Node>,
+    /// Compilation mode: `true` selects Angular's `TemplateCompilationMode.DomOnly` instruction set
+    /// (`ɵɵdomElement*`/`ɵɵdomListener`/`ɵɵdomProperty`), `false` the `Full` set
+    /// (`ɵɵelement*`/`ɵɵlistener`/`ɵɵproperty`). Angular picks `DomOnly` iff the component
+    /// `isStandalone && !hasDirectiveDependencies` (`render3/view/compiler.ts`), `Full` otherwise.
+    ///
+    /// Defaults to `true` (DomOnly) in [`Self::new`]: the selectorless `compile_component` entry point
+    /// (and this module's unit fixtures) always describe a standalone, dependency-free component, for
+    /// which Angular emits the DOM family. The source/decorator front-end overrides it via
+    /// [`Self::with_dom_only`] from the parsed `standalone` flag + resolved directive dependencies.
+    pub dom_only: bool,
 }
 
 impl TemplateCompilationInput {
@@ -99,7 +109,16 @@ impl TemplateCompilationInput {
         TemplateCompilationInput {
             name: name.into(),
             nodes,
+            dom_only: true,
         }
+    }
+
+    /// Set the DOM-only compilation mode (see [`Self::dom_only`]) and return `self`, so callers that
+    /// know the component's `isStandalone && !hasDirectiveDependencies` status can select the matching
+    /// instruction family.
+    pub fn with_dom_only(mut self, dom_only: bool) -> Self {
+        self.dom_only = dom_only;
+        self
     }
 }
 
@@ -456,6 +475,29 @@ fn pipe_insertion_index(creation: &[Stmt], target_slot: usize) -> Option<usize> 
     Some(idx)
 }
 
+/// DOM-property name remapping applied by `reifyDomProperty` (`reify.ts` `DOM_PROPERTY_REMAPPING`):
+/// in DomOnly mode a handful of attribute-style binding names map to their DOM-property spelling
+/// (`class` → `className`, `for` → `htmlFor`, …). Names not in the table pass through unchanged.
+fn remap_dom_property(name: &str) -> &str {
+    match name {
+        "class" => "className",
+        "for" => "htmlFor",
+        "formaction" => "formAction",
+        "innerHtml" => "innerHTML",
+        "readonly" => "readOnly",
+        "tabindex" => "tabIndex",
+        other => other,
+    }
+}
+
+/// Whether `name` is an ARIA attribute name (`isAriaAttribute`, `util/attributes.ts`): begins with
+/// `aria-` and is longer than the prefix. In Full mode an `[aria-*]` property binding reifies to
+/// `ɵɵariaProperty` instead of `ɵɵproperty`.
+fn is_aria_attribute(name: &str) -> bool {
+    const ARIA_PREFIX: &str = "aria-";
+    name.starts_with(ARIA_PREFIX) && name.len() > ARIA_PREFIX.len()
+}
+
 /// The `ɵɵ*` wire name of a callee expression when it is an `ExternalExpr` (`o::import_expr(R3)`).
 /// This is what Angular's `chaining` phase keys its `CHAIN_COMPATIBILITY` map on (`fn.value`).
 fn callee_wire_name(callee: &Expr) -> Option<&str> {
@@ -466,24 +508,73 @@ fn callee_wire_name(callee: &Expr) -> Option<&str> {
     }
 }
 
-/// Whether a call with callee `next` may be chained onto a run whose *first* call's callee is
-/// `first`. Mirrors Angular's `CHAIN_COMPATIBILITY` map (`phases/chaining.ts`): the continuation
-/// callee is keyed on the run's first instruction and is constant for the whole run. Almost every
-/// chainable instruction continues with *itself* (so equivalent callees chain), with one
-/// exception — `ɵɵconditionalCreate` continues with `ɵɵconditionalBranchCreate` (a `@if`/`@switch`
-/// chain emits one `conditionalCreate` followed by `conditionalBranchCreate` branches).
-fn chains_onto(first: &Expr, next: &Expr) -> bool {
-    let cc = R3::ConditionalCreate.name();
-    let cbc = R3::ConditionalBranchCreate.name();
-    let pipe = R3::Pipe.name();
-    match (callee_wire_name(first), callee_wire_name(next)) {
+/// The continuation callee a chained run keyed on `first`'s instruction expects, mirroring Angular's
+/// `CHAIN_COMPATIBILITY` map (`phases/chaining.ts`). Returns the wire name (`ɵɵ…`) that may be
+/// appended onto a run whose *first* call uses `first`, or `None` when `first` is NOT a chainable
+/// instruction (absent from the map — e.g. `ɵɵprojection`, `ɵɵpipe`, `ɵɵtemplate`-anchor-less ops).
+///
+/// Only instructions in this map chain; every other call breaks the run and stays a standalone
+/// statement. Almost every chainable instruction continues with *itself*; the two exceptions are the
+/// conditional-create pair (`conditionalCreate` → `conditionalBranchCreate`, then
+/// `conditionalBranchCreate` → itself).
+fn chain_continuation(first: &Expr) -> Option<&'static str> {
+    let name = callee_wire_name(first)?;
+    // Self-continuing chainable instructions (the bulk of CHAIN_COMPATIBILITY).
+    const SELF_CHAIN: &[R3] = &[
+        R3::AriaProperty,
+        R3::Attribute,
+        R3::ClassProp,
+        R3::Element,
+        R3::ElementContainer,
+        R3::ElementContainerEnd,
+        R3::ElementContainerStart,
+        R3::ElementEnd,
+        R3::ElementStart,
+        R3::DomProperty,
+        R3::I18nExp,
+        R3::Listener,
+        R3::Property,
+        R3::StyleProp,
+        R3::SyntheticHostListener,
+        R3::SyntheticHostProperty,
+        R3::TemplateCreate,
+        R3::TwoWayProperty,
+        R3::TwoWayListener,
+        R3::DeclareLet,
+        R3::DomElement,
+        R3::DomElementStart,
+        R3::DomElementEnd,
+        R3::DomElementContainer,
+        R3::DomElementContainerStart,
+        R3::DomElementContainerEnd,
+        R3::DomListener,
+        R3::DomTemplate,
+        R3::AnimationEnter,
+        R3::AnimationLeave,
+        R3::AnimationEnterListener,
+        R3::AnimationLeaveListener,
+    ];
+    if name == R3::ConditionalCreate.name() {
         // `conditionalCreate` run absorbs subsequent `conditionalBranchCreate` calls.
-        (Some(f), Some(n)) if f == cc => n == cbc,
-        // `ɵɵpipe` is NOT chainable (absent from Angular's CHAIN_COMPATIBILITY): consecutive
-        // pipe create ops stay as separate statements (`ɵɵpipe(2,…);ɵɵpipe(3,…);`).
-        (Some(f), _) if f == pipe => false,
-        // Default: a run continues with the same instruction.
-        _ => first.is_equivalent(next),
+        return Some(R3::ConditionalBranchCreate.name());
+    }
+    if name == R3::ConditionalBranchCreate.name() {
+        return Some(R3::ConditionalBranchCreate.name());
+    }
+    if let Some(r) = SELF_CHAIN.iter().find(|r| r.name() == name) {
+        return Some(r.name());
+    }
+    None
+}
+
+/// Whether a call with callee `next` may be chained onto a run whose *first* call's callee is
+/// `first`. Faithful to Angular's `chainOperationsInList`: `first` must be a chainable instruction
+/// (present in `CHAIN_COMPATIBILITY`) and `next`'s callee must equal the map's continuation for
+/// `first`.
+fn chains_onto(first: &Expr, next: &Expr) -> bool {
+    match (chain_continuation(first), callee_wire_name(next)) {
+        (Some(cont), Some(next_name)) => cont == next_name,
+        _ => false,
     }
 }
 
@@ -631,6 +722,12 @@ pub struct TemplateDefinitionBuilder {
     /// whether the prepended `ɵɵprojectionDef(...)` needs to be emitted in the no-specific-selector
     /// case.
     has_default_projection: bool,
+    /// Compilation mode for THIS view: `true` → Angular's `DomOnly` instruction family
+    /// (`ɵɵdomElement*`/`ɵɵdomListener`/`ɵɵdomProperty`), `false` → the `Full` family
+    /// (`ɵɵelement*`/`ɵɵlistener`/`ɵɵproperty`). Set from [`TemplateCompilationInput::dom_only`] and
+    /// inherited unchanged by every embedded view ([`Self::build_embedded_view`]), since the mode is a
+    /// whole-component property (`render3/view/compiler.ts` selects it once per component).
+    dom_only: bool,
 }
 
 impl TemplateDefinitionBuilder {
@@ -663,6 +760,7 @@ impl TemplateDefinitionBuilder {
             current_target_slot: 0,
             ng_content_selectors: Vec::new(),
             has_default_projection: false,
+            dom_only: input.dom_only,
         }
     }
 
@@ -1190,16 +1288,23 @@ impl TemplateDefinitionBuilder {
         ];
         trim_trailing_nulls(&mut params);
 
-        // Creation: the element itself, then its listeners. Angular 21 emits the DOM-element
-        // family (`ɵɵdomElementStart`/`ɵɵdomElementEnd`/`ɵɵdomElement`) for plain elements.
-        if needs_end {
-            self.creation_code
-                .push(instruction(R3::DomElementStart, params));
+        // Creation: the element itself, then its listeners. Angular's `reify` phase picks the
+        // DOM-only element family (`ɵɵdomElementStart`/`ɵɵdomElementEnd`/`ɵɵdomElement`) when the
+        // component compiles in `DomOnly` mode (standalone, no directive dependencies), and the
+        // classic `Full` family (`ɵɵelementStart`/`ɵɵelementEnd`/`ɵɵelement`) otherwise.
+        let (start_ref, single_ref) = if self.dom_only {
+            (R3::DomElementStart, R3::DomElement)
         } else {
-            self.creation_code.push(instruction(R3::DomElement, params));
+            (R3::ElementStart, R3::Element)
+        };
+        if needs_end {
+            self.creation_code.push(instruction(start_ref, params));
+        } else {
+            self.creation_code.push(instruction(single_ref, params));
         }
 
-        // `(event)="handler"` → creation-block `ɵɵdomListener(...)`.
+        // `(event)="handler"` → creation-block listener (`ɵɵdomListener` in DomOnly mode,
+        // `ɵɵlistener` in Full mode).
         for output in &element.outputs {
             self.build_listener(slot, &element.name, output);
         }
@@ -1225,8 +1330,12 @@ impl TemplateDefinitionBuilder {
             self.visit_all(&children);
         }
         if needs_end {
-            self.creation_code
-                .push(instruction(R3::DomElementEnd, vec![]));
+            let end_ref = if self.dom_only {
+                R3::DomElementEnd
+            } else {
+                R3::ElementEnd
+            };
+            self.creation_code.push(instruction(end_ref, vec![]));
         }
     }
 
@@ -1460,16 +1569,35 @@ impl TemplateDefinitionBuilder {
                 self.update_code
                     .push(instruction(R3::DomProperty, vec![str_lit(&name), lowered]));
             }
-            _ => {
-                let reference = match input.kind {
-                    BindingType::Property | BindingType::TwoWay => R3::DomProperty,
-                    BindingType::Class => R3::ClassProp,
-                    BindingType::Style => R3::StyleProp,
-                    BindingType::Attribute => R3::Attribute,
-                    BindingType::Animation | BindingType::LegacyAnimation => unreachable!(),
-                };
-                let params = vec![str_lit(&input.name), lowered];
-                self.update_code.push(instruction(reference, params));
+            BindingType::Property | BindingType::TwoWay => {
+                // A plain `[name]="expr"` property binding reifies to `ɵɵdomProperty` in DomOnly mode
+                // and `ɵɵproperty` in Full mode (`reify.ts` `reifyDomProperty`/`reifyProperty`). In
+                // DomOnly mode the property name is run through `DOM_PROPERTY_REMAPPING` (e.g.
+                // `class` → `className`); in Full mode an ARIA-attribute name (`aria-*`) selects
+                // `ɵɵariaProperty` instead and the DOM remapping is not applied.
+                if self.dom_only {
+                    let name = remap_dom_property(&input.name);
+                    self.update_code
+                        .push(instruction(R3::DomProperty, vec![str_lit(name), lowered]));
+                } else if is_aria_attribute(&input.name) {
+                    self.update_code
+                        .push(instruction(R3::AriaProperty, vec![str_lit(&input.name), lowered]));
+                } else {
+                    self.update_code
+                        .push(instruction(R3::Property, vec![str_lit(&input.name), lowered]));
+                }
+            }
+            BindingType::Class => {
+                self.update_code
+                    .push(instruction(R3::ClassProp, vec![str_lit(&input.name), lowered]));
+            }
+            BindingType::Style => {
+                self.update_code
+                    .push(instruction(R3::StyleProp, vec![str_lit(&input.name), lowered]));
+            }
+            BindingType::Attribute => {
+                self.update_code
+                    .push(instruction(R3::Attribute, vec![str_lit(&input.name), lowered]));
             }
         }
     }
@@ -1521,8 +1649,16 @@ impl TemplateDefinitionBuilder {
             Some(handler_name),
         );
 
+        // A regular template listener reifies to `ɵɵdomListener` in DomOnly mode and `ɵɵlistener`
+        // in Full mode (`reify.ts`: `domListener` iff `mode === DomOnly && !hostListener &&
+        // !isLegacyAnimationListener`). Both take the same `(name, handlerFn)` argument shape.
+        let listener_ref = if self.dom_only {
+            R3::DomListener
+        } else {
+            R3::Listener
+        };
         self.creation_code.push(instruction(
-            R3::DomListener,
+            listener_ref,
             vec![str_lit(&output.name), handler_fn],
         ));
     }
@@ -1578,7 +1714,17 @@ impl TemplateDefinitionBuilder {
             params.push(o::import_expr(R3::TemplateRefExtractor.reference(), None));
         }
         trim_trailing_nulls(&mut params);
-        self.creation_code.push(instruction(R3::DomTemplate, params));
+        // An `<ng-template>` reifies to `ɵɵdomTemplate` in DomOnly mode and `ɵɵtemplate` in Full mode
+        // (`reify.ts`: `domTemplate` iff `templateKind === Block || mode === DomOnly`). A plain
+        // `<ng-template>` is an `NgTemplate`, so the choice follows the component's compilation mode;
+        // control-flow block bodies (`@if`/`@for`) are built via [`Self::build_embedded_view`] and
+        // referenced by `ɵɵconditionalCreate`/`ɵɵrepeaterCreate`, not this `<ng-template>` path.
+        let template_ref = if self.dom_only {
+            R3::DomTemplate
+        } else {
+            R3::TemplateCreate
+        };
+        self.creation_code.push(instruction(template_ref, params));
     }
 
     /// Lower a list of template-reference variables (`#ref` / `#ref="exportAs"`) into a single
@@ -1614,7 +1760,8 @@ impl TemplateDefinitionBuilder {
         loop_vars: Vec<LoopVar>,
         update_prelude: Vec<Stmt>,
     ) -> (Expr, usize, usize) {
-        let nested_input = TemplateCompilationInput::new(fn_name.clone(), children);
+        let nested_input =
+            TemplateCompilationInput::new(fn_name.clone(), children).with_dom_only(self.dom_only);
         let mut nested = TemplateDefinitionBuilder::new(&nested_input);
         // An embedded view is never the root: its hoisted descendant fns bubble up to the root
         // (below) rather than being inlined into this view body, so each is emitted exactly once.
@@ -2680,6 +2827,63 @@ mod tests {
         assert!(out.contains("ctx.x"), "got: {out}");
         // The render-flags branching shape.
         assert!(out.contains("rf"), "got: {out}");
+    }
+
+    #[test]
+    fn full_mode_selects_classic_element_family() {
+        // Angular compiles a non-standalone component (or one with directive dependencies) in `Full`
+        // mode (`render3/view/compiler.ts`), where `reify` selects the classic
+        // `ɵɵelementStart`/`ɵɵelementEnd` family instead of the DomOnly `ɵɵdomElement*` family.
+        let input =
+            TemplateCompilationInput::new("Test_Template", div_with_interpolation()).with_dom_only(false);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let out = emit_expression(&func);
+
+        assert!(out.contains("\u{0275}\u{0275}elementStart(0, \"div\")"), "got: {out}");
+        assert!(out.contains("\u{0275}\u{0275}elementEnd()"), "got: {out}");
+        // The DomOnly family must NOT appear in Full mode.
+        assert!(!out.contains("\u{0275}\u{0275}domElement"), "got: {out}");
+    }
+
+    #[test]
+    fn full_mode_property_uses_classic_property_instruction() {
+        // A `[id]="x"` property binding on a Full-mode element reifies to the classic `ɵɵproperty`
+        // instruction (not the DomOnly `ɵɵdomProperty`).
+        let nodes = element_with_input("div", "id", BindingType::Property, prop_read("x"));
+        let input = TemplateCompilationInput::new("Test_Template", nodes).with_dom_only(false);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let out = emit_expression(&func);
+
+        assert!(out.contains("\u{0275}\u{0275}property(\"id\""), "got: {out}");
+        assert!(!out.contains("\u{0275}\u{0275}domProperty"), "got: {out}");
+    }
+
+    #[test]
+    fn full_mode_aria_property_uses_aria_property_instruction() {
+        // In Full mode an `[aria-*]` property binding reifies to `ɵɵariaProperty` (`reify.ts`
+        // `reifyProperty` → `isAriaAttribute`), unlike DomOnly which keeps `ɵɵdomProperty`.
+        let nodes = element_with_input("div", "aria-label", BindingType::Property, prop_read("x"));
+        let input = TemplateCompilationInput::new("Test_Template", nodes).with_dom_only(false);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let out = emit_expression(&func);
+
+        assert!(out.contains("\u{0275}\u{0275}ariaProperty(\"aria-label\""), "got: {out}");
+    }
+
+    #[test]
+    fn dom_only_property_remaps_class_to_class_name() {
+        // In DomOnly mode `[class]="x"` is remapped to the DOM property `className`
+        // (`reify.ts` `DOM_PROPERTY_REMAPPING`).
+        let nodes = element_with_input("div", "class", BindingType::Property, prop_read("x"));
+        let input = TemplateCompilationInput::new("Test_Template", nodes); // dom_only defaults to true
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let out = emit_expression(&func);
+
+        assert!(out.contains("\u{0275}\u{0275}domProperty(\"className\""), "got: {out}");
     }
 
     #[test]
@@ -4173,10 +4377,14 @@ mod tests {
         let out = emit_expression(&func);
 
         // `projectionDef(0)` references the interned selector array const. The default slot emits
-        // `ɵɵprojection(0)` (index elided) and the named slot `ɵɵprojection(1, 1)`; the two adjacent
-        // projection create ops are CHAINED into one statement (Angular `chainedInstruction`).
+        // `ɵɵprojection(0)` (index elided) and the named slot `ɵɵprojection(1, 1)`. `ɵɵprojection` is
+        // NOT in Angular's `CHAIN_COMPATIBILITY` map, so the two adjacent projection create ops stay
+        // as SEPARATE statements (faithful to Angular's `content_projection` goldens, which emit
+        // `ɵɵprojection(0); ɵɵprojection(1, 1);` un-chained).
         assert!(out.contains("\u{0275}\u{0275}projectionDef(0)"), "got: {out}");
-        assert!(out.contains("\u{0275}\u{0275}projection(0)(1, 1)"), "got: {out}");
+        assert!(out.contains("\u{0275}\u{0275}projection(0)"), "got: {out}");
+        assert!(out.contains("\u{0275}\u{0275}projection(1, 1)"), "got: {out}");
+        assert!(!out.contains("\u{0275}\u{0275}projection(0)(1, 1)"), "got: {out}");
         // The const pool holds the specific-selector list.
         let consts = builder
             .const_pool()

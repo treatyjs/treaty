@@ -13,12 +13,12 @@ This harness runs Treaty's Rust/OXC Angular compiler (`render3` crate, via the
 | Metric | Value |
 | --- | --- |
 | Total compliance cases | 642 |
-| Compiled (runnable) | 93 |
-| PASS | 2 |
-| DIFF | 91 |
-| Skipped (un-runnable) | 549 |
-| **Pass-rate (of runnable subset)** | **2.2%** (2/93) |
-| Pass-rate (of full corpus) | 0.3% (2/642) |
+| Compiled (runnable) | 98 |
+| PASS | 6 |
+| DIFF | 92 |
+| Skipped (un-runnable) | 544 |
+| **Pass-rate (of runnable subset)** | **6.1%** (6/98) |
+| Pass-rate (of full corpus) | 0.9% (6/642) |
 
 ### How a case is run and matched
 
@@ -43,18 +43,19 @@ from our output. Top entry = implement first to raise the score.
 
 | Count | Category (instruction / shape at first missing fragment) |
 | --- | --- |
-| 18 | `ɵɵtext` |
-| 17 | `misc-shape` |
-| 11 | `ɵɵelement` |
+| 21 | `ɵɵtext` |
+| 16 | `misc-shape` |
 | 10 | `ɵɵdomElementStart` |
 | 9 | `ɵɵdeclareLet` |
+| 7 | `ɵɵelement` |
 | 5 | `def-header-counts` |
 | 4 | `ɵɵconditionalCreate` |
+| 3 | `ɵɵelementStart` |
 | 3 | `ɵɵi18nPostprocess` |
 | 3 | `ɵɵprojectionDef` |
-| 2 | `ɵɵelementStart` |
 | 2 | `ɵɵgetCurrentView` |
 | 2 | `ɵɵrepeaterCreate` |
+| 2 | `ɵɵdomTemplate` |
 | 2 | `ɵɵtemplate` |
 | 1 | `ɵɵcontentQuerySignal` |
 | 1 | `nested-fn-shape` |
@@ -62,27 +63,20 @@ from our output. Top entry = implement first to raise the score.
 
 ### Sample diverging cases
 
-- **`ɵɵtext`** (18):
+- **`ɵɵtext`** (21):
   - r3_view_compiler_let/should create a simple @let declaration
     - near: `cls:1,vars:1,template:functionMyAp`
   - r3_view_compiler_let/should create multiple @let declarations that depend on each other
     - near: `cls:1,vars:1,template:functionMyAp`
   - r3_view_compiler_let/should remove a single unused let declaration
     - near: `cls:2,vars:2,template:functionMyAp`
-- **`misc-shape`** (17):
+- **`misc-shape`** (16):
+  - r3_view_compiler_styling/style_bindings/should assign a sanitizer instance to the element style allocation instruction if any url-based properties are detected
+    - near: `on:2})`
   - r3_view_compiler_styling/component_styles/should pass in the component metadata styles into the component definition but skip shimming when style encapsulation is set to shadow dom
-    - near: `styles:["div.cool{color:blue;}",`
+    - near: `on:3})`
   - r3_view_compiler_styling/component_animations/should pass in the component metadata animations into the component definition
     - near: `(rf,ID){},encapsulation:2,data:{an`
-  - r3_view_compiler_styling/component_animations/should include animations even if the provided array is empty
-    - near: `(rf,ID){},encapsulation:2,data:{an`
-- **`ɵɵelement`** (11):
-  - r3_view_compiler_styling/style_bindings/should place initial, multi, singular and application followed by attribute style instructions in the template code in that order
-    - near: `ars:7,consts:[[AM,"opacity","1"]],`
-  - r3_view_compiler_styling/style_bindings/should assign a sanitizer instance to the element style allocation instruction if any url-based properties are detected
-    - near: `){ɵɵelement(0,"div");}if(rf&2){ɵɵs`
-  - r3_view_compiler_styling/component_animations/should generate any animation triggers into the component template
-    - near: `ars:3,template:functionMyComponent`
 - **`ɵɵdomElementStart`** (10):
   - r3_view_compiler_listener/should not generate restore/reset view when listener does not use @let in the same scope
     - near: `cls:2,vars:1,consts:[[3,"click"]],`
@@ -97,6 +91,13 @@ from our output. Top entry = implement first to raise the score.
     - near: `tx){if(rf&1){ɵɵdeclareLet(0);ɵɵtex`
   - r3_view_compiler_let/should be able to use let declarations in event listeners inside child views
     - near: `tx){if(rf&1){ɵɵdeclareLet(0);ɵɵdom`
+- **`ɵɵelement`** (7):
+  - r3_view_compiler_styling/style_bindings/should place initial, multi, singular and application followed by attribute style instructions in the template code in that order
+    - near: `ars:7,consts:[[AM,"opacity","1"]],`
+  - r3_view_compiler_styling/component_animations/should generate any animation triggers into the component template
+    - near: `ars:3,template:functionMyComponent`
+  - r3_view_compiler_styling/class_bindings/should place initial, multi, singular and application followed by attribute class instructions in the template code in that order
+    - near: `ars:7,consts:[[AM,"grape"]],templa`
 - **`def-header-counts`** (5):
   - r3_view_compiler_let/should be able to use local references in let declarations
     - near: `cls:5,vars:1,`
@@ -111,6 +112,13 @@ from our output. Top entry = implement first to raise the score.
     - near: `cls:1,vars:1,template:functionMyAp`
   - r3_view_compiler_arrow_functions/should handle arrow function with optional reads in nested views
     - near: `tx){if(rf&1){ɵɵconditionalCreate(0`
+- **`ɵɵelementStart`** (3):
+  - r3_view_compiler_styling/component_animations/should generate animation listeners
+    - near: `s:1,template:functionMyComponent_T`
+  - r3_view_compiler_i18n/blocks/should support @for blocks
+    - near: `sts:()=>{leti18n_0;if(typeofngI18n`
+  - r3_view_compiler_i18n/blocks/should support @defer blocks
+    - near: `sts:()=>{leti18n_0;if(typeofngI18n`
 - **`ɵɵi18nPostprocess`** (3):
   - r3_view_compiler_let/should handle an @let referenced inside i18n and in a child view
     - near: `cls:4,vars:2,consts:()=>{letID;if(`
@@ -122,14 +130,9 @@ from our output. Top entry = implement first to raise the score.
   - r3_compiler_compliance/components_and_directives/content_projection/should support multi-slot content projection with multiple wildcard slots
     - near: `({,selectors:[["ng-component"]],st`
   - r3_compiler_compliance/components_and_directives/content_projection/should capture the node name of ng-content with a structural directive
-    - near: `lse,ngContentSelectors:ID,decls:1,`
+    - near: `ors:ID,decls:1,vars:1,consts:[[AM,`
   - r3_compiler_compliance/components_and_directives/content_projection/should support fallback content in ng-content
-    - near: `ngContentSelectors:ID,decls:7,va`
-- **`ɵɵelementStart`** (2):
-  - r3_view_compiler_styling/component_animations/should generate animation listeners
-    - near: `s:1,template:functionMyComponent_T`
-  - r3_view_compiler_i18n/blocks/should support @for blocks
-    - near: `sts:()=>{leti18n_0;if(typeofngI18n`
+    - near: `ors:ID,decls:7,vars:2,consts:[[4,"`
 - **`ɵɵgetCurrentView`** (2):
   - r3_view_compiler_listener/local refs in listeners defined before the local refs
     - near: `s:[["user",""],[AM,"click"]],templ`
@@ -140,6 +143,11 @@ from our output. Top entry = implement first to raise the score.
     - near: `tx){if(rf&1){ɵɵrepeaterCreate(0,My`
   - r3_view_compiler_arrow_functions/should handle arrow function using loop variables
     - near: `tx){if(rf&1){ɵɵrepeaterCreate(0,Te`
+- **`ɵɵdomTemplate`** (2):
+  - r3_view_compiler_deferred/should generate a deferred block with placeholder block parameters
+    - near: `s:[[2000],["src","placeholder.gif"`
+  - r3_view_compiler_deferred/should generate a deferred block with loading block parameters
+    - near: `s:[[2000,500],["src","loading.gif"`
 - **`ɵɵtemplate`** (2):
   - r3_compiler_compliance/components_and_directives/should support empty property bindings on ng-template
     - near: `s:0,consts:[[AM,"id"]],template:fu`
@@ -166,14 +174,17 @@ error-expectation cases).
 | 477 | `no-full-golden(partial/ngDeclare-only)` |
 | 41 | `fe:multi-class` |
 | 17 | `multi-input-file` |
-| 5 | `fe:other(@defer block transform not yet ported)` |
 | 4 | `no-input-file` |
 | 3 | `fe:host/hostDirectives` |
 | 2 | `fe:queries` |
 
 ## Passing cases
 
-2 runnable compliance cases match Angular's golden `ɵɵdefineComponent` block:
+6 runnable compliance cases match Angular's golden `ɵɵdefineComponent` block:
 
+- model_inputs/should capture input/output pair in a component definition
+- output_function/should generate an output mapping for the component
+- r3_compiler_compliance/components_and_directives/value_composition/should convert #my-app selector to ["", "id", "my-app"]
+- r3_view_compiler_input_outputs/should declare inputs/outputs on a component
 - r3_view_compiler_styling/class_bindings/should handle bindings to classes with special characters in a template
 - signal_inputs/should capture signal based input flag in component definition
