@@ -76,3 +76,9 @@
 
 # Migration build logs
 baseline-cargo-build.log
+
+# Agent/editor local config (was untracked in upstream)
+.claude/
+
+# NAPI build artifact
+libs/authoring/node/*.node
