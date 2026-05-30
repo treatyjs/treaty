@@ -248,6 +248,29 @@ impl PipeSlotAllocator for BuilderPipes<'_> {
             var_offset,
         }
     }
+
+    /// Reserve the single binding (var) slot a hoisted `ɵɵarrowFunction` consumes from this view's
+    /// shared var pool, returning its offset. Mirrors Angular `varsUsedByOp` ⇒ `1` for an
+    /// `ArrowFunction` IR expression (`var_counting.ts:186`). Drawn from the same `var_cursor` the
+    /// pipe / pure-function slots come from, so the view's `vars` total grows by one per hoisted
+    /// arrow and the offset follows the host binding's own slots in lowering order.
+    fn allocate_arrow_slot(&self) -> Option<usize> {
+        let mut state = self.state.borrow_mut();
+        let offset = state.var_cursor;
+        state.var_cursor += 1;
+        Some(offset)
+    }
+
+    /// Reserve the `1 + num_args` binding (var) slots a hoisted `ɵɵpureFunctionN` consumes from this
+    /// view's shared var pool, returning its offset. Mirrors Angular `varsUsedByOp` for a
+    /// `PureFunctionExpr` (`var_counting.ts:180`). Like the arrow / pipe slots, these are drawn from
+    /// `var_cursor` so the view's `vars` total reflects every extracted pure literal.
+    fn allocate_pure_function_slot(&self, num_args: usize) -> Option<usize> {
+        let mut state = self.state.borrow_mut();
+        let offset = state.var_cursor;
+        state.var_cursor += 1 + num_args;
+        Some(offset)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1272,25 +1295,18 @@ impl TemplateDefinitionBuilder {
             statements.push(o::if_stmt(cond, update, None));
         }
 
-        // Hoisted `@if`/`@for`/`@switch` branch/loop template functions are emitted as leading
-        // `function …_Conditional_n_Template(rf, ctx) {…}` / `…_For_n_Template(…)` declarations.
-        // Angular hoists these onto the `ConstantPool.statements` (siblings of the definition); this
-        // standalone builder, which returns a single self-contained view-function expression, hoists
-        // them to the head of the enclosing view body instead. Either way they are top-level NAMED
-        // functions referenced by name from `ɵɵconditionalCreate`/`ɵɵrepeaterCreate` — never inline
-        // closures. They are also reachable via [`Self::hoisted_functions`] for callers that prefer
-        // to surface them at the true top level.
-        //
-        // Only the ROOT view inlines them: a child view's hoisted fns bubble up to the root via
-        // [`Self::build_embedded_view`], so inlining them here too would emit each nested fn twice
-        // (once inside the parent view body and once at the top level). Angular always hoists every
-        // child view fn to a single top-level scope (`pool.statements`).
-        let mut body: Vec<Stmt> = if self.is_root {
-            self.hoisted_fns.clone()
-        } else {
-            Vec::new()
-        };
-        body.append(&mut statements);
+        // Angular hoists every nested branch/loop/template view function onto
+        // `ConstantPool.statements` — emitted as top-level sibling `function …_Template(…){…}`
+        // declarations OUTSIDE (and before) the `ɵɵdefineComponent({…})` call, NEVER inside the
+        // root view body. The component-definition harness (and Angular's own goldens) extract only
+        // the `ɵɵdefineComponent` block, so the root template function must begin directly with
+        // `if (rf & 1) {…}` and close immediately after `if (rf & 2) {…}` — no leading or trailing
+        // function declarations inside it. The collected hoisted functions are therefore left OUT
+        // of the returned view-function body entirely; callers surface them at the true top level
+        // via [`Self::hoisted_functions`] (`ConstantPool.statements`). A child view's hoisted fns
+        // bubble up to the root via [`Self::build_embedded_view`], so the whole nested-view tree is
+        // collected once on the root builder's `hoisted_fns`.
+        let body: Vec<Stmt> = statements;
 
         o::fn_(
             vec![
@@ -2667,9 +2683,18 @@ impl TemplateDefinitionBuilder {
         };
 
         if used_in_view {
-            // `const <name>_r<id> = <value-or-storeLet>;` — the in-view local for reads of this let.
+            // `const $<name>_<id>$ = <value-or-storeLet>;` — the in-view local for reads of this let.
+            //
+            // A `@let`'s in-view local is an *identifier* semantic variable (Angular `generate_
+            // variables.ts`), NOT a loop variable. Angular's compliance goldens spell these with the
+            // renamable `$<name>_<index>$` expect-emit placeholder (`$result_0$`, `$one_0$`/`$two_1$`/
+            // `$result_2$`), the same `$…$` convention this builder already uses for the saved-view
+            // (`$s_<id>$`) and local-ref (`$<name>_<id>$`, [`local_ref_var_name`]) view variables —
+            // distinct from the loop-variable `_r<n>` view-suffix form. The single generated name is
+            // used both for the `const … =` binding and for every read of the let inside this view
+            // (resolved through `loop_vars`).
             self.var_counter += 1;
-            let local_name = format!("{}_r{}", decl.name, self.var_counter);
+            let local_name = local_ref_var_name(&decl.name, self.var_counter);
             self.update_code.push(Stmt::with_modifiers(
                 StmtKind::DeclareVar {
                     name: local_name.clone(),
@@ -3647,6 +3672,20 @@ mod tests {
         ParseSourceSpan { start: 0, end: 0 }
     }
 
+    /// Emit the root view function PLUS its hoisted nested-view functions concatenated, mirroring
+    /// the real component definition where Angular prints every `function …_Template(rf, ctx) {…}`
+    /// on `ConstantPool.statements` as a sibling of (and before) the `ɵɵdefineComponent` call. The
+    /// root view body itself no longer inlines them, so tests that assert on nested-fn shape look at
+    /// this combined text.
+    fn emit_with_hoisted(builder: &TemplateDefinitionBuilder, func: &Expr) -> String {
+        let mut out = emit_expression(func);
+        for stmt in builder.hoisted_functions() {
+            out.push('\n');
+            out.push_str(&crate::output::emitter::emit_statements(std::slice::from_ref(stmt)));
+        }
+        out
+    }
+
     /// `{{ x }}` — implicit-receiver property read of `x`.
     fn prop_read_x() -> AstNode {
         let implicit = AstNode::new(
@@ -3800,13 +3839,14 @@ mod tests {
 
         // A `@let` read only within its own view is NOT external: `optimizeStoreLet` drops the
         // `ɵɵstoreLet` wrapper and `ɵɵdeclareLet` op entirely, so the value inlines as a plain
-        // `const x_r1 = 1;` in the update block (Angular `simple_let` golden).
+        // `const $x_1$ = 1;` in the update block (Angular `simple_let` golden, whose in-view let
+        // local is the renamable `$<name>_<index>$` identifier placeholder).
         assert!(!out.contains("\u{0275}\u{0275}declareLet"), "got: {out}");
         assert!(!out.contains("\u{0275}\u{0275}storeLet"), "got: {out}");
-        assert!(out.contains("const x_r1 = 1"), "got: {out}");
+        assert!(out.contains("const $x_1$ = 1"), "got: {out}");
         // The interpolation reads the inlined let local, NOT `ctx.x`.
         assert!(out.contains("\u{0275}\u{0275}textInterpolate"), "got: {out}");
-        assert!(out.contains("x_r1"), "got: {out}");
+        assert!(out.contains("$x_1$"), "got: {out}");
         assert!(!out.contains("ctx.x"), "got: {out}");
         // No `ɵɵdeclareLet` slot and no `ɵɵstoreLet` var: only the text node (1 decl) and the
         // interpolation (1 var) remain.
@@ -4600,7 +4640,7 @@ mod tests {
         let input = TemplateCompilationInput::new("Test_Template", vec![Node::IfBlock(block)]);
         let mut builder = TemplateDefinitionBuilder::new(&input);
         let func = builder.build_template_function(&input);
-        let out = emit_expression(&func);
+        let out = emit_with_hoisted(&builder, &func);
 
         // Angular 21: a single `@if` branch lowers to `ɵɵconditionalCreate` referencing a HOISTED,
         // NAMED branch template fn, with the branch root element tag (`'div'`) as the trailing arg.
@@ -4650,7 +4690,7 @@ mod tests {
         let input = TemplateCompilationInput::new("Test_Template", vec![Node::IfBlock(block)]);
         let mut builder = TemplateDefinitionBuilder::new(&input);
         let func = builder.build_template_function(&input);
-        let out = emit_expression(&func);
+        let out = emit_with_hoisted(&builder, &func);
 
         // The first branch lowers to `ɵɵconditionalCreate` and the `@else` branch's
         // `ɵɵconditionalBranchCreate` is CHAINED onto it as a call operand (Angular 21
@@ -4718,7 +4758,7 @@ mod tests {
         let input = TemplateCompilationInput::new("Test_Template", vec![Node::ForLoopBlock(block)]);
         let mut builder = TemplateDefinitionBuilder::new(&input);
         let func = builder.build_template_function(&input);
-        let out = emit_expression(&func);
+        let out = emit_with_hoisted(&builder, &func);
 
         // Angular 21: `ɵɵrepeaterCreate(slot, <Fn>, decls, vars, "li", null, trackBy)` referencing a
         // HOISTED, NAMED loop body fn (the primary view fn is at slot+1 — here the `@for` is the root
@@ -4843,7 +4883,7 @@ mod tests {
         let input = TemplateCompilationInput::new("Test_Template", vec![Node::SwitchBlock(block)]);
         let mut builder = TemplateDefinitionBuilder::new(&input);
         let func = builder.build_template_function(&input);
-        let out = emit_expression(&func);
+        let out = emit_with_hoisted(&builder, &func);
 
         // `@switch` shares the conditional-create mechanism: the first case group lowers to
         // `ɵɵconditionalCreate` (with the case root tag `'div'`) and the remaining cases' branch
@@ -4965,7 +5005,8 @@ mod tests {
         });
         let input = TemplateCompilationInput::new("Test_Template", vec![div]);
         let mut builder = TemplateDefinitionBuilder::new(&input);
-        let out = emit_expression(&builder.build_template_function(&input));
+        let func = builder.build_template_function(&input);
+        let out = emit_with_hoisted(&builder, &func);
 
         // The `@if` branch view declares its shared ancestor context once via `ɵɵnextContext()` and
         // reads the collection through it: `const ctx_r1 = ɵɵnextContext(); … ɵɵrepeater(ctx_r1.xs);`.
@@ -5048,7 +5089,8 @@ mod tests {
         };
         let input = TemplateCompilationInput::new("Test_Template", vec![Node::Template(tpl)]);
         let mut builder = TemplateDefinitionBuilder::new(&input);
-        let out = emit_expression(&builder.build_template_function(&input));
+        let func = builder.build_template_function(&input);
+        let out = emit_with_hoisted(&builder, &func);
 
         // DOM-only template instruction with the local-ref extractor lowering. The embedded view is
         // hoisted under a tag-derived name and referenced by name; the trailing args are

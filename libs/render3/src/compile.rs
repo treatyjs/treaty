@@ -18,7 +18,7 @@
 
 use std::cell::RefCell;
 
-use crate::output::emitter::emit_expression;
+use crate::output::emitter::{emit_expression, emit_statements};
 use crate::output_ast::{
     self as o, ArrowBody, Expr, ExprKind, ImportUrl, LiteralMapEntry, ParseSourceSpan, Stmt,
     StmtKind, WrappedNodeHandle,
@@ -109,6 +109,11 @@ impl TemplateBuilder for RealTemplateBuilder {
             // pipeline does not emit — hence there are genuinely no initializer statements here.
             consts_initializers: Vec::new(),
             content_selectors,
+            // Hoisted nested-view functions (`@if`/`@for`/`@switch`/`@defer` branch + loop bodies,
+            // projection fallbacks, `ng-template` bodies) — surfaced as top-level sibling
+            // declarations on `ConstantPool.statements`, emitted before the `ɵɵdefineComponent`
+            // call exactly as Angular does (the root view body never inlines them).
+            pool_statements: builder.hoisted_functions().to_vec(),
         }
     }
 }
@@ -571,7 +576,24 @@ pub fn compile_component(
     //    table, so this substitution must happen first — ngtsc hands the wrapped TS node straight to
     //    the printer instead).
     resolve_wrapped_nodes(&mut compiled.expression);
-    let code = emit_expression(&compiled.expression);
+
+    // Angular emits the hoisted nested-view functions (and any other `ConstantPool.statements`)
+    // as top-level sibling declarations BEFORE the `ɵɵdefineComponent({…})` call. Mirror that:
+    // print the pool statements first, then the definition expression. The wrapped-node side table
+    // must be resolved inside the pool statements too (they reference the component class etc.).
+    let code = if pool_statements.is_empty() {
+        emit_expression(&compiled.expression)
+    } else {
+        for stmt in &mut pool_statements {
+            resolve_wrapped_nodes_stmt(stmt);
+        }
+        let mut out = emit_statements(&pool_statements);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&emit_expression(&compiled.expression));
+        out
+    };
 
     CompiledComponent { code, errors }
 }

@@ -1111,6 +1111,30 @@ impl<'b> HtmlAstToIvyAst<'b> {
             }
         }
 
+        // A static `animate.enter="slide"` / `animate.leave="fade"` attribute (no binding
+        // delimiters) is an animation binding, not a plain const-pool attribute. Angular keeps it as
+        // a `TextAttribute` through `r3_template_transform`, then `binding_specialization.ts`
+        // rewrites the resulting `animate.`-named attribute binding into an `AnimationBindingOp`
+        // (`AnimationBindingKind.STRING`) that reifies to a create-block `ɵɵanimateEnter("slide")`
+        // with no const-pool entry. In this direct-to-Ivy port there is no separate specialization
+        // pass, so the equivalent gating decision is made here: lift the static `animate.*` attribute
+        // into an `ANIMATION` `ParsedProperty` whose expression is the string literal. That makes
+        // `categorizePropertyAttributes` produce a `BoundAttribute` of kind `Animation` (the
+        // animation node) and keeps the attribute out of the static const-pool attrs.
+        if name.starts_with("animate.") {
+            let key_span = create_key_span(src_span, "", name);
+            self.binding_parser.parse_animation_literal(
+                name,
+                value,
+                src_span,
+                absolute_offset,
+                &attribute.value_span,
+                parsed_properties,
+                &key_span,
+            );
+            return true;
+        }
+
         // No explicit binding: an attribute whose value may contain `{{ }}`.
         let key_span = create_key_span(src_span, "", name);
         self.binding_parser.parse_property_interpolation(
@@ -2052,6 +2076,37 @@ impl BindingParser {
         });
     }
 
+    /// A static `animate.enter="slide"` attribute: an animation binding whose expression is the
+    /// literal string value. Mirrors the `_parseAnimation` shape (`ParsedPropertyType.ANIMATION`)
+    /// from `template_parser/binding_parser.ts`, but with the value wrapped as a literal primitive
+    /// (the static-string form, equivalent to `AnimationBindingKind.STRING` in the TDB pipeline)
+    /// rather than a parsed binding expression. The full `animate.enter` / `animate.leave` name is
+    /// preserved so `createBoundElementProperty`'s `animate` branch keeps it intact.
+    #[allow(clippy::too_many_arguments)]
+    pub fn parse_animation_literal(
+        &mut self,
+        name: &str,
+        value: &str,
+        source_span: &ParseSourceSpan,
+        absolute_offset: i32,
+        value_span: &Option<ParseSourceSpan>,
+        parsed_properties: &mut Vec<ParsedProperty>,
+        key_span: &ParseSourceSpan,
+    ) {
+        let location = format!("{}", source_span.start.offset);
+        let aws = self
+            .parser
+            .wrap_literal_primitive(Some(value), location, absolute_offset);
+        parsed_properties.push(ParsedProperty {
+            name: name.to_string(),
+            expression: aws,
+            ty: ParsedPropertyType::Animation,
+            source_span: to_offset_span(source_span),
+            key_span: to_offset_span(key_span),
+            value_span: to_offset_span_opt(value_span),
+        });
+    }
+
     /// `parseEvent` — append a `ParsedEvent` (Regular or TwoWay).
     #[allow(clippy::too_many_arguments)]
     pub fn parse_event(
@@ -2070,8 +2125,14 @@ impl BindingParser {
             .parse_action(value, offset_handler, abs_offset(handler_span));
         let errs = aws.errors.clone();
         self.record_expr_errors(&errs, source_span);
+        // `parseEvent` (`template_parser/binding_parser.ts`): a `(animate.enter)` / `(animate.leave)`
+        // output is an animation listener (`ParsedEventType.Animation`); a two-way `[(x)]` assignment
+        // event is `TwoWay`; everything else is a regular DOM listener. The `animate.` check takes
+        // precedence over `Regular` (assignment events never carry the `animate.` prefix).
         let ty = if is_assignment_event {
             ParsedEventType::TwoWay
+        } else if name.starts_with("animate.") {
+            ParsedEventType::Animation
         } else {
             ParsedEventType::Regular
         };

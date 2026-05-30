@@ -796,6 +796,12 @@ pub struct TemplateBuilderResult {
     pub consts_initializers: Vec<Stmt>,
     /// `ngContentSelectors`, or `None` when there is no projection.
     pub content_selectors: Option<Expr>,
+    /// Hoisted nested-view functions (`@if`/`@for`/`@switch`/`@defer` branch + loop bodies,
+    /// projection fallbacks, `ng-template` bodies). Angular declares these as top-level sibling
+    /// `function …_Template(rf, ctx) {…}` statements on `ConstantPool.statements`, emitted BEFORE
+    /// the `ɵɵdefineComponent({…})` call (never inside the root view body). The orchestrator merges
+    /// these into the caller-provided `pool_statements` so they print as leading declarations.
+    pub pool_statements: Vec<Stmt>,
 }
 
 /// Abstraction over template emission (`ingestComponent` → `transform` → `emitTemplateFn`).
@@ -842,6 +848,7 @@ impl TemplateBuilder for StubTemplateBuilder {
             consts: Vec::new(),
             consts_initializers: Vec::new(),
             content_selectors: None,
+            pool_statements: Vec::new(),
         }
     }
 }
@@ -1511,6 +1518,11 @@ where
 
     // Ingest + transform + emit (delegated to the template-builder abstraction).
     let tpl = template_builder.build(meta, all_deferrable_deps_fn.as_ref());
+
+    // Hoisted nested-view functions live on `ConstantPool.statements` — top-level siblings emitted
+    // before the `ɵɵdefineComponent({…})` call (Angular `ɵɵdefineComponent` is preceded by every
+    // `function …_Template(rf, ctx) {…}` it references). Surface them onto the shared pool.
+    pool_statements.extend(tpl.pool_statements.iter().cloned());
 
     if let Some(content_selectors) = &tpl.content_selectors {
         definition_map.set("ngContentSelectors", Some(content_selectors.clone()));
