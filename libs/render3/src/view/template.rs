@@ -434,9 +434,13 @@ fn callee_wire_name(callee: &Expr) -> Option<&str> {
 fn chains_onto(first: &Expr, next: &Expr) -> bool {
     let cc = R3::ConditionalCreate.name();
     let cbc = R3::ConditionalBranchCreate.name();
+    let pipe = R3::Pipe.name();
     match (callee_wire_name(first), callee_wire_name(next)) {
         // `conditionalCreate` run absorbs subsequent `conditionalBranchCreate` calls.
         (Some(f), Some(n)) if f == cc => n == cbc,
+        // `ɵɵpipe` is NOT chainable (absent from Angular's CHAIN_COMPATIBILITY): consecutive
+        // pipe create ops stay as separate statements (`ɵɵpipe(2,…);ɵɵpipe(3,…);`).
+        (Some(f), _) if f == pipe => false,
         // Default: a run continues with the same instruction.
         _ => first.is_equivalent(next),
     }
