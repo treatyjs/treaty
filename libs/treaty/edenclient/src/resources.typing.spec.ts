@@ -53,50 +53,57 @@ type _Infer = Expect<Equal<InferResponse<UsersGetReturn>, User[]>>
 // --- Resource response inference (end-to-end typesafe) ---------------------
 
 declare const client: AppClient
-
-// edenHttpResource infers Resource<User[] | undefined> from the route response.
-const usersResource = edenHttpResource(() => client.users.get())
-type _ResUsers = Expect<
-  Equal<typeof usersResource, ResourceRef<User[] | undefined>>
->
-type _ResUsersValue = Expect<
-  Equal<ReturnType<typeof usersResource.value>, User[] | undefined>
->
-
-// With a defaultValue, the undefined branch is removed.
-const usersResourceDefaulted = edenHttpResource(() => client.users.get(), {
-  defaultValue: [] as User[],
-})
-type _ResUsersDefault = Expect<
-  Equal<ReturnType<typeof usersResourceDefaulted.value>, User[]>
->
-
-// Parameterised resource infers Post.
-const postResource = edenHttpResource(() => client.posts['1'].get())
-type _ResPost = Expect<
-  Equal<typeof postResource, ResourceRef<Post | undefined>>
->
-
-// --- Promise client + promise resource -------------------------------------
-
 declare const pclient: PromiseClient<AppClient>
-type PUsersGet = ReturnType<pclientUsersGet>
+
+// The assertions below are purely type-level: this function is NEVER called at runtime, so the
+// resource constructors are not actually executed (which would require an injection context).
+// Its only purpose is to make `tsc` evaluate the `Expect<Equal<...>>` aliases.
+function _typeChecks() {
+  // edenHttpResource infers Resource<User[] | undefined> from the route response.
+  const usersResource = edenHttpResource(() => client.users.get())
+  type _ResUsers = Expect<
+    Equal<typeof usersResource, ResourceRef<User[] | undefined>>
+  >
+  type _ResUsersValue = Expect<
+    Equal<ReturnType<typeof usersResource.value>, User[] | undefined>
+  >
+
+  // With a defaultValue, the undefined branch is removed.
+  const usersResourceDefaulted = edenHttpResource(() => client.users.get(), {
+    defaultValue: [] as User[],
+  })
+  type _ResUsersDefault = Expect<
+    Equal<ReturnType<typeof usersResourceDefaulted.value>, User[]>
+  >
+
+  // Parameterised resource infers Post.
+  const postResource = edenHttpResource(() => client.posts['1'].get())
+  type _ResPost = Expect<
+    Equal<typeof postResource, ResourceRef<Post | undefined>>
+  >
+
+  // Promise resource preserves typing.
+  const pUsersResource = edenPromiseResource(() => pclient.users.get())
+  type _PResUsersValue = Expect<
+    Equal<
+      ReturnType<typeof pUsersResource.value>,
+      EdenClient.DetailedResponse<User[]> | undefined
+    >
+  >
+
+  return [usersResource, usersResourceDefaulted, postResource, pUsersResource]
+}
+
+// Promise client call typing (top-level type aliases — no runtime cost).
 type pclientUsersGet = PromiseClient<AppClient>['users']['get']
+type PUsersGet = ReturnType<pclientUsersGet>
 type _PromiseClientReturn = Expect<
   Equal<PUsersGet, Promise<EdenClient.DetailedResponse<User[]>>>
->
-
-const pUsersResource = edenPromiseResource(() => pclient.users.get())
-type _PResUsersValue = Expect<
-  Equal<
-    ReturnType<typeof pUsersResource.value>,
-    EdenClient.DetailedResponse<User[]> | undefined
-  >
 >
 
 describe('resources typing', () => {
   it('compiles the type-level assertions', () => {
     // The real assertions are the type aliases above; reaching here means they all held.
-    expect(true).toBe(true)
+    expect(typeof _typeChecks).toBe('function')
   })
 })

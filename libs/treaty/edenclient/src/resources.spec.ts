@@ -22,7 +22,6 @@ import type { FakeApp, User } from './testing/fixtures'
 describe('edenHttpResource (runtime)', () => {
 	let httpMock: HttpTestingController
 	let injector: Injector
-	let appRef: ApplicationRef
 
 	const domain = 'http://localhost:3000'
 
@@ -32,24 +31,32 @@ describe('edenHttpResource (runtime)', () => {
 		})
 		httpMock = TestBed.inject(HttpTestingController)
 		injector = TestBed.inject(Injector)
-		appRef = TestBed.inject(ApplicationRef)
 	})
 
 	afterEach(() => {
 		httpMock.verify()
 	})
 
-	/** Flush Angular's reactive graph so the resource picks up param/effect changes. */
-	const flush = () => appRef.tick()
+	/** Flush Angular's reactive graph (effects + resource scheduling). */
+	const flush = () => TestBed.tick()
 
-	it('transitions loading -> resolved and exposes the typed value', () => {
-		const client = runInInjectionContext(injector, () =>
-			createClient<FakeApp>(domain)
-		)
+	/** Flush reactive graph, then settle microtasks/async resource transitions. */
+	const settle = async () => {
+		flush()
+		// Drain the microtask queue so rxResource's stream emission lands, then flush effects.
+		await Promise.resolve()
+		await Promise.resolve()
+		flush()
+	}
 
-		const users = runInInjectionContext(injector, () =>
-			edenHttpResource(() => client.users.get(), { injector })
-		)
+	const makeUsersResource = () =>
+		runInInjectionContext(injector, () => {
+			const client = createClient<FakeApp>(domain)
+			return edenHttpResource(() => client.users.get(), { injector })
+		})
+
+	it('transitions loading -> resolved and exposes the typed value', async () => {
+		const users = makeUsersResource()
 
 		// Kick the resource so it issues its request.
 		flush()
@@ -61,7 +68,7 @@ describe('edenHttpResource (runtime)', () => {
 			{ id: 1, name: 'Ada', email: 'ada@example.com' },
 		]
 		httpMock.expectOne(`${domain}/users`).flush(payload)
-		flush()
+		await settle()
 
 		expect(users.status()).toBe('resolved')
 		expect(users.isLoading()).toBe(false)
@@ -70,14 +77,8 @@ describe('edenHttpResource (runtime)', () => {
 		expect(users.error()).toBeUndefined()
 	})
 
-	it('transitions loading -> error when the request fails', () => {
-		const client = runInInjectionContext(injector, () =>
-			createClient<FakeApp>(domain)
-		)
-
-		const users = runInInjectionContext(injector, () =>
-			edenHttpResource(() => client.users.get(), { injector })
-		)
+	it('transitions loading -> error when the request fails', async () => {
+		const users = makeUsersResource()
 
 		flush()
 		expect(users.status()).toBe('loading')
@@ -85,27 +86,21 @@ describe('edenHttpResource (runtime)', () => {
 		httpMock
 			.expectOne(`${domain}/users`)
 			.flush('boom', { status: 500, statusText: 'Server Error' })
-		flush()
+		await settle()
 
 		expect(users.status()).toBe('error')
 		expect(users.error()).toBeInstanceOf(Error)
 		expect(users.isLoading()).toBe(false)
 	})
 
-	it('reload() re-issues the request', () => {
-		const client = runInInjectionContext(injector, () =>
-			createClient<FakeApp>(domain)
-		)
-
-		const users = runInInjectionContext(injector, () =>
-			edenHttpResource(() => client.users.get(), { injector })
-		)
+	it('reload() re-issues the request', async () => {
+		const users = makeUsersResource()
 
 		flush()
 		httpMock
 			.expectOne(`${domain}/users`)
 			.flush([{ id: 1, name: 'Ada', email: 'ada@example.com' }] as User[])
-		flush()
+		await settle()
 		expect(users.status()).toBe('resolved')
 
 		users.reload()
@@ -117,7 +112,7 @@ describe('edenHttpResource (runtime)', () => {
 			.flush([
 				{ id: 2, name: 'Grace', email: 'grace@example.com' },
 			] as User[])
-		flush()
+		await settle()
 
 		expect(users.status()).toBe('resolved')
 		expect(users.value()).toEqual([
