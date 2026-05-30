@@ -1,7 +1,5 @@
 /// <reference types='vitest' />
-import { defineConfig, sortUserPlugins } from 'vite';
-
-import { nxViteTsPaths } from '@nx/vite/plugins/nx-tsconfig-paths.plugin';
+import { defineConfig } from 'vite';
 
 import { treatySFC } from './src/tools/treaty-sfc/compiler'
 import { angular } from './src/tools/angular'
@@ -27,7 +25,6 @@ export default defineConfig({
 
 
   plugins: [
-    nxViteTsPaths(),
     treatySFC(),
     angular(),
   ],

@@ -1,0 +1,108 @@
+warning: rust_authoring v0.1.0 (D:\dev\treaty\apps\rust\authoring) ignoring invalid dependency `cargo-watch` which is missing a lib target
+    Checking rust_authoring v0.1.0 (D:\dev\treaty\apps\rust\authoring)
+warning: unused import: `oxc::syntax::class`
+ --> apps\rust\authoring\src\angular\transformers\injectable.rs:6:5
+  |
+6 | use oxc::syntax::class;
+  |     ^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+error[E0277]: the trait bound `CompactStr: std::default::Default` is not satisfied
+    --> apps\rust\authoring\src\angular\transformers\dependency.rs:112:60
+     |
+ 112 |         let factory_name = format!("factory{}", class_name.unwrap_or_default());
+     |                                                            ^^^^^^^^^^^^^^^^^ the trait `std::default::Default` is not implemented for `CompactStr`
+     |
+note: required by a bound in `Option::<T>::unwrap_or_default`
+    --> C:\Users\Jordan\.rustup\toolchains\1.95.0-x86_64-pc-windows-msvc\lib/rustlib/src/rust\library\core\src\option.rs:1095:12
+     |
+1093 |     pub const fn unwrap_or_default(self) -> T
+     |                  ----------------- required by a bound in this associated function
+1094 |     where
+1095 |         T: [const] Default,
+     |            ^^^^^^^^^^^^^^^ required by this bound in `Option::<T>::unwrap_or_default`
+
+error[E0277]: the trait bound `CompactStr: std::default::Default` is not satisfied
+    --> apps\rust\authoring\src\angular\transformers\injectable.rs:51:44
+     |
+  51 |                         class_name.clone().unwrap_or_default().to_string(),
+     |                                            ^^^^^^^^^^^^^^^^^ the trait `std::default::Default` is not implemented for `CompactStr`
+     |
+note: required by a bound in `Option::<T>::unwrap_or_default`
+    --> C:\Users\Jordan\.rustup\toolchains\1.95.0-x86_64-pc-windows-msvc\lib/rustlib/src/rust\library\core\src\option.rs:1095:12
+     |
+1093 |     pub const fn unwrap_or_default(self) -> T
+     |                  ----------------- required by a bound in this associated function
+1094 |     where
+1095 |         T: [const] Default,
+     |            ^^^^^^^^^^^^^^^ required by this bound in `Option::<T>::unwrap_or_default`
+help: consider removing this method call, as the receiver has type `Option<CompactStr>` and `Option<CompactStr>: std::default::Default` trivially holds
+     |
+  51 -                         class_name.clone().unwrap_or_default().to_string(),
+  51 +                         class_name.unwrap_or_default().to_string(),
+     |
+
+error[E0004]: non-exhaustive patterns: `&oxc_ast::ast::TSTypeName::ThisExpression(_)` not covered
+   --> apps\rust\authoring\src\angular\transformers\dependency.rs:146:15
+    |
+146 |         match tstype_name {
+    |               ^^^^^^^^^^^ pattern `&oxc_ast::ast::TSTypeName::ThisExpression(_)` not covered
+    |
+note: `oxc_ast::ast::TSTypeName<'_>` defined here
+   --> C:\Users\Jordan\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\oxc_ast-0.133.0\src\ast\ts.rs:818:1
+    |
+818 | pub enum TSTypeName<'a> {
+    | ^^^^^^^^^^^^^^^^^^^^^^^
+...
+821 |     ThisExpression(Box<'a, ThisExpression>) = 2,
+    |     -------------- not covered
+    = note: the matched value is of type `&oxc_ast::ast::TSTypeName<'_>`
+help: ensure that all possible cases are being handled by adding a match arm with a wildcard pattern or an explicit pattern as shown
+    |
+155 ~             },
+156 +             &oxc_ast::ast::TSTypeName::ThisExpression(_) => todo!()
+    |
+
+warning: unused variable: `injectable_options`
+   --> apps\rust\authoring\src\angular\transformers\dependency.rs:162:9
+    |
+162 |         injectable_options: Option<&InjectableOptions>,
+    |         ^^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_injectable_options`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+error: cannot explicitly borrow within an implicitly-borrowing pattern
+  --> apps\rust\authoring\src\html\parser.rs:93:43
+   |
+93 | ...                   Token::EndTag(ref end_tag) if end_tag == &tag_name => {
+   |                                     ^^^ explicit `ref` binding modifier not allowed when implicitly borrowing
+   |
+   = note: for more information, see <https://doc.rust-lang.org/reference/patterns.html#binding-modes>
+note: matching on a reference type with a non-reference pattern implicitly borrows the contents
+  --> apps\rust\authoring\src\html\parser.rs:93:29
+   |
+93 | ...                   Token::EndTag(ref end_tag) if end_tag == &tag_name => {
+   |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^ this non-reference pattern matches on a reference type `&_`
+help: remove the unnecessary binding modifier
+   |
+93 -                             Token::EndTag(ref end_tag) if end_tag == &tag_name => {
+93 +                             Token::EndTag(end_tag) if end_tag == &tag_name => {
+   |
+
+warning: unused variable: `ch`
+   --> apps\rust\authoring\src\treaty\lexer.rs:352:24
+    |
+352 |         while let Some(ch) = self.current_char {
+    |                        ^^ help: if this is intentional, prefix it with an underscore: `_ch`
+
+warning: unused variable: `ch`
+   --> apps\rust\authoring\src\treaty\lexer.rs:364:24
+    |
+364 |         while let Some(ch) = self.current_char {
+    |                        ^^ help: if this is intentional, prefix it with an underscore: `_ch`
+
+Some errors have detailed explanations: E0004, E0277.
+For more information about an error, try `rustc --explain E0004`.
+warning: `rust_authoring` (lib) generated 4 warnings
+error: could not compile `rust_authoring` (lib) due to 4 previous errors; 4 warnings emitted

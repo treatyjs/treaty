@@ -1,13 +1,12 @@
 use std::{
-    cell::{Ref, RefCell, RefMut},
+    cell::{Ref, RefCell},
     mem,
     rc::Rc,
 };
 
 use oxc_ast::AstBuilder;
 use oxc_diagnostics::Error;
-use oxc_semantic::{ScopeId, ScopeTree, Semantic, SymbolId, SymbolTable};
-use oxc_span::{CompactString, SourceType};
+use oxc_semantic::Semantic;
 
 #[derive(Clone)]
 pub struct AngularCtx<'a>(pub Rc<AstBuilder<'a>>, Rc<RefCell<Semantic<'a>>>, Rc<RefCell<Vec<Error>>>);
@@ -17,15 +16,10 @@ pub trait AngularContext<'a> {
 
     fn semantic(&self) -> Ref<'_, Semantic<'a>>;
 
-    fn symbols(&self) -> Ref<'_, SymbolTable>;
-
-    fn scopes(&self) -> Ref<'_, ScopeTree>;
-
-    fn scopes_mut(&self) -> RefMut<'_, ScopeTree>;
-
-    fn add_binding(&self, name: CompactString);
-
-    fn source_type(&self) -> Ref<'_, SourceType>;
+    /// Mint a (currently non-uniquified) identifier name. In OXC 0.133 the real
+    /// `generate_uid` moved to `oxc_traverse::TraverseCtx`; this shim is sufficient
+    /// for the legacy DI codegen and is superseded by the render3 factory port.
+    fn generate_uid(&self, name: &str) -> String;
 
     fn errors(&self) -> Vec<Error>;
 
@@ -42,25 +36,8 @@ impl<'a> AngularContext<'a> for AngularCtx<'a> {
         self.1.borrow()
     }
 
-    fn symbols(&self) -> Ref<'_, SymbolTable> {
-        Ref::map(self.1.borrow(), |semantic| semantic.symbols())
-    }
-
-    fn scopes(&self) -> Ref<'_, ScopeTree> {
-        Ref::map(self.1.borrow(), |semantic| semantic.scopes())
-    }
-
-    fn scopes_mut(&self) -> RefMut<'_, ScopeTree> {
-        RefMut::map(self.1.borrow_mut(), |semantic| semantic.scopes_mut())
-    }
-
-    fn add_binding(&self, name: CompactString) {
-        // TODO: use the correct scope and symbol id
-        self.scopes_mut().add_binding(ScopeId::new(0), name, SymbolId::new(0));
-    }
-
-    fn source_type(&self) -> Ref<'_, SourceType> {
-        Ref::map(self.1.borrow(), |semantic| semantic.source_type())
+    fn generate_uid(&self, name: &str) -> String {
+        name.to_string()
     }
 
     fn errors(&self) -> Vec<Error> {

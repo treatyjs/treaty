@@ -1,0 +1,73 @@
+warning: rust_authoring v0.1.0 (D:\dev\treaty\apps\rust\authoring) ignoring invalid dependency `cargo-watch` which is missing a lib target
+    Checking rust_authoring v0.1.0 (D:\dev\treaty\apps\rust\authoring)
+warning: unused import: `oxc::syntax::class`
+ --> apps\rust\authoring\src\angular\transformers\injectable.rs:6:5
+  |
+6 | use oxc::syntax::class;
+  |     ^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+error: cannot explicitly borrow within an implicitly-borrowing pattern
+  --> apps\rust\authoring\src\angular\transformers\dependency.rs:82:60
+   |
+82 | ...                   ParamDecorator::Inject(ref _name)
+   |                                              ^^^ explicit `ref` binding modifier not allowed when implicitly borrowing
+83 | ...                   | ParamDecorator::ASelf(ref _name)
+   |                                               ^^^ explicit `ref` binding modifier not allowed when implicitly borrowing
+84 | ...                   | ParamDecorator::Optional(ref _name)
+   |                                                  ^^^ explicit `ref` binding modifier not allowed when implicitly borrowing
+85 | ...                   | ParamDecorator::SkipSelf(ref _name) => {
+   |                                                  ^^^ explicit `ref` binding modifier not allowed when implicitly borrowing
+   |
+   = note: for more information, see <https://doc.rust-lang.org/reference/patterns.html#binding-modes>
+note: matching on a reference type with a non-reference pattern implicitly borrows the contents
+  --> apps\rust\authoring\src\angular\transformers\dependency.rs:85:39
+   |
+85 | ...                   | ParamDecorator::SkipSelf(ref _name) => {
+   |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this non-reference pattern matches on a reference type `&_`
+note: matching on a reference type with a non-reference pattern implicitly borrows the contents
+  --> apps\rust\authoring\src\angular\transformers\dependency.rs:84:39
+   |
+84 | ...                   | ParamDecorator::Optional(ref _name)
+   |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this non-reference pattern matches on a reference type `&_`
+note: matching on a reference type with a non-reference pattern implicitly borrows the contents
+  --> apps\rust\authoring\src\angular\transformers\dependency.rs:83:39
+   |
+83 | ...                   | ParamDecorator::ASelf(ref _name)
+   |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this non-reference pattern matches on a reference type `&_`
+note: matching on a reference type with a non-reference pattern implicitly borrows the contents
+  --> apps\rust\authoring\src\angular\transformers\dependency.rs:82:37
+   |
+82 | ...                   ParamDecorator::Inject(ref _name)
+   |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this non-reference pattern matches on a reference type `&_`
+help: remove the unnecessary binding modifiers
+   |
+82 ~                                     ParamDecorator::Inject(_name)
+83 ~                                     | ParamDecorator::ASelf(_name)
+84 ~                                     | ParamDecorator::Optional(_name)
+85 ~                                     | ParamDecorator::SkipSelf(_name) => {
+   |
+
+warning: unused variable: `injectable_options`
+   --> apps\rust\authoring\src\angular\transformers\dependency.rs:164:9
+    |
+164 |         injectable_options: Option<&InjectableOptions>,
+    |         ^^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_injectable_options`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `ch`
+   --> apps\rust\authoring\src\treaty\lexer.rs:352:24
+    |
+352 |         while let Some(ch) = self.current_char {
+    |                        ^^ help: if this is intentional, prefix it with an underscore: `_ch`
+
+warning: unused variable: `ch`
+   --> apps\rust\authoring\src\treaty\lexer.rs:364:24
+    |
+364 |         while let Some(ch) = self.current_char {
+    |                        ^^ help: if this is intentional, prefix it with an underscore: `_ch`
+
+warning: `rust_authoring` (lib) generated 4 warnings
+error: could not compile `rust_authoring` (lib) due to 1 previous error; 4 warnings emitted

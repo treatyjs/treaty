@@ -6,7 +6,8 @@ use super::context::{AngularContext, AngularCtx};
 use super::transformers::DependencyInjection;
 use super::{InjectableCreator, TopLevelDecorator};
 use oxc_allocator::Allocator;
-use oxc_ast::{ast::*, AstBuilder, AstKind, VisitMut};
+use oxc_ast::{ast::*, AstBuilder};
+use oxc_ast_visit::{walk_mut, VisitMut};
 use oxc_diagnostics::Error;
 use oxc_semantic::Semantic;
 use oxc_span::SourceType;
@@ -60,7 +61,7 @@ impl<'a> Angular<'a> {
         if let Some(specs) = specifiers.as_mut() {
             specs.retain(|specifier| {
                 if let ImportDeclarationSpecifier::ImportSpecifier(import_spec) = specifier {
-                    let imported_name_str: &str = &import_spec.imported.name();
+                    let imported_name_str: &str = import_spec.imported.name().as_str();
                     !desired_imported_names.contains(&imported_name_str)
                 } else {
                     true
@@ -103,14 +104,7 @@ impl<'a> VisitMut<'a> for Angular<'a> {
 
 
     fn visit_import_declaration(&mut self, decl: &mut ImportDeclaration<'a>) {
-        let kind = AstKind::ImportDeclaration(self.alloc(decl));
-
-        let is_angular = decl
-            .source
-            .value
-            .to_compact_string()
-            .starts_with("@angular");
-        self.enter_node(kind);
+        let is_angular = decl.source.value.as_str().starts_with("@angular");
 
         if is_angular {
             let mut all_specifiers_to_remove: Vec<&str> = Vec::new();
@@ -127,7 +121,6 @@ impl<'a> VisitMut<'a> for Angular<'a> {
             }
         }
         self.visit_string_literal(&mut decl.source);
-        self.leave_node(kind);
     }
 
     fn visit_statements(&mut self, stmts: &mut oxc_allocator::Vec<'a, Statement<'a>>) {
@@ -140,15 +133,12 @@ impl<'a> VisitMut<'a> for Angular<'a> {
     fn visit_expression(&mut self, expr: &mut Expression<'a>) {
         // self.dependency_injection.as_mut().map(|t| t.transform_expression(expr));
 
-        self.visit_expression_match(expr);
+        walk_mut::walk_expression(self, expr);
     }
 
     fn visit_decorator(&mut self, decorator: &mut Decorator<'a>) {
-        let kind = AstKind::Decorator(self.alloc(decorator));
         // self.dependency_injection.as_mut().map(|t| t.transform_decorator(decorator));
 
-        self.enter_node(kind);
         self.visit_expression(&mut decorator.expression);
-        self.leave_node(kind);
     }
 }

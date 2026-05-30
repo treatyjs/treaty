@@ -1,0 +1,374 @@
+warning: rust_authoring v0.1.0 (D:\dev\treaty\apps\rust\authoring) ignoring invalid dependency `cargo-watch` which is missing a lib target
+   Compiling windows-sys v0.61.2
+   Compiling is_ci v1.2.0
+   Compiling supports-unicode v3.0.0
+   Compiling supports-hyperlinks v3.2.0
+   Compiling aliasable v0.1.3
+   Compiling authoring_treaty_authoring v0.1.0 (D:\dev\treaty\libs\authoring\treaty_authoring)
+   Compiling authoring_node v0.1.0 (D:\dev\treaty\libs\authoring\node)
+warning: unused variable: `injectable_options`
+   --> apps\rust\authoring\src\angular\transformers\dependency.rs:164:9
+    |
+164 |         injectable_options: Option<&InjectableOptions>,
+    |         ^^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_injectable_options`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `ch`
+   --> apps\rust\authoring\src\treaty\lexer.rs:352:24
+    |
+352 |         while let Some(ch) = self.current_char {
+    |                        ^^ help: if this is intentional, prefix it with an underscore: `_ch`
+
+warning: unused variable: `ch`
+   --> apps\rust\authoring\src\treaty\lexer.rs:364:24
+    |
+364 |         while let Some(ch) = self.current_char {
+    |                        ^^ help: if this is intentional, prefix it with an underscore: `_ch`
+
+warning: type `ValueSansProvider` is more private than the item `InjectableProvider::Value::0`
+  --> apps\rust\authoring\src\angular\decorators\injectable.rs:6:11
+   |
+ 6 |     Value(ValueSansProvider),
+   |           ^^^^^^^^^^^^^^^^^ field `InjectableProvider::Value::0` is reachable at visibility `pub`
+   |
+note: but type `ValueSansProvider` is only usable at visibility `pub(self)`
+  --> apps\rust\authoring\src\angular\decorators\injectable.rs:22:1
+   |
+22 | struct ValueSansProvider {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^
+   = note: `#[warn(private_interfaces)]` on by default
+
+warning: type `ExistingSansProvider` is more private than the item `InjectableProvider::Existing::0`
+  --> apps\rust\authoring\src\angular\decorators\injectable.rs:7:14
+   |
+ 7 |     Existing(ExistingSansProvider),
+   |              ^^^^^^^^^^^^^^^^^^^^ field `InjectableProvider::Existing::0` is reachable at visibility `pub`
+   |
+note: but type `ExistingSansProvider` is only usable at visibility `pub(self)`
+  --> apps\rust\authoring\src\angular\decorators\injectable.rs:26:1
+   |
+26 | struct ExistingSansProvider {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `StaticClassSansProvider` is more private than the item `InjectableProvider::StaticClass::0`
+  --> apps\rust\authoring\src\angular\decorators\injectable.rs:8:17
+   |
+ 8 |     StaticClass(StaticClassSansProvider),
+   |                 ^^^^^^^^^^^^^^^^^^^^^^^ field `InjectableProvider::StaticClass::0` is reachable at visibility `pub`
+   |
+note: but type `StaticClassSansProvider` is only usable at visibility `pub(self)`
+  --> apps\rust\authoring\src\angular\decorators\injectable.rs:30:1
+   |
+30 | struct StaticClassSansProvider {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `ConstructorSansProvider` is more private than the item `InjectableProvider::Constructor::0`
+  --> apps\rust\authoring\src\angular\decorators\injectable.rs:9:17
+   |
+ 9 |     Constructor(ConstructorSansProvider),
+   |                 ^^^^^^^^^^^^^^^^^^^^^^^ field `InjectableProvider::Constructor::0` is reachable at visibility `pub`
+   |
+note: but type `ConstructorSansProvider` is only usable at visibility `pub(self)`
+  --> apps\rust\authoring\src\angular\decorators\injectable.rs:35:1
+   |
+35 | struct ConstructorSansProvider {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `FactorySansProvider` is more private than the item `InjectableProvider::Factory::0`
+  --> apps\rust\authoring\src\angular\decorators\injectable.rs:10:13
+   |
+10 |     Factory(FactorySansProvider),
+   |             ^^^^^^^^^^^^^^^^^^^ field `InjectableProvider::Factory::0` is reachable at visibility `pub`
+   |
+note: but type `FactorySansProvider` is only usable at visibility `pub(self)`
+  --> apps\rust\authoring\src\angular\decorators\injectable.rs:38:1
+   |
+38 | struct FactorySansProvider {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `ClassSansProvider` is more private than the item `InjectableProvider::Class::0`
+  --> apps\rust\authoring\src\angular\decorators\injectable.rs:11:11
+   |
+11 |     Class(ClassSansProvider),
+   |           ^^^^^^^^^^^^^^^^^ field `InjectableProvider::Class::0` is reachable at visibility `pub`
+   |
+note: but type `ClassSansProvider` is only usable at visibility `pub(self)`
+  --> apps\rust\authoring\src\angular\decorators\injectable.rs:51:1
+   |
+51 | struct ClassSansProvider {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: enum `Identifier` is never used
+ --> apps\rust\authoring\src\angular\runtime.rs:7:10
+  |
+7 | pub enum Identifier {
+  |          ^^^^^^^^^^
+  |
+  = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `imported` is never used
+  --> apps\rust\authoring\src\angular\runtime.rs:28:12
+   |
+27 | impl Identifier {
+   | --------------- method in this implementation
+28 |     pub fn imported<OpaqueT>(self) -> (String, String) {
+   |            ^^^^^^^^
+
+warning: method `error` is never used
+  --> apps\rust\authoring\src\angular\context.rs:27:8
+   |
+14 | pub trait AngularContext<'a> {
+   |           -------------- method in this trait
+...
+27 |     fn error<T: Into<Error>>(&mut self, error: T);
+   |        ^^^^^
+
+warning: field `use_value` is never read
+  --> apps\rust\authoring\src\angular\decorators\injectable.rs:23:5
+   |
+22 | struct ValueSansProvider {
+   |        ----------------- field in this struct
+23 |     use_value: Box<dyn Any>,
+   |     ^^^^^^^^^
+   |
+   = note: `ValueSansProvider` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: field `use_existing` is never read
+  --> apps\rust\authoring\src\angular\decorators\injectable.rs:27:5
+   |
+26 | struct ExistingSansProvider {
+   |        -------------------- field in this struct
+27 |     use_existing: Box<dyn Any>,
+   |     ^^^^^^^^^^^^
+   |
+   = note: `ExistingSansProvider` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: fields `use_class` and `deps` are never read
+  --> apps\rust\authoring\src\angular\decorators\injectable.rs:31:5
+   |
+30 | struct StaticClassSansProvider {
+   |        ----------------------- fields in this struct
+31 |     use_class: Box<dyn Any>,
+   |     ^^^^^^^^^
+32 |     deps: Vec<Box<dyn Any>>,
+   |     ^^^^
+   |
+   = note: `StaticClassSansProvider` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: field `deps` is never read
+  --> apps\rust\authoring\src\angular\decorators\injectable.rs:36:5
+   |
+35 | struct ConstructorSansProvider {
+   |        ----------------------- field in this struct
+36 |     deps: Option<Vec<Box<dyn Any>>>,
+   |     ^^^^
+   |
+   = note: `ConstructorSansProvider` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: field `use_factory` is never read
+  --> apps\rust\authoring\src\angular\decorators\injectable.rs:39:5
+   |
+38 | struct FactorySansProvider {
+   |        ------------------- field in this struct
+39 |     use_factory: Box<dyn Fn(Vec<Box<dyn Any>>) -> Box<dyn Any>>,
+   |     ^^^^^^^^^^^
+
+warning: field `use_class` is never read
+  --> apps\rust\authoring\src\angular\decorators\injectable.rs:52:5
+   |
+51 | struct ClassSansProvider {
+   |        ----------------- field in this struct
+52 |     use_class: Box<dyn Any>,
+   |     ^^^^^^^^^
+   |
+   = note: `ClassSansProvider` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: field `nodes` is never read
+  --> apps\rust\authoring\src\angular\transformers\dependency.rs:13:5
+   |
+11 | pub struct DependencyInjection<'a> {
+   |            ------------------- field in this struct
+12 |     ast: Rc<AstBuilder<'a>>,
+13 |     nodes: oxc_allocator::Vec<'a, AstKind<'a>>,
+   |     ^^^^^
+
+warning: field `nodes` is never read
+  --> apps\rust\authoring\src\angular\transformers\injectable.rs:13:5
+   |
+11 | pub struct InjectableCreator<'a> {
+   |            ----------------- field in this struct
+12 |     ast: Rc<AstBuilder<'a>>,
+13 |     nodes: oxc_allocator::Vec<'a, AstKind<'a>>,
+   |     ^^^^^
+
+warning: `rust_authoring` (lib) generated 20 warnings (run `cargo fix --lib -p rust_authoring` to apply 3 suggestions)
+   Compiling supports-color v3.0.2
+   Compiling ouroboros v0.18.5
+   Compiling terminal_size v0.4.4
+   Compiling miette v7.6.0
+   Compiling rust_authoring v0.1.0 (D:\dev\treaty\apps\rust\authoring)
+warning: `rust_authoring` (lib test) generated 20 warnings (20 duplicates)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.81s
+     Running unittests src\lib.rs (target\debug\deps\authoring_node-306764044bc3dab6.exe)
+Load Node-API [napi_get_last_error_info] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_get_undefined] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_get_null] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_get_global] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_get_boolean] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_create_object] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_create_array] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_create_array_with_length] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_create_double] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_create_int32] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_create_uint32] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_create_int64] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_create_string_latin1] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_create_string_utf8] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_create_string_utf16] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_create_symbol] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_create_function] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_create_error] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_create_type_error] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_create_range_error] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_typeof] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_get_value_double] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_get_value_int32] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_get_value_uint32] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_get_value_int64] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_get_value_bool] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_get_value_string_latin1] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_get_value_string_utf8] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_get_value_string_utf16] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_coerce_to_bool] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_coerce_to_number] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_coerce_to_object] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_coerce_to_string] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_get_prototype] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_get_property_names] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_set_property] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_has_property] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_get_property] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_delete_property] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_has_own_property] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_set_named_property] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_has_named_property] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_get_named_property] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_set_element] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_has_element] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_get_element] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_delete_element] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_define_properties] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_is_array] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_get_array_length] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_strict_equals] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_call_function] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_new_instance] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_instanceof] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_get_cb_info] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_get_new_target] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_define_class] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_wrap] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_unwrap] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_remove_wrap] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_create_external] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_get_value_external] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_create_reference] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_delete_reference] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_reference_ref] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_reference_unref] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_get_reference_value] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_open_handle_scope] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_close_handle_scope] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_open_escapable_handle_scope] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_close_escapable_handle_scope] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_escape_handle] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_throw] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_throw_error] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_throw_type_error] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_throw_range_error] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_is_error] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_is_exception_pending] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_get_and_clear_last_exception] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_is_arraybuffer] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_create_arraybuffer] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_create_external_arraybuffer] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_get_arraybuffer_info] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_is_typedarray] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_create_typedarray] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_get_typedarray_info] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_create_dataview] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_is_dataview] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_get_dataview_info] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_get_version] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_create_promise] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_resolve_deferred] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_reject_deferred] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_is_promise] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_run_script] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_adjust_external_memory] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_module_register] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_fatal_error] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_async_init] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_async_destroy] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_make_callback] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_create_buffer] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_create_external_buffer] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_create_buffer_copy] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_is_buffer] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_get_buffer_info] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_create_async_work] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_delete_async_work] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_queue_async_work] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_cancel_async_work] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_get_node_version] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_get_uv_event_loop] from host runtime failed: GetProcAddress failed
+Load Node-API [uv_run] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_fatal_exception] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_add_env_cleanup_hook] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_remove_env_cleanup_hook] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_open_callback_scope] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_close_callback_scope] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_create_threadsafe_function] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_get_threadsafe_function_context] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_call_threadsafe_function] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_acquire_threadsafe_function] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_release_threadsafe_function] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_unref_threadsafe_function] from host runtime failed: GetProcAddress failed
+Load Node-API [napi_ref_threadsafe_function] from host runtime failed: GetProcAddress failed
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (target\debug\deps\authoring_treaty_authoring-778b0a7ff87ee6c6.exe)
+
+running 1 test
+test tests::it_works ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (target\debug\deps\rust_authoring-60690b1a32ac0978.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\main.rs (target\debug\deps\rust_authoring-268ca232aa00f6e9.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests authoring_treaty_authoring
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests rust_authoring
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

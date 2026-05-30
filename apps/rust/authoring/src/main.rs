@@ -1,10 +1,9 @@
 use std::env;
 use std::path::PathBuf;
 
-mod treaty;
-use treaty::lexer::Lexer;
-use treaty::parser::Parser;
-use treaty::token::TokenKind;
+use rust_authoring::treaty::lexer::Lexer;
+use rust_authoring::treaty::parser::Parser;
+use rust_authoring::treaty::token::TokenKind;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let default_path = "apps/rust/authoring/src/test.treaty";

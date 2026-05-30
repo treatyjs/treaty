@@ -90,7 +90,7 @@ impl Parser {
                     let mut children = Vec::new();
                     while self.current < self.tokens.len() {
                         match &self.tokens[self.current] {
-                            Token::EndTag(ref end_tag) if end_tag == &tag_name => {
+                            Token::EndTag(end_tag) if end_tag == &tag_name => {
                                 self.current += 1;
                                 break;
                             }

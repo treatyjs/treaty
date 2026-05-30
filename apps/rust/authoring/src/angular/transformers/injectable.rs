@@ -3,7 +3,6 @@ use crate::angular::{ProviderScope, TopLevelDecorator};
 
 use std::rc::Rc;
 
-use oxc::syntax::class;
 use oxc_ast::{ast::*, AstBuilder, AstKind};
 use oxc_span::SPAN;
 
@@ -17,7 +16,7 @@ pub struct InjectableCreator<'a> {
 
 impl<'a> InjectableCreator<'a> {
     pub fn new(ast: Rc<AstBuilder<'a>>, context: AngularCtx<'a>) -> Option<Self> {
-        let nodes: oxc_allocator::Vec<'_, AstKind<'_>> = ast.new_vec();
+        let nodes: oxc_allocator::Vec<'_, AstKind<'_>> = ast.vec();
         Some(Self {
             ast,
             nodes,
@@ -38,8 +37,8 @@ impl<'a> InjectableCreator<'a> {
             class
                 .id
                 .clone()
-                .map(|id| id.name.to_compact_string())
-                .or_else(|| Some(self.context.scopes().generate_uid("class")))
+                .map(|id| id.name.as_str().to_string())
+                .or_else(|| Some(self.context.generate_uid("class")))
         } else {
             None
         };
@@ -63,112 +62,95 @@ impl<'a> InjectableCreator<'a> {
         class_name: String,
         injectable_options: &InjectableOptions,
     ) -> ClassElement<'a> {
-        let static_property_key = self.ast.property_key_identifier(IdentifierName {
-            span: SPAN,
-            name: self.ast.new_atom("ɵprov"),
-        });
+        let static_property_key = self.ast.property_key_static_identifier(SPAN, "ɵprov");
 
-        let i0_identifier_name = self.ast.new_atom("i0");
-        let i0_identifier = self
-            .ast
-            .identifier_reference_expression(IdentifierReference::new(SPAN, i0_identifier_name));
+        let i0_identifier = self.ast.expression_identifier(SPAN, "i0");
 
         // Create a new vector for properties
-        let mut properties = self.ast.new_vec();
+        let mut properties = self.ast.vec();
 
-        properties.push(ObjectPropertyKind::ObjectProperty(
+        properties.push(ObjectPropertyKind::ObjectProperty(self.ast.alloc(
             self.ast.object_property(
                 SPAN,
                 PropertyKind::Init,
+                self.ast.property_key_static_identifier(SPAN, "token"),
                 self.ast
-                    .property_key_identifier(IdentifierName::new(SPAN, "token".into())),
-                self.ast
-                    .identifier_reference_expression(IdentifierReference::new(
+                    .expression_identifier(SPAN, self.ast.ident(&class_name)),
+                false,
+                false,
+                false,
+            ),
+        )));
+
+        properties.push(ObjectPropertyKind::ObjectProperty(self.ast.alloc(
+            self.ast.object_property(
+                SPAN,
+                PropertyKind::Init,
+                self.ast.property_key_static_identifier(SPAN, "factory"),
+                Expression::StaticMemberExpression(self.ast.alloc(
+                    self.ast.static_member_expression(
                         SPAN,
-                        self.ast.new_atom(&class_name),
-                    )),
-                None,
+                        self.ast
+                            .expression_identifier(SPAN, self.ast.ident(&class_name)),
+                        self.ast.identifier_name(SPAN, "ɵfac"),
+                        false,
+                    ),
+                )),
                 false,
                 false,
                 false,
             ),
-        ));
-
-        properties.push(ObjectPropertyKind::ObjectProperty(
-            self.ast.object_property(
-                SPAN,
-                PropertyKind::Init,
-                self.ast
-                    .property_key_identifier(IdentifierName::new(SPAN, "factory".into())),
-                self.ast.static_member_expression(
-                    SPAN,
-                    self.ast
-                        .identifier_reference_expression(IdentifierReference::new(
-                            SPAN,
-                            class_name.into(),
-                        )),
-                    IdentifierName {
-                        span: SPAN,
-                        name: "ɵfac".into(),
-                    },
-                    false,
-                ),
-                None,
-                false,
-                false,
-                false,
-            ),
-        ));
+        )));
 
         if injectable_options.provided_in != ProviderScope::None {
-            properties.push(ObjectPropertyKind::ObjectProperty(
+            properties.push(ObjectPropertyKind::ObjectProperty(self.ast.alloc(
                 self.ast.object_property(
                     SPAN,
                     PropertyKind::Init,
-                    self.ast
-                        .property_key_identifier(IdentifierName::new(SPAN, "providedIn".into())),
-                    self.ast.literal_string_expression(StringLiteral::new(
+                    self.ast.property_key_static_identifier(SPAN, "providedIn"),
+                    self.ast.expression_string_literal(
                         SPAN,
-                        self.ast
-                            .new_atom(&injectable_options.provided_in.to_string()),
-                    )),
-                    None,
+                        self.ast.str(&injectable_options.provided_in.to_string()),
+                        None,
+                    ),
                     false,
                     false,
                     false,
                 ),
-            ));
+            )));
         }
 
-        let define_injectable_object = self.ast.object_expression(SPAN, properties, None);
+        let define_injectable_object =
+            Expression::ObjectExpression(self.ast.alloc(self.ast.object_expression(SPAN, properties)));
 
-        let define_injectable_name = self.ast.new_atom("ɵɵdefineInjectable");
-        let define_injectable_call_expression = self.ast.call_expression(
+        let define_injectable_call_expression = self.ast.expression_call(
             SPAN,
-            self.ast.static_member_expression(
+            Expression::StaticMemberExpression(self.ast.alloc(self.ast.static_member_expression(
                 SPAN,
                 i0_identifier,
-                IdentifierName {
-                    span: SPAN,
-                    name: define_injectable_name.clone(),
-                },
+                self.ast.identifier_name(SPAN, "ɵɵdefineInjectable"),
                 false,
-            ),
-            self.ast
-                .new_vec_single(Argument::Expression(define_injectable_object)),
+            ))),
+            Option::<TSTypeParameterInstantiation>::None,
+            self.ast.vec1(Argument::from(define_injectable_object)),
             false,
-            None,
         );
 
-        let property_definition = self.ast.class_property(
-            PropertyDefinitionType::PropertyDefinition,
+        self.ast.class_element_property_definition(
             SPAN,
+            PropertyDefinitionType::PropertyDefinition,
+            self.ast.vec(),
             static_property_key,
+            Option::<TSTypeAnnotation>::None,
             Some(define_injectable_call_expression),
             false,
             true,
-            self.ast.new_vec(),
-        );
-        property_definition
+            false,
+            false,
+            false,
+            false,
+            false,
+            None,
+        )
     }
 }

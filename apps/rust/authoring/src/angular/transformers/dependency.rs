@@ -17,7 +17,7 @@ pub struct DependencyInjection<'a> {
 
 impl<'a> DependencyInjection<'a> {
     pub fn new(ast: Rc<AstBuilder<'a>>, context: AngularCtx<'a>) -> Option<Self> {
-        let nodes: oxc_allocator::Vec<'_, AstKind<'_>> = ast.new_vec();
+        let nodes: oxc_allocator::Vec<'_, AstKind<'_>> = ast.vec();
         Some(Self {
             ast,
             nodes,
@@ -36,8 +36,8 @@ impl<'a> DependencyInjection<'a> {
             class
                 .id
                 .clone()
-                .map(|id| self.context.scopes().generate_uid(&id.name))
-                .or_else(|| Some(self.context.scopes().generate_uid("class")))
+                .map(|id| self.context.generate_uid(id.name.as_str()))
+                .or_else(|| Some(self.context.generate_uid("class")))
         } else {
             None
         };
@@ -57,7 +57,7 @@ impl<'a> DependencyInjection<'a> {
             if constructor_has_params {
                 // Use the std::mem::replace strategy if direct mutation isn't possible due to the Vec's traits.
                 let mut temp_params =
-                    std::mem::replace(&mut constructor.value.params.items, self.ast.new_vec());
+                    std::mem::replace(&mut constructor.value.params.items, self.ast.vec());
 
                 for param in temp_params.iter_mut() {
                     let mut decorators_to_remove = Vec::new();
@@ -79,10 +79,10 @@ impl<'a> DependencyInjection<'a> {
                                 ParamDecorator::from_str(name, param, decorator)
                             {
                                 match &param_decorator {
-                                    ParamDecorator::Inject(ref _name)
-                                    | ParamDecorator::ASelf(ref _name)
-                                    | ParamDecorator::Optional(ref _name)
-                                    | ParamDecorator::SkipSelf(ref _name) => {
+                                    ParamDecorator::Inject(_name)
+                                    | ParamDecorator::ASelf(_name)
+                                    | ParamDecorator::Optional(_name)
+                                    | ParamDecorator::SkipSelf(_name) => {
                                         found_param_decorator = true;
                                         self.constructor_params.push(param_decorator);
                                         decorators_to_remove.push(index);
@@ -98,7 +98,7 @@ impl<'a> DependencyInjection<'a> {
 
                     if !found_param_decorator {
                         if let Some(type_name) = self.extract_type_name_from_type_annotation(
-                            &param.pattern.type_annotation.as_ref(),
+                            &param.type_annotation.as_ref(),
                         ) {
                             self.constructor_params
                                 .push(ParamDecorator::Inject(type_name));
@@ -153,6 +153,8 @@ impl<'a> DependencyInjection<'a> {
                 let left_name = self.extract_type_name_from_tstype_name(&qualified_name.left)?;
                 Some(format!("{}.{}", left_name, qualified_name.right.name))
             }
+            // OXC 0.133 added TSTypeName::ThisExpression (and may add more); not a named type ref.
+            _ => None,
         }
     }
 
@@ -161,53 +163,43 @@ impl<'a> DependencyInjection<'a> {
         factory_name: String,
         injectable_options: Option<&InjectableOptions>,
     ) -> ClassElement<'a> {
-        let identifier_name = self.ast.new_atom("ɵfac");
         let identifier_span = SPAN;
-        let identifier_key = self.ast.property_key_identifier(IdentifierName {
-            span: identifier_span,
-            name: identifier_name,
-        });
+        let identifier_key = self
+            .ast
+            .property_key_static_identifier(identifier_span, "ɵfac");
 
-        let function_identifier_name = self.ast.new_atom(&factory_name);
-        let function_identifier_ref =
-            BindingIdentifier::new(identifier_span, function_identifier_name.clone());
-        let function_identifier =
-            self.ast
-                .identifier_reference_expression(IdentifierReference::new(
-                    identifier_span,
-                    function_identifier_name,
-                ));
+        let function_identifier_name = self.ast.ident(&factory_name);
+        let function_identifier_ref = self
+            .ast
+            .binding_identifier(identifier_span, function_identifier_name);
+        let function_identifier = self
+            .ast
+            .expression_identifier(identifier_span, self.ast.ident(&factory_name));
 
-        let param_identifier_name = self.ast.new_atom("t");
         let param_identifier_expression =
-            self.ast
-                .identifier_reference_expression(IdentifierReference::new(
-                    identifier_span,
-                    param_identifier_name.clone(),
-                ));
+            self.ast.expression_identifier(identifier_span, "t");
 
-        let param_identifier = self.ast.alloc(BindingIdentifier::new(
-            identifier_span,
-            param_identifier_name,
-        ));
-
-        let param_binding_pattern =
-            BindingPattern::new_with_kind(BindingPatternKind::BindingIdentifier(param_identifier));
+        let param_binding_pattern = self
+            .ast
+            .binding_pattern_binding_identifier(identifier_span, "t");
 
         let formal_parameter = self.ast.formal_parameter(
             identifier_span,
+            self.ast.vec(),
             param_binding_pattern,
+            None::<oxc_allocator::Box<'_, TSTypeAnnotation<'_>>>,
+            None::<oxc_allocator::Box<'_, Expression<'_>>>,
+            false,
             None,
             false,
             false,
-            self.ast.new_vec(),
         );
 
-        let params: oxc_allocator::Box<'_, FormalParameters<'_>> = self.ast.formal_parameters(
+        let params: FormalParameters<'_> = self.ast.formal_parameters(
             identifier_span,
             FormalParameterKind::FormalParameter,
-            self.ast.new_vec_single(formal_parameter),
-            None,
+            self.ast.vec1(formal_parameter),
+            None::<oxc_allocator::Box<'_, FormalParameterRest<'_>>>,
         );
 
         // Collecting the injection tokens
@@ -226,97 +218,88 @@ impl<'a> DependencyInjection<'a> {
         // Prepare a vector to hold all call expressions as arguments for the new expression
         let mut new_expression_arguments = self
             .ast
-            .new_vec_with_capacity::<Argument<'a>>(inject_tokens.len());
+            .vec_with_capacity::<Argument<'a>>(inject_tokens.len());
 
         for token in inject_tokens {
-            let token_identifier_name = self.ast.new_atom(&token);
-            let token_identifier =
-                self.ast
-                    .identifier_reference_expression(IdentifierReference::new(
-                        identifier_span,
-                        token_identifier_name,
-                    ));
-
-            let i0_identifier_name = self.ast.new_atom("i0");
-            let i0_identifier = self
+            let token_identifier = self
                 .ast
-                .identifier_reference_expression(IdentifierReference::new(
-                    identifier_span,
-                    i0_identifier_name,
-                ));
+                .expression_identifier(identifier_span, self.ast.ident(&token));
 
-            let inject_identifier_name = self.ast.new_atom("ɵɵinject");
+            let i0_identifier = self.ast.expression_identifier(identifier_span, "i0");
 
             // Create the call expression for each token
-            let inject_call_expression = self.ast.call_expression(
+            let inject_call_expression = self.ast.expression_call(
                 identifier_span,
-                self.ast.static_member_expression(
+                Expression::from(self.ast.member_expression_static(
                     identifier_span,
                     i0_identifier,
-                    IdentifierName {
-                        span: identifier_span,
-                        name: inject_identifier_name.clone(),
-                    },
+                    self.ast.identifier_name(identifier_span, "ɵɵinject"),
                     false,
-                ),
-                self.ast
-                    .new_vec_single(Argument::Expression(token_identifier)),
+                )),
+                None::<oxc_allocator::Box<'_, TSTypeParameterInstantiation<'_>>>,
+                self.ast.vec1(Argument::from(token_identifier)),
                 false,
-                None,
             );
 
             // Add the call expression as an argument to the new_expression_arguments
-            new_expression_arguments.push(Argument::Expression(inject_call_expression));
+            new_expression_arguments.push(Argument::from(inject_call_expression));
         }
 
         // Creating the new expression with the aggregated arguments
-        let new_expression = self.ast.new_expression(
+        let new_expression = self.ast.expression_new(
             identifier_span,
-            self.ast.parenthesized_expression(
+            self.ast.expression_parenthesized(
                 identifier_span,
-                self.ast.logical_expression(
+                self.ast.expression_logical(
                     identifier_span,
                     param_identifier_expression,
                     LogicalOperator::Or,
                     function_identifier,
                 ),
             ),
+            None::<oxc_allocator::Box<'_, TSTypeParameterInstantiation<'_>>>,
             new_expression_arguments, // Use the aggregated call expressions here
-            None,
         );
 
         let return_statement = self
             .ast
-            .return_statement(identifier_span, Some(new_expression));
+            .statement_return(identifier_span, Some(new_expression));
 
         let function_body = self.ast.function_body(
             identifier_span,
-            self.ast.new_vec(),
-            self.ast.new_vec_single(return_statement),
+            self.ast.vec(),
+            self.ast.vec1(return_statement),
         );
 
-        let function_expression = self.ast.function_expression(self.ast.function(
-            FunctionType::FunctionExpression,
+        let function_expression = self.ast.expression_function(
             identifier_span,
+            FunctionType::FunctionExpression,
             Some(function_identifier_ref),
             false,
             false,
-            None,
+            false,
+            None::<oxc_allocator::Box<'_, TSTypeParameterDeclaration<'_>>>,
+            None::<oxc_allocator::Box<'_, TSThisParameter<'_>>>,
             params,
+            None::<oxc_allocator::Box<'_, TSTypeAnnotation<'_>>>,
             Some(function_body),
-            None,
-            None,
-            Modifiers::empty(),
-        ));
+        );
 
-        let property_definition = self.ast.class_property(
-            PropertyDefinitionType::PropertyDefinition,
+        let property_definition = self.ast.class_element_property_definition(
             identifier_span,
+            PropertyDefinitionType::PropertyDefinition,
+            self.ast.vec(),
             identifier_key,
+            None::<oxc_allocator::Box<'_, TSTypeAnnotation<'_>>>,
             Some(function_expression),
             false,
             true,
-            self.ast.new_vec(),
+            false,
+            false,
+            false,
+            false,
+            false,
+            None,
         );
         property_definition
     }

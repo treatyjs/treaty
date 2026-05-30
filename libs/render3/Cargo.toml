@@ -1,0 +1,15 @@
+[package]
+name = "render3"
+version = "0.1.0"
+edition = "2024"
+
+# Treaty's direct-to-Ivy Angular compiler, ported from Angular 22.1 packages/compiler.
+# See migration/PORT-ARCHITECTURE.md and migration/render3-specs/.
+
+[dependencies]
+oxc_allocator = "0.133.0"
+oxc_ast = "0.133.0"
+oxc_ast_visit = "0.133.0"
+oxc_codegen = "0.133.0"
+oxc_span = "0.133.0"
+oxc_str = "0.133.0"

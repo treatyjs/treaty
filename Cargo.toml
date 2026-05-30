@@ -3,6 +3,7 @@ resolver = '2'
 members = [
 	'libs/authoring/node',
 	'libs/authoring/treaty_authoring',
+	'libs/render3',
 	'apps/rust/authoring',
 ]
 

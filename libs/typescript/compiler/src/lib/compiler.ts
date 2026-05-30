@@ -302,7 +302,6 @@ export const treatySFC: () => Plugin = () => {
 						animations: null,
 						deferrableTypes: new Map(),
 						i18nUseExternalIds: false,
-						interpolation: compiler.DEFAULT_INTERPOLATION_CONFIG,
 						isSignal: true,
 						providers: null,
 						queries: [],
@@ -310,9 +309,10 @@ export const treatySFC: () => Plugin = () => {
 						template: angularTemplate,
 						encapsulation: compiler.ViewEncapsulation.Emulated,
 						exportAs: null,
-						fullInheritance: false,
 						changeDetection: null,
 						relativeContextFilePath: 'template.html',
+						relativeTemplatePath: null,
+						hasDirectiveDependencies: false,
 						type: {
 							value: new compiler.WrappedNodeExpr(CMP_NAME),
 							type: new compiler.WrappedNodeExpr(CMP_NAME),
@@ -325,7 +325,7 @@ export const treatySFC: () => Plugin = () => {
 						viewQueries: [],
 					},
 					constantPool,
-					compiler.makeBindingParser(compiler.DEFAULT_INTERPOLATION_CONFIG)
+					compiler.makeBindingParser()
 				);
 
 				(out.expression as any).args[0].entries.push(new LiteralMapEntry('dependencies', new compiler.LiteralArrayExpr(

@@ -47,7 +47,7 @@ impl ParamDecorator {
             "SkipSelf" => Some(ParamDecorator::SkipSelf("".into())),
             "Inject" => {
                 if let Expression::CallExpression(call_expr) = &decorator.expression {
-                    if let Some(Argument::Expression(Expression::Identifier(identifier_reference))) = call_expr.arguments.get(0) {
+                    if let Some(Argument::Identifier(identifier_reference)) = call_expr.arguments.get(0) {
                         Some(ParamDecorator::Inject(identifier_reference.name.to_string()))
                     } else {
                         None

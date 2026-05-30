@@ -381,13 +381,13 @@ export const treatyToIvy = async (code: string, id: string, compiler: typeof imp
                 properties: {},
                 specialAttributes: {},
             },
-            rawImports: addToDeclatoration as any,
             inputs,
             outputs: outputs,
             lifecycle: {
                 usesOnChanges: false,
             },
             hostDirectives: null,
+            controlCreate: null,
             declarations: [],
             declarationListEmitMode: 0,
             defer: {
@@ -397,7 +397,6 @@ export const treatyToIvy = async (code: string, id: string, compiler: typeof imp
             deps: [],
             animations: null,
             i18nUseExternalIds: false,
-            interpolation: compiler.DEFAULT_INTERPOLATION_CONFIG,
             isSignal: true,
             providers: null,
             queries: [...contentQueries, ...viewQueries],
@@ -405,9 +404,10 @@ export const treatyToIvy = async (code: string, id: string, compiler: typeof imp
             template: angularTemplate,
             encapsulation: compiler.ViewEncapsulation.Emulated,
             exportAs: null,
-            fullInheritance: false,
             changeDetection: null,
             relativeContextFilePath: 'template.html',
+            relativeTemplatePath: null,
+            hasDirectiveDependencies: false,
             type: {
                 value: new compiler.WrappedNodeExpr(CMP_NAME),
                 type: new compiler.WrappedNodeExpr(CMP_NAME),
@@ -419,7 +419,7 @@ export const treatyToIvy = async (code: string, id: string, compiler: typeof imp
             viewQueries: viewQueries,
         },
         constantPool,
-        compiler.makeBindingParser(compiler.DEFAULT_INTERPOLATION_CONFIG)
+        compiler.makeBindingParser()
     );
 
     (out.expression as any).args[0].entries.push(new LiteralMapEntry('dependencies', new compiler.LiteralArrayExpr(

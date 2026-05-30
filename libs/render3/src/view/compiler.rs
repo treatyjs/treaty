@@ -1,0 +1,1900 @@
+//! `render3/view/compiler.ts` — the direct-to-Ivy entrypoint that assembles
+//! `ɵɵdefineComponent({...})` / `ɵɵdefineDirective({...})`.
+//!
+//! PORT TARGET: see `migration/render3-specs/11-view_compiler.md`
+//! Sources:
+//!   - `tools/angular-ref/packages/compiler/src/render3/view/compiler.ts`
+//!   - `tools/angular-ref/packages/compiler/src/render3/view/api.ts`
+//!
+//! This module is the top-level orchestrator of component/directive compilation. It takes
+//! fully-resolved metadata ([`R3ComponentMetadata`] / [`R3DirectiveMetadata`]) and emits the
+//! `output_ast` IR for the `ɵɵdefineComponent` / `ɵɵdefineDirective` call expression plus the
+//! `.d.ts` declaration [`Type`]. It owns all the *non-template* definition fields; the actual
+//! `ɵɵelement`/`ɵɵtext`/… instruction stream is produced by the template pipeline
+//! (`ingest`/`transform`/`emit`).
+//!
+//! Since the IR in this crate is owned (Box/Vec/String, no arena lifetime), the metadata
+//! structs here are owned too — TS unions become Rust enums, and `{[k]: v}` maps whose
+//! emitted order is observable become [`IndexMap`].
+//!
+//! NOTE(port): the template pipeline (`ingest`/`transform`/`emit`) and the host-binding
+//! pipeline are not yet ported. They are abstracted behind the [`TemplateBuilder`] trait
+//! (template) and [`HostBindingsBuilder`] trait (host bindings) so the orchestration here can
+//! be reproduced and tested faithfully. The default [`StubTemplateBuilder`] produces a
+//! well-formed (but empty-bodied) template function and zero decls/vars/consts.
+
+#![allow(clippy::needless_lifetimes)]
+
+use std::collections::HashMap;
+
+use crate::factory::{R3CompiledExpression, R3Reference};
+use crate::identifiers::R3;
+use crate::output_ast::{
+    self as o, ArrowBody, Expr, ExprKind, FnParam, LeadingComment, LiteralValue, ParseSourceSpan,
+    Stmt, StmtKind, StmtModifier, Type,
+};
+use crate::template::r3_ast as t;
+
+/// A tiny insertion-ordered map (stand-in for `indexmap::IndexMap`, which is not a workspace
+/// dependency). Iteration / serialization order is the insertion order — this is golden-observable
+/// for `inputs`/`outputs`/`host.*`, so order preservation is required (spec §3.12 / §7).
+#[derive(Debug, Clone, PartialEq)]
+pub struct OrderedMap<K, V> {
+    entries: Vec<(K, V)>,
+}
+
+impl<K, V> Default for OrderedMap<K, V> {
+    fn default() -> Self {
+        OrderedMap { entries: Vec::new() }
+    }
+}
+
+impl<K: PartialEq, V> OrderedMap<K, V> {
+    pub fn new() -> OrderedMap<K, V> {
+        OrderedMap { entries: Vec::new() }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+    /// Insert (upsert by key) — later insert overwrites the value but keeps position.
+    pub fn insert(&mut self, key: K, value: V) {
+        if let Some(slot) = self.entries.iter_mut().find(|(k, _)| *k == key) {
+            slot.1 = value;
+        } else {
+            self.entries.push((key, value));
+        }
+    }
+    pub fn get<Q>(&self, key: &Q) -> Option<&V>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: PartialEq + ?Sized,
+    {
+        self.entries
+            .iter()
+            .find(|(k, _)| k.borrow() == key)
+            .map(|(_, v)| v)
+    }
+    pub fn contains_key<Q>(&self, key: &Q) -> bool
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: PartialEq + ?Sized,
+    {
+        self.entries.iter().any(|(k, _)| k.borrow() == key)
+    }
+    pub fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
+        self.entries.iter().map(|(k, v)| (k, v))
+    }
+    pub fn keys(&self) -> impl Iterator<Item = &K> {
+        self.entries.iter().map(|(k, _)| k)
+    }
+}
+
+impl<K, V> IntoIterator for OrderedMap<K, V> {
+    type Item = (K, V);
+    type IntoIter = std::vec::IntoIter<(K, V)>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.into_iter()
+    }
+}
+
+const COMPONENT_VARIABLE: &str = "%COMP%";
+// `_nghost-%COMP%` / `_ngcontent-%COMP%`.
+fn host_attr() -> String {
+    format!("_nghost-{COMPONENT_VARIABLE}")
+}
+fn content_attr() -> String {
+    format!("_ngcontent-{COMPONENT_VARIABLE}")
+}
+
+// ---------------------------------------------------------------------------
+// Local `core` placeholders (`../../core`). NOTE(port): real ones live in `core.ts`.
+// ---------------------------------------------------------------------------
+
+/// `core.ViewEncapsulation` — discriminants pinned to the runtime enum.
+/// NOTE(port): real `ViewEncapsulation` lives in `core.ts` (not yet ported).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewEncapsulation {
+    Emulated = 0,
+    None = 2,
+    ShadowDom = 3,
+}
+
+impl ViewEncapsulation {
+    pub fn as_number(self) -> f64 {
+        self as i32 as f64
+    }
+}
+
+/// `core.ChangeDetectionStrategy` — `OnPush = 0`, `Default = 1`.
+/// NOTE(port): real `ChangeDetectionStrategy` lives in `core.ts` (not yet ported).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeDetectionStrategy {
+    OnPush = 0,
+    Default = 1,
+}
+
+/// `core.InputFlags` — bitflags. `bitflags` is unavailable, so a `u16` newtype.
+/// NOTE(port): real `InputFlags` lives in `core.ts` (not yet ported).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct InputFlags(pub u16);
+
+impl InputFlags {
+    pub const NONE: InputFlags = InputFlags(0);
+    pub const SIGNAL_BASED: InputFlags = InputFlags(1 << 0);
+    pub const HAS_DECORATOR_INPUT_TRANSFORM: InputFlags = InputFlags(1 << 1);
+
+    #[inline]
+    pub fn bits(self) -> u16 {
+        self.0
+    }
+}
+
+impl std::ops::BitOr for InputFlags {
+    type Output = InputFlags;
+    fn bitor(self, rhs: InputFlags) -> InputFlags {
+        InputFlags(self.0 | rhs.0)
+    }
+}
+
+impl std::ops::BitOrAssign for InputFlags {
+    fn bitor_assign(&mut self, rhs: InputFlags) {
+        self.0 |= rhs.0;
+    }
+}
+
+/// `core.parseSelectorToR3Selector(selector)` → `R3CssSelectorList`.
+///
+/// The R3 selector list is `(string | number)[][]`: each selector is a flat array where
+/// `''` introduces an element/attribute group, `1`/`2`/`-1` are not-selector markers, etc. The
+/// full parser lives in `selector.ts`; this port reproduces the common shape exactly enough for
+/// `asLiteral` to serialize it.
+///
+/// NOTE(port): real `parseSelectorToR3Selector` lives in `core.ts` / `selector.ts` (not yet
+/// ported). This minimal version handles `tag`, `.class`, `[attr]`, and `[attr=value]` for a
+/// single (non-comma) selector — enough for the typical `selector: 'app-x'` case.
+pub fn parse_selector_to_r3_selector(selector: Option<&str>) -> Vec<Vec<SelectorPart>> {
+    let selector = match selector {
+        Some(s) if !s.trim().is_empty() => s.trim(),
+        _ => return Vec::new(),
+    };
+
+    // Split on commas (top-level alternatives).
+    let mut result = Vec::new();
+    for alt in selector.split(',') {
+        let alt = alt.trim();
+        if alt.is_empty() {
+            continue;
+        }
+        let mut parts: Vec<SelectorPart> = Vec::new();
+        // Element name comes first (anything before a `.`, `[`, `:`).
+        let mut rest = alt;
+        let mut element = String::new();
+        while let Some(c) = rest.chars().next() {
+            if c == '.' || c == '[' || c == ':' {
+                break;
+            }
+            element.push(c);
+            rest = &rest[c.len_utf8()..];
+        }
+        parts.push(SelectorPart::Str(element));
+
+        // Then class/attribute tokens.
+        let mut chars = rest.chars().peekable();
+        while let Some(&c) = chars.peek() {
+            match c {
+                '.' => {
+                    chars.next();
+                    let mut cls = String::new();
+                    while let Some(&n) = chars.peek() {
+                        if n == '.' || n == '[' || n == ':' {
+                            break;
+                        }
+                        cls.push(n);
+                        chars.next();
+                    }
+                    parts.push(SelectorPart::Str("class".to_string()));
+                    parts.push(SelectorPart::Str(cls));
+                }
+                '[' => {
+                    chars.next();
+                    let mut inner = String::new();
+                    for n in chars.by_ref() {
+                        if n == ']' {
+                            break;
+                        }
+                        inner.push(n);
+                    }
+                    if let Some((name, value)) = inner.split_once('=') {
+                        parts.push(SelectorPart::Str(name.trim().to_string()));
+                        parts.push(SelectorPart::Str(
+                            value.trim().trim_matches(['"', '\'']).to_string(),
+                        ));
+                    } else {
+                        parts.push(SelectorPart::Str(inner.trim().to_string()));
+                        parts.push(SelectorPart::Str(String::new()));
+                    }
+                }
+                _ => {
+                    chars.next();
+                }
+            }
+        }
+        result.push(parts);
+    }
+    result
+}
+
+/// A part of an R3 selector entry — either a string token or a numeric marker.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SelectorPart {
+    Str(String),
+    Num(f64),
+}
+
+// ---------------------------------------------------------------------------
+// `render3/view/util.ts` helpers needed here.
+// ---------------------------------------------------------------------------
+
+/// `asLiteral(value)` — recursively turn a nested string/number array into a `literalArr`/`literal`
+/// with `INFERRED_TYPE`. We model the R3-selector value type ([`SelectorPart`] nesting).
+pub fn as_literal_selectors(selectors: &[Vec<SelectorPart>]) -> Expr {
+    let outer = selectors
+        .iter()
+        .map(|group| {
+            let inner = group.iter().map(as_literal_part).collect();
+            o::literal_arr(inner, None)
+        })
+        .collect();
+    o::literal_arr(outer, None)
+}
+
+fn as_literal_part(part: &SelectorPart) -> Expr {
+    match part {
+        SelectorPart::Str(s) => o::literal(LiteralValue::String(s.clone()), Some(o::inferred_type())),
+        SelectorPart::Num(n) => o::literal(LiteralValue::Number(*n), Some(o::inferred_type())),
+    }
+}
+
+/// `DefinitionMap` — order-preserving object-literal builder. `set` is falsy-skipping (`None`
+/// dropped) and upserts by key. Insertion order is the emitted key order (golden-sensitive).
+#[derive(Debug, Clone, Default)]
+pub struct DefinitionMap {
+    /// `(key, quoted, value)` triples in insertion order.
+    pub values: Vec<(String, bool, Expr)>,
+}
+
+impl DefinitionMap {
+    pub fn new() -> DefinitionMap {
+        DefinitionMap { values: Vec::new() }
+    }
+
+    /// `set(key, value)` — no-op when `value` is `None` (mirrors JS `if (value)` truthiness),
+    /// otherwise upserts by key (later set overwrites). `quoted` is always `false`.
+    pub fn set(&mut self, key: &str, value: Option<Expr>) {
+        if let Some(value) = value {
+            if let Some(existing) = self.values.iter_mut().find(|(k, _, _)| k == key) {
+                existing.2 = value;
+            } else {
+                self.values.push((key.to_string(), false, value));
+            }
+        }
+    }
+
+    /// `toLiteralMap()` → `o.literalMap(values)`.
+    pub fn to_literal_map(&self) -> Expr {
+        o::literal_map(self.values.clone(), None)
+    }
+}
+
+/// `conditionallyCreateDirectiveBindingLiteral(map, forInputs)` for **outputs** (plain
+/// `{field: publicName}` map). Returns `None` when empty. Outputs never track flags or aliases.
+fn conditionally_create_outputs_literal(map: &OrderedMap<String, String>) -> Option<Expr> {
+    if map.is_empty() {
+        return None;
+    }
+    let entries = map
+        .iter()
+        .map(|(field, public_name)| {
+            (
+                field.clone(),
+                is_unsafe_object_key(field),
+                o::literal(LiteralValue::String(public_name.clone()), Some(o::inferred_type())),
+            )
+        })
+        .collect::<Vec<_>>();
+    Some(o::literal_map(entries, None))
+}
+
+/// `conditionallyCreateDirectiveBindingLiteral(inputs, /*forInputs*/ true)` — the inputs variant,
+/// which tracks declared name (for `ngOnChanges`), transform functions and flags.
+fn conditionally_create_inputs_literal(map: &OrderedMap<String, R3InputMetadata>) -> Option<Expr> {
+    if map.is_empty() {
+        return None;
+    }
+    let entries = map
+        .iter()
+        .map(|(minified_name, value)| {
+            let declared_name = &value.class_property_name;
+            let public_name = &value.binding_property_name;
+            let different_declaring_name = public_name != declared_name;
+            let has_transform = value.transform_function.is_some();
+
+            let mut flags = InputFlags::NONE;
+            if value.is_signal {
+                flags |= InputFlags::SIGNAL_BASED;
+            }
+            if has_transform {
+                flags |= InputFlags::HAS_DECORATOR_INPUT_TRANSFORM;
+            }
+
+            let expression_value = if different_declaring_name
+                || has_transform
+                || flags != InputFlags::NONE
+            {
+                let mut result = vec![
+                    o::literal(LiteralValue::Number(flags.bits() as f64), None),
+                    o::literal(LiteralValue::String(public_name.clone()), Some(o::inferred_type())),
+                ];
+                if different_declaring_name || has_transform {
+                    result.push(o::literal(
+                        LiteralValue::String(declared_name.clone()),
+                        Some(o::inferred_type()),
+                    ));
+                    if has_transform {
+                        result.push(value.transform_function.clone().unwrap());
+                    }
+                }
+                o::literal_arr(result, None)
+            } else {
+                o::literal(LiteralValue::String(public_name.clone()), Some(o::inferred_type()))
+            };
+
+            (
+                minified_name.clone(),
+                is_unsafe_object_key(minified_name),
+                expression_value,
+            )
+        })
+        .collect::<Vec<_>>();
+    Some(o::literal_map(entries, None))
+}
+
+/// `isUnsafeObjectKey(key)` — whether a property name needs quoting in the emitted object literal.
+/// (A valid JS identifier never needs quoting; anything else does.)
+fn is_unsafe_object_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    match chars.next() {
+        None => true,
+        Some(c) if !(c.is_ascii_alphabetic() || c == '_' || c == '$') => true,
+        _ => !chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$'),
+    }
+}
+
+/// `stringMapAsLiteralExpression(map)` — `{key: 'value', ...}` with quoted keys (used in `.d.ts`
+/// types). For a `[v]`-arrayed value the first element is used; here values are plain strings.
+fn string_map_as_literal_expression(map: Option<&OrderedMap<String, String>>) -> Expr {
+    let entries = match map {
+        Some(map) => map
+            .iter()
+            .map(|(k, v)| (k.clone(), true, o::literal(LiteralValue::String(v.clone()), None)))
+            .collect::<Vec<_>>(),
+        None => Vec::new(),
+    };
+    o::literal_map(entries, None)
+}
+
+// ---------------------------------------------------------------------------
+// `render3/util.ts` helpers (placeholders). NOTE(port): real ones live in `render3/util.ts`.
+// ---------------------------------------------------------------------------
+
+/// `tsIgnoreComment()` — a leading, multiline `@ts-ignore` comment with a trailing newline.
+fn ts_ignore_comment() -> LeadingComment {
+    o::leading_comment("@ts-ignore", true, true)
+}
+
+/// `typeWithParameters(expr, numParams)` — the stub passes the base type through unchanged
+/// (`.d.ts` type-argument expansion is not yet needed for JS emission).
+fn type_with_parameters(ty: Expr, _num_params: u32) -> Type {
+    o::expression_type(ty, None, None)
+}
+
+fn import_r3(id: R3) -> Expr {
+    o::import_expr(id.reference(), None)
+}
+
+fn import_r3_with_params(id: R3, type_params: Vec<Type>) -> Expr {
+    o::import_expr(id.reference(), Some(type_params))
+}
+
+// ---------------------------------------------------------------------------
+// api.ts — metadata input types (owned).
+// ---------------------------------------------------------------------------
+
+/// `DeferBlockDepsEmitMode` (`api.ts` const enum).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum DeferBlockDepsEmitMode {
+    PerBlock = 0,
+    PerComponent = 1,
+}
+
+/// `DeclarationListEmitMode` (`api.ts` const enum).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum DeclarationListEmitMode {
+    Direct,
+    Closure,
+    ClosureResolved,
+    RuntimeResolved,
+}
+
+/// `R3DirectiveMetadata.deps: R3DependencyMetadata[] | 'invalid' | null` (TS union → enum).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Deps {
+    /// `null` — inherit / no constructor.
+    None,
+    /// `'invalid'` sentinel.
+    Invalid,
+    /// Resolved dependency list (uses the factory's [`R3DependencyMetadata`]).
+    List(Vec<crate::factory::R3DependencyMetadata>),
+}
+
+/// `{usesOnChanges: boolean}`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Lifecycle {
+    pub uses_on_changes: bool,
+}
+
+/// `{passThroughInput: string | null}`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ControlCreate {
+    pub pass_through_input: Option<String>,
+}
+
+/// `R3InputMetadata` (`api.ts`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct R3InputMetadata {
+    pub class_property_name: String,
+    pub binding_property_name: String,
+    pub required: bool,
+    pub is_signal: bool,
+    pub transform_function: Option<Expr>,
+}
+
+/// `R3HostMetadata.specialAttributes` (`{styleAttr?, classAttr?}`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SpecialAttrs {
+    pub style_attr: Option<String>,
+    pub class_attr: Option<String>,
+}
+
+/// `R3HostMetadata` (`api.ts`). Iteration order of the maps is emitted → [`IndexMap`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct R3HostMetadata {
+    pub attributes: OrderedMap<String, Expr>,
+    pub listeners: OrderedMap<String, String>,
+    pub properties: OrderedMap<String, String>,
+    pub special_attributes: SpecialAttrs,
+}
+
+/// `R3HostDirectiveMetadata` (`api.ts`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct R3HostDirectiveMetadata {
+    pub directive: R3Reference,
+    pub is_forward_reference: bool,
+    pub inputs: Option<OrderedMap<String, String>>,
+    pub outputs: Option<OrderedMap<String, String>>,
+}
+
+/// `MaybeForwardRefExpression | string[]` query predicate. NOTE(port): `MaybeForwardRefExpression`
+/// lives in `render3/util.ts`; modelled here as a bare [`Expr`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum QueryPredicate {
+    Expr(Expr),
+    Selectors(Vec<String>),
+}
+
+/// `R3QueryMetadata` (`api.ts`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct R3QueryMetadata {
+    pub property_name: String,
+    pub first: bool,
+    pub predicate: QueryPredicate,
+    pub descendants: bool,
+    pub emit_distinct_changes_only: bool,
+    pub read: Option<Expr>,
+    pub static_: bool,
+    pub is_signal: bool,
+}
+
+/// `R3DirectiveMetadata` (`api.ts`). Owned; `type` → `ty` (Rust keyword).
+#[derive(Debug, Clone, PartialEq)]
+pub struct R3DirectiveMetadata {
+    pub name: String,
+    pub ty: R3Reference,
+    pub type_argument_count: u32,
+    pub type_source_span: ParseSourceSpan,
+    pub deps: Deps,
+    pub selector: Option<String>,
+    pub queries: Vec<R3QueryMetadata>,
+    pub view_queries: Vec<R3QueryMetadata>,
+    pub host: R3HostMetadata,
+    pub lifecycle: Lifecycle,
+    /// Insertion order matters (feeds inputs literal + `.d.ts` inputs type).
+    pub inputs: OrderedMap<String, R3InputMetadata>,
+    pub outputs: OrderedMap<String, String>,
+    pub uses_inheritance: bool,
+    pub control_create: Option<ControlCreate>,
+    pub export_as: Option<Vec<String>>,
+    pub providers: Option<Expr>,
+    pub is_standalone: bool,
+    pub is_signal: bool,
+    pub host_directives: Option<Vec<R3HostDirectiveMetadata>>,
+    pub legacy_optional_chaining: bool,
+}
+
+/// `R3TemplateDependencyKind` (`api.ts`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum R3TemplateDependencyKind {
+    Directive = 0,
+    Pipe = 1,
+    NgModule = 2,
+}
+
+/// `R3TemplateDependency` — the trait every declaration must provide (`kind` + `type`).
+pub trait R3TemplateDependency {
+    fn kind(&self) -> R3TemplateDependencyKind;
+    /// The `type` expression used in the `dependencies` array.
+    fn ty(&self) -> Expr;
+}
+
+/// A simple owned template dependency carrying just `{kind, type}` (the common case used by the
+/// `dependencies` array). Richer variants (`R3DirectiveDependencyMetadata`, etc.) can be added as
+/// the binder port lands.
+#[derive(Debug, Clone, PartialEq)]
+pub struct R3TemplateDependencyMetadata {
+    pub kind: R3TemplateDependencyKind,
+    pub ty: Expr,
+}
+
+impl R3TemplateDependency for R3TemplateDependencyMetadata {
+    fn kind(&self) -> R3TemplateDependencyKind {
+        self.kind
+    }
+    fn ty(&self) -> Expr {
+        self.ty.clone()
+    }
+}
+
+/// `R3ForeignComponentMetadata` (`api.ts`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct R3ForeignComponentMetadata {
+    pub name: String,
+    pub component: Expr,
+}
+
+/// `R3ComponentMetadata.template` (`{nodes, ngContentSelectors, preserveWhitespaces}`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ComponentTemplate {
+    pub nodes: Vec<t::Node>,
+    pub ng_content_selectors: Vec<String>,
+    pub preserve_whitespaces: Option<bool>,
+}
+
+/// `R3ComponentDeferMetadata` (`api.ts` discriminated union). `PerBlock` keys by a stable id
+/// (never AST-node pointer identity).
+#[derive(Debug, Clone, PartialEq)]
+pub enum R3ComponentDeferMetadata {
+    PerBlock { blocks: HashMap<usize, Option<Expr>> },
+    PerComponent { dependencies_fn: Option<Expr> },
+}
+
+impl R3ComponentDeferMetadata {
+    pub fn mode(&self) -> DeferBlockDepsEmitMode {
+        match self {
+            R3ComponentDeferMetadata::PerBlock { .. } => DeferBlockDepsEmitMode::PerBlock,
+            R3ComponentDeferMetadata::PerComponent { .. } => DeferBlockDepsEmitMode::PerComponent,
+        }
+    }
+}
+
+/// `changeDetection: ChangeDetectionStrategy | o.Expression | null` (union → enum).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ChangeDetection {
+    /// Statically-resolved numeric strategy (global compilation).
+    Strategy(ChangeDetectionStrategy),
+    /// Unresolved expression (local compilation) — emitted verbatim.
+    Expr(Expr),
+}
+
+/// `R3ComponentMetadata<DeclarationT>` (`api.ts`, extends directive via composition).
+#[derive(Debug, Clone, PartialEq)]
+pub struct R3ComponentMetadata<D: R3TemplateDependency> {
+    pub base: R3DirectiveMetadata,
+    pub template: ComponentTemplate,
+    pub declarations: Vec<D>,
+    pub defer: R3ComponentDeferMetadata,
+    pub declaration_list_emit_mode: DeclarationListEmitMode,
+    pub styles: Vec<String>,
+    pub external_styles: Option<Vec<String>>,
+    /// Mutated in place during compile (null→Emulated→None — see §4.10 / §7).
+    pub encapsulation: ViewEncapsulation,
+    pub animations: Option<Expr>,
+    pub view_providers: Option<Expr>,
+    pub relative_context_file_path: String,
+    pub i18n_use_external_ids: bool,
+    pub change_detection: Option<ChangeDetection>,
+    pub relative_template_path: Option<String>,
+    pub has_directive_dependencies: bool,
+    pub raw_imports: Option<Expr>,
+    pub foreign_imports: Option<Vec<R3ForeignComponentMetadata>>,
+}
+
+// ---------------------------------------------------------------------------
+// Template builder placeholder. NOTE(port): real one is the `ingest`/`transform`/`emit` pipeline
+// via `crate::view::template::TemplateDefinitionBuilder`.
+// ---------------------------------------------------------------------------
+
+/// The result of running the template pipeline: the emitted `template` function expression plus
+/// the slot-allocation summary (`decls`/`vars`), interned `consts` (+ their initializers) and the
+/// extracted `ngContentSelectors`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TemplateBuilderResult {
+    /// `function MyComponent_Template(rf, ctx) { … }`.
+    pub template_fn: Expr,
+    /// Number of declaration slots (`root.decls`).
+    pub decls: u32,
+    /// Number of binding slots (`root.vars`).
+    pub vars: u32,
+    /// The `consts` array entries (interned literals / attribute arrays).
+    pub consts: Vec<Expr>,
+    /// Statements that must run before the `consts` array is built (arrow-fn form).
+    pub consts_initializers: Vec<Stmt>,
+    /// `ngContentSelectors`, or `None` when there is no projection.
+    pub content_selectors: Option<Expr>,
+}
+
+/// Abstraction over the template pipeline (`ingestComponent` → `transform` → `emitTemplateFn`).
+///
+/// NOTE(port): the real pipeline is heavy and still settling; this trait lets `compiler.rs` be
+/// ported and tested now. Implement it once the pipeline lands and pass it to
+/// [`compile_component_from_metadata`].
+pub trait TemplateBuilder {
+    /// Ingest + transform + emit the template for the given component metadata.
+    fn build<D: R3TemplateDependency>(
+        &mut self,
+        meta: &R3ComponentMetadata<D>,
+        all_deferrable_deps_fn: Option<&Expr>,
+    ) -> TemplateBuilderResult;
+}
+
+/// The default placeholder builder: emits `function <Name>_Template(rf, ctx) {}` with no body and
+/// zero decls/vars/consts. Faithful in *shape* (the function name + `(rf, ctx)` params) so the
+/// orchestration and golden structure around it can be exercised.
+#[derive(Debug, Default)]
+pub struct StubTemplateBuilder;
+
+impl TemplateBuilder for StubTemplateBuilder {
+    fn build<D: R3TemplateDependency>(
+        &mut self,
+        meta: &R3ComponentMetadata<D>,
+        _all_deferrable_deps_fn: Option<&Expr>,
+    ) -> TemplateBuilderResult {
+        let template_fn = o::fn_(
+            vec![
+                FnParam::new("rf", None),
+                FnParam::new("ctx", None),
+            ],
+            Vec::new(),
+            None,
+            Some(format!("{}_Template", meta.base.name)),
+        );
+        TemplateBuilderResult {
+            template_fn,
+            decls: 0,
+            vars: 0,
+            consts: Vec::new(),
+            consts_initializers: Vec::new(),
+            content_selectors: None,
+        }
+    }
+}
+
+/// Abstraction over the host-binding pipeline (`ingestHostBinding` → `transform` →
+/// `emitHostBindingFunction`). Returns the optional `hostBindings` function and sets
+/// `hostAttrs`/`hostVars` on the definition map.
+///
+/// NOTE(port): the real pipeline is not yet ported; the default [`StubHostBindingsBuilder`]
+/// emits nothing.
+pub trait HostBindingsBuilder {
+    /// `createHostBindingsFunction(...)` — returns the host-bindings fn (or `None`) and may set
+    /// `hostAttrs`/`hostVars` on the definition map. `host` may be mutated (special attrs folded in).
+    fn build(
+        &mut self,
+        host: &mut R3HostMetadata,
+        selector: &str,
+        name: &str,
+        legacy_optional_chaining: bool,
+        definition_map: &mut DefinitionMap,
+    ) -> Option<Expr>;
+}
+
+/// Default placeholder: folds `style`/`class` special attributes into the attributes map (faithful
+/// to the real fn's side effect) but emits no host-bindings function.
+#[derive(Debug, Default)]
+pub struct StubHostBindingsBuilder;
+
+impl HostBindingsBuilder for StubHostBindingsBuilder {
+    fn build(
+        &mut self,
+        host: &mut R3HostMetadata,
+        _selector: &str,
+        _name: &str,
+        _legacy_optional_chaining: bool,
+        _definition_map: &mut DefinitionMap,
+    ) -> Option<Expr> {
+        if let Some(style) = host.special_attributes.style_attr.clone() {
+            host.attributes
+                .insert("style".to_string(), o::literal(LiteralValue::String(style), None));
+        }
+        if let Some(class) = host.special_attributes.class_attr.clone() {
+            host.attributes
+                .insert("class".to_string(), o::literal(LiteralValue::String(class), None));
+        }
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// baseDirectiveFields / addFeatures.
+// ---------------------------------------------------------------------------
+
+/// Map the compiler-facing [`R3QueryMetadata`] list onto the
+/// [`crate::view::queries::R3QueryMetadata`] input type consumed by the query-generation module.
+///
+/// The two structs differ only in shape: this module's [`QueryPredicate`] carries a bare [`Expr`]
+/// (forward-ref handling is resolved upstream), so it maps to a [`MaybeForwardRefExpression`] with
+/// [`ForwardRefHandling::None`]; `static_` → `is_static`.
+fn map_query_metadata(queries: &[R3QueryMetadata]) -> Vec<crate::view::queries::R3QueryMetadata> {
+    use crate::view::queries as q;
+    queries
+        .iter()
+        .map(|query| q::R3QueryMetadata {
+            property_name: query.property_name.clone(),
+            first: query.first,
+            predicate: match &query.predicate {
+                QueryPredicate::Selectors(selectors) => q::QueryPredicate::Selectors(selectors.clone()),
+                QueryPredicate::Expr(expr) => q::QueryPredicate::Expression(q::MaybeForwardRefExpression {
+                    expression: expr.clone(),
+                    forward_ref: q::ForwardRefHandling::None,
+                }),
+            },
+            descendants: query.descendants,
+            emit_distinct_changes_only: query.emit_distinct_changes_only,
+            read: query.read.clone(),
+            is_static: query.static_,
+            is_signal: query.is_signal,
+        })
+        .collect()
+}
+
+/// `baseDirectiveFields(meta, pool, bindingParser)` — the shared definition fields. Key order is
+/// load-bearing (golden output).
+fn base_directive_fields<H: HostBindingsBuilder>(
+    meta: &R3DirectiveMetadata,
+    host_builder: &mut H,
+) -> DefinitionMap {
+    let mut definition_map = DefinitionMap::new();
+    let selectors = parse_selector_to_r3_selector(meta.selector.as_deref());
+
+    // e.g. `type: MyDirective`.
+    definition_map.set("type", Some(meta.ty.value.clone()));
+
+    // e.g. `selectors: [['', 'someDir', '']]`.
+    if !selectors.is_empty() {
+        definition_map.set("selectors", Some(as_literal_selectors(&selectors)));
+    }
+
+    // contentQueries / viewQuery — generated by `crate::view::queries`
+    // (`createContentQueriesFunction` / `createViewQueriesFunction`). A fresh `ConstantPool`
+    // stand-in is threaded through both, matching the real entrypoint's `constantPool` arg.
+    let mut query_pool = crate::view::queries::ConstantPool::new();
+
+    if !meta.queries.is_empty() {
+        // e.g. `contentQueries: (rf, ctx, dirIndex) => { ... }`.
+        let queries = map_query_metadata(&meta.queries);
+        definition_map.set(
+            "contentQueries",
+            Some(crate::view::queries::create_content_queries_function(
+                &queries,
+                &mut query_pool,
+                Some(&meta.name),
+            )),
+        );
+    }
+
+    if !meta.view_queries.is_empty() {
+        // e.g. `viewQuery: (rf, ctx) => { ... }`.
+        let view_queries = map_query_metadata(&meta.view_queries);
+        definition_map.set(
+            "viewQuery",
+            Some(crate::view::queries::create_view_queries_function(
+                &view_queries,
+                &mut query_pool,
+                Some(&meta.name),
+            )),
+        );
+    }
+
+    // hostBindings (always called — also sets hostAttrs/hostVars as a side effect).
+    let mut host = meta.host.clone();
+    let host_bindings = host_builder.build(
+        &mut host,
+        meta.selector.as_deref().unwrap_or(""),
+        &meta.name,
+        meta.legacy_optional_chaining,
+        &mut definition_map,
+    );
+    definition_map.set("hostBindings", host_bindings);
+
+    // inputs / outputs.
+    definition_map.set("inputs", conditionally_create_inputs_literal(&meta.inputs));
+    definition_map.set("outputs", conditionally_create_outputs_literal(&meta.outputs));
+
+    if let Some(export_as) = &meta.export_as {
+        let arr = export_as
+            .iter()
+            .map(|e| o::literal(LiteralValue::String(e.clone()), None))
+            .collect();
+        definition_map.set("exportAs", Some(o::literal_arr(arr, None)));
+    }
+
+    // standalone only emitted when false (true is the runtime default).
+    if !meta.is_standalone {
+        definition_map.set("standalone", Some(o::literal(LiteralValue::Bool(false), None)));
+    }
+    // signals only when true.
+    if meta.is_signal {
+        definition_map.set("signals", Some(o::literal(LiteralValue::Bool(true), None)));
+    }
+
+    definition_map
+}
+
+/// `addFeatures(definitionMap, meta)` — order is load-bearing (HostDirectives must precede
+/// InheritDefinition for runtime execution order).
+fn add_features(
+    definition_map: &mut DefinitionMap,
+    meta: &R3DirectiveMetadata,
+    view_providers: Option<&Expr>,
+    external_styles: Option<&[String]>,
+) {
+    let mut features: Vec<Expr> = Vec::new();
+
+    // 1. ProvidersFeature.
+    if meta.providers.is_some() || view_providers.is_some() {
+        let mut args = vec![meta
+            .providers
+            .clone()
+            .unwrap_or_else(|| o::literal_arr(Vec::new(), None))];
+        if let Some(vp) = view_providers {
+            args.push(vp.clone());
+        }
+        features.push(import_r3(R3::ProvidersFeature).call_fn(args, false));
+    }
+
+    // 2. HostDirectivesFeature (before inheritance).
+    if let Some(hds) = &meta.host_directives {
+        if !hds.is_empty() {
+            features.push(
+                import_r3(R3::HostDirectivesFeature)
+                    .call_fn(vec![create_host_directives_feature_arg(hds)], false),
+            );
+        }
+    }
+
+    // 3. InheritDefinitionFeature.
+    if meta.uses_inheritance {
+        features.push(import_r3(R3::InheritDefinitionFeature));
+    }
+
+    // 4. NgOnChangesFeature.
+    if meta.lifecycle.uses_on_changes {
+        features.push(import_r3(R3::NgOnChangesFeature));
+    }
+
+    // 5. ControlFeature.
+    if let Some(cc) = &meta.control_create {
+        let arg = match &cc.pass_through_input {
+            Some(s) => o::literal(LiteralValue::String(s.clone()), None),
+            None => o::literal(LiteralValue::Null, None),
+        };
+        features.push(import_r3(R3::ControlFeature).call_fn(vec![arg], false));
+    }
+
+    // 6. ExternalStylesFeature (component-only).
+    if let Some(styles) = external_styles {
+        if !styles.is_empty() {
+            let nodes = styles
+                .iter()
+                .map(|s| o::literal(LiteralValue::String(s.clone()), None))
+                .collect();
+            features.push(
+                import_r3(R3::ExternalStylesFeature).call_fn(vec![o::literal_arr(nodes, None)], false),
+            );
+        }
+    }
+
+    if !features.is_empty() {
+        definition_map.set("features", Some(o::literal_arr(features, None)));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// compileDirectiveFromMetadata.
+// ---------------------------------------------------------------------------
+
+/// `compileDirectiveFromMetadata(meta, pool, bindingParser)`.
+pub fn compile_directive_from_metadata<H: HostBindingsBuilder>(
+    meta: &R3DirectiveMetadata,
+    host_builder: &mut H,
+) -> R3CompiledExpression {
+    let mut definition_map = base_directive_fields(meta, host_builder);
+    add_features(&mut definition_map, meta, None, None);
+    let expression = import_r3(R3::DefineDirective)
+        // `.callFn([map], undefined, /*pure*/ true)`.
+        .call_fn(vec![definition_map.to_literal_map()], true);
+    let ty = create_directive_type(meta);
+    R3CompiledExpression {
+        expression,
+        ty,
+        statements: Vec::new(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// compileComponentFromMetadata.
+// ---------------------------------------------------------------------------
+
+/// `compileComponentFromMetadata(meta, pool, bindingParser)` — the core entry. See spec §4.1.
+///
+/// The template pipeline is abstracted behind [`TemplateBuilder`] and the host-binding pipeline
+/// behind [`HostBindingsBuilder`]. `pool_statements` stands in for `ConstantPool.statements`
+/// (the defer-deps const + style consts are pushed onto it).
+pub fn compile_component_from_metadata<D, T, H>(
+    meta: &mut R3ComponentMetadata<D>,
+    template_builder: &mut T,
+    host_builder: &mut H,
+    pool_statements: &mut Vec<Stmt>,
+) -> R3CompiledExpression
+where
+    D: R3TemplateDependency,
+    T: TemplateBuilder,
+    H: HostBindingsBuilder,
+{
+    let mut definition_map = base_directive_fields(&meta.base, host_builder);
+    add_features(
+        &mut definition_map,
+        &meta.base,
+        meta.view_providers.as_ref(),
+        meta.external_styles.as_deref(),
+    );
+
+    let template_type_name = meta.base.name.clone();
+
+    // Defer deps fn (PerComponent only).
+    let mut all_deferrable_deps_fn: Option<Expr> = None;
+    if let R3ComponentDeferMetadata::PerComponent { dependencies_fn } = &meta.defer {
+        if let Some(deps_fn) = dependencies_fn {
+            let fn_name = format!("{template_type_name}_DeferFn");
+            pool_statements.push(Stmt::with_modifiers(
+                StmtKind::DeclareVar {
+                    name: fn_name.clone(),
+                    value: Some(deps_fn.clone()),
+                    ty: None,
+                },
+                StmtModifier::FINAL,
+            ));
+            all_deferrable_deps_fn = Some(o::variable(fn_name, None));
+        }
+    }
+
+    // Compilation mode is computed (DomOnly vs Full) and would be threaded into ingest.
+    // NOTE(port): TemplateCompilationMode lives in the pipeline; recorded here as the boolean
+    // `dom_only` but not yet consumed by the stub builder.
+    let _dom_only = meta.base.is_standalone && !meta.has_directive_dependencies;
+
+    // Ingest + transform + emit (delegated to the pipeline abstraction).
+    let tpl = template_builder.build(meta, all_deferrable_deps_fn.as_ref());
+
+    if let Some(content_selectors) = &tpl.content_selectors {
+        definition_map.set("ngContentSelectors", Some(content_selectors.clone()));
+    }
+
+    definition_map.set("decls", Some(o::literal(LiteralValue::Number(tpl.decls as f64), None)));
+    definition_map.set("vars", Some(o::literal(LiteralValue::Number(tpl.vars as f64), None)));
+
+    if !tpl.consts.is_empty() {
+        if !tpl.consts_initializers.is_empty() {
+            // `() => { …initializers…; return [ …consts… ]; }`.
+            let mut body = tpl.consts_initializers.clone();
+            body.push(Stmt::bare(StmtKind::Return(o::literal_arr(tpl.consts.clone(), None))));
+            definition_map.set("consts", Some(o::arrow_fn(Vec::new(), ArrowBody::Block(body), None)));
+        } else {
+            definition_map.set("consts", Some(o::literal_arr(tpl.consts.clone(), None)));
+        }
+    }
+
+    definition_map.set("template", Some(tpl.template_fn));
+
+    // Dependencies.
+    if meta.declaration_list_emit_mode != DeclarationListEmitMode::RuntimeResolved
+        && !meta.declarations.is_empty()
+    {
+        let list = o::literal_arr(meta.declarations.iter().map(|d| d.ty()).collect(), None);
+        definition_map.set(
+            "dependencies",
+            Some(compile_declaration_list(list, meta.declaration_list_emit_mode)),
+        );
+    } else if meta.declaration_list_emit_mode == DeclarationListEmitMode::RuntimeResolved {
+        let mut args = vec![meta.base.ty.value.clone()];
+        if let Some(raw) = &meta.raw_imports {
+            args.push(raw.clone());
+        }
+        definition_map.set(
+            "dependencies",
+            Some(import_r3(R3::GetComponentDepsFactory).call_fn(args, false)),
+        );
+    }
+
+    // Styles / encapsulation (in-place mutation of `meta.encapsulation`). Note: our enum has no
+    // `null` state; we treat the entry default as Emulated (the JS `null → Emulated` normalization).
+    let mut has_styles = meta.external_styles.as_ref().is_some_and(|s| !s.is_empty());
+
+    if !meta.styles.is_empty() {
+        let style_values: Vec<String> = if meta.encapsulation == ViewEncapsulation::Emulated {
+            compile_styles(&meta.styles, &content_attr(), &host_attr())
+        } else {
+            meta.styles.clone()
+        };
+        let mut style_nodes: Vec<Expr> = Vec::new();
+        for style in &style_values {
+            if !style.trim().is_empty() {
+                // NOTE(port): real impl interns via `pool.getConstLiteral`; here a bare literal.
+                style_nodes.push(o::literal(LiteralValue::String(style.clone()), None));
+            }
+        }
+        if !style_nodes.is_empty() {
+            has_styles = true;
+            definition_map.set("styles", Some(o::literal_arr(style_nodes, None)));
+        }
+    }
+
+    if !has_styles && meta.encapsulation == ViewEncapsulation::Emulated {
+        // No styles → don't generate css selectors on elements.
+        meta.encapsulation = ViewEncapsulation::None;
+    }
+
+    // Only set encapsulation if it's not the default (Emulated).
+    if meta.encapsulation != ViewEncapsulation::Emulated {
+        definition_map.set(
+            "encapsulation",
+            Some(o::literal(LiteralValue::Number(meta.encapsulation.as_number()), None)),
+        );
+    }
+
+    // Animations → `data: {animation: <expr>}`.
+    if let Some(animations) = &meta.animations {
+        definition_map.set(
+            "data",
+            Some(o::literal_map(
+                vec![("animation".to_string(), false, animations.clone())],
+                None,
+            )),
+        );
+    }
+
+    // Change detection. Angular v21 (`compiler.ts` setting-change-detection block):
+    // a numeric strategy is emitted only when it differs from `ChangeDetectionStrategy.Default`
+    // (the implicit runtime default). OnPush (= 0) is therefore emitted as `changeDetection: 0`,
+    // while Default (= 1) is omitted.
+    if let Some(cd) = &meta.change_detection {
+        match cd {
+            ChangeDetection::Strategy(strategy) => {
+                if *strategy != ChangeDetectionStrategy::Default {
+                    definition_map.set(
+                        "changeDetection",
+                        Some(o::literal(LiteralValue::Number(*strategy as i32 as f64), None)),
+                    );
+                }
+            }
+            // Unresolved expression (local compilation): emit as-is.
+            ChangeDetection::Expr(expr) => {
+                definition_map.set("changeDetection", Some(expr.clone()));
+            }
+        }
+    }
+
+    let expression = import_r3(R3::DefineComponent)
+        // `.callFn([map], undefined, /*pure*/ true)`.
+        .call_fn(vec![definition_map.to_literal_map()], true);
+    let ty = create_component_type(meta);
+
+    R3CompiledExpression {
+        expression,
+        ty,
+        statements: Vec::new(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Type creation (.d.ts).
+// ---------------------------------------------------------------------------
+
+/// `createComponentType(meta)`.
+pub fn create_component_type<D: R3TemplateDependency>(meta: &R3ComponentMetadata<D>) -> Type {
+    let mut type_params = create_base_directive_type_params(&meta.base);
+    type_params.push(string_array_as_type(&meta.template.ng_content_selectors));
+    type_params.push(o::expression_type(
+        o::literal(LiteralValue::Bool(meta.base.is_standalone), None),
+        None,
+        None,
+    ));
+    type_params.push(create_host_directives_type(&meta.base));
+    if meta.base.is_signal {
+        type_params.push(o::expression_type(
+            o::literal(LiteralValue::Bool(true), None),
+            None,
+            None,
+        ));
+    }
+    o::expression_type(
+        import_r3_with_params(R3::ComponentDeclaration, type_params),
+        None,
+        None,
+    )
+}
+
+/// `createDirectiveType(meta)`.
+pub fn create_directive_type(meta: &R3DirectiveMetadata) -> Type {
+    let mut type_params = create_base_directive_type_params(meta);
+    // Directives have no NgContentSelectors slot → `never` (NONE_TYPE).
+    type_params.push(o::none_type());
+    type_params.push(o::expression_type(
+        o::literal(LiteralValue::Bool(meta.is_standalone), None),
+        None,
+        None,
+    ));
+    type_params.push(create_host_directives_type(meta));
+    if meta.is_signal {
+        type_params.push(o::expression_type(
+            o::literal(LiteralValue::Bool(true), None),
+            None,
+            None,
+        ));
+    }
+    o::expression_type(
+        import_r3_with_params(R3::DirectiveDeclaration, type_params),
+        None,
+        None,
+    )
+}
+
+fn string_as_type(s: &str) -> Type {
+    o::expression_type(o::literal(LiteralValue::String(s.to_string()), None), None, None)
+}
+
+fn string_array_as_type(arr: &[String]) -> Type {
+    if arr.is_empty() {
+        o::none_type()
+    } else {
+        let entries = arr
+            .iter()
+            .map(|v| o::literal(LiteralValue::String(v.clone()), None))
+            .collect();
+        o::expression_type(o::literal_arr(entries, None), None, None)
+    }
+}
+
+fn create_base_directive_type_params(meta: &R3DirectiveMetadata) -> Vec<Type> {
+    // Strip newlines from the selector for the `.d.ts` string literal (must be one line).
+    let selector_for_type = meta.selector.as_ref().map(|s| s.replace('\n', ""));
+
+    vec![
+        type_with_parameters(meta.ty.ty.clone(), meta.type_argument_count),
+        match &selector_for_type {
+            Some(s) => string_as_type(s),
+            None => o::none_type(),
+        },
+        match &meta.export_as {
+            Some(arr) => string_array_as_type(arr),
+            None => o::none_type(),
+        },
+        o::expression_type(get_inputs_type_expression(meta), None, None),
+        o::expression_type(string_map_as_literal_expression(Some(&meta.outputs)), None, None),
+        string_array_as_type(
+            &meta.queries.iter().map(|q| q.property_name.clone()).collect::<Vec<_>>(),
+        ),
+    ]
+}
+
+fn get_inputs_type_expression(meta: &R3DirectiveMetadata) -> Expr {
+    let entries = meta
+        .inputs
+        .iter()
+        .map(|(key, value)| {
+            let mut values = vec![
+                (
+                    "alias".to_string(),
+                    true,
+                    o::literal(LiteralValue::String(value.binding_property_name.clone()), None),
+                ),
+                (
+                    "required".to_string(),
+                    true,
+                    o::literal(LiteralValue::Bool(value.required), None),
+                ),
+            ];
+            if value.is_signal {
+                values.push((
+                    "isSignal".to_string(),
+                    true,
+                    o::literal(LiteralValue::Bool(true), None),
+                ));
+            }
+            (key.clone(), true, o::literal_map(values, None))
+        })
+        .collect::<Vec<_>>();
+    o::literal_map(entries, None)
+}
+
+fn create_host_directives_type(meta: &R3DirectiveMetadata) -> Type {
+    let host_directives = match &meta.host_directives {
+        Some(hds) if !hds.is_empty() => hds,
+        _ => return o::none_type(),
+    };
+
+    let entries = host_directives
+        .iter()
+        .map(|hd| {
+            o::literal_map(
+                vec![
+                    ("directive".to_string(), false, o::typeof_expr(hd.directive.ty.clone())),
+                    (
+                        "inputs".to_string(),
+                        false,
+                        string_map_as_literal_expression(hd.inputs.as_ref()),
+                    ),
+                    (
+                        "outputs".to_string(),
+                        false,
+                        string_map_as_literal_expression(hd.outputs.as_ref()),
+                    ),
+                ],
+                None,
+            )
+        })
+        .collect();
+    o::expression_type(o::literal_arr(entries, None), None, None)
+}
+
+// ---------------------------------------------------------------------------
+// Host-directives feature arg + mapping array.
+// ---------------------------------------------------------------------------
+
+/// `createHostDirectivesFeatureArg(hostDirectives)`.
+fn create_host_directives_feature_arg(host_directives: &[R3HostDirectiveMetadata]) -> Expr {
+    let mut expressions: Vec<Expr> = Vec::new();
+    let mut has_forward_ref = false;
+
+    for current in host_directives {
+        // Shorthand when there are no inputs/outputs.
+        if current.inputs.is_none() && current.outputs.is_none() {
+            expressions.push(current.directive.ty.clone());
+        } else {
+            let mut keys = vec![("directive".to_string(), false, current.directive.ty.clone())];
+            if let Some(inputs) = &current.inputs {
+                if let Some(inputs_literal) = create_host_directives_mapping_array(inputs) {
+                    keys.push(("inputs".to_string(), false, inputs_literal));
+                }
+            }
+            if let Some(outputs) = &current.outputs {
+                if let Some(outputs_literal) = create_host_directives_mapping_array(outputs) {
+                    keys.push(("outputs".to_string(), false, outputs_literal));
+                }
+            }
+            expressions.push(o::literal_map(keys, None));
+        }
+
+        if current.is_forward_reference {
+            has_forward_ref = true;
+        }
+    }
+
+    // With a forward ref → `function() { return [HostDir]; }`; else a plain array.
+    if has_forward_ref {
+        o::fn_(
+            Vec::new(),
+            vec![Stmt::bare(StmtKind::Return(o::literal_arr(expressions, None)))],
+            None,
+            None,
+        )
+    } else {
+        o::literal_arr(expressions, None)
+    }
+}
+
+/// `createHostDirectivesMappingArray(mapping)` — `{a:'b'}` → `['a','b']`, or `None` when empty.
+pub fn create_host_directives_mapping_array(mapping: &OrderedMap<String, String>) -> Option<Expr> {
+    let mut elements: Vec<Expr> = Vec::new();
+    for (public_name, alias) in mapping.iter() {
+        elements.push(o::literal(LiteralValue::String(public_name.clone()), None));
+        elements.push(o::literal(LiteralValue::String(alias.clone()), None));
+    }
+    if elements.is_empty() {
+        None
+    } else {
+        Some(o::literal_arr(elements, None))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// compileDeclarationList.
+// ---------------------------------------------------------------------------
+
+/// `compileDeclarationList(list, mode)`.
+fn compile_declaration_list(list: Expr, mode: DeclarationListEmitMode) -> Expr {
+    match mode {
+        DeclarationListEmitMode::Direct => list,
+        // `() => [MyDir]`.
+        DeclarationListEmitMode::Closure => {
+            o::arrow_fn(Vec::new(), ArrowBody::Expr(Box::new(list)), None)
+        }
+        // `() => [MyDir].map(ng.resolveForwardRef)`.
+        DeclarationListEmitMode::ClosureResolved => {
+            let resolved = list
+                .prop("map")
+                .call_fn(vec![import_r3(R3::ResolveForwardRef)], false);
+            o::arrow_fn(Vec::new(), ArrowBody::Expr(Box::new(resolved)), None)
+        }
+        DeclarationListEmitMode::RuntimeResolved => {
+            panic!("Unsupported with an array of pre-resolved dependencies")
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Host-binding parsing helpers (parseHostBindings / verifyHostBindings — leaf helpers).
+// ---------------------------------------------------------------------------
+
+/// `ParsedHostBindings` (`compiler.ts`). Structurally identical to [`R3HostMetadata`].
+pub type ParsedHostBindings = R3HostMetadata;
+
+/// `parseHostBindings(host)` — classify each key into listener/property/special-attr/attribute.
+/// Returns `Err` if a listener/property/class/style value is not a string.
+pub fn parse_host_bindings(host: OrderedMap<String, HostValue>) -> Result<ParsedHostBindings, String> {
+    let mut out = ParsedHostBindings::default();
+
+    for (key, value) in host {
+        if key.starts_with('(') && key.ends_with(')') {
+            let s = expect_string(&value, "Event binding must be string")?;
+            out.listeners.insert(key[1..key.len() - 1].to_string(), s);
+        } else if key.starts_with('[') && key.ends_with(']') {
+            let s = expect_string(&value, "Property binding must be string")?;
+            // Synthetic (`@`-prefixed) properties stay in the same map.
+            out.properties.insert(key[1..key.len() - 1].to_string(), s);
+        } else {
+            match key.as_str() {
+                "class" => {
+                    out.special_attributes.class_attr =
+                        Some(expect_string(&value, "Class binding must be string")?);
+                }
+                "style" => {
+                    out.special_attributes.style_attr =
+                        Some(expect_string(&value, "Style binding must be string")?);
+                }
+                _ => match value {
+                    HostValue::Str(s) => {
+                        out.attributes.insert(key, o::literal(LiteralValue::String(s), None));
+                    }
+                    HostValue::Expr(e) => {
+                        out.attributes.insert(key, e);
+                    }
+                },
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+/// `string | o.Expression` host-binding value.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HostValue {
+    Str(String),
+    Expr(Expr),
+}
+
+fn expect_string(value: &HostValue, msg: &str) -> Result<String, String> {
+    match value {
+        HostValue::Str(s) => Ok(s.clone()),
+        HostValue::Expr(_) => Err(msg.to_string()),
+    }
+}
+
+/// `validateNoEventBindings` — reject `on*` bound props/attrs (security). Returns error messages.
+pub fn validate_no_event_bindings(bindings: &ParsedHostBindings) -> Vec<String> {
+    let mut errors = Vec::new();
+    for prop in bindings.properties.keys() {
+        let is_attr = prop.starts_with("attr.");
+        let bound_name = if is_attr { &prop[5..] } else { prop.as_str() };
+        if bound_name.to_lowercase().starts_with("on") {
+            let error_type = if is_attr { "attribute" } else { "property" };
+            let suggestion = format!("({})=...", &bound_name[2..]);
+            let mut msg = format!(
+                "Binding to event {error_type} '{bound_name}' is disallowed for security reasons, please use {suggestion}"
+            );
+            if !is_attr {
+                msg.push_str(&format!(
+                    "\nIf '{prop}' is a directive input, make sure the directive is imported by the current module."
+                ));
+            }
+            errors.push(msg);
+        }
+    }
+    errors
+}
+
+// ---------------------------------------------------------------------------
+// compileStyles / encapsulateStyle.
+// ---------------------------------------------------------------------------
+
+/// `compileStyles(styles, selector, hostSelector)`.
+///
+/// NOTE(port): `ShadowCss` (`../../shadow_css`) is not yet ported; this passes styles through
+/// unshimmed. Replace with the real ShadowCss shim when available.
+fn compile_styles(styles: &[String], _selector: &str, _host_selector: &str) -> Vec<String> {
+    styles.to_vec()
+}
+
+/// `encapsulateStyle(style, componentIdentifier?)`.
+///
+/// NOTE(port): `ShadowCss` not yet ported; passes through unshimmed.
+pub fn encapsulate_style(style: &str, _component_identifier: Option<&str>) -> String {
+    style.to_string()
+}
+
+// ---------------------------------------------------------------------------
+// compileDeferResolverFunction.
+// ---------------------------------------------------------------------------
+
+/// `R3DeferPerBlockDependency` (`api.ts`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct R3DeferPerBlockDependency {
+    pub type_reference: Expr,
+    pub symbol_name: String,
+    pub is_deferrable: bool,
+    pub import_path: Option<String>,
+    pub is_default_import: bool,
+}
+
+/// `R3DeferPerComponentDependency` (`api.ts`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct R3DeferPerComponentDependency {
+    pub symbol_name: String,
+    pub import_path: String,
+    pub is_default_import: bool,
+}
+
+/// `R3DeferResolverFunctionMetadata` (`api.ts` discriminated union).
+#[derive(Debug, Clone, PartialEq)]
+pub enum R3DeferResolverFunctionMetadata {
+    PerBlock { dependencies: Vec<R3DeferPerBlockDependency> },
+    PerComponent { dependencies: Vec<R3DeferPerComponentDependency> },
+}
+
+/// `compileDeferResolverFunction(meta)` → `() => [ <dep imports…> ]`.
+pub fn compile_defer_resolver_function(meta: &R3DeferResolverFunctionMetadata) -> Expr {
+    let mut dep_expressions: Vec<Expr> = Vec::new();
+
+    match meta {
+        R3DeferResolverFunctionMetadata::PerBlock { dependencies } => {
+            for dep in dependencies {
+                if dep.is_deferrable {
+                    dep_expressions.push(dynamic_import_then(
+                        dep.import_path.clone().unwrap_or_default(),
+                        if dep.is_default_import { "default" } else { &dep.symbol_name },
+                    ));
+                } else {
+                    // Non-deferrable: bare type reference (preserves the original reference).
+                    dep_expressions.push(dep.type_reference.clone());
+                }
+            }
+        }
+        R3DeferResolverFunctionMetadata::PerComponent { dependencies } => {
+            for dep in dependencies {
+                dep_expressions.push(dynamic_import_then(
+                    dep.import_path.clone(),
+                    if dep.is_default_import { "default" } else { &dep.symbol_name },
+                ));
+            }
+        }
+    }
+
+    o::arrow_fn(
+        Vec::new(),
+        ArrowBody::Expr(Box::new(o::literal_arr(dep_expressions, None))),
+        None,
+    )
+}
+
+/// `import('path').then(m => m.<prop>)` with a leading `@ts-ignore` on the call.
+fn dynamic_import_then(import_path: String, prop: &str) -> Expr {
+    // `m => m.<prop>`.
+    let inner_fn = o::arrow_fn(
+        vec![FnParam::new("m", Some(o::dynamic_type()))],
+        ArrowBody::Expr(Box::new(o::variable("m", None).prop(prop))),
+        None,
+    );
+    let dynamic_import = Expr::bare(ExprKind::DynamicImport {
+        url: o::ImportUrl::Str(import_path),
+        url_comment: None,
+    });
+    let mut call = dynamic_import.prop("then").call_fn(vec![inner_fn], false);
+    call.meta.leading_comments.push(ts_ignore_comment());
+    call
+}
+
+// ---------------------------------------------------------------------------
+// Tests.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::output::emitter::emit_expression;
+
+    fn ref_(name: &str) -> R3Reference {
+        R3Reference {
+            value: o::variable(name, None),
+            ty: o::variable(name, None),
+        }
+    }
+
+    fn span() -> ParseSourceSpan {
+        ParseSourceSpan::new(0, 0)
+    }
+
+    fn directive_meta(name: &str, selector: &str) -> R3DirectiveMetadata {
+        R3DirectiveMetadata {
+            name: name.to_string(),
+            ty: ref_(name),
+            type_argument_count: 0,
+            type_source_span: span(),
+            deps: Deps::None,
+            selector: Some(selector.to_string()),
+            queries: Vec::new(),
+            view_queries: Vec::new(),
+            host: R3HostMetadata::default(),
+            lifecycle: Lifecycle::default(),
+            inputs: OrderedMap::new(),
+            outputs: OrderedMap::new(),
+            uses_inheritance: false,
+            control_create: None,
+            export_as: None,
+            providers: None,
+            is_standalone: true,
+            is_signal: false,
+            host_directives: None,
+            legacy_optional_chaining: false,
+        }
+    }
+
+    fn component_meta(name: &str, selector: &str) -> R3ComponentMetadata<R3TemplateDependencyMetadata> {
+        R3ComponentMetadata {
+            base: directive_meta(name, selector),
+            template: ComponentTemplate::default(),
+            declarations: Vec::new(),
+            defer: R3ComponentDeferMetadata::PerComponent { dependencies_fn: None },
+            declaration_list_emit_mode: DeclarationListEmitMode::Direct,
+            styles: Vec::new(),
+            external_styles: None,
+            encapsulation: ViewEncapsulation::Emulated,
+            animations: None,
+            view_providers: None,
+            relative_context_file_path: String::new(),
+            i18n_use_external_ids: false,
+            change_detection: None,
+            relative_template_path: None,
+            has_directive_dependencies: false,
+            raw_imports: None,
+            foreign_imports: None,
+        }
+    }
+
+    #[test]
+    fn trivial_component_emits_define_component_and_template_fn() {
+        // `{ selector: 'app-x', template: '<div>{{v}}</div>' }` — the template body itself comes
+        // from the (not-yet-ported) pipeline, so we assert the orchestration + shell.
+        let mut meta = component_meta("AppX", "app-x");
+        let mut tb = StubTemplateBuilder;
+        let mut hb = StubHostBindingsBuilder;
+        let mut pool = Vec::new();
+        let compiled = compile_component_from_metadata(&mut meta, &mut tb, &mut hb, &mut pool);
+
+        let js = emit_expression(&compiled.expression);
+        assert!(js.contains("ɵɵdefineComponent"), "missing defineComponent: {js}");
+        assert!(js.contains("AppX_Template"), "missing template fn: {js}");
+        // selectors are emitted for a non-empty selector.
+        assert!(js.contains("app-x"), "missing selector: {js}");
+        // standalone defaults to true → omitted; decls/vars present.
+        assert!(js.contains("decls"), "missing decls: {js}");
+        assert!(js.contains("vars"), "missing vars: {js}");
+    }
+
+    fn view_child_query(property: &str) -> R3QueryMetadata {
+        R3QueryMetadata {
+            property_name: property.to_string(),
+            first: true,
+            predicate: QueryPredicate::Expr(o::variable("SomeChild", None)),
+            descendants: true,
+            emit_distinct_changes_only: true,
+            read: None,
+            static_: false,
+            is_signal: false,
+        }
+    }
+
+    #[test]
+    fn component_with_view_child_query_emits_view_query_fn() {
+        // A component with one (legacy) viewChild query must wire a real `viewQuery` function
+        // into the definition referencing ɵɵviewQuery + the update-phase ɵɵqueryRefresh.
+        let mut meta = component_meta("AppX", "app-x");
+        meta.base.view_queries = vec![view_child_query("child")];
+        let mut tb = StubTemplateBuilder;
+        let mut hb = StubHostBindingsBuilder;
+        let mut pool = Vec::new();
+        let compiled = compile_component_from_metadata(&mut meta, &mut tb, &mut hb, &mut pool);
+
+        let js = emit_expression(&compiled.expression);
+        assert!(js.contains("viewQuery"), "missing viewQuery field: {js}");
+        // Create phase references ɵɵviewQuery; update phase references ɵɵqueryRefresh.
+        assert!(js.contains("ɵɵviewQuery"), "missing ɵɵviewQuery instruction: {js}");
+        assert!(js.contains("ɵɵqueryRefresh"), "missing ɵɵqueryRefresh instruction: {js}");
+        assert!(js.contains("ɵɵloadQuery"), "missing ɵɵloadQuery instruction: {js}");
+        // The query fn is named after the component.
+        assert!(js.contains("AppX_Query"), "missing AppX_Query fn name: {js}");
+        // No content queries were declared → contentQueries must be absent.
+        assert!(!js.contains("contentQueries"), "contentQueries should be absent: {js}");
+    }
+
+    #[test]
+    fn component_with_content_query_emits_content_queries_fn() {
+        let mut meta = component_meta("AppX", "app-x");
+        meta.base.queries = vec![view_child_query("items")];
+        let mut tb = StubTemplateBuilder;
+        let mut hb = StubHostBindingsBuilder;
+        let mut pool = Vec::new();
+        let compiled = compile_component_from_metadata(&mut meta, &mut tb, &mut hb, &mut pool);
+
+        let js = emit_expression(&compiled.expression);
+        assert!(js.contains("contentQueries"), "missing contentQueries field: {js}");
+        assert!(js.contains("ɵɵcontentQuery"), "missing ɵɵcontentQuery instruction: {js}");
+        assert!(js.contains("AppX_ContentQueries"), "missing AppX_ContentQueries fn name: {js}");
+    }
+
+    #[test]
+    fn directive_emits_define_directive() {
+        let meta = directive_meta("MyDir", "[myDir]");
+        let mut hb = StubHostBindingsBuilder;
+        let compiled = compile_directive_from_metadata(&meta, &mut hb);
+        let js = emit_expression(&compiled.expression);
+        assert!(js.contains("ɵɵdefineDirective"), "missing defineDirective: {js}");
+        assert!(js.contains("myDir"), "missing selector token: {js}");
+    }
+
+    #[test]
+    fn non_standalone_emits_standalone_false() {
+        let mut meta = directive_meta("D", "d");
+        meta.is_standalone = false;
+        let mut hb = StubHostBindingsBuilder;
+        let compiled = compile_directive_from_metadata(&meta, &mut hb);
+        let js = emit_expression(&compiled.expression);
+        assert!(js.contains("standalone"), "standalone:false should be emitted: {js}");
+    }
+
+    #[test]
+    fn onpush_emits_change_detection_zero_default_is_omitted() {
+        // Angular v21 emits the numeric strategy only when it differs from
+        // ChangeDetectionStrategy.Default. OnPush (= 0) → `changeDetection: 0`.
+        let mut meta = component_meta("C", "c");
+        meta.change_detection = Some(ChangeDetection::Strategy(ChangeDetectionStrategy::OnPush));
+        let mut tb = StubTemplateBuilder;
+        let mut hb = StubHostBindingsBuilder;
+        let mut pool = Vec::new();
+        let compiled = compile_component_from_metadata(&mut meta, &mut tb, &mut hb, &mut pool);
+        let js = emit_expression(&compiled.expression);
+        assert!(js.contains("changeDetection"), "OnPush should emit changeDetection: {js}");
+        assert!(
+            js.contains("changeDetection: 0") || js.contains("changeDetection:0"),
+            "OnPush should emit changeDetection: 0: {js}"
+        );
+
+        // Default (1) is the implicit runtime default → omitted.
+        let mut meta = component_meta("C", "c");
+        meta.change_detection = Some(ChangeDetection::Strategy(ChangeDetectionStrategy::Default));
+        let compiled = compile_component_from_metadata(&mut meta, &mut tb, &mut hb, &mut pool);
+        assert!(
+            !emit_expression(&compiled.expression).contains("changeDetection"),
+            "Default should omit changeDetection"
+        );
+    }
+
+    #[test]
+    fn no_styles_emulated_downgrades_to_none_and_omits_encapsulation() {
+        // Emulated + no styles → downgraded to None, and None != Emulated so encapsulation IS set.
+        let mut meta = component_meta("C", "c");
+        let mut tb = StubTemplateBuilder;
+        let mut hb = StubHostBindingsBuilder;
+        let mut pool = Vec::new();
+        let compiled = compile_component_from_metadata(&mut meta, &mut tb, &mut hb, &mut pool);
+        assert_eq!(meta.encapsulation, ViewEncapsulation::None);
+        assert!(emit_expression(&compiled.expression).contains("encapsulation"));
+    }
+
+    #[test]
+    fn styles_keep_emulated_and_omit_encapsulation() {
+        let mut meta = component_meta("C", "c");
+        meta.styles = vec![".a{color:red}".to_string()];
+        let mut tb = StubTemplateBuilder;
+        let mut hb = StubHostBindingsBuilder;
+        let mut pool = Vec::new();
+        let compiled = compile_component_from_metadata(&mut meta, &mut tb, &mut hb, &mut pool);
+        // Stays Emulated (has styles) → encapsulation omitted, styles present.
+        assert_eq!(meta.encapsulation, ViewEncapsulation::Emulated);
+        let js = emit_expression(&compiled.expression);
+        assert!(js.contains("styles"), "styles missing: {js}");
+        assert!(!js.contains("encapsulation"), "encapsulation should be omitted: {js}");
+    }
+
+    #[test]
+    fn defer_per_component_pushes_defer_fn_const() {
+        let mut meta = component_meta("C", "c");
+        meta.defer = R3ComponentDeferMetadata::PerComponent {
+            dependencies_fn: Some(o::arrow_fn(
+                Vec::new(),
+                ArrowBody::Expr(Box::new(o::literal_arr(Vec::new(), None))),
+                None,
+            )),
+        };
+        let mut tb = StubTemplateBuilder;
+        let mut hb = StubHostBindingsBuilder;
+        let mut pool = Vec::new();
+        let _ = compile_component_from_metadata(&mut meta, &mut tb, &mut hb, &mut pool);
+        assert_eq!(pool.len(), 1);
+        match &pool[0].kind {
+            StmtKind::DeclareVar { name, .. } => assert_eq!(name, "C_DeferFn"),
+            other => panic!("expected DeclareVar, got {other:?}"),
+        }
+        assert!(pool[0].meta.modifiers.has_modifier(StmtModifier::FINAL));
+    }
+
+    #[test]
+    fn features_order_host_directives_before_inheritance() {
+        let mut meta = directive_meta("D", "d");
+        meta.uses_inheritance = true;
+        meta.host_directives = Some(vec![R3HostDirectiveMetadata {
+            directive: ref_("HostDir"),
+            is_forward_reference: false,
+            inputs: None,
+            outputs: None,
+        }]);
+        let mut hb = StubHostBindingsBuilder;
+        let compiled = compile_directive_from_metadata(&meta, &mut hb);
+        let js = emit_expression(&compiled.expression);
+        let hd = js.find("HostDirectivesFeature").expect("host directives feature");
+        let inh = js.find("InheritDefinitionFeature").expect("inherit feature");
+        assert!(hd < inh, "HostDirectives must precede InheritDefinition: {js}");
+    }
+
+    #[test]
+    fn inputs_literal_tracks_alias_and_flags() {
+        let mut meta = directive_meta("D", "d");
+        meta.inputs.insert(
+            "field".to_string(),
+            R3InputMetadata {
+                class_property_name: "field".to_string(),
+                binding_property_name: "alias".to_string(),
+                required: false,
+                is_signal: true,
+                transform_function: None,
+            },
+        );
+        let mut hb = StubHostBindingsBuilder;
+        let compiled = compile_directive_from_metadata(&meta, &mut hb);
+        let js = emit_expression(&compiled.expression);
+        // Different declaring name + signal flag → array form `[flags, 'alias', 'field']`.
+        assert!(js.contains("inputs"), "inputs missing: {js}");
+        assert!(js.contains("alias"), "public name missing: {js}");
+        assert!(js.contains("field"), "declared name missing: {js}");
+    }
+
+    #[test]
+    fn declaration_list_closure_wraps_in_arrow() {
+        let mut meta = component_meta("C", "c");
+        meta.declaration_list_emit_mode = DeclarationListEmitMode::Closure;
+        meta.declarations = vec![R3TemplateDependencyMetadata {
+            kind: R3TemplateDependencyKind::Directive,
+            ty: o::variable("Dep", None),
+        }];
+        let mut tb = StubTemplateBuilder;
+        let mut hb = StubHostBindingsBuilder;
+        let mut pool = Vec::new();
+        let compiled = compile_component_from_metadata(&mut meta, &mut tb, &mut hb, &mut pool);
+        let js = emit_expression(&compiled.expression);
+        assert!(js.contains("dependencies"), "dependencies missing: {js}");
+        assert!(js.contains("Dep"), "Dep missing: {js}");
+    }
+
+    #[test]
+    fn defer_resolver_per_component_emits_dynamic_import() {
+        let meta = R3DeferResolverFunctionMetadata::PerComponent {
+            dependencies: vec![R3DeferPerComponentDependency {
+                symbol_name: "MyCmp".to_string(),
+                import_path: "./a".to_string(),
+                is_default_import: false,
+            }],
+        };
+        let expr = compile_defer_resolver_function(&meta);
+        let js = emit_expression(&expr);
+        assert!(js.contains("import("), "dynamic import missing: {js}");
+        assert!(js.contains("MyCmp"), "symbol missing: {js}");
+    }
+
+    #[test]
+    fn parse_host_bindings_classifies_keys() {
+        let mut host = OrderedMap::new();
+        host.insert("(click)".to_string(), HostValue::Str("onClick()".to_string()));
+        host.insert("[id]".to_string(), HostValue::Str("myId".to_string()));
+        host.insert("class".to_string(), HostValue::Str("foo".to_string()));
+        host.insert("role".to_string(), HostValue::Str("button".to_string()));
+        let parsed = parse_host_bindings(host).unwrap();
+        assert_eq!(parsed.listeners.get("click").map(String::as_str), Some("onClick()"));
+        assert_eq!(parsed.properties.get("id").map(String::as_str), Some("myId"));
+        assert_eq!(parsed.special_attributes.class_attr.as_deref(), Some("foo"));
+        assert!(parsed.attributes.contains_key("role"));
+    }
+
+    #[test]
+    fn validate_no_event_bindings_rejects_on_prefixed() {
+        let mut parsed = ParsedHostBindings::default();
+        parsed.properties.insert("onclick".to_string(), "x".to_string());
+        let errors = validate_no_event_bindings(&parsed);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("disallowed for security reasons"));
+    }
+}

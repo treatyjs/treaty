@@ -98,7 +98,7 @@ impl InjectableOptions {
     pub fn parse_decorator(decorator: &Decorator) -> Option<InjectableOptions> {
         if let Expression::CallExpression(call_expr) = &decorator.expression {
             call_expr.arguments.iter().find_map(|arg| {
-                if let Argument::Expression(Expression::ObjectExpression(obj_expr)) = arg {
+                if let Argument::ObjectExpression(obj_expr) = arg {
                     InjectableOptions::from_properties(&obj_expr.properties)
                 } else {
                     None
@@ -114,13 +114,13 @@ impl InjectableOptions {
             .iter()
             .filter_map(|property_kind| {
                 if let ObjectPropertyKind::ObjectProperty(boxed_property) = property_kind {
-                    match boxed_property.key {
-                        PropertyKey::Identifier(ref identifier)
+                    match &boxed_property.key {
+                        PropertyKey::StaticIdentifier(identifier)
                         if identifier.name == Self::PROVIDED_IN_KEY =>
                         {
                             match &boxed_property.value {
                                 Expression::StringLiteral(literal) => {
-                                    ProviderScope::from_str(&literal.value)
+                                    ProviderScope::from_str(literal.value.as_str())
                                         .map(|provided_in| Self { provided_in, detail: InjectableProvider::None })
                                 }
                                 _ => None,

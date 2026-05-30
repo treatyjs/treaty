@@ -1,0 +1,88 @@
+   Compiling render3 v0.1.0 (D:\dev\treaty\libs\render3)
+warning: method `is_interpolated_text` is never used
+   --> libs\render3\src\ml_parser.rs:627:8
+    |
+626 | impl Token {
+    | ---------- method in this implementation
+627 |     fn is_interpolated_text(&self) -> bool {
+    |        ^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `BSPACE` is never used
+   --> libs\render3\src\ml_parser.rs:237:15
+    |
+237 |     pub const BSPACE: u32 = 8;
+    |               ^^^^^^
+
+warning: constant `VTAB` is never used
+   --> libs\render3\src\ml_parser.rs:240:15
+    |
+240 |     pub const VTAB: u32 = 11;
+    |               ^^^^
+
+warning: constant `FF` is never used
+   --> libs\render3\src\ml_parser.rs:241:15
+    |
+241 |     pub const FF: u32 = 12;
+    |               ^^
+
+warning: constant `D7` is never used
+   --> libs\render3\src\ml_parser.rs:263:15
+    |
+263 |     pub const D7: u32 = 55;
+    |               ^^
+
+warning: constant `B_LO` is never used
+   --> libs\render3\src\ml_parser.rs:277:15
+    |
+277 |     pub const B_LO: u32 = 98;
+    |               ^^^^
+
+warning: constant `N_LO` is never used
+   --> libs\render3\src\ml_parser.rs:279:15
+    |
+279 |     pub const N_LO: u32 = 110;
+    |               ^^^^
+
+warning: constant `R_LO` is never used
+   --> libs\render3\src\ml_parser.rs:280:15
+    |
+280 |     pub const R_LO: u32 = 114;
+    |               ^^^^
+
+warning: constant `T_LO` is never used
+   --> libs\render3\src\ml_parser.rs:281:15
+    |
+281 |     pub const T_LO: u32 = 116;
+    |               ^^^^
+
+warning: constant `U_LO` is never used
+   --> libs\render3\src\ml_parser.rs:282:15
+    |
+282 |     pub const U_LO: u32 = 117;
+    |               ^^^^
+
+warning: constant `V_LO` is never used
+   --> libs\render3\src\ml_parser.rs:283:15
+    |
+283 |     pub const V_LO: u32 = 118;
+    |               ^^^^
+
+warning: function `is_octal_digit` is never used
+   --> libs\render3\src\ml_parser.rs:309:12
+    |
+309 |     pub fn is_octal_digit(code: u32) -> bool {
+    |            ^^^^^^^^^^^^^^
+
+warning: `render3` (lib test) generated 12 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.21s
+     Running unittests src\lib.rs (target\debug\deps\render3-d32051992f90260f.exe)
+
+running 3 tests
+test compile::tests::compiles_static_button_end_to_end ... ok
+test compile::tests::compiles_div_with_interpolation_end_to_end ... ok
+test compile::tests::compile_component_does_not_panic_on_varied_templates ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 214 filtered out; finished in 0.02s
+

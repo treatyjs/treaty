@@ -1,22 +1,21 @@
 [package]
 name = "rust_authoring"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 
 [dependencies]
-oxc = "0.29.0"
-oxc_allocator = "0.29.0"
-oxc_parser = "0.29.0"
-oxc_span = "0.29.0"
-oxc_semantic = "0.29.0"
-oxc_transformer = "0.29.0"
-oxc_codegen = "0.29.0"
-oxc_diagnostics = "0.29.0"
-oxc_ast    = { version = "0.29.0" }
-swc_visit = "0.6.2"
-swc_html_ast = "0.38.0"
-swc_css = "0.163.0"
+oxc = "0.133.0"
+oxc_allocator = "0.133.0"
+oxc_parser = "0.133.0"
+oxc_span = "0.133.0"
+oxc_semantic = "0.133.0"
+oxc_transformer = "0.133.0"
+oxc_codegen = "0.133.0"
+oxc_diagnostics = "0.133.0"
+oxc_ast    = { version = "0.133.0" }
+oxc_ast_visit = "0.133.0"
+oxc_str = "0.133.0"
 assert-unchecked = { version = "0.1.2" }
 bitflags         = { version = "2.4.2" }
 rustc-hash       = { version = "2.0.0" }
