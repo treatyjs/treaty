@@ -64,6 +64,15 @@ configures NOTHING. A `@treaty/module-federation` helper generates the host/remo
 structure (no hand-written `ModuleFederationPlugin`). Wired via the Angular-CLI integration (I) so
 `ng build`/`ng serve` produce federated host+remotes by default. **Depends on C** (wave 2).
 
+**D2. Federation as deployment granularity (user 2026-05-31) — "module deployment without a full app":**
+MF is the unit of DEPLOYMENT, not just config. (1) **Every lazy feature route auto-becomes a remote**
+(route-graph pass; no manual `exposes`). (2) **Libs are federated modules** too. (3) **Versioned,
+independently-deployable** modules via a runtime **manifest** (module→version→URL) + an
+`@module-federation/enhanced` runtime plugin that resolves each remote's current version at load. (4)
+**Partial deploy + partial ROLLBACK** — update ONE module's manifest entry to deploy/roll back a single
+route/lib without redeploying the app. Treaty emits the federated modules + manifest; the platform
+serves + flips versions. Layer on the D foundation (after wave 2). See [[treaty-federation-deployment]].
+
 **I. Angular-CLI integration — Treaty as a wrapper around Angular itself (user 2026-05-30)** — zero
 the user has to configure:
 - **`angular.json` builders** (`@treaty/build`, `@angular-devkit/architect` `createBuilder`): a
