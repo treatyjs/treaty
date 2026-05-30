@@ -23,34 +23,13 @@ use crate::output_ast::{
     self as o, ArrowBody, BinaryOperator, Expr, ExprKind, FnParam, LeadingComment, LiteralValue,
     Stmt, StmtKind, Type,
 };
+use crate::util::{ts_ignore_comment, type_with_parameters, R3CompiledExpression, R3Reference};
 
 // ---------------------------------------------------------------------------
-// Local placeholders for not-yet-ported sibling types (`render3/util.ts`,
-// `compiler_facade_interface.ts`, `core.ts`). These mirror the real shapes so the
-// algorithm is reproduced faithfully; replace with the real ports when available.
+// Local placeholders for not-yet-ported sibling types (`compiler_facade_interface.ts`, `core.ts`).
+// These mirror the real shapes so the algorithm is reproduced faithfully; replace with the real
+// ports when available. (`R3Reference` / `R3CompiledExpression` now live in `crate::util`.)
 // ---------------------------------------------------------------------------
-
-/// Placeholder for `render3/util.ts`'s `R3Reference` (`{value, type}`). `type` is renamed `ty`
-/// because `type` is reserved in Rust. Both fields are `output_ast` expressions.
-///
-/// NOTE(port): real `R3Reference` lives in `render3/util.ts` (not yet ported).
-#[derive(Debug, Clone, PartialEq)]
-pub struct R3Reference {
-    pub value: Expr,
-    pub ty: Expr,
-}
-
-/// Placeholder for `render3/util.ts`'s `R3CompiledExpression` (`{expression, type, statements}`).
-/// `type` renamed `ty` (it is an `output_ast` [`Type`], not a TS type annotation).
-///
-/// NOTE(port): real `R3CompiledExpression` lives in `render3/util.ts` (not yet ported).
-#[derive(Debug, Clone, PartialEq)]
-pub struct R3CompiledExpression {
-    pub expression: Expr,
-    pub ty: Type,
-    /// Always empty for the factory, but part of the shared return shape.
-    pub statements: Vec<Stmt>,
-}
 
 /// Placeholder for `compiler_facade_interface.ts`'s `FactoryTarget` enum. Discriminants pinned to
 /// the v22.1 source (`Directive = 0 … Service = 5`).
@@ -208,26 +187,8 @@ impl Default for R3DependencyMetadata {
 }
 
 // ---------------------------------------------------------------------------
-// Local emit helpers (`tsIgnoreComment`, `typeWithParameters`).
+// Local emit helpers.
 // ---------------------------------------------------------------------------
-
-/// `tsIgnoreComment()` (`render3/util.ts`) — a leading, multiline `@ts-ignore` comment with a
-/// trailing newline. It must sit on a *statement* (the newline would break a `return` if placed on
-/// an expression — see spec §7).
-///
-/// NOTE(port): real `tsIgnoreComment` lives in `render3/util.ts` (not yet ported).
-fn ts_ignore_comment() -> LeadingComment {
-    o::leading_comment("@ts-ignore", true, true)
-}
-
-/// `typeWithParameters(expr, numParams)` (`render3/util.ts`). The full helper appends
-/// `numParams` `any` type parameters; the port stub passes the base type expression through
-/// unchanged (type-argument expansion is `.d.ts`-only and not yet needed for JS emission).
-///
-/// NOTE(port): real `typeWithParameters` lives in `render3/util.ts` (not yet ported).
-fn type_with_parameters(ty: Expr, _num_params: u32) -> Type {
-    o::expression_type(ty, None, None)
-}
 
 /// Convenience: `o.importExpr(id)` → an `ExternalExpr` for an [`R3`] identifier.
 fn import_r3(id: R3) -> Expr {

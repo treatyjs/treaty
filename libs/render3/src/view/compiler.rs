@@ -27,13 +27,13 @@
 
 use std::collections::HashMap;
 
-use crate::factory::{R3CompiledExpression, R3Reference};
 use crate::identifiers::R3;
 use crate::output_ast::{
-    self as o, ArrowBody, Expr, ExprKind, FnParam, LeadingComment, LiteralValue, ParseSourceSpan,
+    self as o, ArrowBody, Expr, ExprKind, FnParam, LiteralValue, ParseSourceSpan,
     Stmt, StmtKind, StmtModifier, Type,
 };
 use crate::template::r3_ast as t;
+use crate::util::{ts_ignore_comment, type_with_parameters, R3CompiledExpression, R3Reference};
 
 /// A tiny insertion-ordered map (stand-in for `indexmap::IndexMap`, which is not a workspace
 /// dependency). Iteration / serialization order is the insertion order — this is golden-observable
@@ -407,19 +407,9 @@ fn string_map_as_literal_expression(map: Option<&OrderedMap<String, String>>) ->
 }
 
 // ---------------------------------------------------------------------------
-// `render3/util.ts` helpers (placeholders). NOTE(port): real ones live in `render3/util.ts`.
+// `render3/identifiers` import helpers. (`tsIgnoreComment` / `typeWithParameters` now live in
+// the shared `crate::util` module.)
 // ---------------------------------------------------------------------------
-
-/// `tsIgnoreComment()` — a leading, multiline `@ts-ignore` comment with a trailing newline.
-fn ts_ignore_comment() -> LeadingComment {
-    o::leading_comment("@ts-ignore", true, true)
-}
-
-/// `typeWithParameters(expr, numParams)` — the stub passes the base type through unchanged
-/// (`.d.ts` type-argument expansion is not yet needed for JS emission).
-fn type_with_parameters(ty: Expr, _num_params: u32) -> Type {
-    o::expression_type(ty, None, None)
-}
 
 fn import_r3(id: R3) -> Expr {
     o::import_expr(id.reference(), None)

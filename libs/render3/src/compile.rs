@@ -16,7 +16,6 @@
 //!   -> emit_expression                    (output_ast -> JS string via oxc_codegen)
 //! ```
 
-use crate::factory::{R3CompiledExpression, R3Reference};
 use crate::output::emitter::emit_expression;
 use crate::output_ast::{self as o, Expr, ParseSourceSpan};
 use crate::template::template_transform::{
@@ -30,6 +29,7 @@ use crate::view::compiler::{
     ViewEncapsulation,
 };
 use crate::view::template::{TemplateCompilationInput, TemplateDefinitionBuilder};
+use crate::util::{R3CompiledExpression, R3Reference};
 
 /// The result of compiling one component to its Ivy definition.
 #[derive(Debug, Clone, PartialEq)]

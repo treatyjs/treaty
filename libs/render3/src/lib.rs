@@ -11,6 +11,7 @@
 
 pub mod output_ast;
 pub mod identifiers;
+pub mod util;
 pub mod expression;
 pub mod output;
 pub mod template;

@@ -24,6 +24,7 @@ use crate::expression::ast::{
     self as e, AstNode, BinaryOperation, ExprKind as EK, LiteralMapKey, LiteralValue as ELit,
     UnaryOperator as EUnary,
 };
+use crate::identifiers::R3;
 use crate::output_ast::{
     self as o, ArrowBody, BinaryOperator, Expr, ExprKind, FnParam, LiteralValue as OLit,
     UnaryOperator as OUnary, dynamic_type, literal, literal_arr, not, typeof_expr,
@@ -80,6 +81,41 @@ pub trait LocalResolver {
     fn maybe_resolve_local(&self, _name: &str) -> Option<Expr> {
         None
     }
+}
+
+// ---------------------------------------------------------------------------
+// Pipe-slot allocation abstraction.
+// ---------------------------------------------------------------------------
+
+/// The slot pair an [`EK::BindingPipe`] lowering needs: the **data slot** the
+/// `ɵɵpipe(slot, "name")` creation instruction was allocated at, and the **var
+/// offset** (binding/pure-function slot) the `ɵɵpipeBindN(slot, varOffset, …)`
+/// update call reads for change detection. Mirrors the pipeline `PipeBindingExpr`
+/// `{ targetSlot, varOffset }` (`reify.ts` → `ng.pipeBind(slot, varOffset, args)`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PipeSlots {
+    /// Data slot of the `ɵɵpipe(slot, "name")` creation instruction.
+    pub slot: usize,
+    /// Var/change-detection offset passed as the second `ɵɵpipeBindN` argument.
+    pub var_offset: usize,
+}
+
+/// `PipeSlotAllocator` — supplied by the view builder so the converter can turn a
+/// `{{ x | name:args }}` ([`EK::BindingPipe`]) into a `ɵɵpipeBindN`/`ɵɵpipeBindV`
+/// call against builder-allocated slots. The converter calls
+/// [`Self::allocate_pipe`] once per pipe usage as it lowers the expression, in
+/// source order; the builder records the `ɵɵpipe` creation instruction + slots and
+/// reserves the matching var slots (`1 + total_args`, faithful to Angular
+/// `varsUsedByOp` for `PipeBinding`/`PipeBindingVariadic`).
+///
+/// `total_args` is the full lowered argument count — the piped value plus the pipe
+/// parameters (`x | slice:1:3` → 3) — i.e. exactly the `args.length` Angular feeds
+/// `pipeBind`. Implementations use it for var-slot accounting and to pick the arity
+/// instruction.
+pub trait PipeSlotAllocator {
+    /// Register one pipe usage (`name`, with `total_args` lowered arguments) and
+    /// return its allocated [`PipeSlots`].
+    fn allocate_pipe(&self, name: &str, total_args: usize) -> PipeSlots;
 }
 
 /// Default [`LocalResolver`]: every implicit-receiver read roots at a single
@@ -201,6 +237,20 @@ pub fn convert_property_binding_with<R: LocalResolver>(
     ConvertedBinding::pure(cx.convert(expr))
 }
 
+/// Like [`convert_property_binding_with`] but additionally lowers any
+/// `{{ … | name:args }}` ([`EK::BindingPipe`]) to a `ɵɵpipeBindN`/`ɵɵpipeBindV`
+/// call, allocating the pipe's data + var slots through `pipes`. Without an
+/// allocator (the other entry points) a `BindingPipe` falls back to the
+/// `__pipe_<name>(…)` placeholder, so non-pipe callers are unaffected.
+pub fn convert_property_binding_with_pipes<R: LocalResolver, P: PipeSlotAllocator>(
+    expr: &AstNode,
+    resolver: &R,
+    pipes: &P,
+) -> ConvertedBinding {
+    let mut cx = Converter::new(resolver).with_pipes(pipes);
+    ConvertedBinding::pure(cx.convert(expr))
+}
+
 /// `convertActionBinding(ast, ...)` — lower an event-handler expression. Event
 /// handlers are an implicit [`EK::Chain`] of statements; each chained expression
 /// becomes an [`o::Stmt::Expression`], and the *last* expression's value is what a
@@ -253,6 +303,11 @@ struct Converter<'r, R: LocalResolver> {
     /// for safe-navigation guard expansion. Mirrors `allocateTemporary()` /
     /// `_currentTemporary` in the classic `_AstToIrVisitor`.
     next_temp: usize,
+    /// Optional pipe-slot allocator. When `Some`, a `BindingPipe` lowers to a
+    /// `ɵɵpipeBindN`/`ɵɵpipeBindV` call; when `None`, it falls back to the
+    /// `__pipe_<name>(…)` placeholder (the historic behaviour of the non-pipe
+    /// entry points).
+    pipes: Option<&'r dyn PipeSlotAllocator>,
 }
 
 impl<'r, R: LocalResolver> Converter<'r, R> {
@@ -260,7 +315,15 @@ impl<'r, R: LocalResolver> Converter<'r, R> {
         Converter {
             resolver,
             next_temp: 0,
+            pipes: None,
         }
+    }
+
+    /// Attach a [`PipeSlotAllocator`] so `BindingPipe` nodes lower to real
+    /// `ɵɵpipeBindN` calls.
+    fn with_pipes(mut self, pipes: &'r dyn PipeSlotAllocator) -> Self {
+        self.pipes = Some(pipes);
+        self
     }
 
     /// `allocateTemporary()` — mint a fresh temporary-variable [`Expr`]
@@ -494,19 +557,54 @@ impl<R: LocalResolver> Converter<'_, R> {
                 flags: flags.clone(),
             }),
 
-            // BindingPipe — needs pure-function / pipeBind slot allocation that is
-            // not yet ported. Emit a visible placeholder rather than wrong code.
-            // NOTE(port): pipe lowering requires slot allocation (PipeBindN / pure
-            // function slots); fall back to a marker call `__pipe(name, exp, ...args)`.
+            // BindingPipe — `exp | name:arg0:arg1`. With a `PipeSlotAllocator` this
+            // lowers exactly like Angular's pipeline reify (`reify.ts` →
+            // `ng.pipeBind`/`ng.pipeBindV`): the piped value plus the pipe arguments
+            // form the lowered arg list `[value, ...args]`; ≤4 args use the
+            // arity-specialised `ɵɵpipeBind{N}(slot, varOffset, ...args)`, >4 args use
+            // `ɵɵpipeBindV(slot, varOffset, [args])` (`pipe_variadic.ts`). The slot /
+            // var offset come from the builder's allocator. Without an allocator we keep
+            // the historic `__pipe_<name>(…)` placeholder so non-pipe callers are
+            // unaffected.
             EK::BindingPipe {
                 exp, name, args, ..
             } => {
-                let mut call_args = Vec::with_capacity(args.len() + 1);
-                call_args.push(self.convert(exp));
+                let mut lowered_args = Vec::with_capacity(args.len() + 1);
+                lowered_args.push(self.convert(exp));
                 for a in args {
-                    call_args.push(self.convert(a));
+                    lowered_args.push(self.convert(a));
                 }
-                o::variable(format!("__pipe_{name}"), None).call_fn(call_args, false)
+                match self.pipes {
+                    Some(pipes) => {
+                        let slots = pipes.allocate_pipe(name, lowered_args.len());
+                        let slot = literal(OLit::Number(slots.slot as f64), None);
+                        let var_offset = literal(OLit::Number(slots.var_offset as f64), None);
+                        // `args.length` here is the full lowered arg count (value + pipe
+                        // params), matching the pipeline's variadic threshold (>4).
+                        if lowered_args.len() <= 4 {
+                            let reference = match lowered_args.len() {
+                                1 => R3::PipeBind1,
+                                2 => R3::PipeBind2,
+                                3 => R3::PipeBind3,
+                                // `lowered_args` always has ≥1 entry (the piped value);
+                                // 4 is the only remaining case.
+                                _ => R3::PipeBind4,
+                            };
+                            let mut call_args = Vec::with_capacity(lowered_args.len() + 2);
+                            call_args.push(slot);
+                            call_args.push(var_offset);
+                            call_args.extend(lowered_args);
+                            o::import_expr(reference.reference(), None).call_fn(call_args, false)
+                        } else {
+                            // `ɵɵpipeBindV(slot, varOffset, [value, ...args])`.
+                            let arr = literal_arr(lowered_args, None);
+                            o::import_expr(R3::PipeBindV.reference(), None)
+                                .call_fn(vec![slot, var_offset, arr], false)
+                        }
+                    }
+                    None => o::variable(format!("__pipe_{name}"), None)
+                        .call_fn(lowered_args, false),
+                }
             }
         }
     }
@@ -837,6 +935,94 @@ mod tests {
         }
         let r = convert_property_binding_with(&prop("a"), &R);
         assert_eq!(emit_expression(&r.expr), "tmp;\n");
+    }
+
+    /// `x` for use as the piped value, and helpers to build a `BindingPipe` node.
+    fn binding_pipe(exp: AstNode, name: &str, args: Vec<AstNode>) -> AstNode {
+        use crate::expression::ast::BindingPipeType;
+        node(EK::BindingPipe {
+            name_span: ab(),
+            exp: Box::new(exp),
+            name: name.to_string(),
+            args,
+            pipe_type: BindingPipeType::ReferencedByName,
+        })
+    }
+
+    /// A test [`PipeSlotAllocator`] that hands out slot `10 + n` and var offset
+    /// `100 + n` for the n-th registered pipe, recording `(name, total_args)`.
+    struct MockPipes {
+        log: std::cell::RefCell<Vec<(String, usize)>>,
+    }
+    impl MockPipes {
+        fn new() -> Self {
+            MockPipes {
+                log: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+    }
+    impl PipeSlotAllocator for MockPipes {
+        fn allocate_pipe(&self, name: &str, total_args: usize) -> PipeSlots {
+            let mut log = self.log.borrow_mut();
+            let n = log.len();
+            log.push((name.to_string(), total_args));
+            PipeSlots {
+                slot: 10 + n,
+                var_offset: 100 + n,
+            }
+        }
+    }
+
+    #[test]
+    fn binding_pipe_without_allocator_is_placeholder() {
+        // x | uppercase  ->  __pipe_uppercase(ctx.x)
+        let n = binding_pipe(prop("x"), "uppercase", vec![]);
+        assert_eq!(emit(&n), "__pipe_uppercase(ctx.x);\n");
+    }
+
+    #[test]
+    fn binding_pipe_one_arg_lowers_to_pipe_bind1() {
+        // x | uppercase  ->  ɵɵpipeBind1(slot, varOffset, ctx.x)
+        let n = binding_pipe(prop("x"), "uppercase", vec![]);
+        let pipes = MockPipes::new();
+        let r = convert_property_binding_with_pipes(&n, &CtxResolver::ctx(), &pipes);
+        let out = emit_expression(&r.expr);
+        assert!(out.contains("\u{0275}\u{0275}pipeBind1("), "got: {out}");
+        assert!(out.contains("10"), "slot missing, got: {out}");
+        assert!(out.contains("100"), "varOffset missing, got: {out}");
+        assert!(out.contains("ctx.x"), "value missing, got: {out}");
+        // total_args = 1 (just the piped value).
+        assert_eq!(pipes.log.borrow().as_slice(), &[("uppercase".to_string(), 1)]);
+    }
+
+    #[test]
+    fn binding_pipe_two_args_lowers_to_pipe_bind3() {
+        // x | slice:1:3  ->  ɵɵpipeBind3(slot, varOffset, ctx.x, 1, 3)
+        let n = binding_pipe(prop("x"), "slice", vec![num(1.0), num(3.0)]);
+        let pipes = MockPipes::new();
+        let r = convert_property_binding_with_pipes(&n, &CtxResolver::ctx(), &pipes);
+        let out = emit_expression(&r.expr);
+        assert!(out.contains("\u{0275}\u{0275}pipeBind3("), "got: {out}");
+        assert!(out.contains("ctx.x"), "value missing, got: {out}");
+        assert!(out.contains('1') && out.contains('3'), "args missing, got: {out}");
+        // total_args = 3 (value + two pipe args).
+        assert_eq!(pipes.log.borrow().as_slice(), &[("slice".to_string(), 3)]);
+    }
+
+    #[test]
+    fn binding_pipe_variadic_over_four_args() {
+        // x | p:1:2:3:4:5  ->  ɵɵpipeBindV(slot, varOffset, [ctx.x, 1, 2, 3, 4, 5])
+        let n = binding_pipe(
+            prop("x"),
+            "p",
+            vec![num(1.0), num(2.0), num(3.0), num(4.0), num(5.0)],
+        );
+        let pipes = MockPipes::new();
+        let r = convert_property_binding_with_pipes(&n, &CtxResolver::ctx(), &pipes);
+        let out = emit_expression(&r.expr);
+        assert!(out.contains("\u{0275}\u{0275}pipeBindV("), "got: {out}");
+        // total_args = 6 (value + five pipe args).
+        assert_eq!(pipes.log.borrow().as_slice(), &[("p".to_string(), 6)]);
     }
 
     #[test]

@@ -41,12 +41,30 @@ It is **independent of the Rust crate** and never edits `libs/render3` source.
 | `for-index-count`     | `<ul>@for (x of xs; track x) { <li>{{ $index }} of {{ $count }}: {{x}}</li> }</ul>` | `@for` `$index`/`$count` implicit vars |
 | `ng-template-ref`     | `<ng-template #tpl><span>tpl</span></ng-template>` | `ng-template` + ref var |
 | `attr-binding`        | `<div [attr.role]="r"></div>`                     | `[attr.*]` binding |
+| `pipe-simple`         | `<p>{{ x \| uppercase }}</p>`                     | single pipe in interpolation |
+| `pipe-with-args`      | `<p>{{ x \| slice:1:3 }}</p>`                     | pipe with positional args |
+| `pipe-chained`        | `<p>{{ x \| uppercase \| lowercase }}</p>`        | chained pipes |
+| `pipe-in-binding`     | `<div [title]="t \| uppercase"></div>`            | pipe inside a property binding |
 
 > The Rust `compile_component` feeds `@angular/compiler` **empty** `inputs`/`outputs`
 > (it does not scan the template for referenced bindings), so the oracle side uses
 > the same empty maps. A `[id]`/`(click)`/`[class.on]`/`[style.color]` binding still
 > lowers to its instruction stream without the component declaring an input/output,
 > which is exactly what both compilers do — keeping the comparison apples-to-apples.
+>
+> The same convention extends to the **pipe** fixtures. A `{{ x | name }}` /
+> `[p]="x | name"` expression lowers to the pipe instruction stream — `ɵɵpipe(slot,
+> 'name')` in the create block and `ɵɵpipeBind1/2/…/ɵɵpipeBindV(slot, …)` in the
+> update block — purely from **parsing** the template; both compilers emit those
+> instructions whether or not a pipe is *registered*. Pipe declarations (the
+> `pipes`/`declarations` map) only feed dependency **resolution** (the def's
+> `dependencies` array / standalone-import diagnostics), not the create/update
+> instruction stream this harness diffs. The Rust `compile_component` builds its
+> metadata with an **empty** `declarations` set and `has_directive_dependencies:
+> false` (it does not scan the template to register referenced pipes), so the oracle
+> here likewise registers **no** pipes (`declarations: []`,
+> `hasDirectiveDependencies: false`) — both sides lower the identical
+> `ɵɵpipe`/`ɵɵpipeBindN` stream from the template alone, apples-to-apples.
 
 ## Normalisation
 

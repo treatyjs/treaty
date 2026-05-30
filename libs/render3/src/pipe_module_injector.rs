@@ -15,53 +15,28 @@
 //! Everything is constructed from [`crate::output_ast`] builders + [`crate::identifiers::R3`].
 //!
 //! ## Local placeholders
-//! The shared `render3/util.ts` and `render3/view/util.ts` modules are not yet ported, so the
-//! helpers they export (`R3Reference`, `R3CompiledExpression`, `DefinitionMap`,
-//! `typeWithParameters`, `refsToArray`, `jitOnlyGuardedExpression`, `devOnlyGuardedExpression`,
-//! `tsIgnoreComment`) are reproduced *locally* below, faithfully to their TS source. When those
-//! sibling modules land they should replace these (see the per-item `NOTE(port)` comments).
-//! Likewise `R3DependencyMetadata` (from `r3_factory.ts`) and `R3DeferPerComponentDependency`
-//! (from `view/api.ts`) are minimal local stubs — only the fields read here are modelled.
+//! The shared `render3/view/util.ts` module is not yet ported, so the helpers it exports
+//! (`DefinitionMap`, `refsToArray`, `jitOnlyGuardedExpression`, `devOnlyGuardedExpression`) are
+//! reproduced *locally* below, faithfully to their TS source. When that sibling module lands they
+//! should replace these (see the per-item `NOTE(port)` comments). The `render3/util.ts` types
+//! (`R3Reference`, `R3CompiledExpression`, `typeWithParameters`, `tsIgnoreComment`) now live in
+//! the shared [`crate::util`] module. Likewise `R3DependencyMetadata` (from `r3_factory.ts`) and
+//! `R3DeferPerComponentDependency` (from `view/api.ts`) are minimal local stubs — only the fields
+//! read here are modelled.
 
 use crate::identifiers::R3;
 use crate::output_ast::{
-    arrow_fn, dynamic_type, expression_type, import_expr, leading_comment, literal, literal_arr,
+    arrow_fn, dynamic_type, expression_type, import_expr, literal, literal_arr,
     literal_map, none_type, typeof_expr, variable, ArrowBody, Expr, ExprKind, ExternalReference,
     FnParam, ImportUrl, LeadingComment, LiteralMapEntry, LiteralValue, Stmt, Type,
     WrappedNodeHandle,
 };
+use crate::util::{ts_ignore_comment, type_with_parameters, R3CompiledExpression, R3Reference};
 
 // ===========================================================================
-// Local placeholders for not-yet-ported sibling types/helpers (render3/util.ts,
-// render3/view/util.ts, r3_factory.ts, view/api.ts). Replace on those ports.
+// Local placeholders for not-yet-ported sibling types/helpers (render3/view/util.ts,
+// r3_factory.ts, view/api.ts). Replace on those ports.
 // ===========================================================================
-
-/// `util.ts` `R3Reference { value, type }`. A pair of expressions: the runtime value and the
-/// `.d.ts` type expression for a referenced symbol.
-///
-/// NOTE(port): move to the `render3/util` port when it lands.
-#[derive(Debug, Clone, PartialEq)]
-pub struct R3Reference {
-    pub value: Expr,
-    pub r#type: Expr,
-}
-
-impl R3Reference {
-    pub fn new(value: Expr, r#type: Expr) -> R3Reference {
-        R3Reference { value, r#type }
-    }
-}
-
-/// `util.ts` `R3CompiledExpression { expression, type, statements }`. The result of every
-/// `compile*` emitter: the def RHS expression, its `.d.ts` type, and extra top-level statements.
-///
-/// NOTE(port): move to the `render3/util` port when it lands.
-#[derive(Debug, Clone, PartialEq)]
-pub struct R3CompiledExpression {
-    pub expression: Expr,
-    pub r#type: Type,
-    pub statements: Vec<Stmt>,
-}
 
 /// `r3_factory.ts` `R3DependencyMetadata`. Declared on `R3PipeMetadata` for struct parity but
 /// **never read** by these emitters (the factory compiler consumes it). Modelled as an opaque
@@ -85,19 +60,9 @@ pub struct R3DeferPerComponentDependency {
 }
 
 // ---------------------------------------------------------------------------
-// util.ts helpers (local).
+// util.ts helpers (local). NOTE(port): `typeWithParameters` / `tsIgnoreComment` now live in
+// `crate::util`; the guard / refs helpers below remain local until `render3/view/util.ts` lands.
 // ---------------------------------------------------------------------------
-
-/// `util.ts` `typeWithParameters(type, numParams)` — `ExpressionType(type)` with `numParams`
-/// `DYNAMIC_TYPE` type-arguments (none when `numParams === 0`).
-pub fn type_with_parameters(ty: Expr, num_params: u32) -> Type {
-    if num_params == 0 {
-        expression_type(ty, None, None)
-    } else {
-        let params = (0..num_params).map(|_| dynamic_type()).collect();
-        expression_type(ty, None, Some(params))
-    }
-}
 
 /// `util.ts` `refsToArray(refs, shouldForwardDeclare)` — `literalArr(refs.map(r => r.value))`,
 /// wrapped in `() => [...]` when forward declaration is required.
@@ -142,11 +107,6 @@ pub fn jit_only_guarded_expression(expr: Expr) -> Expr {
 /// `util.ts` `devOnlyGuardedExpression(expr)` — guards with `ngDevMode`.
 pub fn dev_only_guarded_expression(expr: Expr) -> Expr {
     guarded_expression("ngDevMode", expr)
-}
-
-/// `util.ts` `tsIgnoreComment()` — a multiline `@ts-ignore` leading comment.
-pub fn ts_ignore_comment() -> LeadingComment {
-    leading_comment("@ts-ignore", true, true)
 }
 
 // ---------------------------------------------------------------------------
@@ -289,11 +249,11 @@ pub fn compile_pipe_from_metadata(metadata: &R3PipeMetadata) -> R3CompiledExpres
     // `ɵɵdefinePipe({...})` — pure call.
     let expression = import_expr(R3::DefinePipe.reference(), None)
         .call_fn(vec![literal_map(entries, None)], /* pure */ true);
-    let r#type = create_pipe_type(metadata);
+    let ty = create_pipe_type(metadata);
 
     R3CompiledExpression {
         expression,
-        r#type,
+        ty,
         statements: vec![],
     }
 }
@@ -306,7 +266,7 @@ pub fn create_pipe_type(metadata: &R3PipeMetadata) -> Type {
         None => LiteralValue::Null,
     };
     let type_params = vec![
-        type_with_parameters(metadata.r#type.r#type.clone(), metadata.type_argument_count),
+        type_with_parameters(metadata.r#type.ty.clone(), metadata.type_argument_count),
         expression_type(literal(pipe_name_literal, None), None, None),
         expression_type(
             literal(LiteralValue::Bool(metadata.is_standalone), None),
@@ -488,11 +448,11 @@ pub fn compile_ng_module(meta: &R3NgModuleMetadata) -> R3CompiledExpression {
 
     let expression = import_expr(R3::DefineNgModule.reference(), None)
         .call_fn(vec![definition_map.to_literal_map()], /* pure */ true);
-    let r#type = create_ng_module_type(meta);
+    let ty = create_ng_module_type(meta);
 
     R3CompiledExpression {
         expression,
-        r#type,
+        ty,
         statements,
     }
 }
@@ -531,7 +491,7 @@ pub fn create_ng_module_type(meta: &R3NgModuleMetadata) -> Type {
         R3NgModuleMetadata::Local(m) => expression_type(m.common.r#type.value.clone(), None, None),
         R3NgModuleMetadata::Isolated(m) => {
             let type_params = vec![
-                expression_type(m.common.r#type.r#type.clone(), None, None),
+                expression_type(m.common.r#type.ty.clone(), None, None),
                 none_type(),
                 match &m.imports_expression {
                     Some(e) => expression_type(e.clone(), None, None),
@@ -559,7 +519,7 @@ pub fn create_ng_module_type(meta: &R3NgModuleMetadata) -> Type {
                 none_type()
             };
             let type_params = vec![
-                expression_type(m.common.r#type.r#type.clone(), None, None),
+                expression_type(m.common.r#type.ty.clone(), None, None),
                 declarations_type,
                 imports_type,
                 tuple_type_of(&m.exports),
@@ -639,7 +599,7 @@ fn tuple_type_of(refs: &[R3Reference]) -> Type {
     } else {
         let types = refs
             .iter()
-            .map(|r| typeof_expr(r.r#type.clone()))
+            .map(|r| typeof_expr(r.ty.clone()))
             .collect();
         expression_type(literal_arr(types, None), None, None)
     }
@@ -682,18 +642,18 @@ pub fn compile_injector(meta: &R3InjectorMetadata) -> R3CompiledExpression {
 
     let expression = import_expr(R3::DefineInjector.reference(), None)
         .call_fn(vec![definition_map.to_literal_map()], /* pure */ true);
-    let r#type = create_injector_type(meta);
+    let ty = create_injector_type(meta);
 
     R3CompiledExpression {
         expression,
-        r#type,
+        ty,
         statements: vec![],
     }
 }
 
 /// `createInjectorType(meta)` → `ExpressionType(importExpr(ɵɵInjectorDeclaration, [ExpressionType(type.type)]))`.
 pub fn create_injector_type(meta: &R3InjectorMetadata) -> Type {
-    let type_params = vec![expression_type(meta.r#type.r#type.clone(), None, None)];
+    let type_params = vec![expression_type(meta.r#type.ty.clone(), None, None)];
     expression_type(
         import_expr(R3::InjectorDeclaration.reference(), Some(type_params)),
         None,

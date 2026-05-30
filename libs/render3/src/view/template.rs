@@ -29,8 +29,8 @@
 use crate::expression::ast::ExprKind as AstExprKind;
 use crate::expression::ast::AstNode;
 use crate::expression_converter::{
-    convert_action_binding_with, convert_property_binding, convert_property_binding_with,
-    LocalResolver,
+    convert_action_binding_with, convert_property_binding_with_pipes, LocalResolver,
+    PipeSlotAllocator, PipeSlots,
 };
 use crate::identifiers::R3;
 use crate::output_ast as o;
@@ -139,6 +139,67 @@ impl ConstantPool {
             None
         } else {
             Some(o::literal_arr(self.entries.clone(), None))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pipe slot allocation.
+// ---------------------------------------------------------------------------
+
+/// Sentinel base for a not-yet-finalised pipe data slot. During the view walk a
+/// pipe's real data slot is unknown (pipe slots land at the *end* of the data
+/// array, after every element/text/block slot), so [`BuilderPipes::allocate_pipe`]
+/// returns `PIPE_SLOT_PLACEHOLDER + ordinal` and [`TemplateDefinitionBuilder::finalize_pipes`]
+/// rewrites it to the real slot once the walk is complete. The base is far above any
+/// realistic data-slot count so a placeholder is never mistaken for a real slot.
+const PIPE_SLOT_PLACEHOLDER: usize = 1_000_000_000;
+
+/// One registered pipe usage collected during the view walk. Mirrors Angular's
+/// `PipeBindingExpr` bookkeeping (`pipe_creation.ts` records a `Pipe` create op per
+/// usage). Each distinct *usage* (not name) reserves its own creation slot + var
+/// slots, faithful to the classic TDB which allocates a fresh pipe slot per
+/// occurrence.
+#[derive(Debug, Clone)]
+struct PendingPipe {
+    /// The pipe name (`uppercase`, `slice`, …) — the `ɵɵpipe(slot, "name")` argument.
+    name: String,
+}
+
+/// Per-view pipe registry. Lives behind a [`std::cell::RefCell`] on the builder so
+/// the `&self` expression-lowering path ([`TemplateDefinitionBuilder::lower_expr`])
+/// can register pipes and reserve their var slots while lowering.
+#[derive(Debug, Default)]
+struct PipeState {
+    /// Registered usages, in source order; the index is the pipe's ordinal.
+    pending: Vec<PendingPipe>,
+    /// Running var-slot cursor, advanced by `1 + total_args` per pipe (Angular
+    /// `varsUsedByOp` for `PipeBinding`/`PipeBindingVariadic`). Seeded from the
+    /// builder's `binding_slots` when lowering begins and flushed back after.
+    var_cursor: usize,
+}
+
+/// The [`PipeSlotAllocator`] the converter receives while a view's update
+/// expressions are lowered. Borrows the builder's [`PipeState`] and allocates a
+/// placeholder data slot + a real var offset per pipe usage.
+struct BuilderPipes<'a> {
+    state: &'a std::cell::RefCell<PipeState>,
+}
+
+impl PipeSlotAllocator for BuilderPipes<'_> {
+    fn allocate_pipe(&self, name: &str, total_args: usize) -> PipeSlots {
+        let mut state = self.state.borrow_mut();
+        let ordinal = state.pending.len();
+        state.pending.push(PendingPipe {
+            name: name.to_string(),
+        });
+        // Var slots: one change-detection slot plus one per lowered argument
+        // (`1 + args.length`), matching Angular `varsUsedByOp`.
+        let var_offset = state.var_cursor;
+        state.var_cursor += 1 + total_args;
+        PipeSlots {
+            slot: PIPE_SLOT_PLACEHOLDER + ordinal,
+            var_offset,
         }
     }
 }
@@ -459,6 +520,12 @@ pub struct TemplateDefinitionBuilder {
     /// time an ancestor read is lowered (so the `_rN` id is allocated from the same component-global
     /// `var_counter` as loop-variable locals, matching Angular's `naming.ts` shared counter).
     next_context_name: std::cell::RefCell<Option<String>>,
+    /// Pipe usages collected while lowering this view's update expressions. `RefCell` because the
+    /// pipe allocator borrows the builder immutably during `lower_expr`. After the walk,
+    /// [`Self::finalize_pipes`] allocates each pipe's data slot at the END of the data array, emits
+    /// the `ɵɵpipe(slot, "name")` creation instructions, and patches the placeholder slots in the
+    /// update block. See Angular `pipe_creation.ts` + `slot_allocation.ts`.
+    pipes: std::cell::RefCell<PipeState>,
 }
 
 impl TemplateDefinitionBuilder {
@@ -487,6 +554,7 @@ impl TemplateDefinitionBuilder {
             temp_counter: 0,
             needs_next_context: std::cell::Cell::new(false),
             next_context_name: std::cell::RefCell::new(None),
+            pipes: std::cell::RefCell::new(PipeState::default()),
         }
     }
 
@@ -498,30 +566,43 @@ impl TemplateDefinitionBuilder {
         &self.hoisted_fns
     }
 
-    /// Lower a binding expression against this view's scope (`ctx` + any in-scope loop variables).
-    /// Equivalent to [`convert_property_binding`] for the root view; inside a `@for` body it also
-    /// rewrites item / `$index` / `$count` reads to their generated locals.
-    fn lower_expr(&self, node: &AstNode) -> Expr {
+    /// Lower a binding expression against this view's scope (`ctx` + any in-scope loop variables),
+    /// resolving any `{{ … | pipe }}` to a `ɵɵpipeBindN`/`ɵɵpipeBindV` call. Inside a `@for` body it
+    /// also rewrites item / `$index` / `$count` reads to their generated locals.
+    ///
+    /// Pipe usages register against this view's [`PipeState`]: each reserves `1 + total_args` var
+    /// slots (Angular `varsUsedByOp`) — taken from the shared `binding_slots` pool *as the pipe is
+    /// reached*, so a pipe's var offset follows the host binding's own slots — and a placeholder data
+    /// slot finalised later by [`Self::finalize_pipes`].
+    fn lower_expr(&mut self, node: &AstNode) -> Expr {
+        // Seed the pipe var cursor at the current binding-slot count: pipe change-detection slots are
+        // drawn from the same pool, immediately after the host binding's slots (Angular var_counting
+        // assigns offsets to bindings in op order).
+        self.pipes.borrow_mut().var_cursor = self.binding_slots;
+
         // Embedded (nested) views resolve ancestor-context reads via `ɵɵnextContext()` (`ctx_r<level>`),
         // recording the need in `needs_next_context`; loop locals still resolve to their generated
         // names. The root view roots everything at `ctx`.
-        if self.view_level > 0 {
+        let expr = if self.view_level > 0 {
             let ctx_name = self.next_context_var_name();
             let resolver = NestedViewResolver {
                 vars: &self.loop_vars,
                 ctx_name,
                 needs: &self.needs_next_context,
             };
-            return convert_property_binding_with(node, &resolver).expr;
-        }
-        if self.loop_vars.is_empty() {
-            convert_property_binding(node, o::variable(CONTEXT_NAME, None), &self.name).expr
+            convert_property_binding_with_pipes(node, &resolver, &BuilderPipes { state: &self.pipes })
+                .expr
         } else {
             let resolver = LoopVarResolver {
                 vars: &self.loop_vars,
             };
-            convert_property_binding_with(node, &resolver).expr
-        }
+            convert_property_binding_with_pipes(node, &resolver, &BuilderPipes { state: &self.pipes })
+                .expr
+        };
+
+        // Flush any var slots the pipes consumed back into the view-wide binding-slot total.
+        self.binding_slots = self.pipes.borrow().var_cursor;
+        expr
     }
 
     /// The shared-context identifier (`ctx_r<level>`) for this embedded view — the `BindingScope`
@@ -593,6 +674,38 @@ impl TemplateDefinitionBuilder {
         }
     }
 
+    /// Finalise the pipe usages collected during the walk (`pipe_creation.ts` + `slot_allocation.ts`):
+    /// allocate each pipe a data slot at the END of the data array (after every element/text/block
+    /// slot), emit its `ɵɵpipe(slot, "name")` creation instruction, and patch the placeholder slots
+    /// (`PIPE_SLOT_PLACEHOLDER + ordinal`) in the update block to the real slot. Pipe slots are taken
+    /// in registration (source) order, so ordinal `k` maps to data slot `pipe_base + k`.
+    fn finalize_pipes(&mut self) {
+        let pending = std::mem::take(&mut self.pipes.borrow_mut().pending);
+        if pending.is_empty() {
+            return;
+        }
+        // Pipe slots come after every other data slot in this view.
+        let pipe_base = self.data_index;
+        self.data_index += pending.len();
+
+        // Emit `ɵɵpipe(slot, "name")` per usage (creation block). Appending here places them after
+        // all element/text creation instructions; chaining will fold the run of `ɵɵpipe` calls.
+        for (ordinal, pending_pipe) in pending.iter().enumerate() {
+            let slot = pipe_base + ordinal;
+            self.creation_code.push(instruction(
+                R3::Pipe,
+                vec![num(slot as f64), str_lit(&pending_pipe.name)],
+            ));
+        }
+
+        // Patch placeholder slot literals in the update block to their real slots.
+        let mut update = std::mem::take(&mut self.update_code);
+        for stmt in &mut update {
+            remap_pipe_slots_in_stmt(stmt, pipe_base);
+        }
+        self.update_code = update;
+    }
+
     /// Walk the root nodes and assemble the `function Name(rf, ctx) { … }` view function.
     ///
     /// Returns the `output_ast` function expression. The collected constants are available via
@@ -601,6 +714,10 @@ impl TemplateDefinitionBuilder {
         // Walk the nodes, accumulating creation + update instructions.
         let nodes = input.nodes.clone();
         self.visit_all(&nodes);
+
+        // Allocate pipe data slots (at the END of the data array), emit their `ɵɵpipe(slot,"name")`
+        // creation instructions, and patch the placeholder slots in the update block.
+        self.finalize_pipes();
 
         let mut statements: Vec<Stmt> = Vec::new();
 
@@ -775,16 +892,22 @@ impl TemplateDefinitionBuilder {
 
         // Update: advance to the slot, then the arity-selected interpolation instruction. Each
         // interpolation expression lowers against this view's scope (`ctx` + any `@for` loop locals),
-        // so `{{x}}` inside a loop body emits `x_r1`, not `ctx.x`.
+        // so `{{x}}` inside a loop body emits `x_r1`, not `ctx.x`; pipes (`{{ x | upper }}`) lower to
+        // `ɵɵpipeBindN` here too. We pre-lower the expressions through `lower_expr` (which needs
+        // `&mut self` for pipe registration), then feed them positionally to `text_interpolation_call`.
         self.advance_to(slot);
-        let loop_vars = self.loop_vars.clone();
-        let name = self.name.clone();
-        let lower = |node: &AstNode| -> Expr {
-            if loop_vars.is_empty() {
-                convert_property_binding(node, o::variable(CONTEXT_NAME, None), &name).expr
-            } else {
-                convert_property_binding_with(node, &LoopVarResolver { vars: &loop_vars }).expr
+        let lowered: Vec<Expr> = match &bound.value.kind {
+            AstExprKind::Interpolation { expressions, .. } => {
+                expressions.iter().map(|e| self.lower_expr(e)).collect()
             }
+            // Bare expression: a single `{{ expr }}`.
+            _ => vec![self.lower_expr(&bound.value)],
+        };
+        let iter = std::cell::RefCell::new(lowered.into_iter());
+        let lower = |_node: &AstNode| -> Expr {
+            iter.borrow_mut()
+                .next()
+                .expect("text_interpolation_call requests one lowered expr per source expr")
         };
         let (reference, params) = text_interpolation_call(&bound.value, &lower);
         self.update_code.push(instruction(reference, params));
@@ -1813,6 +1936,148 @@ fn interpolation_expression_count(value: &AstNode) -> usize {
 }
 
 // ---------------------------------------------------------------------------
+// Pipe-slot finalisation: rewrite placeholder slot literals to real slots.
+// ---------------------------------------------------------------------------
+
+/// Rewrite every placeholder pipe-slot literal (`PIPE_SLOT_PLACEHOLDER + ordinal`) reachable from
+/// `stmt` to its real data slot (`pipe_base + ordinal`). Covers every [`StmtKind`] so a pipe binding
+/// is patched wherever it sits (it only appears in update-block expression statements in practice).
+fn remap_pipe_slots_in_stmt(stmt: &mut Stmt, pipe_base: usize) {
+    match &mut stmt.kind {
+        StmtKind::DeclareVar { value, .. } => {
+            if let Some(v) = value {
+                remap_pipe_slots_in_expr(v, pipe_base);
+            }
+        }
+        StmtKind::DeclareFunction { statements, .. } => {
+            for s in statements {
+                remap_pipe_slots_in_stmt(s, pipe_base);
+            }
+        }
+        StmtKind::Expression(e) | StmtKind::Return(e) => {
+            remap_pipe_slots_in_expr(e, pipe_base);
+        }
+        StmtKind::If {
+            condition,
+            true_case,
+            false_case,
+        } => {
+            remap_pipe_slots_in_expr(condition, pipe_base);
+            for s in true_case {
+                remap_pipe_slots_in_stmt(s, pipe_base);
+            }
+            for s in false_case {
+                remap_pipe_slots_in_stmt(s, pipe_base);
+            }
+        }
+    }
+}
+
+/// Recursively rewrite placeholder pipe-slot literals in `expr`. A pipe's data slot is emitted as
+/// `PIPE_SLOT_PLACEHOLDER + ordinal` during the walk (the real slot is unknown until every other data
+/// slot is allocated); here we map it to `pipe_base + ordinal`. The sentinel base is far above any
+/// real slot count, so the `>= PIPE_SLOT_PLACEHOLDER` test never matches a genuine slot/index literal.
+fn remap_pipe_slots_in_expr(expr: &mut Expr, pipe_base: usize) {
+    use o::ExprKind as K;
+    match &mut expr.kind {
+        K::Literal(o::LiteralValue::Number(n)) => {
+            let v = *n as usize;
+            if *n >= PIPE_SLOT_PLACEHOLDER as f64 && v >= PIPE_SLOT_PLACEHOLDER {
+                let ordinal = v - PIPE_SLOT_PLACEHOLDER;
+                *n = (pipe_base + ordinal) as f64;
+            }
+        }
+        // Leaves with no child expressions.
+        K::ReadVar { .. }
+        | K::WrappedNode(_)
+        | K::RegExpLiteral { .. }
+        | K::Literal(_)
+        | K::TemplateLiteralElement(_)
+        | K::External { .. } => {}
+        K::Typeof(e) | K::Void(e) | K::Not(e) | K::Parenthesized(e) | K::Spread(e) => {
+            remap_pipe_slots_in_expr(e, pipe_base);
+        }
+        K::Invoke { callee, args, .. } => {
+            remap_pipe_slots_in_expr(callee, pipe_base);
+            for a in args {
+                remap_pipe_slots_in_expr(a, pipe_base);
+            }
+        }
+        K::TaggedTemplate { tag, template } => {
+            remap_pipe_slots_in_expr(tag, pipe_base);
+            remap_pipe_slots_in_expr(template, pipe_base);
+        }
+        K::New { class_expr, args } => {
+            remap_pipe_slots_in_expr(class_expr, pipe_base);
+            for a in args {
+                remap_pipe_slots_in_expr(a, pipe_base);
+            }
+        }
+        K::TemplateLiteral { expressions, .. } | K::LocalizedString { expressions, .. } => {
+            for e in expressions {
+                remap_pipe_slots_in_expr(e, pipe_base);
+            }
+        }
+        K::Conditional {
+            condition,
+            true_case,
+            false_case,
+        } => {
+            remap_pipe_slots_in_expr(condition, pipe_base);
+            remap_pipe_slots_in_expr(true_case, pipe_base);
+            if let Some(f) = false_case {
+                remap_pipe_slots_in_expr(f, pipe_base);
+            }
+        }
+        K::DynamicImport { url, .. } => {
+            if let o::ImportUrl::Expr(e) = url {
+                remap_pipe_slots_in_expr(e, pipe_base);
+            }
+        }
+        K::Function { statements, .. } => {
+            for s in statements {
+                remap_pipe_slots_in_stmt(s, pipe_base);
+            }
+        }
+        K::Arrow { body, .. } => match body {
+            o::ArrowBody::Expr(e) => remap_pipe_slots_in_expr(e, pipe_base),
+            o::ArrowBody::Block(stmts) => {
+                for s in stmts {
+                    remap_pipe_slots_in_stmt(s, pipe_base);
+                }
+            }
+        },
+        K::Unary { expr: inner, .. } => remap_pipe_slots_in_expr(inner, pipe_base),
+        K::Binary { lhs, rhs, .. } => {
+            remap_pipe_slots_in_expr(lhs, pipe_base);
+            remap_pipe_slots_in_expr(rhs, pipe_base);
+        }
+        K::ReadProp { receiver, .. } => remap_pipe_slots_in_expr(receiver, pipe_base),
+        K::ReadKey { receiver, index, .. } => {
+            remap_pipe_slots_in_expr(receiver, pipe_base);
+            remap_pipe_slots_in_expr(index, pipe_base);
+        }
+        K::LiteralArray(entries) | K::Comma(entries) => {
+            for e in entries {
+                remap_pipe_slots_in_expr(e, pipe_base);
+            }
+        }
+        K::LiteralMap { entries, .. } => {
+            for entry in entries {
+                match entry {
+                    o::LiteralMapEntry::Property { value, .. } => {
+                        remap_pipe_slots_in_expr(value, pipe_base)
+                    }
+                    o::LiteralMapEntry::Spread { expression } => {
+                        remap_pipe_slots_in_expr(expression, pipe_base)
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests.
 // ---------------------------------------------------------------------------
 
@@ -1888,6 +2153,116 @@ mod tests {
         assert!(out.contains("ctx.x"), "got: {out}");
         // The render-flags branching shape.
         assert!(out.contains("rf"), "got: {out}");
+    }
+
+    /// `{{ x | name:args }}` as a `BoundText` interpolation node (strings `["",""]`, one expression
+    /// that is the `BindingPipe`). `args` are numeric pipe arguments.
+    fn interpolation_with_pipe(name: &str, args: Vec<f64>) -> Vec<Node> {
+        use crate::expression::ast::BindingPipeType;
+        let ab = || AbsoluteSourceSpan::new(0, 0);
+        let sp = || ParseSpan::new(0, 0);
+        let arg_nodes: Vec<AstNode> = args
+            .into_iter()
+            .map(|n| {
+                AstNode::new(
+                    sp(),
+                    ab(),
+                    AstExprKind::LiteralPrimitive {
+                        value: crate::expression::ast::LiteralValue::Num(n),
+                    },
+                )
+            })
+            .collect();
+        let pipe = AstNode::new(
+            sp(),
+            ab(),
+            AstExprKind::BindingPipe {
+                name_span: ab(),
+                exp: Box::new(prop_read_x()),
+                name: name.to_string(),
+                args: arg_nodes,
+                pipe_type: BindingPipeType::ReferencedByName,
+            },
+        );
+        let interp = AstNode::new(
+            sp(),
+            ab(),
+            AstExprKind::Interpolation {
+                strings: vec![String::new(), String::new()],
+                expressions: vec![pipe],
+            },
+        );
+        vec![Node::Element(Element {
+            name: "div".to_string(),
+            attributes: vec![],
+            inputs: vec![],
+            outputs: vec![],
+            directives: vec![],
+            children: vec![Node::BoundText(BoundText {
+                value: interp,
+                source_span: t_span(),
+                i18n: None,
+            })],
+            references: vec![],
+            is_self_closing: false,
+            source_span: t_span(),
+            start_source_span: t_span(),
+            end_source_span: None,
+            is_void: false,
+            i18n: None,
+        })]
+    }
+
+    #[test]
+    fn interpolation_pipe_emits_pipe_creation_and_pipe_bind1() {
+        // `<div>{{ x | uppercase }}</div>`:
+        //   creation: ɵɵpipe(N, "uppercase") after the text/element slots
+        //   update:   ɵɵpipeBind1(N, varOffset, ctx.x)
+        let input =
+            TemplateCompilationInput::new("Test_Template", interpolation_with_pipe("uppercase", vec![]));
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let out = emit_expression(&func);
+
+        // The pipe creation instruction with the pipe name.
+        assert!(out.contains("\u{0275}\u{0275}pipe("), "missing ɵɵpipe, got: {out}");
+        assert!(out.contains("\"uppercase\""), "missing pipe name, got: {out}");
+        // The update-block pipeBind1 with the piped value.
+        assert!(out.contains("\u{0275}\u{0275}pipeBind1("), "missing ɵɵpipeBind1, got: {out}");
+        assert!(out.contains("ctx.x"), "missing piped value, got: {out}");
+        // No leftover placeholder slot literal.
+        assert!(!out.contains("1000000000"), "placeholder slot not patched, got: {out}");
+
+        // Slot accounting: div (0), text (1), pipe (2). One pipe → +1 decl.
+        assert_eq!(builder.data_index(), 3, "expected element+text+pipe data slots");
+        // The pipe creation slot is the last data slot (2).
+        assert!(
+            out.contains("\u{0275}\u{0275}pipe(2"),
+            "pipe slot should be at the end of the data array, got: {out}"
+        );
+        // Var slots: text interpolation (1) + pipe (1 + 1 arg = 2) = 3.
+        assert_eq!(builder.vars(), 3, "expected interpolation + pipe var slots");
+    }
+
+    #[test]
+    fn interpolation_pipe_with_two_args_emits_pipe_bind3() {
+        // `<div>{{ x | slice:1:3 }}</div>` → ɵɵpipeBind3(N, varOffset, ctx.x, 1, 3).
+        let input = TemplateCompilationInput::new(
+            "Test_Template",
+            interpolation_with_pipe("slice", vec![1.0, 3.0]),
+        );
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let out = emit_expression(&func);
+
+        assert!(out.contains("\u{0275}\u{0275}pipe("), "missing ɵɵpipe, got: {out}");
+        assert!(out.contains("\"slice\""), "missing pipe name, got: {out}");
+        assert!(out.contains("\u{0275}\u{0275}pipeBind3("), "missing ɵɵpipeBind3, got: {out}");
+        assert!(out.contains("ctx.x"), "missing piped value, got: {out}");
+        assert!(!out.contains("1000000000"), "placeholder slot not patched, got: {out}");
+
+        // Var slots: interpolation (1) + pipe (1 + 3 args = 4) = 5.
+        assert_eq!(builder.vars(), 5, "expected interpolation + pipe var slots");
     }
 
     #[test]

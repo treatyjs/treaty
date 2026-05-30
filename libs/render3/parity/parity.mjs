@@ -197,6 +197,48 @@ const FIXTURES = [
     selector: 'app-attr-bind',
     className: 'AttrBindComponent',
   },
+  // -------------------------------------------------------------------------
+  // Fourth batch: pipes. A `{{ x | name }}` / `[p]="x | name"` expression lowers
+  // to the pipe instruction stream — `ɵɵpipe(slot, 'name')` in the create block
+  // and `ɵɵpipeBind1/2/.../ɵɵpipeBindV(slot, ...)` in the update block — purely
+  // from PARSING the template; @angular/compiler emits those instructions whether
+  // or not the pipe is registered in the component metadata. Pipe *declarations*
+  // (the `pipes`/`dependencies` map) only affect dependency RESOLUTION (the def's
+  // `dependencies` array / standalone import diagnostics), not the create/update
+  // instruction stream that this harness compares.
+  //
+  // The Rust `compile_component` builds minimal metadata with EMPTY inputs/outputs
+  // and an EMPTY declarations/pipes set (it does not scan the template to register
+  // referenced pipes), so to keep the comparison apples-to-apples the oracle here
+  // likewise registers NO pipes (`declarations: []`, `hasDirectiveDependencies:
+  // false`, unchanged from compileWithOracle). Both sides therefore lower the same
+  // `ɵɵpipe`/`ɵɵpipeBindN` instruction stream from the template alone — exactly the
+  // shape we want to diff — without either side declaring the pipe as available.
+  // -------------------------------------------------------------------------
+  {
+    id: 'pipe-simple',
+    template: '<p>{{ x | uppercase }}</p>',
+    selector: 'app-pipe-simple',
+    className: 'PipeSimpleComponent',
+  },
+  {
+    id: 'pipe-with-args',
+    template: '<p>{{ x | slice:1:3 }}</p>',
+    selector: 'app-pipe-args',
+    className: 'PipeArgsComponent',
+  },
+  {
+    id: 'pipe-chained',
+    template: '<p>{{ x | uppercase | lowercase }}</p>',
+    selector: 'app-pipe-chained',
+    className: 'PipeChainedComponent',
+  },
+  {
+    id: 'pipe-in-binding',
+    template: '<div [title]="t | uppercase"></div>',
+    selector: 'app-pipe-binding',
+    className: 'PipeBindingComponent',
+  },
 ];
 
 // ---------------------------------------------------------------------------
