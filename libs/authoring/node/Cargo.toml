@@ -10,6 +10,7 @@ napi = { version = '2.10.2', default-features = false, features = [
 ] }
 napi-derive = '2.9.3'
 render3 = { path = '../../render3' }
+rust_authoring = { path = '../../../apps/rust/authoring' }
 
 [lib]
 crate-type = [

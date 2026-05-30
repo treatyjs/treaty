@@ -44,3 +44,17 @@ pub fn compile_component_source(source: String) -> CompiledComponent {
         errors: result.errors,
     }
 }
+
+/// Compile a `.treaty` single-file component directly from its source.
+///
+/// `source` is the full `.treaty` file contents and `file_name` its path/name (used for
+/// diagnostics). Returns the emitted `ɵɵdefineComponent({...})` definition, or a
+/// `CompiledComponent` carrying descriptive errors.
+#[napi]
+pub fn compile_treaty_file(source: String, file_name: String) -> CompiledComponent {
+    let result = rust_authoring::sfc::compile_treaty_file(&source, &file_name);
+    CompiledComponent {
+        code: result.code,
+        errors: result.errors,
+    }
+}

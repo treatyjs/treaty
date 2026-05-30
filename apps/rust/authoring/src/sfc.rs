@@ -25,6 +25,11 @@
 //! Component references in the template resolve by class name through render3's selectorless
 //! binder, and template dependencies are auto-collected — there are no manual `imports`.
 
+use oxc_allocator::Allocator;
+use oxc_ast::ast::Expression;
+use oxc_parser::Parser as JsParser;
+use oxc_span::SourceType;
+
 use render3::compile::{CompiledComponent, RealTemplateBuilder};
 use render3::output::emitter::emit_expression;
 use render3::output_ast::{self as o, ParseSourceSpan};
@@ -35,8 +40,8 @@ use render3::util::{R3CompiledExpression, R3Reference};
 use render3::view::compiler::{
     compile_component_from_metadata, ChangeDetection, ChangeDetectionStrategy, ComponentTemplate,
     DeclarationListEmitMode, Deps, Lifecycle, OrderedMap, R3ComponentDeferMetadata,
-    R3ComponentMetadata, R3DirectiveMetadata, R3HostMetadata, R3TemplateDependencyMetadata,
-    StubHostBindingsBuilder, ViewEncapsulation,
+    R3ComponentMetadata, R3DirectiveMetadata, R3HostMetadata, R3InputMetadata,
+    R3TemplateDependencyMetadata, StubHostBindingsBuilder, ViewEncapsulation,
 };
 
 use crate::treaty::ast::AstNode;
@@ -114,6 +119,95 @@ fn to_pascal_case(file_name: &str) -> String {
     }
 }
 
+/// Recognizes a signal initializer call: `input()`, `input.required()`, `model()`,
+/// `model.required()`, `output()`. Returns the base callee identifier (`input`/`model`/`output`)
+/// and whether `.required` was used. Mirrors `render3::source_compile::signal_call`.
+fn signal_call<'a>(expr: &'a Expression<'a>) -> Option<(&'a str, bool)> {
+    let Expression::CallExpression(call) = expr else {
+        return None;
+    };
+    match &call.callee {
+        // `input(...)`, `output(...)`, `model(...)`
+        Expression::Identifier(id) => Some((id.name.as_str(), false)),
+        // `input.required(...)`, `model.required(...)`
+        Expression::StaticMemberExpression(member) => {
+            if let Expression::Identifier(base) = &member.object {
+                let required = member.property.name.as_str() == "required";
+                Some((base.name.as_str(), required))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Parse the component-body JS chunk and extract Treaty signal inputs/outputs.
+///
+/// In the Treaty SFC model the top-level JS *is* the component body, so top-level
+/// `const <name> = input()/input.required()/model()/output()` declarations become the
+/// component's signal inputs/outputs. Mirrors `render3::source_compile` signal extraction:
+///   * `input()`            → signal input
+///   * `input.required()`   → required signal input
+///   * `model()`            → signal input + paired `<name>Change` output
+///   * `output()`           → output
+///
+/// Parse failures are non-fatal: the JS chunk is the user's free-form body and may use syntax
+/// the template path does not care about, so an unparseable chunk simply yields no I/O.
+fn extract_io(
+    javascript: &str,
+    inputs: &mut OrderedMap<String, R3InputMetadata>,
+    outputs: &mut OrderedMap<String, String>,
+) {
+    if javascript.trim().is_empty() {
+        return;
+    }
+
+    let allocator = Allocator::default();
+    let source_type = SourceType::default().with_typescript(true);
+    let ret = JsParser::new(&allocator, javascript, source_type).parse();
+
+    for stmt in &ret.program.body {
+        let oxc_ast::ast::Statement::VariableDeclaration(decl) = stmt else {
+            continue;
+        };
+        for declarator in &decl.declarations {
+            let Some(name) = declarator.id.get_identifier_name() else {
+                continue;
+            };
+            let name = name.to_string();
+            let Some(init) = &declarator.init else {
+                continue;
+            };
+            let Some((base, required)) = signal_call(init) else {
+                continue;
+            };
+            match base {
+                "input" | "model" => {
+                    inputs.insert(
+                        name.clone(),
+                        R3InputMetadata {
+                            class_property_name: name.clone(),
+                            binding_property_name: name.clone(),
+                            required,
+                            is_signal: true,
+                            transform_function: None,
+                        },
+                    );
+                    if base == "model" {
+                        let change = format!("{name}Change");
+                        outputs.insert(change.clone(), change);
+                    }
+                }
+                "output" => {
+                    outputs.insert(name.clone(), name.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 fn class_ref(class_name: &str) -> R3Reference {
     R3Reference {
         value: o::variable(class_name, None),
@@ -140,6 +234,13 @@ pub fn compile_treaty_file(source: &str, file_name: &str) -> CompiledComponent {
         .collect();
 
     let mut errors: Vec<String> = Vec::new();
+
+    // 0. Extract signal inputs/outputs from the component-body JS chunk.
+    let mut inputs: OrderedMap<String, R3InputMetadata> = OrderedMap::new();
+    let mut outputs: OrderedMap<String, String> = OrderedMap::new();
+    let javascript = chunks.javascript.join("");
+    extract_io(&javascript, &mut inputs, &mut outputs);
+    let is_signal = inputs.iter().any(|(_, m)| m.is_signal);
 
     // 1. Template HTML -> HTML AST.
     let parse_result = render3::ml_parser::parse(&template_html, "template.html");
@@ -172,14 +273,14 @@ pub fn compile_treaty_file(source: &str, file_name: &str) -> CompiledComponent {
         view_queries: Vec::new(),
         host: R3HostMetadata::default(),
         lifecycle: Lifecycle::default(),
-        inputs: OrderedMap::new(),
-        outputs: OrderedMap::new(),
+        inputs,
+        outputs,
         uses_inheritance: false,
         control_create: None,
         export_as: None,
         providers: None,
         is_standalone: true,
-        is_signal: false,
+        is_signal,
         host_directives: None,
         legacy_optional_chaining: false,
     };
@@ -261,6 +362,20 @@ mod tests {
             "no interpolation instruction; got: {code}"
         );
         assert!(code.contains("ctx.name"), "did not bind ctx.name; got: {code}");
+    }
+
+    #[test]
+    fn extracts_signal_input_from_js_chunk() {
+        let source = "const name = input();\n<div>{{ name() }}</div>";
+        let out = compile_treaty_file(source, "greeting.treaty");
+
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+
+        assert!(code.contains(DEFINE), "no defineComponent; got: {code}");
+        // The signal input is emitted into the inputs map and marked as a signal input.
+        assert!(code.contains("inputs"), "no inputs map; got: {code}");
+        assert!(code.contains("name"), "inputs missing 'name'; got: {code}");
     }
 
     #[test]
