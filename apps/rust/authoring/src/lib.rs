@@ -7,4 +7,5 @@
 
 pub mod angular;
 pub mod html;
+pub mod sfc;
 pub mod treaty;

@@ -36,8 +36,8 @@ use crate::identifiers::R3;
 use crate::output_ast as o;
 use crate::output_ast::{Expr, FnParam, Stmt, StmtKind, StmtModifier};
 use crate::template::r3_ast::{
-    BoundAttribute, BoundEvent, BoundText, Element, ForLoopBlock, IfBlock, Node, SwitchBlock,
-    Template, Text, TextAttribute, Visitor,
+    BoundAttribute, BoundEvent, BoundText, Element, ForLoopBlock, IfBlock, LetDeclaration, Node,
+    SwitchBlock, Template, Text, TextAttribute, Visitor,
 };
 
 // ---------------------------------------------------------------------------
@@ -1764,6 +1764,51 @@ impl TemplateDefinitionBuilder {
         }
         (vars, prelude)
     }
+
+    /// Lower a `@let x = <expr>;` declaration (`ingest.ts` `ingestLetDeclaration` +
+    /// `declareLet`/`storeLet`/`readContextLet` lowering).
+    ///
+    /// A `@let` reserves a data slot (the `ɵɵdeclareLet(slot)` TNode created in the creation block)
+    /// and a single binding (var) slot (`varsUsedByOp` for a `StoreLet` op). The update block emits
+    /// `const <name>_r<id> = ɵɵstoreLet(<value>)` after advancing to the let's slot, and every
+    /// implicit-receiver read of `<name>` later in this view lowers to the local `<name>_r<id>`
+    /// (registered as a [`LoopVar`], since an in-view let reference resolves exactly like a loop
+    /// variable: source name → generated local). Reads from a *different* view lower to
+    /// `ɵɵreadContextLet(slot)` instead (`reify.ts` `ContextLetReference`); that cross-view case is
+    /// resolved by the embedded view's own scope, so this method only wires the in-view local.
+    fn build_let_declaration(&mut self, decl: &LetDeclaration) {
+        // `declareLet` allocates a data slot; the `storeLet` value occupies one var slot.
+        let slot = self.allocate_data_slot();
+        self.creation_code
+            .push(instruction(R3::DeclareLet, vec![num(slot as f64)]));
+        self.allocate_binding_slots(1);
+
+        // Update: advance to the let's slot, lower the value expression (against this view's scope —
+        // earlier lets in the same view are already in `loop_vars`, so a let chaining off another
+        // resolves to that local), then bind it via `ɵɵstoreLet`. The result is captured in
+        // `<name>_r<id>` so subsequent references reuse the stored value.
+        self.advance_to(slot);
+        self.current_target_slot = slot;
+        let value = self.lower_expr(&decl.value);
+        let store = o::import_expr(R3::StoreLet.reference(), None).call_fn(vec![value], false);
+
+        self.var_counter += 1;
+        let local_name = format!("{}_r{}", decl.name, self.var_counter);
+        self.update_code.push(Stmt::with_modifiers(
+            StmtKind::DeclareVar {
+                name: local_name.clone(),
+                value: Some(store),
+                ty: None,
+            },
+            StmtModifier::FINAL,
+        ));
+
+        // In-view reads of this `@let` now resolve to its generated local.
+        self.loop_vars.push(LoopVar {
+            source_name: decl.name.clone(),
+            local_name,
+        });
+    }
 }
 
 impl Visitor for TemplateDefinitionBuilder {
@@ -1795,6 +1840,10 @@ impl Visitor for TemplateDefinitionBuilder {
 
     fn visit_for_loop_block(&mut self, block: &ForLoopBlock) {
         self.build_for_block(block);
+    }
+
+    fn visit_let_declaration(&mut self, decl: &LetDeclaration) {
+        self.build_let_declaration(decl);
     }
 }
 
@@ -2417,6 +2466,53 @@ mod tests {
         assert!(out.contains("ctx.x"), "got: {out}");
         // The render-flags branching shape.
         assert!(out.contains("rf"), "got: {out}");
+    }
+
+    #[test]
+    fn let_declaration_emits_declare_let_and_store_let() {
+        use crate::expression::ast::LiteralValue as ELit;
+        use crate::template::r3_ast::LetDeclaration;
+
+        // `@let x = 1; {{ x }}` — the let declaration followed by an interpolation reading it.
+        let value = AstNode::new(
+            ParseSpan::new(0, 0),
+            AbsoluteSourceSpan::new(0, 0),
+            AstExprKind::LiteralPrimitive {
+                value: ELit::Num(1.0),
+            },
+        );
+        let nodes = vec![
+            Node::LetDeclaration(LetDeclaration {
+                name: "x".to_string(),
+                value,
+                source_span: t_span(),
+                name_span: t_span(),
+                value_span: t_span(),
+            }),
+            Node::BoundText(BoundText {
+                value: prop_read_x(),
+                source_span: t_span(),
+                i18n: None,
+            }),
+        ];
+
+        let input = TemplateCompilationInput::new("Test_Template", nodes);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let out = emit_expression(&func);
+
+        // Creation: `ɵɵdeclareLet(0)` for the `@let` (slot 0), then the text placeholder.
+        assert!(out.contains("\u{0275}\u{0275}declareLet"), "got: {out}");
+        // Update: `const x_r1 = ɵɵstoreLet(1)`, capturing the value in the generated local.
+        assert!(out.contains("\u{0275}\u{0275}storeLet"), "got: {out}");
+        assert!(out.contains("x_r1"), "got: {out}");
+        // The interpolation reads the stored let local, NOT `ctx.x`.
+        assert!(out.contains("\u{0275}\u{0275}textInterpolate"), "got: {out}");
+        assert!(!out.contains("ctx.x"), "got: {out}");
+        // The `@let` consumes a data slot (`declareLet`) plus the text node = 2 decls; it reserves
+        // one binding (var) slot for the `storeLet`, and the interpolation reserves one more = 2 vars.
+        assert_eq!(builder.data_index(), 2, "decls: {out}");
+        assert_eq!(builder.vars(), 2, "vars: {out}");
     }
 
     /// `{{ x | name:args }}` as a `BoundText` interpolation node (strings `["",""]`, one expression

@@ -1,0 +1,275 @@
+//! `.treaty` single-file-component compiler (Rust port of the REPL's `treat-to-ivy.ts`).
+//!
+//! Splits a `.treaty` source into JavaScript / HTML / CSS chunks using the crate's own
+//! [`crate::treaty`] lexer + parser (no regex), derives a standalone component, and emits the
+//! `ɵɵdefineComponent({...})` definition via the `render3` Ivy engine.
+//!
+//! Pipeline (mirrors `apps/repl/src/tools/treaty-sfc/treat-to-ivy.ts`):
+//! ```text
+//! treaty::Lexer  -> tokens
+//! treaty::Parser -> Ast { nodes }
+//!   JavaScript nodes -> (script, currently unused by render3's template emitter)
+//!   Html nodes       -> template
+//!   Style nodes      -> styles
+//! render3::ml_parser + template_transform -> r3_ast
+//! render3 compile_component_from_metadata  -> ɵɵdefineComponent
+//! ```
+//!
+//! Component derivation:
+//!   * class name: PascalCase of `file_name` (stem only, extension stripped)
+//!   * selector:   `None` (SELECTORLESS / class-name based resolution)
+//!   * standalone: `true`
+//!   * template:   the joined HTML chunks
+//!   * styles:     the CSS chunks (newlines/tabs stripped, as the TS pipeline does)
+//!
+//! Component references in the template resolve by class name through render3's selectorless
+//! binder, and template dependencies are auto-collected — there are no manual `imports`.
+
+use render3::compile::{CompiledComponent, RealTemplateBuilder};
+use render3::output::emitter::emit_expression;
+use render3::output_ast::{self as o, ParseSourceSpan};
+use render3::template::template_transform::{
+    html_ast_to_render3_ast, BindingParser, Render3ParseOptions,
+};
+use render3::util::{R3CompiledExpression, R3Reference};
+use render3::view::compiler::{
+    compile_component_from_metadata, ChangeDetection, ChangeDetectionStrategy, ComponentTemplate,
+    DeclarationListEmitMode, Deps, Lifecycle, OrderedMap, R3ComponentDeferMetadata,
+    R3ComponentMetadata, R3DirectiveMetadata, R3HostMetadata, R3TemplateDependencyMetadata,
+    StubHostBindingsBuilder, ViewEncapsulation,
+};
+
+use crate::treaty::ast::AstNode;
+use crate::treaty::lexer::Lexer;
+use crate::treaty::parser::Parser;
+
+/// The three source kinds extracted from a `.treaty` file.
+#[derive(Debug, Default)]
+struct TreatyChunks {
+    javascript: Vec<String>,
+    html: Vec<String>,
+    css: Vec<String>,
+}
+
+/// Lex + parse `source` and bucket its nodes into JavaScript / HTML / CSS chunks.
+///
+/// Uses the crate's own treaty lexer/parser (no regex). The treaty lexer keeps `{{ … }}`
+/// interpolation *inside* the surrounding HTML chunk, so the HTML bucket is a faithful template.
+fn split_chunks(source: &str) -> TreatyChunks {
+    let mut lexer = Lexer::new(source);
+    let mut tokens = Vec::new();
+    while let Some(token) = lexer.next_token() {
+        tokens.push(token);
+    }
+
+    let mut parser = Parser::new(tokens);
+    let ast = parser.parse();
+
+    let mut chunks = TreatyChunks::default();
+    for node in ast.nodes {
+        match node {
+            AstNode::JavaScript(code) => chunks.javascript.push(code),
+            AstNode::Html(html) => chunks.html.push(html),
+            AstNode::Style(style) => chunks.css.push(style),
+            // Top-level interpolation/control-flow markers are not standalone template chunks in
+            // the common case (they live inside an HTML chunk); the bare markers carry no body and
+            // are ignored here.
+            AstNode::TemplateExpression(_) | AstNode::ControlFlow(_) | AstNode::EOF => {}
+        }
+    }
+    chunks
+}
+
+/// PascalCase the *stem* of a file name (extension and path separators dropped).
+///
+/// `"hello-world.treaty"` -> `"HelloWorld"`, `"my_widget.treaty"` -> `"MyWidget"`.
+fn to_pascal_case(file_name: &str) -> String {
+    // Drop directory components and the extension.
+    let base = file_name
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(file_name);
+    let stem = base.split('.').next().unwrap_or(base);
+
+    let mut out = String::new();
+    let mut new_word = true;
+    for ch in stem.chars() {
+        if ch.is_ascii_alphanumeric() {
+            if new_word {
+                out.extend(ch.to_uppercase());
+                new_word = false;
+            } else {
+                out.push(ch);
+            }
+        } else {
+            // Any separator (space, '-', '_', etc.) starts a new word.
+            new_word = true;
+        }
+    }
+
+    if out.is_empty() {
+        "TreatyComponent".to_string()
+    } else {
+        out
+    }
+}
+
+fn class_ref(class_name: &str) -> R3Reference {
+    R3Reference {
+        value: o::variable(class_name, None),
+        ty: o::variable(class_name, None),
+    }
+}
+
+/// Compile a `.treaty` SFC source into its Ivy `ɵɵdefineComponent` definition.
+///
+/// `file_name` derives the component class name (PascalCase of the stem). The component is
+/// standalone, selectorless (class-name based), with the HTML chunk as its template and the CSS
+/// chunk as its styles.
+pub fn compile_treaty_file(source: &str, file_name: &str) -> CompiledComponent {
+    let chunks = split_chunks(source);
+    let class_name = to_pascal_case(file_name);
+
+    let template_html = chunks.html.join("");
+    // Match the TS pipeline: strip newlines/tabs from collected CSS.
+    let styles: Vec<String> = chunks
+        .css
+        .iter()
+        .map(|s| s.replace(['\n', '\r', '\t'], ""))
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let mut errors: Vec<String> = Vec::new();
+
+    // 1. Template HTML -> HTML AST.
+    let parse_result = render3::ml_parser::parse(&template_html, "template.html");
+    for e in &parse_result.errors {
+        errors.push(e.msg.clone());
+    }
+
+    // 2. HTML AST -> r3_ast. The binder resolves selectorless component refs by class name and
+    //    collects dependencies automatically (no manual imports).
+    let mut binding_parser = BindingParser::new();
+    let r3 = html_ast_to_render3_ast(
+        &parse_result.root_nodes,
+        &mut binding_parser,
+        Render3ParseOptions::default(),
+    );
+    for e in &r3.errors {
+        errors.push(e.msg.clone());
+    }
+
+    // 3. Standalone, selectorless component metadata.
+    let base = R3DirectiveMetadata {
+        name: class_name.clone(),
+        ty: class_ref(&class_name),
+        type_argument_count: 0,
+        type_source_span: ParseSourceSpan::new(0, 0),
+        deps: Deps::None,
+        // SELECTORLESS: no selector → resolution is class-name based.
+        selector: None,
+        queries: Vec::new(),
+        view_queries: Vec::new(),
+        host: R3HostMetadata::default(),
+        lifecycle: Lifecycle::default(),
+        inputs: OrderedMap::new(),
+        outputs: OrderedMap::new(),
+        uses_inheritance: false,
+        control_create: None,
+        export_as: None,
+        providers: None,
+        is_standalone: true,
+        is_signal: false,
+        host_directives: None,
+        legacy_optional_chaining: false,
+    };
+
+    let mut meta: R3ComponentMetadata<R3TemplateDependencyMetadata> = R3ComponentMetadata {
+        base,
+        template: ComponentTemplate {
+            nodes: r3.nodes,
+            ng_content_selectors: r3.ng_content_selectors,
+            preserve_whitespaces: None,
+        },
+        declarations: Vec::new(),
+        defer: R3ComponentDeferMetadata::PerComponent {
+            dependencies_fn: None,
+        },
+        declaration_list_emit_mode: DeclarationListEmitMode::Direct,
+        styles,
+        external_styles: None,
+        encapsulation: ViewEncapsulation::Emulated,
+        animations: None,
+        view_providers: None,
+        relative_context_file_path: file_name.to_string(),
+        i18n_use_external_ids: false,
+        change_detection: Some(ChangeDetection::Strategy(ChangeDetectionStrategy::OnPush)),
+        relative_template_path: None,
+        has_directive_dependencies: false,
+        raw_imports: None,
+        foreign_imports: None,
+    };
+
+    // 4. Emit the definition.
+    let mut template_builder = RealTemplateBuilder;
+    let mut host_builder = StubHostBindingsBuilder;
+    let mut pool_statements = Vec::new();
+    let compiled: R3CompiledExpression = compile_component_from_metadata(
+        &mut meta,
+        &mut template_builder,
+        &mut host_builder,
+        &mut pool_statements,
+    );
+
+    let code = emit_expression(&compiled.expression);
+    CompiledComponent { code, errors }
+}
+
+// ---------------------------------------------------------------------------
+// Tests.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DEFINE: &str = "\u{0275}\u{0275}defineComponent";
+
+    #[test]
+    fn pascal_case_from_file_name() {
+        assert_eq!(to_pascal_case("hello-world.treaty"), "HelloWorld");
+        assert_eq!(to_pascal_case("my_widget.treaty"), "MyWidget");
+        assert_eq!(to_pascal_case("src/foo/Bar.treaty"), "Bar");
+        assert_eq!(to_pascal_case("name"), "Name");
+    }
+
+    #[test]
+    fn compiles_treaty_file_template_and_interpolation() {
+        let source = "const name = 'World';\n<div>{{ name }}</div>";
+        let out = compile_treaty_file(source, "greeting.treaty");
+
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+
+        // Emits a real ɵɵdefineComponent with a real template fn.
+        assert!(code.contains(DEFINE), "no defineComponent; got: {code}");
+        assert!(code.contains("Greeting"), "class name missing; got: {code}");
+        assert!(code.contains("Greeting_Template"), "no template fn; got: {code}");
+        // The interpolation binds against the component context.
+        assert!(
+            code.contains("\u{0275}\u{0275}textInterpolate"),
+            "no interpolation instruction; got: {code}"
+        );
+        assert!(code.contains("ctx.name"), "did not bind ctx.name; got: {code}");
+    }
+
+    #[test]
+    fn compiles_treaty_file_with_styles() {
+        let source = "<div>hi</div>\n<style>.box {\n color: red;\n}</style>";
+        let out = compile_treaty_file(source, "boxed.treaty");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+        assert!(code.contains(DEFINE), "no defineComponent; got: {code}");
+        assert!(code.contains("styles"), "no styles emitted; got: {code}");
+    }
+}

@@ -43,33 +43,32 @@ from our output. Top entry = implement first to raise the score.
 
 | Count | Category (instruction / shape at first missing fragment) |
 | --- | --- |
-| 20 | `ɵɵtext` |
+| 18 | `ɵɵtext` |
 | 17 | `misc-shape` |
 | 11 | `ɵɵelement` |
-| 9 | `ɵɵdomElementStart` |
-| 8 | `ɵɵdeclareLet` |
+| 10 | `ɵɵdomElementStart` |
+| 9 | `ɵɵdeclareLet` |
+| 5 | `def-header-counts` |
 | 4 | `ɵɵconditionalCreate` |
-| 3 | `def-header-counts` |
 | 3 | `ɵɵi18nPostprocess` |
-| 3 | `nested-fn-shape` |
 | 3 | `ɵɵprojectionDef` |
 | 2 | `ɵɵelementStart` |
+| 2 | `ɵɵgetCurrentView` |
 | 2 | `ɵɵrepeaterCreate` |
 | 2 | `ɵɵtemplate` |
 | 1 | `ɵɵcontentQuerySignal` |
-| 1 | `ɵɵgetCurrentView` |
-| 1 | `ɵɵreference` |
+| 1 | `nested-fn-shape` |
 | 1 | `ɵɵforeignComponent` |
 
 ### Sample diverging cases
 
-- **`ɵɵtext`** (20):
-  - r3_view_compiler_listener/should not generate restore/reset view when listener does not use @let in the same scope
-    - near: `&2){constID=123;ɵɵadvance();ɵɵtext`
+- **`ɵɵtext`** (18):
   - r3_view_compiler_let/should create a simple @let declaration
-    - near: `&2){constID=ctx.value*2;ɵɵtextInte`
+    - near: `cls:1,vars:1,template:functionMyAp`
   - r3_view_compiler_let/should create multiple @let declarations that depend on each other
-    - near: `&2){constID=ctx.value+1;constID=ID`
+    - near: `cls:1,vars:1,template:functionMyAp`
+  - r3_view_compiler_let/should remove a single unused let declaration
+    - near: `cls:2,vars:2,template:functionMyAp`
 - **`misc-shape`** (17):
   - r3_view_compiler_styling/component_styles/should pass in the component metadata styles into the component definition but skip shimming when style encapsulation is set to shadow dom
     - near: `styles:["div.cool{color:blue;}",`
@@ -84,34 +83,34 @@ from our output. Top entry = implement first to raise the score.
     - near: `){ɵɵelement(0,"div");}if(rf&2){ɵɵs`
   - r3_view_compiler_styling/component_animations/should generate any animation triggers into the component template
     - near: `ars:3,template:functionMyComponent`
-- **`ɵɵdomElementStart`** (9):
+- **`ɵɵdomElementStart`** (10):
+  - r3_view_compiler_listener/should not generate restore/reset view when listener does not use @let in the same scope
+    - near: `cls:2,vars:1,consts:[[3,"click"]],`
   - r3_view_compiler_let/should handle an @let used only directly inside i18n
     - near: `sts:()=>{letID;if(typeofngI18nClos`
   - r3_view_compiler_let/should handle an @let referenced inside a child view inside i18n
     - near: `cls:4,vars:1,consts:()=>{letID;if(`
-  - r3_view_compiler_let/should handle an @let preceded by an element with i18n
-    - near: `cls:4,vars:2,consts:()=>{letID;if(`
-- **`ɵɵdeclareLet`** (8):
+- **`ɵɵdeclareLet`** (9):
   - r3_view_compiler_let/should create a let using a pipe
     - near: `cls:3,vars:3,template:functionMyAp`
   - r3_view_compiler_let/should share let declarations between parent and child views
-    - near: `cls:3,vars:2,template:functionMyAp`
-  - r3_view_compiler_let/should not optimize away declareLet if expression is using a pipe
-    - near: `cls:3,vars:3,template:functionMyAp`
-- **`ɵɵconditionalCreate`** (4):
-  - r3_view_compiler_let/should be able to use let declarations in child views
-    - near: `cls:2,vars:2,template:functionMyAp`
-  - r3_view_compiler_let/should give precedence to local @let definition over one from a parent view
-    - near: `tx){if(rf&1){ɵɵconditionalCreate(0`
-  - r3_view_compiler_arrow_functions/should handle arrow function with optional reads in nested views
-    - near: `tx){if(rf&1){ɵɵconditionalCreate(0`
-- **`def-header-counts`** (3):
-  - r3_view_compiler_let/should be able to use let declarations in event listeners
-    - near: `cls:3,vars:2,`
+    - near: `tx){if(rf&1){ɵɵdeclareLet(0);ɵɵtex`
   - r3_view_compiler_let/should be able to use let declarations in event listeners inside child views
-    - near: `cls:2,vars:1,`
+    - near: `tx){if(rf&1){ɵɵdeclareLet(0);ɵɵdom`
+- **`def-header-counts`** (5):
+  - r3_view_compiler_let/should be able to use local references in let declarations
+    - near: `cls:5,vars:1,`
+  - r3_view_compiler_let/should be able to use forward references defined after the let declaration
+    - near: `cls:3,vars:1,`
   - r3_view_compiler_let/should not remove let declarations that are only used in an event listener
     - near: `cls:4,vars:3,`
+- **`ɵɵconditionalCreate`** (4):
+  - r3_view_compiler_let/should be able to use let declarations in child views
+    - near: `tx){if(rf&1){ɵɵconditionalCreate(0`
+  - r3_view_compiler_let/should give precedence to local @let definition over one from a parent view
+    - near: `cls:1,vars:1,template:functionMyAp`
+  - r3_view_compiler_arrow_functions/should handle arrow function with optional reads in nested views
+    - near: `tx){if(rf&1){ɵɵconditionalCreate(0`
 - **`ɵɵi18nPostprocess`** (3):
   - r3_view_compiler_let/should handle an @let referenced inside i18n and in a child view
     - near: `cls:4,vars:2,consts:()=>{letID;if(`
@@ -119,13 +118,6 @@ from our output. Top entry = implement first to raise the score.
     - near: `sts:()=>{leti18n_0;if(typeofngI18n`
   - r3_view_compiler_i18n/blocks/should support @switch blocks
     - near: `sts:()=>{leti18n_0;if(typeofngI18n`
-- **`nested-fn-shape`** (3):
-  - r3_compiler_compliance/components_and_directives/value_composition/should support spread elements in array literals
-    - near: `ars:17,template:functionArrayComp_`
-  - r3_compiler_compliance/components_and_directives/value_composition/should support object literals with spread assignments
-    - near: `ars:19,template:functionObjectComp`
-  - r3_compiler_compliance/components_and_directives/value_composition/should support rest arguments in a function call
-    - near: `ars:7,template:functionTestComp_Te`
 - **`ɵɵprojectionDef`** (3):
   - r3_compiler_compliance/components_and_directives/content_projection/should support multi-slot content projection with multiple wildcard slots
     - near: `({,selectors:[["ng-component"]],st`
@@ -138,6 +130,11 @@ from our output. Top entry = implement first to raise the score.
     - near: `s:1,template:functionMyComponent_T`
   - r3_view_compiler_i18n/blocks/should support @for blocks
     - near: `sts:()=>{leti18n_0;if(typeofngI18n`
+- **`ɵɵgetCurrentView`** (2):
+  - r3_view_compiler_listener/local refs in listeners defined before the local refs
+    - near: `s:[["user",""],[AM,"click"]],templ`
+  - r3_view_compiler_let/should be able to use let declarations in event listeners
+    - near: `&1){constID=ɵɵgetCurrentView();ɵɵd`
 - **`ɵɵrepeaterCreate`** (2):
   - r3_view_compiler_let/should be able to use for loop variables in let declarations
     - near: `tx){if(rf&1){ɵɵrepeaterCreate(0,My`
@@ -151,12 +148,9 @@ from our output. Top entry = implement first to raise the score.
 - **`ɵɵcontentQuerySignal`** (1):
   - signal_queries/should generate signal based query instructions for a component
     - near: `contentQueries:functionTestComp`
-- **`ɵɵgetCurrentView`** (1):
-  - r3_view_compiler_listener/local refs in listeners defined before the local refs
-    - near: `s:[["user",""],[AM,"click"]],templ`
-- **`ɵɵreference`** (1):
-  - r3_view_compiler_let/should be able to use forward references defined after the let declaration
-    - near: `&2){constID=ɵɵreference(2);constID`
+- **`nested-fn-shape`** (1):
+  - r3_compiler_compliance/components_and_directives/value_composition/should support rest arguments in a function call
+    - near: `ars:7,template:functionTestComp_Te`
 - **`ɵɵforeignComponent`** (1):
   - r3_compiler_compliance/components_and_directives/standalone/should properly compile foreign component imports in a standalone component
     - near: `ars:0,template:functionTestCmp_Tem`

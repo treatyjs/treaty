@@ -5,6 +5,7 @@ edition = "2024"
 
 
 [dependencies]
+render3 = { path = "../../../libs/render3" }
 oxc = "0.133.0"
 oxc_allocator = "0.133.0"
 oxc_parser = "0.133.0"
