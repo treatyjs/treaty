@@ -7,7 +7,9 @@
 
 pub mod angular;
 pub mod angular_source;
+pub mod authoring;
 pub mod html;
+pub mod jsx;
 pub mod plugin;
 pub mod sfc;
 pub mod treaty;

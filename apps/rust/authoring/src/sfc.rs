@@ -41,7 +41,8 @@ use render3::view::compiler::{
     compile_component_from_metadata, ChangeDetection, ChangeDetectionStrategy, ComponentTemplate,
     DeclarationListEmitMode, Deps, Lifecycle, OrderedMap, R3ComponentDeferMetadata,
     R3ComponentMetadata, R3DirectiveMetadata, R3HostMetadata, R3InputMetadata,
-    R3TemplateDependencyMetadata, StubHostBindingsBuilder, ViewEncapsulation,
+    R3TemplateDependencyKind, R3TemplateDependencyMetadata, StubHostBindingsBuilder,
+    ViewEncapsulation,
 };
 
 use crate::plugin::{extract_server_block, rewrite_call_sites, BackendPlugin, ElysiaEdenPlugin};
@@ -391,8 +392,9 @@ pub fn compile_treaty_file(source: &str, file_name: &str) -> CompiledComponent {
     let class_name = to_pascal_case(file_name);
 
     let template_html = chunks.html.join("");
+    let javascript = chunks.javascript.join("");
 
-    let mut errors: Vec<String> = Vec::new();
+    let mut style_errors: Vec<String> = Vec::new();
 
     // Build the component styles. A `<style lang="scss">` / `lang="sass"` chunk is compiled to CSS
     // with the pure-Rust `grass` sass implementation; plain CSS (no lang) passes through unchanged.
@@ -409,7 +411,7 @@ pub fn compile_treaty_file(source: &str, file_name: &str) -> CompiledComponent {
                 match grass::from_string(chunk.content.clone(), &options) {
                     Ok(css) => css,
                     Err(e) => {
-                        errors.push(format!("sass: {e}"));
+                        style_errors.push(format!("sass: {e}"));
                         continue;
                     }
                 }
@@ -426,15 +428,82 @@ pub fn compile_treaty_file(source: &str, file_name: &str) -> CompiledComponent {
     // them explicitly out of the runtime JS/template/CSS output without being silently discarded.
     let _macros: &[String] = &chunks.macros;
 
+    // The resolved CSS chunks join into a single `styles` string for the shared render3 backend.
+    // Current `.treaty` sources carry at most one style chunk, so this round-trips byte-identically.
+    let styles = styles.join("");
+
+    let mut compiled = compile_from_parts(&class_name, &javascript, &template_html, &styles, file_name);
+    // Surface any sass diagnostics ahead of the template diagnostics from the backend.
+    if !style_errors.is_empty() {
+        let mut errors = style_errors;
+        errors.extend(compiled.errors);
+        compiled.errors = errors;
+    }
+    compiled
+}
+
+/// Compile a component from already-split parts into the `ɵɵdefineComponent` ES module.
+///
+/// This is the render3-backend half of [`compile_treaty_file`], factored out so any authoring
+/// front-end (the `.treaty` lexer, a JSX transpiler, …) can lower its source to a component class
+/// name, a JavaScript body, an Angular template HTML string, and resolved CSS, then reuse the same
+/// Ivy codegen path. `styles` is the final CSS (any preprocessor compilation already done); it is
+/// emitted as the component's single `styles` entry when non-empty.
+///
+/// Pipeline (identical to the back half of the `.treaty` path):
+/// ```text
+/// render3::ml_parser::parse(template_html)        -> HTML AST
+/// html_ast_to_render3_ast                          -> r3 AST
+/// resolve_template_dependencies(imports, template) -> auto dependencies
+/// compile_component_from_metadata                  -> ɵɵdefineComponent
+/// build_module                                     -> runnable ES module
+/// ```
+pub fn compile_from_parts(
+    class_name: &str,
+    javascript: &str,
+    template_html: &str,
+    styles: &str,
+    file_name: &str,
+) -> CompiledComponent {
+    compile_from_parts_with_directives(class_name, javascript, template_html, styles, file_name, &[])
+}
+
+/// Like [`compile_from_parts`], but with an additional set of directive class names that the
+/// front-end resolved by selectorless auto-import (e.g. the JSX directive syntaxes lowered in
+/// [`crate::jsx::directives`]).
+///
+/// These names are merged into the component's `dependencies` in addition to the component/directive
+/// references the render3 binder discovers in the template. A directive applied via an attribute
+/// (`use:tooltip`, `<input Autofocus/>`, `*highlight`) lowers to plain attribute markup that the
+/// instruction parser accepts but that the selectorless binder cannot itself attribute back to a
+/// class — so the class names are threaded explicitly here. Each name still only becomes a
+/// dependency when it was actually applied in the template (the front-end only collects applied
+/// directives), preserving the "unused imports are not emitted" contract. Names are deduplicated and
+/// appended after the binder-resolved dependencies, in first-seen order.
+pub fn compile_from_parts_with_directives(
+    class_name: &str,
+    javascript: &str,
+    template_html: &str,
+    styles: &str,
+    file_name: &str,
+    extra_directives: &[String],
+) -> CompiledComponent {
+    let mut errors: Vec<String> = Vec::new();
+
+    let style_list: Vec<String> = if styles.is_empty() {
+        Vec::new()
+    } else {
+        vec![styles.to_string()]
+    };
+
     // 0. Extract signal inputs/outputs from the component-body JS chunk.
     let mut inputs: OrderedMap<String, R3InputMetadata> = OrderedMap::new();
     let mut outputs: OrderedMap<String, String> = OrderedMap::new();
-    let javascript = chunks.javascript.join("");
-    extract_io(&javascript, &mut inputs, &mut outputs);
+    extract_io(javascript, &mut inputs, &mut outputs);
     let is_signal = inputs.iter().any(|(_, m)| m.is_signal);
 
     // 1. Template HTML -> HTML AST.
-    let parse_result = render3::ml_parser::parse(&template_html, "template.html");
+    let parse_result = render3::ml_parser::parse(template_html, "template.html");
     for e in &parse_result.errors {
         errors.push(e.msg.clone());
     }
@@ -455,16 +524,32 @@ pub fn compile_treaty_file(source: &str, file_name: &str) -> CompiledComponent {
     // chunk's imported identifiers; those actually referenced as `<Foo>` / `@Foo` / `<foo>` in the
     // template (via the selectorless binder) become the component's `dependencies`. Unused imports
     // are not emitted — mirroring `treat-to-ivy.ts`, but via the AST + binder rather than regex.
-    let candidates = collect_imported_names(&javascript);
-    let selectorless_nodes = render3::compile::parse_template_selectorless(&template_html);
-    let declarations =
+    let candidates = collect_imported_names(javascript);
+    let selectorless_nodes = render3::compile::parse_template_selectorless(template_html);
+    let mut declarations =
         render3::compile::resolve_template_dependencies(&candidates, &selectorless_nodes);
+
+    // Append the front-end-resolved directive dependencies (the JSX directive syntaxes). These were
+    // applied as plain attribute markup, which the selectorless binder cannot attribute back to a
+    // class, so they are merged in here. Skip any already present (e.g. a directive also written as
+    // a `<Foo>` selectorless tag) to keep the dependency list unique.
+    for name in extra_directives {
+        let already = declarations.iter().any(|d| {
+            matches!(&d.ty.kind, render3::output_ast::ExprKind::ReadVar { name: n } if n == name)
+        });
+        if !already {
+            declarations.push(R3TemplateDependencyMetadata {
+                kind: R3TemplateDependencyKind::Directive,
+                ty: o::variable(name, None),
+            });
+        }
+    }
     let has_directive_dependencies = !declarations.is_empty();
 
     // 3. Standalone, selectorless component metadata.
     let base = R3DirectiveMetadata {
-        name: class_name.clone(),
-        ty: class_ref(&class_name),
+        name: class_name.to_string(),
+        ty: class_ref(class_name),
         type_argument_count: 0,
         type_source_span: ParseSourceSpan::new(0, 0),
         deps: Deps::None,
@@ -498,7 +583,7 @@ pub fn compile_treaty_file(source: &str, file_name: &str) -> CompiledComponent {
             dependencies_fn: None,
         },
         declaration_list_emit_mode: DeclarationListEmitMode::Direct,
-        styles,
+        styles: style_list,
         external_styles: None,
         encapsulation: ViewEncapsulation::Emulated,
         animations: None,
@@ -524,7 +609,7 @@ pub fn compile_treaty_file(source: &str, file_name: &str) -> CompiledComponent {
     );
 
     let cmp_expression = emit_expression(&compiled.expression);
-    let code = build_module(&class_name, &javascript, &cmp_expression);
+    let code = build_module(class_name, javascript, &cmp_expression);
     CompiledComponent { code, errors }
 }
 
