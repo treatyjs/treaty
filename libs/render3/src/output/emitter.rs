@@ -22,12 +22,17 @@
 //! `BinaryExpression` / `LogicalExpression` / `AssignmentExpression`, so
 //! [`Lowerer::lower_binary`] dispatches to three different node builders.
 //!
-//! # Fallbacks (no `todo!()`)
-//! A handful of `output_ast` node kinds are not yet lowered to a faithful oxc node
-//! (i18n `LocalizedString`, `WrappedNode` foreign handles, regex literals, dynamic
-//! import). Rather than panic, [`Lowerer`] emits a clearly-named placeholder
-//! identifier (e.g. `__unsupported_LocalizedString`) so emission never aborts and
-//! the gap is visible in output. These are enumerated in the module-level notes.
+//! # Template / i18n / regex / dynamic-import lowering
+//! Regular-expression literals lower to a real `oxc_ast` [`RegExp`] literal,
+//! template literals to a real [`TemplateLiteral`], tagged template literals to a
+//! `TaggedTemplateExpression`, dynamic imports to a real `ImportExpression`
+//! (`import(url)`), and i18n `LocalizedString`s to the faithful `$localize`
+//! *tagged-template* form (`$localize\`:meta:head${expr}tail\``) Angular's
+//! `AbstractEmitterVisitor.visitLocalizedString` produces — including the
+//! `serializeI18nHead` / `serializeI18nTemplatePart` cooked/raw metadata blocks.
+//! The only remaining placeholder is `WrappedNode` (an opaque foreign-AST handle
+//! with no `output_ast`-level payload to lower); it emits a clearly-named
+//! `__unsupported_WrappedNode` identifier so emission never aborts.
 
 use std::cell::RefCell;
 
@@ -37,7 +42,8 @@ use oxc_ast::ast::{
     Argument, ArrayExpressionElement, AssignmentOperator, AssignmentTarget, BinaryOperator as OxBin,
     BindingPattern, Declaration, Expression, FormalParameterKind, FunctionBody, FunctionType,
     ImportOrExportKind, LogicalOperator, NumberBase, ObjectPropertyKind, PropertyKey, PropertyKind,
-    SimpleAssignmentTarget, Statement, UnaryOperator as OxUn, VariableDeclarationKind,
+    RegExp, RegExpFlags, RegExpPattern, SimpleAssignmentTarget, Statement, TemplateElement,
+    TemplateElementValue, TemplateLiteral, UnaryOperator as OxUn, VariableDeclarationKind,
 };
 use oxc_codegen::Codegen;
 use oxc_span::{SourceType, SPAN};
@@ -516,35 +522,159 @@ impl<'a> Lowerer<'a> {
 
             ExprKind::Arrow { params, body } => self.lower_arrow(params, body),
 
-            // -- not-yet-lowered node kinds: emit a visible placeholder ------
-            ExprKind::TaggedTemplate { .. } => self.unsupported("TaggedTemplate"),
-            ExprKind::TemplateLiteral { .. } => self.unsupported("TemplateLiteral"),
-            ExprKind::TemplateLiteralElement(_) => self.unsupported("TemplateLiteralElement"),
-            ExprKind::LocalizedString { .. } => self.unsupported("LocalizedString"),
-            ExprKind::RegExpLiteral { .. } => self.unsupported("RegExpLiteral"),
+            ExprKind::TemplateLiteral {
+                elements,
+                expressions,
+            } => self.lower_template_literal(elements, expressions),
+
+            // A standalone template-literal element is only meaningful inside a
+            // `TemplateLiteral`; emit it as a single-quasi template literal so the
+            // text is preserved and well-formed.
+            ExprKind::TemplateLiteralElement(el) => {
+                self.lower_template_literal(std::slice::from_ref(el), &[])
+            }
+
+            ExprKind::TaggedTemplate { tag, template } => {
+                let tag_expr = self.lower_expr(tag);
+                // `template` is always a `TemplateLiteral` node; build the quasi.
+                let quasi = match &template.kind {
+                    ExprKind::TemplateLiteral {
+                        elements,
+                        expressions,
+                    } => self.template_literal_node(elements, expressions),
+                    // Defensive: a non-template payload degrades to an empty quasi.
+                    _ => self.template_literal_node(&[], &[]),
+                };
+                self.ast
+                    .expression_tagged_template(SPAN, tag_expr, oxc_ast::NONE, quasi)
+            }
+
+            ExprKind::RegExpLiteral { body, flags } => {
+                let pattern_text = self.ast.str(body);
+                let regexp = RegExp {
+                    pattern: RegExpPattern {
+                        text: pattern_text,
+                        pattern: None,
+                    },
+                    flags: parse_regexp_flags(flags.as_deref().unwrap_or("")),
+                };
+                // `raw` lets codegen print `/body/flags` verbatim.
+                let raw_text = match flags {
+                    Some(f) => format!("/{body}/{f}"),
+                    None => format!("/{body}/"),
+                };
+                let raw = self.ast.str(&raw_text);
+                self.ast.expression_reg_exp_literal(SPAN, regexp, Some(raw))
+            }
+
+            // i18n `LocalizedString` -> the `$localize` tagged-template form (the
+            // faithful, non-downlevelled output of Angular's
+            // `AbstractEmitterVisitor.visitLocalizedString`):
+            // `$localize\`:meta:part0${e0}part1...\``. The cooked/raw of each quasi
+            // come from `serialize_i18n_head` / `serialize_i18n_template_part`.
+            ExprKind::LocalizedString {
+                meta,
+                message_parts,
+                placeholders,
+                expressions,
+            } => self.lower_localized_string(meta, message_parts, placeholders, expressions),
+
+            // `WrappedNode` is an opaque foreign-AST handle with no output_ast-level
+            // payload to lower to an oxc node; keep the visible placeholder.
             ExprKind::WrappedNode(_) => self.unsupported("WrappedNode"),
+
             ExprKind::DynamicImport { url, .. } => {
-                // `import(<url>)` — model as a call to the `import` keyword-ident so
-                // output is recognizable even though it is not a true ImportExpression.
-                let callee = self.ident_expr("import");
-                let mut arguments = self.ast.vec_with_capacity(1);
-                let url_expr = match url {
+                // A real `import(<url>)` ImportExpression.
+                let source = match url {
                     ImportUrl::Str(s) => {
                         let v = self.ast.str(s);
                         self.ast.expression_string_literal(SPAN, v, None)
                     }
                     ImportUrl::Expr(e) => self.lower_expr(e),
                 };
-                arguments.push(self.arg(url_expr));
-                self.ast.expression_call(
-                    SPAN,
-                    callee,
-                    oxc_ast::NONE,
-                    arguments,
-                    false,
-                )
+                self.ast.expression_import(SPAN, source, None, None)
             }
         }
+    }
+
+    /// Build a real `oxc_ast` [`TemplateLiteral`] expression from `output_ast`
+    /// elements + interpolated expressions (mirrors `visitTemplateLiteralExpr`).
+    fn lower_template_literal(
+        &self,
+        elements: &[o::TemplateLiteralElement],
+        expressions: &[o::Expr],
+    ) -> Expression<'a> {
+        let quasi = self.template_literal_node(elements, expressions);
+        Expression::TemplateLiteral(self.ast.alloc(quasi))
+    }
+
+    /// Build the `TemplateLiteral` AST node (shared by template + tagged-template).
+    /// The N quasis interleave with N-1 expressions; the final quasi is `tail=true`.
+    fn template_literal_node(
+        &self,
+        elements: &[o::TemplateLiteralElement],
+        expressions: &[o::Expr],
+    ) -> TemplateLiteral<'a> {
+        let mut quasis = self.ast.vec_with_capacity(elements.len().max(1));
+        let mut exprs = self.ast.vec_with_capacity(expressions.len());
+
+        if elements.is_empty() {
+            // A template literal must always have at least one quasi.
+            quasis.push(self.template_element("", "", true));
+        } else {
+            let last = elements.len() - 1;
+            for (i, el) in elements.iter().enumerate() {
+                quasis.push(self.template_element(&el.text, &el.raw_text, i == last));
+                if let Some(e) = expressions.get(i) {
+                    exprs.push(self.lower_expr(e));
+                }
+            }
+        }
+        self.ast.template_literal(SPAN, quasis, exprs)
+    }
+
+    /// Build a `TemplateElement` with explicit cooked + raw text (raw passed
+    /// through verbatim; the caller is responsible for any escaping).
+    fn template_element(&self, cooked: &str, raw: &str, tail: bool) -> TemplateElement<'a> {
+        let value = TemplateElementValue {
+            raw: self.ast.str(raw),
+            cooked: Some(self.ast.str(cooked)),
+        };
+        self.ast.template_element(SPAN, value, tail, false)
+    }
+
+    /// Lower a `LocalizedString` to `$localize\`...\`` as a `TaggedTemplateExpression`
+    /// whose tag is the `$localize` identifier. The quasi's first part carries the
+    /// serialized meta block (`serialize_i18n_head`); each subsequent part carries
+    /// the placeholder meta block (`serialize_i18n_template_part`).
+    fn lower_localized_string(
+        &self,
+        meta: &o::I18nMeta,
+        message_parts: &[o::LiteralPiece],
+        placeholders: &[o::PlaceholderPiece],
+        expressions: &[o::Expr],
+    ) -> Expression<'a> {
+        let tag = self.ident_expr("$localize");
+        let n = message_parts.len();
+        let mut quasis = self.ast.vec_with_capacity(n.max(1));
+        let mut exprs = self.ast.vec_with_capacity(expressions.len());
+
+        if message_parts.is_empty() {
+            quasis.push(self.template_element("", "", true));
+        } else {
+            let head = serialize_i18n_head(meta, &message_parts[0].text);
+            quasis.push(self.template_element(&head.0, &head.1, n == 1));
+            for i in 1..n {
+                if let Some(e) = expressions.get(i - 1) {
+                    exprs.push(self.lower_expr(e));
+                }
+                let part = serialize_i18n_template_part(&placeholders[i - 1], &message_parts[i].text);
+                quasis.push(self.template_element(&part.0, &part.1, i == n - 1));
+            }
+        }
+        let quasi = self.ast.template_literal(SPAN, quasis, exprs);
+        self.ast
+            .expression_tagged_template(SPAN, tag, oxc_ast::NONE, quasi)
     }
 
     fn lower_literal(&self, value: &LiteralValue) -> Expression<'a> {
@@ -776,6 +906,110 @@ fn binary_op(op: BinaryOperator) -> OxBin {
 }
 
 // ---------------------------------------------------------------------------
+// Regex flag parsing.
+// ---------------------------------------------------------------------------
+
+/// Parse a JS regex flag string (`"gi"`, `"sm"`, ...) into oxc [`RegExpFlags`].
+/// Unknown chars are ignored (oxc only models the standard `gimsuydv` set).
+fn parse_regexp_flags(flags: &str) -> RegExpFlags {
+    let mut out = RegExpFlags::empty();
+    for c in flags.chars() {
+        out |= match c {
+            'g' => RegExpFlags::G,
+            'i' => RegExpFlags::I,
+            'm' => RegExpFlags::M,
+            's' => RegExpFlags::S,
+            'u' => RegExpFlags::U,
+            'y' => RegExpFlags::Y,
+            'd' => RegExpFlags::D,
+            'v' => RegExpFlags::V,
+            _ => RegExpFlags::empty(),
+        };
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// `$localize` cooked/raw serialization (mirror output_ast.ts
+// `serializeI18nHead` / `serializeI18nTemplatePart` / `createCookedRawString`).
+// ---------------------------------------------------------------------------
+
+const MEANING_SEPARATOR: &str = "|";
+const ID_SEPARATOR: &str = "@@";
+const LEGACY_ID_INDICATOR: &str = "\u{241f}";
+
+fn escape_slashes(s: &str) -> String {
+    s.replace('\\', "\\\\")
+}
+fn escape_starting_colon(s: &str) -> String {
+    if let Some(rest) = s.strip_prefix(':') {
+        format!("\\:{rest}")
+    } else {
+        s.to_string()
+    }
+}
+fn escape_colons(s: &str) -> String {
+    s.replace(':', "\\:")
+}
+fn escape_for_template_literal(s: &str) -> String {
+    s.replace('`', "\\`").replace("${", "$\\{")
+}
+
+/// `createCookedRawString(metaBlock, messagePart)` -> `(cooked, raw)`.
+fn create_cooked_raw_string(meta_block: &str, message_part: &str) -> (String, String) {
+    if meta_block.is_empty() {
+        let cooked = message_part.to_string();
+        let raw = escape_for_template_literal(&escape_starting_colon(&escape_slashes(message_part)));
+        (cooked, raw)
+    } else {
+        let cooked = format!(":{meta_block}:{message_part}");
+        let raw = escape_for_template_literal(&format!(
+            ":{}:{}",
+            escape_colons(&escape_slashes(meta_block)),
+            escape_slashes(message_part)
+        ));
+        (cooked, raw)
+    }
+}
+
+/// `LocalizedString.serializeI18nHead()` -> `(cooked, raw)` for message part 0.
+/// The meta block is `meaning|description@@customId␟legacyId...` (each segment
+/// present only when set), per `parseI18nMeta`'s format.
+fn serialize_i18n_head(meta: &o::I18nMeta, first_part: &str) -> (String, String) {
+    let mut meta_block = meta.description.clone().unwrap_or_default();
+    if let Some(meaning) = meta.meaning.as_deref().filter(|m| !m.is_empty()) {
+        meta_block = format!("{meaning}{MEANING_SEPARATOR}{meta_block}");
+    }
+    if let Some(id) = meta.custom_id.as_deref().filter(|i| !i.is_empty()) {
+        meta_block = format!("{meta_block}{ID_SEPARATOR}{id}");
+    }
+    for legacy_id in &meta.legacy_ids {
+        meta_block = format!("{meta_block}{LEGACY_ID_INDICATOR}{legacy_id}");
+    }
+    create_cooked_raw_string(&meta_block, first_part)
+}
+
+/// `LocalizedString.serializeI18nTemplatePart(i)` -> `(cooked, raw)`. The meta
+/// block is `<placeholder-name>[@@<associated-id>]`, where the associated id is the
+/// computed message id of the associated (ICU) message when it has no legacy ids.
+fn serialize_i18n_template_part(
+    placeholder: &o::PlaceholderPiece,
+    message_part: &str,
+) -> (String, String) {
+    let mut meta_block = placeholder.text.clone();
+    if let Some(assoc) = &placeholder.associated_message {
+        if assoc.legacy_ids.is_empty() {
+            let id = crate::i18n::compute_msg_id(
+                &assoc.message_string,
+                assoc.meaning.as_deref().unwrap_or(""),
+            );
+            meta_block = format!("{meta_block}{ID_SEPARATOR}{id}");
+        }
+    }
+    create_cooked_raw_string(&meta_block, message_part)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -978,12 +1212,79 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_node_emits_placeholder_not_panic() {
+    fn regexp_literal_emits_real_regex() {
         let rx = o::Expr::bare(ExprKind::RegExpLiteral {
             body: "abc".to_string(),
-            flags: None,
+            flags: Some("gi".to_string()),
         });
         let out = emit_expression(&rx);
-        assert!(out.contains("__unsupported_RegExpLiteral"), "got: {out}");
+        assert!(out.contains("/abc/gi"), "got: {out}");
+    }
+
+    #[test]
+    fn wrapped_node_still_placeholder_not_panic() {
+        use crate::output_ast::WrappedNodeHandle;
+        let wn = o::Expr::bare(ExprKind::WrappedNode(WrappedNodeHandle(0)));
+        let out = emit_expression(&wn);
+        assert!(out.contains("__unsupported_WrappedNode"), "got: {out}");
+    }
+
+    #[test]
+    fn template_literal_emits_backticks_and_interpolation() {
+        use crate::output_ast::TemplateLiteralElement;
+        let tl = o::Expr::bare(ExprKind::TemplateLiteral {
+            elements: vec![
+                TemplateLiteralElement::new("a", None),
+                TemplateLiteralElement::new("b", None),
+            ],
+            expressions: vec![variable("x", None)],
+        });
+        let out = emit_expression(&tl);
+        assert!(out.contains('`'), "got: {out}");
+        assert!(out.contains("${"), "got: {out}");
+        assert!(out.contains('x'), "got: {out}");
+    }
+
+    #[test]
+    fn dynamic_import_emits_real_import_expression() {
+        use crate::output_ast::ImportUrl;
+        let di = o::Expr::bare(ExprKind::DynamicImport {
+            url: ImportUrl::Str("./chunk".to_string()),
+            url_comment: None,
+        });
+        let out = emit_expression(&di);
+        assert!(out.contains("import(") && out.contains("./chunk"), "got: {out}");
+    }
+
+    #[test]
+    fn localized_string_emits_dollar_localize_tagged_template() {
+        use crate::output_ast::{I18nMeta, LiteralPiece, ParseSourceSpan, PlaceholderPiece};
+        let sp = ParseSourceSpan::new(0, 0);
+        let ls = o::Expr::bare(ExprKind::LocalizedString {
+            meta: I18nMeta {
+                description: Some("greeting".to_string()),
+                meaning: Some("salute".to_string()),
+                custom_id: Some("xyz".to_string()),
+                legacy_ids: vec![],
+            },
+            message_parts: vec![
+                LiteralPiece { text: "Hello ".to_string(), source_span: sp.clone() },
+                LiteralPiece { text: "!".to_string(), source_span: sp.clone() },
+            ],
+            placeholders: vec![PlaceholderPiece {
+                text: "PH".to_string(),
+                source_span: sp.clone(),
+                associated_message: None,
+            }],
+            expressions: vec![variable("name", None)],
+        });
+        let out = emit_expression(&ls);
+        assert!(out.contains("$localize"), "got: {out}");
+        assert!(out.contains('`'), "got: {out}");
+        // Head meta block: meaning|description@@customId.
+        assert!(out.contains(":salute|greeting@@xyz:Hello "), "got: {out}");
+        // Placeholder meta block on the second part.
+        assert!(out.contains(":PH:!"), "got: {out}");
+        assert!(out.contains("${"), "got: {out}");
     }
 }

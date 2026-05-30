@@ -16,8 +16,13 @@
 //!   -> emit_expression                    (output_ast -> JS string via oxc_codegen)
 //! ```
 
+use std::cell::RefCell;
+
 use crate::output::emitter::emit_expression;
-use crate::output_ast::{self as o, Expr, ParseSourceSpan};
+use crate::output_ast::{
+    self as o, ArrowBody, Expr, ExprKind, ImportUrl, LiteralMapEntry, ParseSourceSpan, Stmt,
+    StmtKind, WrappedNodeHandle,
+};
 use crate::template::template_transform::{
     html_ast_to_render3_ast, BindingParser, Render3ParseOptions,
 };
@@ -57,8 +62,10 @@ impl TemplateBuilder for RealTemplateBuilder {
         let mut builder = TemplateDefinitionBuilder::new(&input);
         let template_fn = builder.build_template_function(&input);
 
-        // `decls` = number of allocated data slots. NOTE(port): the classic TDB also counts
-        // pipe/projection slots; this minimal builder allocates one slot per element/text node.
+        // `decls` = number of allocated data slots after the full walk. `data_index()` already
+        // includes the slots the classic TDB allocates for elements/text, projection anchors
+        // (`<ng-content>`) and pipes (`finalize_pipes` extends `data_index`), matching Angular's
+        // `getConstCount`/data allocation.
         let decls = builder.data_index() as u32;
         // `vars` = the binding-slot count the builder accumulated while emitting property /
         // interpolation bindings (`allocateBindingSlots`), matching Angular's `calculateBindingSlots`.
@@ -66,28 +73,90 @@ impl TemplateBuilder for RealTemplateBuilder {
 
         let consts = builder.const_pool().entries().to_vec();
 
+        // `ngContentSelectors` — the component-level projection selector list (Angular's
+        // `compileComponentFromMetadata` emits `asLiteral(meta.template.ngContentSelectors)` when
+        // any `<ng-content>` slot exists). The selectors were collected by the transform into
+        // `meta.template.ng_content_selectors` (`*` for the catch-all default slot).
+        let content_selectors = if meta.template.ng_content_selectors.is_empty() {
+            None
+        } else {
+            Some(o::literal_arr(
+                meta.template
+                    .ng_content_selectors
+                    .iter()
+                    .map(|s| o::literal(o::LiteralValue::String(s.clone()), None))
+                    .collect(),
+                None,
+            ))
+        };
+
         TemplateBuilderResult {
             template_fn,
             decls,
             vars,
             consts,
-            // NOTE(port): const initializers (e.g. i18n message vars) are not produced by the
-            // standalone builder yet.
+            // No separate const initializers: this pipeline interns i18n messages directly as
+            // `$localize` `LocalizedString` expressions in the const pool (see
+            // `TemplateDefinitionBuilder::intern_i18n_message`), so each message *is* its const-array
+            // entry. The `() => { var $I18N_0$ = goog.getMsg(...); return [...] }` initializer form is
+            // only used by the legacy closure/`goog.getMsg` const-pool path, which this `$localize`
+            // pipeline does not emit — hence there are genuinely no initializer statements here.
             consts_initializers: Vec::new(),
-            // NOTE(port): ngContentSelectors come from `<ng-content>` projection slots, not yet
-            // emitted by the standalone builder.
-            content_selectors: None,
+            content_selectors,
         }
     }
 }
 
-/// A "class reference" expression standing in for the component class symbol. NOTE(port): the real
-/// compiler threads a resolved `o.WrappedNodeExpr`/import here; a bare identifier read of the class
-/// name keeps the emitted definition well-formed.
+// ---------------------------------------------------------------------------
+// WrappedNodeExpr handle registry.
+//
+// In the real ngtsc pipeline an `R3Reference` to the component *class* is an `o.WrappedNodeExpr`
+// wrapping the resolved host (TypeScript) AST node for the class symbol; the emitter prints that
+// node as the class identifier. Our IR mirrors this with an opaque [`WrappedNodeHandle`] indexing a
+// side table of resolved host expressions ([`WrappedNode`](ExprKind::WrappedNode) — see
+// `output_ast.rs`).
+//
+// `class_ref` therefore registers the class identifier expression in this thread-local side table
+// and returns a `WrappedNode(handle)` reference (faithful to `new o.WrappedNodeExpr(classNode)`).
+// Because the JS emitter has no view of this side table, [`resolve_wrapped_nodes`] substitutes each
+// handle back to its registered expression just before emission, so the wrapped class node prints
+// as the class identifier exactly as ngtsc emits it.
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// Side table of host AST node expressions referenced by [`WrappedNodeHandle`], in allocation
+    /// order. Indexed by `handle.0`. Mirrors ngtsc's `WrappedNodeExpr.node` storage.
+    static WRAPPED_NODES: RefCell<Vec<Expr>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Register `expr` as a wrapped host node and return its `WrappedNode(handle)` reference.
+fn wrap_node(expr: Expr) -> Expr {
+    let handle = WRAPPED_NODES.with(|table| {
+        let mut table = table.borrow_mut();
+        let index = table.len() as u32;
+        table.push(expr);
+        WrappedNodeHandle(index)
+    });
+    Expr::bare(ExprKind::WrappedNode(handle))
+}
+
+/// Look up the registered host expression for a [`WrappedNodeHandle`].
+fn resolved_wrapped_node(handle: WrappedNodeHandle) -> Option<Expr> {
+    WRAPPED_NODES.with(|table| table.borrow().get(handle.0 as usize).cloned())
+}
+
+/// Clear the wrapped-node side table (called at the start of each component compilation so handles
+/// are stable and the table does not grow unboundedly across calls).
+fn reset_wrapped_nodes() {
+    WRAPPED_NODES.with(|table| table.borrow_mut().clear());
+}
+
+/// The component class reference: an `o.WrappedNodeExpr` wrapping the class identifier node (used
+/// for both the runtime `value` and the `.d.ts` `type`), faithful to ngtsc's `R3Reference`.
 fn class_ref(class_name: &str) -> R3Reference {
     R3Reference {
-        value: o::variable(class_name, None),
-        ty: o::variable(class_name, None),
+        value: wrap_node(o::variable(class_name, None)),
+        ty: wrap_node(o::variable(class_name, None)),
     }
 }
 
@@ -261,14 +330,136 @@ fn collect_element_tag_usages(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Wrapped-node resolution pass.
+//
+// Walks the compiled definition expression and replaces every `WrappedNode(handle)` leaf with the
+// host expression registered for that handle (the class identifier), so the JS emitter — which has
+// no side table — prints the wrapped node as the class identifier. This is the in-pipeline analogue
+// of ngtsc handing the `WrappedNodeExpr`'s host TS node straight to the TypeScript printer.
+// ---------------------------------------------------------------------------
+
+/// Resolve every `WrappedNode` leaf in `expr` to its registered host expression, in place.
+fn resolve_wrapped_nodes(expr: &mut Expr) {
+    if let ExprKind::WrappedNode(handle) = expr.kind {
+        if let Some(mut resolved) = resolved_wrapped_node(handle) {
+            // A registered node may itself contain wrapped nodes (none today, but resolve to be safe).
+            resolve_wrapped_nodes(&mut resolved);
+            let comments = std::mem::take(&mut expr.meta.leading_comments);
+            *expr = resolved;
+            // Preserve any leading comments that sat on the WrappedNode reference.
+            expr.meta.leading_comments.splice(0..0, comments);
+        }
+        return;
+    }
+    match &mut expr.kind {
+        ExprKind::ReadVar { .. }
+        | ExprKind::Literal(_)
+        | ExprKind::External { .. }
+        | ExprKind::RegExpLiteral { .. }
+        | ExprKind::TemplateLiteralElement(_)
+        | ExprKind::WrappedNode(_) => {}
+        ExprKind::Typeof(e)
+        | ExprKind::Void(e)
+        | ExprKind::Not(e)
+        | ExprKind::Parenthesized(e)
+        | ExprKind::Spread(e)
+        | ExprKind::Unary { expr: e, .. } => resolve_wrapped_nodes(e),
+        ExprKind::Invoke { callee, args, .. } => {
+            resolve_wrapped_nodes(callee);
+            args.iter_mut().for_each(resolve_wrapped_nodes);
+        }
+        ExprKind::TaggedTemplate { tag, template } => {
+            resolve_wrapped_nodes(tag);
+            resolve_wrapped_nodes(template);
+        }
+        ExprKind::New { class_expr, args } => {
+            resolve_wrapped_nodes(class_expr);
+            args.iter_mut().for_each(resolve_wrapped_nodes);
+        }
+        ExprKind::TemplateLiteral { expressions, .. } => {
+            expressions.iter_mut().for_each(resolve_wrapped_nodes);
+        }
+        ExprKind::LocalizedString { expressions, .. } => {
+            expressions.iter_mut().for_each(resolve_wrapped_nodes);
+        }
+        ExprKind::Conditional {
+            condition,
+            true_case,
+            false_case,
+        } => {
+            resolve_wrapped_nodes(condition);
+            resolve_wrapped_nodes(true_case);
+            if let Some(f) = false_case {
+                resolve_wrapped_nodes(f);
+            }
+        }
+        ExprKind::DynamicImport { url, .. } => {
+            if let ImportUrl::Expr(e) = url {
+                resolve_wrapped_nodes(e);
+            }
+        }
+        ExprKind::Function { statements, .. } => {
+            statements.iter_mut().for_each(resolve_wrapped_nodes_stmt);
+        }
+        ExprKind::Arrow { body, .. } => match body {
+            ArrowBody::Expr(e) => resolve_wrapped_nodes(e),
+            ArrowBody::Block(stmts) => stmts.iter_mut().for_each(resolve_wrapped_nodes_stmt),
+        },
+        ExprKind::Binary { lhs, rhs, .. } => {
+            resolve_wrapped_nodes(lhs);
+            resolve_wrapped_nodes(rhs);
+        }
+        ExprKind::ReadProp { receiver, .. } => resolve_wrapped_nodes(receiver),
+        ExprKind::ReadKey { receiver, index, .. } => {
+            resolve_wrapped_nodes(receiver);
+            resolve_wrapped_nodes(index);
+        }
+        ExprKind::LiteralArray(entries) => entries.iter_mut().for_each(resolve_wrapped_nodes),
+        ExprKind::LiteralMap { entries, .. } => {
+            for entry in entries {
+                match entry {
+                    LiteralMapEntry::Property { value, .. } => resolve_wrapped_nodes(value),
+                    LiteralMapEntry::Spread { expression } => resolve_wrapped_nodes(expression),
+                }
+            }
+        }
+        ExprKind::Comma(parts) => parts.iter_mut().for_each(resolve_wrapped_nodes),
+    }
+}
+
+/// Resolve every `WrappedNode` leaf inside a statement.
+fn resolve_wrapped_nodes_stmt(stmt: &mut Stmt) {
+    match &mut stmt.kind {
+        StmtKind::DeclareVar { value, .. } => {
+            if let Some(v) = value {
+                resolve_wrapped_nodes(v);
+            }
+        }
+        StmtKind::DeclareFunction { statements, .. } => {
+            statements.iter_mut().for_each(resolve_wrapped_nodes_stmt);
+        }
+        StmtKind::Expression(e) | StmtKind::Return(e) => resolve_wrapped_nodes(e),
+        StmtKind::If {
+            condition,
+            true_case,
+            false_case,
+        } => {
+            resolve_wrapped_nodes(condition);
+            true_case.iter_mut().for_each(resolve_wrapped_nodes_stmt);
+            false_case.iter_mut().for_each(resolve_wrapped_nodes_stmt);
+        }
+    }
+}
+
 /// Build a minimal-but-faithful [`R3DirectiveMetadata`] base for a standalone component.
 fn base_metadata(selector: &str, class_name: &str) -> R3DirectiveMetadata {
     R3DirectiveMetadata {
         name: class_name.to_string(),
         ty: class_ref(class_name),
         type_argument_count: 0,
-        // NOTE(port): the type source span is only used for diagnostics/`.d.ts`; an empty span is
-        // faithful for emission.
+        // The type source span only drives diagnostics / `.d.ts` location info, neither of which
+        // this emit-only pipeline produces; an empty span is faithful for the emitted definition.
         type_source_span: ParseSourceSpan::new(0, 0),
         deps: Deps::None,
         selector: Some(selector.to_string()),
@@ -300,6 +491,10 @@ pub fn compile_component(
 ) -> CompiledComponent {
     let mut errors: Vec<String> = Vec::new();
 
+    // Stable wrapped-node handles per compilation: clear the side table so this component's class
+    // reference always lands at handle 0 (and the table never grows across repeated calls).
+    reset_wrapped_nodes();
+
     // 1. HTML AST.
     let parse_result = crate::ml_parser::parse(template_html, "template.html");
     for e in &parse_result.errors {
@@ -326,22 +521,27 @@ pub fn compile_component(
             preserve_whitespaces: None,
         },
         declarations: Vec::new(),
-        // NOTE(port): no `@defer` blocks in this minimal pipeline.
+        // Defer metadata is emitted per-component. With no `@defer` blocks in the template there are
+        // no deferrable dependencies, so the resolver function is `None` — which is exactly what
+        // Angular emits for a defer-free `PerComponent` template. (A template that *did* contain
+        // `@defer` blocks would need the imports-driven defer dependency resolver to build a real
+        // `dependencies_fn`; this selectorless pipeline carries no import scope — see `remaining`.)
         defer: R3ComponentDeferMetadata::PerComponent {
             dependencies_fn: None,
         },
         declaration_list_emit_mode: DeclarationListEmitMode::Direct,
         styles: Vec::new(),
         external_styles: None,
-        // NOTE(port): no styles -> compile_component_from_metadata normalizes Emulated -> None.
+        // No styles: `compile_component_from_metadata` normalizes Emulated -> None encapsulation
+        // (the encapsulation field is only emitted when styles are present).
         encapsulation: ViewEncapsulation::Emulated,
         animations: None,
         view_providers: None,
         relative_context_file_path: String::new(),
         i18n_use_external_ids: false,
-        // Default strategy; not emitted (Default differs from the implicit OnPush default, so it
-        // would be emitted — use OnPush to keep output minimal). NOTE(port): real default is
-        // determined by the decorator.
+        // This authoring model has no `@Component` decorator to read a `changeDetection` from, so the
+        // implicit Ivy default (OnPush) is used; it matches the runtime default and so is not emitted
+        // into the definition, keeping the output minimal.
         change_detection: Some(ChangeDetection::Strategy(ChangeDetectionStrategy::OnPush)),
         relative_template_path: None,
         has_directive_dependencies: false,
@@ -353,14 +553,18 @@ pub fn compile_component(
     let mut template_builder = RealTemplateBuilder;
     let mut host_builder = StubHostBindingsBuilder;
     let mut pool_statements = Vec::new();
-    let compiled: R3CompiledExpression = compile_component_from_metadata(
+    let mut compiled: R3CompiledExpression = compile_component_from_metadata(
         &mut meta,
         &mut template_builder,
         &mut host_builder,
         &mut pool_statements,
     );
 
-    // 5. Emit the definition expression to JS.
+    // 5. Resolve the `WrappedNode` class references back to their host identifier expressions, then
+    //    emit the definition expression to JS (the emitter has no view of the wrapped-node side
+    //    table, so this substitution must happen first — ngtsc hands the wrapped TS node straight to
+    //    the printer instead).
+    resolve_wrapped_nodes(&mut compiled.expression);
     let code = emit_expression(&compiled.expression);
 
     CompiledComponent { code, errors }
@@ -417,8 +621,8 @@ mod tests {
     /// Robustness sweep: a variety of template shapes must compile without panicking
     /// and always yield a `ɵɵdefineComponent`. Guards the transform/binder/view layers
     /// against crashes on shapes the per-module tests didn't cover. (Instruction-level
-    /// fidelity for bindings / control-flow is a separate NOTE(port) concern — here we
-    /// only assert "does not panic" + a valid definition is produced.)
+    /// fidelity for bindings / control-flow is exercised by the per-module `view` tests and
+    /// the parity oracle — here we only assert "does not panic" + a valid definition is produced.)
     #[test]
     fn compile_component_does_not_panic_on_varied_templates() {
         let cases: &[&str] = &[

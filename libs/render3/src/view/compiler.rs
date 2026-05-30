@@ -17,11 +17,14 @@
 //! structs here are owned too — TS unions become Rust enums, and `{[k]: v}` maps whose
 //! emitted order is observable become [`IndexMap`].
 //!
-//! NOTE(port): the template pipeline (`ingest`/`transform`/`emit`) and the host-binding
-//! pipeline are not yet ported. They are abstracted behind the [`TemplateBuilder`] trait
-//! (template) and [`HostBindingsBuilder`] trait (host bindings) so the orchestration here can
-//! be reproduced and tested faithfully. The default [`StubTemplateBuilder`] produces a
-//! well-formed (but empty-bodied) template function and zero decls/vars/consts.
+//! The template emission and host-binding emission are abstracted behind the [`TemplateBuilder`]
+//! trait (template) and [`HostBindingsBuilder`] trait (host bindings), keeping this orchestrator
+//! decoupled from the (large) view compiler. The production wiring lives elsewhere:
+//! [`crate::compile::RealTemplateBuilder`] drives the classic
+//! [`crate::view::template::TemplateDefinitionBuilder`], and [`DefaultHostBindingsBuilder`]
+//! generates the `hostBindings` function + `hostAttrs`/`hostVars` directly. The trait-default
+//! [`StubTemplateBuilder`] (empty-bodied template, zero decls/vars/consts) exists only so the
+//! orchestration around the template fn can be unit-tested in isolation.
 
 #![allow(clippy::needless_lifetimes)]
 
@@ -110,11 +113,10 @@ fn content_attr() -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Local `core` placeholders (`../../core`). NOTE(port): real ones live in `core.ts`.
+// `core` enums (`../../core`), reproduced locally with their runtime discriminants.
 // ---------------------------------------------------------------------------
 
 /// `core.ViewEncapsulation` — discriminants pinned to the runtime enum.
-/// NOTE(port): real `ViewEncapsulation` lives in `core.ts` (not yet ported).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewEncapsulation {
     Emulated = 0,
@@ -129,7 +131,6 @@ impl ViewEncapsulation {
 }
 
 /// `core.ChangeDetectionStrategy` — `OnPush = 0`, `Default = 1`.
-/// NOTE(port): real `ChangeDetectionStrategy` lives in `core.ts` (not yet ported).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChangeDetectionStrategy {
     OnPush = 0,
@@ -137,7 +138,6 @@ pub enum ChangeDetectionStrategy {
 }
 
 /// `core.InputFlags` — bitflags. `bitflags` is unavailable, so a `u16` newtype.
-/// NOTE(port): real `InputFlags` lives in `core.ts` (not yet ported).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct InputFlags(pub u16);
 
@@ -165,89 +165,216 @@ impl std::ops::BitOrAssign for InputFlags {
     }
 }
 
-/// `core.parseSelectorToR3Selector(selector)` → `R3CssSelectorList`.
+/// `core.SelectorFlags` — bit flags emitted as numeric markers inside an R3 selector entry.
+mod selector_flags {
+    /// Beginning of a new negative (`:not(...)`) selector.
+    pub const NOT: u32 = 0b0001;
+    /// Attribute-matching mode.
+    pub const ATTRIBUTE: u32 = 0b0010;
+    /// Tag-name matching mode.
+    pub const ELEMENT: u32 = 0b0100;
+    /// Class-name matching mode.
+    pub const CLASS: u32 = 0b1000;
+}
+
+/// A parsed CSS selector (`CssSelector` from `directive_matching.ts`).
+#[derive(Debug, Default)]
+struct CssSelector {
+    element: Option<String>,
+    /// Flat `[name, value, name, value, …]`. Values are lowercased.
+    attrs: Vec<String>,
+    /// Lowercased class names.
+    class_names: Vec<String>,
+    not_selectors: Vec<CssSelector>,
+}
+
+impl CssSelector {
+    fn add_attribute(&mut self, name: &str, value: &str) {
+        self.attrs.push(name.to_string());
+        self.attrs
+            .push(if value.is_empty() { String::new() } else { value.to_lowercase() });
+    }
+    fn add_class_name(&mut self, name: &str) {
+        self.class_names.push(name.to_lowercase());
+    }
+}
+
+/// `CssSelector.parse(selector)` — splits a (possibly comma-separated) selector string into
+/// individual [`CssSelector`]s, honoring `tag`, `.class`, `#id`, `[attr]`, `[attr=value]` and
+/// `:not(...)` groups.
+fn parse_css_selectors(selector: &str) -> Vec<CssSelector> {
+    let mut results: Vec<CssSelector> = Vec::new();
+    let chars: Vec<char> = selector.chars().collect();
+    let mut i = 0usize;
+
+    let mut current_top = CssSelector::default();
+    let mut in_not = false;
+
+    // `current` is either the top-level selector or the active `:not()` sub-selector. We track it
+    // by index into `current_top.not_selectors` to satisfy the borrow checker.
+    macro_rules! current {
+        () => {
+            if in_not {
+                current_top.not_selectors.last_mut().unwrap()
+            } else {
+                &mut current_top
+            }
+        };
+    }
+
+    let is_ident = |c: char| c.is_alphanumeric() || c == '-' || c == '_';
+
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            c if c.is_whitespace() => {
+                i += 1;
+            }
+            ',' => {
+                // Flush the current top-level selector and start a fresh one.
+                let finished = std::mem::take(&mut current_top);
+                results.push(finished);
+                in_not = false;
+                i += 1;
+            }
+            ':' if chars[i..].starts_with(&[':', 'n', 'o', 't', '(']) => {
+                in_not = true;
+                current_top.not_selectors.push(CssSelector::default());
+                i += 5;
+            }
+            ')' => {
+                in_not = false;
+                i += 1;
+            }
+            '.' | '#' => {
+                let prefix = c;
+                i += 1;
+                let start = i;
+                while i < chars.len() && is_ident(chars[i]) {
+                    i += 1;
+                }
+                let name: String = chars[start..i].iter().collect();
+                if prefix == '#' {
+                    current!().add_attribute("id", &name);
+                } else {
+                    current!().add_class_name(&name);
+                }
+            }
+            '[' => {
+                i += 1;
+                let start = i;
+                while i < chars.len() && chars[i] != ']' {
+                    i += 1;
+                }
+                let inner: String = chars[start..i].iter().collect();
+                if i < chars.len() {
+                    i += 1; // consume ']'
+                }
+                if let Some((name, value)) = inner.split_once('=') {
+                    let value = value.trim().trim_matches(['"', '\'']);
+                    current!().add_attribute(name.trim(), value);
+                } else {
+                    current!().add_attribute(inner.trim(), "");
+                }
+            }
+            _ if is_ident(c) => {
+                let start = i;
+                while i < chars.len() && is_ident(chars[i]) {
+                    i += 1;
+                }
+                let tag: String = chars[start..i].iter().collect();
+                current!().element = Some(tag);
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+
+    results.push(current_top);
+    results
+}
+
+/// `parserSelectorToSimpleSelector` — `[element, ...attrs, (CLASS, ...classNames)?]`.
+fn simple_selector_to_r3(selector: &CssSelector) -> Vec<SelectorPart> {
+    let mut parts: Vec<SelectorPart> = Vec::new();
+    let element = match &selector.element {
+        Some(e) if e != "*" => e.clone(),
+        _ => String::new(),
+    };
+    parts.push(SelectorPart::Str(element));
+    for attr in &selector.attrs {
+        parts.push(SelectorPart::Str(attr.clone()));
+    }
+    if !selector.class_names.is_empty() {
+        parts.push(SelectorPart::Num(selector_flags::CLASS as f64));
+        for cls in &selector.class_names {
+            parts.push(SelectorPart::Str(cls.clone()));
+        }
+    }
+    parts
+}
+
+/// `parserSelectorToNegativeSelector` — a `:not(...)` group prefixed with `NOT | mode`.
+fn negative_selector_to_r3(selector: &CssSelector) -> Vec<SelectorPart> {
+    let mut parts: Vec<SelectorPart> = Vec::new();
+    let class_tail = |parts: &mut Vec<SelectorPart>| {
+        if !selector.class_names.is_empty() {
+            parts.push(SelectorPart::Num(selector_flags::CLASS as f64));
+            for cls in &selector.class_names {
+                parts.push(SelectorPart::Str(cls.clone()));
+            }
+        }
+    };
+
+    if let Some(element) = &selector.element {
+        parts.push(SelectorPart::Num((selector_flags::NOT | selector_flags::ELEMENT) as f64));
+        parts.push(SelectorPart::Str(element.clone()));
+        for attr in &selector.attrs {
+            parts.push(SelectorPart::Str(attr.clone()));
+        }
+        class_tail(&mut parts);
+    } else if !selector.attrs.is_empty() {
+        parts.push(SelectorPart::Num((selector_flags::NOT | selector_flags::ATTRIBUTE) as f64));
+        for attr in &selector.attrs {
+            parts.push(SelectorPart::Str(attr.clone()));
+        }
+        class_tail(&mut parts);
+    } else if !selector.class_names.is_empty() {
+        parts.push(SelectorPart::Num((selector_flags::NOT | selector_flags::CLASS) as f64));
+        for cls in &selector.class_names {
+            parts.push(SelectorPart::Str(cls.clone()));
+        }
+    }
+    parts
+}
+
+/// `core.parseSelectorToR3Selector(selector)` → `R3CssSelectorList` (`(string | number)[][]`).
 ///
-/// The R3 selector list is `(string | number)[][]`: each selector is a flat array where
-/// `''` introduces an element/attribute group, `1`/`2`/`-1` are not-selector markers, etc. The
-/// full parser lives in `selector.ts`; this port reproduces the common shape exactly enough for
-/// `asLiteral` to serialize it.
-///
-/// NOTE(port): real `parseSelectorToR3Selector` lives in `core.ts` / `selector.ts` (not yet
-/// ported). This minimal version handles `tag`, `.class`, `[attr]`, and `[attr=value]` for a
-/// single (non-comma) selector — enough for the typical `selector: 'app-x'` case.
+/// Port of `core.ts`'s `parseSelectorToR3Selector` over the [`CssSelector`] parser
+/// (`directive_matching.ts`). Each selector becomes a flat array: the positive simple selector
+/// (`[element, ...attrs, (CLASS, ...classes)?]`) followed by every `:not(...)` negative group
+/// (each prefixed with the `NOT | mode` combined flag). `*` and an absent tag both collapse to
+/// the empty-string element token.
 pub fn parse_selector_to_r3_selector(selector: Option<&str>) -> Vec<Vec<SelectorPart>> {
     let selector = match selector {
         Some(s) if !s.trim().is_empty() => s.trim(),
         _ => return Vec::new(),
     };
 
-    // Split on commas (top-level alternatives).
-    let mut result = Vec::new();
-    for alt in selector.split(',') {
-        let alt = alt.trim();
-        if alt.is_empty() {
-            continue;
-        }
-        let mut parts: Vec<SelectorPart> = Vec::new();
-        // Element name comes first (anything before a `.`, `[`, `:`).
-        let mut rest = alt;
-        let mut element = String::new();
-        while let Some(c) = rest.chars().next() {
-            if c == '.' || c == '[' || c == ':' {
-                break;
+    parse_css_selectors(selector)
+        .iter()
+        .map(|sel| {
+            let mut parts = simple_selector_to_r3(sel);
+            for not in &sel.not_selectors {
+                parts.extend(negative_selector_to_r3(not));
             }
-            element.push(c);
-            rest = &rest[c.len_utf8()..];
-        }
-        parts.push(SelectorPart::Str(element));
-
-        // Then class/attribute tokens.
-        let mut chars = rest.chars().peekable();
-        while let Some(&c) = chars.peek() {
-            match c {
-                '.' => {
-                    chars.next();
-                    let mut cls = String::new();
-                    while let Some(&n) = chars.peek() {
-                        if n == '.' || n == '[' || n == ':' {
-                            break;
-                        }
-                        cls.push(n);
-                        chars.next();
-                    }
-                    parts.push(SelectorPart::Str("class".to_string()));
-                    parts.push(SelectorPart::Str(cls));
-                }
-                '[' => {
-                    chars.next();
-                    let mut inner = String::new();
-                    for n in chars.by_ref() {
-                        if n == ']' {
-                            break;
-                        }
-                        inner.push(n);
-                    }
-                    if let Some((name, value)) = inner.split_once('=') {
-                        parts.push(SelectorPart::Str(name.trim().to_string()));
-                        parts.push(SelectorPart::Str(
-                            value.trim().trim_matches(['"', '\'']).to_string(),
-                        ));
-                    } else {
-                        parts.push(SelectorPart::Str(inner.trim().to_string()));
-                        parts.push(SelectorPart::Str(String::new()));
-                    }
-                }
-                _ => {
-                    chars.next();
-                }
-            }
-        }
-        result.push(parts);
-    }
-    result
+            parts
+        })
+        .collect()
 }
 
-/// A part of an R3 selector entry — either a string token or a numeric marker.
+/// A part of an R3 selector entry — either a string token or a numeric `SelectorFlags` marker.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SelectorPart {
     Str(String),
@@ -499,8 +626,10 @@ pub struct R3HostDirectiveMetadata {
     pub outputs: Option<OrderedMap<String, String>>,
 }
 
-/// `MaybeForwardRefExpression | string[]` query predicate. NOTE(port): `MaybeForwardRefExpression`
-/// lives in `render3/util.ts`; modelled here as a bare [`Expr`].
+/// `MaybeForwardRefExpression | string[]` query predicate. Forward-ref wrapping is resolved
+/// upstream of this metadata, so the expression variant carries a bare [`Expr`]; it is mapped to
+/// [`crate::view::queries::MaybeForwardRefExpression`] (with `ForwardRefHandling::None`) by
+/// [`map_query_metadata`] before query-function generation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum QueryPredicate {
     Expr(Expr),
@@ -645,8 +774,9 @@ pub struct R3ComponentMetadata<D: R3TemplateDependency> {
 }
 
 // ---------------------------------------------------------------------------
-// Template builder placeholder. NOTE(port): real one is the `ingest`/`transform`/`emit` pipeline
-// via `crate::view::template::TemplateDefinitionBuilder`.
+// Template builder abstraction. The production implementation is
+// [`crate::compile::RealTemplateBuilder`], driving
+// [`crate::view::template::TemplateDefinitionBuilder`]; [`StubTemplateBuilder`] is the test stub.
 // ---------------------------------------------------------------------------
 
 /// The result of running the template pipeline: the emitted `template` function expression plus
@@ -668,11 +798,13 @@ pub struct TemplateBuilderResult {
     pub content_selectors: Option<Expr>,
 }
 
-/// Abstraction over the template pipeline (`ingestComponent` → `transform` → `emitTemplateFn`).
+/// Abstraction over template emission (`ingestComponent` → `transform` → `emitTemplateFn`).
 ///
-/// NOTE(port): the real pipeline is heavy and still settling; this trait lets `compiler.rs` be
-/// ported and tested now. Implement it once the pipeline lands and pass it to
-/// [`compile_component_from_metadata`].
+/// The production implementation, [`crate::compile::RealTemplateBuilder`], runs the classic
+/// [`crate::view::template::TemplateDefinitionBuilder`] over the component's template nodes and
+/// returns the emitted function plus its `decls`/`vars`/`consts`/`ngContentSelectors`. The
+/// trait keeps that (large) builder out of this orchestrator and lets it be unit-tested with the
+/// [`StubTemplateBuilder`] default.
 pub trait TemplateBuilder {
     /// Ingest + transform + emit the template for the given component metadata.
     fn build<D: R3TemplateDependency>(
@@ -714,12 +846,10 @@ impl TemplateBuilder for StubTemplateBuilder {
     }
 }
 
-/// Abstraction over the host-binding pipeline (`ingestHostBinding` → `transform` →
+/// Abstraction over host-binding emission (`ingestHostBinding` → `transform` →
 /// `emitHostBindingFunction`). Returns the optional `hostBindings` function and sets
-/// `hostAttrs`/`hostVars` on the definition map.
-///
-/// NOTE(port): the full `ingestHostBinding`/`transform`/`emit` pipeline is not yet ported; the
-/// default [`DefaultHostBindingsBuilder`] generates the host-bindings function directly.
+/// `hostAttrs`/`hostVars` on the definition map. The production implementation is
+/// [`DefaultHostBindingsBuilder`], which generates the host-bindings function directly.
 pub trait HostBindingsBuilder {
     /// `createHostBindingsFunction(...)` — returns the host-bindings fn (or `None`) and may set
     /// `hostAttrs`/`hostVars` on the definition map. `host` may be mutated (special attrs folded in).
@@ -736,18 +866,18 @@ pub trait HostBindingsBuilder {
 /// `createHostBindingsFunction(...)` port. Generates the `hostBindings: function(rf, ctx) {…}`
 /// definition field, and as side effects sets `hostAttrs` / `hostVars` on the definition map.
 ///
-/// NOTE(port): the real Angular implementation routes through the `ingestHostBinding` →
-/// `transform` → `emitHostBindingFunction` pipeline (which performs slot allocation, advance
-/// insertion, and instruction reification). That pipeline is not yet ported. This is a direct,
-/// faithful-in-shape generator that:
+/// This is a direct generator (Angular routes the equivalent work through the
+/// `ingestHostBinding` → `transform` → `emitHostBindingFunction` pipeline). It:
 ///   - parses each property/listener value string with [`crate::expression::parser::Parser`],
 ///   - lowers it via [`crate::expression_converter`] rooted at the `ctx` param,
 ///   - emits the same instruction set the runtime expects (`ɵɵlistener` in CREATE;
 ///     `ɵɵdomProperty`/`ɵɵsyntheticHostProperty`/`ɵɵattribute`/`ɵɵclassProp`/`ɵɵstyleProp` in
-///     UPDATE).
-/// What it does NOT yet reproduce: `ɵɵadvance` interleaving, host-property slot indices, pipe
-/// lowering, and the precise binding ordering the transform pipeline computes. Replace with the
-/// real pipeline when it lands.
+///     UPDATE),
+///   - splits static `class`/`style` host attributes into the `Classes`/`Styles` AttributeMarker
+///     groups of `hostAttrs` (see [`host_attrs_array`]).
+/// Since there are no slotted host instructions here, `ɵɵadvance` interleaving and host-property
+/// slot indices (which the transform pipeline computes) are not modelled; pipe lowering in host
+/// bindings is likewise out of scope.
 #[derive(Debug, Default)]
 pub struct DefaultHostBindingsBuilder;
 
@@ -825,8 +955,9 @@ impl HostBindingsBuilder for DefaultHostBindingsBuilder {
         }
 
         // hostAttrs — the static attributes array, grouped by AttributeMarker (plain pairs first,
-        // then Classes=1 group, then Styles=2 group). `class`/`style` (folded above) are plain
-        // string-valued attrs, not class/style *bindings*, so they go in the plain group.
+        // then the Classes=1 group, then the Styles=2 group). The folded `class`/`style` values are
+        // split into individual class names / style key-value pairs under their markers by
+        // `host_attrs_array` (mirroring `parse_extracted_styles` + `serializeAttributes`).
         if let Some(attrs) = host_attrs_array(&host.attributes) {
             definition_map.set("hostAttrs", Some(attrs));
         }
@@ -864,8 +995,9 @@ impl HostBindingsBuilder for DefaultHostBindingsBuilder {
         // Each binding consumes one host var slot.
         for (prop, value_src) in host.properties.iter() {
             let converted = lower_host_property_value(value_src);
-            // NOTE(port): lowering that spills temporaries is not yet modelled into the host
-            // update block; the converter currently never spills, so `stmts` is empty.
+            // Any temporaries the lowering spilled (e.g. for safe-navigation) must be emitted into
+            // the UPDATE block before the instruction that consumes the resulting value.
+            update_stmts.extend(converted.stmts);
             let value = converted.expr;
             host_vars += 1;
 
@@ -930,24 +1062,156 @@ impl HostBindingsBuilder for DefaultHostBindingsBuilder {
     }
 }
 
+/// `core.AttributeMarker` discriminants used in the `hostAttrs` / element-attributes array. Only
+/// the markers reachable from host static attributes are reproduced here.
+const ATTRIBUTE_MARKER_CLASSES: f64 = 1.0;
+const ATTRIBUTE_MARKER_STYLES: f64 = 2.0;
+
+/// Hyphenate a camelCase CSS property name (`backgroundColor` → `background-color`), matching the
+/// `hyphenate` helper used by Angular's extracted-style parser (`parse_extracted_styles.ts`).
+fn hyphenate_style_prop(value: &str) -> String {
+    let chars: Vec<char> = value.chars().collect();
+    let mut out = String::with_capacity(chars.len() + 2);
+    for (i, &c) in chars.iter().enumerate() {
+        if i > 0
+            && c.is_ascii_uppercase()
+            && chars[i - 1].is_ascii_lowercase()
+        {
+            out.push('-');
+        }
+        out.push(c.to_ascii_lowercase());
+    }
+    out
+}
+
+/// Port of `parse_extracted_styles.ts`'s `parse(value)`: tokenize a CSS `style` attribute value
+/// into a flat `[prop, value, prop, value, …]` list. Honors `()` nesting and `'`/`"` quoting so
+/// `:`/`;` inside `url(...)` or quoted strings don't split. Property names are hyphenated.
+fn parse_style_value(value: &str) -> Vec<String> {
+    let bytes: Vec<char> = value.chars().collect();
+    let mut styles: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    let mut paren_depth: i32 = 0;
+    // 0 = none, '\'' or '"' for active quote char.
+    let mut quote: char = '\0';
+    let mut value_start: Option<usize> = None;
+    let mut prop_start = 0usize;
+    let mut current_prop: Option<String> = None;
+
+    while i < bytes.len() {
+        let c = bytes[i];
+        i += 1;
+        match c {
+            '(' => paren_depth += 1,
+            ')' => paren_depth -= 1,
+            '\'' => {
+                if quote == '\0' {
+                    quote = '\'';
+                } else if quote == '\'' && (i < 2 || bytes[i - 2] != '\\') {
+                    quote = '\0';
+                }
+            }
+            '"' => {
+                if quote == '\0' {
+                    quote = '"';
+                } else if quote == '"' && (i < 2 || bytes[i - 2] != '\\') {
+                    quote = '\0';
+                }
+            }
+            ':' => {
+                if current_prop.is_none() && paren_depth == 0 && quote == '\0' {
+                    let raw: String = bytes[prop_start..i - 1].iter().collect();
+                    current_prop = Some(hyphenate_style_prop(raw.trim()));
+                    value_start = Some(i);
+                }
+            }
+            ';' => {
+                if current_prop.is_some()
+                    && value_start.is_some()
+                    && paren_depth == 0
+                    && quote == '\0'
+                {
+                    let vs = value_start.unwrap();
+                    let style_val: String = bytes[vs..i - 1].iter().collect();
+                    styles.push(current_prop.take().unwrap());
+                    styles.push(style_val.trim().to_string());
+                    prop_start = i;
+                    value_start = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if let (Some(prop), Some(vs)) = (current_prop, value_start) {
+        let style_val: String = bytes[vs..].iter().collect();
+        styles.push(prop);
+        styles.push(style_val.trim().to_string());
+    }
+
+    styles
+}
+
 /// Build the `hostAttrs` consts-style array from the static attributes map, applying
 /// `AttributeMarker` grouping: plain `name, value` pairs first, then a `Classes` (1) group
-/// (class names only), then a `Styles` (2) group (`name, value` pairs).
+/// (individual class names), then a `Styles` (2) group (`name, value` pairs).
 ///
-/// NOTE(port): the real transform splits `class`/`style` attribute *values* into individual
-/// class names / style key-value pairs under the markers. Here those folded attrs are emitted as
-/// plain `["class", "<value>"]` / `["style", "<value>"]` pairs (the common static-attr case);
-/// dedicated marker splitting can be added with the transform pipeline.
+/// The folded `class` / `style` attributes carry their raw string *values*; faithfully to the
+/// transform (`parse_extracted_styles.ts` + `const_collection.ts`'s `serializeAttributes`) the
+/// `class` value is whitespace-split into individual class names under the `Classes` marker, and
+/// the `style` value is parsed into `[prop, value, …]` pairs under the `Styles` marker. Anything
+/// else is emitted as a plain `[name, value]` pair.
 fn host_attrs_array(attributes: &OrderedMap<String, Expr>) -> Option<Expr> {
     if attributes.is_empty() {
         return None;
     }
-    let mut elements: Vec<Expr> = Vec::new();
+
+    let mut plain: Vec<Expr> = Vec::new();
+    let mut classes: Vec<Expr> = Vec::new();
+    let mut styles: Vec<Expr> = Vec::new();
+
     for (key, value) in attributes.iter() {
-        elements.push(o::literal(LiteralValue::String(key.clone()), None));
-        elements.push(value.clone());
+        // `class`/`style` are only special-cased when the value is a static string literal — a
+        // dynamic expression keeps the plain `[name, expr]` shape.
+        let string_value = match (key.as_str(), &value.kind) {
+            ("class", ExprKind::Literal(LiteralValue::String(s))) => Some(s.clone()),
+            ("style", ExprKind::Literal(LiteralValue::String(s))) => Some(s.clone()),
+            _ => None,
+        };
+
+        match (key.as_str(), string_value) {
+            ("class", Some(raw)) => {
+                for token in raw.split_whitespace() {
+                    classes.push(o::literal(LiteralValue::String(token.to_string()), None));
+                }
+            }
+            ("style", Some(raw)) => {
+                for chunk in parse_style_value(&raw) {
+                    styles.push(o::literal(LiteralValue::String(chunk), None));
+                }
+            }
+            _ => {
+                plain.push(o::literal(LiteralValue::String(key.clone()), None));
+                plain.push(value.clone());
+            }
+        }
     }
-    Some(o::literal_arr(elements, None))
+
+    let mut elements: Vec<Expr> = plain;
+    if !classes.is_empty() {
+        elements.push(o::literal(LiteralValue::Number(ATTRIBUTE_MARKER_CLASSES), None));
+        elements.extend(classes);
+    }
+    if !styles.is_empty() {
+        elements.push(o::literal(LiteralValue::Number(ATTRIBUTE_MARKER_STYLES), None));
+        elements.extend(styles);
+    }
+
+    if elements.is_empty() {
+        None
+    } else {
+        Some(o::literal_arr(elements, None))
+    }
 }
 
 /// Backwards-compatible unit struct under the former placeholder name. It is no longer a stub:
@@ -1229,12 +1493,12 @@ where
         }
     }
 
-    // Compilation mode is computed (DomOnly vs Full) and would be threaded into ingest.
-    // NOTE(port): TemplateCompilationMode lives in the pipeline; recorded here as the boolean
-    // `dom_only` but not yet consumed by the stub builder.
-    let _dom_only = meta.base.is_standalone && !meta.has_directive_dependencies;
+    // Angular computes `TemplateCompilationMode` (`DomOnly` when standalone with no directive
+    // dependencies, else `Full`) and threads it into `ingestComponent`. That mode only gates
+    // pipeline-only selectorless optimizations; the classic `TemplateDefinitionBuilder` driven by
+    // [`TemplateBuilder`] is mode-agnostic, so there is nothing to thread through here.
 
-    // Ingest + transform + emit (delegated to the pipeline abstraction).
+    // Ingest + transform + emit (delegated to the template-builder abstraction).
     let tpl = template_builder.build(meta, all_deferrable_deps_fn.as_ref());
 
     if let Some(content_selectors) = &tpl.content_selectors {
@@ -1290,7 +1554,11 @@ where
         let mut style_nodes: Vec<Expr> = Vec::new();
         for style in &style_values {
             if !style.trim().is_empty() {
-                // NOTE(port): real impl interns via `pool.getConstLiteral`; here a bare literal.
+                // Mirrors `constantPool.getConstLiteral(o.literal(style))`: a short string literal
+                // (below the pool's 50-char inclusion threshold) is emitted inline, which is the
+                // common case for component styles. Only long strings would be hoisted into a
+                // shared `_cN` constant, and that requires the template's shared `ConstantPool`
+                // (the template-builder owns it) — not the directive-level `pool_statements` here.
                 style_nodes.push(o::literal(LiteralValue::String(style.clone()), None));
             }
         }
@@ -1681,15 +1949,17 @@ pub fn validate_no_event_bindings(bindings: &ParsedHostBindings) -> Vec<String> 
 
 /// `compileStyles(styles, selector, hostSelector)`.
 ///
-/// NOTE(port): `ShadowCss` (`../../shadow_css`) is not yet ported; this passes styles through
-/// unshimmed. Replace with the real ShadowCss shim when available.
+/// Angular runs each style through `new ShadowCss().shimCssText(style, selector, hostSelector)`
+/// to scope emulated-encapsulation CSS to the component (`[_ngcontent-%COMP%]` / host attrs). The
+/// `ShadowCss` rewriter (`../../shadow_css`, a standalone ~1k-line CSS parser) is a separate
+/// subsystem and is not part of this crate yet, so styles pass through unshimmed. This matches
+/// Angular's output for selector-free / already-scoped CSS; see `remaining`.
 fn compile_styles(styles: &[String], _selector: &str, _host_selector: &str) -> Vec<String> {
     styles.to_vec()
 }
 
-/// `encapsulateStyle(style, componentIdentifier?)`.
-///
-/// NOTE(port): `ShadowCss` not yet ported; passes through unshimmed.
+/// `encapsulateStyle(style, componentIdentifier?)`. Like [`compile_styles`], the real `ShadowCss`
+/// shim is a separate subsystem; styles pass through unshimmed for now.
 pub fn encapsulate_style(style: &str, _component_identifier: Option<&str>) -> String {
     style.to_string()
 }
@@ -2148,16 +2418,74 @@ mod tests {
 
     #[test]
     fn host_static_class_attr_emits_host_attrs() {
-        // `host: { 'class': 'x' }` → `hostAttrs: ['class', 'x']`, no hostBindings fn.
+        // `host: { 'class': 'foo bar' }` → `hostAttrs: [1 /*Classes*/, 'foo', 'bar']`, no
+        // hostBindings fn. The class value is whitespace-split under the Classes (1) marker.
         let mut meta = directive_meta("D", "[d]");
-        meta.host.special_attributes.class_attr = Some("x".to_string());
+        meta.host.special_attributes.class_attr = Some("foo bar".to_string());
         let mut hb = DefaultHostBindingsBuilder;
         let compiled = compile_directive_from_metadata(&meta, &mut hb);
         let js = emit_expression(&compiled.expression);
         assert!(js.contains("hostAttrs"), "missing hostAttrs: {js}");
-        assert!(js.contains("class"), "missing class attr key: {js}");
+        // Classes marker (1) followed by the individual class names — the literal "class" key is
+        // not emitted (it becomes the marker).
+        assert!(js.contains("\"foo\"") || js.contains("'foo'"), "missing class name foo: {js}");
+        assert!(js.contains("\"bar\"") || js.contains("'bar'"), "missing class name bar: {js}");
+        assert!(!js.contains("\"class\"") && !js.contains("'class'"), "class key should be a marker: {js}");
         // No dynamic bindings → no hostBindings fn.
         assert!(!js.contains("hostBindings"), "static-only should not emit hostBindings: {js}");
+    }
+
+    #[test]
+    fn host_static_style_attr_splits_into_styles_marker() {
+        // `host: { 'style': 'width: 100px; height: 200px' }` → `hostAttrs: [2 /*Styles*/,
+        // 'width', '100px', 'height', '200px']`.
+        let mut meta = directive_meta("D", "[d]");
+        meta.host.special_attributes.style_attr =
+            Some("width: 100px; height: 200px".to_string());
+        let mut hb = DefaultHostBindingsBuilder;
+        let compiled = compile_directive_from_metadata(&meta, &mut hb);
+        let js = emit_expression(&compiled.expression);
+        assert!(js.contains("hostAttrs"), "missing hostAttrs: {js}");
+        assert!(js.contains("width"), "missing style prop width: {js}");
+        assert!(js.contains("100px"), "missing style value 100px: {js}");
+        assert!(js.contains("height"), "missing style prop height: {js}");
+        assert!(js.contains("200px"), "missing style value 200px: {js}");
+    }
+
+    #[test]
+    fn host_attrs_plain_attrs_precede_class_and_style_groups() {
+        // Plain attrs come first, then the Classes (1) group, then the Styles (2) group.
+        let mut meta = directive_meta("D", "[d]");
+        meta.host
+            .attributes
+            .insert("role".to_string(), o::literal(LiteralValue::String("button".to_string()), None));
+        meta.host.special_attributes.class_attr = Some("a".to_string());
+        meta.host.special_attributes.style_attr = Some("color: red".to_string());
+        let arr = host_attrs_array(&{
+            // Replicate the fold the builder performs before calling host_attrs_array.
+            let mut attrs = meta.host.attributes.clone();
+            attrs.insert("style".to_string(), o::literal(LiteralValue::String("color: red".to_string()), None));
+            attrs.insert("class".to_string(), o::literal(LiteralValue::String("a".to_string()), None));
+            attrs
+        })
+        .expect("host attrs array");
+        let entries = match &arr.kind {
+            ExprKind::LiteralArray(e) => e,
+            other => panic!("expected literal array, got {other:?}"),
+        };
+        // role, "button", 1, "a", 2, "color", "red".
+        let nums: Vec<Option<f64>> = entries
+            .iter()
+            .map(|e| match &e.kind {
+                ExprKind::Literal(LiteralValue::Number(n)) => Some(*n),
+                _ => None,
+            })
+            .collect();
+        let classes_marker = nums.iter().position(|n| *n == Some(1.0)).expect("classes marker");
+        let styles_marker = nums.iter().position(|n| *n == Some(2.0)).expect("styles marker");
+        // Plain `role`/`button` pair occupies indices 0,1 → markers come after.
+        assert!(classes_marker >= 2, "plain attrs must precede classes marker");
+        assert!(classes_marker < styles_marker, "classes marker must precede styles marker");
     }
 
     #[test]

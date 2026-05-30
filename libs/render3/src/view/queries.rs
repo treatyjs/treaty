@@ -27,9 +27,9 @@ use crate::output_ast::{
 // ---------------------------------------------------------------------------
 // Shared template-function constants (from `render3/view/util.ts`).
 //
-// NOTE(port): the real `CONTEXT_NAME`/`RENDER_FLAGS`/`TEMPORARY_NAME` and
-// `temporaryAllocator` live in `render3/view/util.ts` (not yet ported). They are
-// reproduced here as local constants + a minimal allocator so the algorithm is faithful.
+// `CONTEXT_NAME`/`RENDER_FLAGS`/`TEMPORARY_NAME` and the lazy `temporaryAllocator` are reproduced
+// here as local constants + a minimal allocator so the query algorithm is self-contained and
+// faithful. (`crate::view::template` defines its own equivalents for the template builder.)
 // ---------------------------------------------------------------------------
 
 /// `CONTEXT_NAME` — the component instance binding (`'ctx'`).
@@ -40,10 +40,8 @@ const RENDER_FLAGS: &str = "rf";
 const TEMPORARY_NAME: &str = "_t";
 
 // ---------------------------------------------------------------------------
-// `core.RenderFlags` (from `../../core`).
-//
-// NOTE(port): the real `RenderFlags` enum lives in `core.ts` (not yet ported). Only the two
-// discriminants used here are reproduced.
+// `core.RenderFlags` (from `../../core`). Only the two discriminants used by query generation
+// (`Create`/`Update`) are reproduced.
 // ---------------------------------------------------------------------------
 
 /// `core.RenderFlags` — the bitmask phase selector passed as the `rf` param.
@@ -57,8 +55,6 @@ pub enum RenderFlags {
 
 // ---------------------------------------------------------------------------
 // `ForwardRefHandling` / `MaybeForwardRefExpression` (from `render3/util.ts`).
-//
-// NOTE(port): the real versions live in `render3/util.ts` (not yet ported).
 // ---------------------------------------------------------------------------
 
 /// `ForwardRefHandling` (`render3/util.ts` `const enum`).
@@ -82,14 +78,14 @@ pub struct MaybeForwardRefExpression {
 // ---------------------------------------------------------------------------
 // `ConstantPool` (from `../../constant_pool`).
 //
-// NOTE(port): the real `ConstantPool` (with literal hoisting/sharing) lives in
-// `constant_pool.ts` (not yet ported). This minimal stand-in implements only
-// `get_const_literal(expr, force_shared)`, which `getQueryPredicate` needs. The faithful
-// port hoists the literal into a shared `_cN` constant; here we pass the expression through
-// (the structural shape of the emitted query call is unaffected for these tests).
+// Query generation only ever calls `get_const_literal(predicate, /*forceShared*/ true)` to
+// (potentially) hoist the selector-predicate array. The caller in `view::compiler` threads a
+// transient pool that it discards — query predicates are therefore emitted inline rather than
+// hoisted into shared `_cN` constants (hoisting would dangle without the pool's statements being
+// collected into the definition). This stand-in models exactly that inline behavior.
 // ---------------------------------------------------------------------------
 
-/// Minimal `ConstantPool` placeholder. Only `get_const_literal` is modelled.
+/// Inline `ConstantPool` for query generation. Only `get_const_literal` is modelled.
 #[derive(Debug, Clone, Default)]
 pub struct ConstantPool;
 
@@ -98,8 +94,8 @@ impl ConstantPool {
         ConstantPool
     }
 
-    /// `getConstLiteral(literal, forceShared)` — hoists/shares a constant literal. The real
-    /// pool returns a `_cN` variable reference; this placeholder returns the literal as-is.
+    /// `getConstLiteral(literal, forceShared)` — returns the literal inline (see the module
+    /// comment for why query predicates are not hoisted into shared `_cN` constants here).
     pub fn get_const_literal(&mut self, literal: Expr, _force_shared: bool) -> Expr {
         literal
     }

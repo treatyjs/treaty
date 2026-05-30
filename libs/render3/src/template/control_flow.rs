@@ -24,12 +24,12 @@
 //! ## Visitor threading
 //! In TS, `html.visitAll(visitor, children, children)` recurses into block bodies
 //! using the `r3_template_transform` visitor (which converts `html.Node` ->
-//! `t.Node`). That transform is not yet ported (it is a sibling `template_transform`
-//! stub), so this module is generic over a [`ChildVisitor`] callback that maps an
-//! `&[ml_parser::Node]` slice to a `Vec<r3_ast::Node>`. The real caller will pass a
-//! closure that delegates to the template transform; tests pass a trivial one.
-//! NOTE(port): replace [`ChildVisitor`] threading with the concrete
-//! `r3_template_transform` visitor once `template_transform` is ported.
+//! `t.Node`). This module is generic over a [`ChildVisitor`] callback that maps an
+//! `&[ml_parser::Node]` slice to a `Vec<r3_ast::Node>`; the real
+//! `template_transform::HtmlAstToIvyAst` driver implements [`ChildVisitor`] and passes
+//! *itself* into these constructors, so child recursion re-enters the concrete
+//! transform exactly as `html.visitAll` does. Tests pass the trivial
+//! [`NullChildVisitor`].
 
 use crate::expression::ast::{AstNode, AstWithSource, ExprKind, ParseSourceSpan};
 use crate::expression::parser::Parser;
@@ -264,8 +264,8 @@ pub fn is_connected_for_loop_block(name: &str) -> bool {
 
 /// Predicate that determines if a block with a specific name can be connected to an
 /// `@if` block. Mirrors `isConnectedIfLoopBlock` (true iff `name === 'else'` or it
-/// matches `ELSE_IF_PATTERN`). NOTE(port): the TS name "IfLoop" is a known misnomer;
-/// renamed here.
+/// matches `ELSE_IF_PATTERN`). (The TS name "IfLoop" is a known upstream misnomer —
+/// there is no `@if` loop; this port uses the accurate `is_connected_if_block`.)
 pub fn is_connected_if_block(name: &str) -> bool {
     name == "else" || is_else_if(name)
 }
@@ -444,7 +444,7 @@ pub fn create_for_loop<V: ChildVisitor>(
             (None, None)
         }
         Some(track) => {
-            validate_track_by_expression(&track.expression, &track.keyword_span, &mut errors);
+            validate_track_by_expression(&track.expression, &track.ml_keyword_span, &mut errors);
             (Some(track.expression), Some(track.keyword_span))
         }
     };
@@ -629,6 +629,11 @@ pub fn create_switch_block<V: ChildVisitor>(
 struct TrackBy {
     expression: AstWithSource,
     keyword_span: ParseSourceSpan,
+    /// The original ml_parser span of the `track` parameter, retained so
+    /// `validate_track_by_expression` can report against a *real* span (faithful to
+    /// the TS `validateTrackByExpression`, which uses the keyword's `ParseSourceSpan`)
+    /// instead of a fabricated file-less one.
+    ml_keyword_span: MlSpan,
 }
 
 /// Result of [`parse_for_loop_parameters`] (mirrors the TS `result` object).
@@ -765,9 +770,16 @@ fn parse_for_loop_parameters(
                 }
                 let param_start = param.source_span.start.offset as u32;
                 let keyword_span = span_of(param_start, move_by(param_start, "track".len() as i64));
+                // Build the *real* ml_parser keyword span ([start, start.moveBy(5)])
+                // so track-by validation errors carry a faithful file-backed span.
+                let ml_keyword_span = MlSpan::new(
+                    param.source_span.start.clone(),
+                    param.source_span.start.move_by("track".len() as isize),
+                );
                 result.track_by = Some(TrackBy {
                     expression,
                     keyword_span,
+                    ml_keyword_span,
                 });
             }
             continue;
@@ -784,10 +796,11 @@ fn parse_for_loop_parameters(
 }
 
 /// Validates that a `track` expression does not use pipes. Mirrors
-/// `validateTrackByExpression`.
+/// `validateTrackByExpression`, reporting against the real `track`-keyword
+/// `ParseSourceSpan` (the ml_parser span threaded through [`TrackBy`]).
 fn validate_track_by_expression(
     expression: &AstWithSource,
-    parse_source_span: &ParseSourceSpan,
+    keyword_span: &MlSpan,
     errors: &mut Vec<ParseError>,
 ) {
     use crate::expression::ast::AstVisitor;
@@ -795,10 +808,7 @@ fn validate_track_by_expression(
     visitor.visit(&expression.ast);
     if visitor.has_pipe {
         errors.push(ParseError::new(
-            // The TS error uses the keyword span (an r3 offset span); wrap it in a
-            // minimal ml_parser error span via the original block. We only have the
-            // r3 span here, so reconstruct a ParseError directly on it.
-            ml_error_span_from_r3(parse_source_span),
+            keyword_span.clone(),
             "Cannot use pipes in track expressions",
         ));
     }
@@ -1220,33 +1230,16 @@ impl crate::expression::ast::AstVisitor for PipeVisitor {
 // ---------------------------------------------------------------------------
 // Error-span plumbing.
 //
-// `ParseError::new` (from ml_parser) takes an `ml_parser::ParseSourceSpan`. Most
-// errors carry a real ml_parser span (cloned from the input block/param). Two
-// call sites (`validate_track_by_expression`) only have an r3 offset span; we
-// synthesize a minimal ml_parser span for those. The block-level errors that take
-// `block.sourceSpan` use the ml_parser span directly.
+// `ParseError::new` (from ml_parser) takes an `ml_parser::ParseSourceSpan`; every
+// error in this module now carries a *real* ml_parser span — block-level errors use
+// the block/param `source_span` directly, and `validate_track_by_expression` uses the
+// `track`-keyword span threaded through `TrackBy::ml_keyword_span`. No span is
+// fabricated.
 // ---------------------------------------------------------------------------
 
 /// The ml_parser `sourceSpan` of a block, for errors that report against it.
 fn r3_to_ml_error_span(block: &html::Block) -> MlSpan {
     block.source_span.clone()
-}
-
-/// Synthesize a minimal ml_parser span carrying only offsets, for the rare error
-/// sites that only have an r3 offset span available. The line/col are not known, so
-/// they are left at 0 — acceptable for diagnostics keyed off offsets.
-///
-/// NOTE(port): the TS source reports `validateTrackByExpression` errors against the
-/// `track` keyword's `ParseSourceSpan`. Here we only have the r3 offset form, so we
-/// rebuild an ml_parser span at those offsets over the original file is not possible
-/// without the file handle; we therefore fabricate a detached span. Once
-/// `ParseError` is unified on the offset span this conversion goes away.
-fn ml_error_span_from_r3(span: &ParseSourceSpan) -> MlSpan {
-    use crate::ml_parser::{ParseLocation, ParseSourceFile};
-    let file = ParseSourceFile::new(String::new(), "");
-    let start = ParseLocation::new(file.clone(), span.start as usize, 0, 0);
-    let end = ParseLocation::new(file, span.end as usize, 0, 0);
-    MlSpan::new(start, end)
 }
 
 // ---------------------------------------------------------------------------

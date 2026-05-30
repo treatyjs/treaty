@@ -279,8 +279,7 @@ pub enum LiteralMapKey {
     },
 }
 
-/// `ArrowFunctionIdentifierParameter`. Currently the only `ArrowFunctionParameter`
-/// kind (rest parameters are a TODO in the TS source).
+/// `ArrowFunctionIdentifierParameter` — a plain named parameter `(name) => …`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ArrowFunctionIdentifierParameter {
     pub name: String,
@@ -288,11 +287,24 @@ pub struct ArrowFunctionIdentifierParameter {
     pub source_span: AbsoluteSourceSpan,
 }
 
-/// `ArrowFunctionParameter` — `type ArrowFunctionParameter = ArrowFunctionIdentifierParameter`.
-/// Modeled as an enum so rest parameters can be added later without breaking callers.
+/// `ArrowFunctionRestParameter` — a rest parameter `(...name) => …`. The `name` is
+/// the identifier the rest array binds to; `span`/`source_span` cover the whole
+/// `...name` token range (including the leading `...`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ArrowFunctionRestParameter {
+    pub name: String,
+    pub span: ParseSpan,
+    pub source_span: AbsoluteSourceSpan,
+}
+
+/// `ArrowFunctionParameter` — an identifier parameter or a trailing rest parameter.
+/// (The TS `type ArrowFunctionParameter` historically aliased only the identifier
+/// form; this port models the rest form as a distinct variant so `(...rest) => …`
+/// lowers faithfully.)
 #[derive(Clone, Debug, PartialEq)]
 pub enum ArrowFunctionParameter {
     Identifier(ArrowFunctionIdentifierParameter),
+    Rest(ArrowFunctionRestParameter),
 }
 
 /// A single literal/static text chunk of a template literal. Mirrors the

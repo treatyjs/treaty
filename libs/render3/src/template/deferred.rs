@@ -22,10 +22,11 @@
 //! ## The transform callback
 //!
 //! In TS, `createDeferredBlock` calls `html.visitAll(visitor, children, children)` to
-//! recursively transform the block's HTML children into render3 template nodes. The
-//! html→render3 transform driver (`r3_template_transform`) is a not-yet-ported sibling
-//! (NOTE(port)), so this module takes the child-transform as a [`ChildTransform`]
-//! callback, which the driver supplies. Tests pass a trivial transform.
+//! recursively transform the block's HTML children into render3 template nodes. This
+//! module takes the child-transform as a [`ChildTransform`] callback — the
+//! `template_transform` driver supplies a closure that delegates to its
+//! `HtmlAstToIvyAst` visitor, so child recursion re-enters the concrete transform
+//! exactly as `html.visitAll` does. Tests pass a trivial transform.
 
 use crate::expression::ast::{
     AstNode, AstWithSource, ExprKind, LiteralMapKey, ParseSourceSpan as R3Span,
@@ -76,9 +77,9 @@ fn r3_span_between(start: &crate::ml_parser::ParseLocation, end: &crate::ml_pars
 // ---------------------------------------------------------------------------
 
 /// Transforms a slice of html-AST children into render3 template nodes. Supplied by
-/// the (not-yet-ported) `r3_template_transform` driver. NOTE(port): real driver lives
-/// in `template_transform.rs`; this signature mirrors `html.visitAll(visitor, children,
-/// children)` collapsed to a plain transform.
+/// the `r3_template_transform` driver (`template_transform.rs`) as a closure that
+/// delegates to its `HtmlAstToIvyAst` visitor; the signature mirrors
+/// `html.visitAll(visitor, children, children)` collapsed to a plain transform.
 pub type ChildTransform<'a> = dyn FnMut(&[HtmlNode]) -> Vec<t::Node> + 'a;
 
 // ---------------------------------------------------------------------------
@@ -515,7 +516,7 @@ pub fn parse_never_trigger(
                     hydrate_span,
                 },
             };
-            track_trigger(t::TriggerKey::Never, triggers, errors, trigger);
+            track_trigger(t::TriggerKey::Never, triggers, errors, trigger, source_span);
         }
     }
 }
@@ -562,7 +563,7 @@ pub fn parse_when_trigger(
                     hydrate_span,
                 },
             };
-            track_trigger(t::TriggerKey::When, triggers, errors, trigger);
+            track_trigger(t::TriggerKey::When, triggers, errors, trigger, source_span);
         }
     }
 }
@@ -623,19 +624,18 @@ pub fn parse_on_trigger(
 
 /// `trackTrigger` — inserts `trigger` into the slot for `key`, or pushes a duplicate
 /// error if that slot is occupied. Records insertion order for traversal parity.
+/// `trigger_span` is the real ml_parser span of the trigger parameter, used verbatim
+/// for the duplicate-trigger diagnostic (faithful to the TS `trigger.sourceSpan`).
 fn track_trigger(
     key: t::TriggerKey,
     all_triggers: &mut t::DeferredBlockTriggers,
     errors: &mut Vec<MlParseError>,
     trigger: t::DeferredTrigger,
+    trigger_span: &MlSpan,
 ) {
     let occupied = all_triggers.get(key).is_some();
     if occupied {
-        // `trigger.sourceSpan` — already converted; wrap back into an ml-less ParseError
-        // span. We keep the r3 offsets but ParseError wants an ml span; build a degenerate
-        // one is impossible without a file handle, so we report via the offset span through
-        // a synthetic ml span is not available — instead emit on the closest available.
-        errors.push(duplicate_trigger_error(key, &trigger));
+        errors.push(duplicate_trigger_error(key, trigger_span));
     } else {
         match key {
             t::TriggerKey::When => all_triggers.when = Some(trigger),
@@ -665,15 +665,11 @@ fn trigger_key_name(key: t::TriggerKey) -> &'static str {
     }
 }
 
-/// A duplicate-trigger error. The TS code reports on `trigger.sourceSpan`; here we only
-/// hold the offset-only r3 span, so we surface a [`MlParseError`] carrying the message
-/// and the r3 offsets encoded into a synthetic-but-offset-faithful ml span via the
-/// trigger's own span file is unavailable. We therefore carry offsets in the message-free
-/// span by reusing the r3 offsets — see [`MlParseError`]; we build it from the r3 span's
-/// offsets through [`offset_only_ml_span`].
-fn duplicate_trigger_error(key: t::TriggerKey, trigger: &t::DeferredTrigger) -> MlParseError {
+/// A duplicate-trigger error reported against the real `trigger` parameter span
+/// (faithful to the TS `trigger.sourceSpan`).
+fn duplicate_trigger_error(key: t::TriggerKey, trigger_span: &MlSpan) -> MlParseError {
     MlParseError::new(
-        offset_only_ml_span(&trigger.spans.source_span),
+        trigger_span.clone(),
         format!(
             "Duplicate \"{}\" trigger is not allowed",
             trigger_key_name(key)
@@ -1213,7 +1209,7 @@ impl<'a, 'e> OnTriggerParser<'a, 'e> {
 
         match result {
             Ok((key, trigger)) => {
-                track_trigger(key, self.triggers, self.errors, trigger);
+                track_trigger(key, self.triggers, self.errors, trigger, self.span);
             }
             Err(msg) => self.error(identifier, &msg),
         }
@@ -1439,27 +1435,6 @@ fn slice_range(value: &str, from: usize, to: usize) -> &str {
 /// Unwrap an [`AstWithSource`] to its inner [`AstNode`] (TS `parsed.ast`).
 fn aws_into_ast(parsed: AstWithSource) -> AstNode {
     *parsed.ast
-}
-
-/// Build a [`MlSpan`]-shaped error span when only offset-only r3 offsets are available.
-/// NOTE(port): the connected `parse_util` port should expose a way to construct a span
-/// from raw offsets + a file handle; until then duplicate-trigger errors carry the
-/// offsets in a degenerate span anchored at the trigger's source offsets via the global
-/// file-less location helper below.
-fn offset_only_ml_span(span: &R3Span) -> MlSpan {
-    use crate::ml_parser::{ParseLocation, ParseSourceFile};
-    use std::rc::Rc;
-    // NOTE(port): no file content is available at this layer, so we synthesize a
-    // file-less location carrying only the offsets. Line/col are 0; downstream code that
-    // needs them re-derives from `offset`. This preserves the offset span used by the
-    // language service while avoiding a dependency on the originating file.
-    let file = Rc::new(ParseSourceFile {
-        content: String::new(),
-        url: String::new(),
-    });
-    let start = ParseLocation::new(file.clone(), span.start as usize, 0, 0);
-    let end = ParseLocation::new(file, span.end as usize, 0, 0);
-    MlSpan::new(start, end)
 }
 
 // ---------------------------------------------------------------------------

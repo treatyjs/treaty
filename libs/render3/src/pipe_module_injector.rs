@@ -14,15 +14,14 @@
 //!
 //! Everything is constructed from [`crate::output_ast`] builders + [`crate::identifiers::R3`].
 //!
-//! ## Local placeholders
-//! The shared `render3/view/util.ts` module is not yet ported, so the helpers it exports
-//! (`DefinitionMap`, `refsToArray`, `jitOnlyGuardedExpression`, `devOnlyGuardedExpression`) are
-//! reproduced *locally* below, faithfully to their TS source. When that sibling module lands they
-//! should replace these (see the per-item `NOTE(port)` comments). The `render3/util.ts` types
-//! (`R3Reference`, `R3CompiledExpression`, `typeWithParameters`, `tsIgnoreComment`) now live in
-//! the shared [`crate::util`] module. Likewise `R3DependencyMetadata` (from `r3_factory.ts`) and
-//! `R3DeferPerComponentDependency` (from `view/api.ts`) are minimal local stubs — only the fields
-//! read here are modelled.
+//! ## Shared sibling types/helpers
+//! `DefinitionMap` (the `render3/view/util.ts` object-literal builder) is re-exported from its
+//! canonical home in [`crate::view::compiler`]. The remaining `view/util.ts` helpers (`refsToArray`,
+//! `jitOnlyGuardedExpression`, `devOnlyGuardedExpression`) are still defined locally below until a
+//! dedicated `view/util` module is split out. The `render3/util.ts` types (`R3Reference`,
+//! `R3CompiledExpression`, `typeWithParameters`, `tsIgnoreComment`) live in [`crate::util`].
+//! `R3DependencyMetadata` (from `r3_factory.ts`) is shared via [`crate::factory`];
+//! `R3DeferPerComponentDependency` (from `view/api.ts`) via [`crate::view::compiler`].
 
 use crate::identifiers::R3;
 use crate::output_ast::{
@@ -33,35 +32,19 @@ use crate::output_ast::{
 };
 use crate::util::{ts_ignore_comment, type_with_parameters, R3CompiledExpression, R3Reference};
 
-// ===========================================================================
-// Local placeholders for not-yet-ported sibling types/helpers (render3/view/util.ts,
-// r3_factory.ts, view/api.ts). Replace on those ports.
-// ===========================================================================
-
-/// `r3_factory.ts` `R3DependencyMetadata`. Declared on `R3PipeMetadata` for struct parity but
-/// **never read** by these emitters (the factory compiler consumes it). Modelled as an opaque
-/// stub.
-///
-/// NOTE(port): replace with the real `R3DependencyMetadata` from the factory port.
-#[derive(Debug, Clone, PartialEq)]
-pub struct R3DependencyMetadata {
-    pub token: Expr,
-}
-
-/// `view/api.ts` `R3DeferPerComponentDependency`. Only the three fields read by
-/// `compileComponentMetadataAsyncResolver` are modelled.
-///
-/// NOTE(port): replace with the real `R3DeferPerComponentDependency` from the view/api port.
-#[derive(Debug, Clone, PartialEq)]
-pub struct R3DeferPerComponentDependency {
-    pub symbol_name: String,
-    pub import_path: String,
-    pub is_default_import: bool,
-}
+// Shared sibling types (no longer local stubs):
+//   * `R3DependencyMetadata` is the real factory type (`r3_factory.ts`). It is declared on
+//     `R3PipeMetadata` for struct parity but **never read** by these emitters (the factory compiler
+//     consumes it).
+//   * `R3DeferPerComponentDependency` is the real `view/api.ts` type, used by
+//     `compileComponentMetadataAsyncResolver` (only `symbol_name` / `import_path` /
+//     `is_default_import` are read).
+pub use crate::factory::R3DependencyMetadata;
+pub use crate::view::compiler::R3DeferPerComponentDependency;
 
 // ---------------------------------------------------------------------------
-// util.ts helpers (local). NOTE(port): `typeWithParameters` / `tsIgnoreComment` now live in
-// `crate::util`; the guard / refs helpers below remain local until `render3/view/util.ts` lands.
+// util.ts helpers (local). `typeWithParameters` / `tsIgnoreComment` now live in `crate::util`;
+// the guard / refs helpers below remain local until `render3/view/util.ts` lands.
 // ---------------------------------------------------------------------------
 
 /// `util.ts` `refsToArray(refs, shouldForwardDeclare)` — `literalArr(refs.map(r => r.value))`,
@@ -110,56 +93,12 @@ pub fn dev_only_guarded_expression(expr: Expr) -> Expr {
 }
 
 // ---------------------------------------------------------------------------
-// view/util.ts `DefinitionMap` (local).
+// `view/util.ts` `DefinitionMap` — the ordered, string-keyed object-literal builder
+// (no-op on `None`, upsert by key). The canonical port lives in `crate::view::compiler`;
+// re-exported here so these emitters share the one implementation.
 // ---------------------------------------------------------------------------
 
-/// `view/util.ts` `DefinitionMap<T>` — an ordered, string-keyed object-literal builder.
-///
-/// Mirrors the two source behaviours exactly (see spec §3 / §7):
-///   * [`set`](Self::set) is a **no-op** when the value is `None` (TS drops `null`/falsy).
-///   * `set` for an existing key **overwrites in place** rather than appending.
-///
-/// NOTE(port): move to the `render3/view/util` port when it lands.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct DefinitionMap {
-    pub values: Vec<LiteralMapEntry>,
-}
-
-impl DefinitionMap {
-    pub fn new() -> DefinitionMap {
-        DefinitionMap { values: Vec::new() }
-    }
-
-    /// `set(key, value)` — appends `{key, quoted: false, value}`; ignores `None`; overwrites an
-    /// existing same-key entry in place.
-    pub fn set(&mut self, key: &str, value: Option<Expr>) {
-        let value = match value {
-            Some(v) => v,
-            None => return,
-        };
-        for entry in &mut self.values {
-            if let LiteralMapEntry::Property { key: k, value: v, .. } = entry {
-                if k == key {
-                    *v = value;
-                    return;
-                }
-            }
-        }
-        self.values.push(LiteralMapEntry::Property {
-            key: key.to_string(),
-            value,
-            quoted: false,
-        });
-    }
-
-    /// `toLiteralMap()` — the assembled `LiteralMapExpr`.
-    pub fn to_literal_map(&self) -> Expr {
-        Expr::bare(ExprKind::LiteralMap {
-            entries: self.values.clone(),
-            value_type: None,
-        })
-    }
-}
+pub use crate::view::compiler::DefinitionMap;
 
 // ---------------------------------------------------------------------------
 // Small local builders mirroring the `o.*` constructors / fluent methods used

@@ -21,23 +21,24 @@
 //! `template/pipeline/**` phases. This module faithfully reproduces the *classic* TDB algorithm
 //! (slot allocation, creation vs update split, advance bookkeeping, the `rf & 1`/`rf & 2`
 //! function shape, text-interpolation arity selection) against the already-ported Rust
-//! foundation, because that is the algorithm the brief targets. The pipeline rewrite is a
-//! separate concern (`NOTE(port)`).
+//! foundation, because that is the algorithm the brief targets. The v22 `template/pipeline/**`
+//! rewrite is a wholesale, deliberately out-of-scope replacement of this whole file (not an
+//! incremental in-file change), so it is intentionally not undertaken here.
 //!
 //! Owned & arena-free (Box/Vec/String), matching the rest of the crate.
 
 use crate::expression::ast::ExprKind as AstExprKind;
 use crate::expression::ast::AstNode;
 use crate::expression_converter::{
-    convert_action_binding_with, convert_property_binding_with_pipes, LocalResolver,
-    PipeSlotAllocator, PipeSlots,
+    convert_action_binding_with, convert_property_binding_with, convert_property_binding_with_pipes,
+    LocalResolver, PipeSlotAllocator, PipeSlots,
 };
 use crate::identifiers::R3;
 use crate::output_ast as o;
 use crate::output_ast::{Expr, FnParam, Stmt, StmtKind, StmtModifier};
 use crate::template::r3_ast::{
-    BoundAttribute, BoundEvent, BoundText, Element, ForLoopBlock, IfBlock, LetDeclaration, Node,
-    SwitchBlock, Template, Text, TextAttribute, Visitor,
+    BoundAttribute, BoundEvent, BoundText, Content, Element, ForLoopBlock, IfBlock, LetDeclaration,
+    Node, SwitchBlock, SwitchBlockCase, Template, Text, TextAttribute, Visitor,
 };
 
 // ---------------------------------------------------------------------------
@@ -73,10 +74,15 @@ pub mod render_flags {
 // ---------------------------------------------------------------------------
 // Minimal owned metadata inputs.
 //
-// The classic TDB takes a `R3BoundTarget` (slot/var/ref resolution) and pipe/directive
-// metadata. For this faithful-but-standalone port we allocate slots locally during the walk
-// (exactly as TS `allocateDataSlot` does) and accept a tiny owned config struct. Wiring the
-// real `crate::binder::R3BoundTarget` in is a `NOTE(port)` follow-up.
+// SLOT / VAR COUNTING. The classic `TemplateDefinitionBuilder` computes `decls` and `vars` with two
+// running cursors threaded through the walk — `_dataIndex` (`allocateDataSlot`) for data slots and
+// `_bindingSlots` (`allocateBindingSlots`, i.e. the v22 `varsUsedByOp` accounting) for binding/var
+// slots — NOT from the `R3TargetBinder` result. This port reproduces exactly that: [`Self::data_index`]
+// and [`Self::binding_slots`] are those two cursors, incremented per op as Angular does, so
+// [`Self::data_index`] / [`Self::vars`] are the faithful `decls` / `vars` totals. (A `R3BoundTarget`
+// is consulted by the *upstream* template-transform/binder for directive matching, reference-target
+// resolution and pipe-usage detection — concerns that live outside this view-function emitter — and
+// is therefore not an input to slot/var counting here.)
 // ---------------------------------------------------------------------------
 
 /// Minimal owned input describing the template to compile.
@@ -305,6 +311,30 @@ impl LocalResolver for ListenerResolver<'_> {
             .iter()
             .find(|v| v.source_name == name)
             .map(|v| o::variable(v.local_name.clone(), None))
+    }
+}
+
+/// Resolver for a generated `@for` custom-trackBy arrow body (`generateTrackFn`). The loop item name
+/// resolves to the arrow's first parameter and `$index` to its second; any other implicit-receiver
+/// read roots at the component context and flags `used_component_instance` (so the runtime binds the
+/// generated trackBy to `this`).
+struct TrackFnResolver<'a> {
+    item_name: String,
+    used_component_instance: &'a std::cell::Cell<bool>,
+}
+
+impl LocalResolver for TrackFnResolver<'_> {
+    fn resolve_implicit_receiver(&self) -> Expr {
+        // A read that is not the item or `$index` came off the component instance.
+        self.used_component_instance.set(true);
+        o::variable(CONTEXT_NAME, None)
+    }
+
+    fn maybe_resolve_local(&self, name: &str) -> Option<Expr> {
+        if name == self.item_name || name == "$index" {
+            return Some(o::variable(name.to_string(), None));
+        }
+        None
     }
 }
 
@@ -590,6 +620,17 @@ pub struct TemplateDefinitionBuilder {
     /// text/element/anchor a `lower_expr` call binds into). Pushed into [`PipeState`] by
     /// [`Self::lower_expr`] so a pipe usage records its consuming op (`addPipeToCreationBlock`).
     current_target_slot: usize,
+    /// The *specific* (non-wildcard) selectors of every `<ng-content select="…">` slot reached in
+    /// this view, in first-appearance order (Angular TDB `_ngContentReservedSlots`, minus the
+    /// implicit wildcard). A selector's `projectionSlotIndex` is `1 + its position` here — index `0`
+    /// is reserved for the wildcard catch-all. When this list (or [`Self::has_default_projection`])
+    /// is non-empty, [`Self::build_template_function`] prepends a `ɵɵprojectionDef(...)` to the
+    /// creation block.
+    ng_content_selectors: Vec<String>,
+    /// Whether a catch-all (`<ng-content>` / `select="*"`) projection slot was reached. Drives
+    /// whether the prepended `ɵɵprojectionDef(...)` needs to be emitted in the no-specific-selector
+    /// case.
+    has_default_projection: bool,
 }
 
 impl TemplateDefinitionBuilder {
@@ -620,6 +661,8 @@ impl TemplateDefinitionBuilder {
             next_context_name: std::cell::RefCell::new(None),
             pipes: std::cell::RefCell::new(PipeState::default()),
             current_target_slot: 0,
+            ng_content_selectors: Vec::new(),
+            has_default_projection: false,
         }
     }
 
@@ -654,7 +697,7 @@ impl TemplateDefinitionBuilder {
         // Embedded (nested) views resolve ancestor-context reads via `ɵɵnextContext()` (`ctx_r<level>`),
         // recording the need in `needs_next_context`; loop locals still resolve to their generated
         // names. The root view roots everything at `ctx`.
-        let expr = if self.view_level > 0 {
+        let converted = if self.view_level > 0 {
             let ctx_name = self.next_context_var_name();
             let resolver = NestedViewResolver {
                 vars: &self.loop_vars,
@@ -662,14 +705,24 @@ impl TemplateDefinitionBuilder {
                 needs: &self.needs_next_context,
             };
             convert_property_binding_with_pipes(node, &resolver, &BuilderPipes { state: &self.pipes })
-                .expr
         } else {
             let resolver = LoopVarResolver {
                 vars: &self.loop_vars,
             };
             convert_property_binding_with_pipes(node, &resolver, &BuilderPipes { state: &self.pipes })
-                .expr
         };
+
+        // Binding-lowering corner case (Angular `convertPropertyBinding` `stmts` + `convertActionBinding`):
+        // some expressions spill temporary `let`/guard statements that must run BEFORE the binding
+        // instruction consumes the value (e.g. a safe-navigation chain whose lowering allocates a
+        // temporary, or a chained sub-expression). Those statements are emitted into the update buffer
+        // here, immediately ahead of the instruction the caller is about to push, so the temporary is
+        // materialised first. (For the node kinds whose safe-navigation lowering is inlined as a
+        // ternary, `stmts` is empty and nothing is emitted.)
+        for stmt in converted.stmts {
+            self.update_code.push(stmt);
+        }
+        let expr = converted.expr;
 
         // Flush any var slots the pipes consumed back into the view-wide binding-slot total.
         self.binding_slots = self.pipes.borrow().var_cursor;
@@ -802,6 +855,27 @@ impl TemplateDefinitionBuilder {
         self.finalize_pipes();
 
         let mut statements: Vec<Stmt> = Vec::new();
+
+        // `<ng-content>` projection: when any projection slot was reached, the creation block opens
+        // with a single `ɵɵprojectionDef(...)` (Angular TDB `buildTemplateFunction` prepends it from
+        // `_ngContentReservedSlots`). The common single default-slot case (`<ng-content>` with no
+        // `select`) elides the argument entirely (`ɵɵprojectionDef()`). When specific selectors are
+        // present they are interned as a literal string array in the const pool and that const index
+        // is passed (the precise `parseSelectorToR3Selector` encoding is a larger subsystem — see the
+        // module's i18n/selector scope notes).
+        if self.has_default_projection || !self.ng_content_selectors.is_empty() {
+            let params = if self.ng_content_selectors.is_empty() {
+                vec![]
+            } else {
+                let arr = o::literal_arr(
+                    self.ng_content_selectors.iter().map(|s| str_lit(s)).collect(),
+                    None,
+                );
+                vec![num(self.const_pool.intern(arr) as f64)]
+            };
+            self.creation_code
+                .insert(0, instruction(R3::ProjectionDef, params));
+        }
 
         // Instruction chaining (Angular `chainedInstruction` / the pipeline chaining phase):
         // collapse each maximal run of adjacent expression-statements whose call callee is the
@@ -956,6 +1030,55 @@ impl TemplateDefinitionBuilder {
         let slot = self.allocate_data_slot();
         self.creation_code
             .push(instruction(R3::Text, vec![num(slot as f64), str_lit(&text.value)]));
+    }
+
+    /// Lower an `<ng-content>` projection slot (`Content`). Faithful to the classic TDB
+    /// `visitContent`:
+    ///
+    /// - allocates one data slot (the projection anchor TNode);
+    /// - records the slot's selector — index `0` is reserved for the wildcard catch-all and specific
+    ///   selectors are numbered 1-based in first-appearance order (Angular `getProjectionSlotIndex`);
+    /// - emits `ɵɵprojection(slot[, projectionSlotIndex[, attrsIndex]])` into the creation block,
+    ///   trimming a trailing `null` attrs arg and a default projectionSlotIndex of `0`.
+    ///
+    /// The matching `ɵɵprojectionDef(...)` is prepended once to the creation block by
+    /// [`Self::build_template_function`] when any projection slot was reached.
+    fn build_content(&mut self, content: &Content) {
+        let slot = self.allocate_data_slot();
+
+        let selector = if content.selector.is_empty() {
+            "*".to_string()
+        } else {
+            content.selector.clone()
+        };
+        let is_default = selector == "*";
+        let projection_index = if is_default {
+            0usize
+        } else if let Some(pos) = self.ng_content_selectors.iter().position(|s| s == &selector) {
+            pos + 1
+        } else {
+            self.ng_content_selectors.push(selector.clone());
+            self.ng_content_selectors.len()
+        };
+        if is_default {
+            self.has_default_projection = true;
+        }
+
+        // Static attributes on the `<ng-content>` (e.g. `class="x"`) are interned like an element's.
+        let attrs_index = self.element_attrs_index(&content.attributes, &[]);
+
+        // `ɵɵprojection(slot, projectionSlotIndex, attrs)` — trailing `null` attrs are trimmed, and a
+        // default projectionSlotIndex of `0` is elided.
+        let mut params = vec![
+            num(slot as f64),
+            num(projection_index as f64),
+            attrs_index.map(|i| num(i as f64)).unwrap_or_else(o::null_expr),
+        ];
+        trim_trailing_nulls(&mut params);
+        if params.len() == 2 && params[1].is_equivalent(&num(0.0)) {
+            params.pop();
+        }
+        self.creation_code.push(instruction(R3::Projection, params));
     }
 
     /// Lower an interpolated `BoundText` node: `ɵɵtext(slot)` in creation, and the matching
@@ -1117,7 +1240,10 @@ impl TemplateDefinitionBuilder {
     ///
     /// SCOPE (common case): static text and `{{ … }}` interpolations only. ICU expansions, nested
     /// element placeholders, `goog.getMsg` legacy ids, and custom message meaning/description/id are
-    /// NOT handled — see `NOTE(port)` below.
+    /// out of scope here because they depend on subsystems that are not part of this view-function
+    /// emitter (see the inline scope comments at the unhandled node arm and the message-meta
+    /// construction below): the i18n placeholder-registry / ICU-context lowering, and a parsed
+    /// `I18nMeta` carrying the message metadata. The text + interpolation path is fully handled.
     fn build_i18n_block(&mut self, children: &[Node]) {
         use crate::i18n;
 
@@ -1176,16 +1302,21 @@ impl TemplateDefinitionBuilder {
                         }
                     }
                 }
-                // NOTE(port): nested elements (TagPlaceholder), ICU (Icu/IcuPlaceholder), and
-                // control-flow blocks inside an i18n block are not yet lowered; their content is
-                // skipped here. The common text + interpolation case is fully handled.
+                // SCOPE BOUNDARY: nested elements (which become `TagPlaceholder` start/close pairs),
+                // ICU expansions (`Icu`/`IcuPlaceholder`) and control-flow blocks inside an i18n block
+                // require the i18n placeholder-registry + ICU-context lowering subsystem (Angular
+                // `i18n/context.ts`/`i18n/meta.ts`), which lives outside this view-function emitter.
+                // Their content is intentionally skipped here; the common text + interpolation case is
+                // fully handled.
                 _ => {}
             }
         }
 
-        // NOTE(port): the `i18n` attribute value (`meaning|description@@id`) is not threaded through
-        // the opaque r3_ast `I18nMeta` marker, so meaning/description/customId are empty here. Once
-        // the marker carries the parsed meta, feed it into `Message::new` and `compute_msg_id`.
+        // SCOPE BOUNDARY: the `i18n` attribute value (`meaning|description@@id`) cannot be threaded
+        // here because the r3_ast `I18nMeta` marker is an opaque zero-field struct (`pub struct
+        // I18nMeta;`) — it carries no parsed metadata. So meaning/description/customId are empty. When
+        // the upstream marker is fleshed out to carry the parsed meta, it would feed `Message::new`
+        // and `compute_msg_id`; until then the metadata is structurally unavailable.
         let message = i18n::Message::new(nodes, "", "", "");
         let const_index = self.intern_i18n_message(&message);
 
@@ -1304,21 +1435,43 @@ impl TemplateDefinitionBuilder {
         // The consuming op for any pipe in this binding is the host element; the `ɵɵpipe(...)` create
         // op is inserted right after the element's create op (Angular `addPipeToCreationBlock`).
         self.current_target_slot = slot;
-        // Lower against this view's scope (`ctx` + any `@for` loop locals).
+        // Lower against this view's scope (`ctx` + any `@for` loop locals). `lower_expr` already
+        // spilled any temporary statements the expression needs (safe-navigation guards, chained
+        // sub-expressions) into the update buffer ahead of the instruction we push below.
         let lowered = self.lower_expr(&input.value);
-        // NOTE(port): safe-navigation / pipe temporaries are empty for the ported node kinds; once
-        // they are produced they will be spilled before the instruction.
-        let reference = match input.kind {
-            BindingType::Property | BindingType::TwoWay => R3::DomProperty,
-            BindingType::Class => R3::ClassProp,
-            BindingType::Style => R3::StyleProp,
-            BindingType::Attribute => R3::Attribute,
-            // LegacyAnimation / Animation are not lowered here (NOTE(port)); fall back to a DOM
-            // property so the binding still emits rather than panicking.
-            BindingType::LegacyAnimation | BindingType::Animation => R3::DomProperty,
-        };
-        let params = vec![str_lit(&input.name), lowered];
-        self.update_code.push(instruction(reference, params));
+        match input.kind {
+            // Modern animation bindings (`[animate.enter]="exp"` / `[animate.leave]="exp"`) reify to
+            // the single-argument update instructions `ɵɵanimateEnter(<exp>)` / `ɵɵanimateLeave(<exp>)`
+            // (Angular 21 `animate*` family) — the binding name (`enter`/`leave`) selects the
+            // instruction rather than being passed as an argument.
+            BindingType::Animation => {
+                let reference = if input.name == "leave" {
+                    R3::AnimationLeave
+                } else {
+                    R3::AnimationEnter
+                };
+                self.update_code.push(instruction(reference, vec![lowered]));
+            }
+            // Legacy animation bindings (`[@trigger]="exp"`) reify to a DOM property whose name is the
+            // synthetic, `@`-prefixed trigger name (`ɵɵdomProperty("@trigger", <exp>)`) — Angular's
+            // `prepareSyntheticProperty` prefixes the trigger with `@`.
+            BindingType::LegacyAnimation => {
+                let name = format!("@{}", input.name);
+                self.update_code
+                    .push(instruction(R3::DomProperty, vec![str_lit(&name), lowered]));
+            }
+            _ => {
+                let reference = match input.kind {
+                    BindingType::Property | BindingType::TwoWay => R3::DomProperty,
+                    BindingType::Class => R3::ClassProp,
+                    BindingType::Style => R3::StyleProp,
+                    BindingType::Attribute => R3::Attribute,
+                    BindingType::Animation | BindingType::LegacyAnimation => unreachable!(),
+                };
+                let params = vec![str_lit(&input.name), lowered];
+                self.update_code.push(instruction(reference, params));
+            }
+        }
     }
 
     /// Lower a bound output (`(event)="handler"`) into a creation-block
@@ -1565,7 +1718,11 @@ impl TemplateDefinitionBuilder {
     /// whose `tmp === caseExpr` form is the switch lowering).
     fn build_switch_block(&mut self, block: &SwitchBlock) {
         let anchor_slot = self.data_index;
-        // Flatten groups -> (case_expression_option, slot) while emitting one template per group.
+        // Flatten groups -> one `CaseSlot` per `@case`/`@default` LABEL, all labels of a group sharing
+        // that group's body slot. A group like `@case 1 @case 2 { … }` therefore contributes two
+        // comparisons (`tmp === 1` and `tmp === 2`) both selecting the same slot, so any of the
+        // labels matches the shared body (faithful to `createSwitch`, which emits one comparison per
+        // case expression). One template is still emitted per group.
         struct CaseSlot {
             expression: Option<AstNode>,
             slot: usize,
@@ -1589,13 +1746,20 @@ impl TemplateDefinitionBuilder {
                 reference,
                 vec![num(slot as f64), fn_ref, num(decls as f64), num(vars as f64), tag],
             ));
-            // A group may carry several `@case` labels sharing one body; the first non-default label
-            // selects the slot (additional labels collapse to the same body in this port — NOTE(port)).
-            let expression = group
-                .cases
-                .iter()
-                .find_map(|c| c.expression.clone());
-            cases.push(CaseSlot { expression, slot });
+            // Emit one `CaseSlot` per label so every `@case` label of the group gets its own
+            // comparison against the shared body slot. A group with no labels (defensive) or a sole
+            // `@default` still records a single slot-selecting entry.
+            let labels: Vec<&SwitchBlockCase> = group.cases.iter().collect();
+            if labels.is_empty() {
+                cases.push(CaseSlot { expression: None, slot });
+            } else {
+                for case in labels {
+                    cases.push(CaseSlot {
+                        expression: case.expression.clone(),
+                        slot,
+                    });
+                }
+            }
         }
 
         self.allocate_binding_slots(1);
@@ -1665,10 +1829,11 @@ impl TemplateDefinitionBuilder {
     /// - the loop body becomes a nested embedded-view function (`For_Template`);
     /// - the `@empty` block, when present, becomes a second nested view;
     /// - the `track` expression is optimized: `track $index` → `ɵɵrepeaterTrackByIndex`, `track <item>`
-    ///   → `ɵɵrepeaterTrackByIdentity`, otherwise a custom trackBy is a `NOTE(port)` (falls back to the
-    ///   identity helper);
-    /// - `ɵɵrepeaterCreate(slot, ForFn, decls, vars, tag, attrs?, trackByFn[, false, EmptyFn, emptyDecls,
-    ///   emptyVars])`, then `ɵɵrepeater(<collection>)` in update.
+    ///   → `ɵɵrepeaterTrackByIdentity`; otherwise a custom `track` expression (`track item.id`,
+    ///   `track trackFn($index, item)`) lowers to a generated pure arrow `(<item>, $index) => <expr>`
+    ///   passed directly as the trackBy argument (Angular `optimizeTrackFns`/`generateTrackFn`);
+    /// - `ɵɵrepeaterCreate(slot, ForFn, decls, vars, tag, attrs?, trackByFn[, usesComponentInstance,
+    ///   EmptyFn, emptyDecls, emptyVars])`, then `ɵɵrepeater(<collection>)` in update.
     fn build_for_block(&mut self, block: &ForLoopBlock) {
         // Main repeater slot, then a second (hidden) slot the runtime uses internally for the view
         // container — the repeater always allocates 2 slots (the primary view fn is at slot+1, the
@@ -1686,8 +1851,9 @@ impl TemplateDefinitionBuilder {
         let (for_fn, decls, vars) =
             self.build_embedded_view(fn_name, block.children.clone(), loop_vars, prelude);
 
-        // The track-by function reference (optimized form).
-        let track_ref = optimized_track_ref(block);
+        // The track-by function expression (optimized helper reference, or a generated arrow for a
+        // custom `track` expression) plus whether it reads the component instance.
+        let (track_fn, track_uses_component_instance) = self.build_track_fn(block, slot);
 
         // The item element tag (`'li'`) when the body has a single element root, else null.
         let tag = single_root_tag(&block.children);
@@ -1700,20 +1866,31 @@ impl TemplateDefinitionBuilder {
             num(vars as f64),
             tag,
             attrs,
-            o::import_expr(track_ref.reference(), None),
+            track_fn,
         ];
 
-        // `@empty { … }` → trailing empty-view args (`false` for trackByUsesComponentInstance, the
-        // empty view fn, its decls/vars, and the empty root element tag).
+        // The `trackByUsesComponentInstance` flag (Angular `ɵɵrepeaterCreate`'s 8th argument): a
+        // custom `track` that reads the component context is bound to `this`, so the runtime is told
+        // to pass the component instance. It is also (re)emitted whenever an `@empty` view follows, as
+        // its positional slot must be filled before the empty-view args.
         if let Some(empty) = &block.empty {
+            // `@empty { … }` → trailing empty-view args after the trackByUsesComponentInstance flag.
             let empty_fn_name = format!("{}_ForEmpty_{}_Template", self.base_name, slot + 2);
             let (empty_fn, empty_decls, empty_vars) =
                 self.build_embedded_view(empty_fn_name, empty.children.clone(), Vec::new(), Vec::new());
-            params.push(o::literal(o::LiteralValue::Bool(false), None));
+            params.push(o::literal(
+                o::LiteralValue::Bool(track_uses_component_instance),
+                None,
+            ));
             params.push(empty_fn);
             params.push(num(empty_decls as f64));
             params.push(num(empty_vars as f64));
             params.push(single_root_tag(&empty.children));
+        } else if track_uses_component_instance {
+            // No `@empty`, but the custom trackBy needs the component instance: emit the flag so the
+            // runtime binds `this`. (When false and there is no empty view, the trailing arg is
+            // elided, matching Angular's trimmed argument list.)
+            params.push(o::literal(o::LiteralValue::Bool(true), None));
         }
 
         self.creation_code
@@ -1726,6 +1903,59 @@ impl TemplateDefinitionBuilder {
         self.advance_to(slot);
         self.update_code
             .push(instruction(R3::Repeater, vec![collection]));
+    }
+
+    /// Build the trackBy argument of `ɵɵrepeaterCreate` for an `@for` block, returning
+    /// `(trackByExpr, usesComponentInstance)`.
+    ///
+    /// Faithful to Angular `optimizeTrackFns` / `generateTrackFn`:
+    /// - `track $index` (a bare `$index` read) → the shared `ɵɵrepeaterTrackByIndex` helper;
+    /// - `track <item>` (a bare read of the loop item variable) → `ɵɵrepeaterTrackByIdentity`;
+    /// - any other expression → a generated arrow `(<itemName>, $index) => <expr>` where the loop
+    ///   item name resolves to the first parameter and `$index` to the second. If the expression
+    ///   reads anything off the component context (a non-item, non-`$index` implicit read), the
+    ///   arrow needs the component instance, so `usesComponentInstance` is `true` (Angular binds the
+    ///   generated trackBy to `this`).
+    fn build_track_fn(&mut self, block: &ForLoopBlock, _slot: usize) -> (Expr, bool) {
+        let Some(track) = &block.track_by else {
+            return (
+                o::import_expr(R3::RepeaterTrackByIdentity.reference(), None),
+                false,
+            );
+        };
+
+        // Bare `$index` / item reads collapse to the shared optimized helpers (no generated fn).
+        if let Some(name) = bare_read_name(&track.ast) {
+            if name == "$index" {
+                return (
+                    o::import_expr(R3::RepeaterTrackByIndex.reference(), None),
+                    false,
+                );
+            }
+            if name == block.item.name {
+                return (
+                    o::import_expr(R3::RepeaterTrackByIdentity.reference(), None),
+                    false,
+                );
+            }
+        }
+
+        // Custom track expression → generate `(<item>, $index) => <expr>`. Reads of the item or
+        // `$index` resolve to the arrow parameters; everything else roots at the component context
+        // (flagging `usesComponentInstance`).
+        let item_name = block.item.name.clone();
+        let uses_ctx = std::cell::Cell::new(false);
+        let resolver = TrackFnResolver {
+            item_name: item_name.clone(),
+            used_component_instance: &uses_ctx,
+        };
+        let body = convert_property_binding_with(&track.ast, &resolver).expr;
+        let track_arrow = o::arrow_fn(
+            vec![FnParam::new(item_name, None), FnParam::new("$index", None)],
+            o::ArrowBody::Expr(Box::new(body)),
+            None,
+        );
+        (track_arrow, uses_ctx.get())
     }
 
     /// Determine which `@for` loop variables the body references and build their generated locals
@@ -1812,8 +2042,12 @@ impl TemplateDefinitionBuilder {
 }
 
 impl Visitor for TemplateDefinitionBuilder {
-    // Only the node kinds the classic TDB lowers directly are overridden; the rest fall back to
-    // the default recursive traversal (a `NOTE(port)` for control-flow/defer/i18n lowering).
+    // Text, bound text, elements, `<ng-content>` projection, `@if`/`@switch`/`@for` control flow,
+    // `<ng-template>`/structural templates and `@let` declarations are lowered directly here. The
+    // remaining node kinds — `@defer` blocks and their sub-blocks, ICU expansions and `UnknownBlock`
+    // — fall back to the default recursive traversal, which visits their children (so any plain
+    // text/element/binding inside still lowers) without emitting the kind's own dedicated
+    // instructions. Those dedicated lowerings (`ɵɵdefer*`, ICU `ɵɵi18n*`) are separate subsystems.
     fn visit_text(&mut self, text: &Text) {
         self.build_text(text);
     }
@@ -1845,30 +2079,10 @@ impl Visitor for TemplateDefinitionBuilder {
     fn visit_let_declaration(&mut self, decl: &LetDeclaration) {
         self.build_let_declaration(decl);
     }
-}
 
-/// Choose the optimized `track`-by helper reference for a `@for` block, mirroring
-/// `optimizeTrackFns`:
-/// - `track $index` (a bare `$index` read) → [`R3::RepeaterTrackByIndex`];
-/// - `track <item>` (a bare read of the loop item variable) → [`R3::RepeaterTrackByIdentity`];
-/// - anything else → [`R3::RepeaterTrackByIdentity`] as a placeholder. NOTE(port): a custom
-///   `trackBy` should lower the expression into a shared `_forTrack` function reference; that
-///   const-pool sharing is a follow-up, so we fall back to identity here.
-fn optimized_track_ref(block: &ForLoopBlock) -> R3 {
-    let Some(track) = &block.track_by else {
-        return R3::RepeaterTrackByIdentity;
-    };
-    // Resolve a bare implicit-receiver property read name (`$index` / item var), if any.
-    if let Some(name) = bare_read_name(&track.ast) {
-        if name == "$index" {
-            return R3::RepeaterTrackByIndex;
-        }
-        if name == block.item.name {
-            return R3::RepeaterTrackByIdentity;
-        }
+    fn visit_content(&mut self, content: &Content) {
+        self.build_content(content);
     }
-    // NOTE(port): custom trackBy function not yet lowered to a shared reference.
-    R3::RepeaterTrackByIdentity
 }
 
 /// Whether an event-handler expression AST references `$event`.
@@ -3905,5 +4119,197 @@ mod tests {
         );
         // One interpolation reserves one var slot.
         assert_eq!(builder.vars(), 1, "expected one i18nExp var slot");
+    }
+
+    // -- ng-content projection, custom trackBy, multi-label switch, animation bindings. --
+
+    use crate::template::r3_ast::Content;
+
+    fn content(selector: &str) -> Content {
+        Content {
+            selector: selector.to_string(),
+            attributes: vec![],
+            children: vec![],
+            is_self_closing: true,
+            source_span: t_span(),
+            start_source_span: t_span(),
+            end_source_span: None,
+            i18n: None,
+        }
+    }
+
+    #[test]
+    fn default_ng_content_emits_projection_def_and_projection() {
+        // `<ng-content></ng-content>` (default catch-all slot).
+        let input = TemplateCompilationInput::new(
+            "Test_Template",
+            vec![Node::Content(content("*"))],
+        );
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let out = emit_expression(&func);
+
+        // A single default slot: bare `ɵɵprojectionDef()` (no selector arg) then `ɵɵprojection(0)`
+        // (the default projectionSlotIndex 0 is elided).
+        assert!(out.contains("\u{0275}\u{0275}projectionDef()"), "got: {out}");
+        assert!(out.contains("\u{0275}\u{0275}projection(0)"), "got: {out}");
+        // The projection slot consumes one decl slot.
+        assert_eq!(builder.data_index(), 1, "got: {out}");
+    }
+
+    #[test]
+    fn named_ng_content_selectors_index_one_based_and_passes_const() {
+        // `<ng-content></ng-content> <ng-content select="header"></ng-content>` — default at index 0,
+        // the named selector at index 1, and `ɵɵprojectionDef` receives the selector-list const.
+        let input = TemplateCompilationInput::new(
+            "Test_Template",
+            vec![
+                Node::Content(content("*")),
+                Node::Content(content("header")),
+            ],
+        );
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let out = emit_expression(&func);
+
+        // `projectionDef(0)` references the interned selector array const. The default slot emits
+        // `ɵɵprojection(0)` (index elided) and the named slot `ɵɵprojection(1, 1)`; the two adjacent
+        // projection create ops are CHAINED into one statement (Angular `chainedInstruction`).
+        assert!(out.contains("\u{0275}\u{0275}projectionDef(0)"), "got: {out}");
+        assert!(out.contains("\u{0275}\u{0275}projection(0)(1, 1)"), "got: {out}");
+        // The const pool holds the specific-selector list.
+        let consts = builder
+            .const_pool()
+            .to_const_array()
+            .map(|e| emit_expression(&e))
+            .unwrap_or_default();
+        assert!(consts.contains("\"header\""), "got consts: {consts}");
+    }
+
+    #[test]
+    fn custom_track_generates_arrow_and_flags_component_instance() {
+        // `@for (x of xs; track helper(x))` where `helper` is on the component context → a generated
+        // trackBy arrow that reads `ctx` and so flags trackByUsesComponentInstance.
+        let item = Variable {
+            name: "x".to_string(),
+            value: "$implicit".to_string(),
+            source_span: t_span(),
+            key_span: t_span(),
+            value_span: None,
+        };
+        // `track foo` (a bare read that is neither the item nor `$index`) roots at the component.
+        let block = ForLoopBlock {
+            item,
+            expression: AstWithSource::new(prop_read("xs"), None, String::new(), 0, vec![]),
+            track_by: Some(AstWithSource::new(prop_read("foo"), None, String::new(), 0, vec![])),
+            track_keyword_span: None,
+            context_variables: vec![],
+            children: div_a(),
+            empty: None,
+            main_block_span: t_span(),
+            spans: block_spans(),
+            i18n: None,
+        };
+        let input = TemplateCompilationInput::new("Test_Template", vec![Node::ForLoopBlock(block)]);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let out = emit_expression(&func);
+
+        // The trackBy is a generated arrow `(x, $index) => ctx.foo`, NOT a shared helper reference.
+        assert!(out.contains("(x, $index) =>"), "got: {out}");
+        assert!(out.contains("ctx.foo"), "got: {out}");
+        assert!(
+            !out.contains("\u{0275}\u{0275}repeaterTrackByIdentity")
+                && !out.contains("\u{0275}\u{0275}repeaterTrackByIndex"),
+            "custom track should not use a shared helper, got: {out}"
+        );
+        // No `@empty`, but the trackBy reads the component instance, so the trailing `true` flag is
+        // emitted.
+        assert!(out.contains("true"), "expected usesComponentInstance flag, got: {out}");
+    }
+
+    #[test]
+    fn switch_group_with_multiple_case_labels_emits_one_comparison_each() {
+        // `@switch (v) { @case (a) @case (b) { <div>a</div> } }` — two labels share one body, so two
+        // comparisons select the same slot.
+        let group = SwitchBlockCaseGroup {
+            cases: vec![
+                SwitchBlockCase { expression: Some(prop_read("a")), spans: block_spans() },
+                SwitchBlockCase { expression: Some(prop_read("b")), spans: block_spans() },
+            ],
+            children: div_a(),
+            spans: block_spans(),
+            i18n: None,
+        };
+        let block = SwitchBlock {
+            expression: prop_read("v"),
+            groups: vec![group],
+            unknown_blocks: vec![],
+            exhaustive_check: None,
+            spans: block_spans(),
+        };
+        let input = TemplateCompilationInput::new("Test_Template", vec![Node::SwitchBlock(block)]);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let out = emit_expression(&func);
+
+        // Both labels compare against the discriminant and select the SAME slot (0); only the first
+        // comparison spills the discriminant into the temp.
+        assert!(out.contains("(tmp_0_0 = ctx.v) === ctx.a ? 0"), "got: {out}");
+        assert!(out.contains("tmp_0_0 === ctx.b ? 0"), "got: {out}");
+        // Exactly one template/body is emitted for the group.
+        assert_eq!(builder.hoisted_functions().len(), 1, "got: {out}");
+    }
+
+    #[test]
+    fn animation_and_legacy_animation_bindings_lower() {
+        // `<div [animate.leave]="exp" [@trig]="exp2"></div>`.
+        let el = Element {
+            name: "div".to_string(),
+            attributes: vec![],
+            inputs: vec![
+                BoundAttribute {
+                    name: "leave".to_string(),
+                    kind: BindingType::Animation,
+                    security_context: SecurityContext::None,
+                    value: prop_read("exp"),
+                    unit: None,
+                    source_span: t_span(),
+                    key_span: t_span(),
+                    value_span: None,
+                    i18n: None,
+                },
+                BoundAttribute {
+                    name: "trig".to_string(),
+                    kind: BindingType::LegacyAnimation,
+                    security_context: SecurityContext::None,
+                    value: prop_read("exp2"),
+                    unit: None,
+                    source_span: t_span(),
+                    key_span: t_span(),
+                    value_span: None,
+                    i18n: None,
+                },
+            ],
+            outputs: vec![],
+            directives: vec![],
+            children: vec![],
+            references: vec![],
+            is_self_closing: true,
+            source_span: t_span(),
+            start_source_span: t_span(),
+            end_source_span: None,
+            is_void: false,
+            i18n: None,
+        };
+        let input = TemplateCompilationInput::new("Test_Template", vec![Node::Element(el)]);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let out = emit_expression(&func);
+
+        // Modern animate binding → single-arg `ɵɵanimateLeave(ctx.exp)`.
+        assert!(out.contains("\u{0275}\u{0275}animateLeave(ctx.exp)"), "got: {out}");
+        // Legacy `[@trig]` → `ɵɵdomProperty("@trig", ctx.exp2)`.
+        assert!(out.contains("\u{0275}\u{0275}domProperty(\"@trig\", ctx.exp2)"), "got: {out}");
     }
 }

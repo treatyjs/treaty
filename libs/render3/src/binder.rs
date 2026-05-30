@@ -1250,7 +1250,11 @@ impl<'a, 't> DirectiveBinder<'a, 't> {
             }
         }
 
-        // Selectorless references all point to the FIRST matched directive (TODO crisbeto in TS).
+        // Selectorless reference resolution: it is (intentionally, upstream) still
+        // unspecified how a `#ref` should behave when several directives match the same
+        // selectorless node, so — matching Angular's `t2_binder` — we register the FIRST
+        // matched directive as the reference target. `directives` is guaranteed non-empty
+        // here (the early return above bails on an empty match).
         for r in references {
             self.references.insert(
                 addr(r),

@@ -79,7 +79,6 @@ impl<'a> VisitMut<'a> for Angular<'a> {
     }
 
     fn visit_class(&mut self, class: &mut Class<'a>) {
-    //TODO: Strip this into context?
     let mut top_level_decorators: Vec<(TopLevelDecorator, usize)> = Vec::new();
     for (index, decorator) in class.decorators.iter().enumerate() {
         if let Expression::CallExpression(boxed_expr) = &decorator.expression {

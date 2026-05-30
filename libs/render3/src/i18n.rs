@@ -11,13 +11,31 @@
 //! message and compute its `$localize` id. Wiring into the template transform
 //! is deferred to a later round.
 //!
-//! NOTE(port): The full i18n AST in Angular carries `ParseSourceSpan`s on every
-//! node and a `Visitor` trait with many concrete visitors (Clone/Recurse/
-//! Serializer). Here we port only the owned node shapes plus the two
-//! serializers that the digest needs (the message-string serializer used for
-//! `$localize` and the UID serializer used by the XLIFF2/XMB/$localize digest).
-//! Source spans, ICU placeholder back-references, and legacy XLIFF1 SHA1 digest
-//! are intentionally omitted until a consumer needs them.
+//! The owned offset-only [`ParseSourceSpan`] type (`i18n_ast.ts`'s `Node.sourceSpan`,
+//! ported as the architecture's `{ start, end }` span) is provided here for the i18n
+//! AST + the connected template transform; ICU placeholder back-references and the
+//! legacy XLIFF1 SHA1 digest remain intentionally omitted until a consumer needs them.
+//! The message-string serializer (`$localize`) and the UID serializer
+//! (XLIFF2/XMB/`$localize` digest) are both ported, and `parse_i18n_meta` reproduces
+//! Angular's `parseI18nMeta` `descIndex`/`idIndex` logic exactly.
+
+// ---------------------------------------------------------------------------
+// Source span (owned, offset-only) — ported from `parse_util.ParseSourceSpan`.
+// ---------------------------------------------------------------------------
+
+/// Offset-only source span (`i18n_ast.ts` `Node.sourceSpan`), mirroring the
+/// architecture's owned `{ start, end }` span used by the expression/template ASTs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ParseSourceSpan {
+    pub start: u32,
+    pub end: u32,
+}
+
+impl ParseSourceSpan {
+    pub fn new(start: u32, end: u32) -> Self {
+        ParseSourceSpan { start, end }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // i18n AST (owned)  — ported from i18n_ast.ts
@@ -288,25 +306,36 @@ pub fn parse_i18n_meta(meta: &str) -> I18nMeta {
 
     let meta = meta.trim();
     if !meta.is_empty() {
-        // Split off the `@@id` (everything after the first `@@`).
-        let (meaning_and_desc, id) = match meta.find(I18N_ID_SEPARATOR) {
-            Some(idx) => (&meta[..idx], &meta[idx + I18N_ID_SEPARATOR.len()..]),
-            None => (meta, ""),
-        };
-        custom_id = id.to_string();
+        // Faithful to Angular's `parseI18nMeta`: both `idIndex` and `descIndex` are
+        // computed against the *original* `meta` string, then `meaning`/`description`
+        // are sliced out of `meaningAndDesc` at `descIndex`.
+        let id_index = meta.find(I18N_ID_SEPARATOR);
+        let desc_index = meta.find(I18N_MEANING_SEPARATOR);
 
-        // NOTE(port): Angular computes `descIndex` against the *original* `meta`
-        // string but then slices `meaningAndDesc`. With a `|` present this is
-        // equivalent because `@@id` (containing no `|`) always trails the
-        // meaning/description, so the index of `|` is identical in both. We
-        // search `meaning_and_desc` directly, which is equivalent for all valid
-        // inputs and avoids a panic on a `|` that lands inside the id.
-        match meaning_and_desc.find(I18N_MEANING_SEPARATOR) {
+        // `[meaningAndDesc, customId] = idIndex > -1 ? [meta.slice(0, idIndex),
+        //  meta.slice(idIndex + 2)] : [meta, '']`.
+        let meaning_and_desc = match id_index {
             Some(idx) => {
-                meaning = meaning_and_desc[..idx].to_string();
-                description = meaning_and_desc[idx + I18N_MEANING_SEPARATOR.len_utf8()..].to_string();
+                custom_id = meta[idx + I18N_ID_SEPARATOR.len()..].to_string();
+                &meta[..idx]
             }
-            None => {
+            None => meta,
+        };
+
+        // `[meaning, description] = descIndex > -1 ? [meaningAndDesc.slice(0,
+        //  descIndex), meaningAndDesc.slice(descIndex + 1)] : ['', meaningAndDesc]`.
+        // `descIndex` indexes into `meta`; because `meaningAndDesc` is the `meta`
+        // prefix ending before `@@id` (which contains no `|`), the `|` byte offset is
+        // identical in both, so slicing `meaningAndDesc` at `descIndex` is exact. We
+        // guard with `desc_index < meaning_and_desc.len()` for safety against a `|`
+        // that (illegally) lands inside the id.
+        match desc_index {
+            Some(idx) if idx < meaning_and_desc.len() => {
+                meaning = meaning_and_desc[..idx].to_string();
+                description =
+                    meaning_and_desc[idx + I18N_MEANING_SEPARATOR.len_utf8()..].to_string();
+            }
+            _ => {
                 description = meaning_and_desc.to_string();
             }
         }

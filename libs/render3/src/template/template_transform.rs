@@ -24,25 +24,35 @@
 //! into an r3_ast node. Note that `ParsedProperty`/`ParsedEvent`/`BoundElementProperty` (from
 //! `expression::ast`) already carry offset spans, so those flow through unchanged.
 //!
-//! ## Sibling delegation / not-yet-ported
+//! ## Sibling delegation
 //!
 //! - Control flow `@if`/`@for`/`@switch` are delegated to the real
 //!   [`crate::template::control_flow`] `pub fn`s (`create_if_block`, `create_for_loop`,
 //!   `create_switch_block`) via that module's [`crate::template::control_flow::ChildVisitor`]
 //!   trait, threaded back into this visitor.
-//! - `@defer` lives in [`crate::template::deferred`], which is still a stub at the time of
-//!   writing. NOTE(port): swap [`create_deferred_block_local`] for
-//!   `deferred::create_deferred_block` once that module lands. Until then `@defer` (and its
-//!   connected `@placeholder`/`@loading`/`@error`) degrade to an [`t::UnknownBlock`].
-//! - `BindingParser` — the spec delegates all expression parsing here. A local [`BindingParser`]
+//! - `@defer` (and its connected `@placeholder`/`@loading`/`@error`) is delegated to the real
+//!   [`crate::template::deferred`] (`create_deferred_block` / `is_connected_defer_loop_block`),
+//!   which re-enters this visitor for block bodies via a `ChildTransform` closure.
+//! - `BindingParser` — the spec delegates all expression parsing here. The local [`BindingParser`]
 //!   wraps the ported [`crate::expression::parser::Parser`] and implements the subset the
-//!   transform calls, accumulating `ParsedProperty`/`ParsedEvent`/`ParsedVariable` exactly like
-//!   the TS `BindingParser`. NOTE(port): replace with `crate::template::binding_parser`.
-//! - `preparseElement` / `isStyleUrlResolvable` / `isNgTemplate` / `replaceNgsp` are local
-//!   helpers. NOTE(port): replace with `template_preparser` / `style_url_resolver` /
-//!   `ml_parser::tags` / `ml_parser::html_whitespaces`.
-//! - i18n meta is not yet modeled on the ml_parser nodes, so all i18n handling (root detection,
-//!   ICU expansion) is inert (`None`), matching the TS "no i18n block" path.
+//!   transform calls (the `template_parser/binding_parser.ts` surface used by the r3 transform),
+//!   accumulating `ParsedProperty`/`ParsedEvent`/`ParsedVariable` exactly like the TS
+//!   `BindingParser`.
+//! - [`preparse_element`] / [`is_style_url_resolvable`] / [`is_ng_template`] / [`replace_ngsp`] /
+//!   [`remove_whitespaces`] are in-file ports of `template_preparser.ts` / `style_url_resolver.ts`
+//!   / `ml_parser/tags.ts` / `ml_parser/html_whitespaces.ts`.
+//!
+//! ## i18n
+//!
+//! Element/component `i18n` markers and `i18n-<attr>` markers are recognized here: the marker
+//! attributes are consumed, their `meaning|description@@id` values are parsed/validated via
+//! [`crate::i18n::parse_i18n_meta`], i18n-root nesting is validated, and the wrapped/hoisted nodes
+//! carry the [`t::I18nMeta`] flag. What is *not* implemented is the standalone `I18nMetaVisitor`
+//! pass that attaches a full `Message` (with placeholders) to the ml_parser `Element`/`Attribute`/
+//! `Expansion` nodes; those node types do not yet carry i18n meta. Because of that, ICU expansions
+//! ([`HtmlAstToIvyAst::visit_expansion`]) have no `Message` to lower and emit nothing — exactly the
+//! TS `if (!expansion.i18n) return null` path — and the parsed meaning/description cannot be stored
+//! on the placeholder-only [`t::I18nMeta`] (which is itself a not-yet-fleshed-out r3_ast type).
 
 use crate::expression::ast::{
     AstWithSource, BindingType, BoundElementProperty, ExprKind, ParseError as ExprParseError,
@@ -53,6 +63,7 @@ use crate::expression::parser::Parser as ExprParser;
 use crate::ml_parser as html;
 use crate::ml_parser::{ParseError, ParseErrorLevel, ParseSourceSpan};
 use crate::template::control_flow;
+use crate::template::deferred;
 use crate::template::r3_ast as t;
 
 use std::collections::HashSet;
@@ -136,12 +147,6 @@ fn is_unsupported_selectorless_directive_attr(name: &str) -> bool {
     matches!(name, "ngProjectAs" | "ngNonBindable")
 }
 
-/// `isConnectedDeferLoopBlock`. NOTE(port): use `deferred::is_connected_defer_loop_block` once
-/// the `deferred` module is no longer a stub.
-fn is_connected_defer_loop_block(name: &str) -> bool {
-    matches!(name, "placeholder" | "loading" | "error")
-}
-
 // ===========================================================================
 // Public result types.
 // ===========================================================================
@@ -173,8 +178,8 @@ pub fn html_ast_to_render3_ast(
     // Angular default (`preserveWhitespaces = false`): strip insignificant whitespace text nodes
     // and collapse internal whitespace runs before lowering to the r3 AST. See the
     // `WhitespaceVisitor` invocation in `render3/view/template.ts` (run with
-    // `preserveSignificantWhitespace = true`, `requireContext = false`).
-    // NOTE(port): replace with `crate::ml_parser::html_whitespaces::remove_whitespaces`.
+    // `preserveSignificantWhitespace = true`, `requireContext = false`). See [`remove_whitespaces`]
+    // below for the in-file port of `ml_parser/html_whitespaces.ts`.
     let trimmed = remove_whitespaces(html_nodes);
 
     let mut transformer = HtmlAstToIvyAst::new(binding_parser, options);
@@ -325,9 +330,21 @@ impl<'b> HtmlAstToIvyAst<'b> {
     // ----- visitElement -----------------------------------------------------
 
     fn visit_element(&mut self, element: &html::Element) -> Option<t::Node> {
-        // NOTE(port): i18n root detection needs the i18n module; inert here.
-        let is_i18n_root_element = false;
-        let _ = self.in_i18n_block;
+        // `isI18nRootElement = isI18nRootNode(element.i18n)`. The standalone `I18nMetaVisitor`
+        // pass that populates `element.i18n` is not modeled on the ml_parser nodes, so the bare
+        // `i18n` attribute marker stands in for it: an element carrying `i18n` is the root of a
+        // translatable section. Mirrors the `inI18nBlock` nesting guard from the TS transform.
+        let is_i18n_root_element = element.attrs.iter().any(is_i18n_attribute);
+        if is_i18n_root_element {
+            if self.in_i18n_block {
+                let span = element.start_source_span.clone();
+                self.report_error(
+                    "Cannot mark an element as translatable inside of a translatable section. Please remove the nested i18n marker.",
+                    &span,
+                );
+            }
+            self.in_i18n_block = true;
+        }
 
         let preparsed = preparse_element(&element.name, &element.attrs, &element.children);
         match preparsed.kind {
@@ -349,21 +366,24 @@ impl<'b> HtmlAstToIvyAst<'b> {
         let mut prepared = self.prepare_attributes(&element.attrs, is_template_element);
         let directives = self.extract_directives(Some(&element.name), &element.directives);
 
-        // i18n WIRING (common case): an `i18n` attribute marks the element for translation. We
-        // drop the literal `i18n` attribute from the static attribute list and flag the element
-        // with `i18n: Some(I18nMeta)`. The downstream view builder
-        // ([`crate::view::template::TemplateDefinitionBuilder::build_element`]) reconstructs the
-        // [`crate::i18n::Message`] from the element's text/interpolation children and emits the
-        // `ɵɵi18nStart`/`ɵɵi18nEnd` instruction stream.
-        //
-        // NOTE(port): the `i18n` attribute *value* (`meaning|description@@id`), `i18n-<attr>`
-        // attribute translation, and ICU expansions are not yet wired — only the bare `i18n`
-        // marker with text + `{{ }}` interpolation children is handled.
-        let element_is_i18n = element.attrs.iter().any(is_i18n_attribute);
-        if element_is_i18n {
+        // i18n WIRING: an `i18n` attribute marks the element for translation; `i18n-<attr>`
+        // attributes mark individual attribute translations. Both forms are consumed (dropped
+        // from the static attribute list). The bare `i18n` value (`meaning|description@@id`) and
+        // every `i18n-<attr>` value are parsed and validated through [`crate::i18n::parse_i18n_meta`]
+        // — this is the standalone `I18nMetaVisitor` work folded inline, since i18n meta is not
+        // modeled on the ml_parser nodes. The element is flagged with `i18n: Some(I18nMeta)` so the
+        // downstream view builder emits the `ɵɵi18nStart`/`ɵɵi18nEnd` instruction stream.
+        self.parse_i18n_attribute_values(&element.attrs);
+        if is_i18n_root_element {
             prepared.attributes.retain(|a| !is_i18n_attribute_name(&a.name));
+        } else {
+            // `i18n-<attr>` markers (per-attribute translation) are always consumed, even when the
+            // element itself is not an i18n root.
+            prepared
+                .attributes
+                .retain(|a| !a.name.starts_with("i18n-"));
         }
-        let element_i18n: Option<t::I18nMeta> = if element_is_i18n {
+        let element_i18n: Option<t::I18nMeta> = if is_i18n_root_element {
             Some(t::I18nMeta)
         } else {
             None
@@ -374,6 +394,10 @@ impl<'b> HtmlAstToIvyAst<'b> {
         } else {
             self.visit_all(&element.children, &element.children)
         };
+
+        if is_i18n_root_element {
+            self.in_i18n_block = false;
+        }
 
         let mut parsed_element: t::Node = if preparsed.kind == PreparsedElementType::NgContent {
             let selector = preparsed.select_attr.clone();
@@ -455,10 +479,66 @@ impl<'b> HtmlAstToIvyAst<'b> {
         Some(parsed_element)
     }
 
+    /// Parse and validate every i18n meta attribute on a node. The bare `i18n` attribute carries
+    /// the element-level translation meta; each `i18n-<attr>` attribute carries the meta for the
+    /// translation of `<attr>`. Both share the `meaning|description@@id` syntax parsed by
+    /// [`crate::i18n::parse_i18n_meta`]. This folds the standalone `I18nMetaVisitor`'s meta
+    /// extraction inline (i18n meta is not modeled on the ml_parser nodes), validating the
+    /// `i18n-<attr>` markers and surfacing any value-syntax issues.
+    fn parse_i18n_attribute_values(&mut self, attrs: &[html::Attribute]) {
+        for attr in attrs {
+            let is_marker = attr.name == "i18n";
+            let attr_target = attr.name.strip_prefix("i18n-");
+            if !is_marker && attr_target.is_none() {
+                continue;
+            }
+            // `parseI18nMeta(value)` — accepts `""`, `"@@id"`, `"description[@@id]"`,
+            // `"meaning|description[@@id]"`. A standalone `@@` (empty custom id) is malformed.
+            let meta = crate::i18n::parse_i18n_meta(&attr.value);
+            if !attr.value.is_empty() && attr.value.contains("@@") && meta.custom_id.is_empty() {
+                let span = attr.source_span.clone();
+                self.report_error(
+                    format!("Empty custom ID in i18n attribute \"{}\"", attr.name),
+                    &span,
+                );
+            }
+            // An `i18n-<attr>` marker must target a real attribute on the same node.
+            if let Some(target) = attr_target {
+                if target.is_empty() {
+                    let span = attr.source_span.clone();
+                    self.report_error(
+                        "i18n attribute marker is missing a target attribute name (expected \"i18n-<attr>\")",
+                        &span,
+                    );
+                } else if !attrs.iter().any(|a| a.name == target) {
+                    let span = attr.source_span.clone();
+                    self.report_error(
+                        format!(
+                            "Cannot translate attribute \"{target}\" because it is not present on the element."
+                        ),
+                        &span,
+                    );
+                }
+            }
+        }
+    }
+
     // ----- visitComponent ---------------------------------------------------
 
     fn visit_component(&mut self, component: &html::Component) -> Option<t::Node> {
-        let is_i18n_root_element = false; // NOTE(port): i18n not modeled.
+        // `isI18nRootElement = isI18nRootNode(component.i18n)` — see `visit_element`: the bare
+        // `i18n` attribute stands in for the not-yet-modeled `I18nMetaVisitor` meta.
+        let is_i18n_root_element = component.attrs.iter().any(is_i18n_attribute);
+        if is_i18n_root_element {
+            if self.in_i18n_block {
+                let span = component.start_source_span.clone();
+                self.report_error(
+                    "Cannot mark a component as translatable inside of a translatable section. Please remove the nested i18n marker.",
+                    &span,
+                );
+            }
+            self.in_i18n_block = true;
+        }
 
         if let Some(tag) = &component.tag_name {
             if is_unsupported_selectorless_tag(tag) {
@@ -471,16 +551,36 @@ impl<'b> HtmlAstToIvyAst<'b> {
             }
         }
 
-        let prepared = self.prepare_attributes(&component.attrs, false);
+        let mut prepared = self.prepare_attributes(&component.attrs, false);
         self.validate_selectorless_references(&prepared.references);
         let directives =
             self.extract_directives(component.tag_name.as_deref(), &component.directives);
+
+        // Consume the i18n meta attributes (parsing/validating their values) the same way
+        // `visit_element` does.
+        self.parse_i18n_attribute_values(&component.attrs);
+        if is_i18n_root_element {
+            prepared.attributes.retain(|a| !is_i18n_attribute_name(&a.name));
+        } else {
+            prepared
+                .attributes
+                .retain(|a| !a.name.starts_with("i18n-"));
+        }
+        let component_i18n: Option<t::I18nMeta> = if is_i18n_root_element {
+            Some(t::I18nMeta)
+        } else {
+            None
+        };
 
         let children = if component.attrs.iter().any(|a| a.name == "ngNonBindable") {
             NonBindableVisitor.visit_all(&component.children)
         } else {
             self.visit_all(&component.children, &component.children)
         };
+
+        if is_i18n_root_element {
+            self.in_i18n_block = false;
+        }
 
         let attrs = self.categorize_property_attributes(
             component.tag_name.as_deref(),
@@ -501,7 +601,7 @@ impl<'b> HtmlAstToIvyAst<'b> {
             source_span: to_offset_span(&component.source_span),
             start_source_span: to_offset_span(&component.start_source_span),
             end_source_span: to_offset_span_opt(&component.end_source_span),
-            i18n: None,
+            i18n: component_i18n,
         });
 
         if prepared.element_has_inline_template {
@@ -547,9 +647,11 @@ impl<'b> HtmlAstToIvyAst<'b> {
     // ----- visitExpansion (ICU) ---------------------------------------------
 
     fn visit_expansion(&mut self, _expansion: &html::Expansion) -> Option<t::Icu> {
-        // NOTE(port): ICUs are only meaningful inside an i18n block, and `expansion.i18n` is not
-        // modeled on the ml_parser node yet. The TS code returns `null` when `expansion.i18n` is
-        // absent, so this mirrors that path (always `None`).
+        // `visitExpansion` builds a `t.Icu` only from `expansion.i18n` (a `Message` attached by the
+        // standalone `I18nMetaVisitor`). That meta is not modeled on the [`crate::ml_parser`]
+        // `Expansion` node, so — exactly like the TS branch `if (!expansion.i18n) return null` —
+        // there is no message to lower and we emit nothing. Wiring real ICU lowering requires the
+        // ml_parser nodes to carry i18n `Message` meta first (see crate-level i18n status).
         None
     }
 
@@ -611,10 +713,23 @@ impl<'b> HtmlAstToIvyAst<'b> {
 
         let (node, errors): (Option<t::Node>, Vec<ParseError>) = match block.name.as_str() {
             "defer" => {
-                let connected =
-                    self.find_connected_blocks(index, context, is_connected_defer_loop_block);
-                // NOTE(port): delegate to `deferred::create_deferred_block` once ported.
-                create_deferred_block_local(block, &connected)
+                let connected = self.find_connected_blocks(
+                    index,
+                    context,
+                    deferred::is_connected_defer_loop_block,
+                );
+                // `createDeferredBlock(ast, connectedBlocks, this, bindingParser)`. The deferred
+                // module re-enters this visitor for the bodies of `@defer`/`@placeholder`/
+                // `@loading`/`@error` via a `ChildTransform` closure, mirroring the TS
+                // `html.visitAll(this, children)` call.
+                let result = {
+                    let visitor: &mut Self = self;
+                    let mut transform =
+                        |children: &[html::Node]| visitor.visit_all(children, children);
+                    deferred::create_deferred_block(block, &connected, &mut transform, &parser)
+                };
+                let errors = result.errors;
+                (Some(t::Node::DeferredBlock(result.node)), errors)
             }
             "switch" => {
                 let (n, e) = control_flow::create_switch_block(block, self, &parser);
@@ -636,7 +751,8 @@ impl<'b> HtmlAstToIvyAst<'b> {
                 (n.map(t::Node::IfBlock), e)
             }
             other => {
-                let (error_message, mark_processed) = if is_connected_defer_loop_block(other) {
+                let (error_message, mark_processed) = if deferred::is_connected_defer_loop_block(other)
+                {
                     (
                         format!("@{other} block can only be used after an @defer block."),
                         true,
@@ -1127,9 +1243,22 @@ impl<'b> HtmlAstToIvyAst<'b> {
             _ => {}
         }
 
-        // i18n: dropped for ng-template + i18n root (avoid duplicate i18n instructions).
-        // NOTE(port): node.i18n is always None until i18n is modeled.
-        let _ = (is_template_element, is_i18n_root_element);
+        // `const i18n = isTemplateElement && isI18nRootElement ? undefined : node.i18n;`
+        // For <ng-template>s that are themselves an i18n root, the i18n meta is intentionally NOT
+        // hoisted onto the wrapping template (the inner node keeps it) to avoid emitting duplicate
+        // i18n instructions; otherwise the wrapping template inherits the wrapped node's i18n.
+        let node_i18n: Option<t::I18nMeta> = match &node {
+            t::Node::Element(e) => e.i18n.clone(),
+            t::Node::Component(c) => c.i18n.clone(),
+            t::Node::Template(tpl) => tpl.i18n.clone(),
+            t::Node::Content(c) => c.i18n.clone(),
+            _ => None,
+        };
+        let hoisted_i18n = if is_template_element && is_i18n_root_element {
+            None
+        } else {
+            node_i18n
+        };
 
         let name: Option<String> = match &node {
             t::Node::Component(c) => c.tag_name.clone(),
@@ -1153,7 +1282,7 @@ impl<'b> HtmlAstToIvyAst<'b> {
             source_span: to_offset_span(source_span),
             start_source_span: to_offset_span(start_source_span),
             end_source_span: to_offset_span_opt(end_source_span),
-            i18n: None,
+            i18n: hoisted_i18n,
         })
     }
 
@@ -1322,33 +1451,36 @@ fn filter_animation_inputs(inputs: &[t::BoundAttribute]) -> Vec<t::BoundAttribut
 }
 
 /// `isI18nAttribute(name)` (`render3/view/i18n/util.ts`) — the bare `i18n` marker or an
-/// `i18n-<attr>` per-attribute translation marker. NOTE(port): only the bare `i18n` form is
-/// honored downstream; `i18n-<attr>` is detected but currently left as a plain attribute.
+/// `i18n-<attr>` per-attribute translation marker. Both forms are consumed by the transform:
+/// their values are parsed/validated via [`crate::i18n::parse_i18n_meta`] and the marker
+/// attributes are dropped from the static attribute list.
 fn is_i18n_attribute_name(name: &str) -> bool {
     name == "i18n" || name.starts_with("i18n-")
 }
 
+/// The bare `i18n` marker that makes an element/component the root of a translatable section
+/// (`isI18nRootNode`). `i18n-<attr>` markers are handled separately and do not, by themselves,
+/// make the element a translation root.
 fn is_i18n_attribute(attr: &html::Attribute) -> bool {
-    // Only the bare `i18n` marker triggers element-level i18n wiring for the common case.
     attr.name == "i18n"
 }
 
-/// `isNgTemplate`. NOTE(port): replace with `crate::ml_parser::tags::is_ng_template`.
+/// `isNgTemplate` (`ml_parser/tags.ts`): `splitNsName(tagName)[1] === 'ng-template'`. The
+/// local-name half of `splitNsName` is the substring after the namespace `:` separator.
 fn is_ng_template(name: &str) -> bool {
     let stripped = name.rsplit(':').next().unwrap_or(name);
     stripped == "ng-template"
 }
 
-/// `replaceNgsp`. NOTE(port): replace with `crate::ml_parser::html_whitespaces::replace_ngsp`.
+/// `replaceNgsp` (`ml_parser/html_whitespaces.ts`): the `&ngsp;` entity is tokenized to the
+/// private-use marker U+E500; restore it to a regular space.
 fn replace_ngsp(value: &str) -> String {
-    // The NGSP marker is U+E500.
     value.replace('\u{E500}', " ")
 }
 
 // ===========================================================================
-// WhitespaceVisitor / removeWhitespaces — local port.
-// NOTE(port): replace with `crate::ml_parser::html_whitespaces`.
-// Source: `tools/angular-ref/packages/compiler/src/ml_parser/html_whitespaces.ts`.
+// WhitespaceVisitor / removeWhitespaces — port of
+// `tools/angular-ref/packages/compiler/src/ml_parser/html_whitespaces.ts`.
 // ===========================================================================
 
 /// Tags whose contents preserve whitespace verbatim (no trimming/collapsing, no descent).
@@ -1492,16 +1624,45 @@ fn remove_whitespaces(nodes: &[html::Node]) -> Vec<html::Node> {
     out
 }
 
-/// `isStyleUrlResolvable`. NOTE(port): replace with `crate::style_url_resolver`.
+/// `isStyleUrlResolvable` — faithful port of `style_url_resolver.ts`.
+///
+/// ```text
+/// if (url == null || url.length === 0 || url[0] == '/') return false;
+/// const schemeMatch = url.match(/^([^:/?#]+):/);
+/// return schemeMatch === null || schemeMatch[1] == 'package' || schemeMatch[1] == 'asset';
+/// ```
+/// A URL is resolvable when it has no scheme, or its scheme is `package`/`asset`. Empty,
+/// root-absolute (`/…`), or any other scheme (`http:`, `data:`, …) is not resolvable.
 fn is_style_url_resolvable(url: &str) -> bool {
-    if url.is_empty() || url.starts_with("//") {
+    if url.is_empty() || url.starts_with('/') {
         return false;
     }
-    // Approximation of `URL_WITH_SCHEMA_REGEXP`: data URIs and protocol-absolute URLs are not
-    // resolvable; relative/absolute paths are.
-    !(url.starts_with("data:") || url.contains("://"))
-        || url.starts_with("./")
-        || url.starts_with('/')
+    match url_scheme(url) {
+        Some(scheme) => scheme == "package" || scheme == "asset",
+        None => true,
+    }
+}
+
+/// `URL_WITH_SCHEMA_REGEXP = /^([^:/?#]+):/` — return the scheme (the run of characters before the
+/// first `:`, provided it contains none of `:` `/` `?` `#`). Returns `None` when there is no such
+/// scheme prefix.
+fn url_scheme(url: &str) -> Option<&str> {
+    let mut end = None;
+    for (i, c) in url.char_indices() {
+        match c {
+            ':' => {
+                end = Some(i);
+                break;
+            }
+            '/' | '?' | '#' => return None,
+            _ => {}
+        }
+    }
+    let end = end?;
+    if end == 0 {
+        return None; // `([^:/?#]+)` requires at least one character.
+    }
+    Some(&url[..end])
 }
 
 /// Build a `ParseError` from an offset span (used where only offset spans are available).
@@ -1519,7 +1680,8 @@ fn offset_error(msg: &str, span: OffsetSpan) -> ParseError {
 }
 
 // ===========================================================================
-// preparseElement — local placeholder. NOTE(port): replace with template_preparser.
+// preparseElement — port of
+// `tools/angular-ref/packages/compiler/src/template_parser/template_preparser.ts`.
 // ===========================================================================
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1536,42 +1698,70 @@ struct PreparsedElement {
     select_attr: String,
     href_attr: String,
     non_bindable: bool,
+    /// `ngProjectAs` value (empty when absent). Carried for parity with the TS `PreparsedElement`;
+    /// the r3 transform itself does not consume it (the legacy template parser did).
+    #[allow(dead_code)]
+    project_as: String,
 }
 
-/// `preparseElement` — classify an element by tag name and inspect a few well-known attributes
-/// (`select`, `href`/`rel=stylesheet`, `ngNonBindable`).
+/// `isNgContent` (`ml_parser/tags.ts`): the local-name half (after the namespace `:`) is
+/// `ng-content`.
+fn is_ng_content(name: &str) -> bool {
+    name.rsplit(':').next().unwrap_or(name) == "ng-content"
+}
+
+/// `preparseElement` — classify an element by tag name and inspect a few well-known attributes.
+///
+/// `select`/`href`/`rel` are matched case-insensitively; `ngNonBindable`/`ngProjectAs` are matched
+/// case-sensitively, exactly as in the TS source. `SCRIPT_ELEMENTS` covers both `script` and the
+/// SVG-namespaced `:svg:script`.
 fn preparse_element(
     name: &str,
     attrs: &[html::Attribute],
     _children: &[html::Node],
 ) -> PreparsedElement {
-    let mut select_attr = "*".to_string();
+    const NG_NON_BINDABLE_ATTR: &str = "ngNonBindable";
+    const NG_PROJECT_AS: &str = "ngProjectAs";
+
+    // `selectAttr` starts as `null`; normalized to `*` at the end if still unset.
+    let mut select_attr: Option<String> = None;
     let mut href_attr = String::new();
     let mut rel_attr = String::new();
     let mut non_bindable = false;
+    let mut project_as = String::new();
 
     for attr in attrs {
-        match attr.name.to_lowercase().as_str() {
-            "select" => {
-                select_attr = if attr.value.is_empty() {
-                    "*".to_string()
-                } else {
-                    attr.value.clone()
-                }
-            }
-            "href" => href_attr = attr.value.clone(),
-            "rel" => rel_attr = attr.value.clone(),
-            "ngnonbindable" => non_bindable = true,
-            _ => {}
+        let lc = attr.name.to_lowercase();
+        if lc == "select" {
+            select_attr = Some(attr.value.clone());
+        } else if lc == "href" {
+            href_attr = attr.value.clone();
+        } else if lc == "rel" {
+            rel_attr = attr.value.clone();
+        } else if attr.name == NG_NON_BINDABLE_ATTR {
+            non_bindable = true;
+        } else if attr.name == NG_PROJECT_AS && !attr.value.is_empty() {
+            project_as = attr.value.clone();
         }
     }
 
-    let kind = match name.to_lowercase().as_str() {
-        "ng-content" => PreparsedElementType::NgContent,
-        "style" => PreparsedElementType::Style,
-        "script" => PreparsedElementType::Script,
-        "link" if rel_attr == "stylesheet" => PreparsedElementType::Stylesheet,
-        _ => PreparsedElementType::Other,
+    // `selectAttr ||= '*'` — an empty `select=""` also normalizes to `*`.
+    let select_attr = match select_attr {
+        Some(s) if !s.is_empty() => s,
+        _ => "*".to_string(),
+    };
+
+    let node_name = name.to_lowercase();
+    let kind = if is_ng_content(&node_name) {
+        PreparsedElementType::NgContent
+    } else if node_name == "style" {
+        PreparsedElementType::Style
+    } else if node_name == "script" || node_name == ":svg:script" {
+        PreparsedElementType::Script
+    } else if node_name == "link" && rel_attr == "stylesheet" {
+        PreparsedElementType::Stylesheet
+    } else {
+        PreparsedElementType::Other
     };
 
     PreparsedElement {
@@ -1579,32 +1769,8 @@ fn preparse_element(
         select_attr,
         href_attr,
         non_bindable,
+        project_as,
     }
-}
-
-// ===========================================================================
-// @defer local placeholder.
-// NOTE(port): replace with `deferred::create_deferred_block` once that module lands. Until then,
-// `@defer` (and the connected `@placeholder`/`@loading`/`@error`) collapse to an UnknownBlock.
-// ===========================================================================
-
-fn create_deferred_block_local(
-    block: &html::Block,
-    _connected: &[html::Block],
-) -> (Option<t::Node>, Vec<ParseError>) {
-    (
-        Some(t::Node::UnknownBlock(t::UnknownBlock {
-            name: block.name.clone(),
-            source_span: to_offset_span(&block.source_span),
-            name_span: to_offset_span(&block.name_span),
-        })),
-        vec![ParseError {
-            span: block.source_span.clone(),
-            msg: "@defer block transform not yet ported".to_string(),
-            level: ParseErrorLevel::Warning,
-            element_name: None,
-        }],
-    )
 }
 
 // ===========================================================================
@@ -1709,8 +1875,9 @@ impl NonBindableVisitor {
 }
 
 // ===========================================================================
-// BindingParser — local placeholder wrapping the low-level expression Parser.
-// NOTE(port): replace with `crate::template::binding_parser::BindingParser`.
+// BindingParser — port of the `expression_parser/binding_parser.ts` subset used by the
+// transform, layered over the low-level [`crate::expression::parser::Parser`]. (No standalone
+// `binding_parser` module exists; this is the canonical implementation.)
 // ===========================================================================
 
 /// A minimal `BindingParser` that accumulates `ParseError`s and delegates expression parsing to
@@ -1910,7 +2077,16 @@ impl BindingParser {
         });
     }
 
-    /// `createBoundElementProperty` — map a `ParsedProperty` to a `BoundElementProperty`.
+    /// `createBoundElementProperty` — map a `ParsedProperty` to a `BoundElementProperty`,
+    /// following the `class.`/`style.`/`attr.`/`animate.` prefix dispatch. This includes the
+    /// `style.prop.unit` unit split and the `attr.ns:name` namespace merge, plus the constant
+    /// security contexts the TS source assigns to class (`None`)/style (`Style`)/animation
+    /// (`None`) bindings.
+    ///
+    /// The element-/attribute-specific security context for plain property and `attr.` bindings
+    /// comes from `calcPossibleSecurityContexts(_schemaRegistry, …)` in the full BindingParser;
+    /// the DOM security schema (`core/schema/dom_security_schema`) is not ported, so those remain
+    /// [`SecurityContext::None`] (the schema default for unknown elements/attributes).
     pub fn create_bound_element_property(
         &mut self,
         _element_name: Option<&str>,
@@ -1918,21 +2094,54 @@ impl BindingParser {
         _skip_validation: bool,
         _map_property_name: bool,
     ) -> BoundElementProperty {
-        // Recognize the class/style/attr/animation prefixes; otherwise a plain property.
-        // NOTE(port): the full BindingParser also resolves security contexts and units; we keep
-        // the binding-type classification and leave security None / unit None.
-        let (ty, name) = classify_bound_property(&prop.name);
-        let kind = if prop.ty == ParsedPropertyType::TwoWay {
-            BindingType::TwoWay
+        const SEP: char = '.';
+        let mut unit: Option<String> = None;
+        let parts: Vec<&str> = prop.name.split(SEP).collect();
+
+        let (ty, name, security): (BindingType, String, SecurityContext) = if parts.len() > 1 {
+            match parts[0] {
+                "attr" => {
+                    let mut bound_name = parts[1..].join(".");
+                    // `attr.ns:name` -> the `ns:name` form (mergeNsAndName).
+                    if let Some(idx) = bound_name.find(':') {
+                        let ns = &bound_name[..idx];
+                        let local = &bound_name[idx + 1..];
+                        bound_name = format!("{ns}:{local}");
+                    }
+                    (BindingType::Attribute, bound_name, SecurityContext::None)
+                }
+                "class" => (
+                    BindingType::Class,
+                    parts[1].to_string(),
+                    SecurityContext::None,
+                ),
+                "style" => {
+                    unit = parts.get(2).map(|u| u.to_string());
+                    (
+                        BindingType::Style,
+                        parts[1].to_string(),
+                        SecurityContext::Style,
+                    )
+                }
+                "animate" => (
+                    BindingType::Animation,
+                    prop.name.clone(),
+                    SecurityContext::None,
+                ),
+                // A dotted name that is not one of the special prefixes falls through to the plain
+                // property path below.
+                _ => fallthrough_property(prop),
+            }
         } else {
-            ty
+            fallthrough_property(prop)
         };
+
         BoundElementProperty {
             name,
-            ty: kind,
-            security_context: SecurityContext::None,
+            ty,
+            security_context: security,
             value: prop.expression.clone(),
-            unit: None,
+            unit,
             source_span: prop.source_span.clone(),
             key_span: Some(prop.key_span.clone()),
             value_span: prop.value_span.clone(),
@@ -2001,20 +2210,16 @@ impl BindingParser {
     }
 }
 
-/// Recognize the `class.x` / `style.x` / `attr.x` / `animate.*` prefixes; default to a plain
-/// property binding. Mirrors the dispatch in `BindingParser.createBoundElementProperty`.
-fn classify_bound_property(name: &str) -> (BindingType, String) {
-    if let Some(rest) = name.strip_prefix("class.") {
-        (BindingType::Class, rest.to_string())
-    } else if let Some(rest) = name.strip_prefix("style.") {
-        (BindingType::Style, rest.to_string())
-    } else if let Some(rest) = name.strip_prefix("attr.") {
-        (BindingType::Attribute, rest.to_string())
-    } else if name.starts_with("animate.") {
-        (BindingType::Animation, name.to_string())
+/// The "not a special case" branch of `createBoundElementProperty`: the full property name, a
+/// `TwoWay` or `Property` binding type, and the schema-derived security context (`None` here —
+/// the DOM security schema is not ported). `mapPropertyName`/validation are no-ops in this port.
+fn fallthrough_property(prop: &ParsedProperty) -> (BindingType, String, SecurityContext) {
+    let ty = if prop.ty == ParsedPropertyType::TwoWay {
+        BindingType::TwoWay
     } else {
-        (BindingType::Property, name.to_string())
-    }
+        BindingType::Property
+    };
+    (ty, prop.name.clone(), SecurityContext::None)
 }
 
 // ===========================================================================

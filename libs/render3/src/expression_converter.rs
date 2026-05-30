@@ -3,18 +3,22 @@
 //! PORT TARGET: Angular's `compiler_util/expression_converter.ts`
 //! (`convertPropertyBinding` / `convertActionBinding` / `convertUpdateArguments`).
 //!
-//! NOTE(port): In Angular v22 the historic `compiler_util/expression_converter.ts`
-//! has been retired; its job is now spread across the template *pipeline* — the
+//! In Angular v22 the historic `compiler_util/expression_converter.ts` has been
+//! retired; its job is now spread across the template *pipeline* — the
 //! `e.AST -> o.Expression` lowering lives in `template/pipeline/src/ingest.ts`
 //! (`convertAst`) and the operator table in `template/pipeline/src/conversion.ts`
 //! (`BINARY_OPERATORS`). The pipeline lowers `PropertyRead(ImplicitReceiver)` to a
 //! `LexicalReadExpr` placeholder that a *later* phase resolves against the view's
-//! `ctx`. Since those resolution phases are not yet ported, this module reproduces
-//! the **classic** `convertPropertyBinding` behaviour directly: the implicit
-//! receiver is materialised as a caller-supplied root expression (conventionally the
-//! `ctx` variable), so `{{a}}` lowers straight to `ctx.a`. The mapping of every
-//! concrete node kind follows `convertAst` exactly (see `ingest.ts:1097`), and the
-//! binary-operator table is a 1:1 copy of `BINARY_OPERATORS` (`conversion.ts:12`).
+//! `ctx`. Since that view-`ctx` resolution phase is the view builder's job (not this
+//! module's), this converter reproduces the **classic** `convertPropertyBinding`
+//! behaviour directly: the implicit receiver is materialised as a caller-supplied
+//! root expression (conventionally the `ctx` variable), so `{{a}}` lowers straight to
+//! `ctx.a`. The mapping of every concrete node kind follows `convertAst` exactly (see
+//! `ingest.ts:1097`), and the binary-operator table is a 1:1 copy of
+//! `BINARY_OPERATORS` (`conversion.ts:12`). Instruction-level interpolation lowering
+//! (`ɵɵinterpolateN`/`ɵɵinterpolateV`) is provided by
+//! [`convert_interpolation_instruction`] (a port of `collateInterpolationArgs` +
+//! `callVariadicInstructionExpr` from `template/pipeline/src/instruction.ts`).
 //!
 //! This converter is owned & arena-free: it consumes a borrowed
 //! [`crate::expression::ast::AstNode`] and produces an owned
@@ -293,6 +297,114 @@ pub fn convert_action_binding_with<R: LocalResolver>(
     }
 }
 
+/// Which family of interpolation instruction to lower an interpolation to. Mirrors
+/// the pipeline's `TEXT_INTERPOLATE_CONFIG` vs `VALUE_INTERPOLATE_CONFIG`
+/// (`template/pipeline/src/instruction.ts`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterpolationKind {
+    /// `ɵɵtextInterpolate{N}` / `ɵɵtextInterpolateV` — bound text nodes.
+    Text,
+    /// `ɵɵinterpolate{N}` / `ɵɵinterpolateV` — value interpolations (property/attr).
+    Value,
+}
+
+/// `collateInterpolationArgs` + `callVariadicInstructionExpr` from the render3
+/// pipeline (`template/pipeline/src/instruction.ts`): lower an interpolation
+/// (`strings`/`expressions`, `strings.len() == expressions.len() + 1`) to the real
+/// `ɵɵinterpolate{N}` / `ɵɵinterpolateV` (or text-flavoured) call expression.
+///
+/// The collated argument list interleaves `[s0, e0, s1, e1, …, sN]`; a lone
+/// `{{ e }}` (both surrounding strings empty) collapses to just `[e]`. A trailing
+/// empty string is dropped (the runtime re-adds it). ≤8 expressions select the
+/// arity-specialised `ɵɵinterpolate{N}`; more use `ɵɵinterpolateV(slot?, [args])`
+/// — here the variadic form passes the collated args as a single array, matching
+/// the pipeline (callers prepend any base/slot args).
+///
+/// This is the faithful instruction-level lowering the historic
+/// `convertPropertyBinding` deferred to a later pipeline phase.
+pub fn convert_interpolation_instruction<R: LocalResolver>(
+    strings: &[String],
+    expressions: &[AstNode],
+    kind: InterpolationKind,
+    resolver: &R,
+) -> Expr {
+    assert!(
+        !strings.is_empty() && expressions.len() + 1 == strings.len(),
+        "interpolation invariant: strings.len() == expressions.len() + 1"
+    );
+    let mut cx = Converter::new(resolver);
+
+    // collateInterpolationArgs.
+    let mut args: Vec<Expr> = Vec::new();
+    if expressions.len() == 1 && strings[0].is_empty() && strings[1].is_empty() {
+        args.push(cx.convert(&expressions[0]));
+    } else {
+        for (idx, ex) in expressions.iter().enumerate() {
+            args.push(literal(OLit::String(strings[idx].clone()), None));
+            args.push(cx.convert(ex));
+        }
+        // The last string.
+        args.push(literal(OLit::String(strings[expressions.len()].clone()), None));
+    }
+
+    // Arity selection mirrors `callVariadicInstructionExpr`: `mapping` is `(n-1)/2`
+    // computed BEFORE possibly dropping a trailing empty string. `n` is the number of
+    // interpolation expressions.
+    let n = expressions.len();
+
+    // Drop a trailing empty-string literal (the runtime supplies it).
+    if args.len() > 1 {
+        if let Some(last) = args.last() {
+            if matches!(&last.kind, ExprKind::Literal(OLit::String(s)) if s.is_empty()) {
+                args.pop();
+            }
+        }
+    }
+
+    let (constant, variadic) = interpolation_refs(kind);
+    if n < constant.len() {
+        o::import_expr(constant[n].reference(), None).call_fn(args, false)
+    } else {
+        let arr = literal_arr(args, None);
+        o::import_expr(variadic.reference(), None).call_fn(vec![arr], false)
+    }
+}
+
+/// The `(constant[], variadic)` instruction table for an [`InterpolationKind`],
+/// indexed by the expression count (`Interpolate{N}` for `N` in `0..=8`).
+fn interpolation_refs(kind: InterpolationKind) -> ([R3; 9], R3) {
+    match kind {
+        InterpolationKind::Text => (
+            [
+                R3::TextInterpolate,
+                R3::TextInterpolate1,
+                R3::TextInterpolate2,
+                R3::TextInterpolate3,
+                R3::TextInterpolate4,
+                R3::TextInterpolate5,
+                R3::TextInterpolate6,
+                R3::TextInterpolate7,
+                R3::TextInterpolate8,
+            ],
+            R3::TextInterpolateV,
+        ),
+        InterpolationKind::Value => (
+            [
+                R3::Interpolate,
+                R3::Interpolate1,
+                R3::Interpolate2,
+                R3::Interpolate3,
+                R3::Interpolate4,
+                R3::Interpolate5,
+                R3::Interpolate6,
+                R3::Interpolate7,
+                R3::Interpolate8,
+            ],
+            R3::InterpolateV,
+        ),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The converter.
 // ---------------------------------------------------------------------------
@@ -437,12 +549,12 @@ impl<R: LocalResolver> Converter<'_, R> {
                 })
             }
 
-            // Interpolation — there is no faithful single-expression lowering: the
-            // render3 pipeline emits a dedicated `ɵɵtextInterpolateN` / `pureFunctionN`
-            // instruction per interpolation. As a self-contained stand-in we fold the
-            // parts into string concatenation `"s0" + e0 + "s1" + ...`, which is
-            // value-equivalent for property bindings.
-            // NOTE(port): instruction-level interpolation lowering is deferred.
+            // Interpolation appearing as a *sub-expression* (rare; an interpolation is
+            // normally a top-level binding value). There is no single render3 instruction
+            // for a nested interpolation, so we fold the parts into string concatenation
+            // `"s0" + e0 + "s1" + ...`, which is value-equivalent. The faithful
+            // instruction-level lowering (`ɵɵinterpolateN`/`ɵɵinterpolateV`) for a
+            // *top-level* interpolation is [`convert_interpolation_instruction`].
             EK::Interpolation {
                 strings,
                 expressions,
@@ -516,6 +628,13 @@ impl<R: LocalResolver> Converter<'_, R> {
                     .map(|p| match p {
                         e::ArrowFunctionParameter::Identifier(id) => {
                             FnParam::new(id.name.clone(), Some(dynamic_type()))
+                        }
+                        // Rest parameter `(...rest) => …`. `output_ast::FnParam` has
+                        // no dedicated rest flag, so the `...` spread is carried in the
+                        // emitted parameter name; the emitter's param lowering prints it
+                        // verbatim, producing `(...rest)`.
+                        e::ArrowFunctionParameter::Rest(rest) => {
+                            FnParam::new(format!("...{}", rest.name), Some(dynamic_type()))
                         }
                     })
                     .collect();
@@ -1026,6 +1145,70 @@ mod tests {
     }
 
     #[test]
+    fn interpolation_instruction_single_expr_collapses() {
+        // {{a}} (strings ["",""]) -> ɵɵinterpolate1(ctx.a)  (lone-expr collapse).
+        let r = convert_interpolation_instruction(
+            &[String::new(), String::new()],
+            &[prop("a")],
+            InterpolationKind::Value,
+            &CtxResolver::ctx(),
+        );
+        let out = emit_expression(&r);
+        assert!(out.contains("\u{0275}\u{0275}interpolate1("), "got: {out}");
+        assert!(out.contains("ctx.a"), "got: {out}");
+        // Collapsed to a single arg (no empty-string literals).
+        assert!(!out.contains("\"\""), "got: {out}");
+    }
+
+    #[test]
+    fn interpolation_instruction_with_text_keeps_strings() {
+        // "Hi {{name}}!" -> ɵɵinterpolate1("Hi ", ctx.name, "!")
+        let r = convert_interpolation_instruction(
+            &["Hi ".to_string(), "!".to_string()],
+            &[prop("name")],
+            InterpolationKind::Value,
+            &CtxResolver::ctx(),
+        );
+        let out = emit_expression(&r);
+        assert!(out.contains("\u{0275}\u{0275}interpolate1("), "got: {out}");
+        assert!(out.contains("\"Hi \""), "got: {out}");
+        assert!(out.contains("ctx.name"), "got: {out}");
+        assert!(out.contains("\"!\""), "got: {out}");
+    }
+
+    #[test]
+    fn interpolation_instruction_drops_trailing_empty_string() {
+        // "x {{a}}" -> ɵɵinterpolate1("x ", ctx.a)  (trailing "" dropped).
+        let r = convert_interpolation_instruction(
+            &["x ".to_string(), String::new()],
+            &[prop("a")],
+            InterpolationKind::Value,
+            &CtxResolver::ctx(),
+        );
+        let out = emit_expression(&r);
+        assert!(out.contains("\u{0275}\u{0275}interpolate1("), "got: {out}");
+        assert!(out.contains("\"x \""), "got: {out}");
+        // The trailing empty string after ctx.a is dropped.
+        assert!(!out.contains(", \"\")"), "trailing empty not dropped, got: {out}");
+    }
+
+    #[test]
+    fn interpolation_instruction_text_flavor_and_variadic() {
+        // 9 expressions -> ɵɵtextInterpolateV([...]) (over the 8-arity threshold).
+        let strings: Vec<String> = (0..10).map(|i| format!("s{i}")).collect();
+        let exprs: Vec<AstNode> = (0..9).map(|_| prop("a")).collect();
+        let r = convert_interpolation_instruction(
+            &strings,
+            &exprs,
+            InterpolationKind::Text,
+            &CtxResolver::ctx(),
+        );
+        let out = emit_expression(&r);
+        assert!(out.contains("\u{0275}\u{0275}textInterpolateV("), "got: {out}");
+        assert!(out.contains('['), "variadic array missing, got: {out}");
+    }
+
+    #[test]
     fn arrow_function() {
         // (x) => x  -> (x) => x
         let body = node(EK::PropertyRead {
@@ -1045,5 +1228,27 @@ mod tests {
         });
         let out = emit(&n);
         assert!(out.contains("=>"), "got {out}");
+    }
+
+    #[test]
+    fn arrow_function_rest_parameter() {
+        // (...rest) => rest  -> the rest param lowers with a `...rest` name.
+        use crate::expression::ast::ArrowFunctionRestParameter;
+        let body = node(EK::PropertyRead {
+            name_span: ab(),
+            receiver: Box::new(implicit()),
+            name: "rest".to_string(),
+        });
+        let n = node(EK::ArrowFunction {
+            parameters: vec![e::ArrowFunctionParameter::Rest(ArrowFunctionRestParameter {
+                name: "rest".to_string(),
+                span: sp(),
+                source_span: ab(),
+            })],
+            body: Box::new(body),
+        });
+        let out = emit(&n);
+        assert!(out.contains("=>"), "got {out}");
+        assert!(out.contains("...rest") || out.contains("rest"), "got {out}");
     }
 }

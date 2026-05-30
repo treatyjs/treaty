@@ -23,56 +23,13 @@ use crate::output_ast::{
     self as o, ArrowBody, BinaryOperator, Expr, ExprKind, FnParam, LeadingComment, LiteralValue,
     Stmt, StmtKind, Type,
 };
-use crate::util::{ts_ignore_comment, type_with_parameters, R3CompiledExpression, R3Reference};
+use crate::util::{
+    ts_ignore_comment, type_with_parameters, R3CompiledExpression, R3Reference,
+};
 
-// ---------------------------------------------------------------------------
-// Local placeholders for not-yet-ported sibling types (`compiler_facade_interface.ts`, `core.ts`).
-// These mirror the real shapes so the algorithm is reproduced faithfully; replace with the real
-// ports when available. (`R3Reference` / `R3CompiledExpression` now live in `crate::util`.)
-// ---------------------------------------------------------------------------
-
-/// Placeholder for `compiler_facade_interface.ts`'s `FactoryTarget` enum. Discriminants pinned to
-/// the v22.1 source (`Directive = 0 … Service = 5`).
-///
-/// NOTE(port): real `FactoryTarget` lives in `compiler_facade_interface.ts` (not yet ported).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FactoryTarget {
-    Directive = 0,
-    Component = 1,
-    Injectable = 2,
-    Pipe = 3,
-    NgModule = 4,
-    Service = 5,
-}
-
-/// Placeholder for `core.ts`'s `InjectFlags` const enum (bitflags). `bitflags` is unavailable, so
-/// a plain `u8` newtype with `BitOr`, mirroring how the source ORs flags together.
-///
-/// NOTE(port): real `InjectFlags` lives in `core.ts` (not yet ported).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct InjectFlags(pub u8);
-
-impl InjectFlags {
-    pub const DEFAULT: InjectFlags = InjectFlags(0b0_0000);
-    pub const HOST: InjectFlags = InjectFlags(1 << 0);
-    pub const SELF: InjectFlags = InjectFlags(1 << 1);
-    pub const SKIP_SELF: InjectFlags = InjectFlags(1 << 2);
-    pub const OPTIONAL: InjectFlags = InjectFlags(1 << 3);
-    /// `@internal` flag used for pipe-target dependencies.
-    pub const FOR_PIPE: InjectFlags = InjectFlags(1 << 4);
-
-    #[inline]
-    pub fn bits(self) -> u8 {
-        self.0
-    }
-}
-
-impl std::ops::BitOr for InjectFlags {
-    type Output = InjectFlags;
-    fn bitor(self, rhs: InjectFlags) -> InjectFlags {
-        InjectFlags(self.0 | rhs.0)
-    }
-}
+// `FactoryTarget` / `InjectFlags` are the shared render3 "core" types; they live in `crate::util`
+// and are re-exported here for the many callers that reach for `crate::factory::FactoryTarget`.
+pub use crate::util::{FactoryTarget, InjectFlags};
 
 // ---------------------------------------------------------------------------
 // Factory metadata input types (`r3_factory.ts` interfaces/enums).
