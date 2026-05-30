@@ -250,6 +250,17 @@ fn pure_param(idx: usize) -> Expr {
     o::variable(format!("a{idx}"), None)
 }
 
+/// Which const-pool namespace a hoisted factory reference belongs to. Angular keeps pure-literal
+/// factories (`$cN$`) and arrow-function factories (`$arrowFn{N}$`) in independent sequences, so a
+/// view mixing both numbers each kind separately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FactoryKind {
+    /// A literal-array/map pure-function factory (`$cN$`).
+    PureLiteral,
+    /// An arrow-function factory (`$arrowFn{N}$`).
+    Arrow,
+}
+
 fn map_literal_value(v: &ELit) -> OLit {
     match v {
         ELit::Str(s) => OLit::String(s.clone()),
@@ -634,6 +645,19 @@ struct Converter<'r, R: LocalResolver> {
     /// `None`). Like [`Self::arrow_slot_fallback`] a self-contained stand-in; the real offset (and
     /// the matching `vars` growth) is the view builder's job.
     pure_slot_fallback: std::cell::Cell<usize>,
+    /// Running counter seeding the const-pool reference name minted for a hoisted *pure-function*
+    /// factory when the host const pool is not wired ([`PipeSlotAllocator::intern_pure_function_factory`]
+    /// returns `None`). Angular hoists every pure-function factory to a module-level `const $cN$ = …`
+    /// and references it by name (`ConstantPool.getSharedConstant` → `$c0$`, `$c1$`, …); minting the
+    /// reference here keeps the live `ɵɵpureFunctionN(slot, $cN$, …)` call byte-faithful to the golden
+    /// even when the builder has not (yet) interned the factory body — the factory declaration is a
+    /// sibling of the definition, outside the `defineComponent` call this converter produces.
+    next_const_name: std::cell::Cell<usize>,
+    /// Running counter seeding the const-pool reference name minted for a hoisted *arrow-function*
+    /// factory (`$arrowFn0$`, `$arrowFn1$`, …) when the host const pool is not wired. Angular's
+    /// `getSharedFunctionReference` names arrow factories `$arrowFn{N}$`, distinct from the `$cN$`
+    /// pure-literal namespace, so a view mixing both keeps two independent sequences.
+    next_arrow_name: std::cell::Cell<usize>,
 }
 
 impl<'r, R: LocalResolver> Converter<'r, R> {
@@ -648,6 +672,8 @@ impl<'r, R: LocalResolver> Converter<'r, R> {
             extract_pure: false,
             in_child_operation: 0,
             pure_slot_fallback: std::cell::Cell::new(0),
+            next_const_name: std::cell::Cell::new(0),
+            next_arrow_name: std::cell::Cell::new(0),
         }
     }
 
@@ -1053,9 +1079,9 @@ impl<R: LocalResolver> Converter<'_, R> {
             None,
         );
 
-        // The factory argument: a const-pool reference (`$arrowFn0$`) when the host's pool is wired
-        // (Angular `getSharedFunctionReference`), else the factory emitted inline (value-correct).
-        let factory_arg = self.intern_factory(factory);
+        // The factory argument: a const-pool reference (`$arrowFn0$`), from the host's pool when
+        // wired (Angular `getSharedFunctionReference`), else minted here.
+        let factory_arg = self.intern_factory(factory, FactoryKind::Arrow);
 
         // ɵɵarrowFunction(slot, factory, ctx)
         let ctx_capture = o::variable("ctx", None);
@@ -1179,7 +1205,7 @@ impl<R: LocalResolver> Converter<'_, R> {
             .map(|i| FnParam::new(format!("a{i}"), Some(dynamic_type())))
             .collect();
         let factory = o::arrow_fn(params, ArrowBody::Expr(Box::new(body)), None);
-        let factory_arg = self.intern_factory(factory);
+        let factory_arg = self.intern_factory(factory, FactoryKind::PureLiteral);
 
         let slot_lit = literal(OLit::Number(slot as f64), None);
         if num_args < 9 {
@@ -1210,15 +1236,31 @@ impl<R: LocalResolver> Converter<'_, R> {
     /// Intern a factory expression into the host const pool and return the reference to pass as the
     /// `ɵɵpureFunctionN`/`ɵɵarrowFunction` factory argument. When the host exposes its pool
     /// ([`PipeSlotAllocator::intern_pure_function_factory`]) the factory is hoisted and referenced
-    /// by name (`$c0$`/`$arrowFn0$`); otherwise it is emitted inline (value-correct).
-    fn intern_factory(&self, factory: Expr) -> Expr {
-        match self
+    /// by the host-assigned name; otherwise this mints the same module-level reference Angular's
+    /// `ConstantPool` would (`$cN$` for a pure-literal factory, `$arrowFn{N}$` for an arrow factory)
+    /// so the live call stays byte-faithful to the golden. The factory *declaration* is a sibling of
+    /// the component definition (outside the `defineComponent` call this converter emits), so it is
+    /// the view builder's job to materialise it; the converter only produces the reference.
+    fn intern_factory(&self, factory: Expr, kind: FactoryKind) -> Expr {
+        if let Some(name) = self
             .pipes
             .and_then(|p| p.intern_pure_function_factory(&factory))
         {
-            Some(name) => o::variable(name, None),
-            None => factory,
+            return o::variable(name, None);
         }
+        let name = match kind {
+            FactoryKind::PureLiteral => {
+                let n = self.next_const_name.get();
+                self.next_const_name.set(n + 1);
+                format!("$c{n}$")
+            }
+            FactoryKind::Arrow => {
+                let n = self.next_arrow_name.get();
+                self.next_arrow_name.set(n + 1);
+                format!("$arrowFn{n}$")
+            }
+        };
+        o::variable(name, None)
     }
 
     /// Expand a safe-navigation access (`a?.b`, `a?.[k]`, `f?.(args)`) into a
@@ -1586,9 +1628,25 @@ mod tests {
     }
 
     /// A [`PipeSlotAllocator`] that additionally hands out a fixed arrow var slot, so the
-    /// hoisting path can be exercised with a host-provided offset.
+    /// hoisting path can be exercised with a host-provided offset. It also models a wired const pool:
+    /// each interned factory is captured (so its body stays inspectable) and referenced by a stable
+    /// `$arrowFn{N}$` name, exactly as a real builder would.
     struct ArrowPipes {
         arrow_slot: usize,
+        interned: std::cell::RefCell<Vec<Expr>>,
+    }
+    impl ArrowPipes {
+        fn new(arrow_slot: usize) -> Self {
+            ArrowPipes {
+                arrow_slot,
+                interned: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+        /// The most recently interned factory (the `(ctx, view) => …` / `(a0, …) => …` body),
+        /// for tests that inspect the hoisted factory body.
+        fn last_factory(&self) -> Expr {
+            self.interned.borrow().last().cloned().expect("no factory interned")
+        }
     }
     impl PipeSlotAllocator for ArrowPipes {
         fn allocate_pipe(&self, _name: &str, _total_args: usize) -> PipeSlots {
@@ -1599,6 +1657,12 @@ mod tests {
         }
         fn allocate_arrow_slot(&self) -> Option<usize> {
             Some(self.arrow_slot)
+        }
+        fn intern_pure_function_factory(&self, factory: &Expr) -> Option<String> {
+            let mut interned = self.interned.borrow_mut();
+            let n = interned.len();
+            interned.push(factory.clone());
+            Some(format!("$arrowFn{n}$"))
         }
     }
 
@@ -1712,14 +1776,18 @@ mod tests {
             parameters: vec![arrow_id_param("a")],
             body: Box::new(body),
         });
-        // Use the arrow-only allocator so the factory is emitted inline and its body is inspectable.
-        let pipes = ArrowPipes { arrow_slot: 1 };
+        // The allocator interns the factory (capturing its body) and the call references it by name.
+        let pipes = ArrowPipes::new(1);
         let r = convert_property_binding_with_pipes(&arrow, &CtxResolver::ctx(), &pipes);
         let out = emit_expression(&r.expr);
-        // The arrow is hoisted (arrowFunction), but the inner object literal is verbatim — no pure fn.
+        // The arrow is hoisted (arrowFunction) and references the interned factory by name.
         assert!(out.contains("\u{0275}\u{0275}arrowFunction("), "arrow not hoisted, got: {out}");
+        assert!(out.contains("$arrowFn0$"), "factory not interned, got: {out}");
         assert!(!out.contains("pureFunction"), "object literal wrongly extracted, got: {out}");
-        assert!(out.contains("foo:"), "object literal missing, got: {out}");
+        // The inner object literal is verbatim inside the hoisted factory body (no pure fn).
+        let body = emit_expression(&pipes.last_factory());
+        assert!(body.contains("foo:"), "object literal missing in factory, got: {body}");
+        assert!(!body.contains("pureFunction"), "object literal wrongly extracted, got: {body}");
     }
 
     #[test]
@@ -1777,18 +1845,20 @@ mod tests {
             parameters: vec![arrow_id_param("param")],
             body: Box::new(body),
         });
-        let pipes = ArrowPipes { arrow_slot: 1 };
+        let pipes = ArrowPipes::new(1);
         let r = convert_property_binding_with_pipes(&arrow, &CtxResolver::ctx(), &pipes);
         let out = emit_expression(&r.expr);
         assert!(out.contains("\u{0275}\u{0275}arrowFunction("), "no arrowFunction, got: {out}");
-        // The single binding slot (varOffset) the host allocated.
+        // The single binding slot (varOffset) the host allocated, and the interned factory reference.
         assert!(out.contains("arrowFunction(1,"), "wrong slot, got: {out}");
-        // Factory wraps the user arrow in a `(ctx, view) => …` outer arrow.
-        assert!(out.contains("(ctx, view) =>"), "no factory wrapper, got: {out}");
+        assert!(out.contains("$arrowFn0$"), "factory not interned, got: {out}");
+        // The interned factory wraps the user arrow in a `(ctx, view) => …` outer arrow.
+        let body = emit_expression(&pipes.last_factory());
+        assert!(body.contains("(ctx, view) =>"), "no factory wrapper, got: {body}");
         // Captured context argument is `ctx`; the body's `value` read becomes `ctx.value`.
-        assert!(out.contains("ctx.value"), "body not ctx-rooted, got: {out}");
+        assert!(body.contains("ctx.value"), "body not ctx-rooted, got: {body}");
         // The bound parameter is NOT rewritten to `ctx.param`.
-        assert!(out.contains("param + ctx.value + 1"), "param shadowing broke, got: {out}");
+        assert!(body.contains("param + ctx.value + 1"), "param shadowing broke, got: {body}");
     }
 
     #[test]
@@ -1821,7 +1891,7 @@ mod tests {
             parameters: vec![],
             body: Box::new(prop("x")),
         });
-        let pipes = ArrowPipes { arrow_slot: 1 };
+        let pipes = ArrowPipes::new(1);
         let r = convert_property_binding_with_pipes(&arrow, &NestedRes, &pipes);
         let out = emit_expression(&r.expr);
         assert!(!out.contains("arrowFunction"), "should stay inline, got: {out}");
@@ -1863,12 +1933,15 @@ mod tests {
             parameters: vec![arrow_id_param("a")],
             body: Box::new(inner),
         });
-        let pipes = ArrowPipes { arrow_slot: 2 };
+        let pipes = ArrowPipes::new(2);
         let r = convert_property_binding_with_pipes(&outer, &CtxResolver::ctx(), &pipes);
         let out = emit_expression(&r.expr);
-        // Exactly one arrowFunction instruction (the outer), inner stays a plain arrow.
+        // Exactly one arrowFunction instruction (the outer), referencing the interned factory.
         assert_eq!(out.matches("\u{0275}\u{0275}arrowFunction(").count(), 1, "got: {out}");
-        assert!(out.contains("a => b => a + b"), "nested arrow body wrong, got: {out}");
+        assert!(out.contains("$arrowFn0$"), "factory not interned, got: {out}");
+        // The interned factory body carries the nested arrow verbatim (inner stays a plain arrow).
+        let body = emit_expression(&pipes.last_factory());
+        assert!(body.contains("a => b => a + b"), "nested arrow body wrong, got: {body}");
     }
 
     #[test]

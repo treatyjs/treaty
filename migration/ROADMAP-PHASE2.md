@@ -140,8 +140,14 @@ as a NATIVE RUST binary (supersedes the wave-2 TS @treaty/cli; keep TS until Rus
 - **Fallback = a custom RUST-NATIVE bundler + dev-server with federation built in** when no external
   bundler is chosen — Treaty's own fast bundler.
 - Commands `dev`/`build`/`generate` (selectorless + signal scaffolds, federation-ready by default).
+- **Deploy plugins** in the plugin system (pluggable deploy methods/targets) to help deploy.
+- **CI affected-change detection (user 2026-05-31)**: a command that tells CI which parts ACTUALLY
+  changed (from the `@treaty/compiler` content-hash cache + the route/lib dependency graph — a changed
+  shared lib fans out to dependents), so CI **compiles only that federation, tests only that part, and
+  deploys only that part** (Nx/Turborepo-style "affected" at federated-module granularity). Build/CI
+  counterpart to the D2 runtime manifest (deploy = flip a version; rollback = revert it).
 New crate (e.g. `apps/cli` or `libs/treaty/cli-rs`), depends on render3/authoring → sequence after a
-compliance round (builds against render3). See [[treaty-angular-cli-federation]].
+compliance round (builds against render3). See [[treaty-angular-cli-federation]], [[treaty-federation-deployment]].
 
 ## Harness
 - **File-by-file harness**: compile a corpus of individual `.treaty`/`.tsx`/`.ts` files through `@treaty/compiler`
