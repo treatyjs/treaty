@@ -50,9 +50,33 @@ single per-file Angular entry point.
 `@treaty/vite`, `@treaty/rspack`, `@treaty/rsbuild`, `@treaty/rslib`. Per-file transform + HMR/watch +
 handle file deletion + production build (build-to-deploy output). Territory: `libs/treaty/{vite,rspack,rsbuild,rslib}` (new, disjoint per package).
 
-**D. Module Federation (latest)** — `@module-federation/enhanced` integrated out-of-the-box across the
-bundler plugins (Rspack native MF; Vite via `@module-federation/vite`). A `@treaty/module-federation`
-helper package + per-plugin wiring. **Depends on C** (wave 2).
+**D. Module Federation (latest, AUTOMATIC + zero-config — user 2026-05-30)** —
+`@module-federation/enhanced` integrated out-of-the-box across the bundler plugins (Rspack native MF;
+Vite via `@module-federation/vite`). **EVERY Treaty app is Module Federation automatically** — the user
+configures NOTHING. A `@treaty/module-federation` helper generates the host/remote config from project
+structure (no hand-written `ModuleFederationPlugin`). Wired via the Angular-CLI integration (I) so
+`ng build`/`ng serve` produce federated host+remotes by default. **Depends on C** (wave 2).
+
+**I. Angular-CLI integration — Treaty as a wrapper around Angular itself (user 2026-05-30)** — zero
+the user has to configure:
+- **`angular.json` builders** (`@treaty/build`, `@angular-devkit/architect` `createBuilder`): a
+  `build`/`serve` builder that runs Treaty's Rust compiler + the rspack(+MF) plugin, referenced as the
+  project's `architect.build.builder`. So `ng build` / `ng serve` use Treaty + automatic federation.
+- **Schematics** (`@treaty/schematics`, `@angular-devkit/schematics`): `ng add @treaty` rewrites
+  `angular.json` to the Treaty builders and scaffolds projects/libs **pre-wired as MF host + remotes**;
+  `ng generate` app/lib schematics keep the federation structure out-of-the-box. Nothing to configure.
+- **CLI** (`@treaty/cli`, bin `treaty`): the STANDALONE driver for projects WITHOUT `angular.json`
+  (user 2026-05-30) — `treaty dev`/`build`/`generate` drive the bundler plugins + `@treaty/compiler`
+  directly, no Angular workspace file. (It is NOT an `ng` wrapper; angular.json projects use `ng`
+  itself plus the Treaty builders/schematics above.)
+- **Depends on C/D** (wave 2). Territory: `libs/treaty/{build,schematics,cli,module-federation}` (new).
+
+**Dual-mode: angular.json AND standalone (user 2026-05-30)** — the build tools support BOTH:
+- **angular.json projects** → the architect builders / schematics (workstream I): `ng build`/`ng serve`.
+- **standalone** (no `angular.json`) → the bundler plugins (workstream C) used directly in
+  `vite.config` / `rspack.config` / rsbuild / rslib config.
+Both paths share the same `@treaty/compiler` core and keep Module Federation automatic. The user picks
+either; nothing forces an Angular workspace file.
 
 **E. REPL "everything" demo** — `apps/repl`: an example app exercising `.treaty` + JSX + signals + control
 flow + server fns (all 3 transports) + macros + each bundler plugin + a Module Federation host/remote
