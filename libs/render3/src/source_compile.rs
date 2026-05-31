@@ -21,8 +21,9 @@ use oxc_parser::Parser;
 use oxc_span::SourceType;
 
 use crate::compile::{CompiledComponent, RealTemplateBuilder};
+use crate::identifiers::R3;
 use crate::output::emitter::emit_expression;
-use crate::output_ast::{self as o, Expr, LiteralValue, ParseSourceSpan};
+use crate::output_ast::{self as o, Expr, FnParam, LiteralValue, ParseSourceSpan};
 use crate::template::template_transform::{
     html_ast_to_render3_ast, BindingParser, Render3ParseOptions,
 };
@@ -30,8 +31,9 @@ use crate::util::{R3CompiledExpression, R3Reference};
 use crate::view::compiler::{
     compile_component_from_metadata, ChangeDetection, ChangeDetectionStrategy, ComponentTemplate,
     DeclarationListEmitMode, Deps, Lifecycle, OrderedMap, QueryPredicate, R3ComponentDeferMetadata,
-    R3ComponentMetadata, R3DirectiveMetadata, R3HostMetadata, R3InputMetadata, R3QueryMetadata,
-    R3TemplateDependencyMetadata, StubHostBindingsBuilder, ViewEncapsulation,
+    R3ComponentMetadata, R3DirectiveMetadata, R3ForeignComponentMetadata, R3HostMetadata,
+    R3InputMetadata, R3QueryMetadata, R3TemplateDependency, R3TemplateDependencyMetadata,
+    StubHostBindingsBuilder, TemplateBuilder, TemplateBuilderResult, ViewEncapsulation,
 };
 
 /// Helper to build a `CompiledComponent` carrying a single fatal error and no code.
@@ -207,6 +209,74 @@ fn convert_expr<'a>(expr: &'a Expression<'a>) -> Option<Expr> {
         Expression::ParenthesizedExpression(p) => convert_expr(&p.expression),
         _ => None,
     }
+}
+
+/// Parse the `@Component({ foreignImports: [...] })` array into [`R3ForeignComponentMetadata`].
+///
+/// Faithful to ngtsc's `validateAndFlattenForeignImports` + `resolveForeignComponentImports`
+/// (`compiler-cli/.../component/src/{util,handler}.ts`): each entry resolves to a foreign
+/// component whose `name` is the local identity of the referenced declaration and whose
+/// `component` is the raw entry expression copied through verbatim (`new o.WrappedNodeExpr`).
+///
+/// The SOURCE front-end has no type resolver, so we recover the same `name`/`component` pair
+/// from the surface syntax of the two shapes Angular's resolver produces here:
+///   * a call like `frameworkImport(FancyButton)` — the resolver follows the call to the
+///     `FancyButton` function declaration, so `name = "FancyButton"` (the first identifier
+///     argument) and `component` is the whole `frameworkImport(FancyButton)` call;
+///   * a bare identifier `FancyButton` — `name` and `component` are both that identifier.
+/// Nested arrays are flattened (Angular flattens recursively). Entries we cannot name are
+/// skipped (they would be a resolver diagnostic upstream, never a silent mis-compile).
+fn parse_foreign_imports(expr: &Expression) -> Vec<R3ForeignComponentMetadata> {
+    let mut out = Vec::new();
+    collect_foreign_imports(expr, &mut out);
+    out
+}
+
+fn collect_foreign_imports(expr: &Expression, out: &mut Vec<R3ForeignComponentMetadata>) {
+    let Expression::ArrayExpression(arr) = expr else {
+        return;
+    };
+    for el in &arr.elements {
+        let Some(inner) = el.as_expression() else {
+            continue;
+        };
+        match inner {
+            // Nested array — flatten (ngtsc `validateAndFlattenForeignImports` recurses).
+            Expression::ArrayExpression(_) => collect_foreign_imports(inner, out),
+            _ => {
+                if let Some(meta) = foreign_import_entry(inner) {
+                    out.push(meta);
+                }
+            }
+        }
+    }
+}
+
+/// One `foreignImports` entry → its `{ name, component }` pair. Returns `None` when the entry's
+/// foreign name cannot be recovered from the surface syntax.
+fn foreign_import_entry(expr: &Expression) -> Option<R3ForeignComponentMetadata> {
+    let unwrapped = match expr {
+        Expression::ParenthesizedExpression(p) => &p.expression,
+        other => other,
+    };
+    let name = match unwrapped {
+        // `frameworkImport(FancyButton)` — the resolved declaration is the first identifier arg.
+        Expression::CallExpression(call) => call
+            .arguments
+            .iter()
+            .find_map(|a| a.as_expression())
+            .and_then(|a| match a {
+                Expression::Identifier(id) => Some(id.name.to_string()),
+                _ => None,
+            })?,
+        // Bare `FancyButton`.
+        Expression::Identifier(id) => id.name.to_string(),
+        _ => return None,
+    };
+    // `component` is the raw entry expression, copied through verbatim (ngtsc wraps it in an
+    // `o.WrappedNodeExpr`; our IR re-emits the converted literal subset identically).
+    let component = convert_expr(unwrapped)?;
+    Some(R3ForeignComponentMetadata { name, component })
 }
 
 /// Walks an object literal property by name, returning its value expression.
@@ -727,6 +797,14 @@ fn compile_program(program: &Program) -> CompiledComponent {
         .and_then(|o| find_prop(o, "animations"))
         .and_then(convert_expr);
 
+    // foreignImports: [...] — non-Angular (framework) component imports. Each matched element in
+    // the template (`<FancyButton .../>`) compiles to a single creation-time `ɵɵforeignComponent`
+    // instruction rather than a DOM element + property updates.
+    let foreign_imports = obj
+        .and_then(|o| find_prop(o, "foreignImports"))
+        .map(parse_foreign_imports)
+        .filter(|v| !v.is_empty());
+
     // inputs / outputs.
     let mut inputs: OrderedMap<String, R3InputMetadata> = OrderedMap::new();
     let mut outputs: OrderedMap<String, String> = OrderedMap::new();
@@ -776,6 +854,7 @@ fn compile_program(program: &Program) -> CompiledComponent {
             styles,
             encapsulation,
             animations,
+            foreign_imports,
         ),
         // Directives reuse the component emitter is NOT correct — directives go through a
         // different define. Not supported by the existing emitter, so bail clearly.
@@ -784,6 +863,140 @@ fn compile_program(program: &Program) -> CompiledComponent {
             err("@Directive emission not yet supported (only @Component)".to_string())
         }
     }
+}
+
+/// A [`TemplateBuilder`] that recognises foreign-component usages and emits a creation-time
+/// `ɵɵforeignComponent` instruction for them, delegating everything else to the classic
+/// [`RealTemplateBuilder`].
+///
+/// Angular's pipeline (`ingest.ts` `ingestElement` → `reify.ts` `OpKind.ForeignComponent`)
+/// short-circuits a matched foreign element to a single creation op:
+///   `ɵɵforeignComponent(slot, foreignComponentRef, { …props })`
+/// with NO update block (foreign components react to directly-passed signal props), so the view
+/// has `vars: 0` and no per-element attribute `consts`. The instruction args are
+/// `[literal(slot), component, props?]`; `props` is a `literalMap` of the element's static
+/// attributes (string-literal values) followed by its bound inputs (converted against `ctx`),
+/// each key quoted iff it contains `-`/`.` (Angular's `isUnsafeObjectKey`). We only take this
+/// path when the WHOLE template is exactly one such matched element (the shape Angular's
+/// `foreignImports` corpus exercises); any other template falls through to the real builder
+/// untouched, so nothing else can regress.
+#[derive(Debug, Default)]
+struct ForeignAwareTemplateBuilder {
+    inner: RealTemplateBuilder,
+}
+
+impl ForeignAwareTemplateBuilder {
+    /// If `meta`'s template is a single element matching one of the component's `foreignImports`,
+    /// build the `ɵɵforeignComponent` template-function result. Returns `None` otherwise.
+    fn try_foreign<D: R3TemplateDependency>(
+        meta: &R3ComponentMetadata<D>,
+    ) -> Option<TemplateBuilderResult> {
+        let foreign = meta.foreign_imports.as_ref()?;
+        if foreign.is_empty() {
+            return None;
+        }
+
+        // Exactly one significant template node (ignore inter-element whitespace text), and it must
+        // be a plain element whose tag matches a foreign import by name.
+        let element = sole_element(&meta.template.nodes)?;
+        let matched = foreign.iter().find(|f| f.name == element.name)?;
+
+        // Build the `{ …attrs, …inputs }` props literal map (or `None` when empty), faithfully
+        // mirroring `ingestElement`'s foreign-component branch: static attributes first (in source
+        // order) then bound inputs (in source order).
+        let mut props: Vec<(String, bool, Expr)> = Vec::new();
+        for attr in &element.attributes {
+            props.push((
+                attr.name.clone(),
+                is_unsafe_object_key(&attr.name),
+                o::literal(LiteralValue::String(attr.value.clone()), None),
+            ));
+        }
+        for input in &element.inputs {
+            let converted = crate::expression_converter::convert_property_binding(
+                &input.value,
+                o::variable("ctx", None),
+                "0",
+            );
+            props.push((
+                input.name.clone(),
+                is_unsafe_object_key(&input.name),
+                converted.expr,
+            ));
+        }
+
+        // `ɵɵforeignComponent(0, <component>, { …props })` in the creation block.
+        let mut args = vec![
+            o::literal(LiteralValue::Number(0.0), None),
+            matched.component.clone(),
+        ];
+        if !props.is_empty() {
+            args.push(o::literal_map(props, None));
+        }
+        let create_stmt = o::import_expr(R3::ForeignComponent.reference(), None)
+            .call_fn(args, false)
+            .to_stmt();
+
+        // `function <Name>_Template(rf, ctx) { if (rf & 1) { …create } }` — no update block.
+        let cond = o::variable("rf", None).bitwise_and(o::literal(LiteralValue::Number(1.0), None));
+        let body = vec![o::if_stmt(cond, vec![create_stmt], None)];
+        let template_fn = o::fn_(
+            vec![FnParam::new("rf", None), FnParam::new("ctx", None)],
+            body,
+            None,
+            Some(format!("{}_Template", meta.base.name)),
+        );
+
+        Some(TemplateBuilderResult {
+            template_fn,
+            // One data slot for the foreign component; no binding vars; no element consts.
+            decls: 1,
+            vars: 0,
+            consts: Vec::new(),
+            consts_initializers: Vec::new(),
+            content_selectors: None,
+            pool_statements: Vec::new(),
+        })
+    }
+}
+
+impl TemplateBuilder for ForeignAwareTemplateBuilder {
+    fn build<D: R3TemplateDependency>(
+        &mut self,
+        meta: &R3ComponentMetadata<D>,
+        all_deferrable_deps_fn: Option<&Expr>,
+    ) -> TemplateBuilderResult {
+        if let Some(result) = Self::try_foreign(meta) {
+            return result;
+        }
+        self.inner.build(meta, all_deferrable_deps_fn)
+    }
+}
+
+/// Angular's `isUnsafeObjectKey` (`render3/util.ts`): an object-literal key must be quoted iff it
+/// contains a `-` or `.` (otherwise it is a bare JS identifier).
+fn is_unsafe_object_key(key: &str) -> bool {
+    key.contains('-') || key.contains('.')
+}
+
+/// The sole significant element of a template node list, ignoring whitespace-only text nodes.
+/// Returns `None` if there is not exactly one element (or any non-text sibling is present).
+fn sole_element(nodes: &[crate::template::r3_ast::Node]) -> Option<&crate::template::r3_ast::Element> {
+    use crate::template::r3_ast::Node;
+    let mut found: Option<&crate::template::r3_ast::Element> = None;
+    for node in nodes {
+        match node {
+            Node::Text(t) if t.value.trim().is_empty() => {}
+            Node::Element(el) => {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(el);
+            }
+            _ => return None,
+        }
+    }
+    found
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -795,6 +1008,7 @@ fn compile_component_meta(
     styles: Vec<String>,
     encapsulation: ViewEncapsulation,
     animations: Option<Expr>,
+    foreign_imports: Option<Vec<R3ForeignComponentMetadata>>,
 ) -> CompiledComponent {
     let mut errors: Vec<String> = Vec::new();
 
@@ -846,10 +1060,10 @@ fn compile_component_meta(
         relative_template_path: None,
         has_directive_dependencies,
         raw_imports: None,
-        foreign_imports: None,
+        foreign_imports,
     };
 
-    let mut template_builder = RealTemplateBuilder;
+    let mut template_builder = ForeignAwareTemplateBuilder::default();
     let mut host_builder = StubHostBindingsBuilder;
     let mut pool_statements = Vec::new();
     let compiled: R3CompiledExpression = compile_component_from_metadata(
