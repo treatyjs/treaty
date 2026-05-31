@@ -1,0 +1,15 @@
+[package]
+name = "treaty_ivy_core"
+version = "0.1.0"
+edition = "2024"
+
+# Backend-agnostic foundation of Treaty's direct-to-Ivy Angular compiler:
+# output IR + emitter/source-map, runtime identifiers, factory, the
+# binding-expression lexer/parser/converter, util helpers, and the i18n
+# message-id digest primitives. Ported from Angular 22.1 packages/compiler.
+
+[dependencies]
+oxc_allocator = "0.133.0"
+oxc_ast = "0.133.0"
+oxc_codegen = "0.133.0"
+oxc_span = "0.133.0"

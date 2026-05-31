@@ -31,22 +31,23 @@
 //! call sites inside and outside the crate (e.g. `apps/rust/authoring`) are unchanged; the split is
 //! structural and emitted Ivy is byte-identical.
 
-/// Backend-agnostic foundation: output IR, emitter, runtime identifiers, factory,
-/// and the binding-expression pipeline. Depends on nothing in `template`/`decorators`.
-pub mod core;
-
-// Re-export every `core` module from its historical top-level path. These aliases
-// keep `crate::output_ast::…`, `crate::output::…`, `crate::factory::…`, etc.
-// resolving exactly as before (the canonical paths are now `crate::core::…`).
-pub use core::digest;
-pub use core::expression;
-pub use core::expression_converter;
-pub use core::factory;
-pub use core::identifiers;
-pub use core::output;
-pub use core::output_ast;
-
-pub mod util;
+// The backend-agnostic foundation (output IR, emitter, runtime identifiers,
+// factory, the binding-expression pipeline, util helpers, and the i18n digest
+// primitives) is now the separate crate `treaty_ivy_core`. Re-export every core
+// module from its historical top-level path so `crate::output_ast::…`,
+// `crate::output::…`, `crate::factory::…`, `crate::util::…`, `crate::digest::…`,
+// etc. keep resolving inside this crate exactly as before — the not-yet-carved
+// template/decorator/facade subtrees reference these via `crate::…` and need no
+// per-file edit until they are themselves carved. The split is structural;
+// emitted Ivy is byte-identical.
+pub use treaty_ivy_core::digest;
+pub use treaty_ivy_core::expression;
+pub use treaty_ivy_core::expression_converter;
+pub use treaty_ivy_core::factory;
+pub use treaty_ivy_core::identifiers;
+pub use treaty_ivy_core::output;
+pub use treaty_ivy_core::output_ast;
+pub use treaty_ivy_core::util;
 
 // ---------------------------------------------------------------------------
 // `template` subtree (Phase 2). The HTML/template → instruction-IR layer —

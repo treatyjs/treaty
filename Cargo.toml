@@ -4,6 +4,7 @@ members = [
 	'libs/authoring/node',
 	'libs/authoring/treaty_authoring',
 	'libs/render3',
+	'libs/treaty-ivy/core',
 	'apps/rust/authoring',
 	'libs/runtime',
 	'apps/treaty-cli',

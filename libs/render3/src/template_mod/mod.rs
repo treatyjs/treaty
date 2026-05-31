@@ -1,7 +1,7 @@
 //! `template` — the HTML/template → instruction-IR layer. It turns parsed markup
 //! into render3's template AST, binds it (selectorless resolution + auto-import),
 //! lowers it to the instruction-emitter inputs, and extracts i18n metadata. It
-//! depends on [`crate::core`] but knows nothing about decorators or metadata
+//! depends on [`treaty_ivy_core`] but knows nothing about decorators or metadata
 //! extraction.
 //!
 //! Contents:

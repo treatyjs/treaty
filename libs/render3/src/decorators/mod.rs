@@ -15,7 +15,7 @@
 //!                                  `source_compile`'s per-class loop dispatches through it so
 //!                                  adding a kind is a registration, not a `match` arm.
 //!
-//! Depends on [`crate::core`] (IR + emit) and [`crate::template_mod`] (template lowering, the
+//! Depends on [`treaty_ivy_core`] (IR + emit) and [`crate::template_mod`] (template lowering, the
 //! template-definition builder, query generation). It knows nothing about the per-FILE driver —
 //! that thin "join" stays in [`crate::source_compile`].
 //!
