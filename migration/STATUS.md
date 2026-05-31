@@ -18,14 +18,14 @@ a `DecoratorCompiler` registry that mirrors the authoring-plugin design.
 
 Where things stand:
 
-- **treaty_ivy compiler** — DONE & green: 4 crates, **447 `#[test]`** total. Emits
+- **treaty_ivy compiler** — DONE & green: 4 crates, **448 `#[test]`** total. Emits
   complete ES-module Ivy output (component/directive/injectable/pipe). Golden
   parity vs Angular's own corpus: **142 / 185 runnable = 76.8%** (committed
   report), climbing toward full parity as the ranked DIFFs are closed.
-- **Angular Linker** — IN PROGRESS: partial `ɵɵngDeclare*` → AOT `ɵɵdefine*`
-  in `libs/treaty-ivy/facade/src/linker.rs`. Lets Treaty apps consume real
-  published Angular libraries with **no JIT** in dev *and* prod. Bundler wiring
-  is the next step.
+- **Angular Linker** — IN PROGRESS (not yet committed): partial `ɵɵngDeclare*`
+  → AOT `ɵɵdefine*`, planned to land in the facade crate. Lets Treaty apps
+  consume real published Angular libraries with **no JIT** in dev *and* prod.
+  Bundler wiring is the following step.
 - **Node-compatible runtime** — DONE & green: 483 in-crate tests, module-granular
   `node:` builtins, real `node:tls` + `node:https` over rustls/ring, offline-clean.
 - **File-based routing** — DONE: `treaty_file_routing` Rust crate + CLI, wired into
@@ -53,8 +53,8 @@ core  <-  template  <-  decorators  <-  facade
 | `treaty_ivy_core` | Ivy instructions, const pool, expression lowering, i18n primitives, sourcemap, `ngDeclare` shapes | 215 |
 | `treaty_ivy_template` | template parse + bind, control flow, host/styling | 138 |
 | `treaty_ivy_decorators` | `@Component/@Directive/@Injectable/@Pipe` lowering, queries, DI | 39 |
-| `treaty_ivy_facade` | public entry, NAPI ports, compliance + parity harness, linker | 55 |
-| **Total** | | **447** |
+| `treaty_ivy_facade` | public entry, NAPI ports, compliance + parity harness | 56 |
+| **Total** | | **448** |
 
 A **`DecoratorCompiler` registry** sits in the decorators crate so decorator
 handlers compose the same way authoring plugins do.
@@ -118,23 +118,25 @@ Harness moved into the facade crate:
 
 ## (2) Angular Linker — partial → AOT
 
-**Status: IN PROGRESS.**
+**Status: IN PROGRESS (design landed, code not yet committed).**
 
-`libs/treaty-ivy/facade/src/linker.rs` + a NAPI `linkPartial` entry.
+Planned home: a `linker.rs` pass in the facade crate + a NAPI `linkPartial`
+entry. (As of this snapshot the facade `src/` contains `lib.rs`, `compile.rs`
+and `source_compile.rs` only — the linker module is not yet on disk.)
 
 Published Angular libraries ship **partial-compilation** output
 (`ɵɵngDeclareComponent` / `ɵɵngDeclareDirective` / … the `ɵɵngDeclare*` family).
 Without a linker, consuming them forces the JIT fallback and triggers the
 `_PlatformLocation needs JIT / @angular/compiler not available` runtime error.
 
-The linker re-emits the fully-AOT `ɵɵdefineComponent` / `ɵɵdefine*` calls so
+The linker will re-emit the fully-AOT `ɵɵdefineComponent` / `ɵɵdefine*` calls so
 Treaty apps depend on real Angular libraries with **no JIT** — and it must run in
 **both dev and production** builds.
 
-- DONE: Rust linker pass (`ɵɵngDeclare*` → `ɵɵdefine*`) in the facade crate.
-- REMAINING: bundler wiring (run the linker over `node_modules` partial libs
-  during vite/build), and NAPI surfacing of `linkPartial` in the addon. This is
-  the blocker for the real build + boot e2e (workstream 5).
+- REMAINING: implement the Rust linker pass (`ɵɵngDeclare*` → `ɵɵdefine*`);
+  bundler wiring (run the linker over `node_modules` partial libs during
+  vite/build); NAPI surfacing of `linkPartial` in the addon. This is the blocker
+  for the real build + boot e2e (workstream 5).
 
 Why it matters: it is the gate to using the existing Angular ecosystem
 unmodified, AOT, without bundling `@angular/compiler` into the app.
