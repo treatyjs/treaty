@@ -171,6 +171,81 @@ function extractDefineBlockOfKind(code, kind) {
   return extractBalancedArgs(code, kind);
 }
 
+/** Extract ALL balanced `marker({ ... })` argument blocks (incl. parens) in `code`, in
+ *  source order. A single source file that declares several classes emits several
+ *  `ɵɵdefine*({...})` blocks; the consuming golden is anchored on ONE of them. */
+function extractAllBlocksOfKind(code, kind) {
+  const out = [];
+  let from = 0;
+  for (;;) {
+    const at = code.indexOf(kind, from);
+    if (at === -1) break;
+    const block = extractBalancedArgs(code, kind, at);
+    if (!block) break;
+    out.push(block);
+    // Advance past this block's opening marker so the next search finds the following one.
+    from = at + kind.length;
+  }
+  return out;
+}
+
+/** Read the `type:` class identifier a golden/emit define block is anchored on, e.g.
+ *  `type: MyApp,` -> "MyApp". Returns null when absent (the block carries no `type:`). */
+function anchorTypeOfBlock(block) {
+  const m = /type:\s*([A-Za-z_$][\w$]*)/.exec(block);
+  return m ? m[1] : null;
+}
+
+/** Read the canonical `selectors:` slice of a define block (the bracketed array literal
+ *  immediately after `selectors:`), normalised, for matching a golden anchor to OUR
+ *  block when the `type:` identifiers differ in name but the selector is the anchor. */
+function anchorSelectorOfBlock(block) {
+  const at = block.indexOf('selectors:');
+  if (at === -1) return null;
+  const open = block.indexOf('[', at);
+  if (open === -1) return null;
+  let depth = 0;
+  for (let i = open; i < block.length; i++) {
+    const ch = block[i];
+    if (ch === '[') depth++;
+    else if (ch === ']') {
+      depth--;
+      if (depth === 0) return canonicalize(block.slice(open, i + 1));
+    }
+  }
+  return null;
+}
+
+/**
+ * Select, from OUR full emit, the `ɵɵdefine<kind>({...})` block that corresponds to the
+ * class the GOLDEN is anchored on. A multi-class source file emits several define blocks
+ * (e.g. a child component declared before the consuming component); the golden is a
+ * fragment of exactly one class's def. Blindly taking the FIRST block compares the
+ * golden's anchor class against whichever class we happened to emit first. Instead we:
+ *   1. read the golden's anchor `type:` identifier and `selectors:`,
+ *   2. find OUR block whose `type:` identifier matches (exact, name-preserving), else
+ *   3. fall back to OUR block whose canonical `selectors:` equals the golden's,
+ *   4. and only if neither disambiguates, the first block (legacy behaviour).
+ * STRICT: this is pure SELECTION among blocks WE emitted — it never alters emitted Ivy,
+ * never borrows another case's golden, and degrades to the old first-block pick when the
+ * file declares a single class (the common case) or the anchors are absent.
+ */
+function selectMatchingBlock(code, kind, goldenBlock) {
+  const blocks = extractAllBlocksOfKind(code, kind);
+  if (blocks.length <= 1) return blocks[0] ?? extractDefineBlockOfKind(code, kind);
+  const wantType = anchorTypeOfBlock(goldenBlock);
+  if (wantType) {
+    const byType = blocks.find((b) => anchorTypeOfBlock(b) === wantType);
+    if (byType) return byType;
+  }
+  const wantSel = anchorSelectorOfBlock(goldenBlock);
+  if (wantSel) {
+    const bySel = blocks.find((b) => anchorSelectorOfBlock(b) === wantSel);
+    if (bySel) return bySel;
+  }
+  return blocks[0];
+}
+
 /** Which DEFINE_KINDS (if any) does this code contain a real define block for?
  *  Returns the highest-priority kind present, or null. */
 function definePresentKind(code) {
@@ -555,7 +630,7 @@ function main() {
       continue;
     }
 
-    const rustBlock = extractDefineBlockOfKind(rustOut.code, defineKind);
+    const rustBlock = selectMatchingBlock(rustOut.code, defineKind, golden.block);
     if (!rustBlock) {
       bumpSkip(result, `no-define-block(${defineKind})`, id);
       continue;
@@ -731,6 +806,15 @@ function writeReport(r, rust) {
   console.log('\nWrote ' + path.relative(repoRoot, outPath));
 }
 
-export { canonicalize, extractDefineComponentBlock, splitFragments, matchGolden };
+export {
+  canonicalize,
+  extractDefineComponentBlock,
+  splitFragments,
+  matchGolden,
+  extractAllBlocksOfKind,
+  anchorTypeOfBlock,
+  anchorSelectorOfBlock,
+  selectMatchingBlock,
+};
 
 if (!process.env.COMPLIANCE_NO_MAIN) main();
