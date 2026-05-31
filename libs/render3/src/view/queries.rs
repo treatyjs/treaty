@@ -125,11 +125,16 @@ impl ConstantPool {
             .iter()
             .enumerate()
             .map(|(index, literal)| {
-                Stmt::bare(StmtKind::DeclareVar {
-                    name: format!("{CONSTANT_PREFIX}{index}"),
-                    value: Some(literal.clone()),
-                    ty: None,
-                })
+                // Angular's `ConstantPool` declares shared literals with `StmtModifier.Final`, so
+                // the emitter prints `const _cN = …;` (not `let`).
+                Stmt::with_modifiers(
+                    StmtKind::DeclareVar {
+                        name: format!("{CONSTANT_PREFIX}{index}"),
+                        value: Some(literal.clone()),
+                        ty: None,
+                    },
+                    crate::output_ast::StmtModifier::FINAL,
+                )
             })
             .collect()
     }

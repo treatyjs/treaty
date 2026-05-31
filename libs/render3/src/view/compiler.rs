@@ -1285,6 +1285,7 @@ fn base_directive_fields<H: HostBindingsBuilder>(
     meta: &R3DirectiveMetadata,
     host_builder: &mut H,
     default_selector: Option<&str>,
+    pool_statements: &mut Vec<Stmt>,
 ) -> DefinitionMap {
     let mut definition_map = DefinitionMap::new();
     // Mirror `extractDirectiveMetadata` (compiler-cli directive/shared.ts): the resolved selector
@@ -1335,6 +1336,14 @@ fn base_directive_fields<H: HostBindingsBuilder>(
             )),
         );
     }
+
+    // The selector-predicate arrays the query functions hoisted into the shared `_cN` pool
+    // (`getConstLiteral(..., /*forceShared*/ true)`) are emitted as top-level `const _cN = [...]`
+    // declarations BEFORE the definition — Angular's `ConstantPool.statements`. Surface them onto
+    // the caller's pool so the referenced `_cN` constants are actually declared (a query whose
+    // predicate is an expression token, e.g. `viewChild(SomeDir)`, never interns into the pool, so
+    // this is empty for those).
+    pool_statements.extend(query_pool.statements());
 
     // hostBindings (always called — also sets hostAttrs/hostVars as a side effect).
     let mut host = meta.host.clone();
@@ -1449,7 +1458,11 @@ pub fn compile_directive_from_metadata<H: HostBindingsBuilder>(
     meta: &R3DirectiveMetadata,
     host_builder: &mut H,
 ) -> R3CompiledExpression {
-    let mut definition_map = base_directive_fields(meta, host_builder, None);
+    // Query-predicate `const _cN = [...]` declarations the query functions hoist into the shared
+    // pool are returned on `statements` (Angular's `ConstantPool.statements`) for the caller to
+    // emit before the definition.
+    let mut statements: Vec<Stmt> = Vec::new();
+    let mut definition_map = base_directive_fields(meta, host_builder, None, &mut statements);
     add_features(&mut definition_map, meta, None, None);
     let expression = import_r3(R3::DefineDirective)
         // `.callFn([map], undefined, /*pure*/ true)`.
@@ -1458,7 +1471,7 @@ pub fn compile_directive_from_metadata<H: HostBindingsBuilder>(
     R3CompiledExpression {
         expression,
         ty,
-        statements: Vec::new(),
+        statements,
     }
 }
 
@@ -1484,7 +1497,8 @@ where
 {
     // Components fall back to the default element name (`ng-component`) when they have no selector,
     // matching `getDefaultComponentElementName()` plumbed through `extractDirectiveMetadata`.
-    let mut definition_map = base_directive_fields(&meta.base, host_builder, Some("ng-component"));
+    let mut definition_map =
+        base_directive_fields(&meta.base, host_builder, Some("ng-component"), pool_statements);
     add_features(
         &mut definition_map,
         &meta.base,

@@ -14,11 +14,11 @@ This harness runs Treaty's Rust/OXC Angular compiler (`render3` crate, via the
 | --- | --- |
 | Total compliance cases | 642 |
 | Compiled (runnable) | 98 |
-| PASS | 86 |
-| DIFF | 12 |
+| PASS | 87 |
+| DIFF | 11 |
 | Skipped (un-runnable) | 544 |
-| **Pass-rate (of runnable subset)** | **87.8%** (86/98) |
-| Pass-rate (of full corpus) | 13.4% (86/642) |
+| **Pass-rate (of runnable subset)** | **88.8%** (87/98) |
+| Pass-rate (of full corpus) | 13.6% (87/642) |
 
 ### How a case is run and matched
 
@@ -48,7 +48,6 @@ from our output. Top entry = implement first to raise the score.
 | 2 | `ɵɵelementStart` |
 | 2 | `ɵɵpureFunction1` |
 | 1 | `ɵɵdomElementStart` |
-| 1 | `ɵɵforeignComponent` |
 
 ### Sample diverging cases
 
@@ -79,9 +78,6 @@ from our output. Top entry = implement first to raise the score.
 - **`ɵɵdomElementStart`** (1):
   - r3_view_compiler_let/should handle an @let referenced inside a child view inside i18n
     - near: `cls:4,vars:1,consts:()=>{letID;if(`
-- **`ɵɵforeignComponent`** (1):
-  - r3_compiler_compliance/components_and_directives/standalone/should properly compile foreign component imports in a standalone component
-    - near: `ars:0,template:functionTestCmp_Tem`
 
 ## Skip categories (cases not runnable through the source front-end)
 
@@ -100,7 +96,7 @@ error-expectation cases).
 
 ## Passing cases
 
-86 runnable compliance cases match Angular's golden `ɵɵdefineComponent` block:
+87 runnable compliance cases match Angular's golden `ɵɵdefineComponent` block:
 
 - model_inputs/should capture input/output pair in a component definition
 - output_function/should generate an output mapping for the component
@@ -112,6 +108,7 @@ error-expectation cases).
 - r3_compiler_compliance/components_and_directives/should not share pure functions between null and function calls
 - r3_compiler_compliance/components_and_directives/should not share pure functions between null and object literals
 - r3_compiler_compliance/components_and_directives/should support empty property bindings on ng-template
+- r3_compiler_compliance/components_and_directives/standalone/should properly compile foreign component imports in a standalone component
 - r3_compiler_compliance/components_and_directives/value_composition/should convert #my-app selector to ["", "id", "my-app"]
 - r3_compiler_compliance/components_and_directives/value_composition/should not treat ElementRef, ViewContainerRef, or ChangeDetectorRef specially when injecting
 - r3_compiler_compliance/components_and_directives/value_composition/should support dollar escape in template
