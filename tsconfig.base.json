@@ -51,7 +51,10 @@
       "@treaty/build/application": ["./libs/treaty/build/src/application.ts"],
       "@treaty/build/dev-server": ["./libs/treaty/build/src/dev-server.ts"],
       "@treaty/cli": ["./libs/treaty/cli/src/index.ts"],
-      "@treaty/schematics": ["./libs/treaty/schematics/src/index.ts"]
+      "@treaty/schematics": ["./libs/treaty/schematics/src/index.ts"],
+      "@treaty/jsx": ["./libs/treaty/jsx/src/index.ts"],
+      "@treaty/jsx/jsx-runtime": ["./libs/treaty/jsx/src/jsx-runtime.ts"],
+      "@treaty/ssg": ["./libs/treaty/ssg/src/index.ts"]
     },
     "types": ["bun-types"]
   },
