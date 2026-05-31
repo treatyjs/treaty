@@ -19,6 +19,7 @@ pub mod control_flow;
 pub mod directives;
 pub mod signals;
 pub mod template;
+pub mod ts_erase;
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{

@@ -560,21 +560,32 @@ fn attribute_name(name: &JSXAttributeName) -> String {
     }
 }
 
-/// Verbatim source text of a JSX expression (the inside of a `{ … }`), or `None` for an empty
+/// Template-expression text of a JSX expression (the inside of a `{ … }`), or `None` for an empty
 /// expression (`{}` / a comment-only container).
+///
+/// JSX `{ … }` containers hold *real TypeScript* expressions, but the value becomes an Angular
+/// **template** binding expression (an event handler, `[prop]` binding, class/style binding, etc.).
+/// The text is therefore routed through [`super::ts_erase::erase_expression`], which strips
+/// runtime-erased TS-only syntax (`as`/`satisfies`/`!`/`<T>`/type annotations) the template-
+/// expression parser cannot parse, while leaving non-TS expressions byte-identical.
 fn expression_text(expression: &JSXExpression, source: &str) -> Option<String> {
-    if let JSXExpression::EmptyExpression(_) = expression {
-        return None;
-    }
-    let span = oxc_span::GetSpan::span(expression);
-    Some(source[span.start as usize..span.end as usize].to_string())
+    let JSXExpression::EmptyExpression(_) = expression else {
+        // `JSXExpression` is `Expression` plus the `EmptyExpression` variant; every non-empty
+        // variant maps onto an `Expression`, so erase it as one. (`as_expression` yields the inner
+        // `&Expression` for all non-empty variants.)
+        return expression
+            .as_expression()
+            .map(|expr| super::ts_erase::erase_expression(expr, source));
+    };
+    None
 }
 
-/// Verbatim source text of a plain expression (object property values, spread arguments, array
-/// elements). Always present (these are never the JSX `EmptyExpression`).
+/// Template-expression text of a plain expression (object property values, spread arguments, array
+/// elements). Always present (these are never the JSX `EmptyExpression`). Routed through the same
+/// TS-erasing serializer as [`expression_text`] so directive inputs, `class`/`style` object values,
+/// and spread arguments emit JS-only template text.
 pub(crate) fn expression_source(expression: &Expression, source: &str) -> String {
-    let span = oxc_span::GetSpan::span(expression);
-    source[span.start as usize..span.end as usize].to_string()
+    super::ts_erase::erase_expression(expression, source)
 }
 
 /// Whether `name` is a boolean DOM attribute — the set whose mere presence sets the attribute. A
@@ -922,5 +933,127 @@ mod tests {
         assert!(html.contains("[tooltip]=\"msg\""), "no tooltip input; got {html}");
         assert!(html.contains("(click)=\"go($event)\""), "no click; got {html}");
         assert_eq!(refs, vec!["Tooltip".to_string()]);
+    }
+
+    // ----- TS-type erasure in handlers / bindings ---------------------------
+    //
+    // JSX handlers and bound-attribute values are real TypeScript, but they lower into Angular
+    // *template* binding expressions. Runtime-erased TS-only syntax (`as`/`satisfies`/`!`/`<T>` /
+    // type annotations) must be stripped so the render3 template-expression parser accepts the text;
+    // every other expression must lower byte-identically.
+
+    #[test]
+    fn handler_inline_arrow_with_as_assertion_erases_to_input_binding_without_as() {
+        // (1) The headline case: an inline `onInput` handler that casts the event target. The `as`
+        //     assertion is erased, so the emitted `(input)` binding carries plain JS the template
+        //     grammar can parse — and crucially contains no `as`.
+        let out = lower(
+            "<input onInput={(event) => name.set((event.target as HTMLInputElement).value)} />",
+        );
+        assert!(
+            out.contains("(input)="),
+            "onInput did not lower to an (input) binding; got {out}"
+        );
+        assert!(
+            !out.contains(" as "),
+            "TS `as` assertion was not erased; got {out}"
+        );
+        // The behaviour-bearing JS is intact: the arrow still sets the signal from the target value.
+        assert!(
+            out.contains("name.set((event.target).value)")
+                || out.contains("name.set(event.target.value)"),
+            "handler body lost/garbled; got {out}"
+        );
+    }
+
+    #[test]
+    fn handler_arrow_with_typed_params_drops_annotation() {
+        // (2) An arrow with a typed parameter drops the `: Event` annotation but keeps the param.
+        let out = lower("<button onClick={(e: Event) => handle(e)}>x</button>");
+        assert!(out.contains("(click)="), "no click binding; got {out}");
+        assert!(!out.contains(": Event"), "param type not erased; got {out}");
+        assert!(!out.contains(" Event"), "type leaked into output; got {out}");
+        assert!(
+            out.contains("(e) =>") && out.contains("handle(e)"),
+            "arrow param/body garbled; got {out}"
+        );
+    }
+
+    #[test]
+    fn handler_arrow_with_return_type_drops_annotation() {
+        // A return-type annotation on the arrow is erased too.
+        let out = lower("<button onClick={(): void => go()}>x</button>");
+        assert!(out.contains("(click)="), "no click binding; got {out}");
+        assert!(!out.contains("void"), "return type not erased; got {out}");
+        assert!(out.contains("() =>") && out.contains("go()"), "arrow garbled; got {out}");
+    }
+
+    #[test]
+    fn binding_with_parenthesized_as_assertion_erases() {
+        // (3a) `[value]={(x as number) + 1}` → `[value]="(x) + 1"` (no `as`).
+        let out = lower("<input value={(x as number) + 1} />");
+        assert!(out.contains("[value]="), "no value binding; got {out}");
+        assert!(!out.contains(" as "), "`as` not erased; got {out}");
+        assert!(out.contains("+ 1"), "binding body lost; got {out}");
+    }
+
+    #[test]
+    fn binding_with_non_null_assertion_erases() {
+        // (3b) A non-null assertion `x!` is erased to `x`.
+        let out = lower("<input value={x!.length} />");
+        assert!(out.contains("[value]="), "no value binding; got {out}");
+        assert!(!out.contains('!'), "non-null `!` not erased; got {out}");
+        assert!(out.contains("x.length"), "binding body lost; got {out}");
+    }
+
+    #[test]
+    fn binding_with_satisfies_expression_erases() {
+        // (3c) `x satisfies T` is erased to `x`.
+        let out = lower("<input value={x satisfies number} />");
+        assert!(out.contains("[value]="), "no value binding; got {out}");
+        assert!(!out.contains("satisfies"), "`satisfies` not erased; got {out}");
+        assert!(out.contains("[value]=\"x\""), "binding body lost; got {out}");
+    }
+
+    #[test]
+    fn binding_with_call_type_arguments_erases() {
+        // (3d) `foo<T>(a)` drops the explicit type arguments.
+        let out = lower("<input value={foo<string>(a)} />");
+        assert!(out.contains("[value]=\"foo(a)\""), "type args not erased; got {out}");
+        assert!(!out.contains("string"), "type arg leaked; got {out}");
+    }
+
+    #[test]
+    fn nested_assertion_inside_array_and_optional_chain_erases() {
+        // Deeply nested: an `as` inside an array element that is then optional-chained. Only the TS
+        // syntax is erased; the array, optional chain, and member access survive.
+        let out = lower("<input value={[a as number, b]?.[0]} />");
+        assert!(out.contains("[value]="), "no value binding; got {out}");
+        assert!(!out.contains(" as "), "nested `as` not erased; got {out}");
+        assert!(out.contains("?."), "optional chain lost; got {out}");
+    }
+
+    #[test]
+    fn plain_reference_handler_is_unchanged() {
+        // (4a) A plain reference handler must lower IDENTICALLY to the pre-erasure behaviour: the
+        //      bare reference is invoked with `$event`.
+        assert_eq!(
+            lower("<button onClick={greet}>x</button>"),
+            "<button (click)=\"greet($event)\">x</button>"
+        );
+    }
+
+    #[test]
+    fn plain_property_binding_is_unchanged() {
+        // (4b) A plain `[prop]` binding (a signal read) is byte-identical to before.
+        assert_eq!(
+            lower("<input value={name()} />"),
+            "<input [value]=\"name()\" />"
+        );
+        // And a plain member/optional-chain binding with no TS syntax is untouched.
+        assert_eq!(
+            lower("<input value={user?.name} />"),
+            "<input [value]=\"user?.name\" />"
+        );
     }
 }
