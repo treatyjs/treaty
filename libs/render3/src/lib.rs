@@ -13,7 +13,7 @@
 //!   - [`core`]         — backend-agnostic IR + emit + shared expression primitives (output AST,
 //!                        emitter / source maps, runtime identifiers, factory, the binding-expression
 //!                        lexer/parser/converter). Knows nothing about templates or decorators.
-//!   - [`template_mod`] — the HTML/template → instruction-IR layer (`ml_parser`, the template AST +
+//!   - `treaty_ivy_template` — the HTML/template → instruction-IR layer (`ml_parser`, the template AST +
 //!                        transform + control-flow / defer lowerings, the `t2` binder, the
 //!                        template-definition builder + query generation, i18n). Depends on `core`.
 //!   - [`decorators`]   — the decorator → definition layer (the `compile_*_from_metadata` instruction
@@ -50,27 +50,25 @@ pub use treaty_ivy_core::output_ast;
 pub use treaty_ivy_core::util;
 
 // ---------------------------------------------------------------------------
-// `template` subtree (Phase 2). The HTML/template → instruction-IR layer —
-// `ml_parser`, the template AST + transform + control-flow / defer lowerings,
-// the `t2` binder, the template-definition builder + query generation, and i18n
-// — now live under `template_mod/`. Each is re-exported from its historical
-// top-level path so call sites outside `template` are unchanged (the canonical
-// paths are now `crate::template_mod::…`). See `migration/RENDER3-SPLIT-PLAN.md`.
+// `template` subtree. The HTML/template → instruction-IR layer — `ml_parser`,
+// the template AST + transform + control-flow / defer lowerings, the `t2`
+// binder, the template-definition builder + query generation, and i18n — is now
+// the separate crate `treaty_ivy_template`. Each member is re-exported from its
+// historical top-level path so call sites inside the not-yet-carved
+// decorator/facade subtrees (which reference these via `crate::…`) need no
+// per-file edit until they are themselves carved. The split is structural;
+// emitted Ivy is byte-identical.
 // ---------------------------------------------------------------------------
-
-/// HTML/template → instruction-IR layer: parser, template AST/transform, binder,
-/// template-definition builder, query generation, and i18n. Depends on `core`.
-pub mod template_mod;
 
 // Re-export every `template` module from its historical top-level path. These
 // aliases keep `crate::template::r3_ast::…`, `crate::ml_parser::…`,
 // `crate::binder::…`, and `crate::i18n::…` resolving exactly as before.
 // (`crate::view::template` / `crate::view::queries` are re-exported from
 // `crate::view` itself, alongside the still-resident `view::compiler`.)
-pub use template_mod::binder;
-pub use template_mod::i18n;
-pub use template_mod::ml_parser;
-pub use template_mod::template;
+pub use treaty_ivy_template::binder;
+pub use treaty_ivy_template::i18n;
+pub use treaty_ivy_template::ml_parser;
+pub use treaty_ivy_template::template;
 
 // ---------------------------------------------------------------------------
 // `decorators` subtree (Phase 3). The decorator → definition layer — the

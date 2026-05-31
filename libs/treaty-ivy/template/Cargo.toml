@@ -1,0 +1,13 @@
+[package]
+name = "treaty_ivy_template"
+version = "0.1.0"
+edition = "2024"
+
+# The HTML/template -> instruction-IR layer of Treaty's direct-to-Ivy Angular
+# compiler: ml_parser, the template AST + transform + control-flow / defer
+# lowerings, the t2 binder, the template-definition builder + query generation,
+# and i18n. Depends on treaty_ivy_core. Ported from Angular 22.1 packages/compiler.
+
+[dependencies]
+treaty_ivy_core = { path = "../core" }
+oxc_allocator = "0.133.0"

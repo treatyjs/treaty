@@ -676,7 +676,7 @@ pub fn parse_i18n_meta(meta: &str) -> I18nMeta {
 // / `crate::i18n::fingerprint` surface.
 // ---------------------------------------------------------------------------
 
-pub use crate::digest::{compute_msg_id, fingerprint};
+pub use treaty_ivy_core::digest::{compute_msg_id, fingerprint};
 
 // ---------------------------------------------------------------------------
 // Closure-mode const-pool statement builder.
