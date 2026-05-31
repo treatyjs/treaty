@@ -508,10 +508,13 @@ mod tests {
             !manifest.unsupported.is_empty(),
             "shipped manifest should enumerate known gaps (crypto, http, worker_threads, ...)"
         );
-        // Sanity: a representative unimplemented surface is covered by some entry.
+        // Sanity: a representative still-unimplemented surface is covered by some entry. We assert
+        // against `worker-threads`, a durable gap (the runtime has no thread/MessagePort transport),
+        // rather than a surface like crypto/http/zlib/tls that has since been implemented and whose
+        // manifest entry was correctly removed — so this invariant tracks a real gap, not stale lore.
         assert!(
-            manifest.match_reason("crypto-hash").is_some(),
-            "a crypto-* test should be marked unsupported by the shipped manifest"
+            manifest.match_reason("worker-threads").is_some(),
+            "a worker-threads test should be marked unsupported by the shipped manifest"
         );
     }
 
