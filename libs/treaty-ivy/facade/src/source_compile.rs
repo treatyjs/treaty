@@ -2769,6 +2769,36 @@ mod tests {
     }
 
     #[test]
+    fn nested_view_local_refs_precede_template_const() {
+        // `liftLocalRefs` runs across ALL views before `collectElementConsts`: every local-ref const
+        // (root `#foo`/`#baz`, nested-view `#bar`) must precede the structural `[Template,"if"]` const
+        // in the component `consts` pool. The nested `#bar` was previously interned AFTER the root's
+        // `*if` template const, producing `[["foo"],["baz"],[4,"if"],["bar"]]` instead of the correct
+        // `[["foo"],["baz"],["bar"],[4,"if"]]`.
+        let src = r#"@Component({selector:"my-component",template:`
+            <div #foo></div>
+            {{foo}}
+            <div *if>
+              {{foo}}-{{bar}}
+              <span *if>{{foo}}-{{bar}}-{{baz}}</span>
+              <span #bar></span>
+            </div>
+            <div #baz></div>
+        `}) export class MyComponent {}"#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        // Strip whitespace so multi-line const arrays compare positionally.
+        let flat: String = out.code.chars().filter(|c| !c.is_whitespace()).collect();
+        let foo = flat.find("[\"foo\",\"\"]").expect("missing foo const");
+        let baz = flat.find("[\"baz\",\"\"]").expect("missing baz const");
+        let bar = flat.find("[\"bar\",\"\"]").expect("missing bar const");
+        // The structural template const (AttributeMarker.Template == 4, then "if").
+        let tmpl = flat.find("[4,\"if\"]").expect("missing [Template,\"if\"] const");
+        assert!(foo < baz && baz < bar, "local-ref order wrong: foo={foo} baz={baz} bar={bar}");
+        assert!(bar < tmpl, "nested-view #bar const must precede the [Template,\"if\"] const; got: {flat}");
+    }
+
+    #[test]
     fn pure_function_factory_consts_are_declared() {
         // A template that hoists pure-literal factories (`@let` over array literals with spreads)
         // must DECLARE every `$cN$` factory const it references in a `ɵɵpureFunctionN` call —

@@ -2908,6 +2908,15 @@ impl TemplateDefinitionBuilder {
         // handler reads a ref declared LATER can resolve it.
         self.prepass_local_ref_consts(&nodes);
 
+        // Then, for the ROOT view, pre-intern every DESCENDANT view's local-ref consts (breadth-first
+        // by view level) so the WHOLE template's local-ref consts precede every Template/attribute
+        // const — Angular's `liftLocalRefs` runs across all views before `collectElementConsts`. A
+        // nested view's ref const is otherwise interned only when that view is built (after the root
+        // walk already interned the enclosing `[Template,"if"]` const), which mis-orders the pool.
+        if self.is_root {
+            self.prepass_descendant_local_ref_consts(&nodes);
+        }
+
         // Classify every top-level `@let` in this view (external / pipe-bearing) so the inline walk
         // can decide whether each reserves a `ɵɵdeclareLet` slot + `ɵɵstoreLet`, or inlines as a
         // plain `const`/bare statement (`optimizeStoreLet` / `optimizeVariables`).
@@ -4679,6 +4688,100 @@ impl TemplateDefinitionBuilder {
                     self.local_refs_index(&tmpl.references);
                     for r in &tmpl.references {
                         self.preregister_local_ref(&r.name);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Pre-intern the local-reference consts of every DESCENDANT view (control-flow / `<ng-template>`
+    /// / loop bodies), BREADTH-FIRST by view level, into the component-global const pool — AFTER this
+    /// (root) view's own refs and BEFORE the main walk interns any Template/attribute const. Angular's
+    /// `liftLocalRefs` runs across the WHOLE template before `collectElementConsts`, so EVERY view's
+    /// local-ref consts (root view first, then each child view in creation order) precede every
+    /// attribute/`[Template,...]` const in the pool. Our per-view prepass only interns the current
+    /// view's refs; a nested view's ref const would otherwise be interned when that view is BUILT —
+    /// after the root walk already interned the enclosing structural `[Template,"if"]` const, putting
+    /// the nested ref AFTER it (wrong order). Const interning is pure + de-duped, so the nested view
+    /// re-interns to the SAME index when it is later built; this pass only fixes pool ORDER.
+    ///
+    /// Only the ROOT view runs this (a child view's own descendants are reached transitively here),
+    /// and it is const-only: no slot pre-registration / generated-local side effects (those stay
+    /// per-view in `prepass_local_ref_consts`).
+    fn prepass_descendant_local_ref_consts(&mut self, root_nodes: &[Node]) {
+        // BFS queue of child-view node lists, seeded with the root view's immediate child views.
+        let mut queue: std::collections::VecDeque<Vec<Node>> = std::collections::VecDeque::new();
+        Self::collect_child_view_bodies(root_nodes, &mut queue);
+        while let Some(view_nodes) = queue.pop_front() {
+            // Intern THIS child view's local-ref consts in create (pre-order) order, recursing into
+            // same-view element children but NOT into deeper views (those are enqueued separately so
+            // the breadth-first, view-level ordering is preserved).
+            self.intern_view_local_ref_consts(&view_nodes);
+            Self::collect_child_view_bodies(&view_nodes, &mut queue);
+        }
+    }
+
+    /// Intern the local-ref consts reachable WITHIN a single view (recursing into element children,
+    /// stopping at nested view bodies), const-only (no slot/local side effects). Mirrors the
+    /// const-interning half of [`Self::prepass_local_ref_consts`].
+    fn intern_view_local_ref_consts(&mut self, nodes: &[Node]) {
+        for node in nodes {
+            match node {
+                Node::Element(el) => {
+                    self.local_refs_index(&el.references);
+                    self.intern_view_local_ref_consts(&el.children);
+                }
+                Node::Template(tmpl) => {
+                    // The `<ng-template>` host's own `#ref`s belong to THIS view; its body is a
+                    // separate child view (enqueued by `collect_child_view_bodies`).
+                    self.local_refs_index(&tmpl.references);
+                }
+                Node::Component(c) => {
+                    self.local_refs_index(&c.references);
+                    self.intern_view_local_ref_consts(&c.children);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Append the immediate child-view node lists spawned by `nodes` (control-flow branch / case /
+    /// loop bodies and `<ng-template>` bodies) to `out`, in create order. Recurses into element /
+    /// component children (same view) to discover nested structural blocks, but treats each spawned
+    /// body as a single opaque child view (its OWN nested views are discovered when it is processed).
+    fn collect_child_view_bodies(nodes: &[Node], out: &mut std::collections::VecDeque<Vec<Node>>) {
+        for node in nodes {
+            match node {
+                Node::Element(el) => Self::collect_child_view_bodies(&el.children, out),
+                Node::Component(c) => Self::collect_child_view_bodies(&c.children, out),
+                Node::Template(tmpl) => out.push_back(tmpl.children.clone()),
+                Node::IfBlock(b) => {
+                    for branch in &b.branches {
+                        out.push_back(branch.children.clone());
+                    }
+                }
+                Node::SwitchBlock(b) => {
+                    for group in &b.groups {
+                        out.push_back(group.children.clone());
+                    }
+                }
+                Node::ForLoopBlock(b) => {
+                    out.push_back(b.children.clone());
+                    if let Some(empty) = &b.empty {
+                        out.push_back(empty.children.clone());
+                    }
+                }
+                Node::DeferredBlock(b) => {
+                    out.push_back(b.children.clone());
+                    if let Some(p) = &b.placeholder {
+                        out.push_back(p.children.clone());
+                    }
+                    if let Some(l) = &b.loading {
+                        out.push_back(l.children.clone());
+                    }
+                    if let Some(e) = &b.error {
+                        out.push_back(e.children.clone());
                     }
                 }
                 _ => {}
