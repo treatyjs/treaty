@@ -10,17 +10,16 @@
  * the JSON value the template binds against.
  *
  * Treaty is a compiler, not a host, so this package does not embed Nova. The
- * Nova `run_macro` entry is reachable from Rust and is *intended* to be surfaced
- * to Node through the `@treaty/authoring-node` NAPI addon. At the time of
- * writing that addon exposes only the compile entry points
- * (`compile`/`compileMany`/…) and NOT `run_macro` — see
- * `libs/authoring/node/index.d.ts`. Rather than depend on an addon symbol that
- * is not yet there, `@treaty/ssg` defines the clean {@link RenderRuntime}
- * interface here. A Nova-backed implementation that simply forwards to the
- * addon's `runMacro` (once exported) satisfies it verbatim — see
- * {@link createNovaRenderRuntime} for the exact structural binding — and the
- * built-in {@link StubRenderRuntime} lets the pipeline (and its smoke test) run
- * end-to-end today without the native macro entry.
+ * Nova `run_macro` entry is reachable from Rust and is surfaced to Node through
+ * the `@treaty/authoring-node` NAPI addon, which now exports
+ * `runMacro(tsSource, inputJson) -> string` (JSON in, JSON out) alongside the
+ * compile entry points (`compile`/`compileMany`/…) — see
+ * `libs/authoring/node/index.d.ts`. `@treaty/ssg` still defines the clean
+ * {@link RenderRuntime} interface here so the pipeline depends only on a shape,
+ * not the native binding: {@link createNovaRenderRuntime} wraps the addon's
+ * `runMacro` (forwarding the source + JSON input and parsing the JSON result)
+ * to satisfy it, and the built-in {@link StubRenderRuntime} remains the
+ * fallback for builds run without the prebuilt addon present.
  */
 
 /** A JSON value — the only thing that crosses the runtime boundary. */
@@ -54,9 +53,9 @@ export interface RenderMacro {
  * The execute-render-time-data seam. Exactly mirrors Nova's
  * `run_macro(ts_source, input_json) -> MacroOutput` shape: a single call that
  * takes the macro TS source plus a JSON input and returns the JSON value the
- * template binds against. A Nova-backed implementation forwards straight to the
- * addon; the {@link StubRenderRuntime} interprets a tiny safe subset so the
- * pipeline runs without the native entry.
+ * template binds against. {@link createNovaRenderRuntime} forwards straight to
+ * the addon's `runMacro`; the {@link StubRenderRuntime} interprets a tiny safe
+ * subset so the pipeline runs without the native addon.
  */
 export interface RenderRuntime {
 	/**
@@ -68,13 +67,13 @@ export interface RenderRuntime {
 }
 
 /**
- * The structural shape `@treaty/authoring-node` is expected to expose for the
- * Nova `run_macro` entry. Declared here (rather than imported) precisely so this
- * package compiles whether or not the addon currently exports it: a Nova-backed
- * runtime binds to this shape at the call site. When the addon adds
+ * The structural shape `@treaty/authoring-node` exposes for the Nova
+ * `run_macro` entry. Declared here (rather than imported) so this package
+ * depends only on the shape, not on a hard import of the native addon: a
+ * Nova-backed runtime binds to it at the call site. The addon's
  * `export declare function runMacro(tsSource: string, inputJson: string): string`
- * (JSON in, JSON out — matching the Rust `run_macro`), it satisfies
- * {@link NovaMacroAddon} with no change here.
+ * (JSON in, JSON out — matching the Rust `run_macro`) satisfies
+ * {@link NovaMacroAddon} structurally.
  */
 export interface NovaMacroAddon {
 	/**
@@ -88,11 +87,11 @@ export interface NovaMacroAddon {
 /**
  * Build a {@link RenderRuntime} backed by the Nova `run_macro` NAPI entry. Pass
  * the `@treaty/authoring-node` addon (or any object satisfying
- * {@link NovaMacroAddon}) once it surfaces `runMacro`:
+ * {@link NovaMacroAddon}), which now exports `runMacro`:
  *
  * ```ts
  * import * as addon from '@treaty/authoring-node'
- * const runtime = createNovaRenderRuntime(addon) // when addon.runMacro exists
+ * const runtime = createNovaRenderRuntime(addon)
  * ```
  *
  * This is the documented plug-in point: the rest of the pipeline only ever sees

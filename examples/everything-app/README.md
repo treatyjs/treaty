@@ -113,10 +113,11 @@ each remote's url+version from the manifest **at load**, so a manifest flip
 
 ## Authoring notes
 
-- `src/treaty-jsx.d.ts` is an authoring-time shim that types the Treaty JSX
-  dialect (lowercase elements, `use:` directives, `class` over `className`,
-  `{signal()}` interpolation) so the `.tsx` source is `tsgo`-clean. The real
-  types come from the compiler output; this is local to the example.
+- The Treaty JSX dialect (lowercase elements, `use:` directives, `class` over
+  `className`, `{signal()}` interpolation) is typed by the **shipped
+  `@treaty/jsx` ambient types** — `tsconfig.json` sets
+  `"jsxImportSource": "@treaty/jsx"`, so the `.tsx` source is `tsgo`-clean with
+  no hand-copied `treaty-jsx.d.ts` shim in the example.
 - The JSX front-end authors components as **functions** returning JSX and
   expresses conditionals as JSX expressions (ternary / `&&`) that lower to Ivy
   `@if`. `.treaty` and `.ts` templates use the native `@if`/`@for` block syntax.

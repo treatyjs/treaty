@@ -17,11 +17,17 @@
  *      via an injected writeFile sink, returns a route -> output-file manifest,
  *      and the emitted document contains the macro-rendered interpolation text,
  *   7. a parameterized route prerenders one document per param set, each with its
- *      own substituted url + per-route render data.
+ *      own substituted url + per-route render data,
+ *   8. (when the prebuilt @treaty/authoring-node addon is present) prerenderAll
+ *      drives a route through the REAL Nova runtime via createNovaRenderRuntime:
+ *      a macro that COMPUTES its render data (a reduce + input ref the stub can
+ *      NOT interpret) executes in Nova and the emitted static HTML contains the
+ *      computed value.
  *
- * The Nova-backed RenderRuntime (run_macro via @treaty/authoring-node, once that
- * addon exports it) plugs in verbatim through createNovaRenderRuntime; this test
- * uses the built-in StubRenderRuntime so it runs without the native macro entry.
+ * Cases 1–7 use the built-in StubRenderRuntime so they run without the native
+ * addon. Case 8 plugs the Nova-backed RenderRuntime (run_macro via
+ * @treaty/authoring-node) in verbatim through createNovaRenderRuntime; it is
+ * skipped (not failed) when the prebuilt addon is absent.
  *
  * Run: node libs/treaty/ssg/test/ssg.smoke.mjs
  */
@@ -33,6 +39,7 @@ import {
 	prerenderRoute,
 	prerenderAll,
 	StubRenderRuntime,
+	createNovaRenderRuntime,
 	HYDRATION_MARKER_ATTR,
 	HYDRATION_STATE_ID,
 } from '../dist/index.js'
@@ -49,6 +56,20 @@ function check(label, fn) {
 			failures++
 			results.push(`FAIL ${label}: ${err.stack ?? err.message}`)
 		})
+}
+
+// Try to load the prebuilt Nova addon (@treaty/authoring-node). Returns an
+// object satisfying NovaMacroAddon (it exposes runMacro) when the native binary
+// is present, or null so the Nova case is skipped rather than failing on a box
+// without the prebuilt addon.
+async function loadNovaAddon() {
+	try {
+		const addon = await import('@treaty/authoring-node')
+		const runMacro = addon.runMacro ?? addon.default?.runMacro
+		return typeof runMacro === 'function' ? { runMacro } : null
+	} catch {
+		return null
+	}
 }
 
 // A trivial @Component whose template interpolates a single binding. The
@@ -163,6 +184,47 @@ await check('prerenderAll fans a parameterized route into one document per param
 	assert.ok(written.get(alpha.output).includes('<h1>alpha</h1>'), 'alpha rendered with its param')
 	assert.ok(written.get(beta.output).includes('<h1>beta</h1>'), 'beta rendered with its param')
 })
+
+// Case 8: the REAL Nova runtime, end-to-end through prerenderAll, when the
+// prebuilt @treaty/authoring-node addon is present. The macro COMPUTES its
+// render data (an array reduce seeded by input.base) — a form the
+// StubRenderRuntime explicitly rejects (it only understands literal objects),
+// so a pass here proves the value came out of Nova, not the stub.
+const novaAddon = await loadNovaAddon()
+if (novaAddon) {
+	await check('prerenderAll executes a computed macro through the REAL Nova runtime', async () => {
+		const runtime = createNovaRenderRuntime(novaAddon)
+
+		// Sanity: the stub canNOT interpret this macro, so it is a genuine Nova path.
+		const computedMacro = {
+			source: 'const items = [1, 2, 3, 4]; ({ title: items.reduce((a, b) => a + b, input.base) })',
+		}
+		assert.throws(
+			() => new StubRenderRuntime().runMacro({ ...computedMacro, input: { base: 10 } }),
+			/StubRenderRuntime supports only a literal-object macro/,
+			'the computed macro is beyond the stub — so case 8 is a true Nova execution'
+		)
+
+		// 1 + 2 + 3 + 4 + base(10) = 20, computed by Nova and bound into the template.
+		const written = new Map()
+		const manifest = await prerenderAll({
+			routes: [{ path: 'computed', component: {} }],
+			resolve: () => ({ source: interpolationComponent, macro: { ...computedMacro, input: { base: 10 } } }),
+			runtime,
+			outDir: 'dist/ssg',
+			writeFile: async (path, contents) => void written.set(path, contents),
+		})
+		assert.equal(manifest.routes.length, 1, 'one route prerendered through Nova')
+		const doc = written.get(manifest.routes[0].output)
+		assert.ok(doc, 'the Nova-prerendered document was written')
+		assert.ok(
+			doc.includes('<h1>20</h1>'),
+			'static HTML contains the value COMPUTED by the Nova runtime (1+2+3+4+10)'
+		)
+	})
+} else {
+	results.push('SKIP Nova run_macro case (prebuilt @treaty/authoring-node addon not present)')
+}
 
 for (const line of results) console.log(line)
 if (failures > 0) {

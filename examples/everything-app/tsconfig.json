@@ -8,9 +8,14 @@
     "lib": ["es2022", "dom", "dom.iterable"],
     "strict": true,
     "noEmit": true,
-    "jsx": "preserve",
+    "jsx": "react-jsx",
+    "jsxImportSource": "@treaty/jsx",
     "types": [],
     "paths": {
+      "@treaty/jsx": ["../../libs/treaty/jsx/dist/index.d.ts"],
+      "@treaty/jsx/jsx-runtime": [
+        "../../libs/treaty/jsx/dist/jsx-runtime.d.ts"
+      ],
       "@treaty/compiler": ["../../libs/treaty/compiler/dist/index.d.ts"],
       "@treaty/vite": ["../../libs/treaty/vite/dist/index.d.ts"],
       "@treaty/rspack": ["../../libs/treaty/rspack/dist/index.d.ts"],
