@@ -16,7 +16,7 @@ tasks:
     outputs:
     - dist
   typecheck:
-    command: tsc
+    command: tsgo
     args:
     - --noEmit
     - -p
@@ -25,3 +25,12 @@ tasks:
     - src/**/*
     - tsconfig.json
     - tsconfig.lib.json
+  lint:
+    command: oxlint
+    args:
+    - -c
+    - $workspaceRoot/.oxlintrc.json
+    - $projectRoot/src
+    inputs:
+    - src/**/*
+    - $workspaceRoot/.oxlintrc.json

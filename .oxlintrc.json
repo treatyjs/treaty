@@ -1,0 +1,31 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["typescript", "oxc"],
+  "categories": {
+    "correctness": "error",
+    "suspicious": "warn"
+  },
+  "env": {
+    "node": true,
+    "es2024": true
+  },
+  "ignorePatterns": [
+    "**/dist/**",
+    "**/node_modules/**",
+    "**/*.d.ts",
+    "**/tmp/**"
+  ],
+  "rules": {
+    "no-await-in-loop": "off",
+    "no-unused-vars": "warn",
+    "no-this-in-exported-function": "off"
+  },
+  "overrides": [
+    {
+      "files": ["**/*.spec.ts", "**/*.test.ts", "**/*.smoke.mjs", "**/test/**", "**/testing/**"],
+      "rules": {
+        "no-console": "off"
+      }
+    }
+  ]
+}

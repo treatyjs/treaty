@@ -31,7 +31,7 @@ tasks:
     - dist/**/schema.json
     - dist/**/files/**/*
   typecheck:
-    command: tsc
+    command: tsgo
     args:
     - --noEmit
     - -p
@@ -40,6 +40,15 @@ tasks:
     - src/**/*
     - tsconfig.json
     - tsconfig.lib.json
+  lint:
+    command: oxlint
+    args:
+    - -c
+    - $workspaceRoot/.oxlintrc.json
+    - $projectRoot/src
+    inputs:
+    - src/**/*
+    - $workspaceRoot/.oxlintrc.json
   smoke:
     command: node
     args:

@@ -12,7 +12,6 @@
     "composite": false,
     "lib": ["es2022"],
     "types": ["node"],
-    "baseUrl": ".",
     "paths": {
       "@treaty/compiler": ["../../../libs/treaty/compiler/dist/index.d.ts"]
     }

@@ -14,45 +14,44 @@
     "composite": true,
     "skipLibCheck": true,
     "skipDefaultLibCheck": true,
-    "baseUrl": ".",
     "paths": {
-      "@treaty/httpclient": ["libs/treaty/edenclient/src/index.ts"],
-      "@treaty/httpclient/client": ["libs/treaty/edenclient/src/client.ts"],
+      "@treaty/httpclient": ["./libs/treaty/edenclient/src/index.ts"],
+      "@treaty/httpclient/client": ["./libs/treaty/edenclient/src/client.ts"],
       "@treaty/httpclient/resources": [
-        "libs/treaty/edenclient/src/resources.ts"
+        "./libs/treaty/edenclient/src/resources.ts"
       ],
-      "@treaty/ts-vite": ["libs/typescript/vite/src/index.ts"],
-      "@treaty/ts-compiler": ["libs/typescript/compiler/src/index.ts"],
-      "@treaty/lsp": ["libs/treaty/lsp/src/index.ts"],
-      "@treaty/lsp/plugins": ["libs/treaty/lsp/src/plugins.ts"],
-      "@treaty/compiler": ["libs/treaty/compiler/src/index.ts"],
-      "@treaty/vite": ["libs/treaty/vite/src/index.ts"],
-      "@treaty/rslib": ["libs/treaty/rslib/src/index.ts"],
-      "@treaty/rspack": ["libs/treaty/rspack/src/index.ts"],
-      "@treaty/rspack/loader": ["libs/treaty/rspack/src/loader.ts"],
-      "@treaty/rspack/plugin": ["libs/treaty/rspack/src/plugin.ts"],
-      "@treaty/rsbuild": ["libs/treaty/rsbuild/src/index.ts"],
-      "@treaty/rsbuild/loader": ["libs/treaty/rsbuild/src/loader.ts"],
+      "@treaty/ts-vite": ["./libs/typescript/vite/src/index.ts"],
+      "@treaty/ts-compiler": ["./libs/typescript/compiler/src/index.ts"],
+      "@treaty/lsp": ["./libs/treaty/lsp/src/index.ts"],
+      "@treaty/lsp/plugins": ["./libs/treaty/lsp/src/plugins.ts"],
+      "@treaty/compiler": ["./libs/treaty/compiler/src/index.ts"],
+      "@treaty/vite": ["./libs/treaty/vite/src/index.ts"],
+      "@treaty/rslib": ["./libs/treaty/rslib/src/index.ts"],
+      "@treaty/rspack": ["./libs/treaty/rspack/src/index.ts"],
+      "@treaty/rspack/loader": ["./libs/treaty/rspack/src/loader.ts"],
+      "@treaty/rspack/plugin": ["./libs/treaty/rspack/src/plugin.ts"],
+      "@treaty/rsbuild": ["./libs/treaty/rsbuild/src/index.ts"],
+      "@treaty/rsbuild/loader": ["./libs/treaty/rsbuild/src/loader.ts"],
       "@treaty/module-federation": [
-        "libs/treaty/module-federation/src/index.ts"
+        "./libs/treaty/module-federation/src/index.ts"
       ],
       "@treaty/module-federation/rspack": [
-        "libs/treaty/module-federation/src/rspack.ts"
+        "./libs/treaty/module-federation/src/rspack.ts"
       ],
       "@treaty/module-federation/vite": [
-        "libs/treaty/module-federation/src/vite.ts"
+        "./libs/treaty/module-federation/src/vite.ts"
       ],
       "@treaty/federation-deploy": [
-        "libs/treaty/federation-deploy/src/index.ts"
+        "./libs/treaty/federation-deploy/src/index.ts"
       ],
       "@treaty/federation-deploy/runtime": [
-        "libs/treaty/federation-deploy/src/runtime.ts"
+        "./libs/treaty/federation-deploy/src/runtime.ts"
       ],
-      "@treaty/build": ["libs/treaty/build/src/index.ts"],
-      "@treaty/build/application": ["libs/treaty/build/src/application.ts"],
-      "@treaty/build/dev-server": ["libs/treaty/build/src/dev-server.ts"],
-      "@treaty/cli": ["libs/treaty/cli/src/index.ts"],
-      "@treaty/schematics": ["libs/treaty/schematics/src/index.ts"]
+      "@treaty/build": ["./libs/treaty/build/src/index.ts"],
+      "@treaty/build/application": ["./libs/treaty/build/src/application.ts"],
+      "@treaty/build/dev-server": ["./libs/treaty/build/src/dev-server.ts"],
+      "@treaty/cli": ["./libs/treaty/cli/src/index.ts"],
+      "@treaty/schematics": ["./libs/treaty/schematics/src/index.ts"]
     },
     "types": ["bun-types"]
   },

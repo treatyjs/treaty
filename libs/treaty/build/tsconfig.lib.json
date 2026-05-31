@@ -12,7 +12,6 @@
     "composite": false,
     "lib": ["es2022"],
     "types": ["node"],
-    "baseUrl": ".",
     "paths": {
       "@treaty/rspack": ["../../../libs/treaty/rspack/dist/index.d.ts"],
       "@treaty/rspack/plugin": ["../../../libs/treaty/rspack/dist/plugin.d.ts"],

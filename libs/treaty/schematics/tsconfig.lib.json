@@ -12,7 +12,6 @@
     "composite": false,
     "lib": ["es2022"],
     "types": ["node"],
-    "baseUrl": ".",
     "paths": {
       "@treaty/module-federation": [
         "../module-federation/dist/index.d.ts"
