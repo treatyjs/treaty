@@ -162,9 +162,19 @@ the **Angular Package Format**: FESM (esm2022) bundles, flattened/`.d.ts` types,
 supports **everything the Treaty compiler supports** — ALL authoring plugins (`.treaty`, JSX, plain
 Angular) via `@treaty/compiler` (NAPI → render3), since it is plugin-authoring-aware: anything the
 compiler can compile, treaty-packagr can package. Distinct from `@treaty/rslib` (an rslib preset);
-treaty-packagr is the full APF packager (the ng-packagr replacement). New package `libs/treaty/packagr`
-(`@treaty/packagr`), orchestrating the Treaty compiler + an oxc-based bundler (rolldown/rslib) +
-type emit. Depends on the compiler + bundler plugins. See [[treaty-packagr]].
+treaty-packagr is the full APF packager (the ng-packagr replacement). **Implemented in RUST (user
+2026-05-31 "we want rust!")**: an oxc-based crate — render3/oxc to compile, `oxc_isolated_declarations`
+to emit `.d.ts`, **rolldown** (Rust) to bundle FESM, and Rust for the APF manifest/exports. Driven by
+the Rust `treaty` CLI (K) and a THIN `@treaty/build` JS builder shim (NAPI) for the angular.json path —
+no TS orchestrator. New crate (e.g. `libs/packagr`), depends on render3/authoring → Rust-crate wave
+(after compliance frees render3, with K). See [[treaty-packagr]].
+
+## Rust-first principle (user 2026-05-31, reaffirmed)
+**Core logic is RUST** (render3/oxc/rolldown). TypeScript is allowed ONLY as a THIN adapter where a
+JS-ecosystem contract is unavoidable: bundler plugin objects (Vite/Rspack/Rsbuild/Rslib), `@angular-
+devkit` builders/schematics, the Module-Federation BROWSER runtime, and the `@treaty/compiler` NAPI
+seam. Everything else — the compiler, packagr, CLI, affected/manifest logic — should be Rust. When a
+piece is built in TS for speed, prefer migrating its core to Rust (e.g. the treaty CLI K, packagr M).
 
 ## Harness
 - **File-by-file harness**: compile a corpus of individual `.treaty`/`.tsx`/`.ts` files through `@treaty/compiler`
