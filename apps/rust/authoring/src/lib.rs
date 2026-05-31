@@ -1,14 +1,13 @@
 //! `rust_authoring` — Treaty's Rust/OXC Angular compiler.
 //!
-//! Wires the previously-orphaned `angular` (OXC-based Ivy codegen) and `html`
-//! modules into the crate so they are actually type-checked and testable.
-//! The legacy top-level `parser.rs` targets a stale `treaty` API and is left
-//! out of the build until the render3 port replaces it.
+//! Routes each authoring format to its front-end (see [`authoring::compile_file`]):
+//! `.treaty` via [`sfc`], `.tsx`/`.tjsx` via [`jsx`], and base Angular `.ts` via
+//! [`angular_source`] — all lowering to Ivy through the `render3` crate. The
+//! [`plugin`] system lifts `server { … }` blocks to a backend module and emits
+//! the matching client bindings.
 
-pub mod angular;
 pub mod angular_source;
 pub mod authoring;
-pub mod html;
 pub mod jsx;
 pub mod plugin;
 pub mod sfc;
