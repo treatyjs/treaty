@@ -14,6 +14,16 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./ambient": {
+      "types": "./dist/ambient.d.ts"
+    }
+  },
+  "typesVersions": {
+    "*": {
+      "ambient": [
+        "./dist/ambient.d.ts"
+      ]
     }
   },
   "sideEffects": false,

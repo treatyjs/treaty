@@ -1,3 +1,4 @@
+/// <reference path="../../libs/treaty/compiler/dist/ambient.d.ts" />
 /// <reference path="../../libs/treaty/jsx/dist/ambient.d.ts" />
 
 /**
@@ -14,15 +15,16 @@
  * Treaty is a compiler, not a host: these declarations exist only to keep the
  * authoring-time configs type-clean; nothing here runs.
  *
- * The authoring-format module shims (`*.treaty` / `*.tjsx`) are NOT declared
- * here: they ship from `@treaty/jsx` (its `./ambient` entry) and are picked up
- * by the single triple-slash reference above, so no per-app `declare module`
- * block is needed. This workspace consumes `@treaty/jsx` from its built `dist`
- * rather than an installed package, so the reference targets that shipped
- * `dist/ambient.d.ts` directly; an app that installs `@treaty/jsx` as a real
- * dependency uses the package-name form instead — either
- * `/// <reference types="@treaty/jsx/ambient" />` or
- * `compilerOptions.types: ["@treaty/jsx/ambient"]`.
+ * The authoring-format module shims are NOT declared here: each ships from the
+ * package that OWNS the format — `*.treaty` from `@treaty/compiler` (its
+ * `./ambient` entry) and `*.tjsx` from `@treaty/jsx` (its `./ambient` entry) —
+ * picked up by the two triple-slash references above, so no per-app
+ * `declare module` block is needed. This workspace consumes the libs from their
+ * built `dist` rather than installed packages, so the references target the
+ * shipped `dist/ambient.d.ts` files directly; an app that installs them as real
+ * dependencies uses the package-name form instead — either
+ * `/// <reference types="@treaty/compiler/ambient" />` /
+ * `"@treaty/jsx/ambient"`, or `compilerOptions.types`.
  */
 
 declare module '@module-federation/enhanced/runtime' {
