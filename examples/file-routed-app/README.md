@@ -3,22 +3,80 @@
 A realistic example directory tree that exercises the **full** file-routing
 convention implemented by the `treaty_file_routing` crate (`libs/file-routing`).
 
-These are example **source files** — there is no build step. The point of this
-app is its *shape*: a real `routes/` + `api/` tree on disk that the crate's
-`generate_routing(config, &dyn DirTree)` pipeline can be pointed at end-to-end
-(via a filesystem-backed `DirTree`) to produce Angular lazy routes, Module
-Federation remotes, and a server-endpoint manifest.
+The point of this app is its *shape*: a real `routes/` + `api/` tree on disk
+that the crate's `generate_routing(config, &dyn DirTree)` pipeline is pointed at
+end-to-end (via a filesystem-backed `DirTree`) to produce Angular lazy routes,
+Module Federation remotes, and a server-endpoint manifest.
 
-You can run the pipeline against this exact tree:
+## Running file-based routing
+
+`src/generated/routes.ts` is **generated** from the on-disk `routes/` + `api/`
+tree by the real `treaty_file_routing` engine — it is never hand-written. One
+command produces it:
 
 ```sh
-cargo run --manifest-path libs/file-routing/Cargo.toml \
-  --example real_dir_tree -- examples/file-routed-app
+# From this directory (examples/file-routed-app):
+npm run generate-routes        # alias: npm run routes
 ```
 
-The tables at the bottom of this file are the **verified** output of that run
-under the default `FileRoutingConfig` (Bracket dynamic style, federation on),
-so an E2E test can assert against them.
+That runs `scripts/generate-routes.mjs`, which:
+
+1. `cargo build`s the detached crate's CLI
+   (`cargo build --manifest-path libs/file-routing/Cargo.toml`, a no-op once
+   compiled),
+2. runs the binary over **this app's own project root** twice —
+   `treaty-file-routing . --style colon --emit ts` for the Angular `Routes`
+   array + `federationRemotes`, and `--emit json` to lift the api/ endpoint
+   manifest — and
+3. writes the combined module to `src/generated/routes.ts` (`routes`,
+   `federationRemotes`, and `apiEndpoints` exports).
+
+`vite.config.ts` re-runs the same script on `buildStart`, so the generated
+routes are always current with the directory tree. To invoke the engine
+directly instead of through the npm script (run from the repo root):
+
+```sh
+# Full GeneratedRouting (routes + remotes + endpoints) as JSON:
+cargo run --manifest-path libs/file-routing/Cargo.toml --bin treaty-file-routing -- \
+  examples/file-routed-app --style colon
+
+# Just the ready-to-import Angular route module (lazy loadComponent() + remotes):
+cargo run --manifest-path libs/file-routing/Cargo.toml --bin treaty-file-routing -- \
+  examples/file-routed-app --style colon --emit ts
+```
+
+### How `routes/` + `api/` map to the output
+
+Each entry below is asserted by the end-to-end test
+(`npm run test:e2e`, `test/routing.e2e.mjs`), which regenerates the module and
+checks the result against the tree — proving the generation is real and correct:
+
+| On disk | Generated route `path` |
+| --- | --- |
+| `routes/layout.treaty` | `""` (root layout parent) |
+| `routes/index.treaty` | `""` (landing, child of root layout) |
+| `routes/(marketing)/index.treaty` | `""` (group name stripped) |
+| `routes/(marketing)/about.tjsx` | `"about"` (group name stripped) |
+| `routes/blog/layout.treaty` | `"blog"` (nested layout parent) |
+| `routes/blog/index.treaty` | `""` under `blog` |
+| `routes/blog/[slug]/index.treaty` | `":slug"` |
+| `routes/blog/[...path]/index.treaty` | `":...path"` (catch-all directory) |
+| `routes/docs/[category]/[page]/index.tjsx` | `"docs/:category/:page"` |
+| `routes/not-found.treaty` | `"**"` (wildcard) |
+
+| On disk | Generated `apiEndpoints[].path` |
+| --- | --- |
+| `api/index.ts` | `/` |
+| `api/health/index.ts` | `/health` |
+| `api/posts/index.ts` | `/posts` |
+| `api/posts/[id]/index.ts` | `/posts/:id` (param `id`) |
+
+The generator uses `--style colon`, so dynamic segments are the Angular-router
+native `:param` form and `provideRouter(routes)` consumes the module as-is. The
+tables in **Expected output** below are the **verified** colon-style output the
+E2E test asserts against. The pretty inspector example
+(`cargo run --example real_dir_tree -- examples/file-routed-app`) prints the same
+data as an indented summary.
 
 ## The convention
 
@@ -33,19 +91,19 @@ Run with the default config:
 | `not_found_file_name` | `not-found` | lowers to an Angular `**` wildcard route |
 | `route_extensions` | `.treaty`, `.tjsx`, `.tsx`, `.ts` | recognised route component files |
 | `api_extensions` | `.treaty`, `.ts` | recognised api handler files (note: **no `.tsx`/`.tjsx`**) |
-| `dynamic_segment_style` | Bracket (`[id]`) | both `[id]` and `:id` parse on input; Bracket is the canonical output spelling |
+| `dynamic_segment_style` | Bracket (`[id]`) | both `[id]` and `:id` parse on input; Bracket is the crate default, but this app generates with `--style colon` for Angular-native `:id` output |
 | `federation` | on | every lazy route + layout boundary is emitted as a `FederationRemote` |
 
 Naming rules applied to directory and file base names:
 
 - **Static** — `blog`, `about` → a literal path segment.
-- **Dynamic** — `[slug]` (or `:slug`) → a route parameter. Under the default
-  Bracket style the *route* path keeps the `[slug]` spelling; *api* paths always
-  render dynamic segments as `:slug`.
+- **Dynamic** — `[slug]` (or `:slug`) → a route parameter. This app generates
+  with `--style colon`, so the *route* path renders `:slug`; *api* paths always
+  render dynamic segments as `:slug` regardless of style.
 - **Catch-all** — `[...path]` (or `:...path`) → a rest parameter. In the **api**
   manifest this becomes `*path`. In **routes** a catch-all *directory* lowers to
-  a normal dynamic path segment (`[...path]`); only a `not-found` file produces
-  the `**` wildcard.
+  a normal dynamic path segment (`:...path` under colon style); only a
+  `not-found` file produces the `**` wildcard.
 - **Route group** — `(marketing)` → organises files in a folder **without
   contributing a URL segment** (Next.js / Analog semantics). The parenthesised
   name is stripped from the generated route `path`: `(marketing)/about` lowers to
@@ -83,12 +141,12 @@ examples/file-routed-app/
 │   ├── blog/
 │   │   ├── layout.treaty        # blog layout  -> nested parent route at "blog"
 │   │   ├── index.treaty         #   -> "" under blog  (URL /blog)
-│   │   ├── [slug]/index.treaty  # dynamic post -> "[slug]" under blog
-│   │   └── [...path]/index.treaty  # catch-all -> "[...path]" under blog
+│   │   ├── [slug]/index.treaty  # dynamic post -> ":slug" under blog
+│   │   └── [...path]/index.treaty  # catch-all -> ":...path" under blog
 │   └── docs/
 │       └── [category]/
 │           └── [page]/
-│               └── index.tjsx   # deep nested dynamic -> "docs/[category]/[page]"
+│               └── index.tjsx   # deep nested dynamic -> "docs/:category/:page"
 └── api/
     ├── index.ts                 # root handler        -> "/"
     ├── health/
@@ -114,9 +172,9 @@ the scanner, then lowered).
 | ` about` | leaf | `routes/(marketing)/about.tjsx` |
 | ` blog` | layout | `routes/blog/layout.treaty` |
 | `  ""` | leaf | `routes/blog/index.treaty` |
-| `  [...path]` | leaf | `routes/blog/[...path]/index.treaty` |
-| `  [slug]` | leaf | `routes/blog/[slug]/index.treaty` |
-| ` docs/[category]/[page]` | leaf | `routes/docs/[category]/[page]/index.tjsx` |
+| `  :...path` | leaf | `routes/blog/[...path]/index.treaty` |
+| `  :slug` | leaf | `routes/blog/[slug]/index.treaty` |
+| ` docs/:category/:page` | leaf | `routes/docs/[category]/[page]/index.tjsx` |
 | ` **` | leaf (wildcard) | `routes/not-found.treaty` |
 
 Leading spaces indicate child depth under the root layout / blog layout.
@@ -154,9 +212,9 @@ group-stripped** path (so `(marketing)` never appears in it).
 | `about` | `about` | `routes/(marketing)/about.tjsx` |
 | `blog` | `blog` | `routes/blog/layout.treaty` |
 | `root-blog` | `""` | `routes/blog/index.treaty` |
-| `path` | `[...path]` | `routes/blog/[...path]/index.treaty` |
-| `slug` | `[slug]` | `routes/blog/[slug]/index.treaty` |
-| `docs-category-page` | `docs/[category]/[page]` | `routes/docs/[category]/[page]/index.tjsx` |
+| `path` | `:...path` | `routes/blog/[...path]/index.treaty` |
+| `slug` | `:slug` | `routes/blog/[slug]/index.treaty` |
+| `docs-category-page` | `docs/:category/:page` | `routes/docs/[category]/[page]/index.tjsx` |
 | `not-found` | `**` | `routes/not-found.treaty` |
 
 ### API endpoints

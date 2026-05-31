@@ -19,6 +19,14 @@ name = "treaty_file_routing"
 version = "0.1.0"
 edition = "2024"
 
+# The library is the pure, deterministic core. The `treaty-file-routing` binary
+# is the runnable CLI host that drives it against a real directory on disk and
+# emits the GeneratedRouting as JSON or a ready-to-import TypeScript route
+# module. See `src/main.rs` for the full argument/output contract.
+[[bin]]
+name = "treaty-file-routing"
+path = "src/main.rs"
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
