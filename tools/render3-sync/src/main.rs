@@ -3,7 +3,7 @@
 //! Scaffold subcommands:
 //!   * `map`        — print the symbol->module map as JSON (the maintained pillar-1 table).
 //!   * `exports <ts-file>` — parse a TypeScript file under the vendored Angular ref and print its
-//!                    exported symbol names + the Rust modules each maps to.
+//!     exported symbol names + the Rust modules each maps to.
 //!
 //! Drift diffing, conformance regen, and mechanical codegen are layered on top of these
 //! primitives (see `migration/RENDER3-SYNC-PLAN.md`).

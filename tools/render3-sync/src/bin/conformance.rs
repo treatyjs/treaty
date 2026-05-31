@@ -88,11 +88,11 @@ fn cmd_run(args: &[String]) -> ExitCode {
         }
     };
     println!("{json}");
-    if let Some(path) = out {
-        if let Err(e) = std::fs::write(&path, &json) {
-            eprintln!("conformance: failed to write {}: {e}", path.display());
-            return ExitCode::FAILURE;
-        }
+    if let Some(path) = out
+        && let Err(e) = std::fs::write(&path, &json)
+    {
+        eprintln!("conformance: failed to write {}: {e}", path.display());
+        return ExitCode::FAILURE;
     }
 
     // A run that produced neither harness's numbers is a hard failure; otherwise success.

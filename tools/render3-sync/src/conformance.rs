@@ -343,13 +343,10 @@ pub fn parse_compliance(stdout: &str) -> ComplianceResult {
 
         // Markdown "Sample diverging cases" bullets are nested under `- **\`cat\`** (n):` headers;
         // the case IDs are the deeper `  - <id>` bullets. Harvest those that look like case IDs.
-        if trimmed.starts_with("- ") && line.starts_with("  - ") {
-            if let Some(id) = trimmed.strip_prefix("- ") {
-                let id = id.trim();
-                if is_case_id(id) {
-                    push_unique(&mut r.diff_ids, id.to_string());
-                }
-            }
+        if line.starts_with("  - ")
+            && let Some(id) = trimmed.strip_prefix("- ").map(str::trim).filter(|id| is_case_id(id))
+        {
+            push_unique(&mut r.diff_ids, id.to_string());
         }
     }
 
@@ -404,14 +401,14 @@ pub fn parse_oracle(stdout: &str) -> OracleResult {
         }
 
         // Authoritative summary line.
-        if let Some(rest) = line.strip_prefix("Summary:") {
-            if let Some(s) = parse_oracle_summary(rest) {
-                r.pass = s.0;
-                r.diff = s.1;
-                r.oracle_only = s.2;
-                r.total = s.3;
-                summary_seen = true;
-            }
+        if let Some(rest) = line.strip_prefix("Summary:")
+            && let Some(s) = parse_oracle_summary(rest)
+        {
+            r.pass = s.0;
+            r.diff = s.1;
+            r.oracle_only = s.2;
+            r.total = s.3;
+            summary_seen = true;
         }
     }
 
@@ -437,7 +434,7 @@ fn parse_oracle_summary(rest: &str) -> Option<(u32, u32, u32, u32)> {
     let total = rest
         .split("(of")
         .nth(1)
-        .and_then(|t| first_uint(t))
+        .and_then(first_uint)
         .unwrap_or(pass + diff + oracle_only);
     Some((pass, diff, oracle_only, total))
 }
