@@ -389,12 +389,6 @@ impl<'b> HtmlAstToIvyAst<'b> {
                 .attributes
                 .retain(|a| !a.name.starts_with("i18n-"));
         }
-        let element_i18n: Option<t::I18nMeta> = if is_i18n_root_element {
-            Some(t::I18nMeta)
-        } else {
-            None
-        };
-
         let children = if preparsed.non_bindable {
             NonBindableVisitor.visit_all(&element.children)
         } else {
@@ -404,6 +398,18 @@ impl<'b> HtmlAstToIvyAst<'b> {
         if is_i18n_root_element {
             self.in_i18n_block = false;
         }
+
+        // An element marked `i18n` whose translatable content is EMPTY (no text/ICU/child
+        // placeholder) is NOT translated: Angular consumes the `i18n` attribute as a marker
+        // only and lowers `<div i18n></div>` to a plain element (`ɵɵelement`, decls:1, no
+        // i18n const/op). Only flag the element as an i18n root — driving the downstream
+        // `ɵɵi18n`/message-const emission — when it actually carries translatable content.
+        let has_i18n_content = !children.is_empty();
+        let element_i18n: Option<t::I18nMeta> = if is_i18n_root_element && has_i18n_content {
+            Some(t::I18nMeta)
+        } else {
+            None
+        };
 
         let mut parsed_element: t::Node = if preparsed.kind == PreparsedElementType::NgContent {
             let selector = preparsed.select_attr.clone();
@@ -2478,6 +2484,30 @@ mod tests {
         assert!(element.i18n.is_some(), "element should be marked i18n");
         // Content (text + interpolation) is preserved.
         assert!(matches!(element.children[0], t::Node::BoundText(_)));
+    }
+
+    #[test]
+    fn empty_i18n_element_is_not_marked() {
+        // `<div i18n></div>` has no translatable content: the `i18n` attribute is consumed as
+        // a marker only and the element is NOT flagged for translation (Angular lowers it to a
+        // plain `ɵɵelement`, no i18n const/op).
+        let nodes = parse_html(r#"<div i18n></div>"#);
+        let mut bp = BindingParser::new();
+        let result = html_ast_to_render3_ast(&nodes, &mut bp, Render3ParseOptions::default());
+        let element = match &result.nodes[0] {
+            t::Node::Element(e) => e,
+            other => panic!("expected Element, got {other:?}"),
+        };
+        assert!(
+            element.attributes.iter().all(|a| a.name != "i18n"),
+            "i18n marker attribute should still be dropped: {:?}",
+            element.attributes
+        );
+        assert!(
+            element.i18n.is_none(),
+            "empty i18n element must NOT be marked for translation"
+        );
+        assert!(element.children.is_empty(), "expected no children");
     }
 
     #[test]
