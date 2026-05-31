@@ -8,6 +8,7 @@ members = [
 	'libs/runtime',
 	'apps/treaty-cli',
 	'libs/packagr',
+	'tools/node-conformance',
 ]
 
 [profile.release]
