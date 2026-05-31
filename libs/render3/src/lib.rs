@@ -4,18 +4,32 @@
 //! Per-module port specs live in `migration/render3-specs/`; architecture in
 //! `migration/PORT-ARCHITECTURE.md`.
 //!
-//! Layering (each must compile before the next):
-//!   L0 foundation: [`output_ast`], [`expression::lexer`], [`expression::ast`], [`identifiers`]
-//!   L1: [`expression::parser`], output emitter, r3 template AST
-//!   L2+: template transform, binder (selectorless/auto-import), instruction emitter
-
-// ---------------------------------------------------------------------------
-// Module groups. The crate is being reorganized into composable subtrees
-// (`core` / `template` / `decorators`) joined by a decorator-compiler registry
-// (see `migration/RENDER3-SPLIT-PLAN.md`). Phase 1 lands `core`; the IR + emit +
-// shared expression primitives now live under `core/` and are re-exported from
-// their historical top-level paths so nothing outside `core` had to change.
-// ---------------------------------------------------------------------------
+//! # Module groups
+//!
+//! The crate is organized into composable subtrees in dependency order
+//! (`core <- template <- decorators <- facade`), joined by a decorator-compiler plugin registry
+//! (see `migration/RENDER3-SPLIT-PLAN.md`):
+//!
+//!   - [`core`]         — backend-agnostic IR + emit + shared expression primitives (output AST,
+//!                        emitter / source maps, runtime identifiers, factory, the binding-expression
+//!                        lexer/parser/converter). Knows nothing about templates or decorators.
+//!   - [`template_mod`] — the HTML/template → instruction-IR layer (`ml_parser`, the template AST +
+//!                        transform + control-flow / defer lowerings, the `t2` binder, the
+//!                        template-definition builder + query generation, i18n). Depends on `core`.
+//!   - [`decorators`]   — the decorator → definition layer (the `compile_*_from_metadata` instruction
+//!                        emitter, `@Pipe`/`@NgModule` emit, and the
+//!                        [`decorators::registry::DecoratorCompiler`] plugin registry — one plugin
+//!                        per decorator kind, mirroring `apps/rust/authoring`'s `AuthoringPlugin`).
+//!                        Depends on `core` + `template`.
+//!   - [`facade`]       — the thin per-FILE "join": [`compile`] (template-only helper) and
+//!                        [`source_compile`] (the TypeScript SOURCE front-end). Scans decorated
+//!                        classes and dispatches each through the registry, then re-assembles the
+//!                        complete module. Depends on all three lower layers.
+//!
+//! Every member is re-exported from its historical top-level path (`crate::output_ast`,
+//! `crate::ml_parser`, `crate::view::compiler`, `crate::compile`, `crate::source_compile`, …) so
+//! call sites inside and outside the crate (e.g. `apps/rust/authoring`) are unchanged; the split is
+//! structural and emitted Ivy is byte-identical.
 
 /// Backend-agnostic foundation: output IR, emitter, runtime identifiers, factory,
 /// and the binding-expression pipeline. Depends on nothing in `template`/`decorators`.
@@ -76,6 +90,28 @@ pub mod decorators;
 // resolves exactly as before (the canonical path is now `crate::decorators::pipe_module_injector`).
 pub use decorators::pipe_module_injector;
 
+// `view` is now a pure compatibility facade: every member physically lives in `template_mod`
+// (`view::template` / `view::queries`) or `decorators` (`view::compiler`) and is re-exported from
+// here so `crate::view::…` keeps resolving exactly as before.
 pub mod view;
-pub mod compile;
-pub mod source_compile;
+
+// ---------------------------------------------------------------------------
+// `facade` subtree (Phase 4). The thin per-FILE "join" at the top of the
+// dependency DAG: the template-only `compile` helper and the TypeScript SOURCE
+// front-end (`source_compile`). Both scan classes and dispatch through the
+// `decorators` registry rather than carrying emit logic of their own. Each is
+// re-exported from its historical top-level path (`crate::compile`,
+// `crate::source_compile`) so call sites inside and outside the crate are
+// unchanged. See `migration/RENDER3-SPLIT-PLAN.md`.
+// ---------------------------------------------------------------------------
+
+/// The thin compile facade: the template-only end-to-end helper and the `@Component`/`@Directive`/
+/// `@Pipe`/`@NgModule` TypeScript SOURCE front-end, both joining the lower layers via the
+/// [`decorators::registry::DecoratorRegistry`]. Depends on `core`, `template`, and `decorators`.
+pub mod facade;
+
+// Re-export the facade members from their historical top-level paths so `crate::compile::…` and
+// `crate::source_compile::…` resolve exactly as before (the canonical paths are now
+// `crate::facade::…`).
+pub use facade::compile;
+pub use facade::source_compile;
