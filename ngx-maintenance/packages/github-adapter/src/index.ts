@@ -42,6 +42,8 @@ export type {
   TakeoverPlanned,
   CloneResult,
   CloneOptions,
+  OpenPrOutcome,
+  CloneMigrateResult,
 } from "./operations.js";
 export {
   migrationBranch,
@@ -49,12 +51,23 @@ export {
   buildOptInSuggestion,
   openMigrationPr,
   openOptInSuggestion,
+  findOpenMigrationPr,
+  openMigrationPrIfAbsent,
   clone,
+  cloneAndMigrate,
   parentDir,
 } from "./operations.js";
+
+export type { WorkdirProvider, WorkdirEvent, FakeWorkdirProvider } from "./workdir.js";
+export { createNodeWorkdirs, createFakeWorkdirs } from "./workdir.js";
 
 export type { GitHubAdapter, AdapterConfig } from "./adapter.js";
 export { createGitHubAdapter, makeAdapter } from "./adapter.js";
 
-export type { FakeOctokit, FakeAdapter } from "./fakes.js";
+export type {
+  FakeOctokit,
+  FakeAdapter,
+  FakeAdapterOptions,
+  PullListResponder,
+} from "./fakes.js";
 export { createFakeOctokit, createFakeAdapter } from "./fakes.js";

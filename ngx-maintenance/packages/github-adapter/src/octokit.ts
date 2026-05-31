@@ -14,6 +14,15 @@ export interface OctokitLike {
   readonly rest: {
     readonly pulls: {
       create(params: Record<string, unknown>): Promise<{ data: unknown }>;
+      /**
+       * List pull requests for a repository. The orchestrator queries this to
+       * stay IDEMPOTENT: before opening a migration PR it checks whether one is
+       * already open on the migration head branch. Returns the raw PR array;
+       * callers read only the structural subset they need.
+       */
+      list(
+        params: Record<string, unknown>,
+      ): Promise<{ data: ReadonlyArray<unknown> }>;
     };
     readonly issues: {
       create(params: Record<string, unknown>): Promise<{ data: unknown }>;

@@ -1,4 +1,8 @@
-import type { MigrationPlan } from "@ngx-maintenance/migration-engine";
+import {
+  runMigration,
+  type MigrationPlan,
+  type MigrationResult,
+} from "@ngx-maintenance/migration-engine";
 import type { TakeoverSpec } from "@ngx-maintenance/takeover";
 import { parseRepoRef, type OctokitLike, type RepoRef } from "./octokit.js";
 import type { Shell } from "./shell.js";
@@ -160,6 +164,77 @@ export async function openMigrationPr(
   return ref;
 }
 
+/** The outcome of an idempotent migration-PR open. */
+export interface OpenPrOutcome {
+  /** The parsed target repository ref. */
+  readonly ref: RepoRef;
+  /**
+   * `"created"` when a new PR was opened this call, `"existing"` when an open
+   * PR on the migration head branch was already present (so nothing was done).
+   */
+  readonly status: "created" | "existing";
+}
+
+/**
+ * Whether an OPEN pull request already exists on `spec.head` for the target
+ * repository. Queries `pulls.list` filtered to the head branch and the `open`
+ * state. This is the idempotency probe the orchestrator uses so a migration PR
+ * is never opened twice for the same library + target major.
+ *
+ * GitHub's `head` filter expects `owner:branch`; we match defensively on the
+ * branch suffix as well so a fake (or a fork-namespaced head) still matches.
+ */
+export async function findOpenMigrationPr(
+  octokit: OctokitLike,
+  spec: MigrationPrSpec,
+): Promise<Record<string, unknown> | undefined> {
+  const ref = parseRepoRef(spec.repoUrl);
+  if (ref === undefined) {
+    throw new Error(`cannot parse repo from URL: ${spec.repoUrl}`);
+  }
+  const response = await octokit.rest.pulls.list({
+    owner: ref.owner,
+    repo: ref.repo,
+    state: "open",
+    head: `${ref.owner}:${spec.head}`,
+  });
+  for (const raw of response.data) {
+    if (typeof raw !== "object" || raw === null) continue;
+    const pr = raw as Record<string, unknown>;
+    const prHead = pr["head"];
+    const headRef =
+      typeof prHead === "object" && prHead !== null
+        ? (prHead as Record<string, unknown>)["ref"]
+        : prHead;
+    if (headRef === spec.head || prHead === spec.head) {
+      return pr;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Idempotently open the migration PR: if an open PR already targets
+ * `spec.head`, do nothing and report `"existing"`; otherwise open it and report
+ * `"created"`. This is the single entry the orchestrator calls so re-running a
+ * cycle never produces duplicate PRs.
+ */
+export async function openMigrationPrIfAbsent(
+  octokit: OctokitLike,
+  spec: MigrationPrSpec,
+): Promise<OpenPrOutcome> {
+  const existing = await findOpenMigrationPr(octokit, spec);
+  const ref = parseRepoRef(spec.repoUrl);
+  if (ref === undefined) {
+    throw new Error(`cannot parse repo from URL: ${spec.repoUrl}`);
+  }
+  if (existing !== undefined) {
+    return { ref, status: "existing" };
+  }
+  await openMigrationPr(octokit, spec);
+  return { ref, status: "created" };
+}
+
 /** Open an opt-in suggestion issue (and its sample PR) via octokit. */
 export async function openOptInSuggestion(
   octokit: OctokitLike,
@@ -244,4 +319,43 @@ export function parentDir(dir: string): string {
   );
   if (lastSep <= 0) return lastSep === 0 ? normalized.slice(0, 1) : ".";
   return normalized.slice(0, lastSep);
+}
+
+/** The outcome of cloning a repository and running a migration plan in it. */
+export interface CloneMigrateResult {
+  /** The clone half (where it landed + whether checkout succeeded). */
+  readonly clone: CloneResult;
+  /**
+   * The migration half. `undefined` when the clone itself failed (the migration
+   * was never attempted).
+   */
+  readonly migration: MigrationResult | undefined;
+  /** True only when the clone succeeded AND every migration step succeeded. */
+  readonly ok: boolean;
+}
+
+/**
+ * Clone `repoUrl` into `dir` and run the migration `plan` inside the checkout,
+ * all through the injected {@link Shell}. This is the git+process pipeline the
+ * orchestrator drives for a stale library: production passes a real spawning
+ * shell (real `git clone` + real `ng update`/`npm` per step); tests pass a
+ * recording fake so the whole flow is deterministic with no network/process.
+ *
+ * The migration is attempted ONLY when the clone succeeds; a clone failure
+ * short-circuits with `migration: undefined` so the caller can skip opening a
+ * PR for a tree that never materialised.
+ */
+export async function cloneAndMigrate(
+  shell: Shell,
+  repoUrl: string,
+  dir: string,
+  plan: MigrationPlan,
+  options: CloneOptions = {},
+): Promise<CloneMigrateResult> {
+  const cloneResult = await clone(shell, repoUrl, dir, options);
+  if (!cloneResult.ok) {
+    return { clone: cloneResult, migration: undefined, ok: false };
+  }
+  const migration = await runMigration(cloneResult.dir, plan, shell);
+  return { clone: cloneResult, migration, ok: migration.status === "success" };
 }

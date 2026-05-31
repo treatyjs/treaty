@@ -53,3 +53,22 @@ export type {
 export { computeScan, runScheduledScan } from "./scheduler.js";
 
 export { createApp } from "./app.js";
+
+// The runnable bot: the orchestration that drives the full
+// discover -> migrate -> PR -> takeover flow through the github-adapter
+// boundary, plus the registry-backed metadata source, the host poller and the
+// CLI. The deterministic cycle itself lives in @ngx-maintenance/orchestrator.
+export type {
+  MetadataOctokit,
+  MetadataSourceConfig,
+} from "./metadata-source.js";
+export { createMetadataSource } from "./metadata-source.js";
+
+export type { RunnerConfig, Runner } from "./runner.js";
+export { createRunner, createRunnerFrom, makeAdapter } from "./runner.js";
+
+export type { PollOutcome } from "./poller.js";
+export { poll } from "./poller.js";
+
+export type { CliArgs } from "./cli.js";
+export { parseArgs, summarize, main } from "./cli.js";

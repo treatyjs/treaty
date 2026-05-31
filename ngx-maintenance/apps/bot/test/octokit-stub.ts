@@ -1,9 +1,10 @@
 /**
  * Test-only stub for the out-of-band `octokit` package. The real Octokit is
  * supplied out-of-band at deploy time and is not installed in this Turborepo,
- * so the vitest config aliases `octokit` to this stub. Tests inject recording
- * fakes via {@link createFakeAdapter}; the production {@link createGitHubAdapter}
- * path constructs this stub only to prove it is wired, never to make a call.
+ * so the vitest config aliases `octokit` to this stub. Bot tests inject fakes
+ * (a fake GitHub adapter + fake metadata + fake takeover adapter) via
+ * `createRunnerFrom`; the production `createRunner` path constructs this stub
+ * only to prove wiring, never to make a network call.
  */
 export class Octokit {
   readonly rest = {
@@ -14,12 +15,19 @@ export class Octokit {
     issues: {
       create: () => Promise.resolve({ data: {} }),
     },
+    repos: {
+      createFork: () => Promise.resolve({ data: {} }),
+      listCommits: () => Promise.resolve({ data: [] as unknown[] }),
+    },
   };
 
-  /** Captured construction options; the stub never authenticates or calls out. */
   readonly options: { auth?: string; [key: string]: unknown };
 
   constructor(options?: { auth?: string; [key: string]: unknown }) {
     this.options = options ?? {};
+  }
+
+  request(): Promise<{ status: number; data: unknown }> {
+    return Promise.resolve({ status: 201, data: {} });
   }
 }

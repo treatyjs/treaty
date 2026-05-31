@@ -14,11 +14,17 @@
     "lint": "oxlint -c ../../.oxlintrc.json src",
     "test": "vitest run"
   },
+  "bin": {
+    "ngx-maintenance": "./src/cli.ts"
+  },
   "dependencies": {
     "@ngx-maintenance/registry": "workspace:*",
     "@ngx-maintenance/migration-engine": "workspace:*",
     "@ngx-maintenance/takeover": "workspace:*",
-    "@ngx-maintenance/treaty-support": "workspace:*"
+    "@ngx-maintenance/treaty-support": "workspace:*",
+    "@ngx-maintenance/orchestrator": "workspace:*",
+    "@ngx-maintenance/github-adapter": "workspace:*",
+    "@ngx-maintenance/staleness-detector": "workspace:*"
   },
   "devDependencies": {
     "octokit": "*",

@@ -29,3 +29,18 @@ declare module "node:child_process" {
     options: { cwd: string },
   ): ChildProcess;
 }
+
+declare module "node:fs/promises" {
+  /** Create a uniquely-suffixed temp directory from a prefix; resolves its path. */
+  export function mkdtemp(prefix: string): Promise<string>;
+  /** Remove a path, recursively/force per options. */
+  export function rm(
+    path: string,
+    options?: { recursive?: boolean; force?: boolean },
+  ): Promise<void>;
+}
+
+declare module "node:os" {
+  /** The OS temp directory. */
+  export function tmpdir(): string;
+}

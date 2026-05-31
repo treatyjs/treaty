@@ -12,6 +12,15 @@
       "@ngx-maintenance/takeover": ["../../packages/takeover/src/index.ts"],
       "@ngx-maintenance/treaty-support": [
         "../../packages/treaty-support/src/index.ts"
+      ],
+      "@ngx-maintenance/orchestrator": [
+        "../../packages/orchestrator/src/index.ts"
+      ],
+      "@ngx-maintenance/github-adapter": [
+        "../../packages/github-adapter/src/index.ts"
+      ],
+      "@ngx-maintenance/staleness-detector": [
+        "../../packages/staleness-detector/src/index.ts"
       ]
     }
   },

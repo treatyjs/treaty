@@ -3,30 +3,29 @@ import { existsSync } from "node:fs";
 import { defineConfig } from "vitest/config";
 
 const pkg = (rel: string): string =>
-  fileURLToPath(new URL(`../../packages/${rel}`, import.meta.url));
+  fileURLToPath(new URL(`../${rel}`, import.meta.url));
 
 const local = (rel: string): string =>
   fileURLToPath(new URL(rel, import.meta.url));
 
 /**
  * Resolve the workspace `@ngx-maintenance/*` packages directly from TypeScript
- * source. The packages are not installed (no `bun install` at this Turborepo
- * root), so tests run straight against `src`.
+ * source, and stub the out-of-band `octokit` dependency. The packages are not
+ * installed (no install step at this Turborepo root) and `octokit` is supplied
+ * out-of-band at deploy time, so tests run straight against `src` with a local
+ * `octokit` shim that the production paths never reach under test (tests inject
+ * fakes; only the type/identity surface is touched).
  */
 export default defineConfig({
   resolve: {
     alias: {
-      "@ngx-maintenance/registry": pkg("registry/src/index.ts"),
-      "@ngx-maintenance/migration-engine": pkg(
-        "migration-engine/src/index.ts",
-      ),
-      "@ngx-maintenance/takeover": pkg("takeover/src/index.ts"),
-      "@ngx-maintenance/treaty-support": pkg("treaty-support/src/index.ts"),
-      "@ngx-maintenance/orchestrator": pkg("orchestrator/src/index.ts"),
       "@ngx-maintenance/github-adapter": pkg("github-adapter/src/index.ts"),
+      "@ngx-maintenance/migration-engine": pkg("migration-engine/src/index.ts"),
+      "@ngx-maintenance/registry": pkg("registry/src/index.ts"),
       "@ngx-maintenance/staleness-detector": pkg(
         "staleness-detector/src/index.ts",
       ),
+      "@ngx-maintenance/takeover": pkg("takeover/src/index.ts"),
       octokit: local("test/octokit-stub.ts"),
     },
   },
@@ -49,7 +48,7 @@ export default defineConfig({
     },
   ],
   test: {
-    include: ["src/**/*.test.ts"],
+    include: ["test/**/*.test.ts"],
     environment: "node",
   },
 });
