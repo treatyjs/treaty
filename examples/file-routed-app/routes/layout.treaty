@@ -19,7 +19,6 @@ const year = signal(new Date().getFullYear())
     </nav>
   </header>
 
-  // <router-outlet> is where the matched child route renders.
   <main><router-outlet /></main>
 
   <footer class="colophon">© {{ year() }} file-routed-app</footer>

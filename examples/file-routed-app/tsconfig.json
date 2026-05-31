@@ -1,0 +1,26 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": false,
+    "moduleResolution": "bundler",
+    "module": "esnext",
+    "target": "es2022",
+    "lib": ["es2022", "dom", "dom.iterable"],
+    "strict": true,
+    "noEmit": true,
+    "jsx": "react-jsx",
+    "jsxImportSource": "@treaty/jsx",
+    "types": [],
+    "paths": {
+      "@treaty/jsx": ["../../libs/treaty/jsx/dist/index.d.ts"],
+      "@treaty/jsx/jsx-runtime": ["../../libs/treaty/jsx/dist/jsx-runtime.d.ts"],
+      "@treaty/compiler": ["../../libs/treaty/compiler/dist/index.d.ts"],
+      "@treaty/vite": ["../../libs/treaty/vite/dist/index.d.ts"],
+      "@treaty/module-federation": [
+        "../../libs/treaty/module-federation/dist/index.d.ts"
+      ]
+    }
+  },
+  "include": ["src/**/*.ts", "src/**/*.tsx", "*.config.ts", "peers.d.ts"],
+  "exclude": ["node_modules"]
+}

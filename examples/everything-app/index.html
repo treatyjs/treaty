@@ -1,0 +1,21 @@
+<!doctype html>
+<!--
+  Vite HTML entry for the everything-app.
+
+  Treaty is a compiler, not a host: Vite owns the page. This file is the single
+  document Vite serves; it loads the ES-module entry `src/main.ts`, which
+  bootstraps the Angular application. Every authoring file the app pulls in
+  (`.treaty` / `.tsx` / `.tjsx` / `@Component` `.ts`) is lowered to Ivy JS by the
+  `@treaty/vite` plugin during the build that produces this page's bundle.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Treaty everything-app</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+  </head>
+  <body>
+    <app-root></app-root>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
