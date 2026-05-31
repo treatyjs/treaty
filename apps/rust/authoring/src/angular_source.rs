@@ -9,10 +9,27 @@ use oxc_allocator::Allocator;
 use oxc_ast::ast::{Class, Decorator, Expression, Statement};
 use oxc_parser::Parser;
 use oxc_span::SourceType;
-use render3::source_compile::compile_component_source;
+use render3::source_compile::compile_component_source_with_map;
 
 use crate::plugin::{extract_server_block, rewrite_call_sites, PluginRegistry};
+use crate::source_map::redact_server_bodies_in_map;
 use crate::CompiledAuthoring;
+
+/// The original-source name embedded in the emitted map's `sources[0]`. The base-Angular path does
+/// not yet thread a real file path through to here, so a stable placeholder is used; the generated
+/// artifact name (`file`) is left to render3's default.
+const SOURCE_NAME: &str = "component.ts";
+const GENERATED_NAME: &str = "component.js";
+
+/// Normalize render3's empty-string "no map" sentinel into `None`. render3 returns an empty `map`
+/// when compilation failed (it never emits `{}`); anything non-empty is a real v3 JSON document.
+fn map_or_none(map: String) -> Option<String> {
+    if map.trim().is_empty() {
+        None
+    } else {
+        Some(map)
+    }
+}
 
 /// The recognized top-level Angular decorator kinds a `.ts` source may carry.
 ///
@@ -139,16 +156,32 @@ pub fn compile_angular_component_with(
     let extraction = extract_server_block(source);
 
     if extraction.server_fns.is_empty() {
-        let compiled = compile_component_source(&extraction.client_source);
+        // No server block: compile with the additive v3 map and pass it through UNCHANGED.
+        let compiled = compile_component_source_with_map(
+            &extraction.client_source,
+            GENERATED_NAME,
+            SOURCE_NAME,
+        );
         return CompiledAuthoring {
             code: compiled.code,
             server_module: None,
             errors: compiled.errors,
+            map: map_or_none(compiled.map),
         };
     }
 
     let emit = emit(&extraction.server_fns);
-    let compiled = compile_component_source(&extraction.client_source);
+    let compiled =
+        compile_component_source_with_map(&extraction.client_source, GENERATED_NAME, SOURCE_NAME);
+
+    // CLIENT PRIVACY: the map embeds the authoring source as `sourcesContent`. Even though the
+    // `server { … }` block was already lifted out of `client_source` before compilation, redact each
+    // lifted server-fn body from the map's `sourcesContent` as a defense-in-depth guarantee, blanking
+    // the body bytes to spaces so the map's line/column positions stay valid. The server source text
+    // never reaches the client map.
+    let server_bodies: Vec<String> =
+        extraction.server_fns.iter().map(|f| f.source.clone()).collect();
+    let map = map_or_none(redact_server_bodies_in_map(&compiled.map, &server_bodies));
 
     // render3 emits only the `defineComponent`, and lowers every template reference to a component
     // context member (`save(user)` -> `ctx.save(ctx.user)`). The generic [`rewrite_call_sites`]
@@ -168,6 +201,7 @@ pub fn compile_angular_component_with(
         code,
         server_module: Some(emit.server_module),
         errors: compiled.errors,
+        map,
     }
 }
 
@@ -188,7 +222,12 @@ pub fn compile_angular_component_with(
 /// the base-Angular path does not derive a class name from it (the `@Component` class names itself).
 pub fn compile_angular_source(source: &str, file_name: &str) -> CompiledAuthoring {
     let _ = file_name;
-    let kinds = detect_angular_decorators(source);
+    // Detect decorators on the SERVER-STRIPPED source: a `server { … }` block is not valid TS, so a
+    // `@Component` that colocates one would otherwise fail to parse here and be misrouted to the
+    // pass-through path. Lifting the block first lets detection see the real `@Component` and route
+    // it to the server-block-aware component path (which re-extracts the block itself).
+    let stripped = extract_server_block(source).client_source;
+    let kinds = detect_angular_decorators(&stripped);
 
     // A `@Component` is the only kind the source front-end emits; route it through the existing
     // server-block-aware component path. (If a file mixes `@Component` with other decorators, the
@@ -205,6 +244,7 @@ pub fn compile_angular_source(source: &str, file_name: &str) -> CompiledAuthorin
         code: source.to_string(),
         server_module: None,
         errors: Vec::new(),
+        map: None,
     }
 }
 
@@ -300,6 +340,53 @@ export class AppComponent {}\n";
     }
 
     #[test]
+    fn component_without_server_block_carries_a_v3_map() {
+        // A plain `@Component` (no server block) compiles WITH the additive v3 map threaded out.
+        let source = "import { Component } from '@angular/core';\n\
+@Component({ selector: 'app-x', template: '<div>{{x}}</div>' })\n\
+export class XComponent { x = 1; }\n";
+        let out = compile_angular_component(source);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+
+        let map = out.map.expect("expected a source map");
+        let value: serde_json::Value =
+            serde_json::from_str(&map).expect("map should be valid JSON");
+        assert_eq!(value["version"], serde_json::json!(3), "not a v3 map: {map}");
+        assert!(value.get("sourcesContent").is_some(), "no sourcesContent: {map}");
+    }
+
+    #[test]
+    fn component_server_block_body_is_absent_from_client_map() {
+        // CLIENT PRIVACY: a `@Component` with an inline server fn must compile to a v3 map whose
+        // `sourcesContent` does NOT contain the server fn body text.
+        let source = "import { Component } from '@angular/core';\n\
+server {\n\
+  async function save(user: User) { return db.insert(user); }\n\
+}\n\
+@Component({ template: '<button (click)=\"save(user)\">go</button>' })\n\
+export class AppComponent {}\n";
+
+        let out = compile_angular_component(source);
+        let map = out.map.expect("expected a source map for a server-block component");
+        let value: serde_json::Value =
+            serde_json::from_str(&map).expect("map should be valid JSON");
+        assert_eq!(value["version"], serde_json::json!(3), "not a v3 map: {map}");
+
+        // The server body never appears anywhere in the map's sourcesContent.
+        let contents = value["sourcesContent"]
+            .as_array()
+            .expect("sourcesContent array");
+        for c in contents {
+            let text = c.as_str().unwrap_or("");
+            assert!(!text.contains("db.insert"), "server body leaked into map content: {text}");
+            assert!(
+                !text.contains("async function save"),
+                "server signature leaked into map content: {text}"
+            );
+        }
+    }
+
+    #[test]
     fn angular_without_server_block_has_no_server_module() {
         let source = "import { Component } from '@angular/core';\n\
 @Component({ template: '<div></div>' })\n\
@@ -319,6 +406,34 @@ export class XComponent { x = 1; }\n";
         let out = compile_angular_source(source, "x.component.ts");
         assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
         assert!(out.code.contains(DEFINE), "no defineComponent; got: {}", out.code);
+    }
+
+    #[test]
+    fn source_router_routes_component_with_server_block_and_redacts_map() {
+        // A `@Component` that colocates a `server { … }` block must route through the component path
+        // even via the unified `compile_angular_source` entry (the block is stripped before decorator
+        // detection), produce a v3 map, and keep the server body out of that map's sourcesContent.
+        let source = "import { Component } from '@angular/core';\n\
+server {\n\
+  async function save(user: User) { return db.insert(user); }\n\
+}\n\
+@Component({ template: '<button (click)=\"save(user)\">go</button>' })\n\
+export class AppComponent {}\n";
+
+        let out = compile_angular_source(source, "app.component.ts");
+        assert!(out.server_module.is_some(), "server block not routed: no server module");
+        let map = out.map.expect("expected a v3 map for the routed server-block component");
+        let value: serde_json::Value = serde_json::from_str(&map).expect("valid JSON map");
+        assert_eq!(value["version"], serde_json::json!(3));
+        let joined: String = value["sourcesContent"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|c| c.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!joined.contains("db.insert"), "server body leaked into map: {joined}");
+        assert!(!out.code.contains("db.insert"), "server body leaked into client code");
     }
 
     #[test]

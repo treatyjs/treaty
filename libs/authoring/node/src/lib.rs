@@ -2,7 +2,16 @@
 extern crate napi_derive;
 
 use render3::compile::compile_component as r3_compile_component;
-use render3::source_compile::compile_component_source as r3_compile_component_source;
+use render3::source_compile::compile_component_source_with_map as r3_compile_component_source_with_map;
+
+/// Normalize render3's empty-string "no map" sentinel into `None` (it never emits `{}`).
+fn map_or_none(map: String) -> Option<String> {
+    if map.trim().is_empty() {
+        None
+    } else {
+        Some(map)
+    }
+}
 
 /// Result of compiling a component template to Ivy.
 #[napi(object)]
@@ -11,6 +20,9 @@ pub struct CompiledComponent {
     pub code: String,
     /// Parse/transform diagnostics (empty on success).
     pub errors: Vec<String>,
+    /// The additive Source Map v3 JSON mapping `code` back to the original source, or `undefined`
+    /// when the underlying path produced no map (e.g. the template-only `compileComponent` entry).
+    pub map: Option<String>,
 }
 
 /// Compile an Angular component template directly to Ivy via the Rust/OXC `render3` compiler.
@@ -27,21 +39,24 @@ pub fn compile_component(
     CompiledComponent {
         code: result.code,
         errors: result.errors,
+        // The template-only entry does not run the source-map pipeline.
+        map: None,
     }
 }
 
 /// Compile an Angular `@Component`/`@Directive` class directly from its TypeScript SOURCE.
 ///
 /// `source` is the full TS file (or snippet) containing exactly one decorated class. Returns the
-/// emitted `ɵɵdefineComponent({...})` definition, or a `CompiledComponent` carrying a descriptive
-/// error for shapes the source front-end does not yet support (providers, queries, host bindings,
-/// `templateUrl`, multi-class files, etc.).
+/// emitted `ɵɵdefineComponent({...})` definition plus the additive Source Map v3 JSON (`map`), or a
+/// `CompiledComponent` carrying a descriptive error for shapes the source front-end does not yet
+/// support (providers, queries, host bindings, `templateUrl`, multi-class files, etc.).
 #[napi]
 pub fn compile_component_source(source: String) -> CompiledComponent {
-    let result = r3_compile_component_source(&source);
+    let result = r3_compile_component_source_with_map(&source, "component.js", "component.ts");
     CompiledComponent {
         code: result.code,
         errors: result.errors,
+        map: map_or_none(result.map),
     }
 }
 
@@ -56,6 +71,8 @@ pub fn compile_treaty_file(source: String, file_name: String) -> CompiledCompone
     CompiledComponent {
         code: result.code,
         errors: result.errors,
+        // The `.treaty` SFC path lowers via `emit_expression`, not the source-map component entry.
+        map: None,
     }
 }
 
@@ -70,6 +87,11 @@ pub struct CompiledAuthoring {
     pub server_module: Option<String>,
     /// Parse/transform diagnostics (empty on success).
     pub errors: Vec<String>,
+    /// The additive Source Map v3 JSON mapping `code` back to the original authoring source, or
+    /// `undefined` when the routed front-end produced no map. CLIENT PRIVACY: when a `server { … }`
+    /// block was present, every lifted server-fn body has been redacted from the map's
+    /// `sourcesContent` before this field is populated.
+    pub map: Option<String>,
 }
 
 /// Unified per-file authoring compile: route `source` to the right front-end by `file_name`'s
@@ -91,6 +113,7 @@ pub fn compile(source: String, file_name: String) -> CompiledAuthoring {
         code: result.code,
         server_module: result.server_module,
         errors: result.errors,
+        map: result.map,
     }
 }
 
@@ -118,6 +141,10 @@ pub struct CompiledAuthoringEntry {
     pub server_module: Option<String>,
     /// Parse/transform diagnostics (empty on success).
     pub errors: Vec<String>,
+    /// The additive Source Map v3 JSON mapping `code` back to the original authoring source, or
+    /// `undefined` when the routed front-end produced no map. Server-fn bodies are redacted from the
+    /// map's `sourcesContent` (client privacy), exactly as for the single-file [`compile`] entry.
+    pub map: Option<String>,
 }
 
 /// Compile many authoring files IN PARALLEL across all available cores.
@@ -145,6 +172,7 @@ pub fn compile_many(files: Vec<AuthoringFile>) -> Vec<CompiledAuthoringEntry> {
                 code: result.code,
                 server_module: result.server_module,
                 errors: result.errors,
+                map: result.map,
             }
         })
         .collect()

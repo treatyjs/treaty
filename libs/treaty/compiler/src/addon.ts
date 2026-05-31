@@ -31,6 +31,14 @@ import {
 export interface CompiledComponent {
 	readonly code: string
 	readonly errors: readonly string[]
+	/**
+	 * The additive Source Map v3 JSON mapping `code` back to the original source,
+	 * or `undefined` when the routed front-end produced no map. CLIENT PRIVACY:
+	 * when the source declared a `server { … }` block, every lifted server-fn body
+	 * has already been redacted from the map's `sourcesContent` by the Rust addon
+	 * before it reaches this seam.
+	 */
+	readonly map?: string
 }
 
 /**

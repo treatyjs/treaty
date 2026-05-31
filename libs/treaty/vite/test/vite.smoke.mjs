@@ -81,6 +81,34 @@ await check('transform returns { code, map } shape', () => {
 	assert.ok('map' in treatyOut, 'result carries a map field')
 })
 
+// 3b. SOURCE MAP forwarding: a `.ts` @Component yields a v3 map from the core,
+//     and the plugin forwards it on transform()'s { code, map } unchanged.
+await check('transform forwards the v3 source map when the core produces one', () => {
+	const tsComponent =
+		"import { Component } from '@angular/core';\n" +
+		"@Component({ selector: 'app-sm', template: '<div>sm</div>' })\n" +
+		'export class SmComponent {}\n'
+	const out = runTransform(tsComponent, 'Sm.ts')
+	assert.ok(out, 'a .ts @Component is owned and transforms')
+	assert.ok(out.code.includes('defineComponent'), 'lowered to Ivy JS')
+	assert.equal(typeof out.map, 'string', 'the v3 source map is forwarded as a JSON string')
+	const map = JSON.parse(out.map)
+	assert.equal(map.version, 3, 'forwarded map is Source Map v3')
+	assert.equal(typeof map.mappings, 'string', 'map carries a mappings field')
+})
+
+// 3c. sourceMap:false makes the plugin return a null map so Vite skips map work.
+await check('sourceMap:false returns a null map', () => {
+	const p = treaty({ sourceMap: false })
+	const tsComponent =
+		"import { Component } from '@angular/core';\n" +
+		"@Component({ selector: 'app-nm', template: '<div>nm</div>' })\n" +
+		'export class NmComponent {}\n'
+	const out = p.transform.call({}, tsComponent, 'Nm.ts')
+	assert.ok(out, 'still transforms with sourceMap disabled')
+	assert.equal(out.map, null, 'map is null when sourceMap is off')
+})
+
 // 4. .tsx @Component -> Ivy JS
 await check('transform(.tsx @Component) -> defineComponent', () => {
 	const tsxSource =

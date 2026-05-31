@@ -718,6 +718,9 @@ pub fn compile_treaty_authoring_with(
             code: compiled.code,
             server_module: None,
             errors: compiled.errors,
+            // The `.treaty` SFC path emits via `emit_expression` directly (not render3's source-map
+            // component entry), so it carries no v3 map yet.
+            map: None,
         };
     }
 
@@ -734,6 +737,8 @@ pub fn compile_treaty_authoring_with(
         code: compiled.code,
         server_module: Some(emit.server_module),
         errors: compiled.errors,
+        // See the no-server branch: the `.treaty` SFC path does not yet emit a v3 map.
+        map: None,
     }
 }
 

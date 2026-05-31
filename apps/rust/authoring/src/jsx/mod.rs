@@ -190,6 +190,9 @@ pub fn compile(source: &str, file_name: &str) -> CompiledAuthoring {
     CompiledAuthoring {
         code: compiled.code,
         server_module,
+        // The JSX front-end lowers via `compile_from_parts_with_directives` (emit_expression), not
+        // render3's source-map component entry, so it carries no v3 map yet.
+        map: None,
         errors: all_errors,
     }
 }

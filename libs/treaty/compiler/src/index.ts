@@ -20,8 +20,18 @@ export type {
 	TreatyFileKind,
 } from './types.js'
 
-export type { ServerFnManifest, ServerFnManifestEntry } from './server-chunks.js'
-export { buildServerFnManifest, serverFnChunkId, splitServerModule } from './server-chunks.js'
+export type {
+	ServerBodyMapAudit,
+	ServerFnManifest,
+	ServerFnManifestEntry,
+} from './server-chunks.js'
+export {
+	assertNoServerBodyInMap,
+	buildServerFnManifest,
+	isValidSourceMapV3,
+	serverFnChunkId,
+	splitServerModule,
+} from './server-chunks.js'
 
 export type { CacheStats } from './cache.js'
 export { contentHash, IncrementalCache } from './cache.js'

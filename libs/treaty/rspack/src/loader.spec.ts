@@ -19,15 +19,25 @@ class Hello {
   <h1>Hello {{ name }}</h1>
 </template>`
 
+/**
+ * A `.ts` `@Component` source. The base-Angular front-end emits a v3 source map
+ * for this shape, so it is the deterministic fixture for the map-forwarding case
+ * (the `.treaty`/JSX front-ends do not yet produce a map).
+ */
+const TS_COMPONENT_SOURCE =
+	"import { Component } from '@angular/core'\n" +
+	"@Component({ selector: 'app-x', template: '<div>x</div>' })\n" +
+	'export class XComponent {}\n'
+
 /** Build a fake loader context capturing the result the loader reports. */
 function fakeContext(
 	resourcePath: string,
 	options: TreatyLoaderOptions = {}
 ): {
 	ctx: TreatyLoaderContext
-	result: () => { error: Error | null | undefined; content?: string }
+	result: () => { error: Error | null | undefined; content?: string; map?: unknown }
 } {
-	let captured: { error: Error | null | undefined; content?: string } = {
+	let captured: { error: Error | null | undefined; content?: string; map?: unknown } = {
 		error: undefined,
 	}
 	const ctx: TreatyLoaderContext = {
@@ -37,8 +47,8 @@ function fakeContext(
 		async: () => () => {
 			throw new Error('async path not expected in this spec')
 		},
-		callback: (error, content) => {
-			captured = { error, content }
+		callback: (error, content, map) => {
+			captured = { error, content, map }
 		},
 	}
 	return { ctx, result: () => captured }
@@ -71,6 +81,26 @@ describe('treatyLoader', () => {
 		const out = treatyLoader.call(ctx, TREATY_SOURCE)
 		expect(typeof out).toBe('string')
 		expect(out as string).toContain('ɵɵdefineComponent')
+	})
+
+	it('forwards the v3 source map through the loader callback', () => {
+		const { ctx, result } = fakeContext('/abs/X.ts')
+		const ret = treatyLoader.call(ctx, TS_COMPONENT_SOURCE)
+
+		// Delivered through this.callback, so the loader returns nothing.
+		expect(ret).toBeUndefined()
+
+		const { error, content, map } = result()
+		expect(error).toBeNull()
+		expect(typeof content).toBe('string')
+		expect(content).toContain('ɵɵdefineComponent')
+
+		// The compiler's serialized JSON map is parsed to the object shape
+		// webpack/rspack's callback expects, and forwarded as the third arg.
+		expect(map).toBeDefined()
+		const parsed = map as { version?: number; mappings?: string }
+		expect(parsed.version).toBe(3)
+		expect(typeof parsed.mappings).toBe('string')
 	})
 
 	it('passes through modules it does not own', () => {

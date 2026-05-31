@@ -12,7 +12,7 @@
  * call, sharing one compiler instance across invocations for cache reuse.
  */
 
-import { createTreatyCompiler, type TreatyCompiler } from '@treaty/compiler'
+import { createTreatyCompiler, type TransformResult, type TreatyCompiler } from '@treaty/compiler'
 import type { TreatyPluginOptions } from './options.js'
 import { toCompilerOptions } from './options.js'
 import { serverChunkFileName } from './server-chunks.js'
@@ -29,6 +29,33 @@ interface LoaderContext {
 	 * file (the body never enters the client bundle).
 	 */
 	emitFile?(name: string, content: string): void
+	/**
+	 * Webpack/Rspack synchronous result callback. The only loader contract that
+	 * can carry a source map alongside the emitted code: `callback(err, code, map)`.
+	 * Present on real loader contexts; declared optional so a minimal/test context
+	 * (which cannot forward a map) still drives the loader via its return value.
+	 */
+	callback?(
+		error: Error | null | undefined,
+		content?: string,
+		sourceMap?: unknown
+	): void
+}
+
+/**
+ * Parse the compiler's serialized Source Map v3 JSON into the object shape
+ * webpack/rspack's loader callback expects. Returns `undefined` when the
+ * transform produced no map, and forwards a non-JSON map string as-is rather
+ * than dropping it. CLIENT PRIVACY: any lifted server-fn body was already
+ * redacted from the map upstream, so forwarding it here leaks nothing.
+ */
+function parseMap(result: TransformResult): unknown {
+	if (result.map === undefined) return undefined
+	try {
+		return JSON.parse(result.map) as unknown
+	} catch {
+		return result.map
+	}
 }
 
 /**
@@ -58,12 +85,19 @@ function readOptions(ctx: LoaderContext): TreatyPluginOptions {
 
 /**
  * The loader entry point. Synchronous: the underlying compiler is synchronous,
- * so returning the transformed source directly is both correct and fastest.
+ * so the transformed source is produced in one call.
+ *
+ * When the transform yields a source map, it is forwarded through the loader's
+ * `this.callback(null, code, map)` contract (the only loader path that can carry
+ * a map) so downstream tooling receives the v3 map; the function returns nothing
+ * in that case. On a context without `callback` (a minimal/test context), or
+ * when there is no map, the emitted code is returned directly.
  *
  * @returns Emitted Ivy JS, or the original `source` for modules the compiler
- *   does not own (lets the bundler's normal pipeline handle them).
+ *   does not own (lets the bundler's normal pipeline handle them). Returns
+ *   `undefined` when the result was delivered via `this.callback`.
  */
-export default function treatyLoader(this: LoaderContext, source: string): string {
+export default function treatyLoader(this: LoaderContext, source: string): string | void {
 	const options = readOptions(this)
 	const compiler = compilerFor(options)
 	const result = compiler.transform(this.resourcePath, source)
@@ -75,6 +109,14 @@ export default function treatyLoader(this: LoaderContext, source: string): strin
 		for (const chunk of result.serverChunks) {
 			this.emitFile(serverChunkFileName(chunk.id), chunk.code)
 		}
+	}
+	// Forward the v3 source map through the loader callback when both the map and
+	// the callback are present — the bundler-native way to attach a map to a
+	// loader result. Otherwise (no map, or a minimal context) return the code.
+	const map = parseMap(result)
+	if (map !== undefined && typeof this.callback === 'function') {
+		this.callback(null, result.code, map)
+		return
 	}
 	return result.code
 }

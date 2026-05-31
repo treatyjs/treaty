@@ -9,6 +9,11 @@ export interface CompiledComponent {
   code: string
   /** Parse/transform diagnostics (empty on success). */
   errors: Array<string>
+  /**
+   * The additive Source Map v3 JSON mapping `code` back to the original source, or `undefined`
+   * when the underlying path produced no map (e.g. the template-only `compileComponent` entry).
+   */
+  map?: string
 }
 /**
  * Compile an Angular component template directly to Ivy via the Rust/OXC `render3` compiler.
@@ -21,9 +26,9 @@ export declare function compileComponent(template: string, selector: string, cla
  * Compile an Angular `@Component`/`@Directive` class directly from its TypeScript SOURCE.
  *
  * `source` is the full TS file (or snippet) containing exactly one decorated class. Returns the
- * emitted `ɵɵdefineComponent({...})` definition, or a `CompiledComponent` carrying a descriptive
- * error for shapes the source front-end does not yet support (providers, queries, host bindings,
- * `templateUrl`, multi-class files, etc.).
+ * emitted `ɵɵdefineComponent({...})` definition plus the additive Source Map v3 JSON (`map`), or a
+ * `CompiledComponent` carrying a descriptive error for shapes the source front-end does not yet
+ * support (providers, queries, host bindings, `templateUrl`, multi-class files, etc.).
  */
 export declare function compileComponentSource(source: string): CompiledComponent
 /**
@@ -48,6 +53,13 @@ export interface CompiledAuthoring {
   serverModule?: string
   /** Parse/transform diagnostics (empty on success). */
   errors: Array<string>
+  /**
+   * The additive Source Map v3 JSON mapping `code` back to the original authoring source, or
+   * `undefined` when the routed front-end produced no map. CLIENT PRIVACY: when a `server { … }`
+   * block was present, every lifted server-fn body has been redacted from the map's
+   * `sourcesContent` before this field is populated.
+   */
+  map?: string
 }
 /**
  * Unified per-file authoring compile: route `source` to the right front-end by `file_name`'s
@@ -91,6 +103,12 @@ export interface CompiledAuthoringEntry {
   serverModule?: string
   /** Parse/transform diagnostics (empty on success). */
   errors: Array<string>
+  /**
+   * The additive Source Map v3 JSON mapping `code` back to the original authoring source, or
+   * `undefined` when the routed front-end produced no map. Server-fn bodies are redacted from the
+   * map's `sourcesContent` (client privacy), exactly as for the single-file `compile` entry.
+   */
+  map?: string
 }
 /**
  * Compile many authoring files IN PARALLEL across all available cores.

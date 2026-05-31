@@ -176,6 +176,7 @@ pub fn compile_file(source: &str, file_name: &str) -> CompiledAuthoring {
             code: source.to_string(),
             server_module: None,
             errors: Vec::new(),
+            map: None,
         },
     }
 }

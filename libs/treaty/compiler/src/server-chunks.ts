@@ -389,3 +389,130 @@ export function buildServerFnManifest(
 function escapeRegExp(input: string): string {
 	return input.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
+
+/** The Source Map v3 shape this package inspects for the client-privacy guard. */
+interface SourceMapV3 {
+	readonly version?: number
+	readonly sources?: readonly unknown[]
+	readonly sourcesContent?: readonly unknown[]
+	readonly mappings?: unknown
+	readonly names?: readonly unknown[]
+}
+
+/** Outcome of {@link assertNoServerBodyInMap}: a pass, or the first leaked token. */
+export interface ServerBodyMapAudit {
+	/** `true` when the map carries no server-fn body text (or there is no map). */
+	readonly ok: boolean
+	/**
+	 * When `ok` is `false`, the first server-fn body token found in the map and
+	 * where it leaked (`sources` or `sourcesContent`); otherwise `undefined`.
+	 */
+	readonly leak?: { readonly token: string; readonly where: 'sources' | 'sourcesContent' }
+}
+
+/**
+ * Pull the distinctive, single-line body tokens out of a server-fn chunk's
+ * `code`. A token is a non-trivial trimmed line of the chunk that is NOT part of
+ * the shared backend scaffolding (imports/`use`, route registration, the fn's own
+ * signature/braces) — i.e. text that originated in the AUTHOR's server-fn body
+ * and therefore must never appear in the CLIENT map. Tokens shorter than four
+ * non-space characters are dropped to avoid matching incidental punctuation.
+ */
+function serverBodyTokens(chunkCode: string): string[] {
+	const tokens: string[] = []
+	for (const raw of chunkCode.split('\n')) {
+		const line = raw.trim()
+		if (line.length === 0) continue
+		// Skip scaffolding that is emitted by the backend, not authored in the body.
+		if (/^(?:import|export|use)\b/.test(line)) continue
+		if (/__server\//.test(line)) continue
+		if (/^(?:pub\s+)?(?:async\s+)?(?:function|fn)\b/.test(line)) continue
+		if (/^(?:#\[|\}|\{|\)|\];?|app\.|router\.|\.route\b)/.test(line)) continue
+		if (line.replace(/\s+/g, '').length < 4) continue
+		tokens.push(line)
+	}
+	return tokens
+}
+
+/**
+ * Client-privacy guard, used in tests: assert that none of a transform result's
+ * server-fn body text appears anywhere in its (client) source map.
+ *
+ * The Rust addon redacts every lifted server-fn body from the map's
+ * `sourcesContent` (blanking it to position-preserving whitespace) before the map
+ * reaches this package — see `redact_server_bodies_in_map`. This helper is the
+ * defensive end-to-end check of that contract: for a {@link TransformResult} that
+ * has `serverChunks`, it parses `result.map` (if present) as Source Map v3 and
+ * verifies that no distinctive body token from any chunk survives in the map's
+ * `sources` or `sourcesContent`.
+ *
+ * Returns `{ ok: true }` when the result has no map (nothing to leak), no
+ * `serverChunks` (no server bodies exist), or the map is clean. Returns
+ * `{ ok: false, leak }` naming the first leaked token and the field it was found
+ * in. A `map` that is not parseable v3 JSON is reported as a leak-free pass for
+ * the body check but flagged via {@link ServerBodyMapAudit} only when it actually
+ * contains a token (a malformed map cannot be trusted, so it is scanned as raw
+ * text too).
+ */
+export function assertNoServerBodyInMap(
+	result: Pick<TransformResult, 'map' | 'serverChunks'>
+): ServerBodyMapAudit {
+	const { map, serverChunks } = result
+	if (map === undefined || !serverChunks || serverChunks.length === 0) {
+		return { ok: true }
+	}
+
+	// Distinctive body tokens across every server-fn chunk.
+	const tokens = new Set<string>()
+	for (const chunk of serverChunks) {
+		for (const token of serverBodyTokens(chunk.code)) tokens.add(token)
+	}
+	if (tokens.size === 0) return { ok: true }
+
+	// Prefer structured inspection of the v3 sources/sourcesContent arrays; fall
+	// back to scanning the raw map text when it does not parse (an unparseable map
+	// is still untrusted, so any token in it is a leak).
+	let sources: string[] = []
+	let sourcesContent: string[] = []
+	let parsed = false
+	try {
+		const v3 = JSON.parse(map) as SourceMapV3
+		parsed = true
+		sources = (v3.sources ?? []).filter((s): s is string => typeof s === 'string')
+		sourcesContent = (v3.sourcesContent ?? []).filter((s): s is string => typeof s === 'string')
+	} catch {
+		parsed = false
+	}
+
+	for (const token of tokens) {
+		if (sources.some((s) => s.includes(token))) {
+			return { ok: false, leak: { token, where: 'sources' } }
+		}
+		if (sourcesContent.some((s) => s.includes(token))) {
+			return { ok: false, leak: { token, where: 'sourcesContent' } }
+		}
+		// Defensive: a non-v3-parseable map is scanned as raw text.
+		if (!parsed && map.includes(token)) {
+			return { ok: false, leak: { token, where: 'sourcesContent' } }
+		}
+	}
+	return { ok: true }
+}
+
+/**
+ * Whether `map` is structurally a valid Source Map v3 document: a JSON object
+ * with `version === 3`, a string `mappings`, and array `sources`. Used by the
+ * privacy test to assert the threaded map is well-formed before inspecting it.
+ */
+export function isValidSourceMapV3(map: string): boolean {
+	let v3: SourceMapV3
+	try {
+		v3 = JSON.parse(map) as SourceMapV3
+	} catch {
+		return false
+	}
+	if (v3 === null || typeof v3 !== 'object') return false
+	if (v3.version !== 3) return false
+	if (typeof v3.mappings !== 'string') return false
+	return Array.isArray(v3.sources)
+}

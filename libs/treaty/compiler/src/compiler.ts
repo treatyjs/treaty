@@ -286,18 +286,29 @@ export class TreatyCompiler {
 	 * declared server functions — decompose the single `serverModule` blob into
 	 * per-fn {@link ServerFnChunk}s so a bundler can code-split each fn into its
 	 * own loadable chunk. `serverModule` is retained as the back-compat blob.
+	 *
+	 * The additive Source Map v3 JSON the Rust addon produced (`compiled.map`) is
+	 * threaded onto the result unchanged. CLIENT PRIVACY: the addon has already
+	 * redacted every lifted server-fn body from the map's `sourcesContent`, so the
+	 * map shipped to the client never carries server-fn source text — see
+	 * {@link assertNoServerBodyInMap}, the test-time guard for this invariant.
 	 */
 	private postProcess(id: string, compiled: CompiledAuthoring): TransformResult {
 		let out = compiled.code
 		if (this.dropServerFns) out = dropUnusedServerFns(out)
 		if (this.annotatePure) out = annotatePureFactories(out)
+		const map = compiled.map
 		if (compiled.serverModule === undefined) {
-			return { code: out, sideEffects: false }
+			return map === undefined
+				? { code: out, sideEffects: false }
+				: { code: out, map, sideEffects: false }
 		}
 		const serverChunks = splitServerModule(id, compiled.serverModule)
-		return serverChunks.length > 0
-			? { code: out, serverModule: compiled.serverModule, serverChunks, sideEffects: false }
-			: { code: out, serverModule: compiled.serverModule, sideEffects: false }
+		const base: TransformResult =
+			serverChunks.length > 0
+				? { code: out, serverModule: compiled.serverModule, serverChunks, sideEffects: false }
+				: { code: out, serverModule: compiled.serverModule, sideEffects: false }
+		return map === undefined ? base : { ...base, map }
 	}
 
 	/** Index the importers a module references, for {@link onDelete}. */
