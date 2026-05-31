@@ -188,6 +188,18 @@ const PIPE_SLOT_PLACEHOLDER: usize = 1_000_000_000;
 /// and disjoint from the pipe placeholder so neither masks a genuine slot literal.
 const LOCAL_REF_SLOT_PLACEHOLDER: usize = 2_000_000_000;
 
+/// Placeholder a var (change-detection) offset carries during the walk until the view's two-pass
+/// var-offset assignment runs. The var offsets of `ɵɵpipeBindN` / `ɵɵarrowFunction` /
+/// `ɵɵpureFunctionN` cannot be assigned inline as each expression is lowered, because Angular
+/// (`var_counting.ts`) assigns them in a deferred per-view pass: first every top-level op reserves
+/// its var slots, THEN — in expression-traversal (post-order) order — pipes/arrows get offsets, and
+/// only AFTER that do pure functions get theirs (the historic two-pass behaviour the TDB emulates).
+/// So a var consumer reached during lowering emits `VAR_OFFSET_PLACEHOLDER + ordinal` for its offset
+/// argument; [`TemplateDefinitionBuilder::finalize_var_offsets`] resolves each ordinal to its real
+/// offset after the whole view is walked. Distinct, large, and disjoint from the slot placeholders so
+/// the remap never touches a genuine slot/offset literal.
+const VAR_OFFSET_PLACEHOLDER: usize = 3_000_000_000;
+
 /// One registered pipe usage collected during the view walk. Mirrors Angular's
 /// `PipeBindingExpr` bookkeeping (`pipe_creation.ts` records a `Pipe` create op per
 /// usage). Each distinct *usage* (not name) reserves its own creation slot + var
@@ -203,19 +215,73 @@ struct PendingPipe {
     /// inside the consuming element's creation block — e.g. between `ɵɵtext` and the element's
     /// `ɵɵdomElementEnd` — rather than appended at the end of the creation buffer.
     target_slot: usize,
+    /// A real data slot pre-assigned *positionally* during the walk, when the pipe's consuming op is
+    /// NOT the last data op (e.g. a pipe in a `@let result = x | pipe` value, whose consuming
+    /// `ɵɵdeclareLet` precedes later text/element slots). Angular allocates slots by walking the
+    /// final create-op list in order, so such a pipe takes the slot immediately after its consuming
+    /// op (shifting every later op up). `None` falls back to end-of-data-array allocation, which
+    /// coincides with the positional slot for the common case of a pipe consumed by a leaf op.
+    real_slot: Option<usize>,
 }
 
-/// Per-view pipe registry. Lives behind a [`std::cell::RefCell`] on the builder so
+/// One var (change-detection) slot consumer recorded during the walk, in expression-lowering
+/// (post-order) order. The var offset each consumer's instruction references is assigned in a
+/// deferred per-view pass ([`TemplateDefinitionBuilder::finalize_var_offsets`]) that mirrors Angular's
+/// `var_counting.ts`: pipes & arrows are assigned first (in this recorded order), pure functions
+/// second. `slots` is the number of var slots the consumer occupies (`varsUsedByOp` / `varsUsedByIrExpression`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VarConsumerKind {
+    /// `ɵɵpipeBindN` / `ɵɵpipeBindV` — first-pass, `1 + total_args` slots.
+    Pipe,
+    /// `ɵɵarrowFunction` — first-pass, `1` slot.
+    Arrow,
+    /// `ɵɵpureFunctionN` / `ɵɵpureFunctionV` — second-pass, `1 + num_args` slots.
+    Pure,
+    /// A `ɵɵstoreLet(value)` expression (an external `@let`) — first-pass, `1` slot
+    /// (`varsUsedByIrExpression` for `ExpressionKind.StoreLet` ⇒ `1`). It consumes a var slot for
+    /// change-detection but emits NO offset argument, so it only advances the assignment cursor
+    /// (nothing to patch). Recorded AFTER its value is lowered so — post-order, exactly like Angular —
+    /// any arrow / pure function the stored value contains is assigned its offset *before* the
+    /// enclosing `storeLet` takes its slot. This is what places `ɵɵarrowFunction` at the lower offset
+    /// in `@let theFn = (a, b) => …` (the arrow precedes the storeLet in the var sequence).
+    StoreLet,
+}
+
+/// A recorded var-slot consumer awaiting its deferred offset. `ordinal` is its position in the
+/// recorded sequence (the `VAR_OFFSET_PLACEHOLDER + ordinal` literal emitted in its instruction).
+#[derive(Debug, Clone, Copy)]
+struct VarConsumer {
+    kind: VarConsumerKind,
+    /// Number of var slots this consumer occupies.
+    slots: usize,
+}
+
+/// Per-view pipe + var-offset registry. Lives behind a [`std::cell::RefCell`] on the builder so
 /// the `&self` expression-lowering path ([`TemplateDefinitionBuilder::lower_expr`])
-/// can register pipes and reserve their var slots while lowering.
+/// can register pipes and var-slot consumers while lowering.
 #[derive(Debug, Default)]
 struct PipeState {
-    /// Registered usages, in source order; the index is the pipe's ordinal.
+    /// Registered pipe usages, in source order; the index is the pipe's ordinal.
     pending: Vec<PendingPipe>,
-    /// Running var-slot cursor, advanced by `1 + total_args` per pipe (Angular
-    /// `varsUsedByOp` for `PipeBinding`/`PipeBindingVariadic`). Seeded from the
-    /// builder's `binding_slots` when lowering begins and flushed back after.
-    var_cursor: usize,
+    /// Every var-slot consumer (pipe / arrow / pure function) reached during the walk, in
+    /// expression-lowering (post-order) order. Drives the deferred two-pass var-offset assignment
+    /// (`finalize_var_offsets`); the consumer's index is the ordinal its `VAR_OFFSET_PLACEHOLDER + n`
+    /// offset literal carries.
+    var_consumers: Vec<VarConsumer>,
+    /// View-global counter minting the shared-constant reference name for a hoisted pure-literal
+    /// factory (`$c0$`, `$c1$`, …). Persists across every binding of the view (the per-binding
+    /// expression converter is recreated each call, so the name counter must live here) so distinct
+    /// factories get distinct names — Angular keeps `null`, `[]`, and `{foo: a}` factories separate
+    /// (`getSharedConstant`). See [`BuilderPipes::intern_pure_function_factory`].
+    next_const_name: usize,
+    /// View-global counter minting the shared-function reference name for a hoisted arrow factory
+    /// (`$arrowFn0$`, `$arrowFn1$`, …) — a namespace independent of the `$cN$` pure-literal names
+    /// (Angular `getSharedFunctionReference`).
+    next_arrow_name: usize,
+    /// Interned factory bodies (kept for structural de-dup, mirroring `ConstantPool.getSharedConstant`
+    /// / `getSharedFunctionReference`, which return the SAME reference for an equivalent factory). Each
+    /// entry is `(factory_expr, reference_name)`; a structurally-equivalent factory reuses its name.
+    interned_factories: Vec<(Expr, String)>,
     /// The data slot of the creation op currently being bound (the text/element/anchor the binding
     /// under lowering targets). Set by [`TemplateDefinitionBuilder::lower_expr`] before each
     /// conversion so [`BuilderPipes::allocate_pipe`] can record it on the [`PendingPipe`]; that slot
@@ -230,46 +296,85 @@ struct BuilderPipes<'a> {
     state: &'a std::cell::RefCell<PipeState>,
 }
 
+impl BuilderPipes<'_> {
+    /// Record a var-slot consumer (pipe / arrow / pure function) reached during lowering and return
+    /// the *placeholder* var offset (`VAR_OFFSET_PLACEHOLDER + ordinal`) its instruction should carry.
+    /// The real offset is resolved later by [`TemplateDefinitionBuilder::finalize_var_offsets`], which
+    /// runs Angular's deferred two-pass assignment over the recorded sequence.
+    fn record_var_consumer(&self, kind: VarConsumerKind, slots: usize) -> usize {
+        let mut state = self.state.borrow_mut();
+        let ordinal = state.var_consumers.len();
+        state.var_consumers.push(VarConsumer { kind, slots });
+        VAR_OFFSET_PLACEHOLDER + ordinal
+    }
+}
+
 impl PipeSlotAllocator for BuilderPipes<'_> {
     fn allocate_pipe(&self, name: &str, total_args: usize) -> PipeSlots {
-        let mut state = self.state.borrow_mut();
-        let ordinal = state.pending.len();
-        let target_slot = state.current_target_slot;
-        state.pending.push(PendingPipe {
-            name: name.to_string(),
-            target_slot,
-        });
-        // Var slots: one change-detection slot plus one per lowered argument
-        // (`1 + args.length`), matching Angular `varsUsedByOp`.
-        let var_offset = state.var_cursor;
-        state.var_cursor += 1 + total_args;
+        let (ordinal, target_slot) = {
+            let mut state = self.state.borrow_mut();
+            let ordinal = state.pending.len();
+            let target_slot = state.current_target_slot;
+            state.pending.push(PendingPipe {
+                name: name.to_string(),
+                target_slot,
+                real_slot: None,
+            });
+            (ordinal, target_slot)
+        };
+        let _ = target_slot;
+        // Var slots: one change-detection slot plus one per lowered argument (`1 + args.length`,
+        // Angular `varsUsedByOp` for `PipeBinding`/`PipeBindingVariadic`). The offset is a deferred
+        // placeholder — pipes are first-pass var consumers, assigned in lowering (post-order) order.
+        let var_offset = self.record_var_consumer(VarConsumerKind::Pipe, 1 + total_args);
         PipeSlots {
             slot: PIPE_SLOT_PLACEHOLDER + ordinal,
             var_offset,
         }
     }
 
-    /// Reserve the single binding (var) slot a hoisted `ɵɵarrowFunction` consumes from this view's
-    /// shared var pool, returning its offset. Mirrors Angular `varsUsedByOp` ⇒ `1` for an
-    /// `ArrowFunction` IR expression (`var_counting.ts:186`). Drawn from the same `var_cursor` the
-    /// pipe / pure-function slots come from, so the view's `vars` total grows by one per hoisted
-    /// arrow and the offset follows the host binding's own slots in lowering order.
+    /// Record the single var slot a hoisted `ɵɵarrowFunction` consumes (Angular `varsUsedByOp` ⇒ `1`
+    /// for an `ArrowFunction` IR expression, `var_counting.ts:186`) and return its deferred placeholder
+    /// offset. Arrows are first-pass var consumers, assigned alongside pipes in lowering order.
     fn allocate_arrow_slot(&self) -> Option<usize> {
-        let mut state = self.state.borrow_mut();
-        let offset = state.var_cursor;
-        state.var_cursor += 1;
-        Some(offset)
+        Some(self.record_var_consumer(VarConsumerKind::Arrow, 1))
     }
 
-    /// Reserve the `1 + num_args` binding (var) slots a hoisted `ɵɵpureFunctionN` consumes from this
-    /// view's shared var pool, returning its offset. Mirrors Angular `varsUsedByOp` for a
-    /// `PureFunctionExpr` (`var_counting.ts:180`). Like the arrow / pipe slots, these are drawn from
-    /// `var_cursor` so the view's `vars` total reflects every extracted pure literal.
+    /// Record the `1 + num_args` var slots a hoisted `ɵɵpureFunctionN` consumes (Angular `varsUsedByOp`
+    /// for a `PureFunctionExpr`, `var_counting.ts:180`) and return its deferred placeholder offset. Pure
+    /// functions are SECOND-pass var consumers: every pipe/arrow in the view is assigned an offset
+    /// before any pure function (the TDB's lazy pure-function offset assignment).
     fn allocate_pure_function_slot(&self, num_args: usize) -> Option<usize> {
+        Some(self.record_var_consumer(VarConsumerKind::Pure, 1 + num_args))
+    }
+
+    /// Mint the shared-constant reference name for a hoisted factory, de-duping structurally
+    /// equivalent factories (Angular `ConstantPool.getSharedConstant` for pure-literal factories /
+    /// `getSharedFunctionReference` for arrow factories — both return the SAME reference for an
+    /// equivalent factory). Pure-literal factories get `$cN$` names, arrow factories `$arrowFnN$`,
+    /// from independent view-global counters so a view mixing both keeps two sequences. The counter
+    /// lives on the view's [`PipeState`] (not the per-binding converter, which is recreated each call),
+    /// so distinct factories across distinct bindings get distinct names.
+    fn intern_pure_function_factory(&self, factory: &Expr, is_arrow: bool) -> Option<String> {
         let mut state = self.state.borrow_mut();
-        let offset = state.var_cursor;
-        state.var_cursor += 1 + num_args;
-        Some(offset)
+        if let Some((_, name)) = state
+            .interned_factories
+            .iter()
+            .find(|(f, _)| f.is_equivalent(factory))
+        {
+            return Some(name.clone());
+        }
+        let name = if is_arrow {
+            let n = state.next_arrow_name;
+            state.next_arrow_name = n + 1;
+            format!("$arrowFn{n}$")
+        } else {
+            let n = state.next_const_name;
+            state.next_const_name = n + 1;
+            format!("$c{n}$")
+        };
+        state.interned_factories.push((factory.clone(), name.clone()));
+        Some(name)
     }
 }
 
@@ -412,15 +517,20 @@ impl LocalResolver for ListenerResolver<'_> {
         if name == EVENT_NAME {
             return Some(o::variable(EVENT_NAME, None));
         }
-        // A `@let` read in the handler resolves to its `ɵɵreadContextLet` local (loop vars first,
-        // since a `@for` item shadows everything).
+        // Inside a callback, EVERY in-scope `@let` is read through its `ɵɵreadContextLet` local —
+        // even one declared in THIS view — rather than its in-view `ɵɵstoreLet` local
+        // (`generate_variables.ts`: `scope.view !== view.xref || isCallback`). A `@let`'s in-view
+        // const is also recorded in `vars` (as a semantic local), so the `context_let_locals` lookup
+        // MUST take precedence over `vars` here, otherwise the handler would bind the storeLet temp
+        // instead of the `ɵɵreadContextLet` const.
+        if let Some((_, local)) = self.context_let_locals.iter().find(|(src, _)| src == name) {
+            return Some(o::variable(local.clone(), None));
+        }
+        // Otherwise a `@for` loop item / `$index` etc. resolves to its generated loop local.
         if let Some(v) = self.vars.iter().find(|v| v.source_name == name) {
             return Some(o::variable(v.local_name.clone(), None));
         }
-        self.context_let_locals
-            .iter()
-            .find(|(src, _)| src == name)
-            .map(|(_, local)| o::variable(local.clone(), None))
+        None
     }
 }
 
@@ -852,6 +962,11 @@ pub struct TemplateDefinitionBuilder {
     /// whether the prepended `ɵɵprojectionDef(...)` needs to be emitted in the no-specific-selector
     /// case.
     has_default_projection: bool,
+    /// The number of `<ng-content>` projection slots reached so far in this view. Angular's
+    /// `generateProjectionDefs` assigns every projection op a *unique ascending* `projectionSlotIndex`
+    /// (`op.projectionSlotIndex = projectionSlotIndex++`) — independent of selector dedup — so the
+    /// N-th `<ng-content>` (0-based) carries index N (`ɵɵprojection(slot, N)`, the `0` case elided).
+    projection_count: usize,
     /// Compilation mode for THIS view: `true` → Angular's `DomOnly` instruction family
     /// (`ɵɵdomElement*`/`ɵɵdomListener`/`ɵɵdomProperty`), `false` → the `Full` family
     /// (`ɵɵelement*`/`ɵɵlistener`/`ɵɵproperty`). Set from [`TemplateCompilationInput::dom_only`] and
@@ -896,6 +1011,7 @@ impl TemplateDefinitionBuilder {
             current_target_slot: 0,
             ng_content_selectors: Vec::new(),
             has_default_projection: false,
+            projection_count: 0,
             dom_only: input.dom_only,
         }
     }
@@ -917,14 +1033,13 @@ impl TemplateDefinitionBuilder {
     /// reached*, so a pipe's var offset follows the host binding's own slots — and a placeholder data
     /// slot finalised later by [`Self::finalize_pipes`].
     fn lower_expr(&mut self, node: &AstNode) -> Expr {
-        // Seed the pipe var cursor at the current binding-slot count: pipe change-detection slots are
-        // drawn from the same pool, immediately after the host binding's slots (Angular var_counting
-        // assigns offsets to bindings in op order). Also publish the consuming op's data slot so any
-        // pipe reached here records it (Angular `addPipeToCreationBlock` keys the create-op insertion
-        // point on the owning update op's `target`).
+        // Publish the consuming op's data slot so any pipe reached here records it (Angular
+        // `addPipeToCreationBlock` keys the create-op insertion point on the owning update op's
+        // `target`). Var (change-detection) offsets for pipes / arrows / pure functions are NOT
+        // assigned here — they are deferred to `finalize_var_offsets`, which runs Angular's two-pass
+        // per-view assignment after every top-level op has reserved its own var slots.
         {
             let mut pipes = self.pipes.borrow_mut();
-            pipes.var_cursor = self.binding_slots;
             pipes.current_target_slot = self.current_target_slot;
         }
 
@@ -960,11 +1075,7 @@ impl TemplateDefinitionBuilder {
         for stmt in converted.stmts {
             self.update_code.push(stmt);
         }
-        let expr = converted.expr;
-
-        // Flush any var slots the pipes consumed back into the view-wide binding-slot total.
-        self.binding_slots = self.pipes.borrow().var_cursor;
-        expr
+        converted.expr
     }
 
     /// The shared-context identifier (`ctx_r<level>`) for this embedded view — the `BindingScope`
@@ -1104,6 +1215,29 @@ impl TemplateDefinitionBuilder {
         }
     }
 
+    /// Pre-assign real, positional data slots to any pipes registered for the consuming op at
+    /// `target_slot` that have not yet been slotted, allocating a fresh data slot per pipe right now
+    /// (so subsequent nodes' slots shift up). Used for a `@let … = x | pipe` value whose consuming
+    /// `ɵɵdeclareLet` precedes later ops — Angular's in-order slot allocation places the `ɵɵpipe`
+    /// immediately after the `ɵɵdeclareLet`. Pipes sharing the op are slotted in registration order.
+    fn assign_positional_pipe_slots_for(&mut self, target_slot: usize) {
+        // Collect the ordinals of not-yet-slotted pipes for this op (immutable borrow first).
+        let ordinals: Vec<usize> = {
+            let state = self.pipes.borrow();
+            state
+                .pending
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.target_slot == target_slot && p.real_slot.is_none())
+                .map(|(i, _)| i)
+                .collect()
+        };
+        for ordinal in ordinals {
+            let real = self.allocate_data_slot();
+            self.pipes.borrow_mut().pending[ordinal].real_slot = Some(real);
+        }
+    }
+
     /// Finalise the pipe usages collected during the walk (`pipe_creation.ts` + `slot_allocation.ts`):
     /// allocate each pipe a data slot at the END of the data array (after every element/text/block
     /// slot), emit its `ɵɵpipe(slot, "name")` creation instruction, and patch the placeholder slots
@@ -1114,9 +1248,22 @@ impl TemplateDefinitionBuilder {
         if pending.is_empty() {
             return;
         }
-        // Pipe slots come after every other data slot in this view.
-        let pipe_base = self.data_index;
-        self.data_index += pending.len();
+        // Resolve each pipe's real data slot. A pipe whose consuming op was NOT the last data op got
+        // a slot pre-assigned *positionally* during the walk ([`PendingPipe::real_slot`], e.g. a pipe
+        // in a `@let … = x | pipe` value — the `ɵɵpipe` lands right after the `ɵɵdeclareLet`, ahead of
+        // later text/element slots). Every other pipe (the common leaf case) is allocated at the END
+        // of the data array, in registration order, which coincides with its positional slot there.
+        let mut slots = vec![0usize; pending.len()];
+        let mut pipe_base = self.data_index;
+        for (ordinal, pending_pipe) in pending.iter().enumerate() {
+            if let Some(real) = pending_pipe.real_slot {
+                slots[ordinal] = real;
+            } else {
+                slots[ordinal] = pipe_base;
+                pipe_base += 1;
+            }
+        }
+        self.data_index = pipe_base;
 
         // Insert each `ɵɵpipe(slot, "name")` create op into the creation block at the position
         // Angular's `addPipeToCreationBlock` picks: immediately after the create op that *consumes*
@@ -1128,7 +1275,7 @@ impl TemplateDefinitionBuilder {
         // `chain_statements` pass folds any resulting run of adjacent `ɵɵpipe` calls.
         let mut creation = std::mem::take(&mut self.creation_code);
         for (ordinal, pending_pipe) in pending.iter().enumerate() {
-            let slot = pipe_base + ordinal;
+            let slot = slots[ordinal];
             let pipe_op = instruction(
                 R3::Pipe,
                 vec![num(slot as f64), str_lit(&pending_pipe.name)],
@@ -1139,10 +1286,65 @@ impl TemplateDefinitionBuilder {
         }
         self.creation_code = creation;
 
-        // Patch placeholder slot literals in the update block to their real slots.
+        // Patch placeholder slot literals in the update block to their real slots (per-ordinal map).
         let mut update = std::mem::take(&mut self.update_code);
         for stmt in &mut update {
-            remap_pipe_slots_in_stmt(stmt, pipe_base);
+            remap_pipe_slots_in_stmt(stmt, &slots);
+        }
+        self.update_code = update;
+    }
+
+    /// Assign the deferred var (change-detection) offsets every pipe / arrow / pure-function consumer
+    /// reserved during the walk, faithful to Angular's two-pass `countVariables` (`var_counting.ts`):
+    ///
+    /// 1. Every top-level op has already reserved its own var slots in [`Self::binding_slots`] (via
+    ///    [`Self::allocate_binding_slots`], counted as the op was emitted) — this is the base offset.
+    /// 2. FIRST pass: walk the recorded consumers in lowering (post-order) order and assign offsets to
+    ///    every pipe and arrow (`hasUsesVarOffsetTrait`, skipping pure functions), advancing the cursor
+    ///    by each consumer's slot count.
+    /// 3. SECOND pass: walk the recorded consumers again, assigning offsets to the pure functions that
+    ///    were skipped (the TDB assigns pure-function offsets lazily, *after* every other binding).
+    ///
+    /// The cursor's final value is the view's total var count ([`Self::binding_slots`] is updated to
+    /// it, so [`Self::vars`] reports the full total). Each consumer's instruction was emitted with a
+    /// `VAR_OFFSET_PLACEHOLDER + ordinal` offset literal; here we build the ordinal→offset map and
+    /// patch the update block.
+    fn finalize_var_offsets(&mut self) {
+        let consumers = std::mem::take(&mut self.pipes.borrow_mut().var_consumers);
+        if consumers.is_empty() {
+            return;
+        }
+        // Base = every top-level op's reserved var slots (already in `binding_slots`).
+        let mut cursor = self.binding_slots;
+        let mut offsets = vec![0usize; consumers.len()];
+
+        // First pass: pipes, arrows, and storeLets, in recorded (post-order) order. (StoreLet consumes
+        // a slot but emits no offset argument, so its `offsets[ordinal]` is never read — it only
+        // advances the cursor, after any arrow/pure its value contained.)
+        for (ordinal, c) in consumers.iter().enumerate() {
+            if matches!(
+                c.kind,
+                VarConsumerKind::Pipe | VarConsumerKind::Arrow | VarConsumerKind::StoreLet
+            ) {
+                offsets[ordinal] = cursor;
+                cursor += c.slots;
+            }
+        }
+        // Second pass: pure functions, in recorded order (assigned only after every pipe/arrow).
+        for (ordinal, c) in consumers.iter().enumerate() {
+            if matches!(c.kind, VarConsumerKind::Pure) {
+                offsets[ordinal] = cursor;
+                cursor += c.slots;
+            }
+        }
+
+        // The view's full var total now includes every deferred consumer.
+        self.binding_slots = cursor;
+
+        // Patch every `VAR_OFFSET_PLACEHOLDER + ordinal` offset literal to its assigned offset.
+        let mut update = std::mem::take(&mut self.update_code);
+        for stmt in &mut update {
+            remap_placeholder_slots_in_stmt(stmt, VAR_OFFSET_PLACEHOLDER, &|ordinal| offsets[ordinal]);
         }
         self.update_code = update;
     }
@@ -1179,6 +1381,14 @@ impl TemplateDefinitionBuilder {
         self.bring_ancestor_lets_into_scope(&nodes);
 
         self.visit_all(&nodes);
+
+        // Assign the deferred var (change-detection) offsets for every pipe / arrow / pure-function
+        // consumer — Angular's two-pass `var_counting`. Runs after the whole view is walked (so every
+        // op has reserved its var slots). Resolves the `VAR_OFFSET_PLACEHOLDER` (3e9) offset literals
+        // to real small offsets BEFORE `finalize_pipes` runs, so the pipe-data-slot remap (which maps
+        // every literal `>= PIPE_SLOT_PLACEHOLDER` = 1e9) never mistakes a var-offset placeholder for a
+        // pipe data slot. Updates `binding_slots` to the full view var total.
+        self.finalize_var_offsets();
 
         // Allocate pipe data slots (at the END of the data array), emit their `ɵɵpipe(slot,"name")`
         // creation instructions, and patch the placeholder slots in the update block.
@@ -1417,16 +1627,16 @@ impl TemplateDefinitionBuilder {
             content.selector.clone()
         };
         let is_default = selector == "*";
-        let projection_index = if is_default {
-            0usize
-        } else if let Some(pos) = self.ng_content_selectors.iter().position(|s| s == &selector) {
-            pos + 1
-        } else {
-            self.ng_content_selectors.push(selector.clone());
-            self.ng_content_selectors.len()
-        };
+        // Angular's `generateProjectionDefs` assigns each `<ng-content>` op a *unique ascending*
+        // `projectionSlotIndex` (0-based, in create-block order), regardless of selector dedup.
+        let projection_index = self.projection_count;
+        self.projection_count += 1;
         if is_default {
             self.has_default_projection = true;
+        } else if !self.ng_content_selectors.iter().any(|s| s == &selector) {
+            // The projectionDef/ngContentSelectors selector list (a separate const-pool subsystem)
+            // records each specific selector once, in first-appearance order.
+            self.ng_content_selectors.push(selector.clone());
         }
 
         // Static attributes on the `<ng-content>` (e.g. `class="x"`) are interned like an element's.
@@ -1525,8 +1735,24 @@ impl TemplateDefinitionBuilder {
         for input in &element.inputs {
             if matches!(
                 input.kind,
-                BindingType::Class | BindingType::Style | BindingType::Attribute
+                BindingType::Class
+                    | BindingType::Style
+                    | BindingType::Attribute
+                    | BindingType::Animation
             ) {
+                // A modern animation binding (`animate.enter`/`[animate.enter]`) reifies to a
+                // create-block `ɵɵanimateEnter` op with NO const-pool entry (Angular's
+                // `convert_animations` removes the binding op; it never reaches
+                // `attribute_extraction`), so its name is not extracted under
+                // `AttributeMarker.Bindings`.
+                continue;
+            }
+            // A whole-element `[class]="exp"` / `[style]="exp"` binding becomes a `ClassMap`/
+            // `StyleMap` op (`style_binding_specialization.ts`), which — like ClassProp/StyleProp —
+            // is NOT a property and never extracts an `AttributeMarker.Bindings` name.
+            if matches!(input.kind, BindingType::Property | BindingType::TwoWay)
+                && (input.name == "class" || input.name == "style")
+            {
                 continue;
             }
             binding_names.push(input.name.clone());
@@ -1578,12 +1804,27 @@ impl TemplateDefinitionBuilder {
             self.build_listener(slot, &element.name, output);
         }
 
+        // Modern animation bindings (`animate.enter`/`[animate.leave]`) reify to a CREATE-block
+        // `ɵɵanimateEnter`/`ɵɵanimateLeave` op (Angular `convert_animations` inserts it right after
+        // the element op, removing the update binding), emitted here after the listeners and before
+        // the element's children. They reserve NO var slots and NO const-pool entry.
+        for input in &element.inputs {
+            if matches!(input.kind, BindingType::Animation) {
+                self.build_animation(input);
+            }
+        }
+
         // Update: `[name]="expr"` → binding instructions (`ɵɵdomProperty`/`ɵɵclassProp`/
         // `ɵɵstyleProp`/`ɵɵattribute`), each advancing to this slot first. The bindings are
         // re-ordered into Angular's fixed `UPDATE_ORDERING` groups (`phases/ordering.ts`):
         // style props, then class props, then (non-interpolation) properties, then attributes —
-        // a stable sort, so within a group source order is preserved.
-        let mut ordered: Vec<&BoundAttribute> = element.inputs.iter().collect();
+        // a stable sort, so within a group source order is preserved. Animation bindings are
+        // create-block ops (handled above) and are excluded from the update pass.
+        let mut ordered: Vec<&BoundAttribute> = element
+            .inputs
+            .iter()
+            .filter(|input| !matches!(input.kind, BindingType::Animation))
+            .collect();
         ordered.sort_by_key(|input| update_order_rank(input));
         for input in ordered {
             self.build_property(slot, input);
@@ -1800,10 +2041,17 @@ impl TemplateDefinitionBuilder {
             _ => 0,
         };
 
+        // A whole-element `[class]="exp"` / `[style]="exp"` binding (a `Property` whose name is
+        // exactly `class`/`style`) is specialized to a `ClassMap`/`StyleMap` op
+        // (`style_binding_specialization.ts`).
+        let is_style_or_class_map = matches!(input.kind, BindingType::Property | BindingType::TwoWay)
+            && (input.name == "class" || input.name == "style");
+
         // Reserve var slots per Angular `varsUsedByOp`: property/attribute = 1 (+N), class/style
-        // = 2 (+N).
+        // (ClassProp/StyleProp AND ClassMap/StyleMap) = 2 (+N).
         let base_vars = match input.kind {
             BindingType::Class | BindingType::Style => 2,
+            _ if is_style_or_class_map => 2,
             _ => 1,
         };
         self.allocate_binding_slots(base_vars + interp_extra);
@@ -1818,18 +2066,10 @@ impl TemplateDefinitionBuilder {
         // sub-expressions) into the update buffer ahead of the instruction we push below.
         let lowered = self.lower_expr(&input.value);
         match input.kind {
-            // Modern animation bindings (`[animate.enter]="exp"` / `[animate.leave]="exp"`) reify to
-            // the single-argument update instructions `ɵɵanimateEnter(<exp>)` / `ɵɵanimateLeave(<exp>)`
-            // (Angular 21 `animate*` family) — the binding name (`enter`/`leave`) selects the
-            // instruction rather than being passed as an argument.
-            BindingType::Animation => {
-                let reference = if input.name == "leave" {
-                    R3::AnimationLeave
-                } else {
-                    R3::AnimationEnter
-                };
-                self.update_code.push(instruction(reference, vec![lowered]));
-            }
+            // Modern animation bindings (`animate.enter`/`[animate.enter]`) are CREATE-block ops
+            // handled by `build_animation` (Angular `convert_animations` removes the update binding),
+            // so they never reach this update-pass lowering.
+            BindingType::Animation => {}
             // Legacy animation bindings (`[@trigger]="exp"`) reify to a DOM property whose name is the
             // synthetic, `@`-prefixed trigger name (`ɵɵdomProperty("@trigger", <exp>)`) — Angular's
             // `prepareSyntheticProperty` prefixes the trigger with `@`.
@@ -1837,6 +2077,17 @@ impl TemplateDefinitionBuilder {
                 let name = format!("@{}", input.name);
                 self.update_code
                     .push(instruction(R3::DomProperty, vec![str_lit(&name), lowered]));
+            }
+            BindingType::Property | BindingType::TwoWay if is_style_or_class_map => {
+                // Whole-element `[class]="exp"` / `[style]="exp"` reify to `ɵɵclassMap(exp)` /
+                // `ɵɵstyleMap(exp)` (`style_binding_specialization.ts` + `reify.ts`), with NO
+                // `AttributeMarker.Bindings` const entry and the value as a single argument.
+                let reference = if input.name == "style" {
+                    R3::StyleMap
+                } else {
+                    R3::ClassMap
+                };
+                self.update_code.push(instruction(reference, vec![lowered]));
             }
             BindingType::Property | BindingType::TwoWay => {
                 // A plain `[name]="expr"` property binding reifies to `ɵɵdomProperty` in DomOnly mode
@@ -1865,10 +2116,58 @@ impl TemplateDefinitionBuilder {
                     .push(instruction(R3::StyleProp, vec![str_lit(&input.name), lowered]));
             }
             BindingType::Attribute => {
-                self.update_code
-                    .push(instruction(R3::Attribute, vec![str_lit(&input.name), lowered]));
+                // `ɵɵattribute(name, value[, sanitizer])` — `resolve_sanitizers.ts` appends the
+                // security-context sanitizer when one applies. `[attr.style]` carries the STYLE
+                // context (→ `ɵɵsanitizeStyle`); URL-ish attributes carry URL/RESOURCE_URL. The
+                // attribute name drives the context the way Angular's schema does for the common
+                // cases (the upstream transform leaves `attr.*` context at `None`, so derive it here).
+                let mut params = vec![str_lit(&input.name), lowered];
+                if let Some(sanitizer) = attribute_sanitizer(&input.security_context, &input.name) {
+                    params.push(o::import_expr(sanitizer.reference(), None));
+                }
+                self.update_code.push(instruction(R3::Attribute, params));
             }
         }
+    }
+
+    /// Lower a modern animation binding (`animate.enter`/`[animate.enter]`,
+    /// `animate.leave`/`[animate.leave]`) into a CREATE-block `ɵɵanimateEnter`/`ɵɵanimateLeave` op
+    /// (Angular `convert_animations` inserts it right after the element op). Two shapes, per
+    /// `AnimationBindingKind`:
+    ///
+    /// - **STRING** (static `animate.enter="slide"`, the value is a string literal): the literal is
+    ///   passed directly — `ɵɵanimateEnter("slide")`.
+    /// - **VALUE** (`[animate.enter]="exp"`, a bound expression): the expression is wrapped in a
+    ///   zero-arg callback named `<viewFn>_<name-without-dot>_cb` (`naming.ts`) whose body
+    ///   `return`s the lowered expression — `ɵɵanimateEnter(function MyApp_Template_animateenter_cb() { return ctx.exp(); })`.
+    ///
+    /// Reserves NO var slots and emits NO const-pool entry (the binding name is not extracted under
+    /// `AttributeMarker.Bindings`).
+    fn build_animation(&mut self, input: &BoundAttribute) {
+        let reference = if input.name.ends_with("leave") {
+            R3::AnimationLeave
+        } else {
+            R3::AnimationEnter
+        };
+
+        // STRING form: the parsed value is a bare string literal (Angular's
+        // `AnimationBindingKind.STRING`, lifted from a static `animate.*="..."` attribute).
+        let arg = if let AstExprKind::LiteralPrimitive {
+            value: crate::expression::ast::LiteralValue::Str(s),
+        } = &input.value.kind
+        {
+            str_lit(s)
+        } else {
+            // VALUE form: wrap the lowered expression in a zero-arg `_cb` callback returning it.
+            // The expression lowers against this view's scope (`ctx` + any `@for` loop locals).
+            let lowered = self.lower_expr(&input.value);
+            // `naming.ts`: `${unit.fnName}_${name.replace('.', '')}_cb`.
+            let cb_name = format!("{}_{}_cb", self.name, input.name.replace('.', ""));
+            let body = vec![o::Stmt::bare(o::StmtKind::Return(lowered))];
+            o::fn_(vec![], body, None, Some(cb_name))
+        };
+
+        self.creation_code.push(instruction(reference, vec![arg]));
     }
 
     /// Lower a bound output (`(event)="handler"`) into a creation-block
@@ -2646,10 +2945,12 @@ impl TemplateDefinitionBuilder {
             None
         };
 
-        // An external let's `ɵɵstoreLet` reserves one var slot (`var_counting` `StoreLet` => 1).
-        if is_external {
-            self.allocate_binding_slots(1);
-        }
+        // An external let's `ɵɵstoreLet` reserves one var slot (`var_counting` `StoreLet` => 1). This
+        // slot is NOT counted as a top-level op var here: in Angular it is a first-pass *expression*
+        // consumer (`ExpressionKind.StoreLet`), assigned its slot in expression-traversal order —
+        // crucially AFTER any arrow / pure function nested in the stored value (post-order). It is
+        // therefore recorded as a deferred [`VarConsumerKind::StoreLet`] consumer right after the value
+        // is lowered (below), so the deferred two-pass assignment orders it correctly.
 
         // Advance to the let's slot before its update binding when it reserved one.
         if let Some(slot) = slot {
@@ -2677,10 +2978,30 @@ impl TemplateDefinitionBuilder {
 
         let value = self.lower_expr(&decl.value);
         let value = if is_external {
+            // Record the `ɵɵstoreLet` var-slot consumer AFTER the value was lowered, so any arrow /
+            // pure function inside the value is recorded (and thus assigned an offset) first — Angular's
+            // post-order var assignment. StoreLet emits no offset argument; it only advances the cursor.
+            self.pipes
+                .borrow_mut()
+                .var_consumers
+                .push(VarConsumer {
+                    kind: VarConsumerKind::StoreLet,
+                    slots: 1,
+                });
             o::import_expr(R3::StoreLet.reference(), None).call_fn(vec![value], false)
         } else {
             value
         };
+
+        // A pipe in the let's value (`@let result = one | double`) is consumed by this let's
+        // `ɵɵdeclareLet` op, which precedes any later text/element ops. Angular allocates data slots
+        // by walking the final create-op list in order, so the `ɵɵpipe` op takes the slot immediately
+        // after the `ɵɵdeclareLet` — shifting every later op up. Pre-assign those pipe slots
+        // positionally NOW (before the next node allocates its slot) so the order is
+        // `declareLet(N), pipe(N+1), <next op>(N+2)` and the subsequent `ɵɵadvance` counts are right.
+        if let Some(slot) = slot {
+            self.assign_positional_pipe_slots_for(slot);
+        }
 
         if used_in_view {
             // `const $<name>_<id>$ = <value-or-storeLet>;` — the in-view local for reads of this let.
@@ -2726,6 +3047,41 @@ impl TemplateDefinitionBuilder {
     /// `on` trigger (defaulting to `ɵɵdeferOnIdle()` when no concrete trigger is given). Deferred
     /// block bodies always compile DOM-only (`reify.ts`: block templates emit `ɵɵdomTemplate`).
     fn build_deferred_block(&mut self, deferred: &DeferredBlock) {
+        // Defer timing config arrays (`defer_configs.ts`): a `@placeholder (minimum Nms)` collects a
+        // `[minimumTime]` const, a `@loading (minimum / after)` a `[minimumTime, afterTime]` const.
+        // These are `ConstCollectedExpr`s gathered by `collectConstExpressions`, which runs BEFORE
+        // `collectElementConsts` — so a defer config const precedes every element-attrs const in the
+        // pool. Intern them HERE, before building the secondary views (whose element attrs would
+        // otherwise be interned first), so the pool order matches Angular
+        // (e.g. `consts: [[2000], ["src", "placeholder.gif"]]`).
+        let placeholder_config_index = deferred
+            .placeholder
+            .as_ref()
+            .and_then(|ph| ph.minimum_time)
+            .map(|t| {
+                let arr = o::literal_arr(vec![num(t)], None);
+                self.const_pool.intern(arr)
+            });
+        let loading_config_index = deferred.loading.as_ref().and_then(|ld| {
+            if ld.minimum_time.is_some() || ld.after_time.is_some() {
+                // `[minimumTime, afterTime]` — absent entries are `null` (kept; the array is 2-wide).
+                let arr = o::literal_arr(
+                    vec![
+                        ld.minimum_time.map(num).unwrap_or_else(o::null_expr),
+                        ld.after_time.map(num).unwrap_or_else(o::null_expr),
+                    ],
+                    None,
+                );
+                Some(self.const_pool.intern(arr))
+            } else {
+                None
+            }
+        });
+        // `enableTimerScheduling` is set whenever any timing config exists (`reify.ts`): the runtime
+        // needs the timer scheduler function passed as the final `ɵɵdefer` argument.
+        let enable_timer_scheduling = placeholder_config_index.is_some()
+            || loading_config_index.is_some();
+
         // Main deferred view — one data slot, named `<Base>_Defer_<mainSlot>_Template` (`naming.ts`).
         let main_slot = self.allocate_data_slot();
         let main_fn = format!("{}_Defer_{}_Template", self.base_name, main_slot);
@@ -2775,9 +3131,12 @@ impl TemplateDefinitionBuilder {
             emit_template(self, *s, r.clone(), *d, *v);
         }
 
-        // `ɵɵdefer(deferSlot, mainSlot, resolverFn, loadingSlot, placeholderSlot, errorSlot)` with
-        // trailing `null`s trimmed (`instruction.ts` `defer`). The basic block trims everything past
-        // `mainSlot`, leaving `ɵɵdefer(deferSlot, mainSlot)`.
+        // `ɵɵdefer(selfSlot, primarySlot, dependencyResolverFn, loadingSlot, placeholderSlot,
+        // errorSlot, loadingConfig, placeholderConfig, enableTimerScheduling, flags)` with trailing
+        // `null`s trimmed (`instruction.ts` `defer`). `loadingConfig`/`placeholderConfig` are the
+        // interned timing-config const indices; `enableTimerScheduling` becomes the
+        // `ɵɵdeferEnableTimerScheduling` import when any timing config is present (else `null`); the
+        // trailing `flags` arg is always `null` here (basic block).
         let mut defer_params = vec![
             num(defer_slot as f64),
             num(main_slot as f64),
@@ -2794,6 +3153,18 @@ impl TemplateDefinitionBuilder {
                 .as_ref()
                 .map(|(s, ..)| num(*s as f64))
                 .unwrap_or_else(o::null_expr),
+            loading_config_index
+                .map(|i| num(i as f64))
+                .unwrap_or_else(o::null_expr),
+            placeholder_config_index
+                .map(|i| num(i as f64))
+                .unwrap_or_else(o::null_expr),
+            if enable_timer_scheduling {
+                o::import_expr(R3::DeferEnableTimerScheduling.reference(), None)
+            } else {
+                o::null_expr()
+            },
+            o::null_expr(), // flags (TDeferDetailsFlags) — always null for a basic defer block.
         ];
         trim_trailing_nulls(&mut defer_params);
         self.creation_code.push(instruction(R3::Defer, defer_params));
@@ -3058,10 +3429,42 @@ fn single_root_tag(children: &[Node]) -> Expr {
 /// binding instructions for a single element are stable-sorted by this rank so style props precede
 /// class props precede (non-interpolation) properties precede attributes — matching Angular exactly.
 /// Interpolated `Attribute`/`Property` bindings sort into the earlier interpolation groups.
+/// The `ɵɵattribute(...)` sanitizer for a bound `[attr.name]` binding, per Angular's
+/// `resolve_sanitizers.ts` (the security context selects the sanitizer function). Returns `None`
+/// when no sanitization applies. The security context normally comes from the schema; the upstream
+/// transform records `None` for `attr.*`, so the well-known sanitized attribute names are recovered
+/// here (`style` → STYLE, URL/resource-URL attributes → URL) to match Angular's emitted output.
+fn attribute_sanitizer(
+    security_context: &crate::expression::ast::SecurityContext,
+    name: &str,
+) -> Option<R3> {
+    use crate::expression::ast::SecurityContext;
+    let ctx = match security_context {
+        SecurityContext::None => match name {
+            "style" => SecurityContext::Style,
+            _ => SecurityContext::None,
+        },
+        other => other.clone(),
+    };
+    match ctx {
+        SecurityContext::Style => Some(R3::SanitizeStyle),
+        SecurityContext::Html => Some(R3::SanitizeHtml),
+        SecurityContext::Script => Some(R3::SanitizeScript),
+        SecurityContext::Url => Some(R3::SanitizeUrl),
+        SecurityContext::ResourceUrl => Some(R3::SanitizeResourceUrl),
+        SecurityContext::None => None,
+    }
+}
+
 fn update_order_rank(input: &BoundAttribute) -> u8 {
     use crate::expression::ast::BindingType;
     let is_interp = matches!(input.value.kind, AstExprKind::Interpolation { .. });
     match input.kind {
+        // A whole-element `[style]="exp"` / `[class]="exp"` binding (a `Property` whose name is
+        // exactly `style`/`class`) is a StyleMap / ClassMap — Angular's `UPDATE_ORDERING` groups 0/1,
+        // ahead of the per-key StyleProp/ClassProp groups.
+        BindingType::Property | BindingType::TwoWay if input.name == "style" => 0,
+        BindingType::Property | BindingType::TwoWay if input.name == "class" => 1,
         BindingType::Style => 2,
         BindingType::Class => 3,
         BindingType::Attribute => {
@@ -3508,8 +3911,8 @@ fn interpolation_expression_count(value: &AstNode) -> usize {
 /// Rewrite every placeholder pipe-slot literal (`PIPE_SLOT_PLACEHOLDER + ordinal`) reachable from
 /// `stmt` to its real data slot (`pipe_base + ordinal`). Covers every [`StmtKind`] so a pipe binding
 /// is patched wherever it sits (it only appears in update-block expression statements in practice).
-fn remap_pipe_slots_in_stmt(stmt: &mut Stmt, pipe_base: usize) {
-    remap_placeholder_slots_in_stmt(stmt, PIPE_SLOT_PLACEHOLDER, &|ordinal| pipe_base + ordinal);
+fn remap_pipe_slots_in_stmt(stmt: &mut Stmt, slots: &[usize]) {
+    remap_placeholder_slots_in_stmt(stmt, PIPE_SLOT_PLACEHOLDER, &|ordinal| slots[ordinal]);
 }
 
 /// Rewrite every placeholder slot literal `>= placeholder` reachable from `stmt`, mapping its
@@ -3792,16 +4195,20 @@ mod tests {
     }
 
     #[test]
-    fn dom_only_property_remaps_class_to_class_name() {
-        // In DomOnly mode `[class]="x"` is remapped to the DOM property `className`
-        // (`reify.ts` `DOM_PROPERTY_REMAPPING`).
+    fn whole_element_class_binding_lowers_to_class_map() {
+        // A whole-element `[class]="x"` binding (a `Property` whose name is exactly `class`) is
+        // specialized to a `ɵɵclassMap(x)` op by `style_binding_specialization.ts` — which runs
+        // unconditionally, BEFORE the DomOnly `class`→`className` DOM-property remapping — so it is
+        // a ClassMap (NOT a `ɵɵdomProperty("className")`) even in DomOnly mode. (The `class_binding`
+        // compliance golden confirms: `[class]="myClassExp"` → `ɵɵclassMap(ctx.myClassExp)`.)
         let nodes = element_with_input("div", "class", BindingType::Property, prop_read("x"));
         let input = TemplateCompilationInput::new("Test_Template", nodes); // dom_only defaults to true
         let mut builder = TemplateDefinitionBuilder::new(&input);
         let func = builder.build_template_function(&input);
         let out = emit_expression(&func);
 
-        assert!(out.contains("\u{0275}\u{0275}domProperty(\"className\""), "got: {out}");
+        assert!(out.contains("\u{0275}\u{0275}classMap(ctx.x)"), "got: {out}");
+        assert!(!out.contains("\u{0275}\u{0275}domProperty"), "got: {out}");
     }
 
     #[test]
@@ -5400,7 +5807,7 @@ mod tests {
             attributes: vec![],
             inputs: vec![
                 BoundAttribute {
-                    name: "leave".to_string(),
+                    name: "animate.leave".to_string(),
                     kind: BindingType::Animation,
                     security_context: SecurityContext::None,
                     value: prop_read("exp"),
@@ -5438,9 +5845,15 @@ mod tests {
         let func = builder.build_template_function(&input);
         let out = emit_expression(&func);
 
-        // Modern animate binding → single-arg `ɵɵanimateLeave(ctx.exp)`.
-        assert!(out.contains("\u{0275}\u{0275}animateLeave(ctx.exp)"), "got: {out}");
-        // Legacy `[@trig]` → `ɵɵdomProperty("@trig", ctx.exp2)`.
+        // Modern `[animate.leave]="exp"` (a bound expression) → a CREATE-block `ɵɵanimateLeave`
+        // taking a zero-arg `_cb` callback returning the lowered expression (`convert_animations.ts`
+        // `AnimationBindingKind.VALUE`). It reserves no var slot and no const entry.
+        assert!(
+            out.contains("\u{0275}\u{0275}animateLeave(function Test_Template_animateleave_cb() {"),
+            "got: {out}"
+        );
+        assert!(out.contains("return ctx.exp;"), "got: {out}");
+        // Legacy `[@trig]` → update-block `ɵɵdomProperty("@trig", ctx.exp2)`.
         assert!(out.contains("\u{0275}\u{0275}domProperty(\"@trig\", ctx.exp2)"), "got: {out}");
     }
 }

@@ -161,7 +161,12 @@ pub trait PipeSlotAllocator {
     /// then emits the factory *inline* as the call argument (value-correct, but not byte-identical to
     /// Angular, which hoists it — hoisting requires the builder's const pool, which it owns). A
     /// builder wired to its const pool overrides this to intern `factory` and return its name.
-    fn intern_pure_function_factory(&self, _factory: &Expr) -> Option<String> {
+    ///
+    /// `is_arrow` distinguishes the two reference namespaces Angular keeps independent: an arrow
+    /// factory is hoisted as `$arrowFn{N}$` (`getSharedFunctionReference`), a pure-literal factory as
+    /// `$c{N}$` (`getSharedConstant`). The host needs this to mint the right name; the converter knows
+    /// the kind at the call site (it built the factory).
+    fn intern_pure_function_factory(&self, _factory: &Expr, _is_arrow: bool) -> Option<String> {
         None
     }
 }
@@ -1242,9 +1247,10 @@ impl<R: LocalResolver> Converter<'_, R> {
     /// the component definition (outside the `defineComponent` call this converter emits), so it is
     /// the view builder's job to materialise it; the converter only produces the reference.
     fn intern_factory(&self, factory: Expr, kind: FactoryKind) -> Expr {
+        let is_arrow = matches!(kind, FactoryKind::Arrow);
         if let Some(name) = self
             .pipes
-            .and_then(|p| p.intern_pure_function_factory(&factory))
+            .and_then(|p| p.intern_pure_function_factory(&factory, is_arrow))
         {
             return o::variable(name, None);
         }
@@ -1658,7 +1664,7 @@ mod tests {
         fn allocate_arrow_slot(&self) -> Option<usize> {
             Some(self.arrow_slot)
         }
-        fn intern_pure_function_factory(&self, factory: &Expr) -> Option<String> {
+        fn intern_pure_function_factory(&self, factory: &Expr, _is_arrow: bool) -> Option<String> {
             let mut interned = self.interned.borrow_mut();
             let n = interned.len();
             interned.push(factory.clone());
@@ -1691,7 +1697,7 @@ mod tests {
         fn allocate_pure_function_slot(&self, _num_args: usize) -> Option<usize> {
             Some(self.slot)
         }
-        fn intern_pure_function_factory(&self, _factory: &Expr) -> Option<String> {
+        fn intern_pure_function_factory(&self, _factory: &Expr, _is_arrow: bool) -> Option<String> {
             let n = self.next_const.get();
             self.next_const.set(n + 1);
             Some(format!("$c{n}$"))
