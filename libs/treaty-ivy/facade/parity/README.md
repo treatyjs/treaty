@@ -12,7 +12,7 @@ templates with **two** compilers and diffs the resulting Ivy
    `@treaty/authoring-node` NAPI addon:
    `compile_component(template, selector, className) -> { code, errors }`.
 
-It is **independent of the Rust crate** and never edits `libs/render3` source.
+It is **independent of the Rust crate** and never edits `libs/treaty-ivy` source.
 
 ## Fixtures
 
@@ -71,7 +71,7 @@ It is **independent of the Rust crate** and never edits `libs/render3` source.
 > The **i18n** fixtures follow the same apples-to-apples principle. The Rust
 > `compile_component` does **not** pass any i18n options, and its template transform
 > leaves i18n handling entirely **inert** (see the `NOTE(port)` in
-> `libs/render3/src/template/template_transform.rs`: "all i18n handling (root
+> `libs/treaty-ivy/template/src/template/template_transform.rs`: "all i18n handling (root
 > detection, ICU expansion) is inert"). It builds metadata with
 > `i18n_use_external_ids: false` and never enters an i18n block, so the `i18n` marker
 > is carried through as an ordinary static attribute — no `ɵɵi18n`/`ɵɵi18nStart`
@@ -131,7 +131,7 @@ configuration that currently fails:
 
 ```
 error[E0599]: no method named `convert_safe` found for `&mut Converter<'_, R>`
-   --> libs/render3/src/expression_converter.rs:319 / :332
+   --> libs/treaty-ivy/core/src/expression_converter.rs:319 / :332
 ```
 
 (The older break the previous notes mentioned in `output/emitter.rs` is gone;
@@ -143,7 +143,7 @@ break is in the Rust crate, which this task must not modify.
 ## Run
 
 ```sh
-node libs/render3/parity/parity.mjs
+node libs/treaty-ivy/facade/parity/parity.mjs
 ```
 
 Exit code: `0` when every comparison passes (or the addon is unavailable and the
@@ -168,7 +168,7 @@ trails Angular 21:
 Divergence #1 is the **first** reported diff for `static-element`, `nested`,
 `attribute`; divergences #2/#3 dominate the interpolation fixtures. The `vars: 0`
 issue is the documented `R3BoundTarget` binding-slot-counting `NOTE(port)` TODO
-in `libs/render3/src/compile.rs`.
+in `libs/treaty-ivy/facade/src/compile.rs`.
 
 Example raw report (first divergence windows):
 

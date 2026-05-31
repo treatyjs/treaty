@@ -243,7 +243,7 @@ const FIXTURES = [
   // Fifth batch: i18n. A `<div i18n>...</div>` MARKS the element for translation.
   // Crucially, the Rust `compile_component` does NOT pass any i18n options and its
   // template transform leaves i18n handling entirely INERT — see the NOTE(port) in
-  // libs/render3/src/template/template_transform.rs:44 ("all i18n handling (root
+  // libs/treaty-ivy/template/src/template/template_transform.rs:44 ("all i18n handling (root
   // detection, ICU expansion) is inert (`None`)") and compile.rs, which builds its
   // metadata with `i18n_use_external_ids: false` and never enables i18n. The Rust
   // side therefore treats the `i18n` marker as a PLAIN static attribute named
