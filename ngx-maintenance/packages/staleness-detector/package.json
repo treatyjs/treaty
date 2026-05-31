@@ -1,9 +1,9 @@
 {
-  "name": "@ngx-maintenance/migration-engine",
+  "name": "@ngx-maintenance/staleness-detector",
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Deterministic Angular migration chain (vX..latest via official ng update schematics + VE->Ivy + curated codemods).",
+  "description": "Pure (no-AI, no-network) staleness + discovery predicates, takeover-planning rules, and migration-step sequencing for the ngx-maintenance bot.",
   "main": "./src/index.ts",
   "types": "./src/index.ts",
   "exports": {

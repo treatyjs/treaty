@@ -1,0 +1,14 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "typeRoots": ["../../types"],
+    "paths": {
+      "@ngx-maintenance/migration-engine": [
+        "../migration-engine/src/index.ts"
+      ],
+      "@ngx-maintenance/takeover": ["../takeover/src/index.ts"]
+    }
+  },
+  "include": ["src/**/*.ts", "../../types/**/*.d.ts"]
+}

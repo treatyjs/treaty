@@ -12,7 +12,10 @@
  * tooling stays here).
  *
  * Everything is a deterministic function of timestamps and boolean activity
- * signals.
+ * signals. The core emits SPECS only; the real fork, npm publish and
+ * standalone-repo creation run out-of-band behind the injected
+ * {@link GithubAdapter} ({@link runTakeover} gates them on the policy
+ * decision), so the orchestration is unit-tested with a fake adapter.
  */
 
 export type {
@@ -43,3 +46,15 @@ export {
   scopedName,
   bareName,
 } from "./plan.js";
+
+export type {
+  GithubAdapter,
+  ForkInput,
+  ForkResult,
+  CreateRepoResult,
+  PublishInput,
+  PublishResult,
+  TakeoverExecution,
+  TakeoverRun,
+} from "./adapter.js";
+export { executeTakeover, runTakeover } from "./adapter.js";

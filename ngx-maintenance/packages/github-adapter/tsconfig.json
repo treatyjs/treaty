@@ -2,8 +2,11 @@
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
     "noEmit": true,
-    "rootDir": ".",
-    "types": ["node"]
+    "types": ["node"],
+    "paths": {
+      "@ngx-maintenance/migration-engine": ["../migration-engine/src/index.ts"],
+      "@ngx-maintenance/takeover": ["../takeover/src/index.ts"]
+    }
   },
   "include": [
     "src/**/*.ts",
