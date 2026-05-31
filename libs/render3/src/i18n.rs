@@ -492,6 +492,113 @@ pub fn placeholder_values_to_param(values: &[String]) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// I18nParamValue + formatValue/formatParamValues
+//
+// Ported from `template/pipeline/src/phases/extract_i18n_messages.ts`
+// (`formatValue`, `formatParamValues`) plus the `I18nParamValueFlags` enum
+// (`ir/src/enums.ts`). A `TagPlaceholder` / `BlockPlaceholder`'s runtime
+// substitution value is the sentinel `�{closeMarker}{tagMarker}{slot}{:subTemplateIndex}�`,
+// where the tag marker is `#` for an element and `*` for a template/block, the close
+// marker is `/`, and the context (`:n`) is the sub-template index (null at root).
+// ---------------------------------------------------------------------------
+
+/// `ir/src/enums.ts` `I18nParamValueFlags` — the bit flags encoding how a placeholder's
+/// runtime value is serialized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct I18nParamValueFlags(pub u8);
+
+impl I18nParamValueFlags {
+    pub const NONE: I18nParamValueFlags = I18nParamValueFlags(0b0000);
+    pub const ELEMENT_TAG: I18nParamValueFlags = I18nParamValueFlags(0b0001);
+    pub const TEMPLATE_TAG: I18nParamValueFlags = I18nParamValueFlags(0b0010);
+    pub const OPEN_TAG: I18nParamValueFlags = I18nParamValueFlags(0b0100);
+    pub const CLOSE_TAG: I18nParamValueFlags = I18nParamValueFlags(0b1000);
+
+    pub fn contains(self, other: I18nParamValueFlags) -> bool {
+        (self.0 & other.0) != 0
+    }
+
+    pub fn without(self, other: I18nParamValueFlags) -> I18nParamValueFlags {
+        I18nParamValueFlags(self.0 & !other.0)
+    }
+}
+
+impl std::ops::BitOr for I18nParamValueFlags {
+    type Output = I18nParamValueFlags;
+    fn bitor(self, rhs: I18nParamValueFlags) -> I18nParamValueFlags {
+        I18nParamValueFlags(self.0 | rhs.0)
+    }
+}
+
+/// One placeholder runtime value (`ir.I18nParamValue`). `value` is the data slot of the
+/// element/template the placeholder points at; `sub_template_index` is the child-view index
+/// (`None` at root); `flags` encode the tag/close markers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct I18nParamValue {
+    pub value: usize,
+    pub sub_template_index: Option<usize>,
+    pub flags: I18nParamValueFlags,
+}
+
+/// `extract_i18n_messages.ts` `formatValue` — serialize one `I18nParamValue` into its runtime
+/// magic-string form.
+pub fn format_value(value: &I18nParamValue) -> String {
+    const ESCAPE: char = '\u{FFFD}';
+    const ELEMENT_MARKER: &str = "#";
+    const TEMPLATE_MARKER: &str = "*";
+    const TAG_CLOSE_MARKER: &str = "/";
+
+    // Self-closing tags concatenate the start and close tag values.
+    if value.flags.contains(I18nParamValueFlags::OPEN_TAG)
+        && value.flags.contains(I18nParamValueFlags::CLOSE_TAG)
+    {
+        let open = I18nParamValue {
+            flags: value.flags.without(I18nParamValueFlags::CLOSE_TAG),
+            ..value.clone()
+        };
+        let close = I18nParamValue {
+            flags: value.flags.without(I18nParamValueFlags::OPEN_TAG),
+            ..value.clone()
+        };
+        return format!("{}{}", format_value(&open), format_value(&close));
+    }
+
+    if value.flags == I18nParamValueFlags::NONE {
+        return value.value.to_string();
+    }
+
+    let mut tag_marker = "";
+    let mut close_marker = "";
+    if value.flags.contains(I18nParamValueFlags::ELEMENT_TAG) {
+        tag_marker = ELEMENT_MARKER;
+    } else if value.flags.contains(I18nParamValueFlags::TEMPLATE_TAG) {
+        tag_marker = TEMPLATE_MARKER;
+    }
+    if !tag_marker.is_empty() && value.flags.contains(I18nParamValueFlags::CLOSE_TAG) {
+        close_marker = TAG_CLOSE_MARKER;
+    }
+    let context = match value.sub_template_index {
+        None => String::new(),
+        Some(idx) => format!(":{idx}"),
+    };
+    format!("{ESCAPE}{close_marker}{tag_marker}{}{context}{ESCAPE}", value.value)
+}
+
+/// `extract_i18n_messages.ts` `formatParamValues` — serialize an `I18nParamValue[]` into a single
+/// string (lone value verbatim, or the merged `[a|b|…]` form for >1).
+pub fn format_param_values(values: &[I18nParamValue]) -> Option<String> {
+    if values.is_empty() {
+        return None;
+    }
+    let serialized: Vec<String> = values.iter().map(format_value).collect();
+    Some(if serialized.len() == 1 {
+        serialized.into_iter().next().unwrap()
+    } else {
+        format!("[{}]", serialized.join("|"))
+    })
+}
+
+// ---------------------------------------------------------------------------
 // i18n meta parsing — ported from render3/view/i18n/meta.ts
 // ---------------------------------------------------------------------------
 
@@ -1163,6 +1270,86 @@ mod tests {
         // The decimal digest is computed over the UID serialization (stable, decimal).
         let id = msg.decimal_digest();
         assert!(id.chars().all(|c| c.is_ascii_digit()) && !id.is_empty());
+    }
+
+    #[test]
+    fn format_value_tag_and_block_sentinels() {
+        use I18nParamValueFlags as F;
+        // Element open tag inside sub-template 1 at slot 1: `�#1:1�`.
+        assert_eq!(
+            format_value(&I18nParamValue {
+                value: 1,
+                sub_template_index: Some(1),
+                flags: F::ELEMENT_TAG | F::OPEN_TAG,
+            }),
+            "\u{FFFD}#1:1\u{FFFD}"
+        );
+        // Element close tag: `�/#1:1�`.
+        assert_eq!(
+            format_value(&I18nParamValue {
+                value: 1,
+                sub_template_index: Some(1),
+                flags: F::ELEMENT_TAG | F::CLOSE_TAG,
+            }),
+            "\u{FFFD}/#1:1\u{FFFD}"
+        );
+        // Template (block) open tag at slot 3, sub-template 1: `�*3:1�`.
+        assert_eq!(
+            format_value(&I18nParamValue {
+                value: 3,
+                sub_template_index: Some(1),
+                flags: F::TEMPLATE_TAG | F::OPEN_TAG,
+            }),
+            "\u{FFFD}*3:1\u{FFFD}"
+        );
+        // Template close at slot 4, sub-template 2: `�/*4:2�`.
+        assert_eq!(
+            format_value(&I18nParamValue {
+                value: 4,
+                sub_template_index: Some(2),
+                flags: F::TEMPLATE_TAG | F::CLOSE_TAG,
+            }),
+            "\u{FFFD}/*4:2\u{FFFD}"
+        );
+        // No flags ⇒ raw value (an expression index at the root): `0`.
+        assert_eq!(
+            format_value(&I18nParamValue {
+                value: 0,
+                sub_template_index: None,
+                flags: F::NONE,
+            }),
+            "0"
+        );
+        // Self-closing (void) element ⇒ concatenated open+close: `�#1:1��/#1:1�`.
+        assert_eq!(
+            format_value(&I18nParamValue {
+                value: 1,
+                sub_template_index: Some(1),
+                flags: F::ELEMENT_TAG | F::OPEN_TAG | F::CLOSE_TAG,
+            }),
+            "\u{FFFD}#1:1\u{FFFD}\u{FFFD}/#1:1\u{FFFD}"
+        );
+    }
+
+    #[test]
+    fn format_param_values_single_and_merged() {
+        use I18nParamValueFlags as F;
+        let a = I18nParamValue {
+            value: 1,
+            sub_template_index: Some(1),
+            flags: F::ELEMENT_TAG | F::OPEN_TAG,
+        };
+        let b = I18nParamValue {
+            value: 1,
+            sub_template_index: Some(1),
+            flags: F::ELEMENT_TAG | F::CLOSE_TAG,
+        };
+        assert_eq!(format_param_values(&[]), None);
+        assert_eq!(format_param_values(&[a.clone()]), Some("\u{FFFD}#1:1\u{FFFD}".to_string()));
+        assert_eq!(
+            format_param_values(&[a, b]),
+            Some("[\u{FFFD}#1:1\u{FFFD}|\u{FFFD}/#1:1\u{FFFD}]".to_string())
+        );
     }
 
     #[test]

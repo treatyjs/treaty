@@ -658,6 +658,10 @@ fn trim_trailing_nulls(params: &mut Vec<Expr>) {
 struct I18nInterpolation {
     expr: AstNode,
     placeholder_name: String,
+    /// The sub-template index of the view this interpolation belongs to (`None` = root i18n block).
+    sub_template_index: Option<usize>,
+    /// This interpolation's expression index WITHIN its view (the `n` of the `�n�`/`�n:sub�` value).
+    expr_index_in_view: usize,
 }
 
 /// Faithful i18n message collector — the owned analogue of `i18n_parser.ts`'s `_I18nVisitor`.
@@ -670,6 +674,14 @@ struct I18nCollector {
     nodes: Vec<crate::i18n::Node>,
     exprs: Vec<I18nInterpolation>,
     registry: crate::i18n::PlaceholderRegistry,
+    /// The sub-template index of the view currently being walked (`None` = root i18n block view).
+    current_sub: Option<usize>,
+    /// The next sub-template index to hand out (DFS order; first child view ⇒ 1). Shared across the
+    /// whole collection so it matches the sentinel resolver / real create-walk numbering.
+    next_sub: usize,
+    /// Per-view expression counter (keyed by sub-template index), so each interpolation gets its
+    /// view-local `n` for the `�n�`/`�n:sub�` runtime value.
+    expr_counts: std::collections::HashMap<Option<usize>, usize>,
 }
 
 impl I18nCollector {
@@ -678,6 +690,9 @@ impl I18nCollector {
             nodes: Vec::new(),
             exprs: Vec::new(),
             registry: crate::i18n::PlaceholderRegistry::new(),
+            current_sub: None,
+            next_sub: 1,
+            expr_counts: std::collections::HashMap::new(),
         }
     }
 
@@ -717,6 +732,18 @@ impl I18nCollector {
             Node::Content(c) => {
                 // `<ng-content>` projects: its tag is `ng-content` (never void here).
                 self.push_tag_placeholder(Content::NAME, &[], false, &c.children);
+            }
+            Node::Template(t) => {
+                // `<ng-template>` inside i18n: a `START_TAG_NG_TEMPLATE`/`CLOSE_TAG_NG_TEMPLATE`
+                // placeholder whose children are the template's own (sub-template) content
+                // (`i18n_parser.ts` `_visitElementLike` over the desugared template node). The
+                // children belong to a NEW sub-template view, so bump + switch `current_sub`.
+                let tag = t
+                    .tag_name
+                    .clone()
+                    .unwrap_or_else(|| "ng-template".to_string());
+                let attrs = static_attr_pairs(&t.attributes);
+                self.push_tag_placeholder_sub(&tag, &attrs, false, &t.children);
             }
             Node::IfBlock(b) => self.visit_if_block(b),
             Node::SwitchBlock(b) => self.visit_switch_block(b),
@@ -770,9 +797,14 @@ impl I18nCollector {
             value: normalized,
             name: name.clone(),
         }));
+        let idx = self.expr_counts.entry(self.current_sub).or_insert(0);
+        let expr_index_in_view = *idx;
+        *idx += 1;
         self.exprs.push(I18nInterpolation {
             expr: expr.clone(),
             placeholder_name: name,
+            sub_template_index: self.current_sub,
+            expr_index_in_view,
         });
     }
 
@@ -801,6 +833,66 @@ impl I18nCollector {
             children: collected,
             is_void,
         }));
+    }
+
+    /// As [`Self::push_tag_placeholder`], but the children belong to a NEW sub-template view
+    /// (`<ng-template>` inside i18n): allocate the next sub-template index and switch `current_sub`
+    /// while collecting them, so interpolations inside resolve to `�n:subIdx�`.
+    fn push_tag_placeholder_sub(
+        &mut self,
+        tag: &str,
+        attrs: &[(String, String)],
+        is_void: bool,
+        children: &[Node],
+    ) {
+        use crate::i18n;
+        let start_name = self.registry.start_tag_placeholder_name(tag, attrs, is_void);
+        let saved_sub = self.current_sub;
+        let sub = self.next_sub;
+        self.next_sub += 1;
+        self.current_sub = Some(sub);
+        let collected = self.collect_children(children);
+        self.current_sub = saved_sub;
+        let close_name = if is_void {
+            String::new()
+        } else {
+            self.registry.close_tag_placeholder_name(tag)
+        };
+        self.nodes.push(i18n::Node::TagPlaceholder(i18n::TagPlaceholder {
+            tag: tag.to_string(),
+            start_name,
+            close_name,
+            children: collected,
+            is_void,
+        }));
+    }
+
+    /// As [`Self::push_block_placeholder`], but the children belong to a NEW sub-template view (a
+    /// control-flow body / branch / case): allocate the next sub-template index and switch
+    /// `current_sub` while collecting them.
+    fn push_block_placeholder_sub(
+        &mut self,
+        name: &str,
+        parameters: Vec<String>,
+        children: &[Node],
+    ) {
+        use crate::i18n;
+        let start_name = self.registry.start_block_placeholder_name(name, &parameters);
+        let saved_sub = self.current_sub;
+        let sub = self.next_sub;
+        self.next_sub += 1;
+        self.current_sub = Some(sub);
+        let collected = self.collect_children(children);
+        self.current_sub = saved_sub;
+        let close_name = self.registry.close_block_placeholder_name(name);
+        self.nodes
+            .push(i18n::Node::BlockPlaceholder(i18n::BlockPlaceholder {
+                name: name.to_string(),
+                parameters,
+                start_name,
+                close_name,
+                children: collected,
+            }));
     }
 
     /// Emit a `BlockPlaceholder` for one control-flow branch/case/body (`visitBlock`): a
@@ -878,9 +970,9 @@ impl I18nCollector {
     fn visit_for_block(&mut self, block: &ForLoopBlock) {
         let expr_src = ast_to_source(&block.expression.ast);
         let param = format!("{} of {}", block.item.name, expr_src);
-        self.push_block_placeholder("for", vec![param], &block.children);
+        self.push_block_placeholder_sub("for", vec![param], &block.children);
         if let Some(empty) = &block.empty {
-            self.push_block_placeholder("empty", Vec::new(), &empty.children);
+            self.push_block_placeholder_sub("empty", Vec::new(), &empty.children);
         }
     }
 
@@ -918,9 +1010,14 @@ impl I18nCollector {
         for (_, bt) in &icu.vars {
             if let AstExprKind::Interpolation { expressions, .. } = &bt.value.kind {
                 for e in expressions {
+                    let idx = self.expr_counts.entry(self.current_sub).or_insert(0);
+                    let expr_index_in_view = *idx;
+                    *idx += 1;
                     self.exprs.push(I18nInterpolation {
                         expr: e.clone(),
                         placeholder_name: name.clone(),
+                        sub_template_index: self.current_sub,
+                        expr_index_in_view,
                     });
                 }
             }
@@ -929,6 +1026,304 @@ impl I18nCollector {
             value: inner,
             name,
         }));
+    }
+}
+
+/// A thin alias so the i18n block resolver and the message collector share ONE placeholder-naming
+/// scheme: identical walk order + the same [`crate::i18n::PlaceholderRegistry`] ⇒ identical names.
+type PlaceholderRegistryShim = crate::i18n::PlaceholderRegistry;
+
+/// Resolves the slot-based sentinel runtime values (`�*3:1�`, `�#1:1�`, …) for the `TagPlaceholder`
+/// / `BlockPlaceholder` nodes of an `i18n` block, by simulating the create-op slot allocation and
+/// sub-template-index (DFS) numbering the block emission will perform.
+///
+/// It walks the same node tree, in the same order, with the same [`crate::i18n::PlaceholderRegistry`]
+/// as [`I18nCollector`], so the placeholder NAMES it keys sentinels by are byte-identical. For each
+/// nested element it records `#<slot>` (element marker); for each `<ng-template>` / control-flow body
+/// it records `*<slot>` (template marker) against a freshly-allocated sub-template index. Returns
+/// `None` for any shape it cannot model (so the caller can fall back to omitting sentinels).
+struct I18nSentinelResolver {
+    /// Per-placeholder-name accumulated `I18nParamValue`s, in first-seen order.
+    order: Vec<String>,
+    values: std::collections::HashMap<String, Vec<crate::i18n::I18nParamValue>>,
+    /// Original-code fragments per placeholder name (first-seen wins).
+    original: std::collections::HashMap<String, String>,
+    /// The next sub-template index to hand out (root block is `None`; first child view ⇒ 1).
+    next_sub_template_index: usize,
+    /// `@let` names that reserve a `ɵɵdeclareLet` data slot (external / pipe-bearing), so the
+    /// resolver advances the slot counter past them before the next anchor (matching create order).
+    slot_lets: std::collections::HashSet<String>,
+}
+
+impl I18nSentinelResolver {
+    fn new(slot_lets: std::collections::HashSet<String>) -> Self {
+        I18nSentinelResolver {
+            order: Vec::new(),
+            values: std::collections::HashMap::new(),
+            original: std::collections::HashMap::new(),
+            next_sub_template_index: 1,
+            slot_lets,
+        }
+    }
+
+    fn record(
+        &mut self,
+        name: &str,
+        value: crate::i18n::I18nParamValue,
+        original_code: String,
+    ) {
+        if !self.values.contains_key(name) {
+            self.order.push(name.to_string());
+            self.original.insert(name.to_string(), original_code);
+        }
+        self.values.entry(name.to_string()).or_default().push(value);
+    }
+
+    fn into_ordered_params(
+        self,
+    ) -> Vec<(String, Vec<crate::i18n::I18nParamValue>, String)> {
+        let I18nSentinelResolver {
+            order,
+            mut values,
+            mut original,
+            ..
+        } = self;
+        order
+            .into_iter()
+            .map(|name| {
+                let vals = values.remove(&name).unwrap_or_default();
+                let orig = original.remove(&name).unwrap_or_default();
+                (name, vals, orig)
+            })
+            .collect()
+    }
+
+    /// Walk a sibling list in the CURRENT view (sub-template `cur_sub`), allocating slots from
+    /// `*slot`. Returns `Some(())` on success, `None` if an unmodelled shape is reached.
+    fn resolve_siblings(
+        &mut self,
+        nodes: &[Node],
+        reg: &mut PlaceholderRegistryShim,
+        first_slot: usize,
+    ) -> Option<()> {
+        // The root block view: the i18n block sits at `first_slot - 1`; its bracketed children
+        // allocate from `first_slot`. Root content carries no sub-template index.
+        let mut slot = first_slot;
+        self.resolve_in_view(nodes, reg, &mut slot, None)
+    }
+
+    fn resolve_in_view(
+        &mut self,
+        nodes: &[Node],
+        reg: &mut PlaceholderRegistryShim,
+        slot: &mut usize,
+        cur_sub: Option<usize>,
+    ) -> Option<()> {
+        for node in nodes {
+            match node {
+                Node::Text(_) | Node::BoundText(_) => {}
+                Node::LetDeclaration(l) => {
+                    // An external / pipe-bearing `@let` reserves a `ɵɵdeclareLet` data slot in this
+                    // view, shifting subsequent anchors up.
+                    if self.slot_lets.contains(&l.name) {
+                        *slot += 1;
+                    }
+                }
+                Node::Element(el) => {
+                    let attrs = static_attr_pairs(&el.attributes);
+                    self.resolve_element(
+                        &el.name,
+                        &attrs,
+                        el.is_void,
+                        &el.references,
+                        &el.children,
+                        reg,
+                        slot,
+                        cur_sub,
+                    )?;
+                }
+                Node::Component(c) => {
+                    let attrs = static_attr_pairs(&c.attributes);
+                    self.resolve_element(
+                        &c.full_name,
+                        &attrs,
+                        false,
+                        &[],
+                        &c.children,
+                        reg,
+                        slot,
+                        cur_sub,
+                    )?;
+                }
+                Node::Template(tmpl) => {
+                    let tag = tmpl
+                        .tag_name
+                        .clone()
+                        .unwrap_or_else(|| "ng-template".to_string());
+                    let attrs = static_attr_pairs(&tmpl.attributes);
+                    // The host slot is in THIS view; its `#ref`s each take a slot. Its children are a
+                    // sub-template (new view, new sub-template index, slot counter restarts at 1).
+                    let host_slot = *slot;
+                    *slot += 1 + tmpl.references.len();
+                    let start = reg.start_tag_placeholder_name(&tag, &attrs, false);
+                    let close = reg.close_tag_placeholder_name(&tag);
+                    let sub = self.next_sub_template_index;
+                    self.next_sub_template_index += 1;
+                    let _ = host_slot;
+                    // `<ng-template>` ⇒ template marker `*`, value = host slot, sub-template index.
+                    use crate::i18n::I18nParamValueFlags as F;
+                    self.record(
+                        &start,
+                        crate::i18n::I18nParamValue {
+                            value: host_slot,
+                            sub_template_index: Some(sub),
+                            flags: F::TEMPLATE_TAG | F::OPEN_TAG,
+                        },
+                        format!("<{tag}>"),
+                    );
+                    self.record(
+                        &close,
+                        crate::i18n::I18nParamValue {
+                            value: host_slot,
+                            sub_template_index: Some(sub),
+                            flags: F::TEMPLATE_TAG | F::CLOSE_TAG,
+                        },
+                        format!("</{tag}>"),
+                    );
+                    let mut child_slot = 1usize;
+                    self.resolve_in_view(&tmpl.children, reg, &mut child_slot, Some(sub))?;
+                }
+                Node::ForLoopBlock(b) => {
+                    // `ɵɵrepeaterCreate(slot, ...)` takes 2 slots; the for-body view fn lives at
+                    // `slot+1`, the empty view at `slot+2` (`naming.ts`). Both are sub-templates.
+                    let repeater_slot = *slot;
+                    *slot += 2;
+                    use crate::i18n::I18nParamValueFlags as F;
+                    let item_src = ast_to_source(&b.expression.ast);
+                    let for_header = format!(
+                        "@for ({} of {}; track {}) {{",
+                        b.item.name,
+                        item_src,
+                        b.track_by
+                            .as_ref()
+                            .map(|t| ast_to_source(&t.ast))
+                            .unwrap_or_default()
+                    );
+                    let for_param = format!("{} of {}", b.item.name, item_src);
+                    let start = reg.start_block_placeholder_name("for", &[for_param.clone()]);
+                    let close = reg.close_block_placeholder_name("for");
+                    let for_sub = self.next_sub_template_index;
+                    self.next_sub_template_index += 1;
+                    self.record(
+                        &start,
+                        crate::i18n::I18nParamValue {
+                            value: repeater_slot + 1,
+                            sub_template_index: Some(for_sub),
+                            flags: F::TEMPLATE_TAG | F::OPEN_TAG,
+                        },
+                        for_header,
+                    );
+                    self.record(
+                        &close,
+                        crate::i18n::I18nParamValue {
+                            value: repeater_slot + 1,
+                            sub_template_index: Some(for_sub),
+                            flags: F::TEMPLATE_TAG | F::CLOSE_TAG,
+                        },
+                        "}".to_string(),
+                    );
+                    let mut for_child_slot = 1usize;
+                    self.resolve_in_view(&b.children, reg, &mut for_child_slot, Some(for_sub))?;
+                    if let Some(empty) = &b.empty {
+                        let estart = reg.start_block_placeholder_name("empty", &[]);
+                        let eclose = reg.close_block_placeholder_name("empty");
+                        let empty_sub = self.next_sub_template_index;
+                        self.next_sub_template_index += 1;
+                        self.record(
+                            &estart,
+                            crate::i18n::I18nParamValue {
+                                value: repeater_slot + 2,
+                                sub_template_index: Some(empty_sub),
+                                flags: F::TEMPLATE_TAG | F::OPEN_TAG,
+                            },
+                            "@empty {".to_string(),
+                        );
+                        self.record(
+                            &eclose,
+                            crate::i18n::I18nParamValue {
+                                value: repeater_slot + 2,
+                                sub_template_index: Some(empty_sub),
+                                flags: F::TEMPLATE_TAG | F::CLOSE_TAG,
+                            },
+                            "}".to_string(),
+                        );
+                        let mut empty_child_slot = 1usize;
+                        self.resolve_in_view(
+                            &empty.children,
+                            reg,
+                            &mut empty_child_slot,
+                            Some(empty_sub),
+                        )?;
+                    }
+                }
+                // Other control-flow + ICU shapes are not modelled here (they need
+                // ɵɵi18nPostprocess); bail so the caller omits sentinels rather than emit wrong ones.
+                _ => return None,
+            }
+        }
+        Some(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_element(
+        &mut self,
+        tag: &str,
+        attrs: &[(String, String)],
+        is_void: bool,
+        references: &[crate::template::r3_ast::Reference],
+        children: &[Node],
+        reg: &mut PlaceholderRegistryShim,
+        slot: &mut usize,
+        cur_sub: Option<usize>,
+    ) -> Option<()> {
+        use crate::i18n::I18nParamValueFlags as F;
+        let el_slot = *slot;
+        *slot += 1 + references.len();
+        let start = reg.start_tag_placeholder_name(tag, attrs, is_void);
+        if is_void {
+            self.record(
+                &start,
+                crate::i18n::I18nParamValue {
+                    value: el_slot,
+                    sub_template_index: cur_sub,
+                    flags: F::ELEMENT_TAG | F::OPEN_TAG | F::CLOSE_TAG,
+                },
+                format!("<{tag}>"),
+            );
+            return Some(());
+        }
+        let close = reg.close_tag_placeholder_name(tag);
+        self.record(
+            &start,
+            crate::i18n::I18nParamValue {
+                value: el_slot,
+                sub_template_index: cur_sub,
+                flags: F::ELEMENT_TAG | F::OPEN_TAG,
+            },
+            format!("<{tag}>"),
+        );
+        // Children of a nested element stay in the SAME view (same slot counter, same sub-template).
+        self.resolve_in_view(children, reg, slot, cur_sub)?;
+        self.record(
+            &close,
+            crate::i18n::I18nParamValue {
+                value: el_slot,
+                sub_template_index: cur_sub,
+                flags: F::ELEMENT_TAG | F::CLOSE_TAG,
+            },
+            format!("</{tag}>"),
+        );
+        Some(())
     }
 }
 
@@ -970,6 +1365,89 @@ fn node_emits_i18n_child_create_op(node: &Node) -> bool {
 /// inner expression rather than a wrong one.
 fn i18n_original_code(node: &AstNode) -> String {
     format!("{{{{{}}}}}", ast_to_source(node))
+}
+
+/// Recursively walk i18n message nodes producing the `$localize` `messageParts` / `placeholders` /
+/// `expressions` triples. A `Placeholder`/`IcuPlaceholder` emits one piece (its public name, value
+/// looked up by NAME); a `TagPlaceholder`/`BlockPlaceholder` emits a start piece, then its children,
+/// then a close piece — mirroring `LocalizeMessageStringVisitor` over the same param map.
+#[allow(clippy::too_many_arguments)]
+fn i18n_localize_walk(
+    nodes: &[crate::i18n::Node],
+    param_by_name: &std::collections::HashMap<String, String>,
+    no_span: &o::ParseSourceSpan,
+    pending: &mut String,
+    message_parts: &mut Vec<o::LiteralPiece>,
+    placeholders: &mut Vec<o::PlaceholderPiece>,
+    expressions: &mut Vec<o::Expr>,
+) {
+    use crate::i18n;
+    let push_ph = |name: &str,
+                   pending: &mut String,
+                   message_parts: &mut Vec<o::LiteralPiece>,
+                   placeholders: &mut Vec<o::PlaceholderPiece>,
+                       expressions: &mut Vec<o::Expr>| {
+        message_parts.push(o::LiteralPiece {
+            text: std::mem::take(pending),
+            source_span: no_span.clone(),
+        });
+        placeholders.push(o::PlaceholderPiece {
+            text: i18n::format_i18n_placeholder_name(name, false),
+            source_span: no_span.clone(),
+            associated_message: None,
+        });
+        let value = param_by_name.get(name).cloned().unwrap_or_default();
+        expressions.push(o::literal(o::LiteralValue::String(value), None));
+    };
+    for node in nodes {
+        match node {
+            i18n::Node::Text(t) => pending.push_str(&t.value),
+            i18n::Node::Placeholder(ph) => {
+                push_ph(&ph.name, pending, message_parts, placeholders, expressions)
+            }
+            i18n::Node::IcuPlaceholder(ph) => {
+                push_ph(&ph.name, pending, message_parts, placeholders, expressions)
+            }
+            i18n::Node::TagPlaceholder(ph) => {
+                push_ph(&ph.start_name, pending, message_parts, placeholders, expressions);
+                i18n_localize_walk(
+                    &ph.children,
+                    param_by_name,
+                    no_span,
+                    pending,
+                    message_parts,
+                    placeholders,
+                    expressions,
+                );
+                if !ph.is_void {
+                    push_ph(&ph.close_name, pending, message_parts, placeholders, expressions);
+                }
+            }
+            i18n::Node::BlockPlaceholder(ph) => {
+                push_ph(&ph.start_name, pending, message_parts, placeholders, expressions);
+                i18n_localize_walk(
+                    &ph.children,
+                    param_by_name,
+                    no_span,
+                    pending,
+                    message_parts,
+                    placeholders,
+                    expressions,
+                );
+                push_ph(&ph.close_name, pending, message_parts, placeholders, expressions);
+            }
+            i18n::Node::Container(c) => i18n_localize_walk(
+                &c.children,
+                param_by_name,
+                no_span,
+                pending,
+                message_parts,
+                placeholders,
+                expressions,
+            ),
+            i18n::Node::Icu(_) => {}
+        }
+    }
 }
 
 /// Re-serialize a binding-expression AST back to its authored source for the common cases used by
@@ -1658,6 +2136,58 @@ pub struct TemplateDefinitionBuilder {
     /// inherited unchanged by every embedded view ([`Self::build_embedded_view`]), since the mode is a
     /// whole-component property (`render3/view/compiler.ts` selects it once per component).
     dom_only: bool,
+    /// When this (embedded) view is the child view of an `i18n` block (a `@for`/`@if` body, a
+    /// `@switch` case, an `@empty` view, or an `<ng-template>` inside `i18n`), this carries the
+    /// shared message const index, the sub-template index assigned to this view (DFS order), and the
+    /// interpolation expressions this view contributes to the message (lowered into `ɵɵi18nExp` +
+    /// a trailing `ɵɵi18nApply(0)`). The view brackets its create block in
+    /// `ɵɵi18nStart(0, msgIndex, subTemplateIndex)` … `ɵɵi18nEnd()` (or collapses to a single
+    /// `ɵɵi18n(0, msgIndex, subTemplateIndex)` when it has no further bracketed child create ops).
+    /// Mirrors Angular's `propagateI18nBlocks` sub-template threading.
+    i18n_child_view: Option<I18nChildView>,
+    /// Set when THIS view is currently emitting the create ops of an `i18n` block: child elements,
+    /// templates and control-flow blocks reached during the walk are bracketed inside the open
+    /// `ɵɵi18nStart`/`ɵɵi18nEnd` pair, and any child VIEW they spawn (`@for` body, `<ng-template>`,
+    /// `@if` branch) becomes an i18n sub-template continuation. Carries the running sub-template
+    /// index counter (shared component-wide via the parent block) and the shared message const index.
+    i18n_block_ctx: Option<I18nBlockCtx>,
+    /// Set while emitting the create ops of an `i18n` block's content: a nested element's own text /
+    /// bound-text children are folded into the message (no `ɵɵtext` op), so the element collapses to
+    /// `ɵɵelement` unless it has nested element/control-flow children, and its children are walked via
+    /// [`Self::visit_i18n_create_children`].
+    in_i18n_create: bool,
+}
+
+/// The i18n continuation context threaded into a child view spawned inside an `i18n` block.
+#[derive(Debug, Clone)]
+struct I18nChildView {
+    /// The shared message's const-pool index (the `constIndex` of `ɵɵi18nStart`/`ɵɵi18n`).
+    message_index: usize,
+    /// This child view's sub-template index (DFS order; the root i18n block is sub-template `null`).
+    sub_template_index: usize,
+    /// The interpolation operands this view contributes, in source order. Each lowers to one
+    /// `ɵɵi18nExp(<expr>)`; a single `ɵɵi18nApply(0)` follows. `cross_view_let` carries, for a read
+    /// of a cross-view `@let`, the source name + owning ancestor declareLet slot so the operand
+    /// resolves to a prepended `const <name>_r = ɵɵreadContextLet(slot)` (via `ɵɵnextContext`).
+    interpolations: Vec<I18nChildInterp>,
+}
+
+/// One interpolation an i18n child view contributes to the shared message.
+#[derive(Debug, Clone)]
+struct I18nChildInterp {
+    expr: AstNode,
+    /// `Some((source_name, declare_let_slot))` when the expression is a bare read of a cross-view
+    /// `@let`; the operand resolves to `ɵɵreadContextLet(slot)` against the owning ancestor.
+    cross_view_let: Option<(String, usize)>,
+}
+
+/// State carried while a view emits the create ops of an `i18n` block, so nested child views get
+/// monotonically-increasing sub-template indices (DFS order, matching `propagateI18nBlocks`).
+#[derive(Debug, Clone)]
+struct I18nBlockCtx {
+    message_index: usize,
+    /// The next sub-template index to hand out (starts at 1; the root block itself is `null`).
+    next_sub_template_index: usize,
 }
 
 impl TemplateDefinitionBuilder {
@@ -1700,6 +2230,9 @@ impl TemplateDefinitionBuilder {
             has_default_projection: false,
             projection_count: 0,
             dom_only: input.dom_only,
+            i18n_child_view: None,
+            i18n_block_ctx: None,
+            in_i18n_create: false,
         }
     }
 
@@ -2120,7 +2653,15 @@ impl TemplateDefinitionBuilder {
         // resolve to the generated local rather than `ctx.<name>`.
         self.bring_ancestor_lets_into_scope(&nodes);
 
-        self.visit_all(&nodes);
+        // An i18n child-view continuation (`@for` body / `<ng-template>` inside `i18n` / …) reserves
+        // data slot `0` for its i18n block, brackets its create ops between `ɵɵi18nStart(0, msg,
+        // subIdx)` … `ɵɵi18nEnd()` (collapsing to `ɵɵi18n(0, msg, subIdx)` when nothing nested
+        // brackets create ops), and emits its interpolation operands (`ɵɵi18nExp` + `ɵɵi18nApply(0)`).
+        if let Some(child) = self.i18n_child_view.clone() {
+            self.build_i18n_child_view(&child, &nodes);
+        } else {
+            self.visit_all(&nodes);
+        }
 
         // Assign the deferred var (change-detection) offsets for every pipe / arrow / pure-function
         // consumer — Angular's two-pass `var_counting`. Runs after the whole view is walked (so every
@@ -2698,7 +3239,18 @@ impl TemplateDefinitionBuilder {
         let attrs_index = self.element_attrs_index(&static_attrs, &binding_names);
         let local_refs_index = self.local_refs_index(&element.references);
 
-        let has_children = !element.children.is_empty();
+        // Inside an i18n block, this element's text / bound-text children are folded into the message
+        // (no `ɵɵtext` op), so it has "children" for `needs_end` purposes only when it brackets nested
+        // element/template/control-flow create ops.
+        let in_i18n_create = self.in_i18n_create;
+        let has_children = if in_i18n_create {
+            element
+                .children
+                .iter()
+                .any(node_emits_i18n_child_create_op)
+        } else {
+            !element.children.is_empty()
+        };
         // `collapseEmptyInstructions` (`phases/empty_elements.ts`) only merges an `elementStart` +
         // `elementEnd` into a single `element` when the `End` immediately follows the `Start` (only
         // `Pipe` ops are ignored in between). A **Listener** (a creation-block `ɵɵdomListener`) is
@@ -2790,6 +3342,11 @@ impl TemplateDefinitionBuilder {
             // (`ɵɵi18nStart`/`ɵɵi18nEnd` + `ɵɵi18nExp`/`ɵɵi18nApply`) rather than the normal
             // text / bound-text path.
             self.build_i18n_block(&element.children);
+        } else if in_i18n_create {
+            // Inside an i18n block: this element's text content is part of the message; only its
+            // nested element/template/control-flow children get create ops (i18n-aware walk).
+            let children = element.children.clone();
+            self.visit_i18n_create_children(&children);
         } else if has_children {
             let children = element.children.clone();
             self.visit_all(&children);
@@ -2839,44 +3396,25 @@ impl TemplateDefinitionBuilder {
 
         // `@let` declarations among an i18n block's children contribute nothing to the message
         // (`i18n_parser.ts` `visitLetDeclaration` returns `null`) but are still real update-block
-        // variables: a same-view interpolation that reads the let (`{{result}}` after
-        // `@let result = value * 2`) must resolve to the let's generated local, not `ctx.result`.
-        // Lower the inline (non-external, non-pipe) lets now — before the interpolation operands are
-        // lowered — registering each as an in-scope local so those reads resolve to it. The local
-        // takes the loop-variable `_r<n>` form Angular's i18n goldens spell for a let consumed by an
-        // i18n expression (`const result_r1 = ctx.value * 2;`), distinct from the `$result_0$`
-        // identifier-variable form a let read by a plain `textInterpolate` uses.
-        let let_decls: Vec<&LetDeclaration> = children
+        // variables. Classify them up front (so the sentinel resolver can account for the
+        // `ɵɵdeclareLet` data slots an external/pipe let consumes): an external let (read from a
+        // descendant child view, e.g. `{{result}}` inside a nested `<ng-template>`) needs a
+        // `ɵɵdeclareLet` slot + `ɵɵstoreLet`; the actual lowering happens INSIDE the i18n bracket
+        // (after `ɵɵi18nStart`) so the create-op order is `i18nStart, declareLet, …`.
+        let let_decls: Vec<LetDeclaration> = children
             .iter()
             .filter_map(|n| match n {
-                Node::LetDeclaration(l) => Some(l),
+                Node::LetDeclaration(l) => Some(l.clone()),
                 _ => None,
             })
             .collect();
         for decl in &let_decls {
-            // Only the inline shape is in scope here: a let read solely by this view's i18n content,
-            // with no pipe in its value, inlines to a `const <name>_r<n> = <value>;` (no slot, no
-            // `ɵɵstoreLet`). External (cross-view) / pipe-bearing lets need the `ɵɵdeclareLet` +
-            // `ɵɵstoreLet` machinery and stay on the general `build_let_declaration` path.
-            if self.external_lets.contains_key(&decl.name) || let_value_has_pipe(&decl.value) {
-                self.build_let_declaration(decl);
-                continue;
+            let external = let_used_externally(children, &decl.name);
+            if external || let_value_has_pipe(&decl.value) {
+                self.external_lets
+                    .entry(decl.name.clone())
+                    .or_insert(external);
             }
-            let value = self.lower_expr(&decl.value);
-            self.var_counter += 1;
-            let local_name = format!("{}_r{}", sanitize_identifier(&decl.name), self.var_counter);
-            self.update_code.push(Stmt::with_modifiers(
-                StmtKind::DeclareVar {
-                    name: local_name.clone(),
-                    value: Some(value),
-                    ty: None,
-                },
-                StmtModifier::FINAL,
-            ));
-            self.loop_vars.push(LoopVar {
-                source_name: decl.name.clone(),
-                local_name,
-            });
         }
 
         // SCOPE BOUNDARY: the `i18n` attribute value (`meaning|description@@id`) cannot be threaded
@@ -2909,16 +3447,23 @@ impl TemplateDefinitionBuilder {
         let mut order: Vec<String> = Vec::new();
         let mut values_by_name: std::collections::HashMap<String, (Vec<String>, String)> =
             std::collections::HashMap::new();
-        for (i, ie) in exprs.iter().enumerate() {
+        for ie in exprs.iter() {
             let entry = values_by_name
                 .entry(ie.placeholder_name.clone())
                 .or_insert_with(|| {
                     order.push(ie.placeholder_name.clone());
                     (Vec::new(), i18n_original_code(&ie.expr))
                 });
-            entry.0.push(format!("\u{FFFD}{i}\u{FFFD}"));
+            // The runtime expression-index value: `�n�` at the root, `�n:subTemplateIndex�` inside a
+            // sub-template (Angular `formatValue` with `ExpressionIndex` + a context marker). `n` is
+            // the expression's index WITHIN its view.
+            let value = match ie.sub_template_index {
+                None => format!("\u{FFFD}{}\u{FFFD}", ie.expr_index_in_view),
+                Some(sub) => format!("\u{FFFD}{}:{}\u{FFFD}", ie.expr_index_in_view, sub),
+            };
+            entry.0.push(value);
         }
-        let params: Vec<i18n::I18nPlaceholderParam> = order
+        let mut params: Vec<i18n::I18nPlaceholderParam> = order
             .into_iter()
             .map(|name| {
                 let (values, original_code) = &values_by_name[&name];
@@ -2930,42 +3475,277 @@ impl TemplateDefinitionBuilder {
             })
             .collect();
 
+        // Whether this block brackets child create ops (nested elements / templates / control-flow):
+        // those need the open/close `ɵɵi18nStart`…`ɵɵi18nEnd` pair, and their `TagPlaceholder` /
+        // `BlockPlaceholder` runtime substitution values (the slot-based sentinels) must be resolved.
+        let needs_bracket = children.iter().any(node_emits_i18n_child_create_op);
+
+        // Resolve the tag/block placeholder sentinel values (`�*3:1�`, `�#1:1�`, …) by simulating the
+        // create-op slot allocation + sub-template-index (DFS) numbering this block will perform. The
+        // resolver returns the per-placeholder-name `I18nParamValue` lists (in the same first-seen
+        // order the create walk produces) and the count of sub-templates, so the message params carry
+        // their runtime substitution values. Only blocks we can fully model contribute sentinels.
+        let mut tag_block_resolvable = true;
+        let mut sentinel_params: Vec<i18n::I18nPlaceholderParam> = Vec::new();
+        if needs_bracket {
+            let slot_lets: std::collections::HashSet<String> = let_decls
+                .iter()
+                .filter(|d| {
+                    self.external_lets.contains_key(&d.name) || let_value_has_pipe(&d.value)
+                })
+                .map(|d| d.name.clone())
+                .collect();
+            let mut resolver = I18nSentinelResolver::new(slot_lets);
+            if resolver
+                .resolve_siblings(children, &mut PlaceholderRegistryShim::new(), slot + 1)
+                .is_some()
+            {
+                for (name, values, original_code) in resolver.into_ordered_params() {
+                    sentinel_params.push(i18n::I18nPlaceholderParam {
+                        name,
+                        value: i18n::format_param_values(&values).unwrap_or_default(),
+                        original_code,
+                    });
+                }
+            } else {
+                tag_block_resolvable = false;
+            }
+        }
+
+        // Merge interpolation params with the tag/block sentinel params, in the message's first-seen
+        // placeholder order (so the `goog.getMsg` value map + `$localize` substitutions are complete).
+        // The getMsg value map is sorted alphabetically by `build_i18n_const`; `$localize` order is
+        // recovered by the message-node walk in `intern_i18n_message`, so the merged order only needs
+        // to carry every placeholder once.
+        if needs_bracket && tag_block_resolvable {
+            let known: std::collections::HashSet<String> =
+                params.iter().map(|p| p.name.clone()).collect();
+            for sp in sentinel_params {
+                if !known.contains(&sp.name) {
+                    params.push(sp);
+                }
+            }
+        }
+
         let const_index = self.intern_i18n_message(&message, &params);
 
-        // Creation block. Angular's `reify.ts` emits a SINGLE `ɵɵi18n(slot, constIndex)` for a
-        // self-contained i18n block — one whose translatable content is only static text and `{{ }}`
-        // interpolations (no nested element/template/control-flow ops that would need their own
-        // create instructions bracketed inside the block). When the block DOES bracket child create
-        // ops it instead emits the open/close pair `ɵɵi18nStart(slot, constIndex)` … `ɵɵi18nEnd()`.
-        // (`@let` declarations are update-only — they emit no create op — so they do not force the
-        // bracketed form.)
-        let needs_bracket = children.iter().any(node_emits_i18n_child_create_op);
+        // Creation block. A self-contained block (text + `{{ }}` only) reifies to a single
+        // `ɵɵi18n(slot, constIndex)`; a block that brackets child create ops emits the open/close
+        // pair `ɵɵi18nStart(slot, constIndex)` … (bracketed children) … `ɵɵi18nEnd()`.
         if needs_bracket {
             self.creation_code.push(instruction(
                 R3::I18nStart,
                 vec![num(slot as f64), num(const_index as f64)],
             ));
+            // Emit this block's child create ops bracketed inside the i18n pair. With an active
+            // `i18n_block_ctx`, child VIEWS (`@for` body, `@empty`, `<ng-template>`, `@if` branches)
+            // become i18n sub-template continuations (`ɵɵi18nStart(0, constIndex, subIdx)`).
+            let saved_ctx = self.i18n_block_ctx.take();
+            self.i18n_block_ctx = Some(I18nBlockCtx {
+                message_index: const_index,
+                next_sub_template_index: 1,
+            });
+            // `@let` declarations are lowered INSIDE the bracket (so the create-op order is
+            // `i18nStart, declareLet, <child anchors>`), in source order. An inline let registers an
+            // in-view local; an external let emits `ɵɵdeclareLet` + `ɵɵstoreLet` and a `ContextLet`
+            // so descendant child views resolve reads via `ɵɵreadContextLet(slot)`.
+            self.build_i18n_block_lets(&let_decls);
+            self.visit_i18n_create_children(children);
+            self.i18n_block_ctx = saved_ctx;
             self.creation_code.push(instruction(R3::I18nEnd, vec![]));
         } else {
             self.creation_code.push(instruction(
                 R3::I18n,
                 vec![num(slot as f64), num(const_index as f64)],
             ));
+            // A self-contained block still lowers its `@let`s (a same-view interpolation reading the
+            // let must resolve to its local, not `ctx.<name>`).
+            self.build_i18n_block_lets(&let_decls);
         }
 
-        // Update block: one `ɵɵi18nExp(<expr>)` per interpolation, then a single `ɵɵi18nApply(slot)`.
-        // Each interpolation reserves one binding (var) slot (Angular `i18nExp` → one var).
-        if !exprs.is_empty() {
-            self.allocate_binding_slots(exprs.len());
+        // Update block: one `ɵɵi18nExp(<expr>)` per interpolation belonging to THIS (root) view, then
+        // a single `ɵɵi18nApply(slot)`. Interpolations inside sub-templates emit their own
+        // `ɵɵi18nExp`/`ɵɵi18nApply` in that child view (handled by `build_i18n_child_view`), so they
+        // are excluded here. Each root interpolation reserves one binding (var) slot.
+        let root_exprs: Vec<&I18nInterpolation> = exprs
+            .iter()
+            .filter(|ie| ie.sub_template_index.is_none())
+            .collect();
+        if !root_exprs.is_empty() {
+            self.allocate_binding_slots(root_exprs.len());
             self.advance_to(slot);
             self.current_target_slot = slot;
-            for ie in &exprs {
+            for ie in &root_exprs {
                 let lowered = self.lower_expr(&ie.expr);
                 self.update_code
                     .push(instruction(R3::I18nExp, vec![lowered]));
             }
             self.update_code
                 .push(instruction(R3::I18nApply, vec![num(slot as f64)]));
+        }
+    }
+
+    /// Lower the `@let` declarations of an i18n block, in source order. An external/pipe let routes
+    /// through [`Self::build_let_declaration`] (emitting `ɵɵdeclareLet` + `ɵɵstoreLet`, registering a
+    /// `ContextLet`); an inline let inlines to a `const <name>_r<n> = <value>;` registered as an
+    /// in-view local so this view's own i18n reads resolve to it.
+    fn build_i18n_block_lets(&mut self, let_decls: &[LetDeclaration]) {
+        for decl in let_decls {
+            if self.external_lets.contains_key(&decl.name) || let_value_has_pipe(&decl.value) {
+                self.build_let_declaration(decl);
+                continue;
+            }
+            let value = self.lower_expr(&decl.value);
+            self.var_counter += 1;
+            let local_name = format!("{}_r{}", sanitize_identifier(&decl.name), self.var_counter);
+            self.update_code.push(Stmt::with_modifiers(
+                StmtKind::DeclareVar {
+                    name: local_name.clone(),
+                    value: Some(value),
+                    ty: None,
+                },
+                StmtModifier::FINAL,
+            ));
+            self.loop_vars.push(LoopVar {
+                source_name: decl.name.clone(),
+                local_name,
+            });
+        }
+    }
+
+    /// Emit the CREATE ops for the children of an `i18n` block (or i18n sub-template), bracketed
+    /// inside the open `ɵɵi18nStart`/`ɵɵi18nEnd` pair. Static text and bound text are NOT emitted as
+    /// `ɵɵtext` ops — that content lives in the message — so only element/template/control-flow
+    /// anchors get create ops (Angular's i18n reify). A text-only nested element collapses to a
+    /// single `ɵɵelement(slot, tag)`; one with nested element/block children emits the
+    /// `ɵɵelementStart` … (recursed children) … `ɵɵelementEnd` pair. Control-flow blocks and
+    /// `<ng-template>` delegate to their normal builders (which create i18n sub-template continuations
+    /// when `i18n_block_ctx` is active).
+    fn visit_i18n_create_children(&mut self, nodes: &[Node]) {
+        let saved = self.in_i18n_create;
+        self.in_i18n_create = true;
+        for node in nodes {
+            match node {
+                // Text / interpolation content is folded into the message — no create op.
+                Node::Text(_) | Node::BoundText(_) => {}
+                // `@let` declarations are update-only — handled by the i18n block, not here.
+                Node::LetDeclaration(_) => {}
+                Node::Element(el) => self.build_element(el),
+                Node::Template(tmpl) => self.build_template(tmpl),
+                Node::ForLoopBlock(b) => self.build_for_block(b),
+                Node::IfBlock(b) => self.build_if_block(b),
+                Node::SwitchBlock(b) => self.build_switch_block(b),
+                Node::DeferredBlock(b) => self.build_deferred_block(b),
+                // Components / projected content / ICUs inside an i18n block fall back to the normal
+                // walk (they are not part of the two targeted control-flow/template cases).
+                _ => self.visit_node(node),
+            }
+        }
+        self.in_i18n_create = saved;
+    }
+
+    /// Collect, in source order, the interpolation expressions an i18n child view contributes to the
+    /// shared message (its `ɵɵi18nExp` operands). A bare read of a cross-view `@let` (declared in an
+    /// ancestor view, e.g. the i18n block view) is flagged with its owner `declareLet` slot so the
+    /// child view materialises `const <name>_r = ɵɵreadContextLet(slot)`.
+    fn collect_child_i18n_interpolations(&self, nodes: &[Node]) -> Vec<I18nChildInterp> {
+        let mut out = Vec::new();
+        self.collect_child_i18n_interps_rec(nodes, &mut out);
+        out
+    }
+
+    fn collect_child_i18n_interps_rec(&self, nodes: &[Node], out: &mut Vec<I18nChildInterp>) {
+        for node in nodes {
+            match node {
+                Node::BoundText(bt) => match &bt.value.kind {
+                    AstExprKind::Interpolation { expressions, .. } => {
+                        for e in expressions {
+                            out.push(self.make_child_interp(e));
+                        }
+                    }
+                    _ => out.push(self.make_child_interp(&bt.value)),
+                },
+                Node::Element(el) => self.collect_child_i18n_interps_rec(&el.children, out),
+                Node::Component(c) => self.collect_child_i18n_interps_rec(&c.children, out),
+                _ => {}
+            }
+        }
+    }
+
+    /// Build one [`I18nChildInterp`], detecting a bare cross-view `@let` read.
+    fn make_child_interp(&self, expr: &AstNode) -> I18nChildInterp {
+        let cross_view_let = bare_read_name(expr).and_then(|name| {
+            self.context_lets
+                .iter()
+                .find(|c| c.name == name)
+                .map(|c| (name.to_string(), c.slot))
+        });
+        I18nChildInterp {
+            expr: expr.clone(),
+            cross_view_let,
+        }
+    }
+
+    /// Build a child view (a `@for` body / `@empty` / `<ng-template>` inside `i18n`, or an `@if`
+    /// branch / `@switch` case) as an i18n sub-template continuation. Reserves data slot `0` for the
+    /// i18n block, brackets the view's create ops in `ɵɵi18nStart(0, msg, subIdx)` … `ɵɵi18nEnd()`
+    /// (collapsing to `ɵɵi18n(0, msg, subIdx)` when nothing nested brackets create ops), and emits
+    /// the interpolation operands (`ɵɵi18nExp` + a single `ɵɵi18nApply(0)`).
+    fn build_i18n_child_view(&mut self, child: &I18nChildView, nodes: &[Node]) {
+        let i18n_slot = self.allocate_data_slot();
+        debug_assert_eq!(i18n_slot, 0);
+        let needs_bracket = nodes.iter().any(node_emits_i18n_child_create_op);
+        let start_args = vec![
+            num(i18n_slot as f64),
+            num(child.message_index as f64),
+            num(child.sub_template_index as f64),
+        ];
+        if needs_bracket {
+            self.creation_code
+                .push(instruction(R3::I18nStart, start_args));
+            let saved_ctx = self.i18n_block_ctx.take();
+            self.i18n_block_ctx = Some(I18nBlockCtx {
+                message_index: child.message_index,
+                next_sub_template_index: child.sub_template_index + 1,
+            });
+            self.visit_i18n_create_children(nodes);
+            self.i18n_block_ctx = saved_ctx;
+            self.creation_code.push(instruction(R3::I18nEnd, vec![]));
+        } else {
+            self.creation_code.push(instruction(R3::I18n, start_args));
+        }
+
+        if !child.interpolations.is_empty() {
+            self.allocate_binding_slots(child.interpolations.len());
+            self.advance_to(i18n_slot);
+            self.current_target_slot = i18n_slot;
+            for interp in &child.interpolations {
+                let lowered = if let Some((name, slot)) = &interp.cross_view_let {
+                    // A cross-view `@let` read resolves to a prepended
+                    // `const <name>_r = ɵɵreadContextLet(slot)` (with `ɵɵnextContext`); flag the
+                    // nextContext + mint the read local.
+                    self.needs_next_context.set(true);
+                    self.var_counter += 1;
+                    let local = format!("{}_r{}", sanitize_identifier(name), self.var_counter);
+                    let read = o::import_expr(R3::ReadContextLet.reference(), None)
+                        .call_fn(vec![num(*slot as f64)], false);
+                    self.update_prelude.push(Stmt::with_modifiers(
+                        StmtKind::DeclareVar {
+                            name: local.clone(),
+                            value: Some(read),
+                            ty: None,
+                        },
+                        StmtModifier::FINAL,
+                    ));
+                    o::variable(local, None)
+                } else {
+                    self.lower_expr(&interp.expr)
+                };
+                self.update_code
+                    .push(instruction(R3::I18nExp, vec![lowered]));
+            }
+            self.update_code
+                .push(instruction(R3::I18nApply, vec![num(i18n_slot as f64)]));
         }
     }
 
@@ -3011,33 +3791,22 @@ impl TemplateDefinitionBuilder {
             param_by_name.insert(p.name.clone(), p.value.clone());
         }
 
-        // Walk the (flat, common-case) message nodes: Text → a literal part, Placeholder → a
-        // placeholder piece. Two consecutive literals are merged so `messageParts` and
-        // `placeholders` interleave as `$localize` expects (one more part than placeholder).
+        // Walk the message nodes (recursively, so tag/block placeholders contribute their start
+        // placeholder, their children, then their close placeholder): `Text` → a literal part,
+        // `Placeholder`/`IcuPlaceholder` → one placeholder piece, `TagPlaceholder`/`BlockPlaceholder`
+        // → a start piece, the recursively-walked children, then a close piece. Two consecutive
+        // literals are merged so `messageParts` and `placeholders` interleave as `$localize` expects
+        // (one more part than placeholder).
         let mut pending = String::new();
-        for node in &message.nodes {
-            match node {
-                i18n::Node::Text(t) => pending.push_str(&t.value),
-                i18n::Node::Placeholder(ph) => {
-                    message_parts.push(o::LiteralPiece {
-                        text: std::mem::take(&mut pending),
-                        source_span: no_span.clone(),
-                    });
-                    placeholders.push(o::PlaceholderPiece {
-                        // `$localize` uses the NON-camel public placeholder name (`:INTERPOLATION:`).
-                        text: i18n::format_i18n_placeholder_name(&ph.name, false),
-                        source_span: no_span.clone(),
-                        associated_message: None,
-                    });
-                    let value = param_by_name
-                        .get(&ph.name)
-                        .cloned()
-                        .unwrap_or_default();
-                    expressions.push(o::literal(o::LiteralValue::String(value), None));
-                }
-                _ => {}
-            }
-        }
+        i18n_localize_walk(
+            &message.nodes,
+            &param_by_name,
+            &no_span,
+            &mut pending,
+            &mut message_parts,
+            &mut placeholders,
+            &mut expressions,
+        );
         // Trailing (or sole) literal part. `$localize` always has one more part than placeholder.
         message_parts.push(o::LiteralPiece {
             text: pending,
@@ -3046,9 +3815,20 @@ impl TemplateDefinitionBuilder {
 
         let localize_expr = o::localized_string(meta, message_parts, placeholders, expressions);
 
+        // The `goog.getMsg` placeholder/value/original-code maps are keyed by the CAMEL-cased public
+        // placeholder name and emitted in `[...params.entries()].sort()` (lexicographic) order. Sort
+        // the params by that camel key here so `build_i18n_const` emits the maps in golden order; the
+        // `$localize` substitutions were already collected in message order above (so this re-sort
+        // does not affect them).
+        let mut sorted_params = params.to_vec();
+        sorted_params.sort_by(|a, b| {
+            i18n::format_i18n_placeholder_name(&a.name, true)
+                .cmp(&i18n::format_i18n_placeholder_name(&b.name, true))
+        });
+
         // The message's const ordinal — Angular numbers `$i18n_n$` from the const-array position.
         let index = self.const_pool.entries().len();
-        let i18n_const = i18n::build_i18n_const(message, index, params, localize_expr);
+        let i18n_const = i18n::build_i18n_const(message, index, &sorted_params, localize_expr);
         self.const_pool
             .add_const_with_initializers(i18n_const.const_entry, i18n_const.initializers)
     }
@@ -3485,8 +4265,28 @@ impl TemplateDefinitionBuilder {
         // referenced by name (like control-flow blocks), not embedded inline.
         let suffix = sanitize_identifier(&tag_name);
         let fn_name = format!("{}_{}_{}_Template", self.base_name, suffix, slot);
-        let (fn_ref, decls, vars) =
-            self.build_embedded_view(fn_name, template.children.clone(), Vec::new(), Vec::new());
+        // When this `<ng-template>` is inside an `i18n` block, its body view becomes an i18n
+        // sub-template continuation (next sub-template index, DFS order, matching the sentinels).
+        let tmpl_child_i18n = self.i18n_block_ctx.as_mut().map(|ctx| {
+            let sub = ctx.next_sub_template_index;
+            ctx.next_sub_template_index += 1;
+            I18nChildView {
+                message_index: ctx.message_index,
+                sub_template_index: sub,
+                interpolations: Vec::new(),
+            }
+        });
+        let tmpl_child_i18n = tmpl_child_i18n.map(|mut c| {
+            c.interpolations = self.collect_child_i18n_interpolations(&template.children);
+            c
+        });
+        let (fn_ref, decls, vars) = self.build_embedded_view_i18n(
+            fn_name,
+            template.children.clone(),
+            Vec::new(),
+            Vec::new(),
+            tmpl_child_i18n,
+        );
 
         // `templateBase` arg list: [slot, fn, decls, vars, tag, constIndex, localRefsIndex,
         // templateRefExtractor]. constIndex / localRefsIndex are `null` when absent; trailing
@@ -3616,9 +4416,24 @@ impl TemplateDefinitionBuilder {
         loop_vars: Vec<LoopVar>,
         update_prelude: Vec<Stmt>,
     ) -> (Expr, usize, usize) {
+        self.build_embedded_view_i18n(fn_name, children, loop_vars, update_prelude, None)
+    }
+
+    /// As [`Self::build_embedded_view`], but threading an optional i18n child-view continuation so
+    /// the nested view brackets its content in `ɵɵi18nStart(0, msgIndex, subTemplateIndex)` …
+    /// `ɵɵi18nEnd()` (or `ɵɵi18n`) and emits its interpolation operands.
+    fn build_embedded_view_i18n(
+        &mut self,
+        fn_name: String,
+        children: Vec<Node>,
+        loop_vars: Vec<LoopVar>,
+        update_prelude: Vec<Stmt>,
+        i18n_child_view: Option<I18nChildView>,
+    ) -> (Expr, usize, usize) {
         let nested_input =
             TemplateCompilationInput::new(fn_name.clone(), children).with_dom_only(self.dom_only);
         let mut nested = TemplateDefinitionBuilder::new(&nested_input);
+        nested.i18n_child_view = i18n_child_view;
         // An embedded view is never the root: its hoisted descendant fns bubble up to the root
         // (below) rather than being inlined into this view body, so each is emitted exactly once.
         nested.is_root = false;
@@ -3866,10 +4681,32 @@ impl TemplateDefinitionBuilder {
         // `const <name>_r<n> = ctx.<source>;` declaration to head the body's update block.
         let (loop_vars, prelude) = self.collect_loop_vars(block);
 
+        // When this `@for` sits inside an `i18n` block, its body view (and the `@empty` view) become
+        // i18n sub-template continuations: each gets the next sub-template index (DFS order, matching
+        // the sentinel resolver) and brackets its content in `ɵɵi18nStart(0, msg, subIdx)`.
+        let for_child_i18n = self.i18n_block_ctx.as_mut().map(|ctx| {
+            let sub = ctx.next_sub_template_index;
+            ctx.next_sub_template_index += 1;
+            I18nChildView {
+                message_index: ctx.message_index,
+                sub_template_index: sub,
+                interpolations: Vec::new(),
+            }
+        });
+        let for_child_i18n = for_child_i18n.map(|mut c| {
+            c.interpolations = self.collect_child_i18n_interpolations(&block.children);
+            c
+        });
+
         // Faithful naming: the primary view fn is `<Base>_For_<slot+1>_Template` (`naming.ts`).
         let fn_name = format!("{}_For_{}_Template", self.base_name, slot + 1);
-        let (for_fn, decls, vars) =
-            self.build_embedded_view(fn_name, block.children.clone(), loop_vars, prelude);
+        let (for_fn, decls, vars) = self.build_embedded_view_i18n(
+            fn_name,
+            block.children.clone(),
+            loop_vars,
+            prelude,
+            for_child_i18n,
+        );
 
         // The track-by function expression (optimized helper reference, or a generated arrow for a
         // custom `track` expression) plus whether it reads the component instance.
@@ -3895,9 +4732,27 @@ impl TemplateDefinitionBuilder {
         // its positional slot must be filled before the empty-view args.
         if let Some(empty) = &block.empty {
             // `@empty { … }` → trailing empty-view args after the trackByUsesComponentInstance flag.
+            let empty_child_i18n = self.i18n_block_ctx.as_mut().map(|ctx| {
+                let sub = ctx.next_sub_template_index;
+                ctx.next_sub_template_index += 1;
+                I18nChildView {
+                    message_index: ctx.message_index,
+                    sub_template_index: sub,
+                    interpolations: Vec::new(),
+                }
+            });
+            let empty_child_i18n = empty_child_i18n.map(|mut c| {
+                c.interpolations = self.collect_child_i18n_interpolations(&empty.children);
+                c
+            });
             let empty_fn_name = format!("{}_ForEmpty_{}_Template", self.base_name, slot + 2);
-            let (empty_fn, empty_decls, empty_vars) =
-                self.build_embedded_view(empty_fn_name, empty.children.clone(), Vec::new(), Vec::new());
+            let (empty_fn, empty_decls, empty_vars) = self.build_embedded_view_i18n(
+                empty_fn_name,
+                empty.children.clone(),
+                Vec::new(),
+                Vec::new(),
+                empty_child_i18n,
+            );
             params.push(o::literal(
                 o::LiteralValue::Bool(track_uses_component_instance),
                 None,
@@ -3906,6 +4761,8 @@ impl TemplateDefinitionBuilder {
             params.push(num(empty_decls as f64));
             params.push(num(empty_vars as f64));
             params.push(single_root_tag(&empty.children));
+            // `ɵɵrepeaterCreate` trims a trailing `null` empty-view tag (Angular `instruction.ts`).
+            trim_trailing_nulls(&mut params);
         } else if track_uses_component_instance {
             // No `@empty`, but the custom trackBy needs the component instance: emit the flag so the
             // runtime binds `this`. (When false and there is no empty view, the trailing arg is
