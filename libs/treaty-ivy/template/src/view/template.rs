@@ -2514,6 +2514,31 @@ impl TemplateDefinitionBuilder {
         name
     }
 
+    /// Drain the pure-literal / arrow factory bodies interned by [`BuilderPipes::intern_pure_function_factory`]
+    /// during the walk into top-level `const $cN$ = <factory>;` / `const $arrowFnN$ = <factory>;`
+    /// declarations on `hoisted_fns`, so the printed module DECLARES every `$cN$`/`$arrowFnN$` it
+    /// references in a `ɵɵpureFunctionN`/`ɵɵarrowFunction` call (Angular hoists these factory consts
+    /// alongside the shared-literal consts: `ConstantPool.getSharedConstant` /
+    /// `getSharedFunctionReference` add the declaration to the pool's statements). Without this the
+    /// `$cN$` reference is dangling — the emitted module is broken. The names were minted (and
+    /// structurally de-duped) at intern time, so each entry yields exactly one declaration.
+    ///
+    /// Must run AFTER the whole view is walked (every factory interned) and is idempotent: it `take`s
+    /// the interned list so a second call emits nothing.
+    fn drain_interned_factories(&mut self) {
+        let factories = std::mem::take(&mut self.pipes.borrow_mut().interned_factories);
+        for (factory, name) in factories {
+            self.hoisted_fns.push(Stmt::with_modifiers(
+                StmtKind::DeclareVar {
+                    name,
+                    value: Some(factory),
+                    ty: None,
+                },
+                StmtModifier::FINAL,
+            ));
+        }
+    }
+
     /// Intern the component-level `ngContentSelectors` list into the SHARED constant pool and return
     /// the `$cN$` reference expression — the value `compileComponentFromMetadata` assigns to the
     /// `ngContentSelectors` definition field. Angular hoists this list with
@@ -2915,6 +2940,12 @@ impl TemplateDefinitionBuilder {
         // Allocate pipe data slots (at the END of the data array), emit their `ɵɵpipe(slot,"name")`
         // creation instructions, and patch the placeholder slots in the update block.
         self.finalize_pipes();
+
+        // Emit a top-level `const $cN$ = <factory>;` / `const $arrowFnN$ = <factory>;` for every
+        // pure-literal / arrow factory the walk referenced via `ɵɵpureFunctionN`/`ɵɵarrowFunction`,
+        // so the printed module declares every factory it references (Angular hoists these alongside
+        // the shared-literal consts). Without this the `$cN$`/`$arrowFnN$` reference is dangling.
+        self.drain_interned_factories();
 
         // Patch any placeholder `ɵɵreference(LOCAL_REF_SLOT_PLACEHOLDER + ordinal)` a listener
         // handler emitted for a `#ref` declared LATER in the template (the host's real slot is now

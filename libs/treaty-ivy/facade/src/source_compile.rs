@@ -2769,6 +2769,46 @@ mod tests {
     }
 
     #[test]
+    fn pure_function_factory_consts_are_declared() {
+        // A template that hoists pure-literal factories (`@let` over array literals with spreads)
+        // must DECLARE every `$cN$` factory const it references in a `ɵɵpureFunctionN` call —
+        // otherwise the emitted module carries dangling, undefined references (a real correctness
+        // defect). Assert that every distinct `$cN$` reference has a matching `const $cN$ =` decl.
+        let src = r#"@Component({template:`
+            @let simple = [...foo];
+            @let other = [1, ...foo, 2];
+            {{simple}} {{other}}
+        `}) export class ArrayComp { foo = []; }"#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+        // Collect every `$cN$` reference and require a `const $cN$ =` declaration for each.
+        let mut refs: Vec<String> = Vec::new();
+        let bytes = code.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'$' && code[i..].starts_with("$c") {
+                if let Some(end) = code[i + 1..].find('$') {
+                    refs.push(code[i..i + 1 + end + 1].to_string());
+                    i += end + 2;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        refs.sort();
+        refs.dedup();
+        assert!(!refs.is_empty(), "expected at least one $cN$ factory ref; got: {code}");
+        for r in &refs {
+            let decl = format!("const {r} =");
+            assert!(
+                code.contains(&decl),
+                "factory ref {r} is DANGLING (no `{decl}` declaration); got: {code}"
+            );
+        }
+    }
+
+    #[test]
     fn decorator_input_output_extracted() {
         let src = r#"@Component({selector:"a",template:"<p></p>"})
             export class C {
