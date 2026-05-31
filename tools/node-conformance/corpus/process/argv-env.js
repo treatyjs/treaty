@@ -67,12 +67,55 @@ function describe(name, fn) {
 }
 // === treaty node-conformance harness shim (end) ===
 
-// TextEncoder/TextDecoder are installed by the Node-compat globals layer as lazy, self-replacing
-// accessors on the realm global, and are now reachable from the harness's evaluation scope.
-test("TextEncoder/TextDecoder utf8 round-trip", () => {
-  const enc = new TextEncoder();
-  const dec = new TextDecoder();
-  const bytes = enc.encode("héllo");
-  assert.ok(bytes instanceof Uint8Array, "encode must yield a Uint8Array");
-  assert.strictEqual(dec.decode(bytes), "héllo", "utf8 decode round-trip");
+// Node test/parallel-style: node:process argv/env (read, write, delete), cwd, and the descriptive
+// platform/version/pid identity fields.
+const process = require("node:process");
+
+test("argv is an array of strings", () => {
+  assert.strictEqual(Array.isArray(process.argv), true, "argv is an array");
+  for (const entry of process.argv) {
+    assert.strictEqual(typeof entry, "string", "every argv entry is a string");
+  }
+});
+
+test("env is a string-valued object that round-trips writes and deletes", () => {
+  assert.strictEqual(typeof process.env, "object", "env is an object");
+  process.env.TREATY_CONFORMANCE_VAR = "set-value";
+  assert.strictEqual(
+    process.env.TREATY_CONFORMANCE_VAR,
+    "set-value",
+    "a value written to env reads back"
+  );
+  delete process.env.TREATY_CONFORMANCE_VAR;
+  assert.strictEqual(
+    process.env.TREATY_CONFORMANCE_VAR,
+    undefined,
+    "a deleted env var reads back as undefined"
+  );
+});
+
+test("distinct env keys are stored and read back independently", () => {
+  process.env.TREATY_A = "alpha";
+  process.env.TREATY_B = "beta";
+  assert.strictEqual(process.env.TREATY_A, "alpha", "the first key reads back its own value");
+  assert.strictEqual(process.env.TREATY_B, "beta", "the second key reads back its own value");
+  delete process.env.TREATY_A;
+  assert.strictEqual(process.env.TREATY_A, undefined, "deleting one key leaves the other intact");
+  assert.strictEqual(process.env.TREATY_B, "beta", "the untouched key is still present");
+  delete process.env.TREATY_B;
+});
+
+test("cwd() returns a non-empty path string", () => {
+  assert.strictEqual(typeof process.cwd, "function", "cwd is callable");
+  const cwd = process.cwd();
+  assert.strictEqual(typeof cwd, "string", "cwd() returns a string");
+  assert.strictEqual(cwd.length > 0, true, "cwd() is non-empty");
+});
+
+test("platform, version and pid describe the runtime", () => {
+  assert.strictEqual(typeof process.platform, "string", "platform is a string");
+  assert.strictEqual(process.platform.length > 0, true, "platform is non-empty");
+  assert.strictEqual(typeof process.version, "string", "version is a string");
+  assert.strictEqual(process.version.length > 0, true, "version is non-empty");
+  assert.strictEqual(typeof process.pid, "number", "pid is a number");
 });

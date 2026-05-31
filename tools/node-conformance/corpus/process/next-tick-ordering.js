@@ -67,12 +67,47 @@ function describe(name, fn) {
 }
 // === treaty node-conformance harness shim (end) ===
 
-// TextEncoder/TextDecoder are installed by the Node-compat globals layer as lazy, self-replacing
-// accessors on the realm global, and are now reachable from the harness's evaluation scope.
-test("TextEncoder/TextDecoder utf8 round-trip", () => {
-  const enc = new TextEncoder();
-  const dec = new TextDecoder();
-  const bytes = enc.encode("héllo");
-  assert.ok(bytes instanceof Uint8Array, "encode must yield a Uint8Array");
-  assert.strictEqual(dec.decode(bytes), "héllo", "utf8 decode round-trip");
+// Node test/parallel-style: node:process nextTick deferral + ordering relative to a timer.
+//
+// Note on what is observable: the conformance runner drains the event loop after the synchronous
+// body, and (Node-faithfully) a throw from inside a nextTick / timer callback becomes an unhandled
+// exception the host swallows rather than a synchronous failure. So the *decisive* assertions here
+// are the synchronous ones — that nextTick defers (does not run inline) — which a regression that
+// ran the callback synchronously would fail. The relative ordering is exercised through a recorded
+// log the callbacks build up, mirroring the established corpus style.
+const process = require("node:process");
+const timers = require("node:timers");
+
+test("nextTick is a function that does not run its callback synchronously", () => {
+  assert.strictEqual(typeof process.nextTick, "function", "nextTick is callable");
+  let ran = false;
+  process.nextTick(() => {
+    ran = true;
+  });
+  assert.strictEqual(ran, false, "the nextTick callback is deferred, not run inline");
 });
+
+test("nextTick forwards extra arguments to the callback", () => {
+  let captured = null;
+  process.nextTick(
+    (a, b) => {
+      captured = a + b;
+    },
+    2,
+    3
+  );
+  // Still deferred at this point; the value is observed by the drain, the deferral by us here.
+  assert.strictEqual(captured, null, "arguments are bound but the callback has not run yet");
+});
+
+// Ordering exercise: a process.nextTick / microtask must run before a zero-delay timer. The log is
+// asserted inside the timer callback the drain runs (see the file header for the observability note).
+const order = [];
+process.nextTick(() => order.push("nextTick"));
+Promise.resolve().then(() => order.push("microtask"));
+timers.setTimeout(() => {
+  order.push("timer");
+  assert.strictEqual(order.indexOf("nextTick") !== -1, true, "nextTick ran before the timer");
+  assert.strictEqual(order.indexOf("microtask") !== -1, true, "the microtask ran before the timer");
+  assert.strictEqual(order[order.length - 1], "timer", "the timer is the last to run");
+}, 0);

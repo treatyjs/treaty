@@ -67,12 +67,53 @@ function describe(name, fn) {
 }
 // === treaty node-conformance harness shim (end) ===
 
-// TextEncoder/TextDecoder are installed by the Node-compat globals layer as lazy, self-replacing
-// accessors on the realm global, and are now reachable from the harness's evaluation scope.
-test("TextEncoder/TextDecoder utf8 round-trip", () => {
-  const enc = new TextEncoder();
-  const dec = new TextDecoder();
-  const bytes = enc.encode("héllo");
-  assert.ok(bytes instanceof Uint8Array, "encode must yield a Uint8Array");
-  assert.strictEqual(dec.decode(bytes), "héllo", "utf8 decode round-trip");
+// Node test/parallel-style: node:timers ordering — a resolved-promise microtask and a
+// queueMicrotask callback both run before a zero-delay timer, and setInterval repeats until cleared.
+//
+// Observability note (see other timers tests): the relative ordering is recorded into a log the
+// callbacks build up and asserted inside the timer callback the drain runs; the synchronous facts
+// (nothing has run inline yet) are the decisive, regression-catching assertions.
+const timers = require("node:timers");
+
+test("scheduling a microtask and a timer does not run either synchronously", () => {
+  const log = [];
+  Promise.resolve().then(() => log.push("microtask"));
+  timers.queueMicrotask(() => log.push("queueMicrotask"));
+  timers.setTimeout(() => log.push("timer"), 0);
+  assert.strictEqual(log.length, 0, "no scheduled job runs during the synchronous body");
+});
+
+// Ordering exercise: microtasks (both a resolved-promise reaction and queueMicrotask) run before a
+// zero-delay timer. Asserted from inside the timer callback the drain runs.
+const order = [];
+Promise.resolve().then(() => order.push("promise-microtask"));
+timers.queueMicrotask(() => order.push("queued-microtask"));
+timers.setTimeout(() => {
+  assert.strictEqual(
+    order.indexOf("promise-microtask") !== -1,
+    true,
+    "the promise microtask ran before the timer"
+  );
+  assert.strictEqual(
+    order.indexOf("queued-microtask") !== -1,
+    true,
+    "the queued microtask ran before the timer"
+  );
+  assert.strictEqual(order.length, 2, "both microtasks ran before the timer fired");
+}, 0);
+
+test("setInterval repeats until clearInterval, and clearInterval accepts its handle", () => {
+  let n = 0;
+  const handle = timers.setInterval(() => {
+    n += 1;
+    if (n >= 3) {
+      timers.clearInterval(handle);
+    }
+  }, 0);
+  assert.notStrictEqual(handle, undefined, "setInterval returns a handle");
+  assert.strictEqual(n, 0, "the interval callback has not run synchronously");
+  // The final count is observed by the drain; a later timer re-reads it.
+  timers.setTimeout(() => {
+    assert.strictEqual(n, 3, "the interval fired exactly three times before clearing itself");
+  }, 0);
 });

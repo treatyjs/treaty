@@ -67,12 +67,46 @@ function describe(name, fn) {
 }
 // === treaty node-conformance harness shim (end) ===
 
-// TextEncoder/TextDecoder are installed by the Node-compat globals layer as lazy, self-replacing
-// accessors on the realm global, and are now reachable from the harness's evaluation scope.
-test("TextEncoder/TextDecoder utf8 round-trip", () => {
-  const enc = new TextEncoder();
-  const dec = new TextDecoder();
-  const bytes = enc.encode("héllo");
-  assert.ok(bytes instanceof Uint8Array, "encode must yield a Uint8Array");
-  assert.strictEqual(dec.decode(bytes), "héllo", "utf8 decode round-trip");
+// Node test/parallel-style: node:fs mkdtempSync. Mirrors Node's test-fs-mkdtemp — mkdtempSync creates
+// a brand-new directory whose name extends the given prefix, returns its full path, and yields a
+// distinct directory on each call.
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+
+test("mkdtempSync creates a real directory under the given prefix", () => {
+  const prefix = path.join(os.tmpdir(), "treaty-mkdtemp-");
+  const made = fs.mkdtempSync(prefix);
+
+  assert.strictEqual(typeof made, "string", "mkdtempSync returns the path string");
+  assert.strictEqual(made.length > prefix.length, true, "the prefix is extended with random chars");
+  assert.strictEqual(made.indexOf(prefix), 0, "the returned path begins with the prefix");
+  assert.strictEqual(fs.existsSync(made), true, "the directory really exists");
+  assert.strictEqual(fs.statSync(made).isDirectory(), true, "and it is a directory");
+
+  fs.rmSync(made, { recursive: true });
+});
+
+test("each mkdtempSync call yields a distinct directory", () => {
+  const prefix = path.join(os.tmpdir(), "treaty-mkdtemp-uniq-");
+  const a = fs.mkdtempSync(prefix);
+  const b = fs.mkdtempSync(prefix);
+
+  assert.notStrictEqual(a, b, "two calls produce different paths");
+  assert.strictEqual(fs.existsSync(a), true, "first still exists");
+  assert.strictEqual(fs.existsSync(b), true, "second exists independently");
+
+  fs.rmSync(a, { recursive: true });
+  fs.rmSync(b, { recursive: true });
+});
+
+test("a mkdtemp directory is writable and usable like any directory", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "treaty-mkdtemp-use-"));
+  const file = path.join(dir, "inside.txt");
+
+  fs.writeFileSync(file, "content");
+  assert.deepStrictEqual(fs.readdirSync(dir), ["inside.txt"], "the file lands inside the temp dir");
+  assert.strictEqual(fs.readFileSync(file, "utf8"), "content", "and reads back");
+
+  fs.rmSync(dir, { recursive: true });
 });

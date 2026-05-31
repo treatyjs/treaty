@@ -67,12 +67,57 @@ function describe(name, fn) {
 }
 // === treaty node-conformance harness shim (end) ===
 
-// TextEncoder/TextDecoder are installed by the Node-compat globals layer as lazy, self-replacing
-// accessors on the realm global, and are now reachable from the harness's evaluation scope.
-test("TextEncoder/TextDecoder utf8 round-trip", () => {
-  const enc = new TextEncoder();
-  const dec = new TextDecoder();
-  const bytes = enc.encode("héllo");
-  assert.ok(bytes instanceof Uint8Array, "encode must yield a Uint8Array");
-  assert.strictEqual(dec.decode(bytes), "héllo", "utf8 decode round-trip");
+// Node test/parallel-style: node:fs appendFileSync. Mirrors Node's test-fs-append-file-sync —
+// appendFileSync appends to an existing file and creates the file when it is absent.
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+
+function tmp(prefix) {
+  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+}
+
+test("appendFileSync concatenates onto an existing file", () => {
+  const dir = tmp("treaty-fs-append-");
+  const file = path.join(dir, "log.txt");
+
+  fs.writeFileSync(file, "abc");
+  fs.appendFileSync(file, "de");
+  fs.appendFileSync(file, "f");
+  assert.strictEqual(fs.readFileSync(file, "utf8"), "abcdef", "appends in order, never truncates");
+
+  fs.rmSync(dir, { recursive: true });
+});
+
+test("appendFileSync creates the file when it does not yet exist", () => {
+  const dir = tmp("treaty-fs-append-new-");
+  const file = path.join(dir, "fresh.txt");
+
+  assert.strictEqual(fs.existsSync(file), false, "no file before the append");
+  fs.appendFileSync(file, "created-by-append");
+  assert.strictEqual(fs.existsSync(file), true, "append created the file");
+  assert.strictEqual(
+    fs.readFileSync(file, "utf8"),
+    "created-by-append",
+    "the created file holds exactly the appended bytes"
+  );
+
+  fs.rmSync(dir, { recursive: true });
+});
+
+test("a sequence of appends builds the full content", () => {
+  const dir = tmp("treaty-fs-append-seq-");
+  const file = path.join(dir, "seq.txt");
+
+  const parts = ["one", "-two", "-three", "-four"];
+  for (const part of parts) {
+    fs.appendFileSync(file, part);
+  }
+  assert.strictEqual(
+    fs.readFileSync(file, "utf8"),
+    parts.join(""),
+    "the file equals the concatenation of every appended chunk"
+  );
+
+  fs.rmSync(dir, { recursive: true });
 });

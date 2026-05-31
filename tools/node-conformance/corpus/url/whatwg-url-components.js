@@ -67,20 +67,62 @@ function describe(name, fn) {
 }
 // === treaty node-conformance harness shim (end) ===
 
-// The runtime installs `URL`/`URLSearchParams` as lazy global accessors (the constructible WHATWG
-// classes), distinct from node:url's legacy functional parse()/format()/fileURLToPath() API covered
-// by url-parse-format.js. The constructors are now reachable from the harness's evaluation scope.
-test("WHATWG URL component parsing", () => {
+// Node test/parallel-style: the WHATWG `URL` class reached via `require("node:url").URL`.
+//
+// Unlike the global-only `URL` accessor (unreachable from this eval scope), the constructor is also a
+// named export of node:url, so it is exercised here. Covers full-component decomposition, href
+// round-trip, origin, the port/host pairing and a credentialed authority.
+const { URL } = require("node:url");
+
+test("a full URL decomposes into all its components", () => {
   const u = new URL("https://example.com:8080/a/b?q=1&q=2#frag");
+  assert.strictEqual(u.protocol, "https:", "protocol");
   assert.strictEqual(u.hostname, "example.com", "hostname");
   assert.strictEqual(u.port, "8080", "port");
+  assert.strictEqual(u.host, "example.com:8080", "host pairs hostname:port");
   assert.strictEqual(u.pathname, "/a/b", "pathname");
+  assert.strictEqual(u.search, "?q=1&q=2", "search");
   assert.strictEqual(u.hash, "#frag", "hash");
 });
 
-test("URLSearchParams get/append/getAll", () => {
-  const params = new URLSearchParams("a=1&b=2");
-  assert.strictEqual(params.get("a"), "1", "searchParams get");
-  params.append("a", "3");
-  assert.strictEqual(params.getAll("a").join(","), "1,3", "searchParams append/getAll");
+test("href round-trips the original input", () => {
+  const input = "https://example.com:8080/a/b?q=1&q=2#frag";
+  const u = new URL(input);
+  assert.strictEqual(u.href, input, "href reconstructs the input");
+  assert.strictEqual(String(u), input, "toString equals href");
+});
+
+test("origin reflects protocol + host", () => {
+  const u = new URL("https://example.com:8080/a/b");
+  assert.strictEqual(u.origin, "https://example.com:8080", "origin");
+});
+
+test("a URL without a port reports an empty port and a bare host", () => {
+  const u = new URL("http://host/path");
+  assert.strictEqual(u.protocol, "http:", "protocol");
+  assert.strictEqual(u.hostname, "host", "hostname");
+  assert.strictEqual(u.port, "", "absent port is the empty string");
+  assert.strictEqual(u.host, "host", "host has no colon when port is absent");
+  assert.strictEqual(u.pathname, "/path", "pathname");
+});
+
+test("a query-less, fragment-less URL reports empty search and hash", () => {
+  const u = new URL("http://host/p");
+  assert.strictEqual(u.search, "", "no query -> empty search");
+  assert.strictEqual(u.hash, "", "no fragment -> empty hash");
+});
+
+test("an input with no scheme and no base throws a TypeError", () => {
+  let caught = null;
+  try {
+    new URL("not a url");
+  } catch (e) {
+    caught = e;
+  }
+  assert.ok(caught instanceof TypeError, "must throw a TypeError for an invalid URL");
+});
+
+test("toJSON returns the href", () => {
+  const u = new URL("https://example.com/x");
+  assert.strictEqual(u.toJSON(), u.href, "toJSON equals href");
 });

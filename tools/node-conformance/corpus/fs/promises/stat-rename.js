@@ -67,12 +67,54 @@ function describe(name, fn) {
 }
 // === treaty node-conformance harness shim (end) ===
 
-// TextEncoder/TextDecoder are installed by the Node-compat globals layer as lazy, self-replacing
-// accessors on the realm global, and are now reachable from the harness's evaluation scope.
-test("TextEncoder/TextDecoder utf8 round-trip", () => {
-  const enc = new TextEncoder();
-  const dec = new TextDecoder();
-  const bytes = enc.encode("héllo");
-  assert.ok(bytes instanceof Uint8Array, "encode must yield a Uint8Array");
-  assert.strictEqual(dec.decode(bytes), "héllo", "utf8 decode round-trip");
+// Node test/parallel-style: node:fs/promises stat / rename / access. Mirrors Node's
+// test-fs-promises-stat / test-fs-promises-rename — the promised stat distinguishes files from
+// directories and reports size, rename moves a path, and access resolves/rejects on presence.
+const fsp = require("node:fs/promises");
+const os = require("node:os");
+const path = require("node:path");
+
+test("stat via promises reports isFile / isDirectory / size", async () => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "treaty-fsp-stat-"));
+  const file = path.join(dir, "f.txt");
+  await fsp.writeFile(file, "01234"); // five bytes
+
+  const fileStat = await fsp.stat(file);
+  assert.strictEqual(fileStat.isFile(), true, "the file is a file");
+  assert.strictEqual(fileStat.isDirectory(), false, "the file is not a directory");
+  assert.strictEqual(fileStat.size, 5, "size is the five bytes written");
+
+  const dirStat = await fsp.stat(dir);
+  assert.strictEqual(dirStat.isDirectory(), true, "the directory is a directory");
+
+  await fsp.rm(dir, { recursive: true });
+});
+
+test("rename via promises moves a file and its contents", async () => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "treaty-fsp-rename-"));
+  const from = path.join(dir, "from.txt");
+  const to = path.join(dir, "to.txt");
+
+  await fsp.writeFile(from, "moved-contents");
+  await fsp.rename(from, to);
+
+  await assert.rejects(fsp.stat(from), "the old name no longer stats");
+  assert.strictEqual(await fsp.readFile(to, "utf8"), "moved-contents", "the new name has the data");
+
+  await fsp.rm(dir, { recursive: true });
+});
+
+test("access via promises resolves for a present path and rejects for a missing one", async () => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "treaty-fsp-access-"));
+  const file = path.join(dir, "present.txt");
+  await fsp.writeFile(file, "1");
+
+  // A resolving access() means the path is reachable; await must not throw.
+  await fsp.access(file);
+  await assert.rejects(
+    fsp.access(path.join(dir, "absent.txt")),
+    "access of a missing path must reject"
+  );
+
+  await fsp.rm(dir, { recursive: true });
 });

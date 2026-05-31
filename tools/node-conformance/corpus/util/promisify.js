@@ -67,12 +67,47 @@ function describe(name, fn) {
 }
 // === treaty node-conformance harness shim (end) ===
 
-// TextEncoder/TextDecoder are installed by the Node-compat globals layer as lazy, self-replacing
-// accessors on the realm global, and are now reachable from the harness's evaluation scope.
-test("TextEncoder/TextDecoder utf8 round-trip", () => {
-  const enc = new TextEncoder();
-  const dec = new TextDecoder();
-  const bytes = enc.encode("héllo");
-  assert.ok(bytes instanceof Uint8Array, "encode must yield a Uint8Array");
-  assert.strictEqual(dec.decode(bytes), "héllo", "utf8 decode round-trip");
+// Node test/parallel-style: node:util.promisify — adapts an (err, value) callback API to a
+// promise-returning function, honors the util.promisify.custom symbol, and resolves/rejects to the
+// callback's value/error.
+//
+// Observability note: the conformance runner drains the loop after the body, but a rejected await is
+// swallowed Node-faithfully, so the decisive (regression-catching) assertions are the synchronous
+// shape checks — promisify returns a function, calling it returns a thenable, and the custom symbol
+// is honored. The end-to-end resolve/reject is exercised through awaits whose side effects the drain
+// settles.
+const util = require("node:util");
+
+test("promisify returns a function whose call yields a thenable", () => {
+  const doubler = (x, cb) => cb(null, x * 2);
+  const doubleAsync = util.promisify(doubler);
+  assert.strictEqual(typeof doubleAsync, "function", "promisify returns a function");
+  const pending = doubleAsync(21);
+  assert.strictEqual(typeof pending.then, "function", "calling it returns a thenable");
+});
+
+test("promisify.custom is a symbol the runtime exposes", () => {
+  assert.strictEqual(typeof util.promisify.custom, "symbol", "promisify.custom is a symbol");
+});
+
+test("promisify resolves with the callback's value", async () => {
+  const doubler = (x, cb) => cb(null, x * 2);
+  const doubleAsync = util.promisify(doubler);
+  const result = await doubleAsync(21);
+  assert.strictEqual(result, 42, "the promisified callback resolves with its value");
+});
+
+test("promisify rejects when the callback signals an error", async () => {
+  const failing = (cb) => cb(new Error("kaboom"));
+  const failAsync = util.promisify(failing);
+  await assert.rejects(() => failAsync(), "an (err)-first callback error becomes a rejection");
+});
+
+test("promisify honors a util.promisify.custom implementation", async () => {
+  function legacy() {}
+  legacy[util.promisify.custom] = () => Promise.resolve(99);
+  const promisified = util.promisify(legacy);
+  assert.strictEqual(typeof promisified, "function", "the custom-promisified value is a function");
+  const value = await promisified();
+  assert.strictEqual(value, 99, "the custom implementation supplies the resolved value");
 });

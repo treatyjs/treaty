@@ -67,12 +67,44 @@ function describe(name, fn) {
 }
 // === treaty node-conformance harness shim (end) ===
 
-// TextEncoder/TextDecoder are installed by the Node-compat globals layer as lazy, self-replacing
-// accessors on the realm global, and are now reachable from the harness's evaluation scope.
-test("TextEncoder/TextDecoder utf8 round-trip", () => {
-  const enc = new TextEncoder();
-  const dec = new TextDecoder();
-  const bytes = enc.encode("héllo");
-  assert.ok(bytes instanceof Uint8Array, "encode must yield a Uint8Array");
-  assert.strictEqual(dec.decode(bytes), "héllo", "utf8 decode round-trip");
+// Node test/parallel-style: node:path.posix — the POSIX path sub-namespace always uses forward
+// slashes regardless of host platform: join/normalize/dirname/basename/extname/isAbsolute/relative.
+const path = require("node:path");
+const posix = path.posix;
+
+test("posix.sep and posix.delimiter are the POSIX constants", () => {
+  assert.strictEqual(posix.sep, "/", "posix.sep is a forward slash");
+  assert.strictEqual(posix.delimiter, ":", "posix.delimiter is a colon");
+});
+
+test("posix.join uses forward slashes and collapses repeats", () => {
+  assert.strictEqual(posix.join("a", "b", "c"), "a/b/c", "join with forward slashes");
+  assert.strictEqual(posix.join("/a", "b"), "/a/b", "an absolute root is preserved");
+  assert.strictEqual(posix.join("a/", "/b"), "a/b", "interior separators are collapsed");
+});
+
+test("posix.normalize collapses '.' and '..' against forward slashes", () => {
+  assert.strictEqual(posix.normalize("/a/b/../c"), "/a/c", "'..' removes the previous segment");
+  assert.strictEqual(posix.normalize("a//b/./c"), "a/b/c", "'.' and doubled slashes collapse");
+});
+
+test("posix dirname/basename/extname decompose a forward-slash path", () => {
+  assert.strictEqual(posix.dirname("/foo/bar/baz.txt"), "/foo/bar", "dirname");
+  assert.strictEqual(posix.basename("/foo/bar/baz.txt"), "baz.txt", "basename");
+  assert.strictEqual(posix.basename("/foo/bar/baz.txt", ".txt"), "baz", "basename strips suffix");
+  assert.strictEqual(posix.extname("/foo/bar/baz.txt"), ".txt", "extname");
+});
+
+test("posix.isAbsolute keys on a leading forward slash", () => {
+  assert.strictEqual(posix.isAbsolute("/a/b"), true, "a leading slash is absolute");
+  assert.strictEqual(posix.isAbsolute("a/b"), false, "no leading slash is relative");
+});
+
+test("posix.relative walks up then down between two absolute paths", () => {
+  assert.strictEqual(
+    posix.relative("/a/b/c", "/a/b/d/e"),
+    "../d/e",
+    "relative climbs out of c and into d/e"
+  );
+  assert.strictEqual(posix.relative("/a/b", "/a/b"), "", "the relative path to itself is empty");
 });

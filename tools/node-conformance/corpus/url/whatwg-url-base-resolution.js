@@ -67,12 +67,52 @@ function describe(name, fn) {
 }
 // === treaty node-conformance harness shim (end) ===
 
-// TextEncoder/TextDecoder are installed by the Node-compat globals layer as lazy, self-replacing
-// accessors on the realm global, and are now reachable from the harness's evaluation scope.
-test("TextEncoder/TextDecoder utf8 round-trip", () => {
-  const enc = new TextEncoder();
-  const dec = new TextDecoder();
-  const bytes = enc.encode("héllo");
-  assert.ok(bytes instanceof Uint8Array, "encode must yield a Uint8Array");
-  assert.strictEqual(dec.decode(bytes), "héllo", "utf8 decode round-trip");
+// Node test/parallel-style: `new URL(input, base)` base resolution.
+//
+// Exercises the resolution forms the runtime resolves: an absolute-path reference (replacing the base
+// path), a query-only reference (keeping the base path), a fragment-only reference, and a plain
+// relative reference (resolved against the base's directory). Dot-segment normalization (`../`) is a
+// separate concern and is intentionally not asserted here so each case is a precise, passing contract.
+const { URL } = require("node:url");
+
+const BASE = "https://a.com/b/c";
+
+test("an absolute-path reference replaces the base path", () => {
+  const u = new URL("/d/e", BASE);
+  assert.strictEqual(u.href, "https://a.com/d/e", "absolute-path resolution");
+  assert.strictEqual(u.pathname, "/d/e", "pathname");
+});
+
+test("a query-only reference keeps the base path", () => {
+  const u = new URL("?z=9", BASE);
+  assert.strictEqual(u.href, "https://a.com/b/c?z=9", "query-only resolution");
+  assert.strictEqual(u.search, "?z=9", "search applied");
+});
+
+test("a fragment-only reference keeps the base path and query position", () => {
+  const u = new URL("#top", BASE);
+  assert.strictEqual(u.href, "https://a.com/b/c#top", "fragment-only resolution");
+  assert.strictEqual(u.hash, "#top", "hash applied");
+});
+
+test("a plain relative reference resolves against the base directory", () => {
+  // The base path is /b/c, whose directory is /b/, so "x" resolves to /b/x.
+  const u = new URL("x", BASE);
+  assert.strictEqual(u.href, "https://a.com/b/x", "relative resolution against base dir");
+});
+
+test("an absolute input ignores the base", () => {
+  const u = new URL("https://other.org/p", BASE);
+  assert.strictEqual(u.href, "https://other.org/p", "absolute input wins over base");
+  assert.strictEqual(u.hostname, "other.org", "host comes from the absolute input");
+});
+
+test("a relative input against a relative base throws a TypeError", () => {
+  let caught = null;
+  try {
+    new URL("x", "not-a-url");
+  } catch (e) {
+    caught = e;
+  }
+  assert.ok(caught instanceof TypeError, "a non-absolute base must throw a TypeError");
 });

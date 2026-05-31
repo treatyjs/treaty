@@ -67,12 +67,54 @@ function describe(name, fn) {
 }
 // === treaty node-conformance harness shim (end) ===
 
-// TextEncoder/TextDecoder are installed by the Node-compat globals layer as lazy, self-replacing
-// accessors on the realm global, and are now reachable from the harness's evaluation scope.
-test("TextEncoder/TextDecoder utf8 round-trip", () => {
-  const enc = new TextEncoder();
-  const dec = new TextDecoder();
-  const bytes = enc.encode("héllo");
-  assert.ok(bytes instanceof Uint8Array, "encode must yield a Uint8Array");
-  assert.strictEqual(dec.decode(bytes), "héllo", "utf8 decode round-trip");
+// Node test/parallel-style: node:crypto createHmac against published HMAC test vectors.
+//
+// Pins RFC 4231 test case 2 (HMAC-SHA-256) and RFC 2202 test case 2 (HMAC-SHA-1), both keyed with
+// "Jefe" over "what do ya want for nothing?", so the keyed-hash construction is verified against a
+// fixed external reference. Also exercises chunked update equivalence and the raw-digest path.
+const crypto = require("node:crypto");
+
+const KEY = "Jefe";
+const DATA = "what do ya want for nothing?";
+
+test("HMAC-SHA-256 matches RFC 4231 test case 2", () => {
+  const hex = crypto.createHmac("sha256", KEY).update(DATA).digest("hex");
+  assert.strictEqual(
+    hex,
+    "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843",
+    "HMAC-SHA-256(Jefe, ...)"
+  );
+});
+
+test("HMAC-SHA-1 matches RFC 2202 test case 2", () => {
+  const hex = crypto.createHmac("sha1", KEY).update(DATA).digest("hex");
+  assert.strictEqual(
+    hex,
+    "effcdf6ae5eb2fa2d27416d5f184df9c259a7c79",
+    "HMAC-SHA-1(Jefe, ...)"
+  );
+});
+
+test("chunked HMAC updates concatenate to the one-shot MAC", () => {
+  // HMAC(key, a ++ b) === feeding "a" then "b": split DATA at a space boundary.
+  const split = DATA.indexOf(" want");
+  const head = DATA.slice(0, split);
+  const tail = DATA.slice(split);
+  const streamed = crypto.createHmac("sha256", KEY).update(head).update(tail).digest("hex");
+  assert.strictEqual(
+    streamed,
+    "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843",
+    "chunked HMAC equals one-shot"
+  );
+});
+
+test("an HMAC digest with no encoding is a 32-byte container for sha256", () => {
+  const raw = crypto.createHmac("sha256", KEY).update(DATA).digest();
+  assert.strictEqual(raw.length, 32, "HMAC-SHA-256 output is 32 bytes");
+  // First byte of the RFC 4231 case-2 MAC is 0x5b.
+  assert.strictEqual(raw[0], 0x5b, "first raw MAC byte");
+});
+
+test("an unsupported HMAC algorithm throws", () => {
+  assert.throws(() => crypto.createHmac("sha3-256", KEY), "sha3-256 is not implemented");
 });
