@@ -32,6 +32,13 @@ export const routes: Routes = [
 		path: 'greeter',
 		loadComponent: () => import('../features/greeter/greeter-page.component'),
 	},
+	{
+		// Lazy single-component remote (auto-exposed as ./routes/metrics). Its
+		// component hosts the signals-heavy .treaty Gauge, a selectorless
+		// directive, and a pipe -- another lazy boundary that becomes a remote.
+		path: 'metrics',
+		loadComponent: () => import('../features/metrics/metrics-panel.component'),
+	},
 ]
 
 export default routes

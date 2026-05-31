@@ -21,6 +21,10 @@ true`, or change-detection boilerplate. Treaty is a compiler, not a host.
 | `src/features/greeter/greeting-card.tjsx` | JSX (`.tjsx`) | A **FUNCTION component** (`greetingCard`) — functions are first-class components; **lowercase** name; **signal** locals (`name`, `log`); lowercase **`class`**; a **`use:autofocus`** directive; and Angular **`@if`/`@for`** control-flow blocks written **directly in the JSX** (not a `.map()`/ternary lowering). Declares an **inline `$$`-marked server fn** (`loadGreeting$$`) in the same file — a separate `.server.ts` is optional, not required. |
 | `src/components/log-viewer.component.ts` | Plain Angular `@Component` (`.ts`) | Base Angular — a decorated class — **without a `selector`** (selectorless), using **signals** + **`@if`/`@for`** control flow. Calls the **Stream**-transport server fn. Shows that base-Angular benefits from the same compiler. |
 | `src/features/greeter/greeter-page.component.ts` | Plain Angular `@Component` (`.ts`) | A selectorless decorated class — **no `selector`/`standalone`/CD boilerplate** — default-exported as the **lazy `greeter` route**'s `loadComponent`. It hosts the `.treaty` and `.tjsx` components **selectorlessly** (auto-import by value), so one federated remote shows all three surfaces interop. |
+| `src/features/metrics/gauge.treaty` | `.treaty` single-file component | **Signals by default**, taken to its limit: a top **macro fence** of threshold bands, **three signal inputs** (`min`/`max`/`value`, bound by the host), two derived **`computed`** values (`clamped`, `ratio`), an **`effect`** that records each settled reading into a local history signal, and another `computed` delta — all with **no `@Component`/selector/signal boilerplate**. The view pipes a computed through the **`percent01` pipe** and binds the trend through the **selectorless `HighlightDelta` directive**, with a `<style lang="scss">` block. |
+| `src/features/metrics/highlight-delta.directive.ts` | Plain Angular `@Directive` (`.ts`) | A **selectorless directive** — **no `selector`/`standalone`** (the compiler fills them in) — consumed **by name** in two templates (`<span HighlightDelta [delta]="…">`) after being listed **by class** in the host's `imports`. Uses a **signal `input`**, a **`computed`** tint, and an **`effect`** that reflects the sign as a `data-trend` attribute. |
+| `src/features/metrics/percent.pipe.ts` | Plain Angular `@Pipe` (`.ts`) | A **pipe** — no `standalone` boilerplate — used **by name** in templates (`{{ ratio() \| percent01 }}`, with an optional fraction-digits arg) and listed **by class** in the host's `imports`. Formats a 0..1 ratio as a percentage. |
+| `src/features/metrics/metrics-panel.component.ts` | Plain Angular `@Component` (`.ts`) | A selectorless decorated class — **no `selector`/`standalone`/CD boilerplate** — default-exported as the **lazy `metrics` route**'s `loadComponent`. It hosts the signals-heavy `.treaty` **`Gauge`** selectorlessly and **wires the pipe + selectorless directive** (both by value in `imports`, by name in its template), so one federated remote exercises a SFC, a pipe, and a directive together. |
 
 ### Server functions (three transports, all three markers)
 
@@ -41,11 +45,12 @@ inline `server { ... }` block, and a `$$`-suffixed name.
 
 | File | Shows |
 | --- | --- |
-| `src/routes/app.routes.ts` | One eager route plus three **lazy** feature routes (two `loadComponent`, one `loadChildren`). Treaty's `deriveExposesFromRoutes` turns every lazy boundary into an independently deployable **Module Federation remote** with no hand-written `exposes` map. |
+| `src/routes/app.routes.ts` | One eager route plus four **lazy** feature routes (three `loadComponent`, one `loadChildren`). Treaty's `deriveExposesFromRoutes` turns every lazy boundary into an independently deployable **Module Federation remote** with no hand-written `exposes` map. |
 | `src/features/dashboard/dashboard.component.ts` | A lazy single-component remote (`loadComponent`). |
 | `src/features/profile/profile.routes.ts` | A lazy child-routes remote (`loadChildren`) with nested routing. |
 | `src/features/profile/profile.component.ts`, `profile-settings.component.ts` | The Profile feature's screens (one decorated class per file). |
 | `src/features/greeter/greeter-page.component.ts` | A lazy single-component remote (`loadComponent`, auto-exposed as `./routes/greeter`) that **calls an extracted server fn** and hosts the `.treaty` + `.tjsx` surfaces — showing server-fn extraction and federation together. |
+| `src/features/metrics/metrics-panel.component.ts` | A lazy single-component remote (`loadComponent`, auto-exposed as `./routes/metrics`) that hosts the signals-heavy `.treaty` `Gauge`, the **selectorless directive**, and the **pipe** — showing directive/pipe wiring inside a federated remote. |
 
 Running the route graph through `deriveExposesFromRoutes` yields:
 
@@ -54,7 +59,8 @@ Running the route graph through `deriveExposesFromRoutes` yields:
   "./routes/index": "./src/app/index",
   "./routes/dashboard": "./src/app/dashboard",
   "./routes/profile": "./src/app/profile",
-  "./routes/greeter": "./src/app/greeter"
+  "./routes/greeter": "./src/app/greeter",
+  "./routes/metrics": "./src/app/metrics"
 }
 ```
 
@@ -75,7 +81,7 @@ Ivy JS via `@treaty/compiler` → the Rust addon) and, for the app builds, the
 In every app build the federation `exposes` map is **derived from the route
 graph** by `deriveExposesFromRoutes` (run inside `@treaty/module-federation`) —
 the developer writes no `exposes` by hand. Passing `routes` is the whole config.
-The three lazy routes (`dashboard`, `profile`, `greeter`) become independently
+The four lazy routes (`dashboard`, `profile`, `greeter`, `metrics`) become independently
 deployable remotes; the eager index route stays in the host.
 
 > The bundler peers (`vite`, `@rspack/core`, `@rsbuild/core`, `@rslib/core`, the
