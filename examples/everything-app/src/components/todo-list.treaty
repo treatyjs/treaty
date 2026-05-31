@@ -1,0 +1,94 @@
+```
+// == Macro block ==
+// This fenced block runs at COMPILE time (Treaty's render-time data macro).
+// Whatever it assigns is inlined into the component as constant data, so there
+// is zero runtime cost. Great for build-time tables, feature flags, copy, etc.
+const buildStamp = new Date(0).toISOString()
+const priorities = ['low', 'normal', 'high'].map((label, weight) => ({ label, weight }))
+const meta = { buildStamp, priorities }
+```
+
+// == Component body (TypeScript by default -- no <script> needed) ==
+import { signal, computed } from '@angular/core'
+import { listTodos, addTodo, toggleTodo, type Todo } from '../server/todos.server'
+
+// `signal` / `computed` are used directly; Treaty defaults to standalone +
+// signal + selectorless, so there is no @Component, selector, or boilerplate.
+const todos = signal<Todo[]>([])
+const draft = signal('')
+const remaining = computed(() => todos().filter((t) => !t.done).length)
+
+// Call sites for the API-transport server fn. On the client these compile to
+// the typed Eden/resource binding; the function bodies stay on the server.
+async function refresh(): Promise<void> {
+	todos.set(await listTodos())
+}
+
+async function create(): Promise<void> {
+	const title = draft().trim()
+	if (!title) return
+	await addTodo(title)
+	draft.set('')
+	await refresh()
+}
+
+async function toggle(id: number): Promise<void> {
+	await toggleTodo(id)
+	await refresh()
+}
+
+void refresh()
+
+<template>
+  <section class="todo">
+    <header>
+      <h2>Todos</h2>
+      <small>built {{ meta.buildStamp }} | {{ remaining() }} remaining</small>
+    </header>
+
+    <form (submit)="create()">
+      <input
+        name="title"
+        placeholder="What needs doing?"
+        [value]="draft()"
+        (input)="draft.set($event.target.value)"
+      />
+      <button type="submit">Add</button>
+    </form>
+
+    @if (todos().length) {
+      <ul>
+        @for (todo of todos(); track todo.id) {
+          <li [class.done]="todo.done" (click)="toggle(todo.id)">
+            {{ todo.title }}
+          </li>
+        }
+      </ul>
+    } @else {
+      <p class="empty">No todos yet.</p>
+    }
+  </section>
+</template>
+
+<style lang="scss">
+  .todo {
+    $accent: #6d28d9;
+    font-family: system-ui, sans-serif;
+
+    header {
+      display: flex;
+      align-items: baseline;
+      gap: 0.5rem;
+      small { color: color-mix(in srgb, $accent 60%, gray); }
+    }
+
+    ul { list-style: none; padding: 0; }
+    li {
+      cursor: pointer;
+      padding: 0.25rem 0;
+      &.done { text-decoration: line-through; opacity: 0.5; }
+      &:hover { color: $accent; }
+    }
+    .empty { color: gray; font-style: italic; }
+  }
+</style>

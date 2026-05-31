@@ -1,0 +1,46 @@
+{
+  "name": "@treaty-examples/everything-app",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Showcase of every Treaty authoring capability: .treaty SFCs, JSX components, selectorless Angular @Component, server functions across api/websocket/stream transports, and lazy feature routes that auto-become Module Federation remotes.",
+  "scripts": {
+    "typecheck": "tsgo --noEmit -p tsconfig.json",
+    "lint": "oxlint src *.config.ts federation",
+    "build:vite": "vite build",
+    "dev:vite": "vite",
+    "build:rspack": "rspack build -c rspack.config.ts",
+    "build:rsbuild": "rsbuild build",
+    "dev:rsbuild": "rsbuild dev",
+    "build:lib": "rslib build -c rslib.config.ts",
+    "serve:remote": "rspack serve -c federation/remote.config.ts"
+  },
+  "peerDependencies": {
+    "@angular/common": "^21.0.0",
+    "@angular/core": "^21.0.0",
+    "@angular/router": "^21.0.0",
+    "@module-federation/enhanced": ">=0.9",
+    "@module-federation/vite": ">=1.2",
+    "@rsbuild/core": ">=1.0.0",
+    "@rslib/core": ">=0.1.0",
+    "@rspack/core": ">=1",
+    "vite": "^5.0.0 || ^6.0.0 || ^7.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@module-federation/enhanced": { "optional": true },
+    "@module-federation/vite": { "optional": true },
+    "@rsbuild/core": { "optional": true },
+    "@rslib/core": { "optional": true },
+    "@rspack/core": { "optional": true },
+    "vite": { "optional": true }
+  },
+  "devDependencies": {
+    "@treaty/compiler": "*",
+    "@treaty/federation-deploy": "*",
+    "@treaty/module-federation": "*",
+    "@treaty/rsbuild": "*",
+    "@treaty/rslib": "*",
+    "@treaty/rspack": "*",
+    "@treaty/vite": "*"
+  }
+}
