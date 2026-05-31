@@ -67,12 +67,16 @@ pub fn compile_component_source(source: String) -> CompiledComponent {
 /// `CompiledComponent` carrying descriptive errors.
 #[napi]
 pub fn compile_treaty_file(source: String, file_name: String) -> CompiledComponent {
-    let result = rust_authoring::sfc::compile_treaty_file(&source, &file_name);
+    // Emit the additive v3 map alongside the component, embedding the original `.treaty` source as
+    // `sourcesContent` (named by `file_name`). This entry is server-block-unaware (it compiles the
+    // raw source verbatim); the server-block-aware `.treaty` path with body redaction is reached
+    // through the unified `compile` / `compile_many` entries.
+    let (result, map) =
+        rust_authoring::sfc::compile_treaty_file_with_map(&source, &file_name, &file_name, &source);
     CompiledComponent {
         code: result.code,
         errors: result.errors,
-        // The `.treaty` SFC path lowers via `emit_expression`, not the source-map component entry.
-        map: None,
+        map,
     }
 }
 

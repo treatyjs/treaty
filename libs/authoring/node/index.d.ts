@@ -35,8 +35,10 @@ export declare function compileComponentSource(source: string): CompiledComponen
  * Compile a `.treaty` single-file component directly from its source.
  *
  * `source` is the full `.treaty` file contents and `file_name` its path/name (used for
- * diagnostics). Returns the emitted `ɵɵdefineComponent({...})` definition, or a
- * `CompiledComponent` carrying descriptive errors.
+ * diagnostics and as the map's source name). Returns the emitted `ɵɵdefineComponent({...})`
+ * definition plus the additive Source Map v3 JSON (`map`, embedding the original `.treaty` source
+ * as `sourcesContent`), or a `CompiledComponent` carrying descriptive errors. This entry is
+ * server-block-unaware; the server-block-aware path (with body redaction) is reached via `compile`.
  */
 export declare function compileTreatyFile(source: string, fileName: string): CompiledComponent
 /** Result of the unified per-file authoring compile ([`compile`]). */

@@ -30,7 +30,8 @@ use oxc_parser::Parser as JsParser;
 use oxc_span::SourceType;
 
 use crate::plugin::{extract_server_block, rewrite_call_sites, BackendPlugin, ElysiaEdenPlugin};
-use crate::sfc::compile_from_parts_with_directives;
+use crate::sfc::compile_from_parts_with_directives_and_map;
+use crate::source_map::redact_server_bodies_in_map;
 use crate::CompiledAuthoring;
 
 /// PascalCase the stem of a file name, reused as the component class name. Mirrors the `.treaty`
@@ -155,13 +156,16 @@ pub fn compile(source: &str, file_name: &str) -> CompiledAuthoring {
     let template_html = angular_blocks::restore(&template_html, &cf_blocks);
 
     // 4. When a server block was present, emit it and rewrite client call sites — same contract as
-    //    the `.treaty` path.
-    let (javascript, server_module) = if extraction.server_fns.is_empty() {
-        (javascript, None)
+    //    the `.treaty` path. The lifted server-fn body texts are kept so they can be redacted out of
+    //    the client map's `sourcesContent` below.
+    let (javascript, server_module, server_bodies) = if extraction.server_fns.is_empty() {
+        (javascript, None, Vec::new())
     } else {
         let emit = ElysiaEdenPlugin.emit(&extraction.server_fns);
         let rewritten = rewrite_call_sites(&javascript, &emit.client_bindings);
-        (rewritten, Some(emit.server_module))
+        let bodies: Vec<String> =
+            extraction.server_fns.iter().map(|f| f.source.clone()).collect();
+        (rewritten, Some(emit.server_module), bodies)
     };
 
     // 5. Signals-by-default: every component variable is a signal. Wrap simple-value declarations in
@@ -174,15 +178,25 @@ pub fn compile(source: &str, file_name: &str) -> CompiledAuthoring {
 
     // 6. Reuse the shared render3 backend. JSX components carry no `<style>` chunk yet, so styles
     //    are empty for this phase. The directive classes applied in the template (collected during
-    //    lowering) are threaded in so they auto-import into the component's `dependencies`.
-    let compiled = compile_from_parts_with_directives(
+    //    lowering) are threaded in so they auto-import into the component's `dependencies`. The map
+    //    embeds the ORIGINAL authoring source (`source`) as `sourcesContent`, named by `file_name`,
+    //    exactly as the base `@Component` `.ts` and `.treaty` paths do.
+    let (compiled, map) = compile_from_parts_with_directives_and_map(
         &class_name,
         &javascript,
         &template_html,
         "",
         file_name,
         &directive_refs,
+        file_name,
+        source,
     );
+
+    // CLIENT PRIVACY: the map's `sourcesContent` is the original `.tjsx` source, which still carries
+    // any `server { … }` block. Redact each lifted server-fn body out of the map content (blanked to
+    // position-preserving whitespace) so the server source never reaches the client map — the same
+    // guarantee the `.treaty` and base `@Component` paths provide.
+    let map = map.map(|m| redact_server_bodies_in_map(&m, &server_bodies));
 
     let mut all_errors = errors;
     all_errors.extend(compiled.errors);
@@ -190,9 +204,7 @@ pub fn compile(source: &str, file_name: &str) -> CompiledAuthoring {
     CompiledAuthoring {
         code: compiled.code,
         server_module,
-        // The JSX front-end lowers via `compile_from_parts_with_directives` (emit_expression), not
-        // render3's source-map component entry, so it carries no v3 map yet.
-        map: None,
+        map,
         errors: all_errors,
     }
 }
@@ -430,6 +442,63 @@ mod tests {
             "server body leaked into client JS; got: {}",
             out.code
         );
+    }
+
+    #[test]
+    fn tjsx_without_server_block_carries_a_v3_map() {
+        // A `.tjsx` component (no server block) compiles WITH an additive v3 map whose
+        // `sourcesContent` embeds the original authoring source, named by the file.
+        let source = "export default function App() {\n  return <div>hi</div>;\n}\n";
+        let out = compile(source, "app.tjsx");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+
+        let map = out.map.expect("expected a source map for a `.tjsx` component");
+        let value: serde_json::Value =
+            serde_json::from_str(&map).expect("map should be valid JSON");
+        assert_eq!(value["version"], serde_json::json!(3), "not a v3 map: {map}");
+        assert_eq!(value["sources"][0], serde_json::json!("app.tjsx"), "wrong source name");
+        let contents = value["sourcesContent"].as_array().expect("sourcesContent array");
+        assert!(
+            contents.iter().any(|c| c.as_str() == Some(source)),
+            "authoring source not embedded as sourcesContent; got: {map}"
+        );
+    }
+
+    #[test]
+    fn tjsx_server_block_body_is_absent_from_client_map() {
+        // CLIENT PRIVACY: a `.tjsx` whose component body declares an in-component `server { … }`
+        // block must compile to a v3 map whose `sourcesContent` does NOT contain the server body.
+        let source = "export default function App() {\n\
+  function onSave(user) { return save(user); }\n\
+  server {\n\
+    async function save(user: User) { return db.insert(user); }\n\
+  }\n\
+  return <button onClick={onSave}>save</button>;\n\
+}\n";
+        let out = compile(source, "app.tjsx");
+        assert!(out.server_module.is_some(), "expected a server module");
+
+        let map = out.map.expect("expected a source map for a server-block `.tjsx`");
+        let value: serde_json::Value =
+            serde_json::from_str(&map).expect("map should be valid JSON");
+        assert_eq!(value["version"], serde_json::json!(3), "not a v3 map: {map}");
+
+        let contents = value["sourcesContent"].as_array().expect("sourcesContent array");
+        for c in contents {
+            let text = c.as_str().unwrap_or("");
+            assert!(!text.contains("db.insert"), "server body leaked into map content: {text}");
+            assert!(
+                !text.contains("async function save"),
+                "server signature leaked into map content: {text}"
+            );
+        }
+        // The surviving client text (the handler) is still present in the redacted map.
+        let joined: String = contents
+            .iter()
+            .filter_map(|c| c.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("function onSave"), "client body lost from map: {joined}");
     }
 
     #[test]

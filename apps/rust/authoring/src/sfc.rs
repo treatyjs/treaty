@@ -31,7 +31,7 @@ use oxc_parser::Parser as JsParser;
 use oxc_span::SourceType;
 
 use render3::compile::{CompiledComponent, RealTemplateBuilder};
-use render3::output::emitter::emit_expression;
+use render3::output::emitter::{emit_expression, emit_expression_with_map};
 use render3::output_ast::{self as o, ParseSourceSpan};
 use render3::template::template_transform::{
     html_ast_to_render3_ast, BindingParser, Render3ParseOptions,
@@ -46,6 +46,7 @@ use render3::view::compiler::{
 };
 
 use crate::plugin::{extract_server_block, rewrite_call_sites, BackendEmit, PluginRegistry, ServerFn};
+use crate::source_map::redact_server_bodies_in_map;
 use crate::treaty::ast::AstNode;
 use crate::treaty::lexer::Lexer;
 use crate::treaty::parser::Parser;
@@ -388,6 +389,35 @@ fn class_ref(class_name: &str) -> R3Reference {
 /// export default <Comp>;
 /// ```
 pub fn compile_treaty_file(source: &str, file_name: &str) -> CompiledComponent {
+    compile_treaty_file_inner(source, file_name, None).0
+}
+
+/// Like [`compile_treaty_file`], but ALSO emits an additive Source Map v3 JSON.
+///
+/// `source_name` / `source_content` describe the ORIGINAL authoring source embedded in the map's
+/// `sources[0]` / `sourcesContent[0]`. `source_content` is the verbatim `.treaty` file text (the
+/// caller passes the original, pre-server-strip source so the map carries the author's file); the
+/// server-aware wrapper then redacts any lifted server-fn body out of `sourcesContent` for client
+/// privacy. The `code` is byte-identical to [`compile_treaty_file`]; the map is additive.
+pub fn compile_treaty_file_with_map(
+    source: &str,
+    file_name: &str,
+    source_name: &str,
+    source_content: &str,
+) -> (CompiledComponent, Option<String>) {
+    compile_treaty_file_inner(source, file_name, Some((source_name, source_content)))
+}
+
+/// Shared implementation behind [`compile_treaty_file`] and [`compile_treaty_file_with_map`].
+///
+/// `source` is the (server-stripped) client `.treaty` source that is actually compiled; the
+/// optional `source_map` carries the original authoring `(source_name, source_content)` to embed
+/// in the emitted map. When `source_map` is `None`, the plain map-free path is used.
+fn compile_treaty_file_inner(
+    source: &str,
+    file_name: &str,
+    source_map: Option<(&str, &str)>,
+) -> (CompiledComponent, Option<String>) {
     let chunks = split_chunks(source);
     let class_name = to_pascal_case(file_name);
 
@@ -448,7 +478,22 @@ pub fn compile_treaty_file(source: &str, file_name: &str) -> CompiledComponent {
     // Current `.treaty` sources carry at most one style chunk, so this round-trips byte-identically.
     let styles = styles.join("");
 
-    let mut compiled = compile_from_parts(&class_name, &javascript, &template_html, &styles, file_name);
+    let (mut compiled, map) = match source_map {
+        Some((source_name, source_content)) => compile_from_parts_with_directives_and_map(
+            &class_name,
+            &javascript,
+            &template_html,
+            &styles,
+            file_name,
+            &[],
+            source_name,
+            source_content,
+        ),
+        None => (
+            compile_from_parts(&class_name, &javascript, &template_html, &styles, file_name),
+            None,
+        ),
+    };
     // Surface macro and sass diagnostics ahead of the template diagnostics from the backend.
     if !macro_errors.is_empty() || !style_errors.is_empty() {
         let mut errors = macro_errors;
@@ -456,7 +501,7 @@ pub fn compile_treaty_file(source: &str, file_name: &str) -> CompiledComponent {
         errors.extend(compiled.errors);
         compiled.errors = errors;
     }
-    compiled
+    (compiled, map)
 }
 
 /// Run the captured macro block(s) and encode their combined output as a single injectable JS
@@ -553,6 +598,69 @@ pub fn compile_from_parts_with_directives(
     file_name: &str,
     extra_directives: &[String],
 ) -> CompiledComponent {
+    compile_from_parts_inner(
+        class_name,
+        javascript,
+        template_html,
+        styles,
+        file_name,
+        extra_directives,
+        None,
+    )
+    .0
+}
+
+/// Like [`compile_from_parts_with_directives`], but ALSO emits an additive Source Map v3 JSON
+/// alongside the compiled module.
+///
+/// The map is produced through render3's source-map emitter
+/// ([`render3::output::emitter::emit_expression_with_map`]) for the lowered `ɵɵdefineComponent`
+/// expression, embedding `source_content` as the map's `sourcesContent[0]` and `source_name` as
+/// its `sources[0]`. `source_content` is the ORIGINAL authoring source text (the verbatim
+/// `.treaty` / `.tjsx` file), so the client map carries the author's source — exactly as the base
+/// `@Component` `.ts` path does via [`render3::source_compile::compile_component_source_with_map`].
+///
+/// The returned `code` is byte-identical to [`compile_from_parts_with_directives`] (the map is
+/// additive and never reprints the module). The second tuple element is `None` only when the
+/// emitter produced an empty map.
+pub fn compile_from_parts_with_directives_and_map(
+    class_name: &str,
+    javascript: &str,
+    template_html: &str,
+    styles: &str,
+    file_name: &str,
+    extra_directives: &[String],
+    source_name: &str,
+    source_content: &str,
+) -> (CompiledComponent, Option<String>) {
+    compile_from_parts_inner(
+        class_name,
+        javascript,
+        template_html,
+        styles,
+        file_name,
+        extra_directives,
+        Some((source_name, source_content)),
+    )
+}
+
+/// Shared implementation behind [`compile_from_parts_with_directives`] and
+/// [`compile_from_parts_with_directives_and_map`].
+///
+/// When `source_map` is `Some((source_name, source_content))` the lowered `ɵɵdefineComponent`
+/// expression is emitted through render3's `emit_expression_with_map`, threading out the additive
+/// v3 map (with `source_content` embedded as `sourcesContent[0]`). When `None`, the plain
+/// (map-free) `emit_expression` path is used and the second tuple element is `None`. Both paths
+/// share the identical lowering + module assembly, so `code` is byte-identical between them.
+fn compile_from_parts_inner(
+    class_name: &str,
+    javascript: &str,
+    template_html: &str,
+    styles: &str,
+    file_name: &str,
+    extra_directives: &[String],
+    source_map: Option<(&str, &str)>,
+) -> (CompiledComponent, Option<String>) {
     let mut errors: Vec<String> = Vec::new();
 
     let style_list: Vec<String> = if styles.is_empty() {
@@ -673,9 +781,46 @@ pub fn compile_from_parts_with_directives(
         &mut pool_statements,
     );
 
-    let cmp_expression = emit_expression(&compiled.expression);
+    // Emit the lowered definition expression. When a source map was requested, route through
+    // render3's `emit_expression_with_map` (byte-identical code, plus an additive v3 map embedding
+    // the original authoring source as `sourcesContent`); otherwise use the plain emitter.
+    let (cmp_expression, map) = match source_map {
+        Some((source_name, source_content)) => {
+            // The map's `file` is the generated artifact (the `.js` sibling of the authoring file);
+            // `source_name` / `source_content` describe the original authoring source.
+            let generated_name = generated_name_for(file_name);
+            let (code, map_json) = emit_expression_with_map(
+                &compiled.expression,
+                &generated_name,
+                source_name,
+                source_content,
+            );
+            (code, map_or_none(map_json))
+        }
+        None => (emit_expression(&compiled.expression), None),
+    };
     let code = build_module(class_name, javascript, &cmp_expression);
-    CompiledComponent { code, errors }
+    (CompiledComponent { code, errors }, map)
+}
+
+/// Derive the generated-artifact name (`*.js`) for the map's `file` from the authoring file name,
+/// preserving directory components. `"src/app.treaty"` -> `"src/app.js"`, `"counter.tjsx"` ->
+/// `"counter.js"`; a name with no extension gains a `.js` suffix.
+fn generated_name_for(file_name: &str) -> String {
+    match file_name.rsplit_once('.') {
+        Some((stem, _ext)) if !stem.is_empty() => format!("{stem}.js"),
+        _ => format!("{file_name}.js"),
+    }
+}
+
+/// Normalize render3's empty-string "no map" sentinel into `None`. render3 returns an empty `map`
+/// when emission produced nothing mappable; any non-empty value is a real v3 JSON document.
+fn map_or_none(map: String) -> Option<String> {
+    if map.trim().is_empty() {
+        None
+    } else {
+        Some(map)
+    }
 }
 
 /// Compile a `.treaty` SFC, handling a top-level `server { … }` block via the [`plugin`] system.
@@ -712,15 +857,18 @@ pub fn compile_treaty_authoring_with(
 ) -> CompiledAuthoring {
     let extraction = extract_server_block(source);
 
+    // The map embeds the ORIGINAL authoring file text as `sourcesContent`, named by `file_name`,
+    // mirroring the base `@Component` `.ts` path. The original `source` (pre-server-strip) is used
+    // so the author's verbatim file is the map content; any lifted server-fn body is then redacted
+    // out of that content below.
     if extraction.server_fns.is_empty() {
-        let compiled = compile_treaty_file(&extraction.client_source, file_name);
+        let (compiled, map) =
+            compile_treaty_file_with_map(&extraction.client_source, file_name, file_name, source);
         return CompiledAuthoring {
             code: compiled.code,
             server_module: None,
             errors: compiled.errors,
-            // The `.treaty` SFC path emits via `emit_expression` directly (not render3's source-map
-            // component entry), so it carries no v3 map yet.
-            map: None,
+            map,
         };
     }
 
@@ -731,14 +879,22 @@ pub fn compile_treaty_authoring_with(
     // is hardcoded here.
     let emit = emit(&extraction.server_fns);
     let client_source = rewrite_call_sites(&extraction.client_source, &emit.client_bindings);
-    let compiled = compile_treaty_file(&client_source, file_name);
+    let (compiled, map) =
+        compile_treaty_file_with_map(&client_source, file_name, file_name, source);
+
+    // CLIENT PRIVACY: the map embeds the original authoring source as `sourcesContent`, which still
+    // carries the verbatim `server { … }` block. Redact each lifted server-fn body out of the map's
+    // content (blanked to position-preserving whitespace) so the server source never reaches the
+    // client map — the same guarantee the base `@Component` `.ts` path provides.
+    let server_bodies: Vec<String> =
+        extraction.server_fns.iter().map(|f| f.source.clone()).collect();
+    let map = map.map(|m| redact_server_bodies_in_map(&m, &server_bodies));
 
     CompiledAuthoring {
         code: compiled.code,
         server_module: Some(emit.server_module),
         errors: compiled.errors,
-        // See the no-server branch: the `.treaty` SFC path does not yet emit a v3 map.
-        map: None,
+        map,
     }
 }
 
@@ -1159,6 +1315,65 @@ function setup(user) {\n\
             "server body leaked into client; got: {}",
             out.code
         );
+    }
+
+    #[test]
+    fn treaty_without_server_block_carries_a_v3_map() {
+        // A plain `.treaty` SFC (no server block) compiles WITH an additive v3 map whose
+        // `sourcesContent` embeds the original authoring source.
+        let source = "const name = 'World';\n<div>{{ name }}</div>";
+        let out = compile_treaty_authoring(source, "greeting.treaty");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+
+        let map = out.map.expect("expected a source map for a `.treaty` SFC");
+        let value: serde_json::Value =
+            serde_json::from_str(&map).expect("map should be valid JSON");
+        assert_eq!(value["version"], serde_json::json!(3), "not a v3 map: {map}");
+        // The original authoring source is embedded as `sourcesContent` and named by the file.
+        assert_eq!(value["sources"][0], serde_json::json!("greeting.treaty"), "wrong source name");
+        let contents = value["sourcesContent"].as_array().expect("sourcesContent array");
+        assert!(
+            contents.iter().any(|c| c.as_str() == Some(source)),
+            "authoring source not embedded as sourcesContent; got: {map}"
+        );
+    }
+
+    #[test]
+    fn treaty_server_block_body_is_absent_from_client_map() {
+        // CLIENT PRIVACY: a `.treaty` SFC with an inline server fn must compile to a v3 map whose
+        // `sourcesContent` does NOT contain the server fn body text.
+        let source = "import { User } from './user';\n\
+server {\n\
+  async function save(user: User) { return db.insert(user); }\n\
+}\n\
+function onClick(user) { return save(user); }\n\
+<div>{{ onClick }}</div>\n";
+
+        let out = compile_treaty_authoring(source, "form.treaty");
+        assert!(out.server_module.is_some(), "expected a server module");
+
+        let map = out.map.expect("expected a source map for a server-block `.treaty`");
+        let value: serde_json::Value =
+            serde_json::from_str(&map).expect("map should be valid JSON");
+        assert_eq!(value["version"], serde_json::json!(3), "not a v3 map: {map}");
+
+        let contents = value["sourcesContent"].as_array().expect("sourcesContent array");
+        for c in contents {
+            let text = c.as_str().unwrap_or("");
+            assert!(!text.contains("db.insert"), "server body leaked into map content: {text}");
+            assert!(
+                !text.contains("async function save"),
+                "server signature leaked into map content: {text}"
+            );
+        }
+        // The redaction preserves the surrounding client text and the file name.
+        assert_eq!(value["sources"][0], serde_json::json!("form.treaty"), "wrong source name");
+        let joined: String = contents
+            .iter()
+            .filter_map(|c| c.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("function onClick"), "client body lost from map: {joined}");
     }
 
     #[test]
