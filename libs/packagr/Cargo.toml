@@ -1,0 +1,22 @@
+[package]
+name = "treaty_packagr"
+version = "0.1.0"
+edition = "2024"
+
+# treaty_packagr — the Rust-native ng-packagr successor.
+# Compiles a library's entries through render3 + rust_authoring, emits `.d.ts`
+# via oxc_isolated_declarations, and produces an Angular Package Format (APF)
+# manifest plus per-entry ESM. FESM flattening (via rolldown) is documented as
+# the next step. See migration/ROADMAP-PHASE2 + [[treaty-packagr]].
+
+[dependencies]
+render3 = { path = "../render3" }
+rust_authoring = { path = "../../apps/rust/authoring" }
+oxc_allocator = "0.133.0"
+oxc_ast = "0.133.0"
+oxc_parser = "0.133.0"
+oxc_span = "0.133.0"
+oxc_isolated_declarations = "0.133.0"
+oxc_codegen = "0.133.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
