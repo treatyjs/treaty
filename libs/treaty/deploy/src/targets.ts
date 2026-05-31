@@ -14,8 +14,14 @@
  * paths) and {@link deploy} (which resolves urls + repoints the manifest).
  */
 
-import { mkdir, rm, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { dirname, join, posix, sep } from 'node:path'
+import {
+	parseDeploymentManifest,
+	serializeDeploymentManifest,
+	type DeploymentManifest,
+	type DeploymentManifestStore,
+} from '@treaty/federation-deploy'
 import type { DeployTarget, DeployTargetContext } from './deploy.js'
 
 /** Options for {@link FsDeployTarget}. */
@@ -70,6 +76,50 @@ export class FsDeployTarget implements DeployTarget {
 	async remove(path: string, _ctx: DeployTargetContext): Promise<void> {
 		const dest = join(this.#root, path.split(posix.sep).join(sep))
 		await rm(dest, { force: true })
+	}
+}
+
+/** Options for {@link FsDeploymentStore}. */
+export interface FsDeploymentStoreOptions {
+	/**
+	 * Path to the JSON file the deployment manifest (per-remote ledger) is persisted
+	 * at. Created on first {@link FsDeploymentStore.save}; missing means "no manifest
+	 * yet" on {@link FsDeploymentStore.load}.
+	 */
+	readonly path: string
+}
+
+/**
+ * Reference {@link DeploymentManifestStore} backed by a local JSON file — the
+ * self-hosted ledger store and the template for a database/object-store/config-
+ * service implementation. {@link FsDeploymentStore.load} returns `undefined` when
+ * the file does not exist yet (a first deploy seeds it); {@link FsDeploymentStore.save}
+ * writes the canonical serialization, creating parent directories as needed.
+ */
+export class FsDeploymentStore implements DeploymentManifestStore {
+	readonly #path: string
+
+	constructor(options: FsDeploymentStoreOptions) {
+		if (!options || typeof options.path !== 'string' || options.path.length === 0) {
+			throw new TypeError('FsDeploymentStore: options.path is required')
+		}
+		this.#path = options.path
+	}
+
+	async load(): Promise<DeploymentManifest | undefined> {
+		let json: string
+		try {
+			json = await readFile(this.#path, 'utf8')
+		} catch (err) {
+			if ((err as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+			throw err
+		}
+		return parseDeploymentManifest(json)
+	}
+
+	async save(manifest: DeploymentManifest): Promise<void> {
+		await mkdir(dirname(this.#path), { recursive: true })
+		await writeFile(this.#path, serializeDeploymentManifest(manifest))
 	}
 }
 

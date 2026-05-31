@@ -64,8 +64,20 @@ export type {
 	RollbackOptions,
 } from './deploy.js'
 
-export { FsDeployTarget } from './targets.js'
-export type { FsDeployTargetOptions } from './targets.js'
+export { deployRemote, rollbackRemote, deployAffectedRemotes } from './remote.js'
+export type {
+	RemoteArtifact,
+	AffectedRemoteArtifact,
+	RemoteDeployDeps,
+	DeployRemoteOptions,
+	RollbackRemoteOptions,
+	RemoteDeployResult,
+	DeployAffectedRemotesOptions,
+	DeployAffectedRemotesResult,
+} from './remote.js'
+
+export { FsDeployTarget, FsDeploymentStore } from './targets.js'
+export type { FsDeployTargetOptions, FsDeploymentStoreOptions } from './targets.js'
 
 // Re-exported from `@treaty/federation-deploy` so a deploy caller has the toggle
 // reader and the ejected-config bridge available from one import: skip a deploy
@@ -79,4 +91,27 @@ export type {
 	FederationToggle,
 	EjectedFederationConfig,
 	ManifestModulesFromConfigOptions,
+} from '@treaty/federation-deploy'
+
+// The versioned deployment-manifest layer (per-remote ledger + history) and its
+// store/runtime, re-exported so a deploy caller drives deployRemote/rollbackRemote
+// and resolves remotes at runtime from one import.
+export {
+	createDeploymentManifest,
+	getRemote,
+	hasRemote,
+	recordDeployment,
+	rollbackTo,
+	serializeDeploymentManifest,
+	parseDeploymentManifest,
+	MemoryDeploymentStore,
+	createTreatyDeploymentRuntimePlugin,
+	DEPLOYMENT_MANIFEST_SCHEMA,
+} from '@treaty/federation-deploy'
+export type {
+	DeploymentManifest,
+	RemoteDeployment,
+	RemoteKind,
+	DeploymentManifestStore,
+	DeploymentManifestSource,
 } from '@treaty/federation-deploy'

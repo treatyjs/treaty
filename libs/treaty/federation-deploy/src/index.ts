@@ -71,6 +71,35 @@ export type {
 	TreatyMfRuntimePluginFactory,
 } from './runtime.js'
 
+export {
+	createDeploymentManifest,
+	getRemote,
+	hasRemote,
+	recordDeployment,
+	rollbackTo,
+	serializeDeploymentManifest,
+	parseDeploymentManifest,
+	MemoryDeploymentStore,
+	DEPLOYMENT_MANIFEST_SCHEMA,
+} from './deployment-manifest.js'
+export type {
+	DeploymentManifest,
+	RemoteDeployment,
+	RemoteKind,
+	DeploymentManifestStore,
+	CreateDeploymentManifestOptions,
+	RecordDeploymentOptions,
+	RollbackToOptions,
+} from './deployment-manifest.js'
+
+export { createTreatyDeploymentRuntimePlugin } from './deployment-runtime.js'
+export type {
+	DeploymentManifestSource,
+	RemoteNameResolver,
+	TreatyDeploymentRuntimePluginOptions,
+	TreatyDeploymentRuntimePluginFactory,
+} from './deployment-runtime.js'
+
 export { computeAffectedModules } from './affected.js'
 export type {
 	ModuleNode,
