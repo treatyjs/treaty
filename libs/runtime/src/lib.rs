@@ -152,6 +152,27 @@ impl JsRuntime {
             initialize_global,
         );
 
+        // Install the host-service-backed Node globals (`process`, the timer functions,
+        // `queueMicrotask`, and the lazy WHATWG `URL`/`TextEncoder`/`fetch` family). These cannot be
+        // built from inside the `initialize_global` realm hook (it holds only `&mut Agent`); they need
+        // a `HostState` borrow, which exists *here* — `host_state` (the box) and `agent` are borrowed
+        // separately, exactly the decoupled borrow the module path requires. This is what makes the
+        // Node globals actually MATERIALIZE in the scope user code runs in (bare `setTimeout`,
+        // `process`, `URL`, … and the same names via `globalThis`), matching Node.
+        //
+        // The `&HostState` is derived from the box, which is moved into the returned struct as its last
+        // field and so outlives this call; the borrow is used only within this `run_in_realm`. Building
+        // the eager set (`process`/timers/microtask) must succeed for a usable runtime — a failure here
+        // is a runtime construction bug, so it panics with the engine-level detail rather than silently
+        // yielding a crippled global object.
+        {
+            let host: &HostState = &host_state;
+            agent.run_in_realm(&realm, |agent, gc| {
+                node::install_module_globals(agent, host, gc)
+                    .expect("installing the Node module-backed globals should succeed");
+            });
+        }
+
         Self {
             agent,
             realm,
@@ -780,6 +801,143 @@ mod tests {
         assert_eq!(
             rt.eval("({ a: [1, 2], b: 'x' })").unwrap(),
             json!({ "a": [1, 2], "b": "x" })
+        );
+    }
+
+    #[test]
+    fn node_compat_lazy_globals_materialize_in_user_eval_scope() {
+        // Regression: the always-present Node globals must resolve as BARE names inside the scope user
+        // source runs in (under the `(0, eval)` wrapper), not just via `require`. Before the
+        // module-globals install step these read `undefined`/threw, because the realm-init hook could
+        // not build module-backed globals. They now materialize eagerly (`process`, the timers,
+        // `queueMicrotask`) or via a lazy accessor (`URL`/`TextEncoder`/`TextDecoder`/`fetch`).
+        let mut rt = JsRuntime::with_node_compat();
+        assert_eq!(
+            rt.eval(
+                "typeof setTimeout === 'function' \
+                 && typeof clearTimeout === 'function' \
+                 && typeof queueMicrotask === 'function' \
+                 && typeof process === 'object' \
+                 && typeof URL === 'function' \
+                 && typeof TextEncoder === 'function' \
+                 && typeof TextDecoder === 'function' \
+                 && typeof fetch === 'function'"
+            )
+            .unwrap(),
+            json!(true)
+        );
+    }
+
+    #[test]
+    fn node_compat_globals_visible_via_global_this_too() {
+        // The same names must also be reachable through `globalThis`, exactly like Node — both the
+        // eager set and the (now-materialized) lazy accessors.
+        let mut rt = JsRuntime::with_node_compat();
+        assert_eq!(
+            rt.eval(
+                "typeof globalThis.setTimeout === 'function' \
+                 && typeof globalThis.process === 'object' \
+                 && typeof globalThis.URL === 'function' \
+                 && typeof globalThis.TextEncoder === 'function'"
+            )
+            .unwrap(),
+            json!(true)
+        );
+    }
+
+    #[test]
+    fn node_compat_url_class_parses_and_round_trips() {
+        // The lazy `URL` global is a real constructible WHATWG-shaped class over the `node:url`
+        // functional core: components are exposed and the href round-trips.
+        let mut rt = JsRuntime::with_node_compat();
+        let v = rt
+            .eval(
+                "const u = new URL('https://user@example.com:8443/a/b?x=1&y=2#frag');\
+                 [u.protocol, u.hostname, u.port, u.pathname, u.search, u.hash, u.searchParams.get('y')]",
+            )
+            .unwrap();
+        assert_eq!(
+            v,
+            json!(["https:", "example.com", "8443", "/a/b", "?x=1&y=2", "#frag", "2"])
+        );
+    }
+
+    #[test]
+    fn node_compat_text_encoder_round_trips_utf8() {
+        // `TextEncoder`/`TextDecoder` materialize as classes over the native UTF-8 codec and round-trip
+        // a multi-byte string through a real `Uint8Array`.
+        let mut rt = JsRuntime::with_node_compat();
+        assert_eq!(
+            rt.eval(
+                "const enc = new TextEncoder(); const dec = new TextDecoder();\
+                 const bytes = enc.encode('héllo 🦀');\
+                 (bytes instanceof Uint8Array) && dec.decode(bytes) === 'héllo 🦀'"
+            )
+            .unwrap(),
+            json!(true)
+        );
+    }
+
+    #[test]
+    fn node_compat_settimeout_global_callback_runs_after_drain() {
+        // The eager `setTimeout` global schedules onto the shared event loop; its callback fires when
+        // `eval` drains the loop, observable on the next eval.
+        let mut rt = JsRuntime::with_node_compat();
+        let synchronous = rt
+            .eval("globalThis.__g = 0; setTimeout(() => { globalThis.__g = 5; }); globalThis.__g")
+            .unwrap();
+        assert_eq!(synchronous, json!(0));
+        assert_eq!(rt.eval("globalThis.__g").unwrap(), json!(5));
+    }
+
+    #[test]
+    fn node_compat_process_env_and_cwd_are_readable_bare() {
+        // `process` is an eager global object with a string→string `env` and a working `cwd()`.
+        let mut rt = JsRuntime::with_node_compat();
+        assert_eq!(rt.eval("typeof process.cwd()").unwrap(), json!("string"));
+        assert_eq!(rt.eval("typeof process.env").unwrap(), json!("object"));
+        assert_eq!(rt.eval("Array.isArray(process.argv)").unwrap(), json!(true));
+    }
+
+    #[test]
+    fn node_compat_fetch_rejects_without_transport() {
+        // `fetch` exists as a function (so feature-detection passes) but rejects with a catchable
+        // error in this offline runtime — the documented minimal-fetch behavior.
+        let mut rt = JsRuntime::with_node_compat();
+        let caught = rt
+            .eval(
+                "globalThis.__fe = 'none';\
+                 fetch('https://example.com').catch((e) => { globalThis.__fe = e instanceof TypeError; });\
+                 typeof fetch",
+            )
+            .unwrap();
+        assert_eq!(caught, json!("function"));
+        assert_eq!(rt.eval("globalThis.__fe").unwrap(), json!(true));
+    }
+
+    #[test]
+    fn node_compat_new_builtins_are_requireable() {
+        // The newly-registered builtins resolve through `require` and materialize their exports lazily.
+        // `crypto`/`querystring`/`string_decoder` export an object; `assert`'s default export is the
+        // callable `assert(value)` function (faithful to Node, where `typeof require('assert')` is
+        // `'function'`), so it is checked separately.
+        let mut rt = JsRuntime::with_node_compat();
+        assert_eq!(
+            rt.eval(
+                "['node:crypto','node:querystring','node:string_decoder']\
+                 .every(s => typeof require(s) === 'object')"
+            )
+            .unwrap(),
+            json!(true)
+        );
+        assert_eq!(
+            rt.eval("typeof require('node:assert')").unwrap(),
+            json!("function")
+        );
+        // Even though it is callable, the static methods are present on it.
+        assert_eq!(
+            rt.eval("typeof require('node:assert').strictEqual").unwrap(),
+            json!("function")
         );
     }
 

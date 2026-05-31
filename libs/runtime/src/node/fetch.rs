@@ -18,15 +18,30 @@
 //!   classifications.
 //!
 //! The JS-facing [`install`] seam exposes these as native functions over a plain header **array of
-//! `[name, value]` pairs** (the shape `Headers` is constructed from and iterated as). The reason the
-//! stateful `Headers` / `Request` / `Response` **classes** and a live `fetch()` are *not* built here:
+//! `[name, value]` pairs** (the shape `Headers` is constructed from and iterated as). It also exposes
+//! the network-independent half of `fetch()` — the WHATWG **`data:` URL processor** — as the native
+//! [`js::parse_data_url`] (`parseDataUrl`), so a `fetch("data:...")` resolves to a real `Response`
+//! without any transport:
+//!
+//! * [`DataUrl`] — the WHATWG "data: URL processor": splits `data:[<mediatype>][;base64],<data>` into
+//!   a MIME type (defaulting to `text/plain;charset=US-ASCII`) and a decoded body, percent-decoding a
+//!   plain payload or [`decode_base64`]-decoding a `;base64` payload. Pure bytes in, pure bytes out —
+//!   no Nova, no network — and unit-tested directly.
+//! * [`decode_base64`] / [`percent_decode_bytes`] — the two body decoders the processor needs (RFC
+//!   4648 base64 with optional padding and ASCII-whitespace tolerance, and WHATWG percent-decoding to
+//!   raw bytes), both pure and unit-tested.
+//!
+//! The reason the stateful `Headers` / `Request` / `Response` **classes** and the *networking* half of
+//! `fetch()` are *not* built here:
 //!
 //! * **No network.** `treaty_runtime` depends only on `nova_vm`, `serde_json`, the `oxc_*` transpile
 //!   crates, and `oxc_resolver` (see `libs/runtime/Cargo.toml`). There is no HTTP client crate, and
-//!   this task may edit only this file — it may not add a dependency. A faithful networking `fetch()`
-//!   therefore cannot be implemented here; wiring it (and the `Promise`-returning global) is deferred
-//!   to a follow-up that introduces an HTTP transport behind the event loop. This mirrors how Node
-//!   itself layers `fetch` (undici) over a transport rather than the language core.
+//!   this task may edit only this file — it may not add a dependency. A *networking* `fetch()` (an
+//!   `http(s):` request) therefore cannot be implemented here; wiring it (and the `Promise`-returning
+//!   global) is deferred to a follow-up that introduces an HTTP transport behind the event loop. This
+//!   mirrors how Node itself layers `fetch` (undici) over a transport rather than the language core.
+//!   The transport-free `data:` scheme, by contrast, is implemented in full and is the WinterCG
+//!   minimum `fetch` every offline runtime is expected to honor.
 //! * **Stateful classes need internal slots.** A WHATWG `Headers` object carries a mutable header
 //!   list and a guard in internal slots, and `Request`/`Response` carry a body stream. The pinned Nova
 //!   rev (`bece61ac`) exposes no embedder API to attach native internal state to a JS object, so —
@@ -350,6 +365,238 @@ pub(crate) fn is_ok_status(status: u16) -> bool {
 }
 
 // =================================================================================================
+// WHATWG `data:` URL processor (no Nova, no network; unit-tested directly).
+//
+// `fetch("data:...")` needs no transport: per the WHATWG "data: URL processor" the response body and
+// MIME type are derived purely from the URL itself. This is the offline `fetch` every WinterCG
+// runtime is expected to support, so it is implemented in full here and surfaced through the native
+// `parseDataUrl` so the `fetch()` global resolves a real `Response` for it.
+// =================================================================================================
+
+/// The result of running the WHATWG "data: URL processor" over a `data:` URL.
+///
+/// Carries the decoded body bytes and the MIME type essence/parameters string the `Response` should
+/// report as its `Content-Type`. WHATWG mandates the default `text/plain;charset=US-ASCII` when the
+/// URL omits a media type, so [`DataUrl::mime_type`] is never empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DataUrl {
+    mime_type: String,
+    body: Vec<u8>,
+}
+
+impl DataUrl {
+    /// The MIME type (e.g. `text/plain;charset=US-ASCII`, `application/json`) the `Response` reports.
+    pub(crate) fn mime_type(&self) -> &str {
+        &self.mime_type
+    }
+
+    /// The decoded response body bytes.
+    pub(crate) fn body(&self) -> &[u8] {
+        &self.body
+    }
+}
+
+/// Why a `data:` URL failed the WHATWG "data: URL processor".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DataUrlError {
+    /// The URL does not begin with the `data:` scheme (case-insensitively).
+    NotDataScheme,
+    /// There is no `,` separating the header from the data (the URL is just `data:` + header).
+    MissingComma,
+    /// The `;base64` payload is not decodable as RFC 4648 base64.
+    InvalidBase64,
+}
+
+/// The WHATWG default MIME type for a `data:` URL whose header omits a media type.
+const DATA_URL_DEFAULT_MIME: &str = "text/plain;charset=US-ASCII";
+
+/// Run the WHATWG "data: URL processor" over `url`.
+///
+/// Splits a `data:[<mediatype>][;base64],<data>` URL into its MIME type and decoded body:
+///
+/// * The scheme must be `data:` (matched case-insensitively, since URL schemes are ASCII-case-
+///   insensitive); anything else is [`DataUrlError::NotDataScheme`].
+/// * Everything up to the **first** `,` is the header; the remainder is the data. A header ending in
+///   `;base64` (case-insensitively, ASCII-whitespace tolerated around it) selects base64 decoding of
+///   the data via [`decode_base64`]; otherwise the data is percent-decoded to raw bytes via
+///   [`percent_decode_bytes`].
+/// * The MIME type is the header with any trailing `;base64` removed; an empty media type (header was
+///   empty, or only `;base64`) yields the WHATWG default `text/plain;charset=US-ASCII`. A header that
+///   begins with `;` (a bare parameter list, e.g. `;charset=utf-8`) is prefixed with `text/plain`,
+///   matching the processor's "if mimeType starts with ';' prepend 'text/plain'" step.
+///
+/// Pure: borrows `url`, allocates only the returned body/MIME strings.
+pub(crate) fn parse_data_url(url: &str) -> Result<DataUrl, DataUrlError> {
+    // Scheme is ASCII-case-insensitive. Strip it without lowercasing the rest of the URL.
+    let rest = url
+        .get(..5)
+        .filter(|p| p.eq_ignore_ascii_case("data:"))
+        .map(|_| &url[5..])
+        .ok_or(DataUrlError::NotDataScheme)?;
+
+    let comma = rest.find(',').ok_or(DataUrlError::MissingComma)?;
+    let header = &rest[..comma];
+    let data = &rest[comma + 1..];
+
+    // A trailing `;base64` (ASCII-whitespace tolerated) selects base64; strip it off the MIME header.
+    let (mime_part, is_base64) = match strip_base64_suffix(header) {
+        Some(prefix) => (prefix, true),
+        None => (header, false),
+    };
+
+    let body = if is_base64 {
+        decode_base64(mime_part_data(data)).ok_or(DataUrlError::InvalidBase64)?
+    } else {
+        percent_decode_bytes(data)
+    };
+
+    let mime_type = normalize_data_url_mime(mime_part);
+    Ok(DataUrl { mime_type, body })
+}
+
+/// Identity helper kept readable at the call site: the base64 payload is exactly the post-comma data.
+/// (Factored so the `is_base64` branch reads symmetrically with the percent-decode branch.)
+#[inline]
+fn mime_part_data(data: &str) -> &str {
+    data
+}
+
+/// If `header` ends in `;base64` (case-insensitively, with optional ASCII whitespace before the `;`
+/// and after `base64`), return the header with that suffix removed; otherwise `None`.
+///
+/// WHATWG matches `;base64` only as the final parameter of the media-type header. Surrounding ASCII
+/// whitespace is tolerated because a header like `text/plain ;base64` is produced by lenient authors
+/// and Node/browsers accept it.
+fn strip_base64_suffix(header: &str) -> Option<&str> {
+    let trimmed = header.trim_end_matches(|c: char| c.is_ascii_whitespace());
+    // The suffix is `;base64`, case-insensitive on the `base64` token.
+    let cut = trimmed.len().checked_sub(7)?;
+    let (prefix, suffix) = trimmed.split_at(cut);
+    if suffix.eq_ignore_ascii_case(";base64") {
+        Some(prefix.trim_end_matches(|c: char| c.is_ascii_whitespace()))
+    } else {
+        None
+    }
+}
+
+/// Build the MIME-type string the `Response` reports from the (base64-stripped) media-type header.
+///
+/// Empty -> the WHATWG default `text/plain;charset=US-ASCII`. A header beginning with `;` (a bare
+/// parameter list) is prefixed with `text/plain`. Otherwise the header is used verbatim (trimmed of
+/// surrounding ASCII whitespace).
+fn normalize_data_url_mime(mime_part: &str) -> String {
+    let trimmed = mime_part.trim_matches(|c: char| c.is_ascii_whitespace());
+    if trimmed.is_empty() {
+        DATA_URL_DEFAULT_MIME.to_owned()
+    } else if trimmed.starts_with(';') {
+        let mut s = String::with_capacity("text/plain".len() + trimmed.len());
+        s.push_str("text/plain");
+        s.push_str(trimmed);
+        s
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+/// Decode an RFC 4648 base64 string to bytes, tolerating ASCII whitespace and optional `=` padding.
+///
+/// Accepts the standard alphabet (`A-Z a-z 0-9 + /`). ASCII whitespace (space, `\t`, `\n`, `\r`,
+/// `\x0c`) is skipped anywhere (data: URLs and MIME bodies commonly fold base64 across lines). `=`
+/// padding is honored if present but not required; a trailing partial group of length 2 or 3 decodes
+/// to 1 or 2 bytes respectively. A length-1 trailing group, or any non-alphabet / non-whitespace byte,
+/// is an error (`None`). Pure: a single output `Vec` sized to the worst-case byte count.
+pub(crate) fn decode_base64(input: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(input.len() / 4 * 3 + 3);
+    // The current group of up to four 6-bit sextets, and how many we have buffered.
+    let mut acc: u32 = 0;
+    let mut have: u8 = 0;
+    let mut saw_pad = false;
+    for &b in input.as_bytes() {
+        match b {
+            b' ' | b'\t' | b'\n' | b'\r' | 0x0c => continue,
+            b'=' => {
+                saw_pad = true;
+                continue;
+            }
+            _ => {}
+        }
+        // A non-whitespace, non-`=` byte after padding has begun is malformed.
+        if saw_pad {
+            return None;
+        }
+        let sextet = base64_value(b)?;
+        acc = (acc << 6) | u32::from(sextet);
+        have += 1;
+        if have == 4 {
+            out.push((acc >> 16) as u8);
+            out.push((acc >> 8) as u8);
+            out.push(acc as u8);
+            acc = 0;
+            have = 0;
+        }
+    }
+    match have {
+        0 => {}
+        // A single trailing sextet carries only 6 bits — not a whole byte; malformed.
+        1 => return None,
+        2 => out.push((acc >> 4) as u8),
+        3 => {
+            out.push((acc >> 10) as u8);
+            out.push((acc >> 2) as u8);
+        }
+        _ => unreachable!("`have` is reset to 0 once it reaches 4"),
+    }
+    Some(out)
+}
+
+/// Map a base64 alphabet byte to its 6-bit value, or `None` if it is not an alphabet character.
+#[inline]
+fn base64_value(b: u8) -> Option<u8> {
+    match b {
+        b'A'..=b'Z' => Some(b - b'A'),
+        b'a'..=b'z' => Some(b - b'a' + 26),
+        b'0'..=b'9' => Some(b - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
+}
+
+/// WHATWG percent-decode `input` to raw bytes: every `%HH` (two hex digits) becomes the byte `0xHH`;
+/// every other byte is copied verbatim (a `%` not followed by two hex digits is left as a literal
+/// `%`). The result is the body of a non-base64 `data:` URL. Pure: one output `Vec`.
+pub(crate) fn percent_decode_bytes(input: &str) -> Vec<u8> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        // A `%` followed by two hex digits decodes to one byte; otherwise the `%` is a literal.
+        match (bytes[i], bytes.get(i + 1).copied(), bytes.get(i + 2).copied()) {
+            (b'%', Some(h), Some(l)) if hex_value(h).is_some() && hex_value(l).is_some() => {
+                out.push((hex_value(h).unwrap() << 4) | hex_value(l).unwrap());
+                i += 3;
+            }
+            (byte, _, _) => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Map an ASCII hex digit to its 0..=15 value, or `None` if it is not a hex digit.
+#[inline]
+fn hex_value(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+// =================================================================================================
 // JS-facing wiring.
 // =================================================================================================
 
@@ -384,6 +631,10 @@ impl NodeModule for FetchModule {
 /// * `headersSortedCombined(list) -> [name, value][]` — the canonical iteration order.
 /// * `normalizeMethod(method) -> string` and `isForbiddenMethod(method) -> boolean`.
 /// * `isRedirectStatus` / `isNullBodyStatus` / `isOkStatus` `(number) -> boolean`.
+/// * `parseDataUrl(url) -> { mimeType: string, bytes: number[] }` — the WHATWG `data:` URL processor;
+///   throws a `TypeError` for a non-`data:` / malformed URL so `fetch()` can translate it to a
+///   rejected promise. `bytes` is an integer array (the pinned Nova rev exposes no embedder
+///   `Uint8Array` construction — see `text_encoding.rs`); the bootstrap turns it into a body.
 ///
 /// Materialized once, lazily, on first import (tenet 2).
 pub(crate) fn install<'gc>(
@@ -406,6 +657,7 @@ pub(crate) fn install<'gc>(
     define_fn(agent, obj, "isRedirectStatus", js::is_redirect_status_fn, 1, gc);
     define_fn(agent, obj, "isNullBodyStatus", js::is_null_body_status_fn, 1, gc);
     define_fn(agent, obj, "isOkStatus", js::is_ok_status_fn, 1, gc);
+    define_fn(agent, obj, "parseDataUrl", js::parse_data_url, 1, gc);
 
     Ok(obj.into())
 }
@@ -686,6 +938,68 @@ mod js {
     ) -> JsResult<'gc, Value<'gc>> {
         Ok(Value::Boolean(is_ok_status(read_status(args.get(0)))))
     }
+
+    /// `parseDataUrl(url)` -> `{ mimeType: string, bytes: number[] }`.
+    ///
+    /// Runs the WHATWG `data:` URL processor ([`parse_data_url`]) and marshals the result into a plain
+    /// JS object the fetch bootstrap turns into a `Response`: `mimeType` is the `Content-Type` the
+    /// response reports, and `bytes` is the decoded body as an integer `Array` (each `0..=255`), the
+    /// same byte-exchange shape `text_encoding` uses because the pinned Nova rev exposes no embedder
+    /// `Uint8Array` construction. A non-`data:` or malformed URL throws a `TypeError`, which the
+    /// bootstrap catches and turns into a rejected `fetch()` promise — matching how a browser surfaces
+    /// a failed `data:` fetch.
+    pub(super) fn parse_data_url<'gc>(
+        agent: &mut Agent,
+        _this: Value,
+        args: ArgumentsList,
+        gc: GcScope<'gc, '_>,
+    ) -> JsResult<'gc, Value<'gc>> {
+        let gc = gc.into_nogc();
+        let url = read_str(agent, args.get(0));
+        let parsed = match super::parse_data_url(&url) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                let message = match e {
+                    DataUrlError::NotDataScheme => "fetch failed: not a data: URL",
+                    DataUrlError::MissingComma => "fetch failed: malformed data: URL (no comma)",
+                    DataUrlError::InvalidBase64 => "fetch failed: invalid base64 in data: URL",
+                };
+                return Err(agent.throw_exception_with_static_message(
+                    ExceptionType::TypeError,
+                    message,
+                    gc,
+                ));
+            }
+        };
+
+        let mime: Value = JsString::from_str(agent, parsed.mime_type(), gc).into();
+        // Body bytes as an integer Array (each element a small integer 0..=255).
+        let byte_values: Vec<Value> = parsed
+            .body()
+            .iter()
+            .map(|&b| Value::Integer(i32::from(b).into()))
+            .collect();
+        let bytes: Value = Array::from_slice(agent, &byte_values, gc).into();
+
+        let obj = OrdinaryObject::create_empty_object(agent, gc);
+        let mime_key = PropertyKey::from_static_str(agent, "mimeType", gc);
+        unwrap_try(obj.try_define_own_property(
+            agent,
+            mime_key,
+            nova_vm::ecmascript::PropertyDescriptor::new_data_descriptor(mime),
+            None,
+            gc,
+        ));
+        let bytes_key = PropertyKey::from_static_str(agent, "bytes", gc);
+        unwrap_try(obj.try_define_own_property(
+            agent,
+            bytes_key,
+            nova_vm::ecmascript::PropertyDescriptor::new_data_descriptor(bytes),
+            None,
+            gc,
+        ));
+        Ok(obj.into())
+    }
 }
 
 #[cfg(test)]
@@ -868,5 +1182,338 @@ mod tests {
         assert!(is_ok_status(299));
         assert!(!is_ok_status(199));
         assert!(!is_ok_status(300));
+    }
+
+    // =============================================================================================
+    // WHATWG `data:` URL processor (pure Rust core).
+    // =============================================================================================
+
+    #[test]
+    fn base64_decodes_standard_alphabet_with_and_without_padding() {
+        // "Man" -> "TWFu" (no padding); "Ma" -> "TWE=" (one pad); "M" -> "TQ==" (two pads).
+        assert_eq!(decode_base64("TWFu").unwrap(), b"Man");
+        assert_eq!(decode_base64("TWE=").unwrap(), b"Ma");
+        assert_eq!(decode_base64("TQ==").unwrap(), b"M");
+        // Padding is optional: the same partial groups decode without the `=`.
+        assert_eq!(decode_base64("TWE").unwrap(), b"Ma");
+        assert_eq!(decode_base64("TQ").unwrap(), b"M");
+        // Empty input -> empty output.
+        assert_eq!(decode_base64("").unwrap(), b"");
+    }
+
+    #[test]
+    fn base64_tolerates_ascii_whitespace_anywhere() {
+        // MIME base64 is commonly folded across lines; whitespace between sextets is ignored.
+        assert_eq!(decode_base64("TW Fu").unwrap(), b"Man");
+        assert_eq!(decode_base64("TWFu\n").unwrap(), b"Man");
+        assert_eq!(decode_base64("  TWFu  ").unwrap(), b"Man");
+        assert_eq!(decode_base64("T\tW\rF\nu").unwrap(), b"Man");
+    }
+
+    #[test]
+    fn base64_rejects_malformed_input() {
+        // A non-alphabet byte is an error.
+        assert!(decode_base64("TW*u").is_none());
+        // A lone trailing sextet carries only 6 bits — not a whole byte.
+        assert!(decode_base64("T").is_none());
+        assert!(decode_base64("TWFuT").is_none());
+        // Data after padding has begun is malformed.
+        assert!(decode_base64("TWE=TWFu").is_none());
+    }
+
+    #[test]
+    fn percent_decode_bytes_decodes_escapes_and_keeps_the_rest() {
+        assert_eq!(percent_decode_bytes("Hello%2C%20World"), b"Hello, World");
+        // A `%` not followed by two hex digits is a literal `%`.
+        assert_eq!(percent_decode_bytes("100%done"), b"100%done");
+        assert_eq!(percent_decode_bytes("trailing%"), b"trailing%");
+        assert_eq!(percent_decode_bytes("bad%zz"), b"bad%zz");
+        // Lower- and upper-case hex are both accepted.
+        assert_eq!(percent_decode_bytes("%e2%9c%93"), [0xe2, 0x9c, 0x93]);
+        assert_eq!(percent_decode_bytes("%E2%9C%93"), [0xe2, 0x9c, 0x93]);
+    }
+
+    #[test]
+    fn data_url_plain_text_uses_default_mime() {
+        let d = parse_data_url("data:,Hello%2C%20World").unwrap();
+        assert_eq!(d.mime_type(), "text/plain;charset=US-ASCII");
+        assert_eq!(d.body(), b"Hello, World");
+    }
+
+    #[test]
+    fn data_url_explicit_mime_is_preserved() {
+        let d = parse_data_url("data:application/json,%7B%22a%22%3A1%7D").unwrap();
+        assert_eq!(d.mime_type(), "application/json");
+        assert_eq!(d.body(), br#"{"a":1}"#);
+    }
+
+    #[test]
+    fn data_url_base64_payload_is_decoded() {
+        // base64("Hello") == "SGVsbG8=".
+        let d = parse_data_url("data:text/plain;base64,SGVsbG8=").unwrap();
+        assert_eq!(d.mime_type(), "text/plain");
+        assert_eq!(d.body(), b"Hello");
+    }
+
+    #[test]
+    fn data_url_bare_parameter_list_gets_text_plain_prefix() {
+        // A header that is only a parameter list (`;charset=utf-8`) is prefixed with `text/plain`.
+        let d = parse_data_url("data:;charset=utf-8,abc").unwrap();
+        assert_eq!(d.mime_type(), "text/plain;charset=utf-8");
+        assert_eq!(d.body(), b"abc");
+    }
+
+    #[test]
+    fn data_url_scheme_is_case_insensitive_and_first_comma_splits() {
+        // Scheme matched case-insensitively; only the FIRST comma splits header from data, so a comma
+        // inside the (percent-decoded) data is preserved.
+        let d = parse_data_url("DATA:text/plain,a,b,c").unwrap();
+        assert_eq!(d.mime_type(), "text/plain");
+        assert_eq!(d.body(), b"a,b,c");
+    }
+
+    #[test]
+    fn data_url_errors_are_classified() {
+        assert_eq!(parse_data_url("https://x"), Err(DataUrlError::NotDataScheme));
+        assert_eq!(parse_data_url("data:no-comma-here"), Err(DataUrlError::MissingComma));
+        // `*` is not a base64 alphabet byte.
+        assert_eq!(
+            parse_data_url("data:text/plain;base64,****"),
+            Err(DataUrlError::InvalidBase64)
+        );
+    }
+
+    // =============================================================================================
+    // JS round-trip: the production WHATWG object model + a `data:` URL `fetch()`.
+    //
+    // These exercise the same Headers/Request/Response globals user code sees (materialized by the
+    // globals layer) plus this module's native `parseDataUrl`, end-to-end through `JsRuntime`. The
+    // `fetch()` global itself has no networking transport in this offline runtime (it lives in the
+    // globals layer and rejects for `http(s):`); the transport-free `data:` scheme is driven here
+    // over the native `parseDataUrl` this module exports, proving a `data:` fetch resolves to a real
+    // `Response` whose `text()`/`json()`/`arrayBuffer()` work.
+    // =============================================================================================
+
+    use crate::JsRuntime;
+    use crate::node::core::HostState;
+    use nova_vm::ecmascript::PropertyDescriptor;
+    use nova_vm::engine::Bindable;
+    use serde_json::{json, Value as JsonValue};
+
+    /// The `fetch()`-over-`data:` bootstrap used by the round-trip tests. It mirrors the production
+    /// shape: parse the `data:` URL with the native `parseDataUrl`, build a real `Response` from the
+    /// decoded bytes (decoded to text via the real `TextDecoder` global), and return it as a resolved
+    /// promise — exactly what a WinterCG `fetch("data:...")` does. Parked on `globalThis.__dataFetch`.
+    const DATA_FETCH_BOOTSTRAP: &str = r#"
+      globalThis.__dataFetch = function (url, init) {
+        return Promise.resolve().then(function () {
+          var parsed = globalThis.__fetch_native.parseDataUrl(String(url));
+          var text = new TextDecoder().decode(Uint8Array.from(parsed.bytes));
+          return new Response(text, { status: 200, headers: { "content-type": parsed.mimeType } });
+        });
+      };
+      true
+    "#;
+
+    /// Build a Node-compat runtime and park this module's native exports on `globalThis.__fetch_native`
+    /// so a JS bootstrap can drive `parseDataUrl` end-to-end. The native module backing `fetch` is not
+    /// an importable `node:` builtin (it is a globals-only module), so — exactly as the globals layer
+    /// does via its hidden slot — the host installs it directly here for the test.
+    fn runtime_with_fetch_native() -> JsRuntime {
+        let mut rt = JsRuntime::with_node_compat();
+        let JsRuntime {
+            agent,
+            realm,
+            host_state,
+        } = &mut rt;
+        // Borrow the HostState separately from the agent (the decoupled borrow the module path needs).
+        let host: &HostState = host_state
+            .as_deref()
+            .expect("with_node_compat installs a HostState");
+        agent.run_in_realm(realm, |agent, mut gc| {
+            let ctx = NodeCtx::new(host);
+            let exports = install(agent, &ctx, gc.reborrow())
+                .expect("fetch module installs")
+                .unbind();
+            let nogc = gc.into_nogc();
+            let global = agent.current_realm(nogc).global_object(agent);
+            let key = PropertyKey::from_static_str(agent, "__fetch_native", nogc);
+            unwrap_try(global.try_define_own_property(
+                agent,
+                key,
+                PropertyDescriptor::new_data_descriptor(exports.bind(nogc)),
+                None,
+                nogc,
+            ));
+        });
+        rt
+    }
+
+    /// Evaluate `source` in a runtime that has this module's native exports parked on
+    /// `globalThis.__fetch_native`, returning the JSON completion value.
+    fn eval_with_fetch_native(source: &str) -> JsonValue {
+        let mut rt = runtime_with_fetch_native();
+        rt.eval(source).expect("script evaluates")
+    }
+
+    /// Drive an async body to completion and read its result.
+    ///
+    /// `JsRuntime::eval` reads the completion value *synchronously* and only then drains the event
+    /// loop, so a top-level promise (e.g. the result of an `async function`) has not settled when the
+    /// completion value is captured. The established runtime pattern (see `fs_promises` tests) is to
+    /// let the promise's continuation stash its result on a `globalThis` slot and return a synchronous
+    /// value; the post-eval drain runs the continuation, and a *second* eval reads the now-settled
+    /// slot. This helper wraps that: `body` is the inside of an `async function`, expected to
+    /// `return` the JSON-able result; we run it, route its resolution/rejection onto `globalThis.__out`
+    /// (rejections as `"rejected: <name>"`), drain, then read `__out` back.
+    fn run_async(prelude: &str, body: &str) -> JsonValue {
+        let mut rt = runtime_with_fetch_native();
+        let scheduler = format!(
+            r#"
+            {prelude}
+            globalThis.__out = null;
+            (async function () {{ {body} }})()
+              .then(function (v) {{ globalThis.__out = v; }})
+              .catch(function (e) {{ globalThis.__out = "rejected: " + (e && e.name); }});
+            0
+            "#,
+        );
+        rt.eval(&scheduler).expect("async scheduler evaluates");
+        // The drain after the first eval has run the .then/.catch continuation; read the result.
+        rt.eval("globalThis.__out").expect("result read evaluates")
+    }
+
+    #[test]
+    fn headers_object_model_round_trips_through_the_global() {
+        // The real `Headers` global: case-insensitive get, append-combine, has/delete, and the
+        // Set-Cookie carve-out (kept separate, returned by getSetCookie).
+        let out = eval_with_fetch_native(
+            r#"
+            const h = new Headers({ "Content-Type": "text/plain" });
+            h.append("Accept", "text/html");
+            h.append("accept", "application/json");
+            h.append("Set-Cookie", "a=1");
+            h.append("Set-Cookie", "b=2");
+            ({
+              ct: h.get("content-type"),
+              accept: h.get("ACCEPT"),
+              hasAccept: h.has("accept"),
+              cookies: h.getSetCookie(),
+            })
+            "#,
+        );
+        assert_eq!(
+            out,
+            json!({
+                "ct": "text/plain",
+                "accept": "text/html, application/json",
+                "hasAccept": true,
+                "cookies": ["a=1", "b=2"],
+            })
+        );
+    }
+
+    #[test]
+    fn response_text_and_json_resolve_through_the_event_loop() {
+        // `Response.text()` and `Response.json()` are promise-returning; the runtime drains the event
+        // loop after the script so the awaited values settle before the result is read.
+        let out = run_async(
+            "",
+            r#"
+              const r = new Response('{"x":42,"y":[1,2]}', {
+                status: 201,
+                headers: { "content-type": "application/json" },
+              });
+              const text = await r.clone().text();
+              const data = await r.json();
+              return { ok: r.ok, status: r.status, text, x: data.x, y: data.y, ct: r.headers.get("content-type") };
+            "#,
+        );
+        assert_eq!(
+            out,
+            json!({
+                // 201 is within the 200..=299 "ok" range.
+                "ok": true,
+                "status": 201,
+                "text": "{\"x\":42,\"y\":[1,2]}",
+                "x": 42,
+                "y": [1, 2],
+                "ct": "application/json",
+            })
+        );
+    }
+
+    #[test]
+    fn response_static_json_helper_sets_content_type() {
+        // `Response.json(data)` is the WHATWG static helper: serializes to JSON and defaults the
+        // content-type. `ok` is true for the default 200 status.
+        let out = run_async(
+            "",
+            r#"
+              const r = Response.json({ hello: "world" });
+              return { ok: r.ok, status: r.status, ct: r.headers.get("content-type"), body: await r.text() };
+            "#,
+        );
+        assert_eq!(
+            out,
+            json!({
+                "ok": true,
+                "status": 200,
+                "ct": "application/json",
+                "body": "{\"hello\":\"world\"}",
+            })
+        );
+    }
+
+    #[test]
+    fn data_url_fetch_resolves_to_a_real_response_text() {
+        // A `data:` URL fetch (driven over the native `parseDataUrl`) resolves to a `Response` whose
+        // body and content-type come straight from the URL — no transport involved.
+        let out = run_async(
+            DATA_FETCH_BOOTSTRAP,
+            r#"
+              const r = await globalThis.__dataFetch("data:,Hello%2C%20World");
+              return { ok: r.ok, status: r.status, ct: r.headers.get("content-type"), body: await r.text() };
+            "#,
+        );
+        assert_eq!(
+            out,
+            json!({
+                "ok": true,
+                "status": 200,
+                "ct": "text/plain;charset=US-ASCII",
+                "body": "Hello, World",
+            })
+        );
+    }
+
+    #[test]
+    fn data_url_fetch_decodes_base64_json_and_response_json_parses_it() {
+        // base64('{"n":7}') == 'eyJuIjo3fQ=='. The `data:` fetch decodes it; `Response.json()` parses
+        // the decoded body — proving the base64 path and `json()` compose end-to-end.
+        let out = run_async(
+            DATA_FETCH_BOOTSTRAP,
+            r#"
+              const r = await globalThis.__dataFetch("data:application/json;base64,eyJuIjo3fQ==");
+              const data = await r.json();
+              return { ct: r.headers.get("content-type"), n: data.n };
+            "#,
+        );
+        assert_eq!(out, json!({ "ct": "application/json", "n": 7 }));
+    }
+
+    #[test]
+    fn data_url_fetch_rejects_a_malformed_url() {
+        // A non-`data:` URL makes `parseDataUrl` throw a TypeError, which the bootstrap surfaces as a
+        // rejected promise — the WHATWG failure mode for an unfetchable `data:` request. `run_async`
+        // routes the rejection to `"rejected: <name>"`.
+        let out = run_async(
+            DATA_FETCH_BOOTSTRAP,
+            r#"
+              await globalThis.__dataFetch("https://example.com");
+              return "resolved";
+            "#,
+        );
+        assert_eq!(out, json!("rejected: TypeError"));
     }
 }

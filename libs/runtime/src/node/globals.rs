@@ -36,11 +36,13 @@
 //! allocation-free beyond the three self-reference descriptors.
 
 use nova_vm::ecmascript::{
-    Agent, ArgumentsList, Behaviour, BuiltinFunctionArgs, InternalMethods, JsResult, Object,
-    OrdinaryObject, PropertyDescriptor, PropertyKey, RegularFn, Value, create_builtin_function,
-    unwrap_try,
+    Agent, ArgumentsList, Behaviour, BuiltinFunctionArgs, ExceptionType, InternalMethods, JsResult,
+    Object, OrdinaryObject, PropertyDescriptor, PropertyKey, RegularFn, String as JsString, Value,
+    create_builtin_function, parse_script, script_evaluation, unwrap_try,
 };
 use nova_vm::engine::{Bindable, GcScope, NoGcScope};
+
+use crate::node::core::{HostState, InstallError, NodeCtx};
 
 /// Define a Rust-backed function as a data property `name` (arity `len`) on `obj`.
 ///
@@ -227,6 +229,639 @@ pub(crate) fn install_globals(agent: &mut Agent, global: Object, gc: GcScope) {
     // **no** module: every `node:` builtin stays lazy until the first `require("node:...")` runs
     // (tenet 2).
     crate::node::module_cjs::install_require(agent, global, gc);
+}
+
+/// Install the host-service-backed Node globals that the realm-init hook cannot build.
+///
+/// This is the second half of global wiring and the fix for the long-standing gap where the
+/// always-present Node globals (`process`, the timer functions, `queueMicrotask`, and the WHATWG
+/// `URL`/`URLSearchParams`/`TextEncoder`/`TextDecoder`/`fetch` family) never actually materialized:
+/// [`install_globals`] runs inside Nova's `initialize_global_object` realm hook, which is handed only
+/// `&mut Agent` and therefore cannot build a module's exports (those need a [`NodeCtx`] borrowed out of
+/// the [`HostState`], see the module note). This function runs *after* realm creation, from
+/// [`crate::JsRuntime::with_node_compat`], where the agent and the boxed [`HostState`] are borrowed
+/// **separately** — exactly the decoupled borrow the module path requires.
+///
+/// Wiring, mirroring Node's eager/lazy split (tenet 2):
+///
+/// * **Eager** — `process` (built via [`crate::node::process::install`] and bound on the global as a
+///   data property) and the timer family + `queueMicrotask` (built via [`crate::node::timers::install`]
+///   and [`crate::node::microtask::install`], whose bootstraps publish `setTimeout`/`clearTimeout`/
+///   `setInterval`/`clearInterval`/`setImmediate`/`clearImmediate`/`queueMicrotask` onto `globalThis`
+///   themselves). Real Node code reads these bare on practically every turn, so paying their (tiny)
+///   build cost once at startup is the right trade.
+/// * **Lazy** — the WHATWG class globals `URL`, `URLSearchParams`, `TextEncoder`, `TextDecoder`,
+///   `Headers`, `Request`, `Response`, and `fetch`. Each is a self-replacing accessor ([`define_lazy`])
+///   whose getter JS-bootstraps the class over the native primitives the corresponding leaf module
+///   exports (`node:url`, `node:text_encoding`, `node:fetch`), then redefines itself as a data
+///   property so the value is built at most once and only if the program touches it.
+///
+/// Returns the first [`InstallError`] from building `process`/timers/microtask (the eager set, which
+/// must succeed for a usable runtime); the lazy accessors cannot fail here since installing an accessor
+/// descriptor never runs the getter.
+pub(crate) fn install_module_globals(
+    agent: &mut Agent,
+    state: &HostState,
+    mut gc: GcScope,
+) -> Result<(), InstallError> {
+    let ctx = NodeCtx::new(state);
+
+    // --- Eager: process (bound as a global data property). ---
+    let process = crate::node::process::install(agent, &ctx, gc.reborrow())?.unbind();
+    {
+        let nogc = gc.nogc();
+        let global = agent.current_realm(nogc).global_object(agent);
+        define_value_on(agent, global, "process", process.bind(nogc), nogc);
+    }
+
+    // --- Eager: timers + queueMicrotask (the bootstraps self-publish onto globalThis). ---
+    // Each returns its exports object (ignored here); the side effect — defining the timer functions
+    // and `queueMicrotask` as globals — is what we want. Idempotent if later `require`d (they reuse
+    // the registry/global they parked).
+    crate::node::timers::install(agent, &ctx, gc.reborrow())?;
+    crate::node::microtask::install(agent, &ctx, gc.reborrow())?;
+
+    // --- Lazy: the WHATWG class globals, each a self-replacing accessor. ---
+    let nogc = gc.into_nogc();
+    let global = agent.current_realm(nogc).global_object(agent);
+    define_lazy(agent, global, "URL", lazy_url_getter, nogc);
+    define_lazy(agent, global, "URLSearchParams", lazy_url_search_params_getter, nogc);
+    define_lazy(agent, global, "TextEncoder", lazy_text_encoder_getter, nogc);
+    define_lazy(agent, global, "TextDecoder", lazy_text_decoder_getter, nogc);
+    define_lazy(agent, global, "Headers", lazy_headers_getter, nogc);
+    define_lazy(agent, global, "Request", lazy_request_getter, nogc);
+    define_lazy(agent, global, "Response", lazy_response_getter, nogc);
+    define_lazy(agent, global, "fetch", lazy_fetch_getter, nogc);
+
+    Ok(())
+}
+
+/// `define_value` for an arbitrary [`Object`] target (the shared helper takes an [`OrdinaryObject`]).
+///
+/// The realm global is an [`Object`], so installing `process` onto it needs this generic-target form;
+/// it is otherwise identical to [`define_value`] (a writable/enumerable/configurable data property).
+fn define_value_on(
+    agent: &mut Agent,
+    target: Object,
+    name: &'static str,
+    value: Object,
+    gc: NoGcScope,
+) {
+    let key = PropertyKey::from_static_str(agent, name, gc);
+    unwrap_try(target.try_define_own_property(
+        agent,
+        key,
+        PropertyDescriptor::new_data_descriptor(value),
+        None,
+        gc,
+    ));
+}
+
+// =================================================================================================
+// Lazy WHATWG-class global getters.
+//
+// Each getter materializes its class(es) by evaluating a small JS bootstrap over the native
+// primitives the corresponding leaf module exports (reached via the global `require`, which is
+// installed eagerly in `install_globals`). On success it redefines the global name(s) it owns as
+// plain data properties (collapsing the accessor so the build runs at most once) and returns the
+// requested constructor. The bootstrap source is a single `&'static str` per family (tenet 3).
+//
+// `URL`/`URLSearchParams` share one bootstrap (they are mutually referential — `url.searchParams`
+// is a `URLSearchParams`), so either getter builds both and redefines both; the second-touched
+// global then already finds itself a data property and never re-enters its getter.
+// =================================================================================================
+
+/// Evaluate `bootstrap` (an IIFE) in the current realm and return its completion value.
+///
+/// Used by the lazy class getters: the bootstrap closes over `require` (a global) to pull native
+/// primitives, defines the class(es), publishes any sibling globals it owns, and ends with the
+/// constructor the getter must return. A parse/eval failure surfaces as a thrown JS exception so the
+/// triggering `typeof URL` / `new URL(...)` site sees a real error rather than a panic.
+fn eval_bootstrap<'gc>(
+    agent: &mut Agent,
+    bootstrap: &'static str,
+    mut gc: GcScope<'gc, '_>,
+) -> JsResult<'gc, Value<'gc>> {
+    let source = JsString::from_static_str(agent, bootstrap, gc.nogc());
+    let realm = agent.current_realm(gc.nogc());
+    let script = match parse_script(agent, source, realm, true, None, gc.nogc()) {
+        Ok(script) => script,
+        Err(diags) => {
+            let msg = diags
+                .iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(agent.throw_exception(
+                ExceptionType::Error,
+                if msg.is_empty() {
+                    "failed to parse global bootstrap".to_owned()
+                } else {
+                    msg
+                },
+                gc.into_nogc(),
+            ));
+        }
+    };
+    script_evaluation(agent, script.unbind(), gc.reborrow())
+        .unbind()
+        .map(|v| v.bind(gc.into_nogc()))
+}
+
+/// The shared `URL` + `URLSearchParams` bootstrap.
+///
+/// Builds both classes over `require("node:url").parse`/`.format` (the functional core the `url`
+/// module already implements) and publishes both as globals. The completion value is `URL`.
+const URL_BOOTSTRAP: &str = r##"
+(function () {
+  var nodeUrl = globalThis.__treaty_native_module;
+
+  function decode(s) { try { return decodeURIComponent(s.replace(/\+/g, " ")); } catch (e) { return s; } }
+  function encode(s) { return encodeURIComponent(s); }
+
+  function parseQuery(init, sp) {
+    sp._list = [];
+    if (init == null || init === "") return;
+    if (typeof init === "string") {
+      var q = init.charAt(0) === "?" ? init.slice(1) : init;
+      if (q === "") return;
+      var pairs = q.split("&");
+      for (var i = 0; i < pairs.length; i++) {
+        if (pairs[i] === "") continue;
+        var eq = pairs[i].indexOf("=");
+        var k = eq < 0 ? pairs[i] : pairs[i].slice(0, eq);
+        var v = eq < 0 ? "" : pairs[i].slice(eq + 1);
+        sp._list.push([decode(k), decode(v)]);
+      }
+    } else if (typeof init.forEach === "function" && typeof init !== "string") {
+      // Map / another URLSearchParams / array of pairs.
+      if (Array.isArray(init)) {
+        for (var j = 0; j < init.length; j++) { sp._list.push([String(init[j][0]), String(init[j][1])]); }
+      } else {
+        init.forEach(function (val, key) { sp._list.push([String(key), String(val)]); });
+      }
+    } else {
+      var keys = Object.keys(init);
+      for (var k2 = 0; k2 < keys.length; k2++) { sp._list.push([keys[k2], String(init[keys[k2]])]); }
+    }
+  }
+
+  function URLSearchParams(init) {
+    if (!(this instanceof URLSearchParams)) { return new URLSearchParams(init); }
+    this._list = [];
+    this._url = null; // back-reference so mutations re-serialize the owning URL
+    parseQuery(init, this);
+  }
+  function sync(sp) { if (sp._url) { sp._url._search = sp.toString(); } }
+  URLSearchParams.prototype.append = function (k, v) { this._list.push([String(k), String(v)]); sync(this); };
+  URLSearchParams.prototype.delete = function (k) { k = String(k); this._list = this._list.filter(function (p) { return p[0] !== k; }); sync(this); };
+  URLSearchParams.prototype.get = function (k) { k = String(k); for (var i = 0; i < this._list.length; i++) { if (this._list[i][0] === k) return this._list[i][1]; } return null; };
+  URLSearchParams.prototype.getAll = function (k) { k = String(k); var o = []; for (var i = 0; i < this._list.length; i++) { if (this._list[i][0] === k) o.push(this._list[i][1]); } return o; };
+  URLSearchParams.prototype.has = function (k) { k = String(k); for (var i = 0; i < this._list.length; i++) { if (this._list[i][0] === k) return true; } return false; };
+  URLSearchParams.prototype.set = function (k, v) { k = String(k); v = String(v); var done = false; var o = []; for (var i = 0; i < this._list.length; i++) { if (this._list[i][0] === k) { if (!done) { o.push([k, v]); done = true; } } else { o.push(this._list[i]); } } if (!done) o.push([k, v]); this._list = o; sync(this); };
+  URLSearchParams.prototype.forEach = function (cb, thisArg) { for (var i = 0; i < this._list.length; i++) { cb.call(thisArg, this._list[i][1], this._list[i][0], this); } };
+  URLSearchParams.prototype.keys = function () { return this._list.map(function (p) { return p[0]; })[Symbol.iterator](); };
+  URLSearchParams.prototype.values = function () { return this._list.map(function (p) { return p[1]; })[Symbol.iterator](); };
+  URLSearchParams.prototype.entries = function () { return this._list.map(function (p) { return [p[0], p[1]]; })[Symbol.iterator](); };
+  URLSearchParams.prototype[Symbol.iterator] = function () { return this.entries(); };
+  URLSearchParams.prototype.sort = function () { this._list.sort(function (a, b) { return a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0; }); sync(this); };
+  URLSearchParams.prototype.toString = function () { return this._list.map(function (p) { return encode(p[0]) + "=" + encode(p[1]); }).join("&"); };
+  Object.defineProperty(URLSearchParams.prototype, "size", { get: function () { return this._list.length; }, configurable: true });
+
+  function URL(input, base) {
+    if (!(this instanceof URL)) { return new URL(input, base); }
+    input = String(input);
+    var resolved = input;
+    // Minimal base resolution: if input has no scheme and a base is given, join against the base.
+    var parsed = nodeUrl.parse(input);
+    if ((!parsed.protocol) && base != null) {
+      var b = nodeUrl.parse(String(base));
+      if (!b.protocol) { throw new TypeError("Invalid base URL: " + base); }
+      var basePath = b.pathname || "/";
+      if (input.charAt(0) === "/") {
+        resolved = b.protocol + "//" + (b.host || "") + input;
+      } else if (input.charAt(0) === "?" || input.charAt(0) === "#") {
+        resolved = b.protocol + "//" + (b.host || "") + basePath + input;
+      } else {
+        var dir = basePath.slice(0, basePath.lastIndexOf("/") + 1);
+        resolved = b.protocol + "//" + (b.host || "") + dir + input;
+      }
+      parsed = nodeUrl.parse(resolved);
+    }
+    if (!parsed.protocol) { throw new TypeError("Invalid URL: " + input); }
+    this._protocol = parsed.protocol || "";
+    this._hostname = parsed.hostname || "";
+    this._port = parsed.port || "";
+    this._pathname = parsed.pathname || (this._hostname ? "/" : "");
+    this._search = parsed.search || "";
+    this._hash = parsed.hash || "";
+    var u = parsed.href || resolved;
+    var at = (u.indexOf("@") >= 0 && u.indexOf("//") >= 0) ? u : u;
+    this._username = "";
+    this._password = "";
+    var sp = new URLSearchParams(this._search);
+    sp._url = this;
+    this._searchParams = sp;
+  }
+  function host(u) { return u._port ? u._hostname + ":" + u._port : u._hostname; }
+  Object.defineProperty(URL.prototype, "protocol", { get: function () { return this._protocol; }, set: function (v) { v = String(v); this._protocol = v.charAt(v.length - 1) === ":" ? v : v + ":"; }, configurable: true });
+  Object.defineProperty(URL.prototype, "hostname", { get: function () { return this._hostname; }, set: function (v) { this._hostname = String(v); }, configurable: true });
+  Object.defineProperty(URL.prototype, "port", { get: function () { return this._port; }, set: function (v) { this._port = String(v); }, configurable: true });
+  Object.defineProperty(URL.prototype, "host", { get: function () { return host(this); }, set: function (v) { v = String(v); var c = v.indexOf(":"); if (c >= 0) { this._hostname = v.slice(0, c); this._port = v.slice(c + 1); } else { this._hostname = v; this._port = ""; } }, configurable: true });
+  Object.defineProperty(URL.prototype, "pathname", { get: function () { return this._pathname; }, set: function (v) { v = String(v); this._pathname = v.charAt(0) === "/" || v === "" ? v : "/" + v; }, configurable: true });
+  Object.defineProperty(URL.prototype, "search", { get: function () { return this._search; }, set: function (v) { v = String(v); this._search = v === "" ? "" : (v.charAt(0) === "?" ? v : "?" + v); parseQuery(this._search, this._searchParams); }, configurable: true });
+  Object.defineProperty(URL.prototype, "hash", { get: function () { return this._hash; }, set: function (v) { v = String(v); this._hash = v === "" ? "" : (v.charAt(0) === "#" ? v : "#" + v); }, configurable: true });
+  Object.defineProperty(URL.prototype, "searchParams", { get: function () { return this._searchParams; }, configurable: true });
+  Object.defineProperty(URL.prototype, "origin", { get: function () { return this._hostname ? this._protocol + "//" + host(this) : "null"; }, configurable: true });
+  Object.defineProperty(URL.prototype, "href", { get: function () {
+    var s = this._searchParams && this._searchParams._list.length ? "?" + this._searchParams.toString() : this._search;
+    var out = this._protocol;
+    if (this._hostname) { out += "//" + host(this); }
+    out += this._pathname + (s || "") + this._hash;
+    return out;
+  }, set: function (v) { URL.call(this, String(v)); }, configurable: true });
+  URL.prototype.toString = function () { return this.href; };
+  URL.prototype.toJSON = function () { return this.href; };
+  return { URL: URL, URLSearchParams: URLSearchParams };
+})()
+"##;
+
+fn lazy_url_getter<'gc>(
+    agent: &mut Agent,
+    this: Value,
+    _args: ArgumentsList,
+    gc: GcScope<'gc, '_>,
+) -> JsResult<'gc, Value<'gc>> {
+    materialize_family(
+        agent,
+        this,
+        URL_BOOTSTRAP,
+        &["URL", "URLSearchParams"],
+        "URL",
+        crate::node::url::install,
+        gc,
+    )
+}
+
+fn lazy_url_search_params_getter<'gc>(
+    agent: &mut Agent,
+    this: Value,
+    _args: ArgumentsList,
+    gc: GcScope<'gc, '_>,
+) -> JsResult<'gc, Value<'gc>> {
+    materialize_family(
+        agent,
+        this,
+        URL_BOOTSTRAP,
+        &["URL", "URLSearchParams"],
+        "URLSearchParams",
+        crate::node::url::install,
+        gc,
+    )
+}
+
+/// `TextEncoder` / `TextDecoder` bootstrap over `require("node:text_encoding")`.
+///
+/// The native module exchanges bytes as a plain integer `Array` (the pinned Nova rev exposes no
+/// embedder `Uint8Array` construction — see `text_encoding.rs`); the class wrappers present the
+/// WHATWG surface (`.encode` returns a `Uint8Array`, `.decode` accepts one) by converting between an
+/// integer array and a `Uint8Array` in JS. Publishes both classes as globals; completion value is the
+/// requested constructor name, read back by the caller.
+const TEXT_ENCODING_BOOTSTRAP: &str = r#"
+(function () {
+  var te = globalThis.__treaty_native_module;
+
+  function TextEncoder() {}
+  Object.defineProperty(TextEncoder.prototype, "encoding", { get: function () { return "utf-8"; }, configurable: true });
+  TextEncoder.prototype.encode = function (input) {
+    var arr = te.encode(input === undefined ? "" : String(input));
+    return Uint8Array.from(arr);
+  };
+  TextEncoder.prototype.encodeInto = function (source, dest) {
+    var bytes = te.encode(source === undefined ? "" : String(source));
+    var n = Math.min(bytes.length, dest.length);
+    for (var i = 0; i < n; i++) dest[i] = bytes[i];
+    // Approximate read count: with no surrogate splitting we report the chars consumed for the bytes
+    // written; for the common all-ASCII / fully-fitting case this matches WHATWG.
+    return { read: source ? String(source).length : 0, written: n };
+  };
+
+  function TextDecoder(label, options) {
+    this._encoding = "utf-8";
+    options = options || {};
+    this._fatal = !!options.fatal;
+    this._ignoreBOM = !!options.ignoreBOM;
+  }
+  Object.defineProperty(TextDecoder.prototype, "encoding", { get: function () { return this._encoding; }, configurable: true });
+  Object.defineProperty(TextDecoder.prototype, "fatal", { get: function () { return this._fatal; }, configurable: true });
+  Object.defineProperty(TextDecoder.prototype, "ignoreBOM", { get: function () { return this._ignoreBOM; }, configurable: true });
+  TextDecoder.prototype.decode = function (input) {
+    var bytes;
+    if (input == null) { bytes = []; }
+    else if (Array.isArray(input)) { bytes = input; }
+    else if (input.buffer !== undefined || input.byteLength !== undefined) {
+      var view = input.BYTES_PER_ELEMENT === 1 ? input : new Uint8Array(input.buffer || input);
+      bytes = Array.prototype.slice.call(view);
+    } else { bytes = Array.prototype.slice.call(input); }
+    return te.decode(bytes, { fatal: this._fatal, ignoreBOM: this._ignoreBOM });
+  };
+
+  return { TextEncoder: TextEncoder, TextDecoder: TextDecoder };
+})()
+"#;
+
+fn lazy_text_encoder_getter<'gc>(
+    agent: &mut Agent,
+    this: Value,
+    _args: ArgumentsList,
+    gc: GcScope<'gc, '_>,
+) -> JsResult<'gc, Value<'gc>> {
+    materialize_family(
+        agent,
+        this,
+        TEXT_ENCODING_BOOTSTRAP,
+        &["TextEncoder", "TextDecoder"],
+        "TextEncoder",
+        crate::node::text_encoding::install,
+        gc,
+    )
+}
+
+fn lazy_text_decoder_getter<'gc>(
+    agent: &mut Agent,
+    this: Value,
+    _args: ArgumentsList,
+    gc: GcScope<'gc, '_>,
+) -> JsResult<'gc, Value<'gc>> {
+    materialize_family(
+        agent,
+        this,
+        TEXT_ENCODING_BOOTSTRAP,
+        &["TextEncoder", "TextDecoder"],
+        "TextDecoder",
+        crate::node::text_encoding::install,
+        gc,
+    )
+}
+
+/// `Headers`/`Request`/`Response`/`fetch` bootstrap over `require("node:fetch")`.
+///
+/// The fetch module exposes the WHATWG header/method/status primitives over a `[name, value][]` pair
+/// array (no network, no internal slots — see `fetch.rs`). The class shells here carry their header
+/// list as a plain JS field and delegate validation/combine/sort to those primitives. `fetch()` has no
+/// transport in this offline runtime, so it returns a rejected promise with a clear, catchable message
+/// (Node layers `fetch` over a transport too); the request/response *shape* is fully usable. Publishes
+/// all four globals; completion value unused (the caller reads the requested name back).
+const FETCH_BOOTSTRAP: &str = r#"
+(function () {
+  var F = globalThis.__treaty_native_module;
+
+  function pairsFrom(init) {
+    var list = [];
+    if (init == null) return list;
+    if (Array.isArray(init)) {
+      for (var i = 0; i < init.length; i++) { list.push([String(init[i][0]), String(init[i][1])]); }
+    } else if (typeof init.forEach === "function") {
+      init.forEach(function (v, k) { list.push([String(k), String(v)]); });
+    } else if (typeof init === "object") {
+      var keys = Object.keys(init);
+      for (var j = 0; j < keys.length; j++) { list.push([keys[j], String(init[keys[j]])]); }
+    }
+    return list;
+  }
+
+  function Headers(init) {
+    if (!(this instanceof Headers)) return new Headers(init);
+    this._list = [];
+    var pairs = init instanceof Headers ? init._list.slice() : pairsFrom(init);
+    for (var i = 0; i < pairs.length; i++) { this._list = F.headersAppend(this._list, pairs[i][0], pairs[i][1]); }
+  }
+  Headers.prototype.append = function (n, v) { this._list = F.headersAppend(this._list, String(n), String(v)); };
+  Headers.prototype.set = function (n, v) { this._list = F.headersSet(this._list, String(n), String(v)); };
+  Headers.prototype.get = function (n) { return F.headersGet(this._list, String(n)); };
+  Headers.prototype.has = function (n) { return F.headersHas(this._list, String(n)); };
+  Headers.prototype["delete"] = function (n) { this._list = F.headersDelete(this._list, String(n)); };
+  Headers.prototype.getSetCookie = function () { return F.headersGetSetCookie(this._list); };
+  Headers.prototype.forEach = function (cb, thisArg) { var s = F.headersSortedCombined(this._list); for (var i = 0; i < s.length; i++) { cb.call(thisArg, s[i][1], s[i][0], this); } };
+  Headers.prototype.entries = function () { return F.headersSortedCombined(this._list)[Symbol.iterator](); };
+  Headers.prototype.keys = function () { return F.headersSortedCombined(this._list).map(function (p) { return p[0]; })[Symbol.iterator](); };
+  Headers.prototype.values = function () { return F.headersSortedCombined(this._list).map(function (p) { return p[1]; })[Symbol.iterator](); };
+  Headers.prototype[Symbol.iterator] = function () { return this.entries(); };
+
+  function bodyMixin(proto) {
+    proto.text = function () { return Promise.resolve(this._bodyText == null ? "" : String(this._bodyText)); };
+    proto.json = function () { var t = this._bodyText; return Promise.resolve().then(function () { return JSON.parse(t == null ? "null" : t); }); };
+    proto.arrayBuffer = function () { var t = this._bodyText == null ? "" : String(this._bodyText); return Promise.resolve(new TextEncoder().encode(t).buffer); };
+    Object.defineProperty(proto, "bodyUsed", { get: function () { return !!this._bodyUsed; }, configurable: true });
+  }
+
+  function Request(input, init) {
+    if (!(this instanceof Request)) return new Request(input, init);
+    init = init || {};
+    this.url = typeof input === "object" && input.url ? input.url : String(input);
+    var m = init.method ? F.normalizeMethod(String(init.method)) : (input.method || "GET");
+    if (F.isForbiddenMethod(m)) { throw new TypeError("Method " + m + " is forbidden"); }
+    this.method = m;
+    this.headers = new Headers(init.headers || (input.headers));
+    this._bodyText = init.body != null ? String(init.body) : (input._bodyText != null ? input._bodyText : null);
+    this.redirect = init.redirect || "follow";
+  }
+  bodyMixin(Request.prototype);
+  Request.prototype.clone = function () { return new Request(this.url, { method: this.method, headers: this.headers, body: this._bodyText }); };
+
+  function Response(body, init) {
+    if (!(this instanceof Response)) return new Response(body, init);
+    init = init || {};
+    this._bodyText = body != null ? String(body) : null;
+    this.status = init.status != null ? (init.status | 0) : 200;
+    this.statusText = init.statusText != null ? String(init.statusText) : "";
+    this.headers = new Headers(init.headers);
+    this.ok = F.isOkStatus(this.status);
+    this.redirected = false;
+    this.type = "default";
+    this.url = "";
+  }
+  bodyMixin(Response.prototype);
+  Response.prototype.clone = function () { var r = new Response(this._bodyText, { status: this.status, statusText: this.statusText, headers: this.headers }); return r; };
+  Response.json = function (data, init) { init = init || {}; var h = new Headers(init.headers); if (!h.has("content-type")) h.set("content-type", "application/json"); return new Response(JSON.stringify(data), { status: init.status, statusText: init.statusText, headers: h }); };
+  Response.error = function () { var r = new Response(null, { status: 0 }); r.type = "error"; return r; };
+  Response.redirect = function (url, status) { var r = new Response(null, { status: status || 302 }); r.headers.set("location", String(url)); return r; };
+
+  function fetch(input, init) {
+    // No HTTP transport in this offline runtime: surface a catchable rejection rather than pretend.
+    return Promise.reject(new TypeError(
+      "fetch() is not supported in this runtime: no network transport is available"
+    ));
+  }
+
+  return { Headers: Headers, Request: Request, Response: Response, fetch: fetch };
+})()
+"#;
+
+fn lazy_headers_getter<'gc>(
+    agent: &mut Agent,
+    this: Value,
+    _args: ArgumentsList,
+    gc: GcScope<'gc, '_>,
+) -> JsResult<'gc, Value<'gc>> {
+    materialize_family(
+        agent,
+        this,
+        FETCH_BOOTSTRAP,
+        FETCH_FAMILY,
+        "Headers",
+        crate::node::fetch::install,
+        gc,
+    )
+}
+
+fn lazy_request_getter<'gc>(
+    agent: &mut Agent,
+    this: Value,
+    _args: ArgumentsList,
+    gc: GcScope<'gc, '_>,
+) -> JsResult<'gc, Value<'gc>> {
+    materialize_family(
+        agent,
+        this,
+        FETCH_BOOTSTRAP,
+        FETCH_FAMILY,
+        "Request",
+        crate::node::fetch::install,
+        gc,
+    )
+}
+
+fn lazy_response_getter<'gc>(
+    agent: &mut Agent,
+    this: Value,
+    _args: ArgumentsList,
+    gc: GcScope<'gc, '_>,
+) -> JsResult<'gc, Value<'gc>> {
+    materialize_family(
+        agent,
+        this,
+        FETCH_BOOTSTRAP,
+        FETCH_FAMILY,
+        "Response",
+        crate::node::fetch::install,
+        gc,
+    )
+}
+
+fn lazy_fetch_getter<'gc>(
+    agent: &mut Agent,
+    this: Value,
+    _args: ArgumentsList,
+    gc: GcScope<'gc, '_>,
+) -> JsResult<'gc, Value<'gc>> {
+    materialize_family(
+        agent,
+        this,
+        FETCH_BOOTSTRAP,
+        FETCH_FAMILY,
+        "fetch",
+        crate::node::fetch::install,
+        gc,
+    )
+}
+
+/// The four global names the fetch bootstrap materializes together.
+const FETCH_FAMILY: &[&str] = &["Headers", "Request", "Response", "fetch"];
+
+/// The hidden, non-enumerable global slot through which a lazy getter hands the leaf module's native
+/// primitives to its JS bootstrap. Parked just before the bootstrap evaluates and deleted immediately
+/// after, so it is never observable between turns (and `delete` succeeds because it is configurable).
+const NATIVE_SLOT: &str = "__treaty_native_module";
+
+/// Remove a (configurable) data property `name` from `target`. The teardown half of [`NATIVE_SLOT`].
+fn delete_global_slot(agent: &mut Agent, target: Object, name: &str, gc: NoGcScope) {
+    let key = PropertyKey::from_str(agent, name, gc);
+    unwrap_try(target.try_delete(agent, key, gc));
+}
+
+/// Materialize a family of WHATWG globals from one bootstrap and return the requested member.
+///
+/// The bootstrap (an IIFE) returns an object mapping each `member` name to its freshly-built class /
+/// function. This:
+///   1. evaluates it once (it never touches `globalThis` for the names it owns, so re-reading the
+///      lazy accessor — which would re-enter this getter — cannot happen),
+///   2. reads each `members[i]` off the returned object and `redefine_as_data`s it onto the realm
+///      global, collapsing **every** sibling accessor in the family at once (so touching one member
+///      builds the whole family exactly once and the others are already plain data properties), and
+///   3. returns the value bound to `want`.
+///
+/// Redefining the accessor as a data property is the lazy-init contract; doing it from Rust (rather
+/// than the bootstrap assigning `globalThis.X = …`) is required because the accessor has no setter and
+/// the bootstrap runs in strict mode, where such an assignment would throw.
+fn materialize_family<'gc>(
+    agent: &mut Agent,
+    this: Value,
+    bootstrap: &'static str,
+    members: &[&'static str],
+    want: &'static str,
+    native: crate::node::InstallFn,
+    mut gc: GcScope<'gc, '_>,
+) -> JsResult<'gc, Value<'gc>> {
+    // Build the leaf module's native primitives in Rust and park them on a hidden global slot the
+    // bootstrap reads. The native modules backing these globals (`text_encoding`, `fetch`) are
+    // intentionally NOT importable `node:` specifiers (they appear only as globals — see the
+    // `globals_only_modules_are_not_in_the_import_table` registry test), so the bootstrap cannot reach
+    // them via `require`; the host hands them in directly through the slot instead. Recovering the
+    // `HostState` to build the module mirrors the documented Nova FFI boundary used by `require`.
+    let state = match crate::node::core::host_state(agent) {
+        // SAFETY: see `core::extend_lifetime`. The `HostState` lives in the JsRuntime's box at a stable
+        // address that outlives this call; the borrow is used only here and never aliased mutably with
+        // `&mut Agent` (its caches are `RefCell`-guarded). Identical to `module_cjs::require`.
+        Some(state) => unsafe { crate::node::core::extend_lifetime(state) },
+        None => {
+            return Err(agent.throw_exception_with_static_message(
+                ExceptionType::Error,
+                "the Node compatibility layer is not installed",
+                gc.into_nogc(),
+            ));
+        }
+    };
+    let ctx = NodeCtx::new(state);
+    let native_obj = match native(agent, &ctx, gc.reborrow()) {
+        Ok(obj) => obj.unbind(),
+        Err(e) => {
+            let msg = e.to_string();
+            return Err(agent.throw_exception(ExceptionType::Error, msg, gc.into_nogc()));
+        }
+    };
+    {
+        let nogc = gc.nogc();
+        let global = agent.current_realm(nogc).global_object(agent);
+        define_value_on(agent, global, NATIVE_SLOT, native_obj.bind(nogc), nogc);
+    }
+
+    let result = eval_bootstrap(agent, bootstrap, gc.reborrow()).unbind()?;
+    let nogc = gc.into_nogc();
+    // Clear the slot so it does not linger as an observable global.
+    let global = getter_target(agent, this, nogc);
+    delete_global_slot(agent, global, NATIVE_SLOT, nogc);
+    let Ok(result_obj) = Object::try_from(result.bind(nogc)) else {
+        return Err(agent.throw_exception_with_static_message(
+            ExceptionType::Error,
+            "global bootstrap did not return an object",
+            nogc,
+        ));
+    };
+
+    let mut wanted = Value::Undefined;
+    for &name in members {
+        let key = PropertyKey::from_static_str(agent, name, nogc);
+        let value = match result_obj.try_get(agent, key, result_obj.into(), None, nogc) {
+            std::ops::ControlFlow::Continue(nova_vm::ecmascript::TryGetResult::Value(v)) => v,
+            _ => Value::Undefined,
+        };
+        redefine_as_data(agent, global, name, value, nogc);
+        if name == want {
+            wanted = value;
+        }
+    }
+    Ok(wanted)
 }
 
 #[cfg(test)]

@@ -1,10 +1,6 @@
-// CONFORMANCE: skip — the WHATWG URL/URLSearchParams classes are not reachable in the harness
-//
-// The runtime installs `URL`/`URLSearchParams` as lazy global accessors (not as named exports of
-// node:url, which exposes only the legacy functional parse()/format()/fileURLToPath() API — those
-// are covered by url-parse-format.js). Like the other lazy globals, the constructors are not
-// triggered inside the harness's indirect-eval scope and are not on globalThis, so `new URL(...)`
-// throws "not a constructor". Re-enable once the constructible WHATWG classes are reachable.
+// The runtime installs `URL`/`URLSearchParams` as lazy global accessors (the constructible WHATWG
+// classes), distinct from node:url's legacy functional parse()/format()/fileURLToPath() API covered
+// by url-parse-format.js. The constructors are now reachable from the harness's evaluation scope.
 const u = new URL("https://example.com:8080/a/b?q=1&q=2#frag");
 if (u.hostname !== "example.com") throw new Error("hostname");
 if (u.port !== "8080") throw new Error("port");

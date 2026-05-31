@@ -35,8 +35,10 @@ pub(crate) mod module_esm;
 pub(crate) mod module_resolver;
 
 // Leaf builtin modules — one file each, all exposing the uniform `install` entry.
+pub(crate) mod assert;
 pub(crate) mod buffer;
 pub(crate) mod console;
+pub(crate) mod crypto;
 pub(crate) mod events;
 pub(crate) mod fetch;
 pub(crate) mod fs;
@@ -45,6 +47,8 @@ pub(crate) mod microtask;
 pub(crate) mod os;
 pub(crate) mod path;
 pub(crate) mod process;
+pub(crate) mod querystring;
+pub(crate) mod string_decoder;
 pub(crate) mod structured_clone;
 pub(crate) mod text_encoding;
 pub(crate) mod timers;
@@ -104,6 +108,10 @@ pub(crate) const BUILTINS: &[(&str, InstallFn)] = &[
     ("console", console::install),
     ("timers", timers::install),
     ("url", url::install),
+    ("crypto", crypto::install),
+    ("querystring", querystring::install),
+    ("assert", assert::install),
+    ("string_decoder", string_decoder::install),
 ];
 
 /// Strip the optional `node:` scheme from a specifier, yielding the bare name to match against the
@@ -164,6 +172,23 @@ pub(crate) fn is_builtin(specifier: &str) -> bool {
 /// the rarely-touched ones as self-replacing lazy accessors.
 pub(crate) fn install(agent: &mut Agent, global: Object, gc: GcScope) {
     globals::install_globals(agent, global, gc);
+}
+
+/// Install the host-service-backed Node globals after realm creation.
+///
+/// The realm-init hook ([`install`]) holds only `&mut Agent` and so can wire only the host-service-free
+/// self-references. The always-present module-backed globals — `process`, the timer functions,
+/// `queueMicrotask`, and the lazy WHATWG `URL`/`URLSearchParams`/`TextEncoder`/`TextDecoder`/`fetch`
+/// family — need a [`crate::node::core::HostState`] borrow to build their modules, which only exists
+/// *after* realm creation (where the agent and the boxed `HostState` are borrowed separately). This is
+/// the seam [`crate::JsRuntime::with_node_compat`] calls at that point; see
+/// [`globals::install_module_globals`] for the eager/lazy split.
+pub(crate) fn install_module_globals(
+    agent: &mut Agent,
+    state: &core::HostState,
+    gc: GcScope,
+) -> Result<(), InstallError> {
+    globals::install_module_globals(agent, state, gc)
 }
 
 #[cfg(test)]
@@ -273,6 +298,10 @@ mod tests {
         assert!(registered(console::ConsoleModule::SPECIFIER));
         assert!(registered(timers::TimersModule::SPECIFIER));
         assert!(registered(url::UrlModule::SPECIFIER));
+        assert!(registered(crypto::CryptoModule::SPECIFIER));
+        assert!(registered(querystring::QuerystringModule::SPECIFIER));
+        assert!(registered(assert::AssertModule::SPECIFIER));
+        assert!(registered(string_decoder::StringDecoderModule::SPECIFIER));
     }
 
     #[test]

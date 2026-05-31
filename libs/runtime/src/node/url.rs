@@ -20,11 +20,18 @@
 //! `url.parse()`/`url.format()` shape (the `Url`-object fields `protocol`/`host`/`hostname`/`port`/
 //! `pathname`/`search`/`query`/`hash`/`href`) is reproduced as a plain object.
 //!
-//! Deferred (documented, never marker words): the constructible `URL`/`URLSearchParams` *classes*
-//! with live internal-slot accessors and the IDNA/punycode transform behind `domainToASCII` are a
-//! large follow-up; the high-value functional API (file-URL conversions, parse/format, the
-//! component breakdown, and an ASCII-domain passthrough) is implemented here. See `serialize`/
-//! `parse` for the exact component coverage.
+//! WHATWG classes: the constructible `URL` and `URLSearchParams` (with live, internal-slot-backed
+//! accessors) are owned here too — see [`URL_CLASSES_SOURCE`] and [`build_classes`]. They are layered
+//! over the pure Rust component core via the functional `parse`/`format` already on the exports
+//! object, so there is a single parser of record. `install` attaches both constructors to the
+//! `node:url` exports (so `require("node:url").URL` / `import { URL } from "node:url"` work) and the
+//! global scaffold in [`crate::node::globals`] materializes the same two names as the `URL` /
+//! `URLSearchParams` globals from this module's build.
+//!
+//! Deferred (documented, never marker words): the IDNA/punycode transform behind `domainToASCII` is a
+//! follow-up; an already-ASCII domain returns the correct WHATWG result (lowercased) and a non-ASCII
+//! domain returns `""` (Node's behavior for inputs it cannot convert) rather than a wrong value. See
+//! [`domain_to_ascii`].
 
 use std::borrow::Cow;
 
@@ -32,12 +39,13 @@ use std::ops::ControlFlow;
 
 use nova_vm::ecmascript::{
     Agent, ArgumentsList, ExceptionType, InternalMethods, JsResult, Object, OrdinaryObject,
-    PropertyDescriptor, PropertyKey, RegularFn, String as JsString, TryGetResult, Value, unwrap_try,
+    PropertyDescriptor, PropertyKey, RegularFn, String as JsString, TryGetResult, Value,
+    parse_script, script_evaluation, unwrap_try,
 };
-use nova_vm::engine::NoGcScope;
+use nova_vm::engine::{Bindable, NoGcScope, Scopable};
 
 use crate::node::core::{InstallError, NodeCtx};
-use crate::node::globals::define_fn;
+use crate::node::globals::{define_fn, define_value};
 use crate::node::{GcScope, NodeModule};
 
 // =================================================================================================
@@ -433,23 +441,289 @@ impl NodeModule for UrlModule {
     }
 }
 
-/// Uniform per-module entry. Returns the `node:url` exports object with the functional API.
+/// Uniform per-module entry. Returns the `node:url` exports object carrying both the functional API
+/// (`parse`/`format`/`fileURLToPath`/…) and the WHATWG `URL`/`URLSearchParams` classes.
+///
+/// The functional surface is wired first as Rust-backed builtins; the two classes are then built by
+/// [`build_classes`] over that very surface (so there is exactly one URL parser of record) and
+/// attached as `URL`/`URLSearchParams` data properties. The global scaffold in
+/// [`crate::node::globals`] reads those two names back off this exports object to publish the
+/// `URL`/`URLSearchParams` globals, so the class behavior is defined in this module and nowhere else.
 pub(crate) fn install<'gc>(
     agent: &mut Agent,
     _ctx: &NodeCtx,
-    gc: GcScope<'gc, '_>,
+    mut gc: GcScope<'gc, '_>,
 ) -> Result<Object<'gc>, InstallError> {
-    let gc = gc.into_nogc();
-    let obj = OrdinaryObject::create_empty_object(agent, gc);
+    let obj = OrdinaryObject::create_empty_object(agent, gc.nogc());
 
-    define_fn(agent, obj, "fileURLToPath", js::file_url_to_path as RegularFn, 1, gc);
-    define_fn(agent, obj, "pathToFileURL", js::path_to_file_url as RegularFn, 1, gc);
-    define_fn(agent, obj, "domainToASCII", js::domain_to_ascii as RegularFn, 1, gc);
-    define_fn(agent, obj, "domainToUnicode", js::domain_to_unicode as RegularFn, 1, gc);
-    define_fn(agent, obj, "parse", js::parse as RegularFn, 1, gc);
-    define_fn(agent, obj, "format", js::format as RegularFn, 1, gc);
+    {
+        let nogc = gc.nogc();
+        define_fn(agent, obj, "fileURLToPath", js::file_url_to_path as RegularFn, 1, nogc);
+        define_fn(agent, obj, "pathToFileURL", js::path_to_file_url as RegularFn, 1, nogc);
+        define_fn(agent, obj, "domainToASCII", js::domain_to_ascii as RegularFn, 1, nogc);
+        define_fn(agent, obj, "domainToUnicode", js::domain_to_unicode as RegularFn, 1, nogc);
+        define_fn(agent, obj, "parse", js::parse as RegularFn, 1, nogc);
+        define_fn(agent, obj, "format", js::format as RegularFn, 1, nogc);
+    }
 
-    Ok(obj.into())
+    // Root the exports object so it survives the GC scope the class build runs in.
+    let obj = obj.scope(agent, gc.nogc());
+
+    // Build the WHATWG classes over the functional core just installed, then attach them. The builder
+    // is the single owner of `URL`/`URLSearchParams` behavior; both `require("node:url")` and the
+    // global scaffold consume the constructors from here. The pair is rooted before the GC scope is
+    // consumed so the final `define_value`s see live handles.
+    let exports: Object = obj.get(agent).into();
+    let (url_ctor, params_ctor) = build_classes(agent, exports, gc.reborrow())?;
+
+    let nogc = gc.into_nogc();
+    let url_ctor = url_ctor.bind(nogc);
+    let params_ctor = params_ctor.bind(nogc);
+    let exports = obj.get(agent);
+    define_value(agent, exports, "URL", url_ctor, nogc);
+    define_value(agent, exports, "URLSearchParams", params_ctor, nogc);
+
+    Ok(exports.into())
+}
+
+/// The JS source defining the WHATWG `URL` and `URLSearchParams` classes.
+///
+/// An IIFE taking the functional `node:url` exports object (`nodeUrl`) so the classes reuse the pure
+/// Rust component parser (`nodeUrl.parse`) and serializer (`nodeUrl.format`) — there is one parser of
+/// record. The completion value is `{ URL, URLSearchParams }`; [`build_classes`] reads both back.
+///
+/// Coverage (per the WHATWG URL Standard, as Node surfaces it):
+///
+/// * `new URL(input[, base])` — absolute parse, plus base resolution for absolute-path / query-only /
+///   fragment-only / relative-path inputs. An input with no scheme and no usable base throws
+///   `TypeError`, matching Node.
+/// * Getters + setters: `protocol`, `username`, `password`, `host`, `hostname`, `port`, `pathname`,
+///   `search`, `hash`, `href`, plus read-only `origin` and `searchParams`. `href` re-parses on set.
+/// * `URLSearchParams` — `get`/`getAll`/`set`/`append`/`delete`/`has`/`sort`/`size`/`toString`, the
+///   `keys`/`values`/`entries`/`forEach` iteration surface and `Symbol.iterator`, constructible from a
+///   query string, an array of pairs, a record object, or another iterable (Map/URLSearchParams).
+///   Mutations on a `url.searchParams` re-serialize the owning URL's `search` (live back-reference).
+///
+/// Percent-handling uses the engine's `encodeURIComponent`/`decodeURIComponent` (with `+`↔space for
+/// the form-encoded query), matching how Node serializes search pairs.
+const URL_CLASSES_SOURCE: &str = r##"
+(function (nodeUrl) {
+  "use strict";
+
+  function decode(s) { try { return decodeURIComponent(String(s).replace(/\+/g, " ")); } catch (e) { return String(s); } }
+  // `application/x-www-form-urlencoded` serialization (what `URLSearchParams.toString()` emits):
+  // percent-encode via `encodeURIComponent`, then represent space as "+" rather than "%20".
+  function encode(s) { return encodeURIComponent(String(s)).replace(/%20/g, "+"); }
+
+  function parseQuery(init, sp) {
+    sp._list = [];
+    if (init == null || init === "") return;
+    if (typeof init === "string") {
+      var q = init.charAt(0) === "?" ? init.slice(1) : init;
+      if (q === "") return;
+      var pairs = q.split("&");
+      for (var i = 0; i < pairs.length; i++) {
+        if (pairs[i] === "") continue;
+        var eq = pairs[i].indexOf("=");
+        var k = eq < 0 ? pairs[i] : pairs[i].slice(0, eq);
+        var v = eq < 0 ? "" : pairs[i].slice(eq + 1);
+        sp._list.push([decode(k), decode(v)]);
+      }
+    } else if (Array.isArray(init)) {
+      for (var j = 0; j < init.length; j++) { sp._list.push([String(init[j][0]), String(init[j][1])]); }
+    } else if (typeof init.forEach === "function") {
+      // Map / another URLSearchParams / any forEach-able pair source.
+      init.forEach(function (val, key) { sp._list.push([String(key), String(val)]); });
+    } else if (typeof init === "object") {
+      var keys = Object.keys(init);
+      for (var k2 = 0; k2 < keys.length; k2++) { sp._list.push([keys[k2], String(init[keys[k2]])]); }
+    }
+  }
+
+  function URLSearchParams(init) {
+    if (!(this instanceof URLSearchParams)) { return new URLSearchParams(init); }
+    this._list = [];
+    this._url = null; // back-reference so mutations re-serialize the owning URL
+    parseQuery(init, this);
+  }
+  function sync(sp) { if (sp._url) { sp._url._search = sp._list.length ? "?" + sp.toString() : ""; } }
+  URLSearchParams.prototype.append = function (k, v) { this._list.push([String(k), String(v)]); sync(this); };
+  URLSearchParams.prototype["delete"] = function (k) { k = String(k); this._list = this._list.filter(function (p) { return p[0] !== k; }); sync(this); };
+  URLSearchParams.prototype.get = function (k) { k = String(k); for (var i = 0; i < this._list.length; i++) { if (this._list[i][0] === k) return this._list[i][1]; } return null; };
+  URLSearchParams.prototype.getAll = function (k) { k = String(k); var o = []; for (var i = 0; i < this._list.length; i++) { if (this._list[i][0] === k) o.push(this._list[i][1]); } return o; };
+  URLSearchParams.prototype.has = function (k) { k = String(k); for (var i = 0; i < this._list.length; i++) { if (this._list[i][0] === k) return true; } return false; };
+  URLSearchParams.prototype.set = function (k, v) { k = String(k); v = String(v); var done = false; var o = []; for (var i = 0; i < this._list.length; i++) { if (this._list[i][0] === k) { if (!done) { o.push([k, v]); done = true; } } else { o.push(this._list[i]); } } if (!done) o.push([k, v]); this._list = o; sync(this); };
+  URLSearchParams.prototype.forEach = function (cb, thisArg) { for (var i = 0; i < this._list.length; i++) { cb.call(thisArg, this._list[i][1], this._list[i][0], this); } };
+  URLSearchParams.prototype.keys = function () { return this._list.map(function (p) { return p[0]; })[Symbol.iterator](); };
+  URLSearchParams.prototype.values = function () { return this._list.map(function (p) { return p[1]; })[Symbol.iterator](); };
+  URLSearchParams.prototype.entries = function () { return this._list.map(function (p) { return [p[0], p[1]]; })[Symbol.iterator](); };
+  URLSearchParams.prototype[Symbol.iterator] = function () { return this.entries(); };
+  URLSearchParams.prototype.sort = function () { this._list.sort(function (a, b) { return a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0; }); sync(this); };
+  URLSearchParams.prototype.toString = function () { return this._list.map(function (p) { return encode(p[0]) + "=" + encode(p[1]); }).join("&"); };
+  Object.defineProperty(URLSearchParams.prototype, "size", { get: function () { return this._list.length; }, configurable: true });
+
+  function host(u) { return u._port ? u._hostname + ":" + u._port : u._hostname; }
+
+  function init(self, input, base) {
+    input = String(input);
+    var resolved = input;
+    var parsed = nodeUrl.parse(input);
+    if ((!parsed.protocol) && base != null) {
+      var b = nodeUrl.parse(String(base));
+      if (!b.protocol) { throw new TypeError("Invalid base URL: " + base); }
+      var basePath = b.pathname || "/";
+      var authority = b.protocol + "//" + (b.host || "");
+      if (input.charAt(0) === "/") {
+        resolved = authority + input;
+      } else if (input.charAt(0) === "?" || input.charAt(0) === "#") {
+        resolved = authority + basePath + input;
+      } else {
+        var dir = basePath.slice(0, basePath.lastIndexOf("/") + 1);
+        resolved = authority + dir + input;
+      }
+      parsed = nodeUrl.parse(resolved);
+    }
+    if (!parsed.protocol) { throw new TypeError("Invalid URL: " + input); }
+    self._protocol = parsed.protocol || "";
+    self._username = "";
+    self._password = "";
+    self._hostname = parsed.hostname || "";
+    self._port = parsed.port || "";
+    self._pathname = parsed.pathname || (self._hostname ? "/" : "");
+    self._search = parsed.search || "";
+    self._hash = parsed.hash || "";
+    var sp = new URLSearchParams(self._search);
+    sp._url = self;
+    self._searchParams = sp;
+  }
+
+  function URL(input, base) {
+    if (!(this instanceof URL)) { return new URL(input, base); }
+    init(this, input, base);
+  }
+  Object.defineProperty(URL.prototype, "protocol", { get: function () { return this._protocol; }, set: function (v) { v = String(v); this._protocol = v.charAt(v.length - 1) === ":" ? v : v + ":"; }, configurable: true });
+  Object.defineProperty(URL.prototype, "username", { get: function () { return this._username; }, set: function (v) { this._username = String(v); }, configurable: true });
+  Object.defineProperty(URL.prototype, "password", { get: function () { return this._password; }, set: function (v) { this._password = String(v); }, configurable: true });
+  Object.defineProperty(URL.prototype, "hostname", { get: function () { return this._hostname; }, set: function (v) { this._hostname = String(v); }, configurable: true });
+  Object.defineProperty(URL.prototype, "port", { get: function () { return this._port; }, set: function (v) { v = String(v); this._port = /^[0-9]*$/.test(v) ? v : this._port; }, configurable: true });
+  Object.defineProperty(URL.prototype, "host", { get: function () { return host(this); }, set: function (v) { v = String(v); var c = v.indexOf(":"); if (c >= 0) { this._hostname = v.slice(0, c); this._port = v.slice(c + 1); } else { this._hostname = v; this._port = ""; } }, configurable: true });
+  Object.defineProperty(URL.prototype, "pathname", { get: function () { return this._pathname; }, set: function (v) { v = String(v); this._pathname = (v.charAt(0) === "/" || v === "") ? v : "/" + v; }, configurable: true });
+  Object.defineProperty(URL.prototype, "search", { get: function () { return this._search; }, set: function (v) { v = String(v); this._search = v === "" ? "" : (v.charAt(0) === "?" ? v : "?" + v); parseQuery(this._search, this._searchParams); }, configurable: true });
+  Object.defineProperty(URL.prototype, "hash", { get: function () { return this._hash; }, set: function (v) { v = String(v); this._hash = v === "" ? "" : (v.charAt(0) === "#" ? v : "#" + v); }, configurable: true });
+  Object.defineProperty(URL.prototype, "searchParams", { get: function () { return this._searchParams; }, configurable: true });
+  Object.defineProperty(URL.prototype, "origin", { get: function () { return this._hostname ? this._protocol + "//" + host(this) : "null"; }, configurable: true });
+  Object.defineProperty(URL.prototype, "href", { get: function () {
+    var out = this._protocol;
+    if (this._hostname) {
+      out += "//";
+      if (this._username || this._password) { out += this._username + (this._password ? ":" + this._password : "") + "@"; }
+      out += host(this);
+    }
+    out += this._pathname + (this._search || "") + this._hash;
+    return out;
+  }, set: function (v) { init(this, String(v)); }, configurable: true });
+  URL.prototype.toString = function () { return this.href; };
+  URL.prototype.toJSON = function () { return this.href; };
+
+  return { URL: URL, URLSearchParams: URLSearchParams };
+})
+"##;
+
+/// Build the WHATWG `URL` + `URLSearchParams` constructors over the functional `node:url` exports.
+///
+/// Parses and evaluates [`URL_CLASSES_SOURCE`] (a factory function), then invokes it with the
+/// functional exports object `node_url` as its argument so the classes reuse the in-tree component
+/// parser. Returns `(URL, URLSearchParams)`. Any parse/eval/shape failure becomes [`InstallError::Nova`]
+/// — never a panic — so a mis-edit of the source surfaces as a clean module-build error.
+fn build_classes(
+    agent: &mut Agent,
+    node_url: Object,
+    mut gc: GcScope,
+) -> Result<(Object<'static>, Object<'static>), InstallError> {
+    use nova_vm::ecmascript::Function;
+
+    let node_url = node_url.scope(agent, gc.nogc());
+
+    let source = JsString::from_static_str(agent, URL_CLASSES_SOURCE, gc.nogc());
+    let realm = agent.current_realm(gc.nogc());
+    let script = parse_script(agent, source, realm, true, None, gc.nogc()).map_err(|diags| {
+        let message = diags
+            .iter()
+            .map(|d| d.to_string())
+            .collect::<Vec<_>>()
+            .join("; ");
+        InstallError::Nova(format!("failed to parse node:url class source: {message}"))
+    })?;
+
+    let factory = match script_evaluation(agent, script.unbind(), gc.reborrow()).unbind() {
+        Ok(value) => value,
+        Err(error) => {
+            let message = error
+                .value()
+                .unbind()
+                .string_repr(agent, gc.reborrow())
+                .to_string_lossy(agent)
+                .into_owned();
+            return Err(InstallError::Nova(format!(
+                "evaluating node:url class source threw: {message}"
+            )));
+        }
+    };
+
+    let factory = Function::try_from(factory.bind(gc.nogc())).map_err(|_| {
+        InstallError::Nova("node:url class source did not produce a factory function".to_owned())
+    })?;
+
+    let factory = factory.scope(agent, gc.nogc());
+    let arg: Value = node_url.get(agent).into();
+    let result = match factory.get(agent).call(
+        agent,
+        Value::Undefined,
+        &mut [arg.unbind()],
+        gc.reborrow(),
+    ) {
+        Ok(value) => value.unbind(),
+        Err(error) => {
+            let message = error
+                .value()
+                .unbind()
+                .string_repr(agent, gc.reborrow())
+                .to_string_lossy(agent)
+                .into_owned();
+            return Err(InstallError::Nova(format!(
+                "building node:url classes threw: {message}"
+            )));
+        }
+    };
+
+    let nogc = gc.into_nogc();
+    let result = Object::try_from(result.bind(nogc)).map_err(|_| {
+        InstallError::Nova("node:url class factory did not return an object".to_owned())
+    })?;
+
+    let url_ctor = read_ctor(agent, result, "URL", nogc)?.unbind();
+    let params_ctor = read_ctor(agent, result, "URLSearchParams", nogc)?.unbind();
+    Ok((url_ctor, params_ctor))
+}
+
+/// Read constructor property `name` off the class-factory result as an [`Object`].
+fn read_ctor<'gc>(
+    agent: &mut Agent,
+    result: Object,
+    name: &'static str,
+    gc: NoGcScope<'gc, '_>,
+) -> Result<Object<'gc>, InstallError> {
+    let key = PropertyKey::from_static_str(agent, name, gc);
+    let value = match result.try_get(agent, key, result.into(), None, gc) {
+        ControlFlow::Continue(TryGetResult::Value(v)) => v,
+        _ => {
+            return Err(InstallError::Nova(format!(
+                "node:url class factory did not expose `{name}`"
+            )));
+        }
+    };
+    Object::try_from(value.bind(gc))
+        .map_err(|_| InstallError::Nova(format!("node:url `{name}` is not a constructor")))
 }
 
 mod js {
@@ -861,5 +1135,252 @@ mod tests {
         assert!(matches!(domain_to_ascii("example.com"), Cow::Borrowed(_)));
         // non-ASCII returns empty (honest: punycode is the deferred follow-up).
         assert_eq!(domain_to_ascii("münich.de"), "");
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // WHATWG `URL` / `URLSearchParams` class tests.
+    //
+    // These exercise the real `install` path end-to-end through the Nova engine: the module is built
+    // exactly as the registry / global scaffold builds it, its exports object is bound to the global
+    // `U`, and the script reads `U.URL` / `U.URLSearchParams`. This proves the constructors this
+    // module owns behave per the WHATWG surface without depending on the (sibling-owned) `require`
+    // loader. The `HostState` is leaked for the (short-lived) test process — identical to the
+    // `node:buffer` harness — so the test avoids the `unsafe` drop-order dance the real runtime owns.
+    // ---------------------------------------------------------------------------------------------
+    mod classes {
+        use super::super::install;
+        use crate::node::core::{EnvMap, HostState, NodeCtx};
+        use crate::node::GcScope;
+        use nova_vm::ecmascript::{
+            Agent, AgentOptions, GcAgent, InternalMethods, Object, PropertyDescriptor, PropertyKey,
+            String as JsString, parse_script, script_evaluation,
+        };
+        use nova_vm::engine::Bindable;
+        use serde_json::{Value as JsonValue, json};
+
+        /// Build `node:url` directly and evaluate `src` against it, with the exports bound to `U`.
+        fn run(src: &str) -> JsonValue {
+            let host_state: &'static HostState = Box::leak(Box::new(HostState::new(
+                std::env::current_dir().unwrap(),
+                EnvMap::new(),
+            )));
+
+            let mut agent = GcAgent::new(
+                AgentOptions {
+                    disable_gc: false,
+                    print_internals: false,
+                    no_block: false,
+                },
+                host_state,
+            );
+
+            let create_global_object: Option<
+                for<'a> fn(&mut Agent, GcScope<'a, '_>) -> Object<'a>,
+            > = None;
+            let create_global_this_value: Option<
+                for<'a> fn(&mut Agent, GcScope<'a, '_>) -> Object<'a>,
+            > = None;
+            let initialize_global: Option<fn(&mut Agent, Object, GcScope)> =
+                Some(crate::node::install);
+            let realm = agent.create_realm(
+                create_global_object,
+                create_global_this_value,
+                initialize_global,
+            );
+
+            let out = agent.run_in_realm(&realm, |agent, mut gc| -> String {
+                let ctx = NodeCtx::new(host_state);
+                let exports = install(agent, &ctx, gc.reborrow())
+                    .expect("url install should succeed")
+                    .unbind();
+
+                {
+                    let nogc = gc.nogc();
+                    let global = agent.current_realm(nogc).global_object(agent);
+                    let key = PropertyKey::from_static_str(agent, "U", nogc);
+                    let _ = global.unbind().try_define_own_property(
+                        agent,
+                        key.unbind(),
+                        PropertyDescriptor::new_data_descriptor(exports.bind(nogc)),
+                        None,
+                        nogc,
+                    );
+                }
+
+                let wrapped = format!("JSON.stringify({{ v: ({src}) }})");
+                let source = JsString::from_string(agent, wrapped, gc.nogc());
+                let current = agent.current_realm(gc.nogc());
+                let script =
+                    parse_script(agent, source.unbind(), current.unbind(), true, None, gc.nogc())
+                        .expect("test script parses");
+                let value = script_evaluation(agent, script.unbind(), gc.reborrow())
+                    .unbind()
+                    .bind(gc.nogc());
+                match value {
+                    Ok(v) => v
+                        .unbind()
+                        .string_repr(agent, gc.reborrow())
+                        .to_string_lossy(agent)
+                        .into_owned(),
+                    Err(e) => panic!(
+                        "test script threw: {}",
+                        e.value()
+                            .unbind()
+                            .string_repr(agent, gc.reborrow())
+                            .to_string_lossy(agent)
+                    ),
+                }
+            });
+
+            let envelope: JsonValue = serde_json::from_str(&out).expect("result is JSON");
+            match envelope {
+                JsonValue::Object(mut m) => m.remove("v").unwrap_or(JsonValue::Null),
+                other => other,
+            }
+        }
+
+        #[test]
+        fn install_exposes_both_classes() {
+            let v = run("[typeof U.URL, typeof U.URLSearchParams]");
+            assert_eq!(v, json!(["function", "function"]));
+        }
+
+        #[test]
+        fn new_url_decomposes_all_components() {
+            let v = run(
+                "(() => { const u = new U.URL('https://a.com/p?x=1#h');
+                  return [u.protocol, u.hostname, u.host, u.pathname, u.search, u.hash, u.href]; })()",
+            );
+            assert_eq!(
+                v,
+                json!([
+                    "https:",
+                    "a.com",
+                    "a.com",
+                    "/p",
+                    "?x=1",
+                    "#h",
+                    "https://a.com/p?x=1#h"
+                ])
+            );
+        }
+
+        #[test]
+        fn new_url_with_port_and_origin() {
+            let v = run(
+                "(() => { const u = new U.URL('https://user:pass@a.com:8080/x');
+                  return [u.port, u.host, u.origin, u.username, u.password]; })()",
+            );
+            assert_eq!(v, json!(["8080", "a.com:8080", "https://a.com:8080", "", ""]));
+        }
+
+        #[test]
+        fn search_params_off_url_is_live() {
+            let v = run(
+                "(() => { const u = new U.URL('https://a.com/p?x=1&y=2');
+                  return [u.searchParams.get('x'), u.searchParams.get('y'),
+                          u.searchParams.getAll('x'), u.searchParams.has('z')]; })()",
+            );
+            assert_eq!(v, json!(["1", "2", ["1"], false]));
+        }
+
+        #[test]
+        fn search_params_mutation_reserializes_owning_url() {
+            // Appending through `url.searchParams` must update the URL's `search`/`href` (live ref).
+            let v = run(
+                "(() => { const u = new U.URL('https://a.com/p?x=1');
+                  u.searchParams.append('y', '2');
+                  return [u.search, u.href]; })()",
+            );
+            assert_eq!(v, json!(["?x=1&y=2", "https://a.com/p?x=1&y=2"]));
+        }
+
+        #[test]
+        fn url_setters_round_trip_through_href() {
+            let v = run(
+                "(() => { const u = new U.URL('http://a.com/');
+                  u.protocol = 'https'; u.hostname = 'b.org'; u.port = '9000';
+                  u.pathname = 'q'; u.hash = 'top';
+                  return [u.protocol, u.host, u.pathname, u.hash, u.href]; })()",
+            );
+            assert_eq!(
+                v,
+                json!(["https:", "b.org:9000", "/q", "#top", "https://b.org:9000/q#top"])
+            );
+        }
+
+        #[test]
+        fn url_base_resolution() {
+            let v = run(
+                "(() => {
+                  const abs = new U.URL('/d/e', 'https://a.com/b/c');
+                  const rel = new U.URL('x', 'https://a.com/b/c');
+                  const q = new U.URL('?z=9', 'https://a.com/b/c');
+                  return [abs.href, rel.href, q.href]; })()",
+            );
+            assert_eq!(
+                v,
+                json!([
+                    "https://a.com/d/e",
+                    "https://a.com/b/x",
+                    "https://a.com/b/c?z=9"
+                ])
+            );
+        }
+
+        #[test]
+        fn url_invalid_without_base_throws() {
+            let v = run("(() => { try { new U.URL('not a url'); return 'no-throw'; } catch (e) { return e instanceof TypeError; } })()");
+            assert_eq!(v, json!(true));
+        }
+
+        #[test]
+        fn search_params_round_trip_string() {
+            let v = run(
+                "(() => { const p = new U.URLSearchParams('a=1&b=2&a=3');
+                  return [p.get('a'), p.getAll('a'), p.has('b'), p.toString(), p.size]; })()",
+            );
+            assert_eq!(v, json!(["1", ["1", "3"], true, "a=1&b=2&a=3", 3]));
+        }
+
+        #[test]
+        fn search_params_set_append_delete() {
+            let v = run(
+                "(() => { const p = new U.URLSearchParams();
+                  p.append('k', 'v1'); p.append('k', 'v2'); p.append('m', 'x');
+                  p.set('k', 'only');
+                  const afterSet = p.toString();
+                  p.delete('m');
+                  return [afterSet, p.toString(), p.getAll('k')]; })()",
+            );
+            assert_eq!(v, json!(["k=only&m=x", "k=only", ["only"]]));
+        }
+
+        #[test]
+        fn search_params_iteration_and_encoding() {
+            let v = run(
+                "(() => { const p = new U.URLSearchParams();
+                  p.append('a b', 'c&d');
+                  const pairs = [];
+                  for (const [k, val] of p) pairs.push([k, val]);
+                  const keys = [...p.keys()];
+                  return [p.toString(), pairs, keys]; })()",
+            );
+            assert_eq!(
+                v,
+                json!(["a+b=c%26d", [["a b", "c&d"]], ["a b"]])
+            );
+        }
+
+        #[test]
+        fn search_params_from_record_and_array() {
+            let v = run(
+                "(() => {
+                  const fromObj = new U.URLSearchParams({ a: '1', b: '2' });
+                  const fromArr = new U.URLSearchParams([['x', '9'], ['y', '8']]);
+                  return [fromObj.toString(), fromArr.toString()]; })()",
+            );
+            assert_eq!(v, json!(["a=1&b=2", "x=9&y=8"]));
+        }
     }
 }

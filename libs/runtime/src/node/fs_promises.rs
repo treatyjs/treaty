@@ -18,7 +18,8 @@
 //! pass through.
 //!
 //! Faithful scope (high-value core): `readFile` (text encodings), `writeFile`, `appendFile`,
-//! `unlink`, `rm`, `mkdir`, `rmdir`, `readdir`, `rename`, `copyFile`, `stat`/`lstat`, and `access`.
+//! `unlink`, `rm` (`{ recursive, force }`), `mkdir`, `mkdtemp` (unique temp dir), `rmdir`
+//! (`{ recursive }`), `readdir`, `rename`, `copyFile`, `stat`/`lstat`, and `access`.
 //! Deferred (documented, not stubbed): the binary `readFile` path that returns a `Buffer` when no
 //! encoding is given — it depends on the sibling `buffer` module's object and is wired once that
 //! lands; until then `readFile` returns a UTF-8 string regardless of encoding. `FileHandle`,
@@ -73,6 +74,7 @@ pub(crate) fn install<'gc>(
         ("unlink", unlink, 1),
         ("rm", rm, 1),
         ("mkdir", mkdir, 1),
+        ("mkdtemp", mkdtemp, 1),
         ("rmdir", rmdir, 1),
         ("readdir", readdir, 1),
         ("rename", rename, 2),
@@ -297,10 +299,12 @@ fn unlink<'gc>(
     }))
 }
 
-/// `fs.promises.rm(path)` — remove a file or directory.
+/// `fs.promises.rm(path[, options])` — remove a file or directory.
 ///
-/// Directories are removed recursively (the safe superset for the common `{ recursive: true }`
-/// usage); a single file is removed directly.
+/// Honors `{ recursive: true }` (a non-empty directory is walked and removed rather than failing with
+/// `ENOTEMPTY`) and `{ force: true }` (a missing path resolves instead of rejecting with `ENOENT`),
+/// matching Node. Without `recursive`, a directory is removed with the non-recursive `remove_dir`
+/// (which errors on a populated directory, as Node does).
 fn rm<'gc>(
     agent: &mut Agent,
     _this: Value,
@@ -311,17 +315,58 @@ fn rm<'gc>(
     let Some(path) = arg_string(agent, &args, 0) else {
         return Ok(type_error(agent, "path must be a string", gc));
     };
+    let recursive = option_flag(agent, &args, 1, "recursive", gc.nogc());
+    let force = option_flag(agent, &args, 1, "force", gc.nogc());
     Ok(with_promise(agent, gc, move |agent, _nogc| {
         let resolved = resolve_path(agent, &path);
         let p = resolved.as_path();
-        let result = if p.is_dir() {
-            std::fs::remove_dir_all(p)
+        let meta = match std::fs::symlink_metadata(p) {
+            Ok(m) => m,
+            Err(e) if force && e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Value::Undefined);
+            }
+            Err(e) => return Err(format_io("rm", &path, &e)),
+        };
+        let result = if meta.is_dir() {
+            if recursive {
+                std::fs::remove_dir_all(p)
+            } else {
+                std::fs::remove_dir(p)
+            }
         } else {
             std::fs::remove_file(p)
         };
-        result
-            .map(|()| Value::Undefined)
-            .map_err(|e| format_io("rm", &path, &e))
+        match result {
+            Err(e) if force && e.kind() == std::io::ErrorKind::NotFound => Ok(Value::Undefined),
+            Ok(()) => Ok(Value::Undefined),
+            Err(e) => Err(format_io("rm", &path, &e)),
+        }
+    }))
+}
+
+/// `fs.promises.mkdtemp(prefix)` — create a uniquely-named temporary directory and resolve with its
+/// path. Mirrors `fs.mkdtempSync`: six characters derived from a high-resolution clock reading are
+/// appended to `prefix`, the candidate is created exclusively (retrying on the rare collision), and
+/// the directory genuinely exists on disk when the promise resolves.
+fn mkdtemp<'gc>(
+    agent: &mut Agent,
+    _this: Value,
+    args: ArgumentsList,
+    gc: GcScope<'gc, '_>,
+) -> JsResult<'gc, Value<'gc>> {
+    let args = args.bind(gc.nogc());
+    let Some(prefix) = arg_string(agent, &args, 0) else {
+        return Ok(type_error(agent, "prefix must be a string", gc));
+    };
+    Ok(with_promise(agent, gc, move |agent, nogc| {
+        let resolved = resolve_path(agent, &prefix);
+        match make_temp_dir(resolved.as_os_str()) {
+            Ok(created) => {
+                let s = created.to_string_lossy();
+                Ok(Value::from(JsString::from_str(agent, s.as_ref(), nogc)).unbind())
+            }
+            Err(e) => Err(format_io("mkdtemp", &prefix, &e)),
+        }
     }))
 }
 
@@ -351,7 +396,10 @@ fn mkdir<'gc>(
     }))
 }
 
-/// `fs.promises.rmdir(path)` — remove an empty directory.
+/// `fs.promises.rmdir(path[, options])` — remove a directory.
+///
+/// With `{ recursive: true }` the directory's contents are removed first (so a populated directory
+/// succeeds instead of failing with `ENOTEMPTY`); otherwise the directory must already be empty.
 fn rmdir<'gc>(
     agent: &mut Agent,
     _this: Value,
@@ -362,9 +410,15 @@ fn rmdir<'gc>(
     let Some(path) = arg_string(agent, &args, 0) else {
         return Ok(type_error(agent, "path must be a string", gc));
     };
+    let recursive = option_flag(agent, &args, 1, "recursive", gc.nogc());
     Ok(with_promise(agent, gc, move |agent, _nogc| {
         let resolved = resolve_path(agent, &path);
-        std::fs::remove_dir(resolved.as_path())
+        let result = if recursive {
+            std::fs::remove_dir_all(resolved.as_path())
+        } else {
+            std::fs::remove_dir(resolved.as_path())
+        };
+        result
             .map(|()| Value::Undefined)
             .map_err(|e| format_io("rmdir", &path, &e))
     }))
@@ -545,6 +599,48 @@ fn option_flag(
     }
 }
 
+/// Create a uniquely-named directory whose path is `prefix` followed by six characters, returning the
+/// created path. The suffix is derived from a high-resolution clock reading mixed with the process id
+/// and re-mixed (xorshift) on each attempt, so repeated calls diverge; the candidate is created with
+/// the exclusive `create_dir` so an existing name is retried rather than silently reused. This is the
+/// shared engine behind `fs.promises.mkdtemp` (and mirrors `fs.mkdtempSync`).
+fn make_temp_dir(prefix: &std::ffi::OsStr) -> std::io::Result<PathBuf> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let mut seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+        ^ (std::process::id() as u64).rotate_left(32);
+
+    const ALPHABET: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+
+    for _ in 0..64 {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        let mut suffix = [0u8; 6];
+        let mut s = seed;
+        for slot in suffix.iter_mut() {
+            *slot = ALPHABET[(s % 36) as usize];
+            s /= 36;
+        }
+        let mut candidate = std::ffi::OsString::with_capacity(prefix.len() + 6);
+        candidate.push(prefix);
+        candidate.push(std::str::from_utf8(&suffix).expect("ascii suffix"));
+        let candidate = PathBuf::from(candidate);
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "mkdtemp suffix collision",
+    ))
+}
+
 /// Format an I/O error into a Node-flavored message: `<op> '<path>': <os error>`.
 ///
 /// Kept allocation-light: a single `format!` only on the (cold) error path; the hot success paths
@@ -707,6 +803,68 @@ mod tests {
             rt.eval("globalThis.__err").unwrap(),
             serde_json::json!("caught")
         );
+    }
+
+    #[test]
+    fn mkdtemp_creates_a_unique_real_directory() {
+        let base = std::env::temp_dir().join(format!("treaty_fsp_mkdtemp_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&base);
+        let prefix = base.join("scratch-");
+        let prefix_str = prefix.to_string_lossy().replace('\\', "\\\\");
+
+        let mut rt = JsRuntime::with_node_compat();
+        with_fsp(&mut rt);
+
+        rt.eval(&format!(
+            "__fsp.mkdtemp('{prefix_str}').then(p => {{ globalThis.__td = p; }});0"
+        ))
+        .unwrap();
+        let created = rt.eval("globalThis.__td").unwrap();
+        let created = created.as_str().expect("mkdtemp resolved with a path");
+        assert!(
+            Path::new(created).is_dir(),
+            "mkdtemp made a real directory: {created}"
+        );
+        assert!(created.starts_with(&prefix.to_string_lossy().into_owned()));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn rm_recursive_removes_a_populated_tree() {
+        let base = std::env::temp_dir().join(format!("treaty_fsp_rm_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let tree = base.join("nested");
+        std::fs::create_dir_all(tree.join("a")).unwrap();
+        std::fs::write(tree.join("a").join("f.txt"), b"x").unwrap();
+        let tree_str = tree.to_string_lossy().replace('\\', "\\\\");
+
+        let mut rt = JsRuntime::with_node_compat();
+        with_fsp(&mut rt);
+
+        rt.eval(&format!(
+            "__fsp.rm('{tree_str}', {{ recursive: true }}).then(() => {{ globalThis.__rm = 'gone'; }});0"
+        ))
+        .unwrap();
+        assert_eq!(
+            rt.eval("globalThis.__rm").unwrap(),
+            serde_json::json!("gone")
+        );
+        assert!(!tree.exists(), "populated tree fully removed");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn rm_force_ignores_missing_path() {
+        let mut rt = JsRuntime::with_node_compat();
+        with_fsp(&mut rt);
+        rt.eval(
+            "globalThis.__rf = 'pending';\
+             __fsp.rm('/treaty/definitely/not/here', { force: true }).then(() => { globalThis.__rf = 'ok'; });0",
+        )
+        .unwrap();
+        assert_eq!(rt.eval("globalThis.__rf").unwrap(), serde_json::json!("ok"));
     }
 
     #[test]

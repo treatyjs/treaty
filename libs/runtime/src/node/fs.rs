@@ -10,9 +10,11 @@
 //!
 //! The high-value synchronous core, faithful to Node:
 //! `readFileSync`, `writeFileSync`, `appendFileSync`, `existsSync`, `mkdirSync` (incl.
-//! `{ recursive: true }` passed as the legacy boolean second arg or detected from a string),
-//! `rmdirSync`, `rmSync` (`recursive`/`force`), `unlinkSync`, `readdirSync`, `renameSync`,
-//! `copyFileSync`, `realpathSync`, `accessSync`, and `statSync`/`lstatSync` returning a
+//! `{ recursive: true }` as either the legacy boolean second arg or the modern options object),
+//! `mkdtempSync` (unique temp dir), `rmdirSync` (recursive), `rmSync` (`{ recursive, force }` object
+//! form *and* the legacy boolean — a populated directory is truly walked, not `ENOTEMPTY`-d),
+//! `unlinkSync`, `readdirSync`, `renameSync`, `copyFileSync`, `cpSync` (recursive tree copy),
+//! `realpathSync`, `accessSync`, and `statSync`/`lstatSync` returning a
 //! Node-shaped `Stats` object (`size`, `*Ms` timestamps, and the `isFile()`/`isDirectory()`/
 //! `isSymbolicLink()`/… predicate methods). A `constants` namespace carries the `F_OK`/`R_OK`/
 //! `W_OK`/`X_OK` access flags.
@@ -79,12 +81,14 @@ pub(crate) fn install<'gc>(
     define_fn(agent, obj, "appendFileSync", append_file_sync, 3, gc);
     define_fn(agent, obj, "existsSync", exists_sync, 1, gc);
     define_fn(agent, obj, "mkdirSync", mkdir_sync, 2, gc);
+    define_fn(agent, obj, "mkdtempSync", mkdtemp_sync, 2, gc);
     define_fn(agent, obj, "rmdirSync", rmdir_sync, 2, gc);
     define_fn(agent, obj, "rmSync", rm_sync, 2, gc);
     define_fn(agent, obj, "unlinkSync", unlink_sync, 1, gc);
     define_fn(agent, obj, "readdirSync", readdir_sync, 2, gc);
     define_fn(agent, obj, "renameSync", rename_sync, 2, gc);
     define_fn(agent, obj, "copyFileSync", copy_file_sync, 3, gc);
+    define_fn(agent, obj, "cpSync", cp_sync, 3, gc);
     define_fn(agent, obj, "realpathSync", realpath_sync, 1, gc);
     define_fn(agent, obj, "accessSync", access_sync, 2, gc);
     define_fn(agent, obj, "statSync", stat_sync, 2, gc);
@@ -151,6 +155,44 @@ fn arg_is_utf8(agent: &Agent, args: &ArgumentsList, index: usize) -> bool {
 /// `mkdirSync(p, true)` and friends).
 fn arg_is_true(args: &ArgumentsList, index: usize) -> bool {
     matches!(args.get(index), Value::Boolean(true))
+}
+
+/// Read a boolean flag `name` off the options object at argument `index`, returning `false` when the
+/// argument is not an object, the property is absent, or it is not the boolean `true`.
+///
+/// This reads the own data slot via `try_get_own_property` (no user getter is invoked and no
+/// `ToBoolean` coercion happens), which keeps the whole call inside its `NoGcScope` fast path and
+/// covers the literal-options case real Node code uses (`{ recursive: true }`, `{ force: true }`).
+fn option_flag(
+    agent: &mut Agent,
+    args: &ArgumentsList,
+    index: usize,
+    name: &'static str,
+    gc: NoGcScope,
+) -> bool {
+    let Value::Object(obj) = args.get(index) else {
+        return false;
+    };
+    let key = PropertyKey::from_static_str(agent, name, gc);
+    matches!(
+        unwrap_try(obj.try_get_own_property(agent, key, None, gc)),
+        Some(PropertyDescriptor {
+            value: Some(Value::Boolean(true)),
+            ..
+        })
+    )
+}
+
+/// True when `recursive` is requested at argument `index` by *either* accepted form: the modern
+/// `{ recursive: true }` options object or the legacy boolean positional argument.
+fn wants_recursive(agent: &mut Agent, args: &ArgumentsList, index: usize, gc: NoGcScope) -> bool {
+    arg_is_true(args, index) || option_flag(agent, args, index, "recursive", gc)
+}
+
+/// True when `force` is requested via `{ force: true }` at argument `index` (object form only — Node
+/// has no positional boolean `force`).
+fn wants_force(agent: &mut Agent, args: &ArgumentsList, index: usize, gc: NoGcScope) -> bool {
+    option_flag(agent, args, index, "force", gc)
 }
 
 // --- error mapping ----------------------------------------------------------------------------
@@ -417,9 +459,9 @@ fn mkdir_sync<'gc>(
     let gc = gc.into_nogc();
     let args = args.bind(gc);
     let path = arg_path(agent, &args, 0, "path", gc)?;
-    // `recursive` is requested either by the modern `{ recursive: true }` (object form deferred) or
-    // the legacy boolean second argument; we honor the boolean form.
-    let recursive = arg_is_true(&args, 1);
+    // `recursive` is requested either by the modern `{ recursive: true }` options object or the
+    // legacy boolean second argument; both are honored.
+    let recursive = wants_recursive(agent, &args, 1, gc);
     let result = if recursive {
         std::fs::create_dir_all(&path)
     } else {
@@ -431,6 +473,69 @@ fn mkdir_sync<'gc>(
     }
 }
 
+/// `fs.mkdtempSync(prefix)` — create a uniquely-named temporary directory.
+///
+/// Node appends six random characters to the caller's `prefix` (so `mkdtempSync('/tmp/foo-')` yields
+/// `/tmp/foo-XXXXXX`) and returns the created directory's path. We mirror that: derive six characters
+/// from a high-resolution clock reading, then `create_dir` (exclusive — never `create_dir_all`, so a
+/// collision is observable) the candidate, retrying with a fresh suffix on the rare `EEXIST`. The
+/// directory genuinely exists on disk when this returns, matching Node.
+fn mkdtemp_sync<'gc>(
+    agent: &mut Agent,
+    _this: Value,
+    args: ArgumentsList,
+    gc: GcScope<'gc, '_>,
+) -> JsResult<'gc, Value<'gc>> {
+    let gc = gc.into_nogc();
+    let args = args.bind(gc);
+    let prefix = arg_path(agent, &args, 0, "prefix", gc)?;
+
+    // Seed from the wall clock; mix in a per-call counter so two calls within the same clock tick
+    // (and on the same thread) still diverge. The encoding is Node's: six base-36-ish chars.
+    let mut seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+        ^ (std::process::id() as u64).rotate_left(32);
+
+    const ALPHABET: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let prefix_os = prefix.as_os_str().to_owned();
+
+    // Bounded retry: in practice the first candidate is unique; the loop only matters under the
+    // pathological case of repeated `EEXIST`. We re-mix the seed each attempt so it converges.
+    for _ in 0..64 {
+        // xorshift step for a fresh suffix without pulling in an RNG dependency.
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        let mut suffix = [0u8; 6];
+        let mut s = seed;
+        for slot in suffix.iter_mut() {
+            *slot = ALPHABET[(s % 36) as usize];
+            s /= 36;
+        }
+        // `prefix` + 6 chars, exactly like Node (the prefix is used verbatim, no separator inserted).
+        let mut candidate = std::ffi::OsString::with_capacity(prefix_os.len() + 6);
+        candidate.push(&prefix_os);
+        // The suffix is ASCII by construction, so this is valid UTF-8 / valid on every platform.
+        candidate.push(std::str::from_utf8(&suffix).expect("ascii suffix"));
+        let candidate = PathBuf::from(candidate);
+
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => {
+                let s = candidate.to_string_lossy();
+                return Ok(Value::from(JsString::from_str(agent, s.as_ref(), gc)));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(io_error(agent, &e, "mkdtemp", &prefix, gc)),
+        }
+    }
+
+    // Exhausted the retry budget (astronomically unlikely): surface a faithful EEXIST.
+    let e = std::io::Error::new(std::io::ErrorKind::AlreadyExists, "mkdtemp suffix collision");
+    Err(io_error(agent, &e, "mkdtemp", &prefix, gc))
+}
+
 fn rmdir_sync<'gc>(
     agent: &mut Agent,
     _this: Value,
@@ -440,7 +545,9 @@ fn rmdir_sync<'gc>(
     let gc = gc.into_nogc();
     let args = args.bind(gc);
     let path = arg_path(agent, &args, 0, "path", gc)?;
-    let recursive = arg_is_true(&args, 1);
+    // Honor `recursive` from both the legacy boolean and the `{ recursive: true }` options object, so
+    // a populated directory is truly walked and removed rather than failing with `ENOTEMPTY`.
+    let recursive = wants_recursive(agent, &args, 1, gc);
     let result = if recursive {
         std::fs::remove_dir_all(&path)
     } else {
@@ -461,13 +568,17 @@ fn rm_sync<'gc>(
     let gc = gc.into_nogc();
     let args = args.bind(gc);
     let path = arg_path(agent, &args, 0, "path", gc)?;
-    let recursive = arg_is_true(&args, 1);
+    // Both options are read from the `{ recursive, force }` object (and `recursive` also from the
+    // legacy boolean positional form). `recursive: true` is what lets a non-empty directory be
+    // removed; `force: true` swallows a "path does not exist" error, exactly like Node.
+    let recursive = wants_recursive(agent, &args, 1, gc);
+    let force = wants_force(agent, &args, 1, gc);
 
-    // `rm` removes files or directories. We discover the kind once (one stat), then dispatch. With
-    // `force` (not yet parsed from the object form) a missing path would be ignored; the boolean
-    // second arg here only conveys `recursive`, matching the legacy positional convention.
+    // `rm` removes files or directories. Discover the kind once (one stat), then dispatch.
     let meta = match std::fs::symlink_metadata(&path) {
         Ok(m) => m,
+        // With `force`, a missing path is a no-op (Node resolves rather than throwing ENOENT).
+        Err(e) if force && e.kind() == std::io::ErrorKind::NotFound => return Ok(Value::Undefined),
         Err(e) => return Err(io_error(agent, &e, "stat", &path, gc)),
     };
     let result = if meta.is_dir() {
@@ -480,6 +591,8 @@ fn rm_sync<'gc>(
         std::fs::remove_file(&path)
     };
     match result {
+        // `force` also swallows a not-found race between the stat and the removal.
+        Err(e) if force && e.kind() == std::io::ErrorKind::NotFound => Ok(Value::Undefined),
         Ok(()) => Ok(Value::Undefined),
         Err(e) => Err(io_error(agent, &e, "unlink", &path, gc)),
     }
@@ -561,6 +674,57 @@ fn copy_file_sync<'gc>(
     match std::fs::copy(&from, &to) {
         Ok(_bytes) => Ok(Value::Undefined),
         Err(e) => Err(io_error(agent, &e, "copyfile", &from, gc)),
+    }
+}
+
+/// Recursively copy `from` into `to`, creating destination directories as needed. Mirrors the
+/// behavior `cpSync(src, dest, { recursive: true })` needs: a directory tree is walked and recreated,
+/// a single file is copied directly. Returns the first I/O error encountered.
+fn copy_recursive(from: &Path, to: &Path) -> std::io::Result<()> {
+    let meta = std::fs::symlink_metadata(from)?;
+    if meta.is_dir() {
+        std::fs::create_dir_all(to)?;
+        for entry in std::fs::read_dir(from)? {
+            let entry = entry?;
+            let child_to = to.join(entry.file_name());
+            copy_recursive(&entry.path(), &child_to)?;
+        }
+        Ok(())
+    } else {
+        // Ensure the parent exists for the single-file case invoked directly with a nested dest.
+        if let Some(parent) = to.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        std::fs::copy(from, to).map(|_bytes| ())
+    }
+}
+
+/// `fs.cpSync(src, dest[, options])` — copy a file or, with `{ recursive: true }`, an entire tree.
+///
+/// Without `recursive` this behaves like `copyFileSync` (single file). With `recursive` the source
+/// directory is walked and recreated under `dest`. `std::fs` has no built-in recursive copy, so the
+/// walk is implemented here in [`copy_recursive`].
+fn cp_sync<'gc>(
+    agent: &mut Agent,
+    _this: Value,
+    args: ArgumentsList,
+    gc: GcScope<'gc, '_>,
+) -> JsResult<'gc, Value<'gc>> {
+    let gc = gc.into_nogc();
+    let args = args.bind(gc);
+    let from = arg_path(agent, &args, 0, "src", gc)?;
+    let to = arg_path(agent, &args, 1, "dest", gc)?;
+    let recursive = wants_recursive(agent, &args, 2, gc);
+    let result = if recursive {
+        copy_recursive(&from, &to)
+    } else {
+        std::fs::copy(&from, &to).map(|_bytes| ())
+    };
+    match result {
+        Ok(()) => Ok(Value::Undefined),
+        Err(e) => Err(io_error(agent, &e, "cp", &from, gc)),
     }
 }
 
@@ -834,6 +998,102 @@ mod tests {
             lit(&missing)
         );
         assert_eq!(rt.eval(&src).unwrap(), json!("ENOENT"));
+    }
+
+    #[test]
+    fn mkdtemp_sync_creates_a_unique_real_directory() {
+        let tmp = TempDir::new("mkdtemp");
+        // Prefix ends without a separator — Node appends the six chars directly to the prefix.
+        let prefix = tmp.join("scratch-");
+        let src = format!(
+            "const fs = require('node:fs');\
+             const a = fs.mkdtempSync({0});\
+             const b = fs.mkdtempSync({0});\
+             [a, b, fs.statSync(a).isDirectory(), a === b]",
+            lit(&prefix)
+        );
+        let out = eval(&src);
+        let arr = out.as_array().expect("array result");
+        let a = arr[0].as_str().unwrap();
+        let b = arr[1].as_str().unwrap();
+        // The returned path starts with the prefix and the created dir really exists and is a dir.
+        assert!(a.starts_with(&prefix.to_string_lossy().into_owned()));
+        assert!(Path::new(a).is_dir(), "mkdtempSync made a real directory");
+        assert_eq!(arr[2], json!(true));
+        // Two calls produce distinct directories.
+        assert_eq!(arr[3], json!(false));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn rm_sync_object_form_recurses_into_populated_tree() {
+        let tmp = TempDir::new("rm_obj");
+        let tree = tmp.join("nested");
+        std::fs::create_dir_all(tree.join("a").join("b")).unwrap();
+        std::fs::write(tree.join("top.txt"), "x").unwrap();
+        std::fs::write(tree.join("a").join("mid.txt"), "y").unwrap();
+        std::fs::write(tree.join("a").join("b").join("deep.txt"), "z").unwrap();
+
+        // The modern options-object form must truly recurse (regression: previously ENOTEMPTY'd).
+        let src = format!(
+            "const fs = require('node:fs');\
+             fs.rmSync({0}, {{ recursive: true }});\
+             fs.existsSync({0})",
+            lit(&tree)
+        );
+        assert_eq!(eval(&src), json!(false));
+        assert!(!tree.exists(), "populated tree fully removed");
+    }
+
+    #[test]
+    fn rm_sync_force_ignores_missing_path() {
+        let tmp = TempDir::new("rm_force");
+        let ghost = tmp.join("not-here");
+        let src = format!(
+            "const fs = require('node:fs');\
+             fs.rmSync({0}, {{ force: true }});\
+             'ok'",
+            lit(&ghost)
+        );
+        assert_eq!(eval(&src), json!("ok"));
+    }
+
+    #[test]
+    fn rmdir_sync_object_form_recurses() {
+        let tmp = TempDir::new("rmdir_obj");
+        let dir = tmp.join("d");
+        std::fs::create_dir_all(dir.join("inner")).unwrap();
+        std::fs::write(dir.join("inner").join("f.txt"), "x").unwrap();
+        let src = format!(
+            "const fs = require('node:fs');\
+             fs.rmdirSync({0}, {{ recursive: true }});\
+             fs.existsSync({0})",
+            lit(&dir)
+        );
+        assert_eq!(eval(&src), json!(false));
+    }
+
+    #[test]
+    fn cp_sync_recursively_copies_a_tree() {
+        let tmp = TempDir::new("cp");
+        let src_tree = tmp.join("src");
+        std::fs::create_dir_all(src_tree.join("sub")).unwrap();
+        std::fs::write(src_tree.join("root.txt"), "root").unwrap();
+        std::fs::write(src_tree.join("sub").join("leaf.txt"), "leaf").unwrap();
+        let dest_tree = tmp.join("dest");
+
+        let src = format!(
+            "const fs = require('node:fs');\
+             fs.cpSync({0}, {1}, {{ recursive: true }});\
+             [fs.readFileSync({2}, 'utf8'), fs.readFileSync({3}, 'utf8')]",
+            lit(&src_tree),
+            lit(&dest_tree),
+            lit(&dest_tree.join("root.txt")),
+            lit(&dest_tree.join("sub").join("leaf.txt"))
+        );
+        assert_eq!(eval(&src), json!(["root", "leaf"]));
+        // Source untouched.
+        assert!(src_tree.join("root.txt").exists());
     }
 
     #[test]
