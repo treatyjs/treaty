@@ -160,6 +160,14 @@ fn encapsulation_value<'a>(expr: &'a Expression<'a>) -> Option<ViewEncapsulation
     }
 }
 
+/// Whether an identifier-shaped name is one of the JS literal keywords the binding-expression
+/// parser interprets as a LITERAL value rather than a property read (`true`/`false`/`null`/
+/// `undefined`). A class member with such a name must be read as `this.<name>` so it lowers to a
+/// `ctx.<name>` property read instead of the literal.
+fn is_reserved_literal_word(name: &str) -> bool {
+    matches!(name, "true" | "false" | "null" | "undefined")
+}
+
 /// Whether an object key is a valid bare JS identifier (so it can be emitted unquoted).
 fn is_safe_object_key(key: &str) -> bool {
     let mut chars = key.chars();
@@ -841,10 +849,17 @@ fn collect_member_host_bindings(class: &Class, host: &mut MemberHost) {
                     // directive instance, so a non-identifier name becomes a bracketed property read.
                     let host_prop =
                         decorator_string_alias(dec).unwrap_or_else(|| member_name.to_string());
-                    let value = if is_safe_object_key(member_name) {
-                        member_name.to_string()
-                    } else {
+                    let value = if !is_safe_object_key(member_name) {
+                        // Quoted property (`'is-a'`): bracketed keyed access off the receiver.
                         format!("this[\"{}\"]", member_name.replace('"', "\\\""))
+                    } else if is_reserved_literal_word(member_name) {
+                        // A member whose name is a literal keyword (`true`/`false`/`null`/
+                        // `undefined`) must be read as a member off the receiver (`this.true` →
+                        // `ctx.true`); spliced raw it would parse as the LITERAL, not a property read.
+                        format!("this.{member_name}")
+                    } else {
+                        // Plain identifier: the parser resolves it against the implicit receiver.
+                        member_name.to_string()
                     };
                     host.entries
                         .insert(format!("[{host_prop}]"), HostValue::Str(value));
@@ -2817,6 +2832,23 @@ mod tests {
         let tmpl = flat.find("[4,\"if\"]").expect("missing [Template,\"if\"] const");
         assert!(foo < baz && baz < bar, "local-ref order wrong: foo={foo} baz={baz} bar={bar}");
         assert!(bar < tmpl, "nested-view #bar const must precede the [Template,\"if\"] const; got: {flat}");
+    }
+
+    #[test]
+    fn host_binding_literal_keyword_member_reads_as_property() {
+        // A `@HostBinding` member NAMED with a literal keyword (`true`/`false`) must read as
+        // `ctx.true`/`ctx.false` (a property off the receiver), NOT the literal `true`/`false`.
+        // (Contrast a host-OBJECT value `'[class.a]': 'true'`, whose value IS the literal `true`.)
+        let src = r#"@Directive({selector:"[d]"})
+            export class D {
+                @HostBinding('class.c') true: any;
+                @HostBinding('class.d') false: any;
+            }"#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+        assert!(code.contains("ctx.true"), "member `true` did not read as ctx.true; got: {code}");
+        assert!(code.contains("ctx.false"), "member `false` did not read as ctx.false; got: {code}");
     }
 
     #[test]
