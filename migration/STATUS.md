@@ -2,7 +2,7 @@
 
 **Branch:** `migration/v22-oxc133`
 
-**Updated:** 2026-05-31
+**Updated:** 2026-06-01
 
 > Companion docs: [OXC migration crib](OXC-MIGRATION-CRIB.md) ·
 > [Treaty versions May 2026](treaty-versions-may-2026.md)
@@ -18,10 +18,10 @@ a `DecoratorCompiler` registry that mirrors the authoring-plugin design.
 
 Where things stand:
 
-- **treaty_ivy compiler** — DONE & green: 4 crates, **448 `#[test]`** total. Emits
+- **treaty_ivy compiler** — DONE & green: 4 crates, **447 `#[test]`** total. Emits
   complete ES-module Ivy output (component/directive/injectable/pipe). Golden
-  parity vs Angular's own corpus: **142 / 185 runnable = 76.8%** (committed
-  report), climbing toward full parity as the ranked DIFFs are closed.
+  parity vs Angular's own corpus: **165 / 185 runnable = 89.2%** (live-scored),
+  climbing toward full parity as the ranked DIFFs are closed.
 - **Angular Linker** — IN PROGRESS (not yet committed): partial `ɵɵngDeclare*`
   → AOT `ɵɵdefine*`, planned to land in the facade crate. Lets Treaty apps
   consume real published Angular libraries with **no JIT** in dev *and* prod.
@@ -53,8 +53,8 @@ core  <-  template  <-  decorators  <-  facade
 | `treaty_ivy_core` | Ivy instructions, const pool, expression lowering, i18n primitives, sourcemap, `ngDeclare` shapes | 215 |
 | `treaty_ivy_template` | template parse + bind, control flow, host/styling | 138 |
 | `treaty_ivy_decorators` | `@Component/@Directive/@Injectable/@Pipe` lowering, queries, DI | 39 |
-| `treaty_ivy_facade` | public entry, NAPI ports, compliance + parity harness | 56 |
-| **Total** | | **448** |
+| `treaty_ivy_facade` | public entry, NAPI ports, compliance + parity harness | 55 |
+| **Total** | | **447** |
 
 A **`DecoratorCompiler` registry** sits in the decorators crate so decorator
 handlers compose the same way authoring plugins do.
@@ -84,45 +84,40 @@ Harness moved into the facade crate:
 | --- | --- |
 | Total cases | 642 |
 | Compiled (runnable) | 185 |
-| **matchGolden PASS** | **142** |
-| matchGolden DIFF | 43 |
+| **matchGolden PASS** | **165** |
+| matchGolden DIFF | 20 |
 | Skipped (no runnable golden) | 457 |
-| **Pass-rate (runnable subset)** | **76.8%** |
+| compile-without-error (of 619-entry dump) | 594 |
+| **Pass-rate (runnable subset)** | **89.2%** |
 
-> 435 of the skips are partial / `ngDeclare`-only fixtures (no full golden); the
-> rest are still-unsupported scenarios (host, animations, deferred, etc.).
+> ~435 of the skips are partial / `ngDeclare`-only fixtures (no full golden); the
+> **Angular Linker** work below brings that whole class into scope.
 >
 > Corpus dump env var renamed `RENDER3_CORPUS_DUMP` → **`TREATY_IVY_CORPUS_DUMP`**.
+> The committed `COMPLIANCE-REPORT.md` artifact still shows the pre-fix 142/185; it
+> regenerates to 165/185 the next time `treaty_ivy` is free (a cargo recompute can't
+> run while the linker workflow is editing the crate).
 
-### Ranked DIFF gaps (43 total — the work remaining for full parity)
+### Ranked DIFF gaps (20 remaining — the work toward full parity)
 
-| Category | Count |
-| --- | --- |
-| `ɵɵelement` | 12 |
-| misc-shape | 9 |
-| `ɵɵclassProp` | 3 |
-| `ɵɵelementStart` | 3 |
-| `ɵɵadvance` | 2 |
-| `ɵɵdomProperty` | 2 |
-| `ɵɵpureFunction1` | 2 |
-| `ɵɵviewQuery` | 2 |
-| `ɵɵcontentQuery` | 2 |
-| `ɵɵqueryAdvance` | 1 |
-| `ɵɵsyntheticHostListener` | 1 |
-| `ɵɵstyleProp` | 1 |
-| nested-fn-shape | 1 |
-| `ɵɵdefer` | 1 |
-| `ɵɵattribute` | 1 |
+Genuine features (large / bespoke):
+- control / `field` bindings (2) — need `ɵɵcontrolCreate` (create) + `ɵɵcontrol` (update), breaking the element-create chain (`R3DirectiveMetadata.control_create` scaffolding exists, unpopulated).
+- inline arrows in host binding/listener (2) + inline-arrow `@Input` transform (1) — need full OXC arrow/function-expression → output-AST conversion in `convert_expr`.
+- host-binding array/object literal value → `ɵɵpureFunctionN` + hoisted factory (1).
+- a class with both `@Pipe` and `@Injectable` (ctor DI + `ɵpipe` + `ɵprov`) (1).
+- deep i18n in `@switch`/`@defer`/`@let` (3), defer local deps (1), animation `syntheticHostListener` (1), signal-query `queryAdvance` (1).
+
+Harness / golden-authoring limits (not compiler defects):
+- `ng_modules` JIT-mode goldens (4) — the harness can't request linker JIT mode.
+- `value_composition` `@let` spread (2) — Angular's own goldens spell the binding name two incompatible ways under the canonicalizer.
+- standalone `forwardRef`-in-imports thunk shape (1).
 
 ---
 
 ## (2) Angular Linker — partial → AOT
 
-**Status: IN PROGRESS (design landed, code not yet committed).**
-
-Planned home: a `linker.rs` pass in the facade crate + a NAPI `linkPartial`
-entry. (As of this snapshot the facade `src/` contains `lib.rs`, `compile.rs`
-and `source_compile.rs` only — the linker module is not yet on disk.)
+**Status: IN PROGRESS (being implemented now — `libs/treaty-ivy/facade/src/linker.rs`
++ NAPI `linkPartial`).**
 
 Published Angular libraries ship **partial-compilation** output
 (`ɵɵngDeclareComponent` / `ɵɵngDeclareDirective` / … the `ɵɵngDeclare*` family).
