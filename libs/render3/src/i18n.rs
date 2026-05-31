@@ -512,6 +512,264 @@ fn get_u32_le(view: &[u8], offset: usize) -> u32 {
         | ((view[offset + 3] as u32) << 24)
 }
 
+// ---------------------------------------------------------------------------
+// Closure-mode const-pool statement builder.
+//
+// Ported from `template/pipeline/src/phases/i18n_const_collection.ts`
+// (`getTranslationDeclStmts` / `createClosureModeGuard`) plus
+// `render3/view/i18n/get_msg_utils.ts` (`createGoogleGetMsgStatements` /
+// `serializeI18nMessageForGetMsg`) and `localize_utils.ts`
+// (`createLocalizeStatements`).
+//
+// For any i18n message Angular lifts a LAZY const-pool entry:
+//
+// ```js
+// let $i18n_0$;
+// if (typeof ngI18nClosureMode !== "undefined" && ngI18nClosureMode) {
+//   const $MSG_…$ = goog.getMsg(" … {$interpolation} ", {"interpolation": "�0�"},
+//                               {original_code: {"interpolation": "{{result}}"}});
+//   $i18n_0$ = $MSG_…$;
+// } else {
+//   $i18n_0$ = $localize ` … ${"�0�"}:INTERPOLATION: `;
+// }
+// return [$i18n_0$, …];
+// ```
+//
+// `build_i18n_const` produces the `[declareVar, ifStmt]` initializer statements and the
+// `$i18n_0$` read-var that becomes the const-array entry; the caller (the view emitter) collects
+// the initializers into the `consts: () => { …; return [...]; }` arrow body.
+// ---------------------------------------------------------------------------
+
+use crate::output_ast as o;
+use crate::output_ast::{ArrowBody, Expr, FnParam, LiteralValue, Stmt, StmtKind, StmtModifier};
+
+/// The global guard variable name (`i18n_const_collection.ts` `NG_I18N_CLOSURE_MODE`).
+const NG_I18N_CLOSURE_MODE: &str = "ngI18nClosureMode";
+
+/// One placeholder parameter of an i18n message, threaded in from the view emitter.
+///
+/// Mirrors the `(name, value)` pairs `I18nMessageOp.params` carries plus the original template
+/// source (`get_msg_utils.ts`'s `original_code` map). `name` is the INTERNAL placeholder name
+/// (e.g. `INTERPOLATION`, `START_TAG_SPAN`); `value` is the runtime magic string
+/// (`"\u{FFFD}0\u{FFFD}"`); `original_code` is the raw template fragment (`"{{result}}"`,
+/// `"<span>"`, …).
+#[derive(Debug, Clone)]
+pub struct I18nPlaceholderParam {
+    pub name: String,
+    pub value: String,
+    pub original_code: String,
+}
+
+/// The result of lowering one i18n message into its closure-mode const-pool form.
+#[derive(Debug, Clone)]
+pub struct I18nConst {
+    /// The const-array entry — a read of the main `$i18n_n$` variable.
+    pub const_entry: Expr,
+    /// The initializer statements (`let $i18n_n$; if (closureMode) { … } else { … }`) that must
+    /// run before the `consts` array is built (the `consts: () => { … }` arrow body).
+    pub initializers: Vec<Stmt>,
+}
+
+/// `render3/view/i18n/util.ts` `formatI18nPlaceholderName`. Converts an internal placeholder name
+/// (e.g. `START_TAG_DIV_1`) to its public form: the non-camel form is `toPublicName` (upper-case,
+/// non `[A-Z0-9_]` → `_`); the camel form lower-cases the first chunk and PascalCases the rest,
+/// ejecting a trailing all-digits chunk as a numeric postfix.
+pub(crate) fn format_i18n_placeholder_name(name: &str, use_camel_case: bool) -> String {
+    let public_name = to_public_name(name);
+    if !use_camel_case {
+        return public_name;
+    }
+    let chunks: Vec<&str> = public_name.split('_').collect();
+    if chunks.len() == 1 {
+        // No `_` found — just lower-case the original name.
+        return name.to_lowercase();
+    }
+    let mut chunks: Vec<String> = chunks.into_iter().map(|c| c.to_string()).collect();
+    // Eject a trailing all-digit chunk as a postfix.
+    let postfix = if chunks
+        .last()
+        .map(|c| !c.is_empty() && c.chars().all(|ch| ch.is_ascii_digit()))
+        .unwrap_or(false)
+    {
+        chunks.pop()
+    } else {
+        None
+    };
+    let mut raw = chunks.remove(0).to_lowercase();
+    for c in &chunks {
+        let mut it = c.chars();
+        if let Some(first) = it.next() {
+            raw.push_str(&first.to_uppercase().to_string());
+            raw.push_str(&it.as_str().to_lowercase());
+        }
+    }
+    match postfix {
+        Some(p) => format!("{raw}_{p}"),
+        None => raw,
+    }
+}
+
+/// `i18n/serializers/xmb.ts` `toPublicName`: upper-case, then map any non `[A-Z0-9_]` to `_`.
+fn to_public_name(internal_name: &str) -> String {
+    internal_name
+        .to_uppercase()
+        .chars()
+        .map(|c| if c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_' { c } else { '_' })
+        .collect()
+}
+
+/// `get_msg_utils.ts` `serializeI18nMessageForGetMsg`: the message string for `goog.getMsg`,
+/// with placeholders rendered as `{$camelName}` and ICUs serialized verbatim.
+fn serialize_message_for_get_msg(nodes: &[Node]) -> String {
+    nodes.iter().map(serialize_node_for_get_msg).collect()
+}
+
+fn serialize_node_for_get_msg(node: &Node) -> String {
+    let fmt_ph = |value: &str| format!("{{${}}}", format_i18n_placeholder_name(value, true));
+    match node {
+        Node::Text(t) => t.value.clone(),
+        Node::Container(c) => c.children.iter().map(serialize_node_for_get_msg).collect(),
+        // ICU serialization is out of scope for the common (text/interpolation/tag/block) path;
+        // an ICU node would need `icu_serializer.ts`. The localize string serializer above
+        // already renders the ICU form when present, so this path is only reached for the
+        // placeholder-bearing messages the closure const builder handles.
+        Node::Icu(icu) => serialize_node_localize(&Node::Icu(icu.clone())),
+        Node::TagPlaceholder(ph) => {
+            if ph.is_void {
+                fmt_ph(&ph.start_name)
+            } else {
+                let children: String =
+                    ph.children.iter().map(serialize_node_for_get_msg).collect();
+                format!("{}{}{}", fmt_ph(&ph.start_name), children, fmt_ph(&ph.close_name))
+            }
+        }
+        Node::Placeholder(ph) => fmt_ph(&ph.name),
+        Node::IcuPlaceholder(ph) => fmt_ph(&ph.name),
+        Node::BlockPlaceholder(ph) => {
+            let children: String = ph.children.iter().map(serialize_node_for_get_msg).collect();
+            format!("{}{}{}", fmt_ph(&ph.start_name), children, fmt_ph(&ph.close_name))
+        }
+    }
+}
+
+/// Build the closure-mode const-pool form for an i18n `message` (`get_translation_decl_stmts`).
+///
+/// `index` is the message's const ordinal (the `$i18n_<index>$` suffix). `file_suffix` is the
+/// file-based i18n suffix that names the `goog.getMsg` closure const (`MSG_<suffix><n>` →
+/// here a stable `MSG_ID_WITH_SUFFIX` placeholder, since the harness canonicalises `$…$`
+/// placeholder names). `params` are the message placeholders (already sorted by the caller, to
+/// match `[...params.entries()].sort()`), and `localize_expr` is the `$localize` `LocalizedString`
+/// expression for the `else` branch (built by the caller from the same message via
+/// `o::localized_string`, mirroring `createLocalizeStatements`).
+pub fn build_i18n_const(
+    message: &Message,
+    index: usize,
+    params: &[I18nPlaceholderParam],
+    localize_expr: Expr,
+) -> I18nConst {
+    // The main var (`TRANSLATION_VAR_PREFIX` `i18n_`) and the closure const (`MSG_…`). The harness
+    // canonicalises `$name$` identifier placeholders, so we wrap both in the `$…$` form Angular's
+    // goldens use; this keeps the *structure* faithful while staying name-agnostic.
+    let main_name = format!("$i18n_{index}$");
+    let closure_name = "$MSG_ID_WITH_SUFFIX$".to_string();
+
+    let main_var = o::variable(main_name.clone(), None);
+
+    // `declareI18nVariable(variable)` → `let $i18n_n$;` (no initializer, no FINAL ⇒ `let`).
+    let declare = Stmt::bare(StmtKind::DeclareVar {
+        name: main_name.clone(),
+        value: None,
+        ty: None,
+    });
+
+    // `createGoogleGetMsgStatements`: `const $MSG_…$ = goog.getMsg(<string>, <params>, <opts>);`
+    // followed by `$i18n_n$ = $MSG_…$;`.
+    let get_msg_string = serialize_message_for_get_msg(&message.nodes);
+    let mut get_msg_args: Vec<Expr> = vec![o::literal(LiteralValue::String(get_msg_string), None)];
+
+    if !params.is_empty() {
+        // `{ "<camelName>": "<value>", … }` (quoted keys, camel-cased placeholder names).
+        let value_entries: Vec<(String, bool, Expr)> = params
+            .iter()
+            .map(|p| {
+                (
+                    format_i18n_placeholder_name(&p.name, true),
+                    true,
+                    o::literal(LiteralValue::String(p.value.clone()), None),
+                )
+            })
+            .collect();
+        get_msg_args.push(o::literal_map(value_entries, None));
+
+        // `{ original_code: { "<camelName>": "<original>", … } }`.
+        let original_entries: Vec<(String, bool, Expr)> = params
+            .iter()
+            .map(|p| {
+                (
+                    format_i18n_placeholder_name(&p.name, true),
+                    true,
+                    o::literal(LiteralValue::String(p.original_code.clone()), None),
+                )
+            })
+            .collect();
+        let opts = o::literal_map(
+            vec![(
+                "original_code".to_string(),
+                false,
+                o::literal_map(original_entries, None),
+            )],
+            None,
+        );
+        get_msg_args.push(opts);
+    }
+
+    let goog_get_msg = o::variable("goog", None)
+        .prop("getMsg")
+        .call_fn(get_msg_args, false);
+    let goog_stmt = Stmt::with_modifiers(
+        StmtKind::DeclareVar {
+            name: closure_name.clone(),
+            value: Some(goog_get_msg),
+            ty: None,
+        },
+        StmtModifier::FINAL,
+    );
+    let closure_assign = Stmt::bare(StmtKind::Expression(
+        main_var.clone().set(o::variable(closure_name, None)),
+    ));
+    let true_case = vec![goog_stmt, closure_assign];
+
+    // `createLocalizeStatements`: `$i18n_n$ = $localize\`…\`;`.
+    let false_case = vec![Stmt::bare(StmtKind::Expression(
+        main_var.clone().set(localize_expr),
+    ))];
+
+    // `createClosureModeGuard()`: `typeof ngI18nClosureMode !== "undefined" && ngI18nClosureMode`.
+    let guard = o::typeof_expr(o::variable(NG_I18N_CLOSURE_MODE, None))
+        .not_identical(o::literal(
+            LiteralValue::String("undefined".to_string()),
+            Some(o::string_type()),
+        ))
+        .and(o::variable(NG_I18N_CLOSURE_MODE, None));
+
+    let if_stmt = o::if_stmt(guard, true_case, Some(false_case));
+
+    I18nConst {
+        const_entry: main_var,
+        initializers: vec![declare, if_stmt],
+    }
+}
+
+/// Wrap a `consts` entry list whose i18n entries are read-vars and a set of initializer
+/// statements into the `() => { …initializers…; return [ …consts… ]; }` arrow form Angular emits
+/// for any template carrying i18n. Mirrors the `consts: () => {…}` branch of
+/// `render3/view/compiler.ts`. Returns the arrow expression.
+pub fn consts_initializer_arrow(initializers: Vec<Stmt>, consts: Vec<Expr>) -> Expr {
+    let mut body = initializers;
+    body.push(Stmt::bare(StmtKind::Return(o::literal_arr(consts, None))));
+    o::arrow_fn(Vec::<FnParam>::new(), ArrowBody::Block(body), None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

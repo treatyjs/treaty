@@ -1033,8 +1033,22 @@ impl<R: LocalResolver> Converter<'_, R> {
                             call_args.extend(lowered_args);
                             o::import_expr(reference.reference(), None).call_fn(call_args, false)
                         } else {
-                            // `ɵɵpipeBindV(slot, varOffset, [value, ...args])`.
+                            // `ɵɵpipeBindV(slot, varOffset, [value, ...args])`. The collated
+                            // argument array is itself a literal-array binding: in a binding
+                            // context Angular routes it through `generatePureLiteralStructures`
+                            // so constant elements are hoisted into a const-pool factory and the
+                            // array is replaced by `ɵɵpureFunctionN(slot, $cN$, …nonConstArgs)`
+                            // (`pipe.ts` builds the args array as a `LiteralArray`, which the
+                            // pure-literal transform then extracts). Mirror the `LiteralArray`
+                            // arm: extract when `should_extract_pure()`, else keep verbatim. The
+                            // pure-function var slot is allocated *after* the pipe's own slots,
+                            // matching the golden's offset ordering.
                             let arr = literal_arr(lowered_args, None);
+                            let arr = if self.should_extract_pure() {
+                                self.extract_literal_array(arr)
+                            } else {
+                                arr
+                            };
                             o::import_expr(R3::PipeBindV.reference(), None)
                                 .call_fn(vec![slot, var_offset, arr], false)
                         }

@@ -685,14 +685,55 @@ impl<'a> Lowerer<'a> {
                 self.ast.expression_string_literal(SPAN, v, None)
             }
             LiteralValue::Number(n) => {
+                // Supply an explicit `raw` text so the OXC printer emits the
+                // literal verbatim. Without it the printer re-derives a minimal
+                // form and renders integers like 2000 as `2e3`, whereas Angular
+                // (via the TypeScript printer) always emits the plain decimal.
+                let raw = Self::format_number(*n);
+                let raw = self.ast.str(&raw);
                 self.ast
-                    .expression_numeric_literal(SPAN, *n, None, NumberBase::Decimal)
+                    .expression_numeric_literal(SPAN, *n, Some(raw), NumberBase::Decimal)
             }
             LiteralValue::Bool(b) => self.ast.expression_boolean_literal(SPAN, *b),
             LiteralValue::Null => self.ast.expression_null_literal(SPAN),
             // `undefined` is an identifier in JS, not a literal.
             LiteralValue::Undefined => self.ident_expr("undefined"),
         }
+    }
+
+    /// Format an `f64` the way JavaScript's `Number.prototype.toString()`
+    /// does, which is what the TypeScript printer Angular uses produces. This
+    /// keeps plain decimals/integers verbatim (`2000`, `1000`, `123.456`)
+    /// instead of letting OXC collapse them to scientific notation (`2e3`).
+    ///
+    /// JS only switches to exponential form when the decimal exponent is
+    /// `>= 21` or `<= -7`; for everything in between it emits the fixed form.
+    /// Realistic Angular literals fall in the fixed range, so Rust's default
+    /// `{}` formatting matches JS exactly there. We special-case the extreme
+    /// magnitudes to stay faithful for the rare large/small values.
+    fn format_number(n: f64) -> String {
+        if !n.is_finite() {
+            // NaN / Infinity are not valid numeric literals; fall back to a
+            // textual form that round-trips through the printer.
+            if n.is_nan() {
+                return "NaN".to_string();
+            }
+            return if n < 0.0 { "-Infinity".to_string() } else { "Infinity".to_string() };
+        }
+        if n == 0.0 {
+            // Covers both +0.0 and -0.0 (JS prints both as "0").
+            return "0".to_string();
+        }
+
+        let abs = n.abs();
+        // Outside JS's fixed-notation window, defer to Rust's exponential
+        // formatting (close enough for these vanishingly rare values).
+        if abs >= 1e21 || abs < 1e-6 {
+            return format!("{n:e}");
+        }
+
+        // Within the window Rust's default formatting matches JS's output.
+        format!("{n}")
     }
 
     fn lower_args(&self, args: &[o::Expr]) -> ArenaVec<'a, Argument<'a>> {
@@ -712,9 +753,18 @@ impl<'a> Lowerer<'a> {
 
     fn lower_map_entry(&self, entry: &LiteralMapEntry) -> ObjectPropertyKind<'a> {
         match entry {
-            LiteralMapEntry::Property { key, value, .. } => {
-                let prop_key: PropertyKey =
-                    self.ast.property_key_static_identifier(SPAN, self.ast.ident(key));
+            LiteralMapEntry::Property { key, value, quoted } => {
+                // A `quoted` key emits as a string-literal property name (`{"foo": …}`); otherwise
+                // an identifier name (`{foo: …}`). Angular's emitter (`AbstractJsEmitterVisitor`'s
+                // `visitLiteralMapExpr`) keys on the entry's `quoted` flag — i18n `goog.getMsg`
+                // placeholder/`original_code` maps use quoted keys, plain object literals do not.
+                let prop_key: PropertyKey = if *quoted {
+                    let s = self.ast.str(key);
+                    let lit = self.ast.expression_string_literal(SPAN, s, None);
+                    PropertyKey::from(lit)
+                } else {
+                    self.ast.property_key_static_identifier(SPAN, self.ast.ident(key))
+                };
                 let val = self.lower_expr(value);
                 self.ast.object_property_kind_object_property(
                     SPAN,

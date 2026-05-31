@@ -134,6 +134,12 @@ impl TemplateCompilationInput {
 #[derive(Debug, Clone, Default)]
 pub struct ConstantPool {
     entries: Vec<Expr>,
+    /// i18n const-pool initializer statements (`let $i18n_0$; if (closureMode) { … } else { … }`)
+    /// that must run before the `consts` array is built. Non-empty only when the template carries
+    /// an i18n block, mirroring Angular's `ComponentCompilationJob.constsInitializers`. When
+    /// present the definition emits `consts: () => { …initializers…; return [ … ]; }` instead of
+    /// the inline `consts: [ … ]` literal array.
+    initializers: Vec<Stmt>,
 }
 
 impl ConstantPool {
@@ -151,8 +157,23 @@ impl ConstantPool {
         self.entries.len() - 1
     }
 
+    /// Append an entry along with the initializer statements that produce its value (Angular's
+    /// `job.addConst(mainVar, statements)`). Used for i18n messages whose const-array entry is a
+    /// `$i18n_n$` read-var initialized lazily in the `consts: () => { … }` arrow body. Unlike
+    /// [`intern`], this never de-dupes (each i18n message owns a distinct variable + statements).
+    pub fn add_const_with_initializers(&mut self, value: Expr, initializers: Vec<Stmt>) -> usize {
+        self.initializers.extend(initializers);
+        self.entries.push(value);
+        self.entries.len() - 1
+    }
+
     pub fn entries(&self) -> &[Expr] {
         &self.entries
+    }
+
+    /// The i18n const-pool initializer statements (empty unless an i18n message was collected).
+    pub fn initializers(&self) -> &[Stmt] {
+        &self.initializers
     }
 
     pub fn is_empty(&self) -> bool {
@@ -583,6 +604,31 @@ fn local_ref_var_name(name: &str, counter: usize) -> String {
     format!("${}_{}$", sanitize_identifier(name), counter)
 }
 
+/// Angular `BindingScope.freshReferenceName()` (template-pipeline `naming.ts`,
+/// `SemanticVariableKind.Identifier`): a view-local identifier of the form `<name>_r<id>` (with
+/// `i` inserted before `r` when the identifier is `ctx`, to avoid colliding with the context
+/// variable). Used for the binding const of an *inlined* `@let` whose value is computed directly
+/// (e.g. a `ɵɵpureFunction` literal), which the goldens pin literally as `simple_r1`.
+fn fresh_reference_name(name: &str, counter: usize) -> String {
+    let ident = sanitize_identifier(name);
+    let compat_prefix = if ident == CONTEXT_NAME { "i" } else { "" };
+    format!("{ident}_{compat_prefix}r{counter}")
+}
+
+/// Whether a lowered expression is a *result temp* of a hoisted `ɵɵpureFunctionN` (or pipe-bind)
+/// call — the shape `ɵɵpureFunction1(slot, $cN$, …)`. Angular's `BindingScope` names the binding
+/// const of such a `@let` with the `<name>_r<id>` view-ref form (`fresh_reference_name`), whereas a
+/// plain `@let` value (literal / arithmetic / read) uses the `$name$` expect-emit form.
+fn is_pure_function_result(value: &Expr) -> bool {
+    if let o::ExprKind::Invoke { callee, .. } = &value.kind {
+        if let o::ExprKind::External { value: ext, .. } = &callee.kind {
+            return ext.name.starts_with("\u{0275}\u{0275}pureFunction")
+                || ext.name.starts_with("\u{0275}\u{0275}pipeBind");
+        }
+    }
+    false
+}
+
 /// Pop trailing `null` literal arguments off an instruction's parameter list, mirroring the
 /// `while (args[args.length - 1].isEquivalent(o.NULL_EXPR)) args.pop()` tail in Angular's
 /// `instruction.ts` builders (`templateBase` / `conditionalCreate` / …).
@@ -603,6 +649,68 @@ fn i18n_interpolation_name(index: usize) -> String {
         "INTERPOLATION".to_string()
     } else {
         format!("INTERPOLATION_{index}")
+    }
+}
+
+/// The `original_code` template fragment for an i18n interpolation placeholder: the authored
+/// `{{ <expr> }}` source. `get_msg_utils.ts` records the verbatim template text; the parser keeps
+/// only the structured AST (spans are offset-only with no retained source), so the expression is
+/// re-serialized from the AST. For the common reads/literals/operators this reproduces the authored
+/// form (`{{result}}`, `{{value}}`); cases the reconstructor does not model fall back to an empty
+/// inner expression rather than a wrong one.
+fn i18n_original_code(node: &AstNode) -> String {
+    format!("{{{{{}}}}}", ast_to_source(node))
+}
+
+/// Re-serialize a binding-expression AST back to its authored source for the common cases used by
+/// i18n interpolations (implicit-receiver property reads, keyed reads, literals, binary / unary
+/// operators, parenthesised chains). Unmodelled shapes return `""`.
+fn ast_to_source(node: &AstNode) -> String {
+    match &node.kind {
+        AstExprKind::ImplicitReceiver | AstExprKind::ThisReceiver => String::new(),
+        AstExprKind::PropertyRead { receiver, name, .. }
+        | AstExprKind::SafePropertyRead { receiver, name, .. } => {
+            let safe = matches!(node.kind, AstExprKind::SafePropertyRead { .. });
+            let recv = ast_to_source(receiver);
+            if recv.is_empty() {
+                name.clone()
+            } else if safe {
+                format!("{recv}?.{name}")
+            } else {
+                format!("{recv}.{name}")
+            }
+        }
+        AstExprKind::KeyedRead { receiver, key } => {
+            format!("{}[{}]", ast_to_source(receiver), ast_to_source(key))
+        }
+        AstExprKind::SafeKeyedRead { receiver, key } => {
+            format!("{}?.[{}]", ast_to_source(receiver), ast_to_source(key))
+        }
+        AstExprKind::LiteralPrimitive { value } => {
+            use crate::expression::ast::LiteralValue as LV;
+            match value {
+                LV::Str(s) => format!("'{s}'"),
+                LV::Num(n) => {
+                    if n.fract() == 0.0 && n.is_finite() {
+                        format!("{}", *n as i64)
+                    } else {
+                        n.to_string()
+                    }
+                }
+                LV::Bool(b) => b.to_string(),
+                LV::Null => "null".to_string(),
+                LV::Undefined => "undefined".to_string(),
+            }
+        }
+        AstExprKind::Binary { operation, left, right } => {
+            format!(
+                "{} {} {}",
+                ast_to_source(left),
+                operation.as_str(),
+                ast_to_source(right)
+            )
+        }
+        _ => String::new(),
     }
 }
 
@@ -1475,7 +1583,18 @@ impl TemplateDefinitionBuilder {
         // `const <name>_r<id> = ɵɵreference(slot)` at the head of the variable block, before the
         // bindings consume them (`generate_variables.ts` `Reference`). Emitted in first-use order.
         let used_refs = std::mem::take(&mut *self.used_local_refs.borrow_mut());
-        for (_name, local_name, slot) in used_refs {
+        for (name, local_name, slot) in used_refs {
+            // A `#ref` read by an update binding declared BEFORE the ref's host (a forward
+            // reference — e.g. `@let m = name.value` above `<input #name>`) was recorded with the
+            // pre-pass placeholder slot. By now the host has been reached and
+            // [`Self::register_local_ref`] has filled the real `ɵɵreference(slot)` slot into
+            // `self.local_refs`; re-resolve from there so the materialised const uses the real slot.
+            let slot = self
+                .local_refs
+                .iter()
+                .find(|r| r.name == name && r.slot < LOCAL_REF_SLOT_PLACEHOLDER)
+                .map(|r| r.slot)
+                .unwrap_or(slot);
             update_body.push(Stmt::with_modifiers(
                 StmtKind::DeclareVar {
                     name: local_name,
@@ -1937,7 +2056,20 @@ impl TemplateDefinitionBuilder {
         // the upstream marker is fleshed out to carry the parsed meta, it would feed `Message::new`
         // and `compute_msg_id`; until then the metadata is structurally unavailable.
         let message = i18n::Message::new(nodes, "", "", "");
-        let const_index = self.intern_i18n_message(&message);
+
+        // Build the placeholder params (`I18nMessageOp.params`): each interpolation maps its public
+        // placeholder name to the runtime magic string `\u{FFFD}<index>\u{FFFD}` plus the authored
+        // template source (`original_code`, reconstructed as `{{ <expr-source> }}`). These feed both
+        // the `goog.getMsg` placeholder/options maps and the `$localize` substitution expressions.
+        let params: Vec<i18n::I18nPlaceholderParam> = (0..exprs.len())
+            .map(|i| i18n::I18nPlaceholderParam {
+                name: i18n_interpolation_name(i),
+                value: format!("\u{FFFD}{i}\u{FFFD}"),
+                original_code: i18n_original_code(&exprs[i]),
+            })
+            .collect();
+
+        let const_index = self.intern_i18n_message(&message, &params);
 
         // Creation block: `ɵɵi18nStart(slot, constIndex)` … `ɵɵi18nEnd()`.
         self.creation_code.push(instruction(
@@ -1962,35 +2094,52 @@ impl TemplateDefinitionBuilder {
         }
     }
 
-    /// Intern an i18n [`crate::i18n::Message`] as the `$localize` message expression and return its
+    /// Intern an i18n [`crate::i18n::Message`] as a closure-mode const-pool entry and return its
     /// const-pool index (used as the `constIndex` argument of `ɵɵi18nStart`/`ɵɵi18n`).
     ///
-    /// The expression is `o::localized_string(meta, messageParts, placeholders, [])`, mirroring
-    /// Angular's `createLocalizeStatements` (minus the hoisted-variable assignment — the const pool
-    /// holds the expression directly). `messageParts` are the literal text segments and
-    /// `placeholders` the `{$NAME}` markers, split out of the message string. The expression list is
-    /// left empty here because the interpolation operands flow through `ɵɵi18nExp`, not the
-    /// `$localize` tagged template (matching the runtime i18n instruction model).
-    fn intern_i18n_message(&mut self, message: &crate::i18n::Message) -> usize {
+    /// Mirrors Angular's `i18n_const_collection.ts`: the const-array entry is a `$i18n_n$` read-var
+    /// whose value is assigned lazily in the `consts: () => { … }` arrow body via
+    /// `let $i18n_n$; if (typeof ngI18nClosureMode … && ngI18nClosureMode) { const $MSG_…$ =
+    /// goog.getMsg(…); $i18n_n$ = $MSG_…$; } else { $i18n_n$ = $localize`…`; }`. The `$localize`
+    /// branch's `LocalizedString` is built here (mirroring `createLocalizeStatements`); the
+    /// `goog.getMsg` branch + the closure guard are assembled by [`crate::i18n::build_i18n_const`].
+    ///
+    /// `params` carry, per interpolation placeholder, the runtime magic string and authored source;
+    /// the `$localize` substitution expressions are exactly those magic-string literals (Angular's
+    /// `placeHolders.map(ph => params[ph.text])`).
+    fn intern_i18n_message(
+        &mut self,
+        message: &crate::i18n::Message,
+        params: &[crate::i18n::I18nPlaceholderParam],
+    ) -> usize {
         use crate::i18n;
 
-        let id = message.decimal_digest();
+        // The `$localize` meta block carries only the AUTHORED description / meaning / custom id
+        // (`serializeI18nHead`); the auto-computed decimal digest is the runtime/linker message id
+        // and is NOT embedded in the tagged-template head. With no explicit `@@id`/meaning/desc on
+        // the template, the head is empty (` The result is ${…}:INTERPOLATION: `), matching Angular.
         let meta = o::I18nMeta {
-            description: None,
-            meaning: None,
-            custom_id: Some(id),
+            description: (!message.description.is_empty()).then(|| message.description.clone()),
+            meaning: (!message.meaning.is_empty()).then(|| message.meaning.clone()),
+            custom_id: (!message.custom_id.is_empty()).then(|| message.custom_id.clone()),
             legacy_ids: Vec::new(),
         };
 
         let mut message_parts: Vec<o::LiteralPiece> = Vec::new();
         let mut placeholders: Vec<o::PlaceholderPiece> = Vec::new();
+        // The `$localize` substitution expressions: the placeholder magic strings, in placeholder
+        // order. Without these the emitted tagged template drops the `${…}` substitution entirely.
+        let mut expressions: Vec<o::Expr> = Vec::new();
         let no_span = o::ParseSourceSpan::new(0, 0);
+        let mut param_by_name = std::collections::HashMap::new();
+        for p in params {
+            param_by_name.insert(p.name.clone(), p.value.clone());
+        }
 
         // Walk the (flat, common-case) message nodes: Text → a literal part, Placeholder → a
         // placeholder piece. Two consecutive literals are merged so `messageParts` and
         // `placeholders` interleave as `$localize` expects (one more part than placeholder).
         let mut pending = String::new();
-        let mut started = false;
         for node in &message.nodes {
             match node {
                 i18n::Node::Text(t) => pending.push_str(&t.value),
@@ -1999,25 +2148,34 @@ impl TemplateDefinitionBuilder {
                         text: std::mem::take(&mut pending),
                         source_span: no_span.clone(),
                     });
-                    started = true;
                     placeholders.push(o::PlaceholderPiece {
-                        text: ph.name.clone(),
+                        // `$localize` uses the NON-camel public placeholder name (`:INTERPOLATION:`).
+                        text: i18n::format_i18n_placeholder_name(&ph.name, false),
                         source_span: no_span.clone(),
                         associated_message: None,
                     });
+                    let value = param_by_name
+                        .get(&ph.name)
+                        .cloned()
+                        .unwrap_or_default();
+                    expressions.push(o::literal(o::LiteralValue::String(value), None));
                 }
                 _ => {}
             }
         }
         // Trailing (or sole) literal part. `$localize` always has one more part than placeholder.
-        let _ = started;
         message_parts.push(o::LiteralPiece {
             text: pending,
             source_span: no_span.clone(),
         });
 
-        let expr = o::localized_string(meta, message_parts, placeholders, Vec::new());
-        self.const_pool.intern(expr)
+        let localize_expr = o::localized_string(meta, message_parts, placeholders, expressions);
+
+        // The message's const ordinal — Angular numbers `$i18n_n$` from the const-array position.
+        let index = self.const_pool.entries().len();
+        let i18n_const = i18n::build_i18n_const(message, index, params, localize_expr);
+        self.const_pool
+            .add_const_with_initializers(i18n_const.const_entry, i18n_const.initializers)
     }
 
     /// Lower a bound input (`[name]="value"`) into the matching update-block binding instruction,
@@ -2203,7 +2361,10 @@ impl TemplateDefinitionBuilder {
         let mut let_reads: Vec<Stmt> = Vec::new();
         for cl in &referenced_lets {
             self.var_counter += 1;
-            let local_name = format!("{}_r{}", cl.name, self.var_counter);
+            // Angular's `BindingScope` mints the `ɵɵreadContextLet` read local with the `$name$`
+            // expect-emit form the goldens spell as `$one_1$` (see `local_ref_var_name`), distinct
+            // from the `<name>_r<id>` view-ref scheme used for `ɵɵreference` locals.
+            let local_name = local_ref_var_name(&cl.name, self.var_counter);
             let read = o::import_expr(R3::ReadContextLet.reference(), None)
                 .call_fn(vec![num(cl.slot as f64)], false);
             let_reads.push(Stmt::with_modifiers(
@@ -2893,7 +3054,9 @@ impl TemplateDefinitionBuilder {
             }
 
             self.var_counter += 1;
-            let local_name = format!("{}_r{}", cl.name, self.var_counter);
+            // The cross-view `ɵɵreadContextLet` read local takes the `$name$` expect-emit form the
+            // goldens spell as `$two_0$` (see `local_ref_var_name`), like the listener-scope read.
+            let local_name = local_ref_var_name(&cl.name, self.var_counter);
             let read = o::import_expr(R3::ReadContextLet.reference(), None)
                 .call_fn(vec![num(cl.slot as f64)], false);
             prelude.push(Stmt::with_modifiers(
@@ -3015,7 +3178,18 @@ impl TemplateDefinitionBuilder {
             // used both for the `const … =` binding and for every read of the let inside this view
             // (resolved through `loop_vars`).
             self.var_counter += 1;
-            let local_name = local_ref_var_name(&decl.name, self.var_counter);
+            // Angular's `BindingScope` mints two different forms for a `@let`'s in-view binding
+            // const depending on the shape of the let's lowered value. A plain `@let` (a literal /
+            // arithmetic / property read, including the cross-view `ɵɵstoreLet` wrapper) takes the
+            // `$name$` expect-emit form the goldens spell as `$result_0$` / `$one_r1$`
+            // (`local_ref_var_name`). A let whose value is a hoisted `ɵɵpureFunctionN` / pipe-bind
+            // *result temp* takes the `<name>_r<id>` view-ref form the goldens pin literally as
+            // `simple_r1` (`fresh_reference_name`).
+            let local_name = if is_pure_function_result(&value) {
+                fresh_reference_name(&decl.name, self.var_counter)
+            } else {
+                local_ref_var_name(&decl.name, self.var_counter)
+            };
             self.update_code.push(Stmt::with_modifiers(
                 StmtKind::DeclareVar {
                     name: local_name.clone(),

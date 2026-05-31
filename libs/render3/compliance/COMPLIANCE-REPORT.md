@@ -14,11 +14,11 @@ This harness runs Treaty's Rust/OXC Angular compiler (`render3` crate, via the
 | --- | --- |
 | Total compliance cases | 642 |
 | Compiled (runnable) | 98 |
-| PASS | 50 |
-| DIFF | 48 |
+| PASS | 54 |
+| DIFF | 44 |
 | Skipped (un-runnable) | 544 |
-| **Pass-rate (of runnable subset)** | **51.0%** (50/98) |
-| Pass-rate (of full corpus) | 7.8% (50/642) |
+| **Pass-rate (of runnable subset)** | **55.1%** (54/98) |
+| Pass-rate (of full corpus) | 8.4% (54/642) |
 
 ### How a case is run and matched
 
@@ -48,18 +48,18 @@ from our output. Top entry = implement first to raise the score.
 | 5 | `ɵɵdomElementStart` |
 | 3 | `ɵɵelementStart` |
 | 3 | `ɵɵi18nPostprocess` |
-| 3 | `ɵɵpureFunction1` |
-| 3 | `ɵɵtext` |
 | 3 | `ɵɵprojectionDef` |
-| 2 | `ɵɵrestoreView` |
 | 2 | `ɵɵdomTemplate` |
+| 2 | `ɵɵtext` |
 | 2 | `ɵɵtemplate` |
 | 1 | `ɵɵcontentQuerySignal` |
 | 1 | `ɵɵgetCurrentView` |
+| 1 | `ɵɵpipeBind1` |
 | 1 | `ɵɵconditionalCreate` |
-| 1 | `ɵɵreference` |
 | 1 | `ɵɵdefer` |
+| 1 | `ɵɵpureFunction1` |
 | 1 | `ɵɵforeignComponent` |
+| 1 | `dependencies` |
 
 ### Sample diverging cases
 
@@ -79,39 +79,25 @@ from our output. Top entry = implement first to raise the score.
     - near: `s:[[AM,"grape"]],template:function`
 - **`ɵɵdomElementStart`** (5):
   - r3_view_compiler_let/should handle an @let used only directly inside i18n
-    - near: `sts:()=>{letID;if(typeofngI18nClos`
+    - near: `n":"\uFFFD0\uFFFD"},{original_code`
   - r3_view_compiler_let/should handle an @let referenced inside a child view inside i18n
     - near: `cls:4,vars:1,consts:()=>{letID;if(`
   - r3_view_compiler_let/should handle an @let preceded by an element with i18n
-    - near: `sts:()=>{letID;if(typeofngI18nClos`
+    - near: `n":"\uFFFD0\uFFFD"},{original_code`
 - **`ɵɵelementStart`** (3):
   - r3_view_compiler_styling/component_animations/should generate animation listeners
     - near: `s:1,template:functionMyComponent_T`
   - r3_view_compiler_i18n/blocks/should support @for blocks
-    - near: `sts:()=>{leti18n_0;if(typeofngI18n`
+    - near: `{leti18n_0;if(typeofngI18nClosureM`
   - r3_view_compiler_i18n/blocks/should support @defer blocks
-    - near: `sts:()=>{leti18n_0;if(typeofngI18n`
+    - near: `{leti18n_0;if(typeofngI18nClosureM`
 - **`ɵɵi18nPostprocess`** (3):
   - r3_view_compiler_let/should handle an @let referenced inside i18n and in a child view
     - near: `cls:4,vars:2,consts:()=>{letID;if(`
   - r3_view_compiler_i18n/blocks/should support @if blocks
-    - near: `sts:()=>{leti18n_0;if(typeofngI18n`
+    - near: `{leti18n_0;if(typeofngI18nClosureM`
   - r3_view_compiler_i18n/blocks/should support @switch blocks
-    - near: `sts:()=>{leti18n_0;if(typeofngI18n`
-- **`ɵɵpureFunction1`** (3):
-  - r3_view_compiler_arrow_functions/should be able to use arrow functions inside pure values
-    - near: `0](1000),"",ɵɵpureFunction1(6,ID,ɵ`
-  - r3_compiler_compliance/components_and_directives/value_composition/should support spread elements in array literals
-    - near: `onstsimple_R=ɵɵpureFunction1(4,ID,`
-  - r3_compiler_compliance/components_and_directives/value_composition/should support object literals with spread assignments
-    - near: `onstsimple_R=ɵɵpureFunction1(4,ID,`
-- **`ɵɵtext`** (3):
-  - r3_view_compiler_arrow_functions/should handle arrow function that is passed into a pipe
-    - near: `ipe(1,"test");ɵɵdomElement(2,"hr")`
-  - r3_compiler_compliance/components_and_directives/pipes/should render pipes
-    - near: `ars:20,template:functionMyApp_Temp`
-  - r3_compiler_compliance/components_and_directives/pipes/should use appropriate function for a given no of pipe arguments
-    - near: `rs:27,template:functionMyApp_Templ`
+    - near: `{leti18n_0;if(typeofngI18nClosureM`
 - **`ɵɵprojectionDef`** (3):
   - r3_compiler_compliance/components_and_directives/content_projection/should support multi-slot content projection with multiple wildcard slots
     - near: `ors:ID,decls:3,vars:0,template:fun`
@@ -119,16 +105,16 @@ from our output. Top entry = implement first to raise the score.
     - near: `ors:ID,decls:1,vars:1,consts:[[AM,`
   - r3_compiler_compliance/components_and_directives/content_projection/should support fallback content in ng-content
     - near: `ors:ID,decls:7,vars:2,consts:[[4,"`
-- **`ɵɵrestoreView`** (2):
-  - r3_view_compiler_let/should be able to use let declarations in event listeners
-    - near: `onstID=ɵɵreadContextLet(0);constID`
-  - r3_view_compiler_let/should not remove let declarations that are only used in an event listener
-    - near: `onstID=ɵɵreadContextLet(1);returnɵ`
 - **`ɵɵdomTemplate`** (2):
   - r3_view_compiler_deferred/should generate a deferred block with placeholder block parameters
     - near: `:[[2000],["src","placeholder.gif"]`
   - r3_view_compiler_deferred/should generate a deferred block with loading block parameters
     - near: `:[[2000,500],["src","loading.gif"]`
+- **`ɵɵtext`** (2):
+  - r3_view_compiler_arrow_functions/should handle arrow function that is passed into a pipe
+    - near: `ipe(1,"test");ɵɵdomElement(2,"hr")`
+  - r3_compiler_compliance/components_and_directives/pipes/should render pipes
+    - near: `ipe(1,"myPipe");ɵɵpipe(2,"myPurePi`
 - **`ɵɵtemplate`** (2):
   - r3_compiler_compliance/components_and_directives/should support empty property bindings on ng-template
     - near: `s:0,consts:[[AM,"id"]],template:fu`
@@ -140,18 +126,24 @@ from our output. Top entry = implement first to raise the score.
 - **`ɵɵgetCurrentView`** (1):
   - r3_view_compiler_listener/local refs in listeners defined before the local refs
     - near: `"],[AM,"click"]],template:function`
+- **`ɵɵpipeBind1`** (1):
+  - r3_view_compiler_let/should create a let using a pipe
+    - near: `onstID=ɵɵpipeBind1(1,1,ID);ɵɵadvan`
 - **`ɵɵconditionalCreate`** (1):
   - r3_view_compiler_let/should be able to use let declarations in child views
     - near: `cls:2,vars:2,template:functionMyAp`
-- **`ɵɵreference`** (1):
-  - r3_view_compiler_let/should be able to use forward references defined after the let declaration
-    - near: `ce(2);constID="Hello,"+ID.value;ɵɵ`
 - **`ɵɵdefer`** (1):
   - r3_view_compiler_deferred/should generate a deferred block with secondary blocks
     - near: `eferLoading_3_Template,1,1)(4,MyAp`
+- **`ɵɵpureFunction1`** (1):
+  - r3_view_compiler_arrow_functions/should be able to use arrow functions inside pure values
+    - near: `0](1000),"",ɵɵpureFunction1(6,ID,ɵ`
 - **`ɵɵforeignComponent`** (1):
   - r3_compiler_compliance/components_and_directives/standalone/should properly compile foreign component imports in a standalone component
     - near: `ars:0,template:functionTestCmp_Tem`
+- **`dependencies`** (1):
+  - r3_compiler_compliance/components_and_directives/pipes/should use appropriate function for a given no of pipe arguments
+    - near: `;}},dependencies:[MyPipe],encapsul`
 
 ## Skip categories (cases not runnable through the source front-end)
 
@@ -170,7 +162,7 @@ error-expectation cases).
 
 ## Passing cases
 
-50 runnable compliance cases match Angular's golden `ɵɵdefineComponent` block:
+54 runnable compliance cases match Angular's golden `ɵɵdefineComponent` block:
 
 - model_inputs/should capture input/output pair in a component definition
 - output_function/should generate an output mapping for the component
@@ -178,7 +170,9 @@ error-expectation cases).
 - r3_compiler_compliance/components_and_directives/value_composition/should convert #my-app selector to ["", "id", "my-app"]
 - r3_compiler_compliance/components_and_directives/value_composition/should not treat ElementRef, ViewContainerRef, or ChangeDetectorRef specially when injecting
 - r3_compiler_compliance/components_and_directives/value_composition/should support dollar escape in template
+- r3_compiler_compliance/components_and_directives/value_composition/should support object literals with spread assignments
 - r3_compiler_compliance/components_and_directives/value_composition/should support rest arguments in a function call
+- r3_compiler_compliance/components_and_directives/value_composition/should support spread elements in array literals
 - r3_compiler_compliance/elements/should bind to class and style names
 - r3_view_compiler/animations/should generate animate enter instructions on element with a binding
 - r3_view_compiler/animations/should generate animate enter instructions on element with a simple string
@@ -204,14 +198,16 @@ error-expectation cases).
 - r3_view_compiler_deferred/should generate a basic deferred block
 - r3_view_compiler_input_outputs/should declare inputs/outputs on a component
 - r3_view_compiler_let/should be able to use for loop variables in let declarations
+- r3_view_compiler_let/should be able to use forward references defined after the let declaration
+- r3_view_compiler_let/should be able to use let declarations in event listeners
 - r3_view_compiler_let/should be able to use let declarations in event listeners inside child views
 - r3_view_compiler_let/should be able to use local references in let declarations
-- r3_view_compiler_let/should create a let using a pipe
 - r3_view_compiler_let/should create a simple @let declaration
 - r3_view_compiler_let/should create multiple @let declarations that depend on each other
 - r3_view_compiler_let/should give precedence to local @let definition over one from a parent view
 - r3_view_compiler_let/should not optimize away declareLet if expression is using a pipe
 - r3_view_compiler_let/should not remove let declarations that are only used in a child view
+- r3_view_compiler_let/should not remove let declarations that are only used in an event listener
 - r3_view_compiler_let/should remove a chain of unused let declarations
 - r3_view_compiler_let/should remove a single unused let declaration
 - r3_view_compiler_let/should remove only the unused let declarations from the middle of a chain of declarations

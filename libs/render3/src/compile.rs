@@ -101,13 +101,13 @@ impl TemplateBuilder for RealTemplateBuilder {
             decls,
             vars,
             consts,
-            // No separate const initializers: this pipeline interns i18n messages directly as
-            // `$localize` `LocalizedString` expressions in the const pool (see
-            // `TemplateDefinitionBuilder::intern_i18n_message`), so each message *is* its const-array
-            // entry. The `() => { var $I18N_0$ = goog.getMsg(...); return [...] }` initializer form is
-            // only used by the legacy closure/`goog.getMsg` const-pool path, which this `$localize`
-            // pipeline does not emit — hence there are genuinely no initializer statements here.
-            consts_initializers: Vec::new(),
+            // i18n const-pool initializers: when the template carries an i18n block, each message is
+            // collected into the const array as a `$i18n_n$` read-var whose value is assigned lazily
+            // in the `consts: () => { …; return [...]; }` arrow body (the closure-mode
+            // `let $i18n_n$; if (ngI18nClosureMode) { … goog.getMsg … } else { … $localize … }` form).
+            // `TemplateDefinitionBuilder::intern_i18n_message` records those statements on the const
+            // pool; surface them here so `compile_component_from_metadata` emits the arrow wrapper.
+            consts_initializers: builder.const_pool().initializers().to_vec(),
             content_selectors,
             // Hoisted nested-view functions (`@if`/`@for`/`@switch`/`@defer` branch + loop bodies,
             // projection fallbacks, `ng-template` bodies) — surfaced as top-level sibling
