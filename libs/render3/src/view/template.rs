@@ -1740,6 +1740,30 @@ impl TemplateDefinitionBuilder {
         name
     }
 
+    /// Intern the component-level `ngContentSelectors` list into the SHARED constant pool and return
+    /// the `$cN$` reference expression — the value `compileComponentFromMetadata` assigns to the
+    /// `ngContentSelectors` definition field. Angular hoists this list with
+    /// `getConstLiteral(literalArr(selectors), /*forceShared*/ true)` (the same pool the
+    /// `ɵɵprojectionDef` selector array uses), so the golden emits `ngContentSelectors: $cN$` with a
+    /// top-level `const $cN$ = [...]` rather than an inline array. Must be called AFTER
+    /// [`Self::build_template_function`] so the projectionDef array (`$c0$`) is interned first and the
+    /// selector list takes the next ordinal (`$c1$`), matching the goldens' emission order. Returns
+    /// `None` when there are no projection slots (no `ngContentSelectors` field is emitted).
+    pub fn intern_content_selectors(&mut self, selectors: &[String]) -> Option<Expr> {
+        if selectors.is_empty() {
+            return None;
+        }
+        let arr = o::literal_arr(
+            selectors
+                .iter()
+                .map(|s| o::literal(o::LiteralValue::String(s.clone()), None))
+                .collect(),
+            None,
+        );
+        let name = self.intern_shared_const(arr);
+        Some(o::variable(name, None))
+    }
+
     /// Lower a binding expression against this view's scope (`ctx` + any in-scope loop variables),
     /// resolving any `{{ … | pipe }}` to a `ɵɵpipeBindN`/`ɵɵpipeBindV` call. Inside a `@for` body it
     /// also rewrites item / `$index` / `$count` reads to their generated locals.
@@ -2137,14 +2161,17 @@ impl TemplateDefinitionBuilder {
 
         let mut statements: Vec<Stmt> = Vec::new();
 
-        // `<ng-content>` projection: when any projection slot was reached, the creation block opens
-        // with a single `ɵɵprojectionDef(...)` (Angular TDB `buildTemplateFunction` prepends it from
-        // `_ngContentReservedSlots`). The common single default-slot case (`<ng-content>` with no
-        // `select`) elides the argument entirely (`ɵɵprojectionDef()`). When specific selectors are
-        // present they are interned as a literal string array in the const pool and that const index
-        // is passed (the precise `parseSelectorToR3Selector` encoding is a larger subsystem — see the
-        // module's i18n/selector scope notes).
-        if !self.all_projection_selectors.is_empty() {
+        // `<ng-content>` projection: the single `ɵɵprojectionDef(...)` is emitted ONLY in the ROOT
+        // view (Angular TDB `buildTemplateFunction` prepends it once, in the component's host view,
+        // from the COMPONENT-GLOBAL `_ngContentReservedSlots` — collected across the whole template
+        // tree, including `<ng-content>` reached inside nested structural/control-flow views; the
+        // selector list was bubbled up from those nested views in `build_embedded_view`). Nested views
+        // never emit their own projectionDef — only the per-slot `ɵɵprojection(...)`. The common
+        // single default-slot case (`<ng-content>` with no `select`, even when it only appears inside
+        // a structural template) still emits a BARE no-arg `ɵɵprojectionDef()` in the root. When
+        // specific selectors are present they are interned as a parsed-selector array in the SHARED
+        // const pool and that `$cN$` reference is passed.
+        if self.is_root && !self.all_projection_selectors.is_empty() {
             // Angular `generateProjectionDefs`: the argument is elided when there is exactly one slot
             // and it is the wildcard (`selectors.length === 1 && selectors[0] === "*"`). Otherwise the
             // selectors array is built in slot order — `"*"` stays `"*"`, every specific selector is
@@ -2448,16 +2475,42 @@ impl TemplateDefinitionBuilder {
             .serialize_attrs_entries(&content.attributes, &[], &[])
             .map(|entries| o::literal_arr(entries, None));
 
-        // `ɵɵprojection(slot, projectionSlotIndex, attrs)` — trailing `null` attrs are trimmed, and a
-        // default projectionSlotIndex of `0` is elided.
+        // Fallback (default) content: `<ng-content>…children…</ng-content>`. Angular compiles the
+        // children into a hoisted `<Base>_ProjectionFallback_<slot>_Template` view function and the
+        // `<ng-content>` reserves a SECOND data slot (the fallback container TNode) right after its
+        // projection anchor — so a projection WITH fallback consumes two slots. The projection
+        // instruction then carries `(slot, selectorIndex, attrs, FallbackFn, fallbackDecls,
+        // fallbackVars)` (`generateProjectionDefs`/`projection` with a fallback view). The fallback
+        // fn name roots at THIS view's base name + the projection anchor's local slot.
+        let fallback = if content.children.is_empty() {
+            None
+        } else {
+            // Reserve the fallback container slot (consumed silently — not an instruction argument).
+            self.allocate_data_slot();
+            let fn_name = format!("{}_ProjectionFallback_{}_Template", self.base_name, slot);
+            let (fn_ref, fb_decls, fb_vars) =
+                self.build_embedded_view(fn_name, content.children.clone(), Vec::new(), Vec::new());
+            Some((fn_ref, fb_decls, fb_vars))
+        };
+
+        // `ɵɵprojection(slot, projectionSlotIndex, attrs[, FallbackFn, decls, vars])` — trailing
+        // `null`/default args are trimmed. When a fallback view is present its fn ref + decls/vars are
+        // appended; the earlier `attrs`/`projectionSlotIndex` args are then NOT trimmed (they are
+        // positionally required ahead of the fallback args, with `null` attrs kept explicit).
         let mut params = vec![
             num(slot as f64),
             num(projection_index as f64),
             attrs_inline.unwrap_or_else(o::null_expr),
         ];
-        trim_trailing_nulls(&mut params);
-        if params.len() == 2 && params[1].is_equivalent(&num(0.0)) {
-            params.pop();
+        if let Some((fn_ref, fb_decls, fb_vars)) = fallback {
+            params.push(fn_ref);
+            params.push(num(fb_decls as f64));
+            params.push(num(fb_vars as f64));
+        } else {
+            trim_trailing_nulls(&mut params);
+            if params.len() == 2 && params[1].is_equivalent(&num(0.0)) {
+                params.pop();
+            }
         }
         self.creation_code.push(instruction(R3::Projection, params));
     }
@@ -3578,10 +3631,23 @@ impl TemplateDefinitionBuilder {
         nested.context_lets = self.context_lets.clone();
         nested.loop_vars = loop_vars;
         nested.update_prelude = update_prelude;
+        // `<ng-content>` projection state is COMPONENT-GLOBAL, not per-view: Angular collects every
+        // projection slot's selector and assigns each a single ascending `projectionSlotIndex` across
+        // the WHOLE template tree (root + every nested structural/control-flow view), and emits the
+        // one `ɵɵprojectionDef(...)` only in the ROOT view. Thread the running counter + selector list
+        // DOWN into the nested view so a `<ng-content>` reached inside it continues the global
+        // numbering, then copy the advanced state back UP so the root's prepended projectionDef sees
+        // all of them.
+        nested.projection_count = self.projection_count;
+        nested.all_projection_selectors = std::mem::take(&mut self.all_projection_selectors);
+        nested.has_default_projection = self.has_default_projection;
         let tmpl_fn = nested.build_template_function(&nested_input);
         let decls = nested.data_index;
         let vars = nested.binding_slots;
         self.var_counter = nested.var_counter;
+        self.projection_count = nested.projection_count;
+        self.all_projection_selectors = std::mem::take(&mut nested.all_projection_selectors);
+        self.has_default_projection = nested.has_default_projection;
         for entry in nested.const_pool.entries() {
             self.const_pool.intern(entry.clone());
         }

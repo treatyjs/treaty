@@ -80,21 +80,16 @@ impl TemplateBuilder for RealTemplateBuilder {
         let consts = builder.const_pool().entries().to_vec();
 
         // `ngContentSelectors` — the component-level projection selector list (Angular's
-        // `compileComponentFromMetadata` emits `asLiteral(meta.template.ngContentSelectors)` when
-        // any `<ng-content>` slot exists). The selectors were collected by the transform into
-        // `meta.template.ng_content_selectors` (`*` for the catch-all default slot).
-        let content_selectors = if meta.template.ng_content_selectors.is_empty() {
-            None
-        } else {
-            Some(o::literal_arr(
-                meta.template
-                    .ng_content_selectors
-                    .iter()
-                    .map(|s| o::literal(o::LiteralValue::String(s.clone()), None))
-                    .collect(),
-                None,
-            ))
-        };
+        // `compileComponentFromMetadata` emits `getConstLiteral(literalArr(ngContentSelectors),
+        // /*forceShared*/ true)` when any `<ng-content>` slot exists). The selectors were collected by
+        // the transform into `meta.template.ng_content_selectors` (`*` for the catch-all default
+        // slot). Angular HOISTS this list into the shared constant pool, so the golden emits
+        // `ngContentSelectors: $cN$` with a top-level `const $cN$ = [...]` — NOT an inline array.
+        // Intern it AFTER `build_template_function` (above) so the `ɵɵprojectionDef` selector array
+        // (`$c0$`) is allocated first and the selector list takes the next ordinal (`$c1$`), matching
+        // the goldens; the hoisted declaration is then surfaced below via `hoisted_functions()`.
+        let content_selectors =
+            builder.intern_content_selectors(&meta.template.ng_content_selectors);
 
         TemplateBuilderResult {
             template_fn,
