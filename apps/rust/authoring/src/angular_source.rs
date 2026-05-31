@@ -9,7 +9,7 @@ use oxc_allocator::Allocator;
 use oxc_ast::ast::{Class, Decorator, Expression, Statement};
 use oxc_parser::Parser;
 use oxc_span::SourceType;
-use render3::source_compile::compile_component_source_with_map;
+use treaty_ivy::source_compile::compile_component_source_with_map;
 
 use crate::plugin::{extract_server_block, rewrite_call_sites, PluginRegistry};
 use crate::source_map::redact_server_bodies_in_map;
@@ -36,7 +36,7 @@ fn map_or_none(map: String) -> Option<String> {
 /// `Component` is the one kind the `render3` source front-end emits today. The remaining kinds
 /// (`Directive` / `Pipe` / `Injectable` / `NgModule`) are recognized so the base-Angular path can
 /// make an informed routing decision, but `render3` has no *source* extractor for them yet — their
-/// metadata-driven emitters in [`render3::pipe_module_injector`] require structured metadata the
+/// metadata-driven emitters in [`treaty_ivy::pipe_module_injector`] require structured metadata the
 /// source front-end does not build. Until that lands, a source carrying only these decorators is a
 /// faithful pass-through (see [`compile_angular_source`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,7 +128,7 @@ fn detect_angular_decorators(source: &str) -> Vec<AngularDecoratorKind> {
 ///
 /// Steps:
 ///   1. [`extract_server_block`] removes any `server { … }` block and parses its functions.
-///   2. `render3::source_compile::compile_component_source` compiles the cleaned client source to a
+///   2. `treaty_ivy::source_compile::compile_component_source` compiles the cleaned client source to a
 ///      `defineComponent`.
 ///   3. When server functions were present, the active backend plugin — the
 ///      [`PluginRegistry`](crate::plugin::PluginRegistry) default (axum + typesafe resource HTTP
@@ -212,7 +212,7 @@ pub fn compile_angular_component_with(
 ///     (server-block aware: a `server { … }` block is lifted and routed through the default
 ///     backend, exactly as before).
 ///   * `@Directive` / `@Pipe` / `@Injectable` / `@NgModule` — `render3` has metadata-driven emitters
-///     for pipes / modules / injectors ([`render3::pipe_module_injector`]) but no *source* extractor
+///     for pipes / modules / injectors ([`treaty_ivy::pipe_module_injector`]) but no *source* extractor
 ///     wiring them up yet, so rather than erroring we emit the source **unchanged** (a faithful
 ///     pass-through) with no diagnostics. When a source extractor for these lands, this is the one
 ///     place to route them through.

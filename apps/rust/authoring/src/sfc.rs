@@ -11,7 +11,7 @@
 //!   JavaScript nodes -> (script, currently unused by render3's template emitter)
 //!   Html nodes       -> template
 //!   Style nodes      -> styles
-//! render3::ml_parser + template_transform -> r3_ast
+//! treaty_ivy::ml_parser + template_transform -> r3_ast
 //! render3 compile_component_from_metadata  -> ɵɵdefineComponent
 //! ```
 //!
@@ -30,14 +30,14 @@ use oxc_ast::ast::Expression;
 use oxc_parser::Parser as JsParser;
 use oxc_span::SourceType;
 
-use render3::compile::{CompiledComponent, RealTemplateBuilder};
-use render3::output::emitter::{emit_expression, emit_expression_with_map};
-use render3::output_ast::{self as o, ParseSourceSpan};
-use render3::template::template_transform::{
+use treaty_ivy::compile::{CompiledComponent, RealTemplateBuilder};
+use treaty_ivy::output::emitter::{emit_expression, emit_expression_with_map};
+use treaty_ivy::output_ast::{self as o, ParseSourceSpan};
+use treaty_ivy::template::template_transform::{
     html_ast_to_render3_ast, BindingParser, Render3ParseOptions,
 };
-use render3::util::{R3CompiledExpression, R3Reference};
-use render3::view::compiler::{
+use treaty_ivy::util::{R3CompiledExpression, R3Reference};
+use treaty_ivy::view::compiler::{
     compile_component_from_metadata, ChangeDetection, ChangeDetectionStrategy, ComponentTemplate,
     DeclarationListEmitMode, Deps, Lifecycle, OrderedMap, R3ComponentDeferMetadata,
     R3ComponentMetadata, R3DirectiveMetadata, R3HostMetadata, R3InputMetadata,
@@ -138,7 +138,7 @@ fn to_pascal_case(file_name: &str) -> String {
 
 /// Recognizes a signal initializer call: `input()`, `input.required()`, `model()`,
 /// `model.required()`, `output()`. Returns the base callee identifier (`input`/`model`/`output`)
-/// and whether `.required` was used. Mirrors `render3::source_compile::signal_call`.
+/// and whether `.required` was used. Mirrors `treaty_ivy::source_compile::signal_call`.
 fn signal_call<'a>(expr: &'a Expression<'a>) -> Option<(&'a str, bool)> {
     let Expression::CallExpression(call) = expr else {
         return None;
@@ -163,7 +163,7 @@ fn signal_call<'a>(expr: &'a Expression<'a>) -> Option<(&'a str, bool)> {
 ///
 /// In the Treaty SFC model the top-level JS *is* the component body, so top-level
 /// `const <name> = input()/input.required()/model()/output()` declarations become the
-/// component's signal inputs/outputs. Mirrors `render3::source_compile` signal extraction:
+/// component's signal inputs/outputs. Mirrors `treaty_ivy::source_compile` signal extraction:
 ///   * `input()`            → signal input
 ///   * `input.required()`   → required signal input
 ///   * `model()`            → signal input + paired `<name>Change` output
@@ -562,7 +562,7 @@ fn run_and_encode_macros(macros: &[String], errors: &mut Vec<String>) -> Option<
 ///
 /// Pipeline (identical to the back half of the `.treaty` path):
 /// ```text
-/// render3::ml_parser::parse(template_html)        -> HTML AST
+/// treaty_ivy::ml_parser::parse(template_html)        -> HTML AST
 /// html_ast_to_render3_ast                          -> r3 AST
 /// resolve_template_dependencies(imports, template) -> auto dependencies
 /// compile_component_from_metadata                  -> ɵɵdefineComponent
@@ -614,11 +614,11 @@ pub fn compile_from_parts_with_directives(
 /// alongside the compiled module.
 ///
 /// The map is produced through render3's source-map emitter
-/// ([`render3::output::emitter::emit_expression_with_map`]) for the lowered `ɵɵdefineComponent`
+/// ([`treaty_ivy::output::emitter::emit_expression_with_map`]) for the lowered `ɵɵdefineComponent`
 /// expression, embedding `source_content` as the map's `sourcesContent[0]` and `source_name` as
 /// its `sources[0]`. `source_content` is the ORIGINAL authoring source text (the verbatim
 /// `.treaty` / `.tjsx` file), so the client map carries the author's source — exactly as the base
-/// `@Component` `.ts` path does via [`render3::source_compile::compile_component_source_with_map`].
+/// `@Component` `.ts` path does via [`treaty_ivy::source_compile::compile_component_source_with_map`].
 ///
 /// The returned `code` is byte-identical to [`compile_from_parts_with_directives`] (the map is
 /// additive and never reprints the module). The second tuple element is `None` only when the
@@ -676,7 +676,7 @@ fn compile_from_parts_inner(
     let is_signal = inputs.iter().any(|(_, m)| m.is_signal);
 
     // 1. Template HTML -> HTML AST.
-    let parse_result = render3::ml_parser::parse(template_html, "template.html");
+    let parse_result = treaty_ivy::ml_parser::parse(template_html, "template.html");
     for e in &parse_result.errors {
         errors.push(e.msg.clone());
     }
@@ -698,9 +698,9 @@ fn compile_from_parts_inner(
     // template (via the selectorless binder) become the component's `dependencies`. Unused imports
     // are not emitted — mirroring `treat-to-ivy.ts`, but via the AST + binder rather than regex.
     let candidates = collect_imported_names(javascript);
-    let selectorless_nodes = render3::compile::parse_template_selectorless(template_html);
+    let selectorless_nodes = treaty_ivy::compile::parse_template_selectorless(template_html);
     let mut declarations =
-        render3::compile::resolve_template_dependencies(&candidates, &selectorless_nodes);
+        treaty_ivy::compile::resolve_template_dependencies(&candidates, &selectorless_nodes);
 
     // Append the front-end-resolved directive dependencies (the JSX directive syntaxes). These were
     // applied as plain attribute markup, which the selectorless binder cannot attribute back to a
@@ -708,7 +708,7 @@ fn compile_from_parts_inner(
     // a `<Foo>` selectorless tag) to keep the dependency list unique.
     for name in extra_directives {
         let already = declarations.iter().any(|d| {
-            matches!(&d.ty.kind, render3::output_ast::ExprKind::ReadVar { name: n } if n == name)
+            matches!(&d.ty.kind, treaty_ivy::output_ast::ExprKind::ReadVar { name: n } if n == name)
         });
         if !already {
             declarations.push(R3TemplateDependencyMetadata {

@@ -70,9 +70,9 @@ const COMPLIANCE_ROOT = path.join(
 const WRITE_REPORT = process.argv.includes('--report');
 const VERBOSE = process.argv.includes('--verbose');
 // `--cargo-dump=<path>`: source the front-end output from a JSON dump produced by the
-// render3 cargo test `corpus_dump::dump_corpus` (a map of corpus-relative input path ->
+// treaty_ivy cargo test `corpus_dump::dump_corpus` (a map of corpus-relative input path ->
 // { code, errors }) INSTEAD of the live NAPI addon. This lets the harness verify the
-// score directly against a freshly-built render3 WITHOUT rebuilding the authoring_node
+// score directly against a freshly-built treaty_ivy WITHOUT rebuilding the authoring_node
 // addon (which links treaty_runtime — pinned during runtime work). Byte-for-byte the same
 // `compile_component_source` output the addon would surface.
 const CARGO_DUMP_ARG = process.argv.find((a) => a.startsWith('--cargo-dump='));

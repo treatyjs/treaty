@@ -5,7 +5,7 @@ edition = "2024"
 
 
 [dependencies]
-render3 = { path = "../../../libs/render3" }
+treaty_ivy = { path = "../../../libs/render3" }
 treaty_runtime = { path = "../../../libs/runtime" }
 oxc = "0.133.0"
 oxc_allocator = "0.133.0"

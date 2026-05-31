@@ -1,8 +1,8 @@
 #[macro_use]
 extern crate napi_derive;
 
-use render3::compile::compile_component as r3_compile_component;
-use render3::source_compile::compile_component_source_with_map as r3_compile_component_source_with_map;
+use treaty_ivy::compile::compile_component as r3_compile_component;
+use treaty_ivy::source_compile::compile_component_source_with_map as r3_compile_component_source_with_map;
 
 /// Normalize render3's empty-string "no map" sentinel into `None` (it never emits `{}`).
 fn map_or_none(map: String) -> Option<String> {

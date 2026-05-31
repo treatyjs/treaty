@@ -17,7 +17,7 @@ name = "treaty"
 path = "src/main.rs"
 
 [dependencies]
-render3 = { path = "../../libs/render3" }
+treaty_ivy = { path = "../../libs/render3" }
 rust_authoring = { path = "../rust/authoring" }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }

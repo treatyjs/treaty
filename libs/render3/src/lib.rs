@@ -1,4 +1,4 @@
-//! `render3` — Treaty's direct-to-Ivy Angular compiler.
+//! `treaty_ivy` — Treaty's direct-to-Ivy Angular compiler.
 //!
 //! Ported from Angular 22.1's `packages/compiler` (vendored at `tools/angular-ref`).
 //! Per-module port specs live in `migration/render3-specs/`; architecture in

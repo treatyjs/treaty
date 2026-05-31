@@ -10,7 +10,7 @@ edition = "2024"
 # the next step. See migration/ROADMAP-PHASE2 + [[treaty-packagr]].
 
 [dependencies]
-render3 = { path = "../render3" }
+treaty_ivy = { path = "../render3" }
 rust_authoring = { path = "../../apps/rust/authoring" }
 oxc_allocator = "0.133.0"
 oxc_ast = "0.133.0"

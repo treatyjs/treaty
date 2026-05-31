@@ -3,7 +3,7 @@
 //! Extension selects the front-end:
 //!   * `.treaty` / `.tsx` / `.tjsx` / `.ts` → [`rust_authoring::compile_file`]
 //!   * anything else is treated as a bare `@Component` TS class and routed
-//!     through [`render3::source_compile::compile_component_source`].
+//!     through [`treaty_ivy::source_compile::compile_component_source`].
 //!
 //! Both real entry points are called directly (no NAPI), proving the CLI is
 //! linked against the committed `render3` + `rust_authoring` crates.
@@ -40,7 +40,7 @@ pub fn compile_source(source: &str, file_name: &str) -> CompileOutput {
             }
         }
         Frontend::Component => {
-            let compiled = render3::source_compile::compile_component_source(source);
+            let compiled = treaty_ivy::source_compile::compile_component_source(source);
             CompileOutput {
                 input,
                 code: compiled.code,

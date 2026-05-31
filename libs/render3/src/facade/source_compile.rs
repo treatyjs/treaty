@@ -3752,14 +3752,14 @@ export class BCmp {}
 // This `#[cfg(test)]` helper walks Angular's vendored compliance corpus, runs
 // `compile_component_source` over every single-input case, and writes a JSON dump
 // (`{ "<corpus-rel-input-path>": {code, errors} }`) to the path named by the
-// `RENDER3_CORPUS_DUMP` env var. `libs/render3/compliance/run-compliance.mjs`
+// `TREATY_IVY_CORPUS_DUMP` env var. `libs/render3/compliance/run-compliance.mjs`
 // consumes it via `--cargo-dump=<path>`, applying the SAME canonicalize/matchGolden
 // logic — so the score is verified against a freshly-built render3 WITHOUT rebuilding
 // the `authoring_node` addon (which links the sibling-edited `treaty_runtime`).
 //
-// It is gated on the env var so a normal `cargo test -p render3` does not require the
+// It is gated on the env var so a normal `cargo test -p treaty_ivy` does not require the
 // corpus to be present. Run with:
-//   RENDER3_CORPUS_DUMP=<abs path> cargo test -p render3 corpus_dump -- --ignored --nocapture
+//   TREATY_IVY_CORPUS_DUMP=<abs path> cargo test -p treaty_ivy corpus_dump -- --ignored --nocapture
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod corpus_dump {
@@ -3823,10 +3823,10 @@ mod corpus_dump {
     }
 
     #[test]
-    #[ignore = "corpus dump; run explicitly with RENDER3_CORPUS_DUMP set"]
+    #[ignore = "corpus dump; run explicitly with TREATY_IVY_CORPUS_DUMP set"]
     fn dump_corpus() {
-        let Ok(dump_path) = std::env::var("RENDER3_CORPUS_DUMP") else {
-            eprintln!("RENDER3_CORPUS_DUMP not set; skipping corpus dump");
+        let Ok(dump_path) = std::env::var("TREATY_IVY_CORPUS_DUMP") else {
+            eprintln!("TREATY_IVY_CORPUS_DUMP not set; skipping corpus dump");
             return;
         };
         // libs/render3 -> repo root -> tools/angular-ref/.../test_cases.

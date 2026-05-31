@@ -47,7 +47,7 @@ pub enum Frontend {
     /// `.treaty` / `.tsx` / `.ts` driven through `rust_authoring::compile_file`.
     Authoring,
     /// A bare `@Component` TypeScript class driven through
-    /// `render3::source_compile::compile_component_source`.
+    /// `treaty_ivy::source_compile::compile_component_source`.
     Component,
 }
 

@@ -3,7 +3,7 @@
 //! Reuses the committed front-ends directly: authoring extensions route through
 //! [`rust_authoring::compile_file`]; anything else is treated as a bare
 //! `@Component` TypeScript class and routed through
-//! [`render3::source_compile::compile_component_source`].
+//! [`treaty_ivy::source_compile::compile_component_source`].
 
 /// The ESM compile result for one entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,7 +31,7 @@ pub fn compile_entry(source: &str, file_name: &str) -> EsmOutput {
             errors: compiled.errors,
         }
     } else {
-        let compiled = render3::source_compile::compile_component_source(source);
+        let compiled = treaty_ivy::source_compile::compile_component_source(source);
         EsmOutput {
             code: compiled.code,
             errors: compiled.errors,
