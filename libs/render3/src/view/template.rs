@@ -39,7 +39,7 @@ use crate::output_ast as o;
 use crate::output_ast::{Expr, FnParam, Stmt, StmtKind, StmtModifier};
 use crate::template::r3_ast::{
     BoundAttribute, BoundEvent, BoundText, Content, DeferredBlock, DeferredBlockTriggers,
-    DeferredTriggerKind, Element, ForLoopBlock, IfBlock, LetDeclaration, Node,
+    DeferredTriggerKind, Element, ForLoopBlock, Icu, IfBlock, LetDeclaration, Node,
     SwitchBlock, SwitchBlockCase, Template, Text, TextAttribute, Visitor,
 };
 
@@ -644,6 +644,295 @@ fn trim_trailing_nulls(params: &mut Vec<Expr>) {
     }
 }
 
+/// One collected interpolation inside an i18n message: the bound expression (lowered later into a
+/// `ɵɵi18nExp` operand, in source order) plus the public placeholder name the registry assigned it
+/// (de-duped by content, so two identical `{{x}}` interpolations share one name).
+struct I18nInterpolation {
+    expr: AstNode,
+    placeholder_name: String,
+}
+
+/// Faithful i18n message collector — the owned analogue of `i18n_parser.ts`'s `_I18nVisitor`.
+///
+/// Walks an `i18n`-marked element's children (and, recursively, the children of nested elements and
+/// control-flow blocks) and builds the [`crate::i18n::Node`] tree, assigning placeholder names via a
+/// single shared [`crate::i18n::PlaceholderRegistry`] (so de-duplication and `_<n>` suffixing match
+/// Angular). The flat interpolation list (`exprs`) preserves source order for `ɵɵi18nExp` emission.
+struct I18nCollector {
+    nodes: Vec<crate::i18n::Node>,
+    exprs: Vec<I18nInterpolation>,
+    registry: crate::i18n::PlaceholderRegistry,
+}
+
+impl I18nCollector {
+    fn new() -> Self {
+        I18nCollector {
+            nodes: Vec::new(),
+            exprs: Vec::new(),
+            registry: crate::i18n::PlaceholderRegistry::new(),
+        }
+    }
+
+    /// Visit a sibling list, appending the produced i18n nodes to `self.nodes`.
+    fn visit_children(&mut self, children: &[Node]) {
+        for child in children {
+            self.visit_node(child);
+        }
+    }
+
+    /// Collect the i18n nodes for a sibling list WITHOUT touching `self.nodes` — used for the
+    /// children of a nested tag/block placeholder, which own their own child vector.
+    fn collect_children(&mut self, children: &[Node]) -> Vec<crate::i18n::Node> {
+        let saved = std::mem::take(&mut self.nodes);
+        self.visit_children(children);
+        std::mem::replace(&mut self.nodes, saved)
+    }
+
+    fn visit_node(&mut self, node: &Node) {
+        use crate::i18n;
+        match node {
+            Node::Text(t) => {
+                self.nodes.push(i18n::Node::Text(i18n::Text {
+                    value: t.value.clone(),
+                }));
+            }
+            Node::BoundText(bt) => self.visit_bound_text(bt),
+            Node::Element(el) => {
+                let attrs = static_attr_pairs(&el.attributes);
+                self.push_tag_placeholder(&el.name, &attrs, el.is_void, &el.children);
+            }
+            Node::Component(c) => {
+                let attrs = static_attr_pairs(&c.attributes);
+                // A selectorless component uses its full tag name (`i18n_parser.ts` `node.fullName`).
+                self.push_tag_placeholder(&c.full_name, &attrs, false, &c.children);
+            }
+            Node::Content(c) => {
+                // `<ng-content>` projects: its tag is `ng-content` (never void here).
+                self.push_tag_placeholder(Content::NAME, &[], false, &c.children);
+            }
+            Node::IfBlock(b) => self.visit_if_block(b),
+            Node::SwitchBlock(b) => self.visit_switch_block(b),
+            Node::ForLoopBlock(b) => self.visit_for_block(b),
+            Node::DeferredBlock(b) => self.visit_deferred_block(b),
+            Node::Icu(icu) => self.visit_icu(icu),
+            // `@let` declarations are update-only and contribute nothing to the message
+            // (`i18n_parser.ts` `visitLetDeclaration` returns `null`).
+            Node::LetDeclaration(_) => {}
+            // Comments, references, variables, raw attribute/event nodes, unknown blocks and the
+            // sub-block markers (handled by their parent) contribute no message content.
+            _ => {}
+        }
+    }
+
+    /// An interpolation `BoundText`: literal segments become `Text`, each expression an
+    /// `INTERPOLATION` `Placeholder` (de-duped by normalized source). Mirrors
+    /// `_visitTextWithInterpolation`.
+    fn visit_bound_text(&mut self, bt: &BoundText) {
+        use crate::i18n;
+        match &bt.value.kind {
+            AstExprKind::Interpolation { strings, expressions } => {
+                for (i, expr) in expressions.iter().enumerate() {
+                    if let Some(s) = strings.get(i) {
+                        if !s.is_empty() {
+                            self.nodes.push(i18n::Node::Text(i18n::Text { value: s.clone() }));
+                        }
+                    }
+                    self.push_interpolation(expr);
+                }
+                if let Some(last) = strings.last() {
+                    if !last.is_empty() {
+                        self.nodes.push(i18n::Node::Text(i18n::Text { value: last.clone() }));
+                    }
+                }
+            }
+            // A bare `{{ expr }}` with no surrounding literal text.
+            _ => self.push_interpolation(&bt.value),
+        }
+    }
+
+    /// Register one interpolation: assign a placeholder name (base `INTERPOLATION`, de-duped on the
+    /// reconstructed expression source), push the `Placeholder` node and record the expression.
+    fn push_interpolation(&mut self, expr: &AstNode) {
+        use crate::i18n;
+        // `i18n_parser.ts`: the registry signature is keyed on the normalized expression text; the
+        // `Placeholder.value` (used by the UID/digest serializer) is that same normalized source.
+        let normalized = ast_to_source(expr);
+        let name = self.registry.placeholder_name("INTERPOLATION", &normalized);
+        self.nodes.push(i18n::Node::Placeholder(i18n::Placeholder {
+            value: normalized,
+            name: name.clone(),
+        }));
+        self.exprs.push(I18nInterpolation {
+            expr: expr.clone(),
+            placeholder_name: name,
+        });
+    }
+
+    /// Emit a `TagPlaceholder` for a nested element/component/`ng-content` (`_visitElementLike`):
+    /// a `START_TAG_*` name (or the bare base when void), the recursively-collected children, and a
+    /// `CLOSE_TAG_*` name when not void.
+    fn push_tag_placeholder(
+        &mut self,
+        tag: &str,
+        attrs: &[(String, String)],
+        is_void: bool,
+        children: &[Node],
+    ) {
+        use crate::i18n;
+        let start_name = self.registry.start_tag_placeholder_name(tag, attrs, is_void);
+        let collected = self.collect_children(children);
+        let close_name = if is_void {
+            String::new()
+        } else {
+            self.registry.close_tag_placeholder_name(tag)
+        };
+        self.nodes.push(i18n::Node::TagPlaceholder(i18n::TagPlaceholder {
+            tag: tag.to_string(),
+            start_name,
+            close_name,
+            children: collected,
+            is_void,
+        }));
+    }
+
+    /// Emit a `BlockPlaceholder` for one control-flow branch/case/body (`visitBlock`): a
+    /// `START_BLOCK_*`/`CLOSE_BLOCK_*` pair (named off the block keyword and its parameters) wrapping
+    /// the recursively-collected children.
+    fn push_block_placeholder(&mut self, name: &str, parameters: Vec<String>, children: &[Node]) {
+        use crate::i18n;
+        let start_name = self
+            .registry
+            .start_block_placeholder_name(name, &parameters);
+        let collected = self.collect_children(children);
+        let close_name = self.registry.close_block_placeholder_name(name);
+        self.nodes
+            .push(i18n::Node::BlockPlaceholder(i18n::BlockPlaceholder {
+                name: name.to_string(),
+                parameters,
+                start_name,
+                close_name,
+                children: collected,
+            }));
+    }
+
+    /// `@if`/`@else if`/`@else` — each branch is its own block (`r3_control_flow.ts`): the first is
+    /// `if`, a later branch with a condition is `else if`, the conditionless tail is `else`.
+    fn visit_if_block(&mut self, block: &IfBlock) {
+        for (i, branch) in block.branches.iter().enumerate() {
+            let (name, params) = if i == 0 {
+                ("if", branch.expression.as_ref().map(|e| ast_to_source(e)).into_iter().collect())
+            } else if branch.expression.is_some() {
+                (
+                    "else if",
+                    branch.expression.as_ref().map(|e| ast_to_source(e)).into_iter().collect(),
+                )
+            } else {
+                ("else", Vec::new())
+            };
+            self.push_block_placeholder(name, params, &branch.children);
+        }
+    }
+
+    /// `@switch` — the switch itself is a `Container` (no placeholder; `i18n_parser.ts` `visitBlock`
+    /// returns a `Container` for `switch`); each `@case`/`@default` group is a `case`/`default`
+    /// block placeholder.
+    fn visit_switch_block(&mut self, block: &SwitchBlock) {
+        use crate::i18n;
+        let mut container_children: Vec<i18n::Node> = Vec::new();
+        for group in &block.groups {
+            // A group can carry several `@case` labels sharing one body; the placeholder name comes
+            // off the (first) label kind — `case` for a value label, `default` for the catch-all.
+            let is_default = group.cases.iter().any(|c| c.expression.is_none());
+            let (name, params): (&str, Vec<String>) = if is_default {
+                ("default", Vec::new())
+            } else {
+                let ps: Vec<String> = group
+                    .cases
+                    .iter()
+                    .filter_map(|c| c.expression.as_ref().map(|e| ast_to_source(e)))
+                    .collect();
+                ("case", ps)
+            };
+            // Collect the group's placeholder into the switch container (the switch produces no
+            // placeholder of its own, so its case blocks nest inside a Container).
+            let saved = std::mem::take(&mut self.nodes);
+            self.push_block_placeholder(name, params, &group.children);
+            let produced = std::mem::replace(&mut self.nodes, saved);
+            container_children.extend(produced);
+        }
+        self.nodes.push(i18n::Node::Container(i18n::Container {
+            children: container_children,
+        }));
+    }
+
+    /// `@for` (+ optional `@empty`) — the loop body is a `for` block placeholder (its parameter is
+    /// the loop's `item of expression` source); `@empty` is an `empty` block placeholder.
+    fn visit_for_block(&mut self, block: &ForLoopBlock) {
+        let expr_src = ast_to_source(&block.expression.ast);
+        let param = format!("{} of {}", block.item.name, expr_src);
+        self.push_block_placeholder("for", vec![param], &block.children);
+        if let Some(empty) = &block.empty {
+            self.push_block_placeholder("empty", Vec::new(), &empty.children);
+        }
+    }
+
+    /// `@defer` (+ `@placeholder`/`@loading`/`@error`) — each is a block placeholder named off its
+    /// keyword. The trigger parameters are not part of the translatable signature here.
+    fn visit_deferred_block(&mut self, block: &DeferredBlock) {
+        self.push_block_placeholder("defer", Vec::new(), &block.children);
+        if let Some(p) = &block.placeholder {
+            self.push_block_placeholder("placeholder", Vec::new(), &p.children);
+        }
+        if let Some(l) = &block.loading {
+            self.push_block_placeholder("loading", Vec::new(), &l.children);
+        }
+        if let Some(e) = &block.error {
+            self.push_block_placeholder("error", Vec::new(), &e.children);
+        }
+    }
+
+    /// An ICU expansion embedded in message content becomes an `IcuPlaceholder` (`i18n_parser.ts`
+    /// `visitExpansion`: a non-top-level ICU yields a placeholder named `ICU`/`ICU_<n>`). The inner
+    /// `Icu` carries the var/case structure recovered from the r3 ICU node; full ICU-case
+    /// serialization (`icu_serializer.ts`) is the reify boundary, so the case bodies are collected
+    /// but the raw switch expression/type are best-effort.
+    fn visit_icu(&mut self, icu: &Icu) {
+        use crate::i18n;
+        let name = self.registry.placeholder_name("ICU", "");
+        let inner = i18n::Icu {
+            expression: String::new(),
+            icu_type: String::new(),
+            cases: Vec::new(),
+            expression_placeholder: None,
+        };
+        // Record the var expressions of the ICU so they still flow into `ɵɵi18nExp` (Angular threads
+        // the ICU's bound vars as expressions). The placeholder text/value stays the ICU sentinel.
+        for (_, bt) in &icu.vars {
+            if let AstExprKind::Interpolation { expressions, .. } = &bt.value.kind {
+                for e in expressions {
+                    self.exprs.push(I18nInterpolation {
+                        expr: e.clone(),
+                        placeholder_name: name.clone(),
+                    });
+                }
+            }
+        }
+        self.nodes.push(i18n::Node::IcuPlaceholder(i18n::IcuPlaceholder {
+            value: inner,
+            name,
+        }));
+    }
+}
+
+/// The static (`name="value"`) attribute pairs of an element, used as the tag-placeholder signature
+/// (`_hashTag`). Bound inputs/outputs are excluded (Angular hashes only the static `attrs` map).
+fn static_attr_pairs(attrs: &[TextAttribute]) -> Vec<(String, String)> {
+    attrs
+        .iter()
+        .map(|a| (a.name.clone(), a.value.clone()))
+        .collect()
+}
+
 /// Whether a child of an `i18n`-marked element emits its OWN create-time op that must be bracketed
 /// inside the i18n block — forcing the open/close `ɵɵi18nStart`/`ɵɵi18nEnd` pair rather than the
 /// collapsed single `ɵɵi18n` instruction (Angular `reify.ts`: a block with no bracketed child create
@@ -663,17 +952,6 @@ fn node_emits_i18n_child_create_op(node: &Node) -> bool {
             | Node::ForLoopBlock(_)
             | Node::IfBlock(_)
     )
-}
-
-/// The i18n placeholder name for the `n`-th interpolation in a message: `INTERPOLATION` for the
-/// first, then `INTERPOLATION_1`, `INTERPOLATION_2`, … — mirroring Angular's `PlaceholderRegistry`
-/// (`i18n_parser.ts`: base name `INTERPOLATION`, de-duped with a numeric suffix).
-fn i18n_interpolation_name(index: usize) -> String {
-    if index == 0 {
-        "INTERPOLATION".to_string()
-    } else {
-        format!("INTERPOLATION_{index}")
-    }
 }
 
 /// The `original_code` template fragment for an i18n interpolation placeholder: the authored
@@ -2411,67 +2689,58 @@ impl TemplateDefinitionBuilder {
 
         let slot = self.allocate_data_slot();
 
-        // Build the i18n Message AST + collect the interpolation expressions (in source order) that
-        // become `ɵɵi18nExp` operands.
-        let mut nodes: Vec<i18n::Node> = Vec::new();
-        let mut exprs: Vec<AstNode> = Vec::new();
-        let mut interp_index = 0usize;
-        for child in children {
-            match child {
-                Node::Text(t) => {
-                    nodes.push(i18n::Node::Text(i18n::Text {
-                        value: t.value.clone(),
-                    }));
-                }
-                Node::BoundText(bt) => {
-                    // A `BoundText` is an interpolation: `["a", "b", …]` strings interleaved with
-                    // `[expr, …]`. Each literal-string segment becomes an i18n Text node, each
-                    // expression an INTERPOLATION placeholder (numbered after the first, matching
-                    // Angular's `PlaceholderRegistry`).
-                    match &bt.value.kind {
-                        AstExprKind::Interpolation { strings, expressions } => {
-                            for (i, expr) in expressions.iter().enumerate() {
-                                if let Some(s) = strings.get(i) {
-                                    if !s.is_empty() {
-                                        nodes.push(i18n::Node::Text(i18n::Text { value: s.clone() }));
-                                    }
-                                }
-                                let name = i18n_interpolation_name(interp_index);
-                                interp_index += 1;
-                                nodes.push(i18n::Node::Placeholder(i18n::Placeholder {
-                                    // `value` is only used by the UID/digest serializer; the raw
-                                    // interpolation source is the faithful choice when available.
-                                    value: String::new(),
-                                    name,
-                                }));
-                                exprs.push(expr.clone());
-                            }
-                            if let Some(last) = strings.last() {
-                                if !last.is_empty() {
-                                    nodes.push(i18n::Node::Text(i18n::Text { value: last.clone() }));
-                                }
-                            }
-                        }
-                        // A bare `{{ expr }}` (no surrounding text).
-                        _ => {
-                            let name = i18n_interpolation_name(interp_index);
-                            interp_index += 1;
-                            nodes.push(i18n::Node::Placeholder(i18n::Placeholder {
-                                value: String::new(),
-                                name,
-                            }));
-                            exprs.push(bt.value.clone());
-                        }
-                    }
-                }
-                // SCOPE BOUNDARY: nested elements (which become `TagPlaceholder` start/close pairs),
-                // ICU expansions (`Icu`/`IcuPlaceholder`) and control-flow blocks inside an i18n block
-                // require the i18n placeholder-registry + ICU-context lowering subsystem (Angular
-                // `i18n/context.ts`/`i18n/meta.ts`), which lives outside this view-function emitter.
-                // Their content is intentionally skipped here; the common text + interpolation case is
-                // fully handled.
-                _ => {}
+        // FAITHFUL message collection over the full child set. A single shared collector walks the
+        // children recursively (mirroring `i18n_parser.ts`'s `_I18nVisitor`): static text → `Text`,
+        // interpolation → an `INTERPOLATION` `Placeholder`, nested element → a `START_TAG_*`/
+        // `CLOSE_TAG_*` `TagPlaceholder`, control-flow block → a `START_BLOCK_*`/`CLOSE_BLOCK_*`
+        // `BlockPlaceholder`, ICU expansion → an `Icu`/`IcuPlaceholder`, and `@let` → nothing
+        // (update-only, no message contribution). Placeholder names come from the ported
+        // [`i18n::PlaceholderRegistry`], so the serialized `$localize`/`goog.getMsg` string and the
+        // decimal-digest message id match Angular byte-for-byte.
+        let mut collector = I18nCollector::new();
+        collector.visit_children(children);
+        let I18nCollector { nodes, exprs, .. } = collector;
+
+        // `@let` declarations among an i18n block's children contribute nothing to the message
+        // (`i18n_parser.ts` `visitLetDeclaration` returns `null`) but are still real update-block
+        // variables: a same-view interpolation that reads the let (`{{result}}` after
+        // `@let result = value * 2`) must resolve to the let's generated local, not `ctx.result`.
+        // Lower the inline (non-external, non-pipe) lets now — before the interpolation operands are
+        // lowered — registering each as an in-scope local so those reads resolve to it. The local
+        // takes the loop-variable `_r<n>` form Angular's i18n goldens spell for a let consumed by an
+        // i18n expression (`const result_r1 = ctx.value * 2;`), distinct from the `$result_0$`
+        // identifier-variable form a let read by a plain `textInterpolate` uses.
+        let let_decls: Vec<&LetDeclaration> = children
+            .iter()
+            .filter_map(|n| match n {
+                Node::LetDeclaration(l) => Some(l),
+                _ => None,
+            })
+            .collect();
+        for decl in &let_decls {
+            // Only the inline shape is in scope here: a let read solely by this view's i18n content,
+            // with no pipe in its value, inlines to a `const <name>_r<n> = <value>;` (no slot, no
+            // `ɵɵstoreLet`). External (cross-view) / pipe-bearing lets need the `ɵɵdeclareLet` +
+            // `ɵɵstoreLet` machinery and stay on the general `build_let_declaration` path.
+            if self.external_lets.contains_key(&decl.name) || let_value_has_pipe(&decl.value) {
+                self.build_let_declaration(decl);
+                continue;
             }
+            let value = self.lower_expr(&decl.value);
+            self.var_counter += 1;
+            let local_name = format!("{}_r{}", sanitize_identifier(&decl.name), self.var_counter);
+            self.update_code.push(Stmt::with_modifiers(
+                StmtKind::DeclareVar {
+                    name: local_name.clone(),
+                    value: Some(value),
+                    ty: None,
+                },
+                StmtModifier::FINAL,
+            ));
+            self.loop_vars.push(LoopVar {
+                source_name: decl.name.clone(),
+                local_name,
+            });
         }
 
         // SCOPE BOUNDARY: the `i18n` attribute value (`meaning|description@@id`) cannot be threaded
@@ -2481,15 +2750,47 @@ impl TemplateDefinitionBuilder {
         // and `compute_msg_id`; until then the metadata is structurally unavailable.
         let message = i18n::Message::new(nodes, "", "", "");
 
-        // Build the placeholder params (`I18nMessageOp.params`): each interpolation maps its public
-        // placeholder name to the runtime magic string `\u{FFFD}<index>\u{FFFD}` plus the authored
-        // template source (`original_code`, reconstructed as `{{ <expr-source> }}`). These feed both
-        // the `goog.getMsg` placeholder/options maps and the `$localize` substitution expressions.
-        let params: Vec<i18n::I18nPlaceholderParam> = (0..exprs.len())
-            .map(|i| i18n::I18nPlaceholderParam {
-                name: i18n_interpolation_name(i),
-                value: format!("\u{FFFD}{i}\u{FFFD}"),
-                original_code: i18n_original_code(&exprs[i]),
+        // Build the interpolation placeholder params (`I18nMessageOp.params`): each interpolation maps
+        // its public placeholder name to the runtime magic string `\u{FFFD}<index>\u{FFFD}` plus the
+        // authored template source (`original_code`, reconstructed as `{{ <expr-source> }}`). These
+        // feed both the `goog.getMsg` placeholder/options maps and the `$localize` substitution
+        // expressions. The collector recorded one interpolation-placeholder name per expression (in
+        // source order), de-duped by content exactly as the registry does, so identical expressions
+        // share a name; we therefore key the param by that recorded name.
+        //
+        // REIFY BOUNDARY: `TagPlaceholder` / `BlockPlaceholder` / `IcuPlaceholder` carry NO param
+        // here. Their runtime substitution value is the sentinel `\u{FFFD}<closeMarker><tagMarker>
+        // <slot><:subTemplateIndex>\u{FFFD}` (Angular `extract_i18n_messages.ts` `formatValue`), which
+        // depends on the data slot allocated to the nested element/template and the sub-template index
+        // of the branch — both produced by the create-op bracketing that the classic TDB does not
+        // perform inside the i18n block (the `ɵɵi18nStart`…`ɵɵi18nEnd` pair currently brackets no child
+        // create ops). The message STRING and ID are fully faithful regardless; only the per-tag/block
+        // runtime substitution value is deferred to the reify phase.
+        // Group the per-expression runtime values by placeholder name (preserving first-seen order),
+        // then collapse each group with `placeholder_values_to_param` so a placeholder that recurs
+        // (two identical interpolations sharing one de-duped name) yields the merged `[v0|v1]` form
+        // Angular's `placeholdersToParams` produces, and a lone placeholder yields the value verbatim.
+        let mut order: Vec<String> = Vec::new();
+        let mut values_by_name: std::collections::HashMap<String, (Vec<String>, String)> =
+            std::collections::HashMap::new();
+        for (i, ie) in exprs.iter().enumerate() {
+            let entry = values_by_name
+                .entry(ie.placeholder_name.clone())
+                .or_insert_with(|| {
+                    order.push(ie.placeholder_name.clone());
+                    (Vec::new(), i18n_original_code(&ie.expr))
+                });
+            entry.0.push(format!("\u{FFFD}{i}\u{FFFD}"));
+        }
+        let params: Vec<i18n::I18nPlaceholderParam> = order
+            .into_iter()
+            .map(|name| {
+                let (values, original_code) = &values_by_name[&name];
+                i18n::I18nPlaceholderParam {
+                    name,
+                    value: i18n::placeholder_values_to_param(values),
+                    original_code: original_code.clone(),
+                }
             })
             .collect();
 
@@ -2522,8 +2823,8 @@ impl TemplateDefinitionBuilder {
             self.allocate_binding_slots(exprs.len());
             self.advance_to(slot);
             self.current_target_slot = slot;
-            for expr in &exprs {
-                let lowered = self.lower_expr(expr);
+            for ie in &exprs {
+                let lowered = self.lower_expr(&ie.expr);
                 self.update_code
                     .push(instruction(R3::I18nExp, vec![lowered]));
             }
@@ -6422,6 +6723,271 @@ mod tests {
         );
         // One interpolation reserves one var slot.
         assert_eq!(builder.vars(), 1, "expected one i18nExp var slot");
+    }
+
+    /// `<div i18n>@let result = name; {{result}}</div>` — a `@let` declared INSIDE an i18n block
+    /// whose interpolation reads it. The let contributes nothing to the message, but its in-view
+    /// local must be declared and the i18n interpolation operand must resolve to that local
+    /// (`result_r1`), NOT `ctx.result` (Angular `let_in_i18n` golden).
+    fn i18n_let_div() -> Vec<Node> {
+        use crate::expression::ast::ExprKind as EK;
+        use crate::template::r3_ast::{I18nMeta, LetDeclaration};
+        let ab = || AbsoluteSourceSpan::new(0, 0);
+        let sp = || ParseSpan::new(0, 0);
+        let read = |name: &str| {
+            AstNode::new(
+                sp(),
+                ab(),
+                EK::PropertyRead {
+                    name_span: ab(),
+                    receiver: Box::new(AstNode::new(sp(), ab(), EK::ImplicitReceiver)),
+                    name: name.to_string(),
+                },
+            )
+        };
+        // `@let result = name;`
+        let let_decl = Node::LetDeclaration(LetDeclaration {
+            name: "result".to_string(),
+            value: read("name"),
+            source_span: t_span(),
+            name_span: t_span(),
+            value_span: t_span(),
+        });
+        // `{{result}}`
+        let interp = AstNode::new(
+            sp(),
+            ab(),
+            EK::Interpolation {
+                strings: vec!["".to_string(), "".to_string()],
+                expressions: vec![read("result")],
+            },
+        );
+        let bound = Node::BoundText(BoundText {
+            value: interp,
+            source_span: t_span(),
+            i18n: None,
+        });
+        vec![Node::Element(Element {
+            name: "div".to_string(),
+            attributes: vec![],
+            inputs: vec![],
+            outputs: vec![],
+            directives: vec![],
+            children: vec![let_decl, bound],
+            references: vec![],
+            is_self_closing: false,
+            source_span: t_span(),
+            start_source_span: t_span(),
+            end_source_span: None,
+            is_void: false,
+            i18n: Some(I18nMeta),
+        })]
+    }
+
+    #[test]
+    fn i18n_let_declaration_lowers_and_interpolation_reads_local() {
+        let input = TemplateCompilationInput::new("Test_Template", i18n_let_div());
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let out = emit_expression(&func);
+
+        // The `@let` is lowered to an in-view local using the loop-variable `_r<n>` form Angular's
+        // i18n goldens spell, and the i18n interpolation reads that local — NOT `ctx.result`.
+        assert!(out.contains("result_r1 = ctx.name"), "expected let local decl, got: {out}");
+        assert!(
+            out.contains("\u{0275}\u{0275}i18nExp(result_r1)"),
+            "expected i18nExp to read the let local, got: {out}"
+        );
+        assert!(
+            !out.contains("\u{0275}\u{0275}i18nExp(ctx.result)"),
+            "i18nExp must resolve the let, not ctx.result, got: {out}"
+        );
+        // The let const must precede the i18nExp in the update block.
+        let pos = |n: &str| out.find(n).unwrap_or_else(|| panic!("missing {n}, got: {out}"));
+        assert!(
+            pos("result_r1 = ctx.name") < pos("\u{0275}\u{0275}i18nExp("),
+            "let const must precede i18nExp, got: {out}"
+        );
+    }
+
+    // -- Faithful i18n message collection over the full child set. --
+
+    /// Build a static `<tag attr="v"?>children</tag>` element node (no i18n marker of its own —
+    /// it is a child of an outer i18n block).
+    fn el(name: &str, attrs: Vec<(&str, &str)>, children: Vec<Node>) -> Node {
+        Node::Element(Element {
+            name: name.to_string(),
+            attributes: attrs
+                .into_iter()
+                .map(|(n, v)| TextAttribute {
+                    name: n.to_string(),
+                    value: v.to_string(),
+                    source_span: t_span(),
+                    key_span: None,
+                    value_span: None,
+                    i18n: None,
+                })
+                .collect(),
+            inputs: vec![],
+            outputs: vec![],
+            directives: vec![],
+            children,
+            references: vec![],
+            is_self_closing: false,
+            source_span: t_span(),
+            start_source_span: t_span(),
+            end_source_span: None,
+            is_void: false,
+            i18n: None,
+        })
+    }
+
+    fn text(value: &str) -> Node {
+        Node::Text(Text {
+            value: value.to_string(),
+            source_span: t_span(),
+        })
+    }
+
+    fn collect_message(children: &[Node]) -> crate::i18n::Message {
+        let mut c = I18nCollector::new();
+        c.visit_children(children);
+        crate::i18n::Message::new(c.nodes, "", "", "")
+    }
+
+    #[test]
+    fn i18n_nested_element_builds_tag_placeholder() {
+        // `Hello <b>{{name}}</b>!` — the nested `<b>` becomes a START_BOLD_TEXT/CLOSE_BOLD_TEXT
+        // TagPlaceholder pair (well-known tag map), with the interpolation inside it.
+        use crate::expression::ast::ExprKind as EK;
+        let ab = || AbsoluteSourceSpan::new(0, 0);
+        let sp = || ParseSpan::new(0, 0);
+        let name_read = AstNode::new(
+            sp(),
+            ab(),
+            EK::PropertyRead {
+                name_span: ab(),
+                receiver: Box::new(AstNode::new(sp(), ab(), EK::ImplicitReceiver)),
+                name: "name".to_string(),
+            },
+        );
+        let interp = AstNode::new(
+            sp(),
+            ab(),
+            EK::Interpolation { strings: vec!["".into(), "".into()], expressions: vec![name_read] },
+        );
+        let children = vec![
+            text("Hello "),
+            el("b", vec![], vec![Node::BoundText(BoundText { value: interp, source_span: t_span(), i18n: None })]),
+            text("!"),
+        ];
+        let msg = collect_message(&children);
+        // `<b>` is well-known → BOLD_TEXT base; START_/CLOSE_ public names startBoldText/closeBoldText.
+        assert_eq!(
+            msg.message_string(),
+            "Hello {$START_BOLD_TEXT}{$INTERPOLATION}{$CLOSE_BOLD_TEXT}!"
+        );
+    }
+
+    #[test]
+    fn i18n_unknown_tag_uses_tag_prefix_and_dedupes() {
+        // Two identical `<span>` open/close pairs: the registry reuses START_TAG_SPAN/CLOSE_TAG_SPAN
+        // for the second occurrence (same signature) rather than suffixing.
+        let children = vec![
+            el("span", vec![], vec![text("a")]),
+            el("span", vec![], vec![text("b")]),
+        ];
+        let msg = collect_message(&children);
+        assert_eq!(
+            msg.message_string(),
+            "{$START_TAG_SPAN}a{$CLOSE_TAG_SPAN}{$START_TAG_SPAN}b{$CLOSE_TAG_SPAN}"
+        );
+    }
+
+    #[test]
+    fn i18n_differing_attrs_get_suffixed_tag_placeholder() {
+        // Two `<span>`s with DIFFERENT static attrs have different signatures, so the second start
+        // tag is suffixed START_TAG_SPAN_1 (the close tag signature is attr-independent, so it is
+        // shared → CLOSE_TAG_SPAN for both).
+        let children = vec![
+            el("span", vec![("class", "a")], vec![]),
+            el("span", vec![("class", "b")], vec![]),
+        ];
+        let msg = collect_message(&children);
+        assert_eq!(
+            msg.message_string(),
+            "{$START_TAG_SPAN}{$CLOSE_TAG_SPAN}{$START_TAG_SPAN_1}{$CLOSE_TAG_SPAN}"
+        );
+    }
+
+    #[test]
+    fn i18n_if_block_builds_block_placeholders() {
+        use crate::expression::ast::ExprKind as EK;
+        use crate::template::r3_ast::{BlockSpans, IfBlockBranch};
+        let ab = || AbsoluteSourceSpan::new(0, 0);
+        let sp = || ParseSpan::new(0, 0);
+        let bs = || BlockSpans {
+            name_span: t_span(),
+            source_span: t_span(),
+            start_source_span: t_span(),
+            end_source_span: None,
+        };
+        let cond = AstNode::new(
+            sp(),
+            ab(),
+            EK::PropertyRead {
+                name_span: ab(),
+                receiver: Box::new(AstNode::new(sp(), ab(), EK::ImplicitReceiver)),
+                name: "show".to_string(),
+            },
+        );
+        // `@if (show) { Yes } @else { No }`.
+        let block = Node::IfBlock(IfBlock {
+            branches: vec![
+                IfBlockBranch {
+                    expression: Some(cond),
+                    children: vec![text("Yes")],
+                    expression_alias: None,
+                    spans: bs(),
+                    i18n: None,
+                },
+                IfBlockBranch {
+                    expression: None,
+                    children: vec![text("No")],
+                    expression_alias: None,
+                    spans: bs(),
+                    i18n: None,
+                },
+            ],
+            spans: bs(),
+        });
+        let msg = collect_message(&[block]);
+        // `if` branch → startBlockIf/closeBlockIf; `else` branch → startBlockElse/closeBlockElse.
+        assert_eq!(
+            msg.message_string(),
+            "{$START_BLOCK_IF}Yes{$CLOSE_BLOCK_IF}{$START_BLOCK_ELSE}No{$CLOSE_BLOCK_ELSE}"
+        );
+    }
+
+    #[test]
+    fn i18n_let_declaration_contributes_nothing() {
+        use crate::template::r3_ast::LetDeclaration;
+        let decl = Node::LetDeclaration(LetDeclaration {
+            name: "x".to_string(),
+            value: AstNode::new(
+                ParseSpan::new(0, 0),
+                AbsoluteSourceSpan::new(0, 0),
+                crate::expression::ast::ExprKind::LiteralPrimitive {
+                    value: crate::expression::ast::LiteralValue::Num(1.0),
+                },
+            ),
+            source_span: t_span(),
+            name_span: t_span(),
+            value_span: t_span(),
+        });
+        let msg = collect_message(&[text("A"), decl, text("B")]);
+        // `@let` is update-only — no placeholder, the surrounding text is unaffected.
+        assert_eq!(msg.message_string(), "AB");
     }
 
     // -- ng-content projection, custom trackBy, multi-label switch, animation bindings. --

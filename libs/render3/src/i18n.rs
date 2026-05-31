@@ -278,6 +278,220 @@ fn serialize_node_for_uid(node: &Node) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// PlaceholderRegistry — ported from i18n/serializers/placeholder.ts
+//
+// Creates unique INTERNAL placeholder names (e.g. `START_TAG_DIV`, `CLOSE_TAG_DIV_1`,
+// `START_BLOCK_IF`, `INTERPOLATION_1`) for the i18n message AST. Identical content (by
+// signature) reuses the same name; differing content gets a `_<n>` numeric suffix. This is
+// the exact algorithm the i18n parser (`i18n_parser.ts`) uses to name `TagPlaceholder` /
+// `BlockPlaceholder` / interpolation `Placeholder` nodes, so the emitted `$localize` /
+// `goog.getMsg` message string and its decimal-digest id match Angular byte-for-byte.
+// ---------------------------------------------------------------------------
+
+/// `placeholder.ts` `TAG_TO_PLACEHOLDER_NAMES` — the well-known HTML tag → base-name map. Tags
+/// absent here use `TAG_<UPPER>` (e.g. `div` → `TAG_DIV`).
+fn tag_to_placeholder_base(upper_tag: &str) -> String {
+    let mapped = match upper_tag {
+        "A" => "LINK",
+        "B" => "BOLD_TEXT",
+        "BR" => "LINE_BREAK",
+        "EM" => "EMPHASISED_TEXT",
+        "H1" => "HEADING_LEVEL1",
+        "H2" => "HEADING_LEVEL2",
+        "H3" => "HEADING_LEVEL3",
+        "H4" => "HEADING_LEVEL4",
+        "H5" => "HEADING_LEVEL5",
+        "H6" => "HEADING_LEVEL6",
+        "HR" => "HORIZONTAL_RULE",
+        "I" => "ITALIC_TEXT",
+        "LI" => "LIST_ITEM",
+        "LINK" => "MEDIA_LINK",
+        "OL" => "ORDERED_LIST",
+        "P" => "PARAGRAPH",
+        "Q" => "QUOTATION",
+        "S" => "STRIKETHROUGH_TEXT",
+        "SMALL" => "SMALL_TEXT",
+        "SUB" => "SUBSTRIPT",
+        "SUP" => "SUPERSCRIPT",
+        "TBODY" => "TABLE_BODY",
+        "TD" => "TABLE_CELL",
+        "TFOOT" => "TABLE_FOOTER",
+        "TH" => "TABLE_HEADER_CELL",
+        "THEAD" => "TABLE_HEADER",
+        "TR" => "TABLE_ROW",
+        "TT" => "MONOSPACED_TEXT",
+        "U" => "UNDERLINED_TEXT",
+        "UL" => "UNORDERED_LIST",
+        _ => return format!("TAG_{upper_tag}"),
+    };
+    mapped.to_string()
+}
+
+/// `placeholder.ts` `PlaceholderRegistry` — assigns unique internal placeholder names, reusing the
+/// same name for identical content (by signature) and appending `_<n>` for collisions.
+#[derive(Debug, Default)]
+pub struct PlaceholderRegistry {
+    name_counts: std::collections::HashMap<String, u32>,
+    signature_to_name: std::collections::HashMap<String, String>,
+}
+
+impl PlaceholderRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// `getStartTagPlaceholderName`. `attrs` are `(name, value)` pairs (order-insensitive: the
+    /// signature sorts them).
+    pub fn start_tag_placeholder_name(
+        &mut self,
+        tag: &str,
+        attrs: &[(String, String)],
+        is_void: bool,
+    ) -> String {
+        let signature = self.hash_tag(tag, attrs, is_void);
+        if let Some(existing) = self.signature_to_name.get(&signature) {
+            return existing.clone();
+        }
+        let upper = tag.to_uppercase();
+        let base = tag_to_placeholder_base(&upper);
+        let name = self.generate_unique_name(&if is_void { base } else { format!("START_{base}") });
+        self.signature_to_name.insert(signature, name.clone());
+        name
+    }
+
+    /// `getCloseTagPlaceholderName`.
+    pub fn close_tag_placeholder_name(&mut self, tag: &str) -> String {
+        let signature = self.hash_closing_tag(tag);
+        if let Some(existing) = self.signature_to_name.get(&signature) {
+            return existing.clone();
+        }
+        let upper = tag.to_uppercase();
+        let base = tag_to_placeholder_base(&upper);
+        let name = self.generate_unique_name(&format!("CLOSE_{base}"));
+        self.signature_to_name.insert(signature, name.clone());
+        name
+    }
+
+    /// `getPlaceholderName` — the interpolation / bound-value placeholder. `name` is the base
+    /// (`INTERPOLATION`), `content` the normalized expression text (the de-dup signature key).
+    pub fn placeholder_name(&mut self, name: &str, content: &str) -> String {
+        let upper = name.to_uppercase();
+        let signature = format!("PH: {upper}={content}");
+        if let Some(existing) = self.signature_to_name.get(&signature) {
+            return existing.clone();
+        }
+        let unique = self.generate_unique_name(&upper);
+        self.signature_to_name.insert(signature, unique.clone());
+        unique
+    }
+
+    /// `getUniquePlaceholder` — used for ICU `VAR_<type>` expression placeholders.
+    pub fn unique_placeholder(&mut self, name: &str) -> String {
+        self.generate_unique_name(&name.to_uppercase())
+    }
+
+    /// `getStartBlockPlaceholderName`. `parameters` are the block's raw parameter expressions
+    /// (order-insensitive: the signature sorts them).
+    pub fn start_block_placeholder_name(&mut self, name: &str, parameters: &[String]) -> String {
+        let signature = self.hash_block(name, parameters);
+        if let Some(existing) = self.signature_to_name.get(&signature) {
+            return existing.clone();
+        }
+        let placeholder =
+            self.generate_unique_name(&format!("START_BLOCK_{}", to_snake_case(name)));
+        self.signature_to_name.insert(signature, placeholder.clone());
+        placeholder
+    }
+
+    /// `getCloseBlockPlaceholderName`.
+    pub fn close_block_placeholder_name(&mut self, name: &str) -> String {
+        let signature = self.hash_closing_block(name);
+        if let Some(existing) = self.signature_to_name.get(&signature) {
+            return existing.clone();
+        }
+        let placeholder =
+            self.generate_unique_name(&format!("CLOSE_BLOCK_{}", to_snake_case(name)));
+        self.signature_to_name.insert(signature, placeholder.clone());
+        placeholder
+    }
+
+    /// `_hashTag` — `<tag {sorted attrs}></tag>` (or `/>` when void). Attribute order does not
+    /// affect the signature.
+    fn hash_tag(&self, tag: &str, attrs: &[(String, String)], is_void: bool) -> String {
+        let start = format!("<{tag}");
+        let mut sorted: Vec<&(String, String)> = attrs.iter().collect();
+        sorted.sort_by(|a, b| a.0.cmp(&b.0));
+        let str_attrs: String = sorted
+            .iter()
+            .map(|(name, value)| format!(" {name}={value}"))
+            .collect();
+        let end = if is_void {
+            "/>".to_string()
+        } else {
+            format!("></{tag}>")
+        };
+        format!("{start}{str_attrs}{end}")
+    }
+
+    /// `_hashClosingTag` — `_hashTag('/tag', {}, false)`.
+    fn hash_closing_tag(&self, tag: &str) -> String {
+        self.hash_tag(&format!("/{tag}"), &[], false)
+    }
+
+    /// `_hashBlock` — `@name( sorted params )? {}`.
+    fn hash_block(&self, name: &str, parameters: &[String]) -> String {
+        let params = if parameters.is_empty() {
+            String::new()
+        } else {
+            let mut sorted: Vec<&String> = parameters.iter().collect();
+            sorted.sort();
+            let joined: Vec<String> = sorted.into_iter().cloned().collect();
+            format!(" ({})", joined.join("; "))
+        };
+        format!("@{name}{params} {{}}")
+    }
+
+    /// `_hashClosingBlock` — `_hashBlock('close_' + name, [])`.
+    fn hash_closing_block(&self, name: &str) -> String {
+        self.hash_block(&format!("close_{name}"), &[])
+    }
+
+    /// `_generateUniqueName` — first use returns the base, repeats get `<base>_<n>`.
+    fn generate_unique_name(&mut self, base: &str) -> String {
+        match self.name_counts.get(base).copied() {
+            None => {
+                self.name_counts.insert(base.to_string(), 1);
+                base.to_string()
+            }
+            Some(id) => {
+                self.name_counts.insert(base.to_string(), id + 1);
+                format!("{base}_{id}")
+            }
+        }
+    }
+}
+
+/// `placeholder.ts` `_toSnakeCase` — upper-case, then map any non `[A-Z0-9]` to `_`.
+fn to_snake_case(name: &str) -> String {
+    name.to_uppercase()
+        .chars()
+        .map(|c| if c.is_ascii_uppercase() || c.is_ascii_digit() { c } else { '_' })
+        .collect()
+}
+
+/// `util.ts` `placeholdersToParams` — collapse a placeholder's accumulated values into the single
+/// literal the `goog.getMsg` / `$localize` param map stores: a lone value verbatim, or the merged
+/// `[a|b|…]` form when a placeholder name repeats (e.g. an element opened and closed in the same
+/// `$localize` substitution, or the same tag appearing twice).
+pub fn placeholder_values_to_param(values: &[String]) -> String {
+    if values.len() > 1 {
+        format!("[{}]", values.join("|"))
+    } else {
+        values.first().cloned().unwrap_or_default()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // i18n meta parsing — ported from render3/view/i18n/meta.ts
 // ---------------------------------------------------------------------------
 
@@ -884,6 +1098,71 @@ mod tests {
         // For a single text node the UID serialization is just the text.
         assert_eq!(msg.decimal_digest(), compute_msg_id("Hello", ""));
         assert_eq!(msg.message_string(), "Hello");
+    }
+
+    #[test]
+    fn placeholder_registry_tag_names_and_dedup() {
+        let mut reg = PlaceholderRegistry::new();
+        // Well-known tag → mapped base; unknown → TAG_<UPPER>.
+        assert_eq!(reg.start_tag_placeholder_name("b", &[], false), "START_BOLD_TEXT");
+        assert_eq!(reg.close_tag_placeholder_name("b"), "CLOSE_BOLD_TEXT");
+        assert_eq!(reg.start_tag_placeholder_name("span", &[], false), "START_TAG_SPAN");
+        // Identical signature reuses the same name.
+        assert_eq!(reg.start_tag_placeholder_name("span", &[], false), "START_TAG_SPAN");
+        // Different attrs → different signature → suffixed.
+        assert_eq!(
+            reg.start_tag_placeholder_name("span", &[("class".into(), "x".into())], false),
+            "START_TAG_SPAN_1"
+        );
+        // Void tag uses the base name with no START_ prefix.
+        assert_eq!(reg.start_tag_placeholder_name("br", &[], true), "LINE_BREAK");
+    }
+
+    #[test]
+    fn placeholder_registry_block_and_interpolation_names() {
+        let mut reg = PlaceholderRegistry::new();
+        assert_eq!(reg.start_block_placeholder_name("if", &["a".into()]), "START_BLOCK_IF");
+        assert_eq!(reg.close_block_placeholder_name("if"), "CLOSE_BLOCK_IF");
+        assert_eq!(reg.start_block_placeholder_name("else if", &["b".into()]), "START_BLOCK_ELSE_IF");
+        // Interpolations de-dupe on content.
+        assert_eq!(reg.placeholder_name("INTERPOLATION", "name"), "INTERPOLATION");
+        assert_eq!(reg.placeholder_name("INTERPOLATION", "name"), "INTERPOLATION");
+        assert_eq!(reg.placeholder_name("INTERPOLATION", "other"), "INTERPOLATION_1");
+    }
+
+    #[test]
+    fn placeholder_values_merge_form() {
+        assert_eq!(placeholder_values_to_param(&["\u{FFFD}0\u{FFFD}".into()]), "\u{FFFD}0\u{FFFD}");
+        assert_eq!(
+            placeholder_values_to_param(&["\u{FFFD}#1\u{FFFD}".into(), "\u{FFFD}/#1\u{FFFD}".into()]),
+            "[\u{FFFD}#1\u{FFFD}|\u{FFFD}/#1\u{FFFD}]"
+        );
+        assert_eq!(placeholder_values_to_param(&[]), "");
+    }
+
+    #[test]
+    fn tag_placeholder_message_and_digest() {
+        // A message with a nested `<b>` tag placeholder serializes both the localize string and the
+        // UID digest form faithfully.
+        let msg = Message::new(
+            vec![
+                Node::Text(Text { value: "Hello ".into() }),
+                Node::TagPlaceholder(TagPlaceholder {
+                    tag: "b".into(),
+                    start_name: "START_BOLD_TEXT".into(),
+                    close_name: "CLOSE_BOLD_TEXT".into(),
+                    children: vec![Node::Text(Text { value: "world".into() })],
+                    is_void: false,
+                }),
+            ],
+            "",
+            "",
+            "",
+        );
+        assert_eq!(msg.message_string(), "Hello {$START_BOLD_TEXT}world{$CLOSE_BOLD_TEXT}");
+        // The decimal digest is computed over the UID serialization (stable, decimal).
+        let id = msg.decimal_digest();
+        assert!(id.chars().all(|c| c.is_ascii_digit()) && !id.is_empty());
     }
 
     #[test]
