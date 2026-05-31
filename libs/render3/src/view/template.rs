@@ -644,6 +644,27 @@ fn trim_trailing_nulls(params: &mut Vec<Expr>) {
     }
 }
 
+/// Whether a child of an `i18n`-marked element emits its OWN create-time op that must be bracketed
+/// inside the i18n block — forcing the open/close `ɵɵi18nStart`/`ɵɵi18nEnd` pair rather than the
+/// collapsed single `ɵɵi18n` instruction (Angular `reify.ts`: a block with no bracketed child create
+/// ops reifies to `ɵɵi18n`). Static text and interpolations are folded into the message itself and
+/// `@let` declarations are update-only, so none of those force the bracketed form; nested elements,
+/// templates/components, projected content, control-flow blocks and ICU expansions do.
+fn node_emits_i18n_child_create_op(node: &Node) -> bool {
+    matches!(
+        node,
+        Node::Element(_)
+            | Node::Template(_)
+            | Node::Component(_)
+            | Node::Content(_)
+            | Node::Icu(_)
+            | Node::DeferredBlock(_)
+            | Node::SwitchBlock(_)
+            | Node::ForLoopBlock(_)
+            | Node::IfBlock(_)
+    )
+}
+
 /// The i18n placeholder name for the `n`-th interpolation in a message: `INTERPOLATION` for the
 /// first, then `INTERPOLATION_1`, `INTERPOLATION_2`, … — mirroring Angular's `PlaceholderRegistry`
 /// (`i18n_parser.ts`: base name `INTERPOLATION`, de-duped with a numeric suffix).
@@ -2373,7 +2394,9 @@ impl TemplateDefinitionBuilder {
     /// element's text/interpolation children, allocates a data slot for the i18n block, interns the
     /// `$localize` message expression into the const pool, and emits:
     ///
-    ///   - creation: `ɵɵi18nStart(slot, constIndex)` … `ɵɵi18nEnd()`.
+    ///   - creation: a single `ɵɵi18n(slot, constIndex)` when the block is self-contained (text +
+    ///     interpolation only), or the open/close pair `ɵɵi18nStart(slot, constIndex)` …
+    ///     `ɵɵi18nEnd()` when it brackets child create ops (nested elements / blocks / ICU).
     ///   - update (one per interpolation, in order): `ɵɵi18nExp(<expr>)`, then a single
     ///     `ɵɵi18nApply(slot)` after an `ɵɵadvance` to the block slot.
     ///
@@ -2472,12 +2495,26 @@ impl TemplateDefinitionBuilder {
 
         let const_index = self.intern_i18n_message(&message, &params);
 
-        // Creation block: `ɵɵi18nStart(slot, constIndex)` … `ɵɵi18nEnd()`.
-        self.creation_code.push(instruction(
-            R3::I18nStart,
-            vec![num(slot as f64), num(const_index as f64)],
-        ));
-        self.creation_code.push(instruction(R3::I18nEnd, vec![]));
+        // Creation block. Angular's `reify.ts` emits a SINGLE `ɵɵi18n(slot, constIndex)` for a
+        // self-contained i18n block — one whose translatable content is only static text and `{{ }}`
+        // interpolations (no nested element/template/control-flow ops that would need their own
+        // create instructions bracketed inside the block). When the block DOES bracket child create
+        // ops it instead emits the open/close pair `ɵɵi18nStart(slot, constIndex)` … `ɵɵi18nEnd()`.
+        // (`@let` declarations are update-only — they emit no create op — so they do not force the
+        // bracketed form.)
+        let needs_bracket = children.iter().any(node_emits_i18n_child_create_op);
+        if needs_bracket {
+            self.creation_code.push(instruction(
+                R3::I18nStart,
+                vec![num(slot as f64), num(const_index as f64)],
+            ));
+            self.creation_code.push(instruction(R3::I18nEnd, vec![]));
+        } else {
+            self.creation_code.push(instruction(
+                R3::I18n,
+                vec![num(slot as f64), num(const_index as f64)],
+            ));
+        }
 
         // Update block: one `ɵɵi18nExp(<expr>)` per interpolation, then a single `ɵɵi18nApply(slot)`.
         // Each interpolation reserves one binding (var) slot (Angular `i18nExp` → one var).
@@ -6329,33 +6366,35 @@ mod tests {
     }
 
     #[test]
-    fn i18n_static_emits_i18n_start_end() {
+    fn i18n_static_emits_single_i18n() {
         let input = TemplateCompilationInput::new("Test_Template", i18n_static_div());
         let mut builder = TemplateDefinitionBuilder::new(&input);
         let func = builder.build_template_function(&input);
         let out = emit_expression(&func);
 
-        // The element wrapper plus the i18n block creation instructions.
+        // A self-contained i18n block (static text only, no bracketed child create ops) collapses
+        // to a SINGLE `ɵɵi18n(slot, const)` instruction (Angular `reify.ts`) — not the open/close
+        // `ɵɵi18nStart`/`ɵɵi18nEnd` pair.
         assert!(out.contains("\u{0275}\u{0275}domElementStart"), "got: {out}");
-        assert!(out.contains("\u{0275}\u{0275}i18nStart("), "missing ɵɵi18nStart, got: {out}");
-        assert!(out.contains("\u{0275}\u{0275}i18nEnd("), "missing ɵɵi18nEnd, got: {out}");
+        assert!(out.contains("\u{0275}\u{0275}i18n("), "missing ɵɵi18n, got: {out}");
+        assert!(!out.contains("\u{0275}\u{0275}i18nStart("), "unexpected ɵɵi18nStart, got: {out}");
+        assert!(!out.contains("\u{0275}\u{0275}i18nEnd("), "unexpected ɵɵi18nEnd, got: {out}");
         assert!(out.contains("\u{0275}\u{0275}domElementEnd"), "got: {out}");
         // No interpolation → no i18nExp / i18nApply.
         assert!(!out.contains("\u{0275}\u{0275}i18nExp"), "unexpected ɵɵi18nExp, got: {out}");
-        // i18nStart/i18nEnd must land INSIDE the element block.
+        // The `ɵɵi18n` instruction must land INSIDE the element block.
         let pos = |n: &str| out.find(n).unwrap_or_else(|| panic!("missing {n}, got: {out}"));
         assert!(
             pos("\u{0275}\u{0275}domElementStart")
-                < pos("\u{0275}\u{0275}i18nStart(")
-                && pos("\u{0275}\u{0275}i18nStart(") < pos("\u{0275}\u{0275}i18nEnd(")
-                && pos("\u{0275}\u{0275}i18nEnd(") < pos("\u{0275}\u{0275}domElementEnd"),
-            "expected domElementStart < i18nStart < i18nEnd < domElementEnd, got: {out}"
+                < pos("\u{0275}\u{0275}i18n(")
+                && pos("\u{0275}\u{0275}i18n(") < pos("\u{0275}\u{0275}domElementEnd"),
+            "expected domElementStart < i18n < domElementEnd, got: {out}"
         );
         // Slots: div (0) + i18n block (1). The message is interned into the const pool.
         assert_eq!(builder.data_index(), 2, "expected element + i18n block slots");
         assert_eq!(builder.const_pool().entries().len(), 1, "message const");
-        // The const-index argument of i18nStart is the message's const-pool slot (0).
-        assert!(out.contains("\u{0275}\u{0275}i18nStart(1, 0)"), "got: {out}");
+        // The const-index argument of i18n is the message's const-pool slot (0).
+        assert!(out.contains("\u{0275}\u{0275}i18n(1, 0)"), "got: {out}");
     }
 
     #[test]
@@ -6365,9 +6404,10 @@ mod tests {
         let func = builder.build_template_function(&input);
         let out = emit_expression(&func);
 
-        // Creation: i18nStart/i18nEnd around the element content.
-        assert!(out.contains("\u{0275}\u{0275}i18nStart("), "missing ɵɵi18nStart, got: {out}");
-        assert!(out.contains("\u{0275}\u{0275}i18nEnd("), "missing ɵɵi18nEnd, got: {out}");
+        // Creation: a self-contained interpolation-only block collapses to a single `ɵɵi18n`.
+        assert!(out.contains("\u{0275}\u{0275}i18n("), "missing ɵɵi18n, got: {out}");
+        assert!(!out.contains("\u{0275}\u{0275}i18nStart("), "unexpected ɵɵi18nStart, got: {out}");
+        assert!(!out.contains("\u{0275}\u{0275}i18nEnd("), "unexpected ɵɵi18nEnd, got: {out}");
         // Update: i18nExp for the interpolation operand, then i18nApply, with the bound expr on ctx.
         assert!(out.contains("\u{0275}\u{0275}i18nExp("), "missing ɵɵi18nExp, got: {out}");
         assert!(out.contains("\u{0275}\u{0275}i18nApply("), "missing ɵɵi18nApply, got: {out}");

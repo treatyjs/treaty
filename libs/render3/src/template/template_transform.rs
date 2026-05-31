@@ -131,6 +131,12 @@ fn classify_attr_prefix(name: &str) -> Option<(AttrKind, &'static str, &str)> {
     None
 }
 
+/// `isLegacyAnimationLabel(name)` (`template_parser/binding_parser.ts`): a name beginning with
+/// `@` denotes a legacy (synthetic) animation trigger.
+fn is_legacy_animation_label(name: &str) -> bool {
+    name.starts_with('@')
+}
+
 const BANANA_BOX: (&str, &str) = ("[(", ")]");
 const PROPERTY: (&str, &str) = ("[", "]");
 const EVENT: (&str, &str) = ("(", ")");
@@ -2050,7 +2056,16 @@ impl BindingParser {
         }
     }
 
-    /// `parseLiteralAttr` — append a literal (`@`-prefixed) `ParsedProperty`.
+    /// `parseLiteralAttr` — handle a bare `@`-prefixed attribute (`@bar`, `@bar="exp"`).
+    ///
+    /// Faithful to `template_parser/binding_parser.ts`: an `@`-prefixed name is a legacy
+    /// animation label (`isLegacyAnimationLabel`). It is illegal to assign such a trigger an
+    /// expression via `@prop="exp"` (use `[@prop]="exp"` instead), so a non-empty value is an
+    /// error. The trigger is then lowered through `_parseLegacyAnimation`: with no value the
+    /// expression defaults to `undefined`, producing a `LegacyAnimation` `ParsedProperty` that
+    /// `createBoundElementProperty` turns into a `@`-named property binding
+    /// (`ɵɵproperty("@bar", undefined)`) — never a static const-pool attribute. Any other name
+    /// is a true literal attribute.
     #[allow(clippy::too_many_arguments)]
     pub fn parse_literal_attr(
         &mut self,
@@ -2062,6 +2077,29 @@ impl BindingParser {
         parsed_properties: &mut Vec<ParsedProperty>,
         key_span: &ParseSourceSpan,
     ) {
+        if is_legacy_animation_label(name) {
+            if !value.is_empty() {
+                self.errors.push(ParseError {
+                    span: source_span.clone(),
+                    msg: "Assigning animation triggers via @prop=\"exp\" attributes with an \
+                          expression is invalid. Use property bindings (e.g. [@prop]=\"exp\") or \
+                          use an attribute without a value (e.g. @prop) instead."
+                        .to_string(),
+                    level: ParseErrorLevel::Error,
+                    element_name: None,
+                });
+            }
+            self.parse_legacy_animation(
+                name,
+                value,
+                source_span,
+                absolute_offset,
+                value_span,
+                parsed_properties,
+                key_span,
+            );
+            return;
+        }
         let location = format!("{}", source_span.start.offset);
         let aws = self
             .parser
@@ -2070,6 +2108,42 @@ impl BindingParser {
             name: name.to_string(),
             expression: aws,
             ty: ParsedPropertyType::LiteralAttr,
+            source_span: to_offset_span(source_span),
+            key_span: to_offset_span(key_span),
+            value_span: to_offset_span_opt(value_span),
+        });
+    }
+
+    /// `_parseLegacyAnimation` — a `@trigger` (no value) or `[@trigger]="exp"`. With no
+    /// expression the binding defaults to `undefined` (Angular: `expression || 'undefined'`),
+    /// since `*`/`void` states are applied by the runtime on attach/detach. The full `@`-prefixed
+    /// name is kept so the emitter recognizes it as a synthetic legacy-animation property binding
+    /// (`ɵɵproperty("@name", …)`) and keeps it out of the static-attribute const pool.
+    #[allow(clippy::too_many_arguments)]
+    fn parse_legacy_animation(
+        &mut self,
+        name: &str,
+        expression: &str,
+        source_span: &ParseSourceSpan,
+        absolute_offset: i32,
+        value_span: &Option<ParseSourceSpan>,
+        parsed_properties: &mut Vec<ParsedProperty>,
+        key_span: &ParseSourceSpan,
+    ) {
+        let span = value_span.as_ref().unwrap_or(source_span);
+        let offset_span = to_offset_span(span);
+        let expr = if expression.is_empty() {
+            "undefined"
+        } else {
+            expression
+        };
+        let aws = self.parser.parse_binding(expr, offset_span, absolute_offset);
+        let errs = aws.errors.clone();
+        self.record_expr_errors(&errs, source_span);
+        parsed_properties.push(ParsedProperty {
+            name: name.to_string(),
+            expression: aws,
+            ty: ParsedPropertyType::LegacyAnimation,
             source_span: to_offset_span(source_span),
             key_span: to_offset_span(key_span),
             value_span: to_offset_span_opt(value_span),
