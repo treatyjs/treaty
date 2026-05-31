@@ -2187,7 +2187,7 @@ fn chains_onto(first: &Expr, next: &Expr) -> bool {
 /// applied to the prior `Invoke` expression, i.e. `callee(args0)(args1)(args2)…`. Single-element
 /// runs (and any non-call statement, e.g. an interleaved `ɵɵadvance`) pass through unchanged —
 /// which is exactly what breaks a run, so distinct instructions are never chained together.
-fn chain_statements(stmts: Vec<Stmt>) -> Vec<Stmt> {
+pub fn chain_statements(stmts: Vec<Stmt>) -> Vec<Stmt> {
     let mut out: Vec<Stmt> = Vec::with_capacity(stmts.len());
     let mut iter = stmts.into_iter().peekable();
 

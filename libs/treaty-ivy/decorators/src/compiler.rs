@@ -37,6 +37,7 @@ use crate::output_ast::{
 };
 use crate::template::r3_ast as t;
 use crate::util::{ts_ignore_comment, type_with_parameters, R3CompiledExpression, R3Reference};
+use crate::view::template::chain_statements;
 
 /// A tiny insertion-ordered map (stand-in for `indexmap::IndexMap`, which is not a workspace
 /// dependency). Iteration / serialization order is the insertion order — this is golden-observable
@@ -1060,29 +1061,51 @@ impl HostBindingsBuilder for DefaultHostBindingsBuilder {
         //   `style.X` → ɵɵstyleProp('X', value)
         //   `@X`      → ɵɵsyntheticHostProperty('X', value)
         //   else      → ɵɵdomProperty('name', value)
-        // Each binding consumes one host var slot.
+        //
+        // Angular's `StylingBuilder` buffers `style.X`/`class.X` host bindings SEPARATELY from the
+        // regular property bindings and flushes them together at the END of the update block — all
+        // `ɵɵstyleProp` first, then all `ɵɵclassProp` — regardless of their source order relative to
+        // the regular bindings or each other (`host_bindings.ts` styling flush order). So emit the
+        // regular (`attribute`/`domProperty`/`syntheticHostProperty`) bindings in source order, then
+        // the buffered style bindings, then the buffered class bindings. `chain_statements` (below)
+        // then folds each homogeneous run into a single chained call.
+        //
+        // Host-var accounting (Angular `bindingCount`): a regular binding reserves ONE host var; a
+        // `style.X`/`class.X` styling binding reserves TWO (the bound value plus styling bookkeeping).
+        let mut style_stmts: Vec<Stmt> = Vec::new();
+        let mut class_stmts: Vec<Stmt> = Vec::new();
         for (prop, value_src) in host.properties.iter() {
             let converted = lower_host_property_value(value_src);
-            // Any temporaries the lowering spilled (e.g. for safe-navigation) must be emitted into
-            // the UPDATE block before the instruction that consumes the resulting value.
-            update_stmts.extend(converted.stmts);
             let value = converted.expr;
-            host_vars += 1;
+            let spill = converted.stmts;
 
+            if let Some(cls) = prop.strip_prefix("class.") {
+                host_vars += 2;
+                class_stmts.extend(spill);
+                class_stmts.push(host_instruction(
+                    R3::ClassProp,
+                    vec![o::literal(LiteralValue::String(cls.to_string()), None), value],
+                ));
+                continue;
+            }
+            if let Some(sty) = prop.strip_prefix("style.") {
+                host_vars += 2;
+                style_stmts.extend(spill);
+                style_stmts.push(host_instruction(
+                    R3::StyleProp,
+                    vec![o::literal(LiteralValue::String(sty.to_string()), None), value],
+                ));
+                continue;
+            }
+
+            // Regular binding: spilled temporaries precede the instruction (Angular emits the
+            // safe-navigation temp assignment before the consuming op), one host var each.
+            host_vars += 1;
+            update_stmts.extend(spill);
             let stmt = if let Some(attr) = prop.strip_prefix("attr.") {
                 host_instruction(
                     R3::Attribute,
                     vec![o::literal(LiteralValue::String(attr.to_string()), None), value],
-                )
-            } else if let Some(cls) = prop.strip_prefix("class.") {
-                host_instruction(
-                    R3::ClassProp,
-                    vec![o::literal(LiteralValue::String(cls.to_string()), None), value],
-                )
-            } else if let Some(sty) = prop.strip_prefix("style.") {
-                host_instruction(
-                    R3::StyleProp,
-                    vec![o::literal(LiteralValue::String(sty.to_string()), None), value],
                 )
             } else if let Some(synthetic) = prop.strip_prefix('@') {
                 host_instruction(
@@ -1097,6 +1120,9 @@ impl HostBindingsBuilder for DefaultHostBindingsBuilder {
             };
             update_stmts.push(stmt);
         }
+        // Styling flush: all style bindings, then all class bindings (Angular's styling order).
+        update_stmts.extend(style_stmts);
+        update_stmts.extend(class_stmts);
 
         // hostVars (only when > 0).
         if host_vars > 0 {
@@ -1109,6 +1135,13 @@ impl HostBindingsBuilder for DefaultHostBindingsBuilder {
         if create_stmts.is_empty() && update_stmts.is_empty() {
             return None;
         }
+
+        // Fold consecutive chainable instructions into a single chained call, exactly as the
+        // template builder does for element-level bindings (Angular `chainOperationsInList`):
+        // `ɵɵclassProp("a", …)("b", …)("c", …)`, `ɵɵstyleProp(…)(…)`, `ɵɵlistener(…)(…)`, etc.
+        // A spilled temporary statement (safe-navigation lowering) breaks a run, matching Angular.
+        let create_stmts = chain_statements(create_stmts);
+        let update_stmts = chain_statements(update_stmts);
 
         let mut body: Vec<Stmt> = Vec::new();
         if !create_stmts.is_empty() {
@@ -2776,7 +2809,10 @@ mod tests {
     #[test]
     fn host_attr_class_style_route_to_specialized_instructions() {
         // `[attr.role]`, `[class.active]`, `[style.width]` route to ɵɵattribute / ɵɵclassProp /
-        // ɵɵstyleProp respectively, and each consumes one host var.
+        // ɵɵstyleProp respectively. Host-var accounting (Angular `bindingCount`): a regular binding
+        // (attribute) reserves ONE host var; a `class.X`/`style.X` styling binding reserves TWO. So
+        // 1 + 2 + 2 = 5 (this is why the `host_class_binding_special_chars` golden — 3 class bindings
+        // — reports `hostVars: 6`).
         let mut meta = directive_meta("D", "[d]");
         meta.host.properties.insert("attr.role".to_string(), "r".to_string());
         meta.host.properties.insert("class.active".to_string(), "isActive".to_string());
@@ -2787,11 +2823,14 @@ mod tests {
         assert!(js.contains("ɵɵattribute"), "missing ɵɵattribute: {js}");
         assert!(js.contains("ɵɵclassProp"), "missing ɵɵclassProp: {js}");
         assert!(js.contains("ɵɵstyleProp"), "missing ɵɵstyleProp: {js}");
-        // 3 bindings → hostVars: 3.
         assert!(
-            js.contains("hostVars: 3") || js.contains("hostVars:3"),
-            "expected hostVars: 3: {js}"
+            js.contains("hostVars: 5") || js.contains("hostVars:5"),
+            "expected hostVars: 5 (attr=1 + class=2 + style=2): {js}"
         );
+        // The styling flush groups styleProp before classProp regardless of source order.
+        let style_at = js.find("ɵɵstyleProp").expect("styleProp");
+        let class_at = js.find("ɵɵclassProp").expect("classProp");
+        assert!(style_at < class_at, "styleProp must precede classProp in the flush: {js}");
     }
 
     #[test]
