@@ -3752,9 +3752,9 @@ export class BCmp {}
 // This `#[cfg(test)]` helper walks Angular's vendored compliance corpus, runs
 // `compile_component_source` over every single-input case, and writes a JSON dump
 // (`{ "<corpus-rel-input-path>": {code, errors} }`) to the path named by the
-// `TREATY_IVY_CORPUS_DUMP` env var. `libs/render3/compliance/run-compliance.mjs`
+// `TREATY_IVY_CORPUS_DUMP` env var. `libs/treaty-ivy/facade/compliance/run-compliance.mjs`
 // consumes it via `--cargo-dump=<path>`, applying the SAME canonicalize/matchGolden
-// logic — so the score is verified against a freshly-built render3 WITHOUT rebuilding
+// logic — so the score is verified against a freshly-built treaty_ivy WITHOUT rebuilding
 // the `authoring_node` addon (which links the sibling-edited `treaty_runtime`).
 //
 // It is gated on the env var so a normal `cargo test -p treaty_ivy` does not require the
@@ -3829,9 +3829,10 @@ mod corpus_dump {
             eprintln!("TREATY_IVY_CORPUS_DUMP not set; skipping corpus dump");
             return;
         };
-        // libs/render3 -> repo root -> tools/angular-ref/.../test_cases.
+        // libs/treaty-ivy/facade -> repo root -> tools/angular-ref/.../test_cases.
         let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let corpus = manifest
+            .join("..")
             .join("..")
             .join("..")
             .join("tools/angular-ref/packages/compiler-cli/test/compliance/test_cases");

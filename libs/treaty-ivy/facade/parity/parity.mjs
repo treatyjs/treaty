@@ -14,12 +14,12 @@
  *      loosely sort instruction call arguments) and prints a per-fixture
  *      PASS / DIFF report.
  *
- * This file is INDEPENDENT of the Rust crate and never edits libs/render3 source.
+ * This file is INDEPENDENT of the Rust crate and never edits libs/treaty-ivy source.
  *
  * Build the addon first (see README.md):
  *   cd libs/authoring/node && npx napi build --platform
  * then run:
- *   node libs/render3/parity/parity.mjs
+ *   node libs/treaty-ivy/facade/parity/parity.mjs
  *
  * If the addon cannot be built/loaded on this machine the harness still runs the
  * oracle side and reports the blocker per fixture instead of crashing.
@@ -32,7 +32,7 @@ import * as ng from '@angular/compiler';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const repoRoot = path.resolve(__dirname, '..', '..', '..');
+const repoRoot = path.resolve(__dirname, '..', '..', '..', '..');
 const require = createRequire(import.meta.url);
 
 // ---------------------------------------------------------------------------

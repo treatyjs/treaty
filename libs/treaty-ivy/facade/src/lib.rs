@@ -21,7 +21,7 @@
 //!                        [`decorators::registry::DecoratorCompiler`] plugin registry — one plugin
 //!                        per decorator kind, mirroring `apps/rust/authoring`'s `AuthoringPlugin`).
 //!                        Depends on `core` + `template`.
-//!   - [`facade`]       — the thin per-FILE "join": [`compile`] (template-only helper) and
+//!   - `facade` (THIS crate) — the thin per-FILE "join": [`compile`] (template-only helper) and
 //!                        [`source_compile`] (the TypeScript SOURCE front-end). Scans decorated
 //!                        classes and dispatches each through the registry, then re-assembles the
 //!                        complete module. Depends on all three lower layers.
@@ -93,28 +93,34 @@ pub use treaty_ivy_decorators as decorators;
 // resolves exactly as before (the canonical path is now `treaty_ivy_decorators::pipe_module_injector`).
 pub use treaty_ivy_decorators::pipe_module_injector;
 
-// `view` is now a pure compatibility facade: every member physically lives in `template_mod`
-// (`view::template` / `view::queries`) or `decorators` (`view::compiler`) and is re-exported from
-// here so `crate::view::…` keeps resolving exactly as before.
-pub mod view;
+// `view` is now a pure compatibility facade spanning two crates: `view::compiler` lives in
+// `treaty_ivy_decorators`, while `view::template` / `view::queries` live in `treaty_ivy_template`.
+// All three are re-exported here so `crate::view::…` (and the external
+// `treaty_ivy::view::{compiler, template, queries}`) keep resolving exactly as before — this is the
+// two-crate `view` facade called out as the trickiest re-export of the split.
+pub mod view {
+    pub use treaty_ivy_decorators::compiler;
+    pub use treaty_ivy_template::view::queries;
+    pub use treaty_ivy_template::view::template;
+}
 
 // ---------------------------------------------------------------------------
-// `facade` subtree (Phase 4). The thin per-FILE "join" at the top of the
-// dependency DAG: the template-only `compile` helper and the TypeScript SOURCE
-// front-end (`source_compile`). Both scan classes and dispatch through the
-// `decorators` registry rather than carrying emit logic of their own. Each is
-// re-exported from its historical top-level path (`crate::compile`,
-// `crate::source_compile`) so call sites inside and outside the crate are
-// unchanged. See `migration/RENDER3-SPLIT-PLAN.md`.
+// `facade` subtree (Phase 4). This crate IS the facade — the thin per-FILE
+// "join" at the top of the dependency DAG: the template-only `compile` helper
+// and the TypeScript SOURCE front-end (`source_compile`). Both scan classes and
+// dispatch through the `decorators` registry rather than carrying emit logic of
+// their own. They are the facade crate's only own modules; their historical
+// top-level path `treaty_ivy::compile` / `treaty_ivy::source_compile` is the
+// module itself, so no extra `pub use` is needed. The split is structural;
+// emitted code is byte-identical. See `migration/RENDER3-SPLIT-PLAN.md`.
 // ---------------------------------------------------------------------------
 
-/// The thin compile facade: the template-only end-to-end helper and the `@Component`/`@Directive`/
-/// `@Pipe`/`@NgModule` TypeScript SOURCE front-end, both joining the lower layers via the
+/// The template-only end-to-end helper plus the shared `RealTemplateBuilder` glue and the
+/// selectorless auto-import resolution the source front-end reuses. Joins the lower layers via the
 /// [`decorators::registry::DecoratorRegistry`]. Depends on `core`, `template`, and `decorators`.
-pub mod facade;
+pub mod compile;
 
-// Re-export the facade members from their historical top-level paths so `crate::compile::…` and
-// `crate::source_compile::…` resolve exactly as before (the canonical paths are now
-// `crate::facade::…`).
-pub use facade::compile;
-pub use facade::source_compile;
+/// The `@Component`/`@Directive`/`@Pipe`/`@NgModule` TypeScript SOURCE front-end: oxc-parse the
+/// module, register the per-decorator plugins, dispatch each class through the registry, and
+/// re-assemble the augmented module. Depends on `core`, `template`, and `decorators`.
+pub mod source_compile;
