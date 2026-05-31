@@ -18,12 +18,14 @@ use oxc_ast::ast::{
     PropertyDefinition, PropertyKey, Statement,
 };
 use oxc_parser::Parser;
-use oxc_span::SourceType;
+use oxc_span::{GetSpan, SourceType};
 
 use crate::compile::{CompiledComponent, RealTemplateBuilder};
-use crate::output::emitter::emit_expression_with_map;
+use crate::factory::{
+    compile_factory_function, FactoryDeps, FactoryTarget, R3ConstructorFactoryMetadata,
+    R3FactoryMetadata,
+};
 use crate::identifiers::R3;
-use crate::output::emitter::emit_expression;
 use crate::output_ast::{self as o, Expr, FnParam, LiteralValue, ParseSourceSpan};
 use crate::template::template_transform::{
     html_ast_to_render3_ast, BindingParser, Render3ParseOptions,
@@ -1070,7 +1072,7 @@ pub fn compile_component_source(ts_source: &str) -> CompiledComponent {
         return err(format!("parse error: {}", msgs.join("; ")));
     }
 
-    compile_program(&ret.program, None)
+    compile_program_with_source(&ret.program, Some(ts_source), None)
 }
 
 /// Context for additive source-map emission: the original authoring source text plus the
@@ -1129,7 +1131,8 @@ pub fn compile_component_source_with_map(
         source_content: ts_source,
     };
     let mut map_out = String::new();
-    let compiled = compile_program(&ret.program, Some((&ctx, &mut map_out)));
+    let compiled =
+        compile_program_with_source(&ret.program, Some(ts_source), Some((&ctx, &mut map_out)));
     CompiledComponentWithMap {
         code: compiled.code,
         map: map_out,
@@ -1214,8 +1217,217 @@ fn statement_class<'a>(stmt: &'a Statement<'a>) -> Option<&'a Class<'a>> {
     }
 }
 
-fn compile_program(
+/// The Ivy emit of ONE decorated class, decomposed so the original module can be re-assembled
+/// around it (rather than replaced by it).
+///
+/// `def_expression` is the `ɵɵdefine*({...})` call render3 already produces — byte-identical to the
+/// historical bare-expression emit. `extra_statements` are the hoisted constant-pool consts /
+/// nested template functions (and, for `@NgModule`, the `ɵɵsetNgModuleScope` / `ɵɵregisterNgModuleType`
+/// side-effect statements). `factory` is the `ɵfac` metadata when the kind carries one. The caller
+/// stitches these AFTER the kept (decorator-stripped) class declaration as
+/// `<pool…>; X.ɵfac = <factory>; X.<static_member> = <def_expression>;`.
+struct ClassEmit {
+    class_name: String,
+    /// The Ivy static property name the definition is assigned to (`ɵcmp`/`ɵdir`/`ɵpipe`/`ɵmod`).
+    static_member: &'static str,
+    def_expression: Expr,
+    extra_statements: Vec<o::Stmt>,
+    /// Whether `extra_statements` must be emitted AFTER the `X.<member> =` assignment. Component /
+    /// directive / pipe hoist constant-pool consts the definition REFERENCES, so they come BEFORE
+    /// (`false`); `@NgModule` emits `ɵɵsetNgModuleScope` / `ɵɵregisterNgModuleType` SIDE EFFECTS that
+    /// run after the definition exists, so they come AFTER (`true`).
+    extra_after_def: bool,
+    /// `ɵfac` factory metadata, when the kind declares a factory (Component/Directive/Pipe/NgModule).
+    factory: Option<R3FactoryMetadata>,
+    /// Non-fatal diagnostics (e.g. template parse warnings) gathered while compiling this class.
+    errors: Vec<String>,
+}
+
+/// Build a no-dependency constructor [`R3FactoryMetadata`] for a source-front-end class. The SOURCE
+/// front-end does not yet resolve constructor parameters, so the emitted `ɵfac` is the empty-deps
+/// form Angular generates for a parameterless constructor: `function X_Factory(t) { return new (t || X)(); }`.
+fn empty_factory(class_name: &str, target: FactoryTarget) -> R3FactoryMetadata {
+    R3FactoryMetadata::Constructor(R3ConstructorFactoryMetadata {
+        name: class_name.to_string(),
+        ty: directive_ref(class_name),
+        type_argument_count: 0,
+        deps: FactoryDeps::Deps(Vec::new()),
+        target,
+    })
+}
+
+/// Lower a [`ClassEmit`] into the `output_ast` statements appended AFTER its kept class declaration:
+/// the hoisted pool/side-effect statements, then `X.ɵfac = <factory>;` (when present), then
+/// `X.<static_member> = <def_expression>;`. The `def_expression`'s `ɵɵdefine*({...})` argument block
+/// is preserved byte-for-byte — only the `X.<member> =` assignment is added around it.
+fn class_static_statements(emit: ClassEmit) -> Vec<o::Stmt> {
+    let ClassEmit {
+        class_name,
+        static_member,
+        def_expression,
+        extra_statements,
+        extra_after_def,
+        factory,
+        ..
+    } = emit;
+
+    let mut stmts: Vec<o::Stmt> = Vec::new();
+
+    // Constant-pool consts the definition references are hoisted BEFORE the assignments.
+    if !extra_after_def {
+        stmts.extend(extra_statements.clone());
+    }
+
+    if let Some(factory) = factory {
+        let fac = compile_factory_function(&factory);
+        // The factory may itself hoist a `ɵX_BaseFactory` const (inherited-deps case); emit those
+        // first so the `ɵfac` assignment that references them is well-formed.
+        stmts.extend(fac.statements);
+        stmts.push(
+            o::variable(&class_name, None)
+                .prop("\u{0275}fac")
+                .set(fac.expression)
+                .to_stmt(),
+        );
+    }
+
+    stmts.push(
+        o::variable(&class_name, None)
+            .prop(static_member)
+            .set(def_expression)
+            .to_stmt(),
+    );
+
+    // `@NgModule` scope side effects run AFTER the definition is assigned.
+    if extra_after_def {
+        stmts.extend(extra_statements);
+    }
+    stmts
+}
+
+/// Assemble the COMPLETE ES module: the original source with every Angular decorator stripped and
+/// each decorated class's Ivy statics appended after it, matching Angular Ivy's emit shape.
+///
+/// Shape (per ngtsc's `DecoratorHandler` + the TS class transformer):
+///   * every original `import` declaration is KEPT verbatim;
+///   * `import * as i0 from "@angular/core";` is prepended (the namespace the Ivy statics reference);
+///   * every top-level statement is emitted in SOURCE ORDER — a decorated class keeps its
+///     `export`/`class X { … }` declaration with ONLY the recognized Angular decorator removed, and
+///     its `ɵfac`/`ɵcmp`/… statics follow it; every other statement is copied through verbatim.
+///
+/// `source` is the original authoring TypeScript. `class_emits` maps a class's source start offset
+/// (the decorator's start) to its compiled [`ClassEmit`]. The decorator span is excised from the
+/// kept declaration so the emitted class is plain TS the bundler accepts.
+fn assemble_module(
+    source: &str,
     program: &Program,
+    mut class_emits: std::collections::HashMap<usize, (ClassEmit, u32, u32)>,
+) -> String {
+    // Locate the byte position after the last original import declaration, so the synthetic
+    // `import * as i0` line sits with the other imports (ngtsc groups it there). When there are no
+    // imports it goes to the very top.
+    let mut import_insert_at: usize = 0;
+    for stmt in &program.body {
+        if let Statement::ImportDeclaration(import) = stmt {
+            import_insert_at = import.span().end as usize;
+        }
+    }
+
+    let mut out = String::new();
+    let mut cursor: usize = 0;
+    let i0_line = "import * as i0 from \"@angular/core\";\n";
+
+    for stmt in &program.body {
+        let span = stmt.span();
+        let stmt_start = span.start as usize;
+        let stmt_end = span.end as usize;
+
+        let decorated = class_emits.remove(&stmt_start);
+
+        // The first byte of THIS statement's source. For a decorated class the recognized Angular
+        // decorator sits BEFORE the class statement span (oxc does not include leading decorators in
+        // the class/statement span), so the content begins at the decorator; otherwise at the
+        // statement start. Flush the inter-statement source (leading whitespace/comments) up to that
+        // point verbatim.
+        let content_start = match &decorated {
+            Some((_, dec_start, _)) => (*dec_start as usize).min(stmt_start),
+            None => stmt_start,
+        };
+        if cursor < content_start {
+            out.push_str(&source[cursor..content_start]);
+        }
+
+        if let Some((emit, dec_start, dec_end)) = decorated {
+            // Kept class declaration with the recognized Angular decorator excised: emit the source
+            // from the content start up to the decorator (leading non-Angular decorators / modifiers,
+            // usually empty), SKIP the Angular decorator span, then emit from after it to the
+            // statement end (`export class X { … }`).
+            let dec_start = dec_start as usize;
+            let dec_end = dec_end as usize;
+            if content_start < dec_start {
+                out.push_str(&source[content_start..dec_start]);
+            }
+            out.push_str(&source[dec_end..stmt_end]);
+            // Statics: emitted via the shared lowering, then spliced in WITHOUT the leading
+            // `import * as i0` line (added once at module scope below).
+            let statics = class_static_statements(emit);
+            let block = crate::output::emitter::emit_statements(&statics);
+            let block = strip_i0_import_line(&block);
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str(block.trim_end_matches('\n'));
+            out.push('\n');
+        } else {
+            // A non-Angular statement (or a non-decorated class): copy through verbatim.
+            out.push_str(&source[stmt_start..stmt_end]);
+        }
+        cursor = stmt_end;
+
+        // After emitting the last import, inject the i0 namespace import on its own line.
+        if stmt_end == import_insert_at {
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str(i0_line);
+        }
+    }
+
+    // Trailing source after the final statement (comments / whitespace).
+    if cursor < source.len() {
+        out.push_str(&source[cursor..]);
+    }
+
+    // No imports at all: the i0 line was never injected above — prepend it.
+    if import_insert_at == 0 {
+        let mut prefixed = String::with_capacity(i0_line.len() + out.len());
+        prefixed.push_str(i0_line);
+        prefixed.push_str(&out);
+        out = prefixed;
+    }
+
+    out
+}
+
+/// Strip the single leading `import * as i0 from "@angular/core";` line `emit_statements` prepends,
+/// leaving just the statement bodies (the module-scope import is emitted once by [`assemble_module`]).
+fn strip_i0_import_line(block: &str) -> String {
+    let lines = block.lines();
+    if let Some(first) = lines.clone().next() {
+        if first.trim_start().starts_with("import * as i0 from") {
+            return lines.skip(1).collect::<Vec<_>>().join("\n");
+        }
+    }
+    block.to_string()
+}
+
+/// The module-aware compile. When `source` is `Some`, the emitted `code` is the COMPLETE original
+/// ES module augmented with the Ivy statics (the production path, fixing the missing-export bug);
+/// when `None`, the legacy bare-definition emit is produced (used only where the original source
+/// text is unavailable, e.g. internal callers that pre-parsed without retaining the text).
+fn compile_program_with_source(
+    program: &Program,
+    source: Option<&str>,
     map: Option<(&MapContext, &mut String)>,
 ) -> CompiledComponent {
     let imported_names = collect_imported_names(program);
@@ -1258,36 +1470,36 @@ fn compile_program(
     // `compile_component_meta`).
     let sibling_directives = collect_sibling_directives(&decorated);
 
-    // Single-class fast path preserves the additive source-map behaviour (the map artifact is only
-    // meaningful for a single component definition). Multi-class files always emit plainly.
-    if decorated.len() == 1 {
-        let TopStmt::Decorated(class, kind, dec) = decorated[0];
-        return compile_decorated_class(
+    // Compile EVERY decorated class to a structured [`ClassEmit`]. The def block render3 produces is
+    // unchanged; we only decompose it (def expression + pool/side-effect statements + factory) so the
+    // ORIGINAL module can be re-assembled around the kept class declarations.
+    let mut emits: std::collections::HashMap<usize, (ClassEmit, u32, u32)> =
+        std::collections::HashMap::new();
+    let mut errors: Vec<String> = Vec::new();
+    let mut produced = 0usize;
+    for item in &decorated {
+        let TopStmt::Decorated(class, kind, dec) = *item;
+        match compile_decorated_class(
             class,
             kind,
             dec,
             &auto_import_candidates,
             &sibling_directives,
-            map,
-        );
-    }
-
-    // R1: emit each decorated class in source order and concatenate. A `map` request degrades to
-    // plain emission across classes (no single anchor), so we never thread it here.
-    let mut pieces: Vec<String> = Vec::new();
-    let mut errors: Vec<String> = Vec::new();
-    for item in &decorated {
-        let TopStmt::Decorated(class, kind, dec) = *item;
-        let compiled =
-            compile_decorated_class(class, kind, dec, &auto_import_candidates, &sibling_directives, None);
-        errors.extend(compiled.errors);
-        if !compiled.code.is_empty() {
-            pieces.push(compiled.code);
+        ) {
+            Ok(emit) => {
+                errors.extend(emit.errors.clone());
+                let stmt_start = decorated_stmt_start(program, class);
+                emits.insert(
+                    stmt_start,
+                    (emit, dec.span().start, dec.span().end),
+                );
+                produced += 1;
+            }
+            Err(msg) => errors.push(msg),
         }
     }
 
-    if pieces.is_empty() {
-        // Every class declined — surface the collected reasons.
+    if produced == 0 {
         if errors.is_empty() {
             errors.push("no emittable definition produced".to_string());
         }
@@ -1297,10 +1509,82 @@ fn compile_program(
         };
     }
 
-    CompiledComponent {
-        code: pieces.join("\n"),
-        errors,
+    // Production path: emit the COMPLETE original module augmented with the Ivy statics.
+    let Some(source) = source else {
+        // Legacy bare-definition emit (source text unavailable): concatenate each class's statics
+        // (pool + `X.ɵfac`/`X.ɵcmp` assignments) through the standard emitter. Kept for robustness;
+        // the public entry points always supply the source.
+        let mut all_stmts: Vec<o::Stmt> = Vec::new();
+        let mut keys: Vec<usize> = emits.keys().copied().collect();
+        keys.sort_unstable();
+        for k in keys {
+            if let Some((emit, _, _)) = emits.remove(&k) {
+                all_stmts.extend(class_static_statements(emit));
+            }
+        }
+        let code = crate::output::emitter::emit_statements(&all_stmts);
+        return CompiledComponent { code, errors };
+    };
+
+    // For a single decorated class with a map request, recover that class's def expression + the
+    // static member it's assigned to so the additive map can anchor the emitted `type: <ClassName>`
+    // read to the class declaration AFTER assembly (the map is additive — it never changes `code`).
+    let single_def: Option<(Expr, &'static str)> = if produced == 1 {
+        emits
+            .values()
+            .next()
+            .map(|(e, _, _)| (e.def_expression.clone(), e.static_member))
+    } else {
+        None
+    };
+
+    let code = assemble_module(source, program, emits);
+
+    if let Some((ctx, map_out)) = map {
+        if let Some((def_expr, member)) = single_def {
+            // Locate the def block in the assembled module: the `ɵɵdefine*` marker the member maps
+            // to. Searching the map anchors forward from there yields the correct generated offsets.
+            let marker = define_marker_for(member);
+            let from = code.find(marker).unwrap_or(0);
+            *map_out = crate::output::emitter::build_definition_map(
+                ctx.file_name,
+                ctx.source_name,
+                ctx.source_content,
+                &code,
+                from,
+                &def_expr,
+            );
+        }
     }
+
+    CompiledComponent { code, errors }
+}
+
+/// The `ɵɵdefine*` marker text the given Ivy static member's definition uses, so the source-map
+/// builder can locate the definition's start in the assembled module.
+fn define_marker_for(member: &str) -> &'static str {
+    match member {
+        "\u{0275}cmp" => "\u{0275}\u{0275}defineComponent",
+        "\u{0275}dir" => "\u{0275}\u{0275}defineDirective",
+        "\u{0275}pipe" => "\u{0275}\u{0275}definePipe",
+        "\u{0275}mod" => "\u{0275}\u{0275}defineNgModule",
+        _ => "\u{0275}\u{0275}define",
+    }
+}
+
+/// The byte start of the top-level statement that declares `class` (its decorator, or the
+/// `export`/`class` keyword when no decorator leads). Used as the assembly key. Falls back to the
+/// class node's own span when the declaring statement cannot be located (never expected).
+fn decorated_stmt_start(program: &Program, class: &Class) -> usize {
+    let class_span = class.span();
+    for stmt in &program.body {
+        if let Some(c) = statement_class(stmt) {
+            if c.span() == class_span {
+                return stmt.span().start as usize;
+            }
+        }
+    }
+    class_span.start as usize
 }
 
 /// Collect the `(name, selector, is_component)` of every sibling `@Directive`/`@Component` class
@@ -1333,22 +1617,22 @@ fn collect_sibling_directives(decorated: &[TopStmt]) -> Vec<crate::binder::Selec
     out
 }
 
-/// Compile ONE decorated class to its Ivy definition, dispatching on the decorator kind.
-#[allow(clippy::too_many_arguments)]
+/// Compile ONE decorated class to its [`ClassEmit`], dispatching on the decorator kind. The def
+/// block render3 produces is unchanged — `ClassEmit` decomposes it (def expression + pool/side-effect
+/// statements + factory metadata) so the caller can re-assemble the original module around it.
 fn compile_decorated_class(
     class: &Class,
     kind: TopLevel,
     dec: &Decorator,
     auto_import_candidates: &[String],
     sibling_directives: &[crate::binder::SelectorDirective],
-    map: Option<(&MapContext, &mut String)>,
-) -> CompiledComponent {
+) -> Result<ClassEmit, String> {
     let (class_name, class_name_span) = match &class.id {
         Some(id) => (
             id.name.to_string(),
             ParseSourceSpan::new(id.span.start as usize, id.span.end as usize),
         ),
-        None => return err("decorated class has no name".to_string()),
+        None => return Err("decorated class has no name".to_string()),
     };
 
     let obj = decorator_object(dec);
@@ -1362,14 +1646,13 @@ fn compile_decorated_class(
             class_name_span,
             auto_import_candidates,
             sibling_directives,
-            map,
         ),
         TopLevel::Pipe => compile_pipe_class(obj, &class_name),
         TopLevel::NgModule => compile_ng_module_class(obj, &class_name),
         // `@Injectable` carries no template-facing definition we model yet; the `ɵfac`/`ɵprov`
         // factory + provider emit lives in the factory compiler, out of this front-end's scope.
         TopLevel::Injectable => {
-            err("@Injectable emission not yet supported by the source front-end".to_string())
+            Err("@Injectable emission not yet supported by the source front-end".to_string())
         }
     }
 }
@@ -1387,17 +1670,16 @@ fn compile_component_or_directive(
     class_name_span: ParseSourceSpan,
     auto_import_candidates: &[String],
     sibling_directives: &[crate::binder::SelectorDirective],
-    map: Option<(&MapContext, &mut String)>,
-) -> CompiledComponent {
+) -> Result<ClassEmit, String> {
     // Reject decorator-level metadata we cannot yet model.
     if let Some(obj) = obj {
         for k in UNSUPPORTED_DECORATOR_KEYS {
             if find_prop(obj, k).is_some() {
-                return err(format!("unsupported @{:?} metadata key: {k}", kind));
+                return Err(format!("unsupported @{:?} metadata key: {k}", kind));
             }
         }
         if find_prop(obj, "templateUrl").is_some() {
-            return err("external templateUrl unsupported (inline `template` only)".to_string());
+            return Err("external templateUrl unsupported (inline `template` only)".to_string());
         }
     }
 
@@ -1413,7 +1695,7 @@ fn compile_component_or_directive(
 
     if kind == TopLevel::Component && template_html.is_none() {
         // A component with a non-string `template` (or none) — bail rather than mis-compile.
-        return err("component has no inline string `template`".to_string());
+        return Err("component has no inline string `template`".to_string());
     }
 
     // standalone (default true).
@@ -1470,7 +1752,7 @@ fn compile_component_or_directive(
     // members, parsed into the `R3HostMetadata` the `DefaultHostBindingsBuilder` consumes.
     let host = match build_host_metadata(obj.and_then(|o| find_prop(o, "host")), class) {
         Ok(host) => host,
-        Err(e) => return err(e),
+        Err(e) => return Err(e),
     };
 
     // R2: hostDirectives -> HostDirectivesFeature.
@@ -1494,7 +1776,7 @@ fn compile_component_or_directive(
         None => None,
         Some(e) => match convert_expr(e) {
             Some(expr) => Some(expr),
-            None => return err("unsupported `providers` expression form".to_string()),
+            None => return Err("unsupported `providers` expression form".to_string()),
         },
     };
 
@@ -1505,7 +1787,7 @@ fn compile_component_or_directive(
         None => None,
         Some(e) => match convert_expr(e) {
             Some(expr) => Some(expr),
-            None => return err("unsupported `viewProviders` expression form".to_string()),
+            None => return Err("unsupported `viewProviders` expression form".to_string()),
         },
     };
 
@@ -1513,7 +1795,7 @@ fn compile_component_or_directive(
     let mut inputs: OrderedMap<String, R3InputMetadata> = OrderedMap::new();
     let mut outputs: OrderedMap<String, String> = OrderedMap::new();
     if let Err(e) = collect_io(class, &mut inputs, &mut outputs) {
-        return err(e);
+        return Err(e);
     }
 
     // Queries: signal-based member initializers (`viewChild`/…) AND R3 decorator members
@@ -1582,7 +1864,6 @@ fn compile_component_or_directive(
                 animations,
                 foreign_imports,
                 view_providers,
-                map,
             )
         }
         // R4: @Directive — drive the existing `compile_directive_from_metadata` emitter (no
@@ -1606,31 +1887,27 @@ fn compile_component_or_directive(
 /// R4: emit a `@Directive` class via the existing [`compile_directive_from_metadata`] +
 /// [`DefaultHostBindingsBuilder`]. The hoisted query-predicate `_cN` pool consts are printed
 /// before the `ɵɵdefineDirective({...})` expression, mirroring the component path.
-fn compile_directive_meta(base: R3DirectiveMetadata) -> CompiledComponent {
+fn compile_directive_meta(base: R3DirectiveMetadata) -> Result<ClassEmit, String> {
+    let class_name = base.name.clone();
     let mut host_builder = DefaultHostBindingsBuilder;
     let compiled = compile_directive_from_metadata(&base, &mut host_builder);
 
-    let code = if compiled.statements.is_empty() {
-        emit_expression(&compiled.expression)
-    } else {
-        let mut out = crate::output::emitter::emit_statements(&compiled.statements);
-        if !out.ends_with('\n') {
-            out.push('\n');
-        }
-        out.push_str(&emit_expression(&compiled.expression));
-        out
-    };
-    CompiledComponent {
-        code,
+    Ok(ClassEmit {
+        class_name: class_name.clone(),
+        static_member: "\u{0275}dir",
+        def_expression: compiled.expression,
+        extra_statements: compiled.statements,
+        extra_after_def: false,
+        factory: Some(empty_factory(&class_name, FactoryTarget::Directive)),
         errors: Vec::new(),
-    }
+    })
 }
 
 /// R4: emit a `@Pipe({name, pure?, standalone?})` class via [`compile_pipe_from_metadata`].
 fn compile_pipe_class(
     obj: Option<&oxc_ast::ast::ObjectExpression>,
     class_name: &str,
-) -> CompiledComponent {
+) -> Result<ClassEmit, String> {
     let pipe_name = obj
         .and_then(|o| find_prop(o, "name"))
         .and_then(string_value);
@@ -1655,10 +1932,15 @@ fn compile_pipe_class(
         is_standalone,
     };
     let compiled = crate::pipe_module_injector::compile_pipe_from_metadata(&meta);
-    CompiledComponent {
-        code: emit_expression(&compiled.expression),
+    Ok(ClassEmit {
+        class_name: class_name.to_string(),
+        static_member: "\u{0275}pipe",
+        def_expression: compiled.expression,
+        extra_statements: compiled.statements,
+        extra_after_def: false,
+        factory: Some(empty_factory(class_name, FactoryTarget::Pipe)),
         errors: Vec::new(),
-    }
+    })
 }
 
 /// R4: emit an `@NgModule({declarations, imports, exports, bootstrap, id})` class via
@@ -1670,7 +1952,7 @@ fn compile_pipe_class(
 fn compile_ng_module_class(
     obj: Option<&oxc_ast::ast::ObjectExpression>,
     class_name: &str,
-) -> CompiledComponent {
+) -> Result<ClassEmit, String> {
     use crate::pipe_module_injector::{
         compile_ng_module, R3NgModuleCommon, R3NgModuleMetadata, R3NgModuleMetadataGlobal,
         R3SelectorScopeMode,
@@ -1712,20 +1994,17 @@ fn compile_ng_module_class(
     });
     let compiled = compile_ng_module(&meta);
 
-    let code = if compiled.statements.is_empty() {
-        emit_expression(&compiled.expression)
-    } else {
-        let mut out = crate::output::emitter::emit_statements(&compiled.statements);
-        if !out.ends_with('\n') {
-            out.push('\n');
-        }
-        out.push_str(&emit_expression(&compiled.expression));
-        out
-    };
-    CompiledComponent {
-        code,
+    Ok(ClassEmit {
+        class_name: class_name.to_string(),
+        static_member: "\u{0275}mod",
+        def_expression: compiled.expression,
+        // `compile_ng_module` emits the `ɵɵsetNgModuleScope` / `ɵɵregisterNgModuleType` side-effect
+        // statements; they belong AFTER the class's `ɵmod` assignment.
+        extra_statements: compiled.statements,
+        extra_after_def: true,
+        factory: Some(empty_factory(class_name, FactoryTarget::NgModule)),
         errors: Vec::new(),
-    }
+    })
 }
 
 /// Resolve an array literal of bare class identifiers into their self-references (`Foo` →
@@ -1897,8 +2176,8 @@ fn compile_component_meta(
     animations: Option<Expr>,
     foreign_imports: Option<Vec<R3ForeignComponentMetadata>>,
     view_providers: Option<Expr>,
-    map: Option<(&MapContext, &mut String)>,
-) -> CompiledComponent {
+) -> Result<ClassEmit, String> {
+    let class_name = base.name.clone();
     let mut errors: Vec<String> = Vec::new();
 
     // Template HTML -> r3_ast.
@@ -1993,69 +2272,18 @@ fn compile_component_meta(
 
     // Angular emits the `ConstantPool.statements` (hoisted query-predicate `const _cN = [...]`
     // declarations and nested-view `function …_Template` functions) as top-level siblings BEFORE
-    // the `ɵɵdefineComponent({…})` call. Mirror that: print the pool statements first, then the
-    // definition expression, so the `_cN`/template references the definition makes are declared.
-    //
-    // Map vs. no-map: both branches print the SAME bytes. When a map is requested, the
-    // additive `emit_*_with_map` variants are used; they delegate to the identical lowering
-    // + post-passes, so the code text is byte-for-byte the plain path's. The `*_with_map`
-    // map only covers the slice it emitted, so for the pool-prefixed case we emit the pool
-    // (unmapped, no span-carrying nodes there in practice) and map only the definition
-    // expression — whose generated offset is shifted by the pool prefix length so the
-    // segments point at the correct positions in the final concatenated code.
-    match map {
-        None => {
-            let code = if pool_statements.is_empty() {
-                emit_expression(&compiled.expression)
-            } else {
-                let mut out = crate::output::emitter::emit_statements(&pool_statements);
-                if !out.ends_with('\n') {
-                    out.push('\n');
-                }
-                out.push_str(&emit_expression(&compiled.expression));
-                out
-            };
-            CompiledComponent { code, errors }
-        }
-        Some((ctx, map_out)) => {
-            let code = if pool_statements.is_empty() {
-                let (code, map_json) = emit_expression_with_map(
-                    &compiled.expression,
-                    ctx.file_name,
-                    ctx.source_name,
-                    ctx.source_content,
-                );
-                *map_out = map_json;
-                code
-            } else {
-                let mut out = crate::output::emitter::emit_statements(&pool_statements);
-                if !out.ends_with('\n') {
-                    out.push('\n');
-                }
-                let prefix_len = out.len();
-                let (expr_code, _) = emit_expression_with_map(
-                    &compiled.expression,
-                    ctx.file_name,
-                    ctx.source_name,
-                    ctx.source_content,
-                );
-                out.push_str(&expr_code);
-                // Build the map over the FINAL concatenated code so generated positions are
-                // correct (the definition expression lives after the `prefix_len`-byte pool
-                // prefix). `build_definition_map` re-locates the anchor token in `out`.
-                *map_out = crate::output::emitter::build_definition_map(
-                    ctx.file_name,
-                    ctx.source_name,
-                    ctx.source_content,
-                    &out,
-                    prefix_len,
-                    &compiled.expression,
-                );
-                out
-            };
-            CompiledComponent { code, errors }
-        }
-    }
+    // the `ɵɵdefineComponent({…})` call: the definition references the `_cN`/template names, so they
+    // must be declared first. `class_static_statements` keeps that ordering (`extra_after_def:false`),
+    // and `assemble_module` places the whole block right after the kept class declaration.
+    Ok(ClassEmit {
+        class_name: class_name.clone(),
+        static_member: "\u{0275}cmp",
+        def_expression: compiled.expression,
+        extra_statements: pool_statements,
+        extra_after_def: false,
+        factory: Some(empty_factory(&class_name, FactoryTarget::Component)),
+        errors,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2122,7 +2350,8 @@ mod tests {
     fn auto_imports_used_component_into_dependencies() {
         // The author imports `Foo` and uses `<Foo>` in the template, with NO `imports:` array and
         // NO selector on Foo. `Foo` must land in the emitted `dependencies` array; the unused
-        // `Bar` import must NOT.
+        // `Bar` import must NOT. (The emit is now a COMPLETE module, so the ORIGINAL `Bar` import
+        // statement is correctly preserved verbatim — only the `dependencies` array must exclude it.)
         let src = r#"
             import { Foo } from "./foo";
             import { Bar } from "./bar";
@@ -2133,12 +2362,55 @@ mod tests {
         assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
         let code = &out.code;
         assert!(code.contains(ZWS), "no defineComponent; got: {code}");
-        assert!(code.contains("dependencies"), "no dependencies array; got: {code}");
-        assert!(code.contains("Foo"), "Foo not in dependencies; got: {code}");
+        // The complete module keeps the original imports verbatim (Angular does not tree-shake
+        // unused imports — the bundler does), and adds the i0 namespace import.
         assert!(
-            !code.contains("Bar"),
-            "unused import Bar leaked into output; got: {code}"
+            code.contains("import { Foo } from \"./foo\""),
+            "original Foo import dropped; got: {code}"
         );
+        assert!(
+            code.contains("import { Bar } from \"./bar\""),
+            "original Bar import dropped; got: {code}"
+        );
+        assert!(
+            code.contains("import * as i0 from \"@angular/core\""),
+            "missing i0 namespace import; got: {code}"
+        );
+        // The kept class declaration (decorator stripped) and the appended Ivy statics.
+        assert!(code.contains("export class C"), "class C not kept; got: {code}");
+        assert!(code.contains("C.\u{0275}cmp ="), "no ɵcmp assignment; got: {code}");
+        // Used `<Foo>` lands in `dependencies`; unused `Bar` must NOT appear in that array.
+        let deps = extract_balanced(code, "dependencies:")
+            .unwrap_or_else(|| panic!("no dependencies array; got: {code}"));
+        assert!(deps.contains("Foo"), "Foo not in dependencies; got: {deps}");
+        assert!(
+            !deps.contains("Bar"),
+            "unused import Bar leaked into dependencies; got: {deps}"
+        );
+    }
+
+    /// Extract the balanced `[...]` array value that follows `key` in `code` (e.g.
+    /// `dependencies:[...]`). Returns the slice including the brackets, or `None` if absent.
+    fn extract_balanced(code: &str, key: &str) -> Option<String> {
+        let at = code.find(key)?;
+        let open = code[at..].find('[')? + at;
+        let bytes = code.as_bytes();
+        let mut depth = 0i32;
+        let mut i = open;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'[' => depth += 1,
+                b']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(code[open..=i].to_string());
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        None
     }
 
     #[test]
@@ -2774,6 +3046,179 @@ mod tests {
         assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
         assert!(!out.code.contains("hostBindings"), "spurious hostBindings; got: {}", out.code);
         assert!(!out.code.contains("hostVars"), "spurious hostVars; got: {}", out.code);
+    }
+
+    // -----------------------------------------------------------------------
+    // Complete-ES-module emit — the front-end must emit the ORIGINAL module
+    // augmented with the Ivy statics, NOT a synthetic module that replaces the
+    // class + imports (the live `doesn't provide an export named: AppRoot` bug).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn emits_complete_module_keeps_class_imports_and_def() {
+        // Reproduction of the live bug: the original `export class AppRoot` and the original
+        // `RouterOutlet` import must survive in the emitted module; the Ivy statics are appended.
+        let src = r#"import { RouterOutlet } from "@angular/router";
+@Component({selector:"app-root",template:"<router-outlet></router-outlet>",imports:[RouterOutlet]})
+export class AppRoot {}
+"#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+        // (1) original import kept verbatim.
+        assert!(
+            code.contains("import { RouterOutlet } from \"@angular/router\""),
+            "original RouterOutlet import dropped; got: {code}"
+        );
+        // (2) i0 namespace import prepended.
+        assert!(
+            code.contains("import * as i0 from \"@angular/core\""),
+            "missing i0 namespace import; got: {code}"
+        );
+        // (3) the kept class declaration (decorator stripped — no `@Component` left).
+        assert!(code.contains("export class AppRoot"), "class AppRoot not kept; got: {code}");
+        assert!(
+            !code.contains("@Component"),
+            "Angular decorator not stripped; got: {code}"
+        );
+        // (4) the appended Ivy statics referencing the kept class.
+        assert!(code.contains("AppRoot.\u{0275}fac ="), "no ɵfac assignment; got: {code}");
+        assert!(code.contains("AppRoot.\u{0275}cmp ="), "no ɵcmp assignment; got: {code}");
+        // (5) the def block is preserved (the harness extracts THIS unchanged).
+        assert!(code.contains(ZWS), "no defineComponent; got: {code}");
+        assert!(code.contains("type: AppRoot"), "def missing type ref; got: {code}");
+        // The assignment wraps the def block: `AppRoot.ɵcmp = i0.ɵɵdefineComponent({`.
+        assert!(
+            flat(code).contains(&format!("AppRoot.{}=i0.{}({{", "\u{0275}cmp", ZWS)),
+            "ɵcmp assignment does not wrap the def block; got: {code}"
+        );
+        // (6) the emitted module is syntactically valid TS (it parses with zero errors) — the bug it
+        // fixes was a module that referenced undeclared `AppRoot`/`RouterOutlet`; a complete module
+        // both declares/imports them and parses cleanly.
+        assert_parses(code);
+    }
+
+    /// Assert the emitted module is syntactically valid TypeScript (parses with zero errors).
+    fn assert_parses(code: &str) {
+        let allocator = Allocator::default();
+        let source_type = SourceType::default().with_typescript(true);
+        let ret = Parser::new(&allocator, code, source_type).parse();
+        assert!(
+            ret.errors.is_empty(),
+            "emitted module is not valid TS: {:?}\n--- module ---\n{code}",
+            ret.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn complete_module_directive_keeps_class_and_appends_dir() {
+        let src = r#"import { Foo } from "./foo";
+@Directive({selector:"[bar]"})
+export class BarDir {}
+"#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+        assert!(code.contains("import { Foo } from \"./foo\""), "import dropped; got: {code}");
+        assert!(code.contains("export class BarDir"), "class not kept; got: {code}");
+        assert!(code.contains("BarDir.\u{0275}fac ="), "no ɵfac; got: {code}");
+        assert!(code.contains("BarDir.\u{0275}dir ="), "no ɵdir; got: {code}");
+        assert!(
+            code.contains("\u{0275}\u{0275}defineDirective"),
+            "no defineDirective; got: {code}"
+        );
+        assert_parses(code);
+    }
+
+    #[test]
+    fn complete_module_pipe_keeps_class_and_appends_pipe() {
+        let src = r#"@Pipe({name:"up"})
+export class UpPipe { transform(x: string) { return x; } }
+"#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+        assert!(code.contains("export class UpPipe"), "class not kept; got: {code}");
+        // The method body of the kept class survives verbatim.
+        assert!(code.contains("transform(x: string)"), "class body dropped; got: {code}");
+        assert!(code.contains("UpPipe.\u{0275}fac ="), "no ɵfac; got: {code}");
+        assert!(code.contains("UpPipe.\u{0275}pipe ="), "no ɵpipe; got: {code}");
+        assert!(code.contains("\u{0275}\u{0275}definePipe"), "no definePipe; got: {code}");
+        assert_parses(code);
+    }
+
+    #[test]
+    fn complete_module_ng_module_keeps_class_and_scope_side_effect_after_def() {
+        let src = r#"@NgModule({declarations:[CompA], id:"m"})
+export class MyModule {}
+"#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+        assert!(code.contains("export class MyModule"), "class not kept; got: {code}");
+        assert!(code.contains("MyModule.\u{0275}fac ="), "no ɵfac; got: {code}");
+        assert!(code.contains("MyModule.\u{0275}mod ="), "no ɵmod; got: {code}");
+        assert!(
+            code.contains("\u{0275}\u{0275}defineNgModule"),
+            "no defineNgModule; got: {code}"
+        );
+        // The selector-scope side effect / registration runs AFTER the `ɵmod` assignment.
+        let mod_at = code.find("MyModule.\u{0275}mod =").expect("ɵmod present");
+        let scope_at = code
+            .find("\u{0275}\u{0275}setNgModuleScope")
+            .or_else(|| code.find("\u{0275}\u{0275}registerNgModuleType"))
+            .expect("a scope side effect present");
+        assert!(
+            scope_at > mod_at,
+            "NgModule scope side effect must follow the ɵmod assignment; got: {code}"
+        );
+    }
+
+    #[test]
+    fn complete_module_multi_class_interleaves_each_class_with_its_statics() {
+        // Two decorated classes + a plain (non-Angular) statement in between: each class is kept in
+        // source order with its statics appended right after it, and the plain statement survives.
+        let src = r#"import { NgIf } from "@angular/common";
+@Component({selector:"a-cmp",template:"<div></div>"})
+export class ACmp {}
+export const VERSION = "1.0";
+@Component({selector:"b-cmp",template:"<span></span>"})
+export class BCmp {}
+"#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+        // Both classes kept, both defs emitted, the plain const preserved.
+        assert!(code.contains("export class ACmp"), "ACmp not kept; got: {code}");
+        assert!(code.contains("export class BCmp"), "BCmp not kept; got: {code}");
+        assert!(code.contains("export const VERSION = \"1.0\""), "VERSION dropped; got: {code}");
+        assert!(code.contains("ACmp.\u{0275}cmp ="), "no ACmp def; got: {code}");
+        assert!(code.contains("BCmp.\u{0275}cmp ="), "no BCmp def; got: {code}");
+        // Source order: ACmp decl -> ACmp statics -> VERSION -> BCmp decl -> BCmp statics.
+        let a_class = code.find("export class ACmp").unwrap();
+        let a_cmp = code.find("ACmp.\u{0275}cmp =").unwrap();
+        let version = code.find("export const VERSION").unwrap();
+        let b_class = code.find("export class BCmp").unwrap();
+        let b_cmp = code.find("BCmp.\u{0275}cmp =").unwrap();
+        assert!(
+            a_class < a_cmp && a_cmp < version && version < b_class && b_class < b_cmp,
+            "module statements out of source order; got: {code}"
+        );
+        assert_parses(code);
+    }
+
+    #[test]
+    fn complete_module_no_imports_prepends_i0_at_top() {
+        // With no original imports, the i0 namespace import must still be prepended at the top.
+        let src = r#"@Component({selector:"a",template:"<div></div>"}) export class C {}"#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+        assert!(
+            code.starts_with("import * as i0 from \"@angular/core\""),
+            "i0 import not at top; got: {code}"
+        );
+        assert!(code.contains("export class C"), "class not kept; got: {code}");
     }
 }
 
