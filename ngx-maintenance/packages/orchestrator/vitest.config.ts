@@ -26,6 +26,7 @@ export default defineConfig({
         "staleness-detector/src/index.ts",
       ),
       "@ngx-maintenance/takeover": pkg("takeover/src/index.ts"),
+      "@ngx-maintenance/treaty-support": pkg("treaty-support/src/index.ts"),
       octokit: local("test/octokit-stub.ts"),
     },
   },

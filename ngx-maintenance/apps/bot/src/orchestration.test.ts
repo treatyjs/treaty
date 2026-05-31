@@ -171,6 +171,7 @@ describe("CLI argument parsing + summary", () => {
           finding: undefined,
           migration: undefined,
           prHead: "ngx-maintenance/angular-22",
+          treaty: undefined,
           result: "pr-opened",
         },
       ],

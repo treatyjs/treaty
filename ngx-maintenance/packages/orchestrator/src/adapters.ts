@@ -1,7 +1,7 @@
-import { Octokit } from "octokit";
 import {
   createGitHubAdapter,
   parseRepoRef,
+  Octokit,
   type AdapterConfig,
   type GitHubAdapter,
 } from "@ngx-maintenance/github-adapter";
@@ -15,6 +15,10 @@ import type {
   PublishInput,
   PublishResult,
 } from "@ngx-maintenance/takeover";
+import {
+  createTreatyMigrationStep,
+  type TreatyMigrationStep,
+} from "@ngx-maintenance/treaty-support";
 
 /** The npm organisation / GitHub org all taken-over forks are created under. */
 const FORK_ORG = "ngx-maintenance";
@@ -32,12 +36,26 @@ export interface MaintenanceAdapters {
   readonly metadata: MetadataSource;
   /** The fork/create-repo/publish boundary the takeover module drives. */
   readonly takeover: TakeoverAdapter;
+  /**
+   * The OPTIONAL Treaty migration boundary. Present only when the deployment
+   * enables the Treaty path; the cycle calls it solely for libraries listed in
+   * `config.treatyOptIn`. When omitted, no library runs the Treaty step and the
+   * flow is unchanged. Injected as a fake in tests.
+   */
+  readonly treaty?: TreatyMigrationStep;
 }
 
 /** Configuration for the production adapter bundle. */
 export interface ProductionAdaptersConfig extends AdapterConfig {
   /** The metadata source (npm registry + GitHub queries) to read through. */
   readonly metadata: MetadataSource;
+  /**
+   * Enable the optional Treaty migration step. When `true`, the production
+   * bundle wires {@link createTreatyMigrationStep} over the GitHub adapter's
+   * shell; the cycle still only runs it for `config.treatyOptIn` libraries.
+   * Defaults to `false` (no Treaty boundary at all).
+   */
+  readonly enableTreaty?: boolean;
 }
 
 /**
@@ -118,5 +136,10 @@ export function createProductionAdapters(
     github,
     metadata: config.metadata,
     takeover: createTakeoverAdapter(config.token, github),
+    // The Treaty step shells its transforms + treaty-packagr through the SAME
+    // process boundary the github adapter owns; only wired when enabled.
+    ...(config.enableTreaty === true
+      ? { treaty: createTreatyMigrationStep(github.shell) }
+      : {}),
   };
 }

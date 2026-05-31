@@ -11,7 +11,8 @@
       "@ngx-maintenance/staleness-detector": [
         "../staleness-detector/src/index.ts"
       ],
-      "@ngx-maintenance/takeover": ["../takeover/src/index.ts"]
+      "@ngx-maintenance/takeover": ["../takeover/src/index.ts"],
+      "@ngx-maintenance/treaty-support": ["../treaty-support/src/index.ts"]
     }
   },
   "include": ["src/**/*.ts", "../../types/**/*.d.ts"]

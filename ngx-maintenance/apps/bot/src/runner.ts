@@ -6,6 +6,7 @@ import {
 } from "@ngx-maintenance/github-adapter";
 import {
   createTakeoverAdapter,
+  createTreatyMigrationStep,
   resolveConfig,
   runMaintenanceCycle,
   type BotConfig,
@@ -30,6 +31,12 @@ export interface RunnerConfig {
   readonly latestAngular: number;
   /** Orchestration config (watched orgs/repos + thresholds). */
   readonly bot?: BotConfigInput;
+  /**
+   * Wire the OPTIONAL Treaty migration step. When `true`, the production bundle
+   * adds a Treaty boundary over the GitHub adapter's shell; the cycle still only
+   * runs it for libraries in `bot.treatyOptIn`. Defaults to off.
+   */
+  readonly enableTreaty?: boolean;
 }
 
 /** A fully-assembled runnable bot: the resolved config + boundary adapters. */
@@ -57,6 +64,11 @@ export function createRunner(config: RunnerConfig): Runner {
     github,
     metadata,
     takeover: createTakeoverAdapter(config.token, github),
+    // The optional Treaty step shells through the same process boundary; only
+    // wired when the deployment enables it.
+    ...(config.enableTreaty === true
+      ? { treaty: createTreatyMigrationStep(github.shell) }
+      : {}),
   };
   return assemble(config, adapters);
 }

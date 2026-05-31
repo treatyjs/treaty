@@ -3,6 +3,7 @@ import {
   TWO_WEEKS_MS,
 } from "@ngx-maintenance/staleness-detector";
 import { LATEST_ANGULAR } from "@ngx-maintenance/migration-engine";
+import type { TreatyAuthoringMode } from "@ngx-maintenance/treaty-support";
 
 /**
  * Static, fully-typed configuration for a running ngx-maintenance bot. Every
@@ -41,6 +42,19 @@ export interface BotConfig {
    * run `ng update` + verify; omit for a full clone.
    */
   readonly cloneDepth?: number;
+  /**
+   * The npm package names that have OPTED IN to the additional, optional Treaty
+   * authoring/packaging migration step. A library is run through treaty-support
+   * ONLY if its name is listed here AND a Treaty step adapter is injected; every
+   * other library's flow is unchanged. Defaults to empty (no opt-ins).
+   */
+  readonly treatyOptIn: readonly string[];
+  /**
+   * The Treaty authoring mode applied to opted-in libraries: `compat` switches
+   * only the packaging path, `enhanced` also applies the authoring transforms.
+   * Defaults to `compat` — the conservative, packaging-only adoption.
+   */
+  readonly treatyMode: TreatyAuthoringMode;
 }
 
 /** The partial config an operator supplies; everything else is defaulted. */
@@ -59,6 +73,8 @@ export function resolveConfig(input: BotConfigInput = {}): BotConfig {
     takeoverWindowMs: input.takeoverWindowMs ?? TWO_WEEKS_MS,
     targetAngular: input.targetAngular ?? LATEST_ANGULAR,
     baseBranch: input.baseBranch ?? "main",
+    treatyOptIn: input.treatyOptIn ?? [],
+    treatyMode: input.treatyMode ?? "compat",
     ...(input.cloneDepth !== undefined ? { cloneDepth: input.cloneDepth } : { cloneDepth: 1 }),
   };
 }

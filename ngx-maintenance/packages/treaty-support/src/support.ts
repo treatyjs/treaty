@@ -1,6 +1,10 @@
 import type {
   TreatyAuthoringMode,
+  TreatyMigrationStep,
   TreatyPackageOptions,
+  TreatyShell,
+  TreatyStepInput,
+  TreatyStepResult,
   TreatySupportPlan,
 } from "./types.js";
 
@@ -39,4 +43,51 @@ export function treatyPackagrArgv(
     "--mode",
     options.mode,
   ];
+}
+
+/** The deterministic argv that applies one structural Treaty transform. */
+function transformArgv(transform: string): readonly string[] {
+  return ["treaty", "transform", transform];
+}
+
+/**
+ * Build the PRODUCTION {@link TreatyMigrationStep}: it shells the planned
+ * structural transforms (for `enhanced` mode) and then the treaty-packagr build
+ * through the injected {@link TreatyShell}, in the cloned working directory.
+ * Deterministic, no AI — the plan is a fixed function of the mode. The step
+ * stops at (and reports) the FIRST non-zero command, so a human reviews any
+ * failure rather than an LLM papering over it.
+ *
+ * The same shell the github-adapter already owns is injected here, so the
+ * Treaty step runs through one process boundary and stays fully fake-testable.
+ */
+export function createTreatyMigrationStep(
+  shell: TreatyShell,
+): TreatyMigrationStep {
+  return {
+    async migrate(input: TreatyStepInput): Promise<TreatyStepResult> {
+      const plan = planTreatyMigration(input.mode);
+
+      for (const transform of plan.transforms) {
+        const argv = transformArgv(transform);
+        // eslint-disable-next-line no-await-in-loop
+        const result = await shell(input.workdir, argv);
+        if (result.code !== 0) {
+          return { ok: false, plan, failedArgv: argv, output: result.output };
+        }
+      }
+
+      const buildArgv = treatyPackagrArgv({
+        projectRoot: ".",
+        outDir: input.outDir,
+        mode: input.mode,
+      });
+      const build = await shell(input.workdir, buildArgv);
+      if (build.code !== 0) {
+        return { ok: false, plan, failedArgv: buildArgv, output: build.output };
+      }
+
+      return { ok: true, plan, failedArgv: undefined, output: undefined };
+    },
+  };
 }

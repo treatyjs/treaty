@@ -43,6 +43,17 @@ export type {
 } from "./cycle.js";
 export { runMaintenanceCycle } from "./cycle.js";
 
+// The optional Treaty migration boundary, re-exported so hosts can inject a
+// fake (tests) or enable the production step without depending on the
+// treaty-support package directly.
+export type {
+  TreatyMigrationStep,
+  TreatyStepInput,
+  TreatyStepResult,
+  TreatyAuthoringMode,
+} from "@ngx-maintenance/treaty-support";
+export { createTreatyMigrationStep } from "@ngx-maintenance/treaty-support";
+
 export type {
   SchedulerState,
   SchedulerConfig,

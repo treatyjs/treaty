@@ -11,6 +11,14 @@ export type {
   TreatyAuthoringMode,
   TreatySupportPlan,
   TreatyPackageOptions,
+  TreatyShell,
+  TreatyStepInput,
+  TreatyStepResult,
+  TreatyMigrationStep,
 } from "./types.js";
 
-export { planTreatyMigration, treatyPackagrArgv } from "./support.js";
+export {
+  planTreatyMigration,
+  treatyPackagrArgv,
+  createTreatyMigrationStep,
+} from "./support.js";

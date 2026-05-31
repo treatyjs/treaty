@@ -82,7 +82,7 @@ describe("onInstallation", () => {
       action: "created",
       installation: { id: 1, account: { login: "acme" } },
       repositories: [{ full_name: "acme/widget" }],
-    });
+    } as unknown as Parameters<typeof onInstallation>[1]);
 
     const widget = result.manifest.entries.find(
       (e) => e.npmName === "@acme/widget",
@@ -131,7 +131,7 @@ describe("onAngularRelease", () => {
       action: "published",
       release: { tag_name: "v22.0.0" },
       repository: { full_name: "angular/angular" },
-    });
+    } as unknown as Parameters<typeof onAngularRelease>[1]);
 
     // Exactly one PR for the behind+installed lib.
     expect(result.prs).toHaveLength(1);
@@ -173,7 +173,7 @@ describe("onAngularRelease", () => {
       action: "published",
       release: { tag_name: "not-a-version" },
       repository: { full_name: "angular/angular" },
-    });
+    } as unknown as Parameters<typeof onAngularRelease>[1]);
 
     expect(result.prs).toHaveLength(0);
     expect(fake.pullCalls).toHaveLength(0);

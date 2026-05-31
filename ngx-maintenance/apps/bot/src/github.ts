@@ -6,13 +6,16 @@ import type { Octokit } from "octokit";
  * testable with a fake: any object matching this shape can be injected in unit
  * tests, while production passes a real {@link Octokit} instance.
  */
+// oxlint-disable-next-line typescript/no-explicit-any -- structural GitHub-API boundary must accept the real Octokit’s precise per-endpoint params
+type OctokitParams = any;
+
 export interface OctokitLike {
   readonly rest: {
     readonly pulls: {
-      create(params: Record<string, unknown>): Promise<{ data: unknown }>;
+      create(params: OctokitParams): Promise<{ data: unknown }>;
     };
     readonly issues: {
-      create(params: Record<string, unknown>): Promise<{ data: unknown }>;
+      create(params: OctokitParams): Promise<{ data: unknown }>;
     };
   };
 }

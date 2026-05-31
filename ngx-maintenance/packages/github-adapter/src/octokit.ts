@@ -1,5 +1,8 @@
 import type { Octokit } from "octokit";
 
+// oxlint-disable-next-line typescript/no-explicit-any -- structural GitHub-API boundary must accept the real Octokit’s precise per-endpoint params
+type OctokitParams = any;
+
 /**
  * The structural subset of Octokit the bot depends on. Declaring it here (rather
  * than importing the concrete class everywhere) keeps every other package
@@ -13,7 +16,7 @@ import type { Octokit } from "octokit";
 export interface OctokitLike {
   readonly rest: {
     readonly pulls: {
-      create(params: Record<string, unknown>): Promise<{ data: unknown }>;
+      create(params: OctokitParams): Promise<{ data: unknown }>;
       /**
        * List pull requests for a repository. The orchestrator queries this to
        * stay IDEMPOTENT: before opening a migration PR it checks whether one is
@@ -21,11 +24,11 @@ export interface OctokitLike {
        * callers read only the structural subset they need.
        */
       list(
-        params: Record<string, unknown>,
+        params: OctokitParams,
       ): Promise<{ data: ReadonlyArray<unknown> }>;
     };
     readonly issues: {
-      create(params: Record<string, unknown>): Promise<{ data: unknown }>;
+      create(params: OctokitParams): Promise<{ data: unknown }>;
     };
   };
 }

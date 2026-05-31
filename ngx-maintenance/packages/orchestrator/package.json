@@ -19,7 +19,8 @@
     "@ngx-maintenance/migration-engine": "workspace:*",
     "@ngx-maintenance/registry": "workspace:*",
     "@ngx-maintenance/staleness-detector": "workspace:*",
-    "@ngx-maintenance/takeover": "workspace:*"
+    "@ngx-maintenance/takeover": "workspace:*",
+    "@ngx-maintenance/treaty-support": "workspace:*"
   },
   "devDependencies": {
     "vitest": "^4.1.7"

@@ -71,3 +71,7 @@ export type {
   PullListResponder,
 } from "./fakes.js";
 export { createFakeOctokit, createFakeAdapter } from "./fakes.js";
+
+// Re-export the concrete Octokit class so consumers (e.g. the orchestrator takeover
+// adapter) construct it via this single GitHub boundary without their own octokit dep.
+export { Octokit } from "octokit";

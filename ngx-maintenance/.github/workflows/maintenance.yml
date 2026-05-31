@@ -1,0 +1,134 @@
+name: ngx-maintenance bot
+
+# The dependabot-style cron entry for the no-AI Angular-library maintenance bot.
+# It runs the deterministic discover -> migrate -> PR -> takeover cycle (`poll`)
+# on a schedule, and a discovery-only pass (`scan`) on its own cadence. There is
+# NO AI anywhere; the orchestration is a pure function of its inputs and the
+# GitHub state it reads through GITHUB_TOKEN.
+on:
+  schedule:
+    # Full maintenance poll: every day at 06:00 UTC.
+    - cron: "0 6 * * *"
+    # Discovery scan: every Monday at 07:00 UTC (a separate, lighter pass).
+    - cron: "0 7 * * 1"
+  # Manual run from the Actions tab. `command` lets an operator force either pass
+  # on demand (e.g. a one-off scan after onboarding a new org).
+  workflow_dispatch:
+    inputs:
+      command:
+        description: "Which bot pass to run"
+        type: choice
+        default: poll
+        options:
+          - poll
+          - scan
+      orgs:
+        description: "Space-separated GitHub orgs to watch (overrides config)"
+        type: string
+        required: false
+
+# Read-only by default; the bot opens PRs/issues through the token below, which
+# the job grants the minimum write scopes it needs.
+permissions:
+  contents: read
+
+# Never let two maintenance runs race on the same repos.
+concurrency:
+  group: ngx-maintenance
+  cancel-in-progress: false
+
+defaults:
+  run:
+    working-directory: ngx-maintenance
+
+jobs:
+  # Full maintenance cycle: discover stale opted-in libs, run the deterministic
+  # migration chain, open (idempotently) migration PRs, and evaluate the 2-week
+  # takeover timer. Runs on the daily cron and on a manual `poll` dispatch.
+  poll:
+    name: poll (migrate + PR + takeover)
+    runs-on: ubuntu-latest
+    # Daily cron OR a manual run that selected `poll` (the default).
+    if: >-
+      github.event_name == 'schedule' && github.event.schedule == '0 6 * * *' ||
+      github.event_name == 'workflow_dispatch' && (github.event.inputs.command == 'poll' || github.event.inputs.command == '')
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    env:
+      # The bot authenticates every GitHub API call (PR/issue create, fork) with
+      # this token. Provide a PAT/App token via the `MAINTENANCE_TOKEN` secret
+      # for cross-org writes; falls back to the run's own GITHUB_TOKEN.
+      GITHUB_TOKEN: ${{ secrets.MAINTENANCE_TOKEN || secrets.GITHUB_TOKEN }}
+      # The latest published Angular major the chain targets (operator-tunable).
+      LATEST_ANGULAR: ${{ vars.LATEST_ANGULAR || '22' }}
+      # Space-separated watched orgs; manual input wins, else the repo variable.
+      WATCHED_ORGS: ${{ github.event.inputs.orgs || vars.WATCHED_ORGS }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Build (emits to dist/, gitignored)
+        run: bun run build
+
+      - name: Run maintenance poll
+        run: |
+          ORG_FLAGS=""
+          for org in $WATCHED_ORGS; do
+            ORG_FLAGS="$ORG_FLAGS --org $org"
+          done
+          bun run apps/bot/src/cli.ts poll \
+            --manifest registry.json \
+            $ORG_FLAGS
+
+  # Discovery-only pass: surface stale, unregistered libraries as opt-in
+  # suggestions. Carries NO outstanding takeover PRs, so it only opens migration
+  # PRs for newly-stale libs. Runs on the weekly cron and on a manual `scan`.
+  scan:
+    name: scan (discovery)
+    runs-on: ubuntu-latest
+    # Weekly cron OR a manual run that selected `scan`.
+    if: >-
+      github.event_name == 'schedule' && github.event.schedule == '0 7 * * 1' ||
+      github.event_name == 'workflow_dispatch' && github.event.inputs.command == 'scan'
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    env:
+      GITHUB_TOKEN: ${{ secrets.MAINTENANCE_TOKEN || secrets.GITHUB_TOKEN }}
+      LATEST_ANGULAR: ${{ vars.LATEST_ANGULAR || '22' }}
+      WATCHED_ORGS: ${{ github.event.inputs.orgs || vars.WATCHED_ORGS }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Build (emits to dist/, gitignored)
+        run: bun run build
+
+      - name: Run discovery scan
+        run: |
+          ORG_FLAGS=""
+          for org in $WATCHED_ORGS; do
+            ORG_FLAGS="$ORG_FLAGS --org $org"
+          done
+          bun run apps/bot/src/cli.ts scan \
+            --manifest registry.json \
+            $ORG_FLAGS

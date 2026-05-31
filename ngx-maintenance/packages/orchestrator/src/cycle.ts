@@ -19,6 +19,7 @@ import {
   type TakeoverRun,
   type TakeoverSignals,
 } from "@ngx-maintenance/takeover";
+import type { TreatyStepResult } from "@ngx-maintenance/treaty-support";
 import type { BotConfig } from "./config.js";
 import type { MaintenanceAdapters } from "./adapters.js";
 
@@ -54,6 +55,7 @@ export type SkipReason =
   | "empty-plan"
   | "clone-failed"
   | "migration-failed"
+  | "treaty-failed"
   | "pr-exists";
 
 /** The per-library outcome of the discover -> migrate -> PR pipeline. */
@@ -70,6 +72,12 @@ export interface LibraryOutcome {
   readonly migration: CloneMigrateResult | undefined;
   /** The migration head branch a PR was opened on, when one was opened. */
   readonly prHead: string | undefined;
+  /**
+   * The optional Treaty migration step's result, present ONLY when the library
+   * opted in (its name is in `config.treatyOptIn`) AND a Treaty adapter was
+   * injected. `undefined` for every non-opted-in library — the unchanged path.
+   */
+  readonly treaty: TreatyStepResult | undefined;
   /**
    * `"pr-opened"` when a new migration PR was created; otherwise the reason the
    * library was skipped.
@@ -162,6 +170,7 @@ export async function runMaintenanceCycle(
         finding: undefined,
         migration: undefined,
         prHead: undefined,
+        treaty: undefined,
         result: "not-stale",
       });
       continue;
@@ -179,6 +188,7 @@ export async function runMaintenanceCycle(
         finding,
         migration: undefined,
         prHead: undefined,
+        treaty: undefined,
         result: "empty-plan",
       });
       continue;
@@ -197,14 +207,17 @@ export async function runMaintenanceCycle(
         finding,
         migration: undefined,
         prHead: prSpec.head,
+        treaty: undefined,
         result: "pr-exists",
       });
       continue;
     }
 
-    // Clone into a fresh workdir and run the migration chain there.
+    // Clone into a fresh workdir, run the migration chain there, and — for an
+    // opted-in library only — run the OPTIONAL Treaty step on the same workdir
+    // before it is disposed. A non-opted-in library never touches Treaty.
     // eslint-disable-next-line no-await-in-loop
-    const migration = await runClonedMigration(
+    const { migration, treaty } = await runClonedMigration(
       config,
       adapters,
       prSpec,
@@ -217,6 +230,7 @@ export async function runMaintenanceCycle(
         finding,
         migration,
         prHead: undefined,
+        treaty: undefined,
         result: "clone-failed",
       });
       continue;
@@ -229,12 +243,27 @@ export async function runMaintenanceCycle(
         finding,
         migration,
         prHead: undefined,
+        treaty: undefined,
         result: "migration-failed",
       });
       continue;
     }
+    if (treaty !== undefined && !treaty.ok) {
+      // The opt-in Treaty step failed: report it for human review, no PR opens.
+      libraries.push({
+        ...base,
+        stale: true,
+        finding,
+        migration,
+        prHead: undefined,
+        treaty,
+        result: "treaty-failed",
+      });
+      continue;
+    }
 
-    // Migration succeeded: open the PR (the read above proved none was open).
+    // Migration (and any opted-in Treaty step) succeeded: open the PR (the read
+    // above proved none was open).
     // eslint-disable-next-line no-await-in-loop
     await openMigrationPr(adapters.github.octokit, prSpec);
     libraries.push({
@@ -243,6 +272,7 @@ export async function runMaintenanceCycle(
       finding,
       migration,
       prHead: prSpec.head,
+      treaty,
       result: "pr-opened",
     });
     prsOpened += 1;
@@ -333,25 +363,68 @@ function isStaleAgainstWindow(
   );
 }
 
+/** The combined clone+migrate and (opt-in) Treaty outcome for one library. */
+interface ClonedMigrationOutcome {
+  /** The clone + Angular migration-chain result. */
+  readonly migration: CloneMigrateResult;
+  /**
+   * The Treaty step result, present ONLY when the library opted in AND a Treaty
+   * adapter was injected AND the Angular migration succeeded (so a workdir to
+   * run it against exists). `undefined` otherwise.
+   */
+  readonly treaty: TreatyStepResult | undefined;
+}
+
 /**
- * Clone the library into a fresh workdir and run its migration chain, disposing
- * the workdir afterward. Isolated so the cycle's control flow stays readable.
+ * Decide whether the OPTIONAL Treaty step runs for a library: it runs iff the
+ * library opted in (its name is in `config.treatyOptIn`) AND a Treaty adapter
+ * was injected. Pure — a non-opted-in library, or a deployment with no Treaty
+ * boundary, returns `undefined` and the flow is unchanged.
+ */
+function treatyStepFor(
+  config: BotConfig,
+  adapters: MaintenanceAdapters,
+  npmName: string,
+): MaintenanceAdapters["treaty"] {
+  if (adapters.treaty === undefined) return undefined;
+  return config.treatyOptIn.includes(npmName) ? adapters.treaty : undefined;
+}
+
+/**
+ * Clone the library into a fresh workdir and run its migration chain, then —
+ * for an opted-in library whose migration succeeded — run the additional Treaty
+ * step on that SAME workdir, disposing the workdir afterward in all cases.
+ * Isolated so the cycle's control flow stays readable.
  */
 async function runClonedMigration(
   config: BotConfig,
   adapters: MaintenanceAdapters,
   prSpec: ReturnType<typeof buildMigrationPr>,
   slug: string,
-): Promise<CloneMigrateResult> {
+): Promise<ClonedMigrationOutcome> {
   const dir = await adapters.github.workdirs.allocate(slug);
   try {
-    return await cloneAndMigrate(
+    const migration = await cloneAndMigrate(
       adapters.github.shell,
       prSpec.repoUrl,
       dir,
       prSpec.plan,
       config.cloneDepth !== undefined ? { ref: prSpec.base, depth: config.cloneDepth } : { ref: prSpec.base },
     );
+
+    // The Treaty step only makes sense on a successfully migrated checkout.
+    const step = treatyStepFor(config, adapters, prSpec.npmName);
+    if (step === undefined || !migration.clone.ok || !migration.ok) {
+      return { migration, treaty: undefined };
+    }
+
+    const treaty = await step.migrate({
+      npmName: prSpec.npmName,
+      workdir: dir,
+      mode: config.treatyMode,
+      outDir: "dist",
+    });
+    return { migration, treaty };
   } finally {
     await adapters.github.workdirs.dispose(dir);
   }
