@@ -82,3 +82,4 @@ baseline-cargo-build.log
 
 # NAPI build artifact
 libs/authoring/node/*.node
+migration/*.log
