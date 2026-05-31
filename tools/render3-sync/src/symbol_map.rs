@@ -220,12 +220,26 @@ pub const MODULE_MAP: &[ModuleMapping] = &[
         anchor_symbols: &["compileInjector", "R3InjectorMetadata"],
     },
     // ---- expression converter ----------------------------------------------------------
+    // Angular v22 retired the historic `compiler_util/expression_converter.ts`; the
+    // `e.AST -> o.Expression` lowering it used to own now lives in the template *pipeline*:
+    // `convertAst` (the per-node lowering) in `template/pipeline/src/ingest.ts` and the binary
+    // operator table `BINARY_OPERATORS` in `template/pipeline/src/conversion.ts`. The Rust
+    // `expression_converter.rs` reproduces the classic `convertPropertyBinding` behaviour from
+    // those two pipeline sources (see its `PORT TARGET:` header), so the map points at the
+    // vendored pipeline files that actually exist — not the removed `compiler_util` path.
     ModuleMapping {
-        ts_file: "compiler_util/expression_converter.ts",
+        ts_file: "template/pipeline/src/ingest.ts",
         rust_file: "expression_converter.rs",
         kind: PortKind::Logic,
         spec: None,
-        anchor_symbols: &["convertPropertyBinding", "convertActionBinding", "convertUpdateArguments"],
+        anchor_symbols: &["ingestComponent", "ingestHostBinding"],
+    },
+    ModuleMapping {
+        ts_file: "template/pipeline/src/conversion.ts",
+        rust_file: "expression_converter.rs",
+        kind: PortKind::Logic,
+        spec: None,
+        anchor_symbols: &["BINARY_OPERATORS", "literalOrArrayLiteral"],
     },
     // ---- ml_parser (HTML front-end) ----------------------------------------------------
     ModuleMapping {
@@ -395,6 +409,37 @@ mod tests {
     fn symbol_resolves_to_module() {
         let hits = rust_modules_for_symbol("AttributeMarker");
         assert!(hits.iter().any(|m| m.rust_file == "output_ast.rs"));
+    }
+
+    /// Locate the Treaty repo root from this crate's directory, so the test resolves vendored
+    /// `tools/angular-ref` paths regardless of the cargo invocation's CWD. `CARGO_MANIFEST_DIR`
+    /// is `<repo>/tools/render3-sync`; the root is two levels up.
+    fn repo_root() -> std::path::PathBuf {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        manifest
+            .parent() // tools/
+            .and_then(|p| p.parent()) // <repo>/
+            .expect("crate is nested at <repo>/tools/render3-sync")
+            .to_path_buf()
+    }
+
+    #[test]
+    fn every_ts_file_resolves_to_an_existing_vendored_source() {
+        // A future bad/stale row (e.g. pointing at a non-vendored or renamed Angular source) must
+        // fail CI here, rather than silently letting drift read an empty source for that file.
+        let root = repo_root();
+        let mut missing: Vec<String> = Vec::new();
+        for m in MODULE_MAP {
+            let path = root.join(ANGULAR_COMPILER_SRC_ROOT).join(m.ts_file);
+            if !path.is_file() {
+                missing.push(format!("{} (resolved: {})", m.ts_file, path.display()));
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "every symbol_map ts_file must exist under {ANGULAR_COMPILER_SRC_ROOT}; missing:\n  {}",
+            missing.join("\n  ")
+        );
     }
 
     #[test]

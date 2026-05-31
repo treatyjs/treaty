@@ -19,6 +19,7 @@ pub mod conformance;
 pub mod drift;
 pub mod report;
 pub mod symbol_map;
+pub mod sync;
 pub mod ts;
 pub mod ts2rust;
 
@@ -33,6 +34,10 @@ pub use report::{
 };
 pub use symbol_map::{
     ModuleMapping, PortKind, ANGULAR_COMPILER_SRC_ROOT, MODULE_MAP, RENDER3_SRC_ROOT,
+};
+pub use sync::{
+    diff_baseline, record_baseline, reference_ts_files, verify_codegen, Baseline, FileBaseline,
+    FsReader, SourceReader, VerifyEntry, VerifyReport, VerifyStatus,
 };
 pub use ts2rust::{
     diff_against, emit_rust, CodegenReport, Emitted, EmittedKind, Unsupported,
