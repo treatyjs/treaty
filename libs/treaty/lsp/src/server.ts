@@ -31,6 +31,7 @@ import {
 } from '@volar/language-server/node'
 import { create as createTypeScriptServices } from 'volar-service-typescript'
 import { createTreatyLanguagePlugin } from './language.js'
+import { applyTreatyJsxAutoTypes, resolveTreatyJsxTypesEntry } from './jsx-types.js'
 
 const require = createRequire(import.meta.url)
 
@@ -74,15 +75,26 @@ export function createServer(connection: Connection = createConnection()): Treat
 			params.locale,
 		)
 
+		// Locate the shipped @treaty/jsx ambient declarations once. The resolved
+		// .d.ts (when present) is injected as an extra root file, and every
+		// project compilerOptions are augmented to auto-include @treaty/jsx and
+		// route the automatic JSX runtime through it, so every Treaty file
+		// resolves the global JSX namespace with no per-project tsconfig opt-in.
+		// See applyTreatyJsxAutoTypes.
+		const jsxTypesEntry = resolveTreatyJsxTypesEntry()
+
 		return server.initialize(
 			params,
-			createTypeScriptProject(typescript, diagnosticMessages, () => ({
-				languagePlugins: [
-					createTreatyLanguagePlugin<URI>({
-						scriptIdToFileName: (uri) => uri.fsPath || uri.path,
-					}),
-				],
-			})),
+			createTypeScriptProject(typescript, diagnosticMessages, ({ projectHost }) => {
+				applyTreatyJsxAutoTypes(projectHost, jsxTypesEntry)
+				return {
+					languagePlugins: [
+						createTreatyLanguagePlugin<URI>({
+							scriptIdToFileName: (uri) => uri.fsPath || uri.path,
+						}),
+					],
+				}
+			}),
 			createTypeScriptServices(typescript),
 		)
 	})

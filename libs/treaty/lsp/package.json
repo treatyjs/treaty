@@ -26,6 +26,7 @@
   "sideEffects": false,
   "dependencies": {
     "@treaty/authoring-node": "*",
+    "@treaty/jsx": "*",
     "@volar/language-core": "~2.4.0",
     "@volar/language-server": "~2.4.0",
     "@volar/typescript": "~2.4.0",

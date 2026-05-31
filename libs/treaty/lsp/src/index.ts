@@ -42,3 +42,11 @@ export { compileTreaty, compileSource, compileTemplate } from './compiler.js'
 
 export type { TreatyLanguageServer } from './server.js'
 export { createServer, start } from './server.js'
+
+export type { TreatyJsxProjectHost } from './jsx-types.js'
+export {
+	resolveTreatyJsxTypesEntry,
+	treatyJsxCompilerOptions,
+	applyTreatyJsxAutoTypes,
+	TREATY_JSX_IMPORT_SOURCE,
+} from './jsx-types.js'
