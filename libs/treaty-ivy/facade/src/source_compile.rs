@@ -585,7 +585,7 @@ fn parse_signal_query(prop: &PropertyDefinition) -> Option<(bool, R3QueryMetadat
                 .unwrap_or_default();
             QueryPredicate::Selectors(vec![text])
         }
-        other => QueryPredicate::Expr(convert_expr(other)?),
+        other => query_expr_predicate(other)?,
     };
 
     let descendants = query_descendants(options_node, callee != "contentChildren");
@@ -689,7 +689,7 @@ fn decorator_query_metadata(
                 .unwrap_or_default();
             split_query_selectors(&text)
         }
-        other => QueryPredicate::Expr(convert_expr(other)?),
+        other => query_expr_predicate(other)?,
     };
 
     // descendants default: ContentChildren → false, the rest → true.
@@ -938,6 +938,19 @@ fn host_directive_entry(expr: &Expression) -> Option<R3HostDirectiveMetadata> {
         }
         _ => None,
     }
+}
+
+/// Build the `Expr`-form query predicate for a non-string locator (`@ViewChild(SomeDir)` /
+/// `viewChild(forwardRef(() => SomeDir))`). Angular's `forwardRefResolver` UNWRAPS a
+/// `forwardRef(() => X)` locator to the bare `X` reference (the query records no live forward-ref
+/// handling — `ForwardRefHandling::None`), and a bare identifier `X` is used verbatim. So when the
+/// locator resolves to a class name (directly or through a forwardRef), emit `o::variable(name)`;
+/// otherwise fall back to the structural [`convert_expr`] (e.g. a `read`/token member expression).
+fn query_expr_predicate(expr: &Expression) -> Option<QueryPredicate> {
+    if let Some((name, _was_forward)) = directive_name_maybe_forward(expr) {
+        return Some(QueryPredicate::Expr(o::variable(name, None)));
+    }
+    Some(QueryPredicate::Expr(convert_expr(expr)?))
 }
 
 /// Resolve a directive reference expression to its class name plus whether it was wrapped in
@@ -2796,6 +2809,25 @@ mod tests {
         let tmpl = flat.find("[4,\"if\"]").expect("missing [Template,\"if\"] const");
         assert!(foo < baz && baz < bar, "local-ref order wrong: foo={foo} baz={baz} bar={bar}");
         assert!(bar < tmpl, "nested-view #bar const must precede the [Template,\"if\"] const; got: {flat}");
+    }
+
+    #[test]
+    fn view_query_forward_ref_predicate_resolves_to_class() {
+        // `@ViewChild(forwardRef(() => SomeDir))` must resolve (Angular `forwardRefResolver`) to the
+        // bare class reference so the query emits `ɵɵviewQuery(SomeDir, …)`. Previously the arrow
+        // inside forwardRef defeated `convert_expr`, dropping the query (no `viewQuery` field at all).
+        let src = r#"@Component({selector:"v",template:"<div someDir></div>"})
+            export class V {
+                @ViewChild(forwardRef(() => SomeDir)) someDir!: SomeDir;
+            }"#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+        assert!(code.contains("viewQuery"), "missing viewQuery field; got: {code}");
+        assert!(
+            code.contains("ɵɵviewQuery(SomeDir"),
+            "forwardRef predicate did not resolve to SomeDir; got: {code}"
+        );
     }
 
     #[test]

@@ -387,6 +387,20 @@ function canonicalize(code) {
   // EQUAL to our real literal `ctx`. STRICT: only the exact `$ctx$` token.
   s = s.replace(/\$ctx\$/g, 'ctx');
   s = s.replace(/\$[A-Za-z_][A-Za-z0-9_]*\$/g, 'ID'); // $ctx_r1$, $_r2$, $i0$ already gone
+  // Angular's `ConstantPool` shared-literal references are emitted with the REAL `_cN` name
+  // (`constant_pool.ts` CONSTANT_PREFIX = "_c"), while the goldens spell the SAME reference with a
+  // renamable `$cN$` / `$eN_attrs$` expect-emit placeholder (already collapsed to `ID` above). Map
+  // our literal `_cN` reference to the SAME `ID` token so a hoisted shared-const reference (e.g. a
+  // local-ref query predicate `ɵɵviewQuery(_c0, 5)`) compares equal to the golden's `ɵɵviewQuery(
+  // $e0_attrs$, 5)`. STRICT: only the exact `_c<digits>` const-reference token; the load-bearing
+  // instruction name, argument order and slot indices around it are untouched.
+  s = s.replace(/\b_c\d+\b/g, 'ID');
+  // The query-refresh scratch temporary is emitted with the REAL identifier `_t` (Angular
+  // `generate_variables` / query lowering: `let _t; ɵɵqueryRefresh(_t = ɵɵloadQuery()) && …`),
+  // while the goldens spell it with the renamable `$tmp$` expect-emit placeholder (already → `ID`).
+  // Map the exact `_t` token to `ID` so a query function compares equal regardless of the temp's
+  // surface name. STRICT: only the standalone `_t` identifier token.
+  s = s.replace(/\b_t\b/g, 'ID');
   s = s.replace(/_r\d+\b/g, '_R'); // item_r1 -> item_R
   s = s.replace(/_\d+\b(?=_)/g, '_N'); // intermediate numeric segments in fn names
   // Drop the `type:` metadata entry the goldens vary on / Rust emits a TS type for.
