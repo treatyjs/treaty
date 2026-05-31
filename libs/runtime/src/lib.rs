@@ -23,15 +23,21 @@
 
 use std::fmt;
 
+mod node;
 mod transpile;
 
 pub use transpile::{transpile_ts, TranspileError};
 
 use nova_vm::{
-    ecmascript::{DefaultHostHooks, GcAgent, String as JsString, parse_script, script_evaluation},
-    engine::Bindable,
+    ecmascript::{
+        Agent, AgentOptions, DefaultHostHooks, GcAgent, Object, String as JsString, parse_script,
+        script_evaluation,
+    },
+    engine::{Bindable, GcScope},
 };
 use serde_json::Value as JsonValue;
+
+use crate::node::core::HostState;
 
 /// An error raised while preparing or executing a script.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,14 +83,80 @@ impl std::error::Error for RuntimeError {}
 pub struct JsRuntime {
     agent: GcAgent,
     realm: nova_vm::ecmascript::RealmRoot,
+    // SAFETY: drop order. When the Node-compat layer is enabled, the agent below holds a
+    // `&'static HostState` produced by `node::core::extend_lifetime` from this box. Rust drops
+    // fields in declaration order, so `agent` (declared first) is destroyed before `host_state`
+    // (declared last) — the agent therefore never observes a freed `HostState`. This box is the
+    // only thing keeping that erased-lifetime reference valid; it MUST stay the final field. It is
+    // `None` for a plain `JsRuntime::new`, which uses Nova's `DefaultHostHooks` instead.
+    host_state: Option<Box<HostState>>,
 }
 
 impl JsRuntime {
     /// Construct a new runtime with a fresh Nova agent and a default realm.
+    ///
+    /// This is the plain, Node-free runtime: it uses Nova's `DefaultHostHooks` and a default realm,
+    /// exactly as before. The Node-compat layer is opt-in via [`JsRuntime::with_node_compat`].
     pub fn new() -> Self {
         let mut agent = GcAgent::new(Default::default(), &DefaultHostHooks);
         let realm = agent.create_default_realm();
-        Self { agent, realm }
+        Self {
+            agent,
+            realm,
+            host_state: None,
+        }
+    }
+
+    /// Construct a runtime with the Treaty Node-compatibility layer installed.
+    ///
+    /// This wires a [`HostState`] (the microtask/timer event loop, the `oxc_resolver`-backed module
+    /// resolver, and the lazy builtin registry) behind Nova's host hooks, and initializes the
+    /// realm's global object with the Node globals (eager ones immediately; the rest as lazy
+    /// self-replacing accessors). The CWD and environment are captured from the current process.
+    ///
+    /// All other behavior — `eval`, `eval_with_input`, `run_macro`, `run_server_fn` — is unchanged;
+    /// the Node layer is purely additive. After a script evaluates, `eval*` drains the event loop so
+    /// scheduled promise jobs and timers settle before the completion value is read.
+    pub fn with_node_compat() -> Self {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let env = std::env::vars().collect();
+        let host_state = Box::new(HostState::new(cwd, env));
+
+        // SAFETY: Nova requires `&'static dyn HostHooks`. The reference is derived from `host_state`,
+        // which is moved into the returned struct as its LAST field and so outlives `agent` (see the
+        // field-drop-order comment on `JsRuntime::host_state`). This is the single localized `unsafe`
+        // of the Node layer (defined in `node::core`).
+        let hooks: &'static HostState = unsafe { node::core::extend_lifetime(&*host_state) };
+
+        let mut agent = GcAgent::new(
+            AgentOptions {
+                disable_gc: false,
+                print_internals: false,
+                no_block: false,
+            },
+            hooks,
+        );
+
+        // No custom global object / globalThis value; only a global-initializer that installs the
+        // Node globals. Typed `None`s satisfy the generic `Option<impl FnOnce...>` parameters.
+        let create_global_object: Option<for<'a> fn(&mut Agent, GcScope<'a, '_>) -> Object<'a>> =
+            None;
+        let create_global_this_value: Option<
+            for<'a> fn(&mut Agent, GcScope<'a, '_>) -> Object<'a>,
+        > = None;
+        let initialize_global: Option<fn(&mut Agent, Object, GcScope)> = Some(node::install);
+
+        let realm = agent.create_realm(
+            create_global_object,
+            create_global_this_value,
+            initialize_global,
+        );
+
+        Self {
+            agent,
+            realm,
+            host_state: Some(host_state),
+        }
     }
 
     /// Evaluate `source` and return its completion value as a [`serde_json::Value`].
@@ -111,7 +183,14 @@ impl JsRuntime {
         input: &JsonValue,
     ) -> Result<JsonValue, RuntimeError> {
         let wrapped = wrap_source(source, input)?;
-        let JsRuntime { agent, realm } = self;
+        let JsRuntime {
+            agent,
+            realm,
+            host_state,
+        } = self;
+        // Borrow the event loop out of the (optional) host state for the drain below. `None` for a
+        // plain `JsRuntime::new`, in which case no draining happens and behavior is unchanged.
+        let event_loop = host_state.as_deref().map(|s| s.event_loop());
 
         let outcome = agent.run_in_realm(realm, |agent, mut gc| -> Result<String, RuntimeError> {
             // Build the source string on the Nova heap.
@@ -145,12 +224,34 @@ impl JsRuntime {
 
             match result {
                 Ok(value) => {
-                    // `string_repr` never throws; the wrapper always completes with a string.
+                    // Read the completion value first. The wrapper always completes with the final
+                    // `JSON.stringify({ v: ... })` string, computed synchronously, so reading it now
+                    // captures the result before any event-loop draining can move heap objects.
+                    // `string_repr` never throws.
                     let repr = value
                         .unbind()
-                        .string_repr(agent, gc)
+                        .string_repr(agent, gc.reborrow())
                         .to_string_lossy(agent)
                         .into_owned();
+
+                    // With the Node layer enabled, drain the event loop so promise jobs and due
+                    // timers scheduled by the script run their side effects. Empty queues return
+                    // immediately, so a script that schedules nothing is unaffected. A job that
+                    // throws aborts the drain and surfaces as a runtime error.
+                    if let Some(event_loop) = event_loop {
+                        node::event_loop::run_until_idle(agent, event_loop, None, gc.reborrow())
+                            .unbind()
+                            .map_err(|error| {
+                                let message = error
+                                    .value()
+                                    .unbind()
+                                    .string_repr(agent, gc)
+                                    .to_string_lossy(agent)
+                                    .into_owned();
+                                RuntimeError::Runtime(message)
+                            })?;
+                    }
+
                     Ok(repr)
                 }
                 Err(error) => {
@@ -667,5 +768,43 @@ mod tests {
         let fn_out = run_server_fn("return args[0] * 10;", &json!([2])).unwrap();
         assert_eq!(macro_out.value, fn_out);
         assert_eq!(fn_out, json!(20));
+    }
+
+    // --- Node-compat layer (additive; opt-in via `with_node_compat`) -------------------------
+
+    #[test]
+    fn node_compat_runtime_evaluates_like_the_plain_one() {
+        // The Node layer is additive: the core eval surface behaves identically.
+        let mut rt = JsRuntime::with_node_compat();
+        assert_eq!(rt.eval("1 + 2").unwrap(), json!(3));
+        assert_eq!(
+            rt.eval("({ a: [1, 2], b: 'x' })").unwrap(),
+            json!({ "a": [1, 2], "b": "x" })
+        );
+    }
+
+    #[test]
+    fn node_compat_installs_global_self_reference() {
+        // `globals::install_globals` ran via the realm init hook: Node's `global` aliases globalThis.
+        let mut rt = JsRuntime::with_node_compat();
+        assert_eq!(rt.eval("global === globalThis").unwrap(), json!(true));
+    }
+
+    #[test]
+    fn node_compat_drains_promise_microtasks_before_returning() {
+        // The event-loop pump runs after evaluation: a promise's `.then` side effect lands on a
+        // global, observable by the next eval.
+        let mut rt = JsRuntime::with_node_compat();
+        let value = rt
+            .eval(
+                "globalThis.__hit = 0;\
+                 Promise.resolve().then(() => { globalThis.__hit = 1; });\
+                 globalThis.__hit",
+            )
+            .unwrap();
+        // The trailing expression reads `__hit` synchronously (still 0); after the drain the job has
+        // run, which the next eval observes.
+        assert_eq!(value, json!(0));
+        assert_eq!(rt.eval("globalThis.__hit").unwrap(), json!(1));
     }
 }

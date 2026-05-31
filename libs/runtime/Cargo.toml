@@ -19,3 +19,9 @@ oxc_span = "0.133.0"
 oxc_semantic = "0.133.0"
 oxc_transformer = "0.133.0"
 oxc_codegen = "0.133.0"
+
+# Node-style module resolution for the Node-compat layer: node_modules walk, package.json
+# main/exports/imports + conditions, extension probing, and tsconfig paths. Standalone crate (no
+# dependency on the oxc 0.133 AST crates), so 11.20.0 — the current release — builds alongside them.
+# Used instead of a hand-rolled resolver (see node/resolver.rs).
+oxc_resolver = "11.20.0"
