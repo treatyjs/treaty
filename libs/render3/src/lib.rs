@@ -32,11 +32,31 @@ pub use core::output;
 pub use core::output_ast;
 
 pub mod util;
-pub mod template;
+
+// ---------------------------------------------------------------------------
+// `template` subtree (Phase 2). The HTML/template → instruction-IR layer —
+// `ml_parser`, the template AST + transform + control-flow / defer lowerings,
+// the `t2` binder, the template-definition builder + query generation, and i18n
+// — now live under `template_mod/`. Each is re-exported from its historical
+// top-level path so call sites outside `template` are unchanged (the canonical
+// paths are now `crate::template_mod::…`). See `migration/RENDER3-SPLIT-PLAN.md`.
+// ---------------------------------------------------------------------------
+
+/// HTML/template → instruction-IR layer: parser, template AST/transform, binder,
+/// template-definition builder, query generation, and i18n. Depends on `core`.
+pub mod template_mod;
+
+// Re-export every `template` module from its historical top-level path. These
+// aliases keep `crate::template::r3_ast::…`, `crate::ml_parser::…`,
+// `crate::binder::…`, and `crate::i18n::…` resolving exactly as before.
+// (`crate::view::template` / `crate::view::queries` are re-exported from
+// `crate::view` itself, alongside the still-resident `view::compiler`.)
+pub use template_mod::binder;
+pub use template_mod::i18n;
+pub use template_mod::ml_parser;
+pub use template_mod::template;
+
 pub mod pipe_module_injector;
-pub mod binder;
-pub mod ml_parser;
 pub mod view;
 pub mod compile;
 pub mod source_compile;
-pub mod i18n;
