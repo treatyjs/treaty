@@ -1,0 +1,24 @@
+# treaty_file_routing — the pure, deterministic Rust core for file-based routing.
+#
+# Treaty is a compiler, not a host: this crate takes a directory tree (via an
+# injectable `DirTree` abstraction so it is unit-testable with in-memory
+# fixtures — no real filesystem) and a `FileRoutingConfig`, and produces
+# serde-serializable *data*: an Angular lazy-route config plus Module
+# Federation remote descriptors, and a server-endpoint manifest from an `api/`
+# folder. A thin TS/NAPI binding consumes these outputs in a later step. See
+# [[rust-core-ts-shim-layering]].
+#
+# DETACHED CRATE: the empty `[workspace]` table below makes this crate its own
+# workspace root, so it is NOT a member of the parent workspace and builds
+# independently of the in-flight render3 / runtime edits. Build with:
+#   cargo build --manifest-path libs/file-routing/Cargo.toml
+[workspace]
+
+[package]
+name = "treaty_file_routing"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
