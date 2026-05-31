@@ -29,8 +29,8 @@ use crate::template::template_transform::{
 use crate::util::{R3CompiledExpression, R3Reference};
 use crate::view::compiler::{
     compile_component_from_metadata, ChangeDetection, ChangeDetectionStrategy, ComponentTemplate,
-    DeclarationListEmitMode, Deps, Lifecycle, OrderedMap, R3ComponentDeferMetadata,
-    R3ComponentMetadata, R3DirectiveMetadata, R3HostMetadata, R3InputMetadata,
+    DeclarationListEmitMode, Deps, Lifecycle, OrderedMap, QueryPredicate, R3ComponentDeferMetadata,
+    R3ComponentMetadata, R3DirectiveMetadata, R3HostMetadata, R3InputMetadata, R3QueryMetadata,
     R3TemplateDependencyMetadata, StubHostBindingsBuilder, ViewEncapsulation,
 };
 
@@ -419,6 +419,139 @@ fn collect_io(
     Ok(())
 }
 
+/// The four signal-query initializer API names (`@angular/core`), and whether each is a
+/// single-result query and a content (vs view) query. Mirrors
+/// `compiler-cli/.../directive/src/query_functions.ts`:
+///   `viewChild`/`contentChild` are single (`first = true`); `viewChildren`/`contentChildren`
+///   are multi. `contentChild`/`contentChildren` are content queries; the others are view
+///   queries. The `descendants` default is `true` for every variant except `contentChildren`.
+fn signal_query_kind(name: &str) -> Option<(bool /*first*/, bool /*is_content*/)> {
+    match name {
+        "viewChild" => Some((true, false)),
+        "viewChildren" => Some((false, false)),
+        "contentChild" => Some((true, true)),
+        "contentChildren" => Some((false, true)),
+        _ => None,
+    }
+}
+
+/// Returns the callee identifier name of a call expression `foo(...)`, if the callee is a bare
+/// identifier. (Signal queries are never `.required`, unlike `input`/`model`.)
+fn call_callee_name<'a>(expr: &'a Expression<'a>) -> Option<&'a str> {
+    if let Expression::CallExpression(call) = expr {
+        if let Expression::Identifier(id) = &call.callee {
+            return Some(id.name.as_str());
+        }
+    }
+    None
+}
+
+/// Parse the `descendants` boolean from a query options object literal (2nd arg). Faithful to
+/// `parseDescendantsOption`: only `true`/`false` literals are accepted; absence yields the
+/// per-function default. Any other shape is treated as absent (we do not diagnose here).
+fn query_descendants(options: Option<&Expression>, default: bool) -> bool {
+    let Some(Expression::ObjectExpression(obj)) = options else {
+        return default;
+    };
+    match find_prop(obj, "descendants") {
+        Some(Expression::BooleanLiteral(b)) => b.value,
+        _ => default,
+    }
+}
+
+/// Parse the `read` option of a query (2nd-arg options object). Faithful to `parseReadOption`:
+/// only a bare identifier `read: BLA` or a single property access `read: ns.BLA` is supported;
+/// anything else is ignored (returns `None`).
+fn query_read(options: Option<&Expression>) -> Option<Expr> {
+    let Some(Expression::ObjectExpression(obj)) = options else {
+        return None;
+    };
+    let value = find_prop(obj, "read")?;
+    match value {
+        Expression::Identifier(_) | Expression::StaticMemberExpression(_) => convert_expr(value),
+        _ => None,
+    }
+}
+
+/// Detect a signal-query member initializer and build its [`R3QueryMetadata`].
+///
+/// Mirrors `tryParseSignalQueryFromInitializer` (`query_functions.ts`): the initializer is a call
+/// to one of `viewChild`/`viewChildren`/`contentChild`/`contentChildren`; arg0 is the locator
+/// (predicate), arg1 (optional) an options object carrying `read`/`descendants`. Signal queries
+/// are always `isSignal: true`, `static: false`, `emitDistinctChangesOnly: true`. A string-literal
+/// locator becomes a `Selectors([text])` predicate; any other expression becomes an `Expr`
+/// predicate (`createMayBeForwardRefExpression`, forward-ref resolved upstream → bare `Expr`).
+///
+/// Returns `(is_content_query, metadata)`, or `None` when the initializer is not a signal query.
+fn parse_signal_query(prop: &PropertyDefinition) -> Option<(bool, R3QueryMetadata)> {
+    let member_name = key_name(&prop.key)?.to_string();
+    let init = prop.value.as_ref()?;
+    let callee = call_callee_name(init)?;
+    let (first, is_content) = signal_query_kind(callee)?;
+
+    let args = call_args(init)?;
+    // arg0 is the locator/predicate. Absent locator is a hard error in Angular; we simply skip
+    // (the component still compiles, just without this query) rather than mis-emit.
+    let predicate_node = args.first().and_then(|a| a.as_expression())?;
+    let options_node = args.get(1).and_then(|a| a.as_expression());
+
+    let predicate = match predicate_node {
+        Expression::StringLiteral(s) => QueryPredicate::Selectors(vec![s.value.to_string()]),
+        // No-substitution template literal `` `ref` `` also reads as a string locator.
+        Expression::TemplateLiteral(t)
+            if t.expressions.is_empty() && t.quasis.len() == 1 =>
+        {
+            let text = t.quasis[0]
+                .value
+                .cooked
+                .as_ref()
+                .map(|c| c.to_string())
+                .unwrap_or_default();
+            QueryPredicate::Selectors(vec![text])
+        }
+        other => QueryPredicate::Expr(convert_expr(other)?),
+    };
+
+    let descendants = query_descendants(options_node, callee != "contentChildren");
+    let read = query_read(options_node);
+
+    Some((
+        is_content,
+        R3QueryMetadata {
+            property_name: member_name,
+            first,
+            predicate,
+            descendants,
+            emit_distinct_changes_only: true,
+            read,
+            static_: false,
+            is_signal: true,
+        },
+    ))
+}
+
+/// Walk the class body and split signal-query member initializers into content queries and view
+/// queries (in declaration order), faithful to `query_functions.ts`. Decorator-based queries
+/// (`@ViewChild` &c.) are rejected earlier by [`collect_io`], so only the signal forms reach here.
+fn collect_signal_queries(
+    class: &Class,
+    content_queries: &mut Vec<R3QueryMetadata>,
+    view_queries: &mut Vec<R3QueryMetadata>,
+) {
+    for element in &class.body.body {
+        let ClassElement::PropertyDefinition(prop) = element else {
+            continue;
+        };
+        if let Some((is_content, meta)) = parse_signal_query(prop) {
+            if is_content {
+                content_queries.push(meta);
+            } else {
+                view_queries.push(meta);
+            }
+        }
+    }
+}
+
 /// Compile a single standalone `@Component`/`@Directive` class from its TypeScript source.
 ///
 /// On success the returned [`CompiledComponent::code`] is the emitted `ɵɵdefineComponent({...})`
@@ -601,7 +734,14 @@ fn compile_program(program: &Program) -> CompiledComponent {
         return err(e);
     }
 
-    let is_signal = inputs.iter().any(|(_, m)| m.is_signal);
+    // Signal-based queries (`viewChild`/`viewChildren`/`contentChild`/`contentChildren` member
+    // initializers). Decorator-based queries are rejected upstream by `collect_io`.
+    let mut content_queries: Vec<R3QueryMetadata> = Vec::new();
+    let mut view_queries: Vec<R3QueryMetadata> = Vec::new();
+    collect_signal_queries(class, &mut content_queries, &mut view_queries);
+
+    let has_signal_query = content_queries.iter().chain(view_queries.iter()).any(|q| q.is_signal);
+    let is_signal = inputs.iter().any(|(_, m)| m.is_signal) || has_signal_query;
 
     // Build the base directive metadata.
     let base = R3DirectiveMetadata {
@@ -611,8 +751,8 @@ fn compile_program(program: &Program) -> CompiledComponent {
         type_source_span: ParseSourceSpan::new(0, 0),
         deps: Deps::None,
         selector: selector.clone(),
-        queries: Vec::new(),
-        view_queries: Vec::new(),
+        queries: content_queries,
+        view_queries,
         host: R3HostMetadata::default(),
         lifecycle: Lifecycle::default(),
         inputs,

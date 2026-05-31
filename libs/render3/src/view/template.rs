@@ -64,6 +64,14 @@ pub const ATTRIBUTE_MARKER_STYLES: f64 = 2.0;
 /// Each name following the marker was extracted from a property (`[name]`) input or an event
 /// (`(name)`) output binding. See `core.ts` `AttributeMarker.Bindings = 3`.
 pub const ATTRIBUTE_MARKER_BINDINGS: f64 = 3.0;
+/// `AttributeMarker.Template` — marks the start of the *template-binding* name group: the names of
+/// the structural-directive inputs a `*dir` desugared onto its wrapping `<ng-template>` (e.g.
+/// `*ngIf="x"` → `[…, 4, "ngIf"]`). See `core.ts` `AttributeMarker.Template = 4`.
+pub const ATTRIBUTE_MARKER_TEMPLATE: f64 = 4.0;
+/// `AttributeMarker.ProjectAs` — precedes the single parsed `ngProjectAs` selector array on an
+/// element/template's static attrs (`[…, 5, ["", 8, "someclass"]]`). See `core.ts`
+/// `AttributeMarker.ProjectAs = 5`.
+pub const ATTRIBUTE_MARKER_PROJECT_AS: f64 = 5.0;
 
 /// `core.RenderFlags` — the bitmask the view function branches on.
 pub mod render_flags {
@@ -1257,6 +1265,24 @@ fn parse_selector_to_r3_selector(selector: &str) -> Expr {
     o::literal_arr(lists, None)
 }
 
+/// `parseSelectorToR3Selector(selector)[0]` — the parsed R3 selector array for ONLY the first
+/// comma-separated alternate (`ngProjectAs` does not support multiple selectors, so Angular's
+/// `const_collection.ts` takes `[0]`). `.someclass` → `["", 8, "someclass"]`, `[title]` →
+/// `["", "title", ""]`. Falls back to an empty `[""]` array when the selector parses to nothing.
+fn parse_selector_to_r3_selector_first(selector: &str) -> Expr {
+    let parsed = css_selector_parse(selector);
+    match parsed.first() {
+        Some(sel) => {
+            let mut parts = simple_selector_exprs(sel);
+            for neg in &sel.not_selectors {
+                parts.extend(negative_selector_exprs(neg));
+            }
+            o::literal_arr(parts, None)
+        }
+        None => o::literal_arr(vec![str_lit("")], None),
+    }
+}
+
 /// `instruction(reference, params)` — `ɵɵfoo(...params)` as an expression statement, mirroring
 /// the classic TDB `instruction()` helper (sans source-span span attachment).
 fn instruction(reference: R3, params: Vec<Expr>) -> Stmt {
@@ -2256,23 +2282,64 @@ impl TemplateDefinitionBuilder {
     /// the const index only when an attrs array exists).
     ///
     /// Faithful to Angular's `serializeAttributes` (`const_collection.ts`): plain `name, value`
-    /// pairs come first, then the `AttributeMarker`-prefixed groups in this fixed order — Classes
-    /// (`1`), Styles (`2`), Bindings (`3`). A `class="box"` attribute becomes `[…, 1, "box"]`,
-    /// `style="…"` becomes `[…, 2, "k", "v", …]`, and the names of `[prop]` / `(event)` bindings
-    /// are collected under the Bindings marker (`[…, 3, "prop", "event"]`).
+    /// pairs come first, then the `AttributeMarker`-prefixed groups in this fixed order — ProjectAs
+    /// (`5`), Classes (`1`), Styles (`2`), Bindings (`3`), Template (`4`). A `class="box"` attribute
+    /// becomes `[…, 1, "box"]`, `style="…"` becomes `[…, 2, "k", "v", …]`, the names of `[prop]` /
+    /// `(event)` bindings are collected under the Bindings marker (`[…, 3, "prop", "event"]`), and a
+    /// `ngProjectAs="sel"` attribute additionally contributes its parsed first selector under the
+    /// ProjectAs marker (`[…, 5, ["", 8, "sel"]]`).
     fn element_attrs_index(
         &mut self,
         attributes: &[TextAttribute],
         binding_names: &[String],
     ) -> Option<usize> {
+        self.serialize_attrs_index(attributes, binding_names, &[])
+    }
+
+    /// The general attribute serializer, parameterised by the extra structural-directive
+    /// *template-binding* names (`template_names`) that a desugared `*dir` contributes under the
+    /// `AttributeMarker.Template` (`4`) group. Element/`<ng-content>` paths pass an empty slice; the
+    /// `<ng-template>` path passes the names of its `template_attrs`. Mirrors Angular's
+    /// `serializeAttributes` push order: plain attributes, ProjectAs(5), Classes(1), Styles(2),
+    /// Bindings(3), Template(4).
+    fn serialize_attrs_index(
+        &mut self,
+        attributes: &[TextAttribute],
+        binding_names: &[String],
+        template_names: &[String],
+    ) -> Option<usize> {
+        let entries = self.serialize_attrs_entries(attributes, binding_names, template_names)?;
+        Some(self.const_pool.intern(o::literal_arr(entries, None)))
+    }
+
+    /// Build the raw serialized-attributes array contents (`Vec<Expr>`) without interning, or `None`
+    /// when empty. Shared by [`Self::serialize_attrs_index`] (which interns into the const pool, for
+    /// element/template `attrsIndex` arguments) and [`Self::build_content`] (which emits the array
+    /// INLINE as the `ɵɵprojection` attrs argument — Angular never interns a projection's attrs).
+    fn serialize_attrs_entries(
+        &mut self,
+        attributes: &[TextAttribute],
+        binding_names: &[String],
+        template_names: &[String],
+    ) -> Option<Vec<Expr>> {
         // Angular's `serializeAttributes` encoding: plain `name, value` pairs come first, then the
-        // marker-prefixed groups (Classes `1`, Styles `2`, Bindings `3`) in that fixed order.
+        // marker-prefixed groups (ProjectAs `5`, Classes `1`, Styles `2`, Bindings `3`,
+        // Template `4`) in that fixed order.
         let mut plain: Vec<Expr> = Vec::new();
         let mut classes: Vec<Expr> = Vec::new();
         let mut styles: Vec<Expr> = Vec::new();
+        // `ngProjectAs="sel"` is collected as a normal `name, value` plain pair AND records the
+        // parsed first selector for the ProjectAs(5) marker group (Angular `const_collection.ts`
+        // special-cases the `ngProjectAs` name, pushing both the literal attribute and `projectAs`).
+        let mut project_as: Option<String> = None;
 
         for attr in attributes {
             match attr.name.as_str() {
+                "ngProjectAs" => {
+                    project_as = Some(attr.value.clone());
+                    plain.push(str_lit(&attr.name));
+                    plain.push(str_lit(&attr.value));
+                }
                 "class" => {
                     // `class="a b"` -> each class name as a bare string entry under the marker.
                     for cls in attr.value.split_whitespace() {
@@ -2302,6 +2369,12 @@ impl TemplateDefinitionBuilder {
         }
 
         let mut entries: Vec<Expr> = plain;
+        if let Some(sel) = &project_as {
+            // Angular takes only the FIRST parsed selector (`parseSelectorToR3Selector(projectAs)[0]`)
+            // since `ngProjectAs` does not support multiple alternates.
+            entries.push(num(ATTRIBUTE_MARKER_PROJECT_AS));
+            entries.push(parse_selector_to_r3_selector_first(sel));
+        }
         if !classes.is_empty() {
             entries.push(num(ATTRIBUTE_MARKER_CLASSES));
             entries.extend(classes);
@@ -2314,10 +2387,14 @@ impl TemplateDefinitionBuilder {
             entries.push(num(ATTRIBUTE_MARKER_BINDINGS));
             entries.extend(binding_names.iter().map(|n| str_lit(n)));
         }
+        if !template_names.is_empty() {
+            entries.push(num(ATTRIBUTE_MARKER_TEMPLATE));
+            entries.extend(template_names.iter().map(|n| str_lit(n)));
+        }
         if entries.is_empty() {
             return None;
         }
-        Some(self.const_pool.intern(o::literal_arr(entries, None)))
+        Some(entries)
     }
 
     /// Lower a static `Text` node: `ɵɵtext(slot, "value")`.
@@ -2362,15 +2439,21 @@ impl TemplateDefinitionBuilder {
             self.ng_content_selectors.push(selector.clone());
         }
 
-        // Static attributes on the `<ng-content>` (e.g. `class="x"`) are interned like an element's.
-        let attrs_index = self.element_attrs_index(&content.attributes, &[]);
+        // Static attributes on the `<ng-content>` (e.g. `class="x"`, a residual structural marker
+        // `*ngIf`, or `ngProjectAs`) are serialized like an element's, but Angular emits a projection's
+        // attrs INLINE as the third `ɵɵprojection` argument — never via the const pool (see every
+        // `ɵɵprojection(slot, idx, [...])` golden). Build the array inline so it does not leak a
+        // const-pool entry into the parent view's `consts:`.
+        let attrs_inline = self
+            .serialize_attrs_entries(&content.attributes, &[], &[])
+            .map(|entries| o::literal_arr(entries, None));
 
         // `ɵɵprojection(slot, projectionSlotIndex, attrs)` — trailing `null` attrs are trimmed, and a
         // default projectionSlotIndex of `0` is elided.
         let mut params = vec![
             num(slot as f64),
             num(projection_index as f64),
-            attrs_index.map(|i| num(i as f64)).unwrap_or_else(o::null_expr),
+            attrs_inline.unwrap_or_else(o::null_expr),
         ];
         trim_trailing_nulls(&mut params);
         if params.len() == 2 && params[1].is_equivalent(&num(0.0)) {
@@ -3317,7 +3400,25 @@ impl TemplateDefinitionBuilder {
             .filter(|i| !is_legacy_animation_name(&i.name))
             .map(|i| i.name.clone())
             .collect();
-        let attrs_index = self.element_attrs_index(&template.attributes, &template_binding_names);
+        // The `template_attrs` are the desugared structural-directive bindings (`*ngIf="x"` →
+        // `ngIf`/`show`), hoisted onto the wrapping `<ng-template>` by the transform. Their NAMES are
+        // serialized under the `AttributeMarker.Template` (`4`) group — both literal (`TemplateAttr::
+        // Text`) and bound (`TemplateAttr::Bound`) forms, in declaration order (Angular
+        // `const_collection.ts` collects them as `BindingKind.Template`). The BOUND ones additionally
+        // emit an `ɵɵproperty(name, <expr>)` update binding against the template's slot (below).
+        let template_marker_names: Vec<String> = template
+            .template_attrs
+            .iter()
+            .map(|a| match a {
+                crate::template::r3_ast::TemplateAttr::Text(t) => t.name.clone(),
+                crate::template::r3_ast::TemplateAttr::Bound(b) => b.name.clone(),
+            })
+            .collect();
+        let attrs_index = self.serialize_attrs_index(
+            &template.attributes,
+            &template_binding_names,
+            &template_marker_names,
+        );
         let local_refs_index = self.local_refs_index(&template.references);
 
         let tag_name = template
@@ -3374,6 +3475,28 @@ impl TemplateDefinitionBuilder {
             .filter(|i| !is_empty_binding_value(&i.value))
             .collect();
         for input in bound_inputs {
+            self.build_property(slot, input);
+        }
+
+        // The desugared structural-directive inputs (`*ngIf="show"` → `ngIf`/`show`) carried in
+        // `template_attrs` bind in the PARENT update block against the template's slot, exactly like
+        // an element's `[prop]` inputs: each non-empty bound attribute emits `ɵɵproperty(name, <expr>)`
+        // after advancing to the slot and reserves one var (`build_property`). Literal
+        // (`TemplateAttr::Text`) entries contribute only their const-attr Template-marker name (handled
+        // above) — no update binding.
+        let bound_template_attrs: Vec<&BoundAttribute> = template
+            .template_attrs
+            .iter()
+            .filter_map(|a| match a {
+                crate::template::r3_ast::TemplateAttr::Bound(b)
+                    if !is_empty_binding_value(&b.value) =>
+                {
+                    Some(b)
+                }
+                _ => None,
+            })
+            .collect();
+        for input in bound_template_attrs {
             self.build_property(slot, input);
         }
     }

@@ -14,11 +14,11 @@ This harness runs Treaty's Rust/OXC Angular compiler (`render3` crate, via the
 | --- | --- |
 | Total compliance cases | 642 |
 | Compiled (runnable) | 98 |
-| PASS | 82 |
-| DIFF | 16 |
+| PASS | 86 |
+| DIFF | 12 |
 | Skipped (un-runnable) | 544 |
-| **Pass-rate (of runnable subset)** | **83.7%** (82/98) |
-| Pass-rate (of full corpus) | 12.8% (82/642) |
+| **Pass-rate (of runnable subset)** | **87.8%** (86/98) |
+| Pass-rate (of full corpus) | 13.4% (86/642) |
 
 ### How a case is run and matched
 
@@ -43,24 +43,15 @@ from our output. Top entry = implement first to raise the score.
 
 | Count | Category (instruction / shape at first missing fragment) |
 | --- | --- |
-| 3 | `ɵɵdomElementStart` |
 | 3 | `ɵɵi18nPostprocess` |
 | 3 | `ɵɵprojectionDef` |
 | 2 | `ɵɵelementStart` |
 | 2 | `ɵɵpureFunction1` |
-| 1 | `ɵɵcontentQuerySignal` |
+| 1 | `ɵɵdomElementStart` |
 | 1 | `ɵɵforeignComponent` |
-| 1 | `ɵɵtemplate` |
 
 ### Sample diverging cases
 
-- **`ɵɵdomElementStart`** (3):
-  - r3_view_compiler_let/should handle an @let used only directly inside i18n
-    - near: `n":"\uFFFD0\uFFFD"},{original_code`
-  - r3_view_compiler_let/should handle an @let referenced inside a child view inside i18n
-    - near: `cls:4,vars:1,consts:()=>{letID;if(`
-  - r3_view_compiler_let/should handle an @let preceded by an element with i18n
-    - near: `n":"\uFFFD0\uFFFD"},{original_code`
 - **`ɵɵi18nPostprocess`** (3):
   - r3_view_compiler_let/should handle an @let referenced inside i18n and in a child view
     - near: `cls:4,vars:2,consts:()=>{letID;if(`
@@ -85,15 +76,12 @@ from our output. Top entry = implement first to raise the score.
     - near: `onstsimple_R=ɵɵpureFunction1(4,ID,`
   - r3_compiler_compliance/components_and_directives/value_composition/should support object literals with spread assignments
     - near: `onstsimple_R=ɵɵpureFunction1(4,ID,`
-- **`ɵɵcontentQuerySignal`** (1):
-  - signal_queries/should generate signal based query instructions for a component
-    - near: `contentQueries:functionTestComp_`
+- **`ɵɵdomElementStart`** (1):
+  - r3_view_compiler_let/should handle an @let referenced inside a child view inside i18n
+    - near: `cls:4,vars:1,consts:()=>{letID;if(`
 - **`ɵɵforeignComponent`** (1):
   - r3_compiler_compliance/components_and_directives/standalone/should properly compile foreign component imports in a standalone component
     - near: `ars:0,template:functionTestCmp_Tem`
-- **`ɵɵtemplate`** (1):
-  - r3_compiler_compliance/components_and_directives/content_projection/should include parsed ngProjectAs selectors into template attrs
-    - near: `ars:1,consts:[["ngProjectAs",".som`
 
 ## Skip categories (cases not runnable through the source front-end)
 
@@ -112,10 +100,11 @@ error-expectation cases).
 
 ## Passing cases
 
-82 runnable compliance cases match Angular's golden `ɵɵdefineComponent` block:
+86 runnable compliance cases match Angular's golden `ɵɵdefineComponent` block:
 
 - model_inputs/should capture input/output pair in a component definition
 - output_function/should generate an output mapping for the component
+- r3_compiler_compliance/components_and_directives/content_projection/should include parsed ngProjectAs selectors into template attrs
 - r3_compiler_compliance/components_and_directives/lifecycle_hooks/local reference
 - r3_compiler_compliance/components_and_directives/pipes/should render pipes
 - r3_compiler_compliance/components_and_directives/pipes/should use appropriate function for a given no of pipe arguments
@@ -168,6 +157,8 @@ error-expectation cases).
 - r3_view_compiler_let/should create a simple @let declaration
 - r3_view_compiler_let/should create multiple @let declarations that depend on each other
 - r3_view_compiler_let/should give precedence to local @let definition over one from a parent view
+- r3_view_compiler_let/should handle an @let preceded by an element with i18n
+- r3_view_compiler_let/should handle an @let used only directly inside i18n
 - r3_view_compiler_let/should not optimize away declareLet if expression is using a pipe
 - r3_view_compiler_let/should not remove let declarations that are only used in a child view
 - r3_view_compiler_let/should not remove let declarations that are only used in an event listener
@@ -196,3 +187,4 @@ error-expectation cases).
 - r3_view_compiler_styling/style_bindings/should assign a sanitizer instance to the element style allocation instruction if any url-based properties are detected
 - r3_view_compiler_styling/style_bindings/should place initial, multi, singular and application followed by attribute style instructions in the template code in that order
 - signal_inputs/should capture signal based input flag in component definition
+- signal_queries/should generate signal based query instructions for a component
