@@ -293,6 +293,31 @@ pub(crate) fn install_module_globals(
     define_lazy(agent, global, "Response", lazy_response_getter, nogc);
     define_lazy(agent, global, "fetch", lazy_fetch_getter, nogc);
 
+    // --- Lazy: the WinterCG web globals Bun / Cloudflare Workers (`nodejs_compat`) expose. ---
+    // Each is a self-replacing accessor over a leaf backing module, materialized at most once on
+    // first touch (tenet 2), exactly like the WHATWG class globals above. Nova builtins are bare fn
+    // pointers (no captured state), so each global name gets its own named getter; every getter in a
+    // family routes through `materialize_family`, which builds the whole family from one bootstrap
+    // and collapses every sibling accessor at once.
+    //
+    // The web-globals family (`web_globals` leaf): Web Crypto, Blob/File/FormData, the
+    // AbortController/AbortSignal + Event/EventTarget event model, `performance`, and `btoa`/`atob`.
+    define_lazy(agent, global, "crypto", lazy_crypto_getter, nogc);
+    define_lazy(agent, global, "Blob", lazy_blob_getter, nogc);
+    define_lazy(agent, global, "File", lazy_file_getter, nogc);
+    define_lazy(agent, global, "FormData", lazy_form_data_getter, nogc);
+    define_lazy(agent, global, "AbortController", lazy_abort_controller_getter, nogc);
+    define_lazy(agent, global, "AbortSignal", lazy_abort_signal_getter, nogc);
+    define_lazy(agent, global, "Event", lazy_event_getter, nogc);
+    define_lazy(agent, global, "EventTarget", lazy_event_target_getter, nogc);
+    define_lazy(agent, global, "performance", lazy_performance_getter, nogc);
+    define_lazy(agent, global, "btoa", lazy_btoa_getter, nogc);
+    define_lazy(agent, global, "atob", lazy_atob_getter, nogc);
+    // The WHATWG streams family (`web_streams` leaf): ReadableStream/WritableStream/TransformStream.
+    define_lazy(agent, global, "ReadableStream", lazy_readable_stream_getter, nogc);
+    define_lazy(agent, global, "WritableStream", lazy_writable_stream_getter, nogc);
+    define_lazy(agent, global, "TransformStream", lazy_transform_stream_getter, nogc);
+
     Ok(())
 }
 
@@ -608,10 +633,12 @@ fn lazy_text_decoder_getter<'gc>(
 ///
 /// The fetch module exposes the WHATWG header/method/status primitives over a `[name, value][]` pair
 /// array (no network, no internal slots — see `fetch.rs`). The class shells here carry their header
-/// list as a plain JS field and delegate validation/combine/sort to those primitives. `fetch()` has no
-/// transport in this offline runtime, so it returns a rejected promise with a clear, catchable message
-/// (Node layers `fetch` over a transport too); the request/response *shape* is fully usable. Publishes
-/// all four globals; completion value unused (the caller reads the requested name back).
+/// list as a plain JS field and delegate validation/combine/sort to those primitives. `fetch()`
+/// performs a real request: `data:` URLs resolve via the WHATWG `data:` URL processor, `http://` URLs
+/// route through the shared `node:net`/`node:http` reactor (the `httpStart`/`httpPoll` natives this
+/// module exposes), driven by the shared `__treaty_io` microtask pump so the response settles through
+/// the event loop; `https://` rejects with a catchable `TypeError` (no TLS transport — a documented
+/// follow-up). Publishes all four globals; completion value unused (the caller reads the name back).
 const FETCH_BOOTSTRAP: &str = r#"
 (function () {
   var F = globalThis.__treaty_native_module;
@@ -687,11 +714,76 @@ const FETCH_BOOTSTRAP: &str = r#"
   Response.error = function () { var r = new Response(null, { status: 0 }); r.type = "error"; return r; };
   Response.redirect = function (url, status) { var r = new Response(null, { status: status || 302 }); r.headers.set("location", String(url)); return r; };
 
+  // Shared reactor pump (installed once on globalThis; node:http reuses the same slot). A set of
+  // "drivers" each returning true while they still have outstanding work; the pump runs them on each
+  // microtask tick and re-arms via Promise.resolve().then only while ANY driver reports work, so the
+  // event loop keeps turning until every in-flight request settles, then goes idle.
+  if (!globalThis.__treaty_io) {
+    var io = { drivers: [], armed: false };
+    var tick = function () {
+      io.armed = false;
+      var live = [];
+      for (var i = 0; i < io.drivers.length; i++) {
+        var d = io.drivers[i], keep = true;
+        try { keep = d(); } catch (e) { keep = false; }
+        if (keep) live.push(d);
+      }
+      io.drivers = live;
+      if (io.drivers.length > 0) armIo();
+    };
+    var armIo = function () { if (io.armed) return; io.armed = true; Promise.resolve().then(tick); };
+    io.add = function (driver) { io.drivers.push(driver); armIo(); };
+    globalThis.__treaty_io = io;
+  }
+  var IO = globalThis.__treaty_io;
+
+  function headerPairsFrom(req) {
+    return req.headers && req.headers._list ? req.headers._list.slice() : [];
+  }
+
+  function httpFetch(req) {
+    return new Promise(function (resolve, reject) {
+      var handle;
+      try { handle = F.httpStart(req.method, req.url, headerPairsFrom(req), req._bodyText); }
+      catch (e) { reject(e); return; }
+      IO.add(function () {
+        var r = F.httpPoll(handle);
+        if (r.pending) return true;
+        if (r.error != null) { reject(new TypeError("fetch failed: " + r.error)); return false; }
+        var headers = new Headers();
+        for (var i = 0; i < r.response.headers.length; i++) {
+          headers.append(r.response.headers[i][0], r.response.headers[i][1]);
+        }
+        var resp = new Response(r.response.body, {
+          status: r.response.status,
+          statusText: r.response.statusText,
+          headers: headers,
+        });
+        resp.url = req.url;
+        resolve(resp);
+        return false;
+      });
+    });
+  }
+
   function fetch(input, init) {
-    // No HTTP transport in this offline runtime: surface a catchable rejection rather than pretend.
-    return Promise.reject(new TypeError(
-      "fetch() is not supported in this runtime: no network transport is available"
-    ));
+    return Promise.resolve().then(function () {
+      var req = input instanceof Request ? (init ? new Request(input, init) : input) : new Request(input, init);
+      var url = req.url;
+      // data: URLs resolve with no transport via the WHATWG data: URL processor.
+      if (/^data:/i.test(url)) {
+        var parsed = F.parseDataUrl(url);
+        var text = new TextDecoder().decode(Uint8Array.from(parsed.bytes));
+        return new Response(text, { status: 200, headers: { "content-type": parsed.mimeType } });
+      }
+      if (/^http:\/\//i.test(url)) {
+        return httpFetch(req);
+      }
+      if (/^https:\/\//i.test(url)) {
+        throw new TypeError("fetch failed: https:// is not supported in this runtime (no TLS transport)");
+      }
+      throw new TypeError("fetch failed: unsupported URL scheme: " + url);
+    });
   }
 
   return { Headers: Headers, Request: Request, Response: Response, fetch: fetch };
@@ -768,6 +860,276 @@ fn lazy_fetch_getter<'gc>(
 
 /// The four global names the fetch bootstrap materializes together.
 const FETCH_FAMILY: &[&str] = &["Headers", "Request", "Response", "fetch"];
+
+// =================================================================================================
+// Lazy WinterCG web globals (the Bun / Cloudflare Workers `nodejs_compat` surface).
+//
+// Two families, each backed by a globals-only leaf module (`web_globals` / `web_streams`) reached
+// through the same hidden native-module slot the WHATWG families use. Each family is built from one
+// bootstrap and every member's getter routes through `materialize_family`, so touching any member
+// builds the whole family once and collapses all sibling accessors together.
+//
+// SCAFFOLD: these bootstraps stand up real, minimal-but-functional WinterCG shells over realm
+// intrinsics (so feature-detection and basic use pass), reading the native primitives leaf off the
+// slot defensively (`F = globalThis.__treaty_native_module || {}`). The Build agents replace the
+// bootstrap bodies and the leaf `install`s with the full Web Crypto / Blob / streams implementations.
+// =================================================================================================
+
+/// `crypto` + `Blob`/`File`/`FormData` + `AbortController`/`AbortSignal` + `Event`/`EventTarget` +
+/// `performance` + `btoa`/`atob`, built over the `web_globals` native leaf.
+const WEB_GLOBALS_BOOTSTRAP: &str = r#"
+(function () {
+  var F = globalThis.__treaty_native_module || {};
+
+  // --- btoa / atob (binary <-> base64), pure-JS fallback when the native leaf is empty. ---
+  var B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  function btoa(input) {
+    if (typeof F.btoa === "function") return F.btoa(String(input));
+    var str = String(input), out = "";
+    for (var i = 0; i < str.length; ) {
+      var c1 = str.charCodeAt(i++), c2 = str.charCodeAt(i++), c3 = str.charCodeAt(i++);
+      if (c1 > 255 || (c2 === c2 && c2 > 255) || (c3 === c3 && c3 > 255)) {
+        throw new (globalThis.DOMException || Error)("Invalid character", "InvalidCharacterError");
+      }
+      var e1 = c1 >> 2, e2 = ((c1 & 3) << 4) | (c2 >> 4), e3 = ((c2 & 15) << 2) | (c3 >> 6), e4 = c3 & 63;
+      if (isNaN(c2)) { e3 = e4 = 64; } else if (isNaN(c3)) { e4 = 64; }
+      out += B64.charAt(e1) + B64.charAt(e2) + (e3 === 64 ? "=" : B64.charAt(e3)) + (e4 === 64 ? "=" : B64.charAt(e4));
+    }
+    return out;
+  }
+  function atob(input) {
+    if (typeof F.atob === "function") return F.atob(String(input));
+    var str = String(input).replace(/[ \t\n\f\r]/g, "");
+    if (str.length % 4 === 1) { throw new (globalThis.DOMException || Error)("Invalid base64", "InvalidCharacterError"); }
+    str = str.replace(/=+$/, ""); var out = "", bits = 0, acc = 0;
+    for (var i = 0; i < str.length; i++) {
+      var idx = B64.indexOf(str.charAt(i));
+      if (idx < 0) { throw new (globalThis.DOMException || Error)("Invalid base64", "InvalidCharacterError"); }
+      acc = (acc << 6) | idx; bits += 6;
+      if (bits >= 8) { bits -= 8; out += String.fromCharCode((acc >> bits) & 0xff); }
+    }
+    return out;
+  }
+
+  // --- Web Crypto (RandomSource + randomUUID + a subtle placeholder). ---
+  var crypto = {
+    getRandomValues: function (typedArray) {
+      if (typeof F.getRandomValues === "function") return F.getRandomValues(typedArray);
+      // Fallback CSPRNG-shaped fill via Math.random for shape parity until the native leaf lands.
+      for (var i = 0; i < typedArray.length; i++) { typedArray[i] = Math.floor(Math.random() * 256); }
+      return typedArray;
+    },
+    randomUUID: function () {
+      if (typeof F.randomUUID === "function") return F.randomUUID();
+      var b = new Uint8Array(16); this.getRandomValues(b);
+      b[6] = (b[6] & 0x0f) | 0x40; b[8] = (b[8] & 0x3f) | 0x80;
+      var h = []; for (var i = 0; i < 16; i++) { h.push((b[i] + 0x100).toString(16).slice(1)); }
+      return h[0]+h[1]+h[2]+h[3]+"-"+h[4]+h[5]+"-"+h[6]+h[7]+"-"+h[8]+h[9]+"-"+h[10]+h[11]+h[12]+h[13]+h[14]+h[15];
+    },
+    subtle: (F.subtle || {})
+  };
+
+  // --- Event / EventTarget (DOM event model). ---
+  function Event(type, init) { init = init || {}; this.type = String(type); this.bubbles = !!init.bubbles; this.cancelable = !!init.cancelable; this.defaultPrevented = false; this.timeStamp = (globalThis.performance ? globalThis.performance.now() : 0); this.target = null; this.currentTarget = null; }
+  Event.prototype.preventDefault = function () { if (this.cancelable) this.defaultPrevented = true; };
+  Event.prototype.stopPropagation = function () {};
+  Event.prototype.stopImmediatePropagation = function () {};
+  function EventTarget() { this.__listeners = {}; }
+  EventTarget.prototype.addEventListener = function (type, cb) { type = String(type); (this.__listeners[type] || (this.__listeners[type] = [])).push(cb); };
+  EventTarget.prototype.removeEventListener = function (type, cb) { type = String(type); var l = this.__listeners[type]; if (!l) return; this.__listeners[type] = l.filter(function (x) { return x !== cb; }); };
+  EventTarget.prototype.dispatchEvent = function (event) { var l = (this.__listeners[event.type] || []).slice(); event.target = this; event.currentTarget = this; for (var i = 0; i < l.length; i++) { var h = l[i]; if (typeof h === "function") h.call(this, event); else if (h && typeof h.handleEvent === "function") h.handleEvent(event); } return !event.defaultPrevented; };
+
+  // --- AbortController / AbortSignal. ---
+  function AbortSignal() { EventTarget.call(this); this.aborted = false; this.reason = undefined; this.onabort = null; }
+  AbortSignal.prototype = Object.create(EventTarget.prototype);
+  AbortSignal.prototype.constructor = AbortSignal;
+  AbortSignal.prototype.throwIfAborted = function () { if (this.aborted) throw this.reason; };
+  AbortSignal.abort = function (reason) { var s = new AbortSignal(); s.aborted = true; s.reason = reason !== undefined ? reason : new (globalThis.DOMException || Error)("signal is aborted without reason", "AbortError"); return s; };
+  AbortSignal.timeout = function (ms) { var s = new AbortSignal(); if (typeof setTimeout === "function") { setTimeout(function () { if (!s.aborted) { s.aborted = true; s.reason = new (globalThis.DOMException || Error)("signal timed out", "TimeoutError"); var e = new Event("abort"); s.dispatchEvent(e); if (typeof s.onabort === "function") s.onabort(e); } }, ms); } return s; };
+  function AbortController() { this.signal = new AbortSignal(); }
+  AbortController.prototype.abort = function (reason) { var s = this.signal; if (s.aborted) return; s.aborted = true; s.reason = reason !== undefined ? reason : new (globalThis.DOMException || Error)("signal is aborted without reason", "AbortError"); var e = new Event("abort"); s.dispatchEvent(e); if (typeof s.onabort === "function") s.onabort(e); };
+
+  // --- Blob / File. ---
+  function partsToString(parts) { var s = ""; parts = parts || []; for (var i = 0; i < parts.length; i++) { var p = parts[i]; if (p instanceof Blob) s += p.__text; else if (p && (p.byteLength !== undefined)) { var v = p.BYTES_PER_ELEMENT === 1 ? p : new Uint8Array(p.buffer || p); for (var j = 0; j < v.length; j++) s += String.fromCharCode(v[j]); } else s += String(p); } return s; }
+  function Blob(parts, options) { options = options || {}; this.__text = partsToString(parts); this.size = this.__text.length; this.type = options.type ? String(options.type).toLowerCase() : ""; }
+  Blob.prototype.text = function () { var t = this.__text; return Promise.resolve(t); };
+  Blob.prototype.arrayBuffer = function () { var t = this.__text; var b = new Uint8Array(t.length); for (var i = 0; i < t.length; i++) b[i] = t.charCodeAt(i) & 0xff; return Promise.resolve(b.buffer); };
+  Blob.prototype.slice = function (start, end, contentType) { var t = this.__text.slice(start || 0, end === undefined ? this.__text.length : end); var b = new Blob([], { type: contentType || "" }); b.__text = t; b.size = t.length; return b; };
+  Blob.prototype.stream = function () { if (globalThis.ReadableStream) { var t = this.__text; return new globalThis.ReadableStream({ start: function (c) { var b = new Uint8Array(t.length); for (var i = 0; i < t.length; i++) b[i] = t.charCodeAt(i) & 0xff; c.enqueue(b); c.close(); } }); } return undefined; };
+  function File(parts, name, options) { Blob.call(this, parts, options); this.name = String(name); this.lastModified = options && options.lastModified != null ? options.lastModified : Date.now(); }
+  File.prototype = Object.create(Blob.prototype);
+  File.prototype.constructor = File;
+
+  // --- FormData. ---
+  function FormData() { this.__entries = []; }
+  FormData.prototype.append = function (name, value, filename) { this.__entries.push([String(name), value, filename]); };
+  FormData.prototype.set = function (name, value, filename) { name = String(name); var done = false, out = []; for (var i = 0; i < this.__entries.length; i++) { if (this.__entries[i][0] === name) { if (!done) { out.push([name, value, filename]); done = true; } } else out.push(this.__entries[i]); } if (!done) out.push([name, value, filename]); this.__entries = out; };
+  FormData.prototype.get = function (name) { name = String(name); for (var i = 0; i < this.__entries.length; i++) if (this.__entries[i][0] === name) return this.__entries[i][1]; return null; };
+  FormData.prototype.getAll = function (name) { name = String(name); var o = []; for (var i = 0; i < this.__entries.length; i++) if (this.__entries[i][0] === name) o.push(this.__entries[i][1]); return o; };
+  FormData.prototype.has = function (name) { name = String(name); for (var i = 0; i < this.__entries.length; i++) if (this.__entries[i][0] === name) return true; return false; };
+  FormData.prototype["delete"] = function (name) { name = String(name); this.__entries = this.__entries.filter(function (e) { return e[0] !== name; }); };
+  FormData.prototype.forEach = function (cb, thisArg) { for (var i = 0; i < this.__entries.length; i++) cb.call(thisArg, this.__entries[i][1], this.__entries[i][0], this); };
+  FormData.prototype.entries = function () { return this.__entries.map(function (e) { return [e[0], e[1]]; })[Symbol.iterator](); };
+  FormData.prototype.keys = function () { return this.__entries.map(function (e) { return e[0]; })[Symbol.iterator](); };
+  FormData.prototype.values = function () { return this.__entries.map(function (e) { return e[1]; })[Symbol.iterator](); };
+  FormData.prototype[Symbol.iterator] = function () { return this.entries(); };
+
+  // --- performance (high-resolution monotonic clock). ---
+  var perfOrigin = (typeof F.now === "function") ? F.now() : Date.now();
+  var performance = {
+    now: function () { return (typeof F.now === "function") ? (F.now() - perfOrigin) : (Date.now() - perfOrigin); },
+    timeOrigin: perfOrigin
+  };
+
+  return {
+    crypto: crypto, Blob: Blob, File: File, FormData: FormData,
+    AbortController: AbortController, AbortSignal: AbortSignal,
+    Event: Event, EventTarget: EventTarget,
+    performance: performance, btoa: btoa, atob: atob
+  };
+})()
+"#;
+
+/// The web-globals family: every name the [`WEB_GLOBALS_BOOTSTRAP`] materializes together.
+const WEB_GLOBALS_FAMILY: &[&str] = &[
+    "crypto", "Blob", "File", "FormData", "AbortController", "AbortSignal", "Event", "EventTarget",
+    "performance", "btoa", "atob",
+];
+
+fn lazy_crypto_getter<'gc>(agent: &mut Agent, this: Value, _args: ArgumentsList, gc: GcScope<'gc, '_>) -> JsResult<'gc, Value<'gc>> {
+    materialize_family(agent, this, WEB_GLOBALS_BOOTSTRAP, WEB_GLOBALS_FAMILY, "crypto", crate::node::web_globals::install, gc)
+}
+fn lazy_blob_getter<'gc>(agent: &mut Agent, this: Value, _args: ArgumentsList, gc: GcScope<'gc, '_>) -> JsResult<'gc, Value<'gc>> {
+    materialize_family(agent, this, WEB_GLOBALS_BOOTSTRAP, WEB_GLOBALS_FAMILY, "Blob", crate::node::web_globals::install, gc)
+}
+fn lazy_file_getter<'gc>(agent: &mut Agent, this: Value, _args: ArgumentsList, gc: GcScope<'gc, '_>) -> JsResult<'gc, Value<'gc>> {
+    materialize_family(agent, this, WEB_GLOBALS_BOOTSTRAP, WEB_GLOBALS_FAMILY, "File", crate::node::web_globals::install, gc)
+}
+fn lazy_form_data_getter<'gc>(agent: &mut Agent, this: Value, _args: ArgumentsList, gc: GcScope<'gc, '_>) -> JsResult<'gc, Value<'gc>> {
+    materialize_family(agent, this, WEB_GLOBALS_BOOTSTRAP, WEB_GLOBALS_FAMILY, "FormData", crate::node::web_globals::install, gc)
+}
+fn lazy_abort_controller_getter<'gc>(agent: &mut Agent, this: Value, _args: ArgumentsList, gc: GcScope<'gc, '_>) -> JsResult<'gc, Value<'gc>> {
+    materialize_family(agent, this, WEB_GLOBALS_BOOTSTRAP, WEB_GLOBALS_FAMILY, "AbortController", crate::node::web_globals::install, gc)
+}
+fn lazy_abort_signal_getter<'gc>(agent: &mut Agent, this: Value, _args: ArgumentsList, gc: GcScope<'gc, '_>) -> JsResult<'gc, Value<'gc>> {
+    materialize_family(agent, this, WEB_GLOBALS_BOOTSTRAP, WEB_GLOBALS_FAMILY, "AbortSignal", crate::node::web_globals::install, gc)
+}
+fn lazy_event_getter<'gc>(agent: &mut Agent, this: Value, _args: ArgumentsList, gc: GcScope<'gc, '_>) -> JsResult<'gc, Value<'gc>> {
+    materialize_family(agent, this, WEB_GLOBALS_BOOTSTRAP, WEB_GLOBALS_FAMILY, "Event", crate::node::web_globals::install, gc)
+}
+fn lazy_event_target_getter<'gc>(agent: &mut Agent, this: Value, _args: ArgumentsList, gc: GcScope<'gc, '_>) -> JsResult<'gc, Value<'gc>> {
+    materialize_family(agent, this, WEB_GLOBALS_BOOTSTRAP, WEB_GLOBALS_FAMILY, "EventTarget", crate::node::web_globals::install, gc)
+}
+fn lazy_performance_getter<'gc>(agent: &mut Agent, this: Value, _args: ArgumentsList, gc: GcScope<'gc, '_>) -> JsResult<'gc, Value<'gc>> {
+    materialize_family(agent, this, WEB_GLOBALS_BOOTSTRAP, WEB_GLOBALS_FAMILY, "performance", crate::node::web_globals::install, gc)
+}
+fn lazy_btoa_getter<'gc>(agent: &mut Agent, this: Value, _args: ArgumentsList, gc: GcScope<'gc, '_>) -> JsResult<'gc, Value<'gc>> {
+    materialize_family(agent, this, WEB_GLOBALS_BOOTSTRAP, WEB_GLOBALS_FAMILY, "btoa", crate::node::web_globals::install, gc)
+}
+fn lazy_atob_getter<'gc>(agent: &mut Agent, this: Value, _args: ArgumentsList, gc: GcScope<'gc, '_>) -> JsResult<'gc, Value<'gc>> {
+    materialize_family(agent, this, WEB_GLOBALS_BOOTSTRAP, WEB_GLOBALS_FAMILY, "atob", crate::node::web_globals::install, gc)
+}
+
+/// `ReadableStream` / `WritableStream` / `TransformStream`, built over the `web_streams` native leaf.
+///
+/// A real, minimal WHATWG streams shell: enough surface for construction, a default reader/writer,
+/// `enqueue`/`close`/`error`, and async iteration. The Build agents replace this with the full
+/// backpressure/queuing-strategy implementation and the `node:stream` bridge.
+const WEB_STREAMS_BOOTSTRAP: &str = r#"
+(function () {
+  var F = globalThis.__treaty_native_module || {};
+
+  function ReadableStream(underlyingSource, strategy) {
+    underlyingSource = underlyingSource || {};
+    this.locked = false;
+    this.__chunks = [];
+    this.__closed = false;
+    this.__error = null;
+    var self = this;
+    var controller = {
+      enqueue: function (chunk) { if (!self.__closed) self.__chunks.push(chunk); },
+      close: function () { self.__closed = true; },
+      error: function (e) { self.__error = e; self.__closed = true; }
+    };
+    this.__controller = controller;
+    if (typeof underlyingSource.start === "function") {
+      try { Promise.resolve(underlyingSource.start(controller)); } catch (e) { controller.error(e); }
+    }
+    this.__pull = (typeof underlyingSource.pull === "function") ? underlyingSource.pull : null;
+  }
+  ReadableStream.prototype.getReader = function () {
+    if (this.locked) throw new TypeError("ReadableStream is already locked to a reader");
+    this.locked = true; var self = this;
+    return {
+      read: function () {
+        if (self.__error) return Promise.reject(self.__error);
+        if (self.__chunks.length) return Promise.resolve({ value: self.__chunks.shift(), done: false });
+        if (self.__pull) { try { self.__pull(self.__controller); } catch (e) { return Promise.reject(e); } if (self.__chunks.length) return Promise.resolve({ value: self.__chunks.shift(), done: false }); }
+        return Promise.resolve({ value: undefined, done: true });
+      },
+      releaseLock: function () { self.locked = false; },
+      cancel: function () { self.__closed = true; self.__chunks = []; return Promise.resolve(); },
+      closed: Promise.resolve()
+    };
+  };
+  ReadableStream.prototype.cancel = function () { this.__closed = true; this.__chunks = []; return Promise.resolve(); };
+  ReadableStream.prototype[Symbol.asyncIterator] = function () {
+    var reader = this.getReader();
+    return { next: function () { return reader.read(); }, "return": function () { reader.releaseLock(); return Promise.resolve({ value: undefined, done: true }); } };
+  };
+
+  function WritableStream(underlyingSink, strategy) {
+    underlyingSink = underlyingSink || {};
+    this.locked = false;
+    this.__sink = underlyingSink;
+    this.__closed = false;
+  }
+  WritableStream.prototype.getWriter = function () {
+    if (this.locked) throw new TypeError("WritableStream is already locked to a writer");
+    this.locked = true; var self = this, sink = this.__sink;
+    return {
+      write: function (chunk) { if (typeof sink.write === "function") { try { return Promise.resolve(sink.write(chunk)); } catch (e) { return Promise.reject(e); } } return Promise.resolve(); },
+      close: function () { self.__closed = true; if (typeof sink.close === "function") { try { return Promise.resolve(sink.close()); } catch (e) { return Promise.reject(e); } } return Promise.resolve(); },
+      abort: function (reason) { self.__closed = true; if (typeof sink.abort === "function") { try { return Promise.resolve(sink.abort(reason)); } catch (e) { return Promise.reject(e); } } return Promise.resolve(); },
+      releaseLock: function () { self.locked = false; },
+      ready: Promise.resolve(),
+      closed: Promise.resolve()
+    };
+  };
+  WritableStream.prototype.abort = function () { this.__closed = true; return Promise.resolve(); };
+  WritableStream.prototype.close = function () { this.__closed = true; return Promise.resolve(); };
+
+  function TransformStream(transformer, writableStrategy, readableStrategy) {
+    transformer = transformer || {};
+    var queue = [];
+    var rsController = null;
+    this.readable = new ReadableStream({ start: function (c) { rsController = c; } });
+    var transform = typeof transformer.transform === "function" ? transformer.transform : function (chunk, controller) { controller.enqueue(chunk); };
+    var flush = typeof transformer.flush === "function" ? transformer.flush : null;
+    var tcontroller = { enqueue: function (chunk) { if (rsController) rsController.enqueue(chunk); }, terminate: function () { if (rsController) rsController.close(); }, error: function (e) { if (rsController) rsController.error(e); } };
+    this.writable = new WritableStream({
+      write: function (chunk) { return Promise.resolve(transform(chunk, tcontroller)); },
+      close: function () { var p = flush ? Promise.resolve(flush(tcontroller)) : Promise.resolve(); return p.then(function () { tcontroller.terminate(); }); }
+    });
+    if (typeof transformer.start === "function") { try { transformer.start(tcontroller); } catch (e) { tcontroller.error(e); } }
+  }
+
+  return { ReadableStream: ReadableStream, WritableStream: WritableStream, TransformStream: TransformStream };
+})()
+"#;
+
+/// The streams family: every name the [`WEB_STREAMS_BOOTSTRAP`] materializes together.
+const WEB_STREAMS_FAMILY: &[&str] = &["ReadableStream", "WritableStream", "TransformStream"];
+
+fn lazy_readable_stream_getter<'gc>(agent: &mut Agent, this: Value, _args: ArgumentsList, gc: GcScope<'gc, '_>) -> JsResult<'gc, Value<'gc>> {
+    materialize_family(agent, this, WEB_STREAMS_BOOTSTRAP, WEB_STREAMS_FAMILY, "ReadableStream", crate::node::web_streams::install, gc)
+}
+fn lazy_writable_stream_getter<'gc>(agent: &mut Agent, this: Value, _args: ArgumentsList, gc: GcScope<'gc, '_>) -> JsResult<'gc, Value<'gc>> {
+    materialize_family(agent, this, WEB_STREAMS_BOOTSTRAP, WEB_STREAMS_FAMILY, "WritableStream", crate::node::web_streams::install, gc)
+}
+fn lazy_transform_stream_getter<'gc>(agent: &mut Agent, this: Value, _args: ArgumentsList, gc: GcScope<'gc, '_>) -> JsResult<'gc, Value<'gc>> {
+    materialize_family(agent, this, WEB_STREAMS_BOOTSTRAP, WEB_STREAMS_FAMILY, "TransformStream", crate::node::web_streams::install, gc)
+}
 
 /// The hidden, non-enumerable global slot through which a lazy getter hands the leaf module's native
 /// primitives to its JS bootstrap. Parked just before the bootstrap evaluates and deleted immediately

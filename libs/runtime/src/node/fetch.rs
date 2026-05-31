@@ -659,6 +659,12 @@ pub(crate) fn install<'gc>(
     define_fn(agent, obj, "isOkStatus", js::is_ok_status_fn, 1, gc);
     define_fn(agent, obj, "parseDataUrl", js::parse_data_url, 1, gc);
 
+    // The networking half of `fetch()`: start a background `http://` request and poll it for
+    // completion. These drive the same reactor `node:http`/`node:net` use, so the global `fetch`
+    // performs a real request without `require`-ing `node:http`.
+    define_fn(agent, obj, "httpStart", js::http_start, 4, gc);
+    define_fn(agent, obj, "httpPoll", js::http_poll, 1, gc);
+
     Ok(obj.into())
 }
 
@@ -999,6 +1005,146 @@ mod js {
             gc,
         ));
         Ok(obj.into())
+    }
+
+    /// `httpStart(method, url, headerPairs, body)` -> client handle (number).
+    ///
+    /// Splits the `http://` URL and spawns a background request on the shared reactor (the same one
+    /// `node:http`/`node:net` use). Throws a `TypeError` for a non-`http://` URL (notably `https://`,
+    /// which has no TLS transport here) so `fetch()` rejects with a catchable error.
+    pub(super) fn http_start<'gc>(
+        agent: &mut Agent,
+        _this: Value,
+        args: ArgumentsList,
+        gc: GcScope<'gc, '_>,
+    ) -> JsResult<'gc, Value<'gc>> {
+        let method = read_str(agent, args.get(0));
+        let url = read_str(agent, args.get(1));
+        let header_value = args.get(2);
+        let body = read_str(agent, args.get(3));
+        let gc = gc.into_nogc();
+
+        let headers = read_header_pairs(agent, header_value, gc);
+        let parsed = match crate::node::http::split_http_url(&url) {
+            Ok(p) => p,
+            Err(e) => return Err(agent.throw_exception(ExceptionType::TypeError, e, gc)),
+        };
+        let req = crate::node::http::ParsedRequest {
+            method: method.to_ascii_uppercase(),
+            path: parsed.path,
+            headers,
+            body: body.into_bytes(),
+        };
+        let handle = crate::node::net::client_start(req, parsed.host, parsed.port);
+        Ok(Value::Integer((handle as i32).into()))
+    }
+
+    /// `httpPoll(handle)` -> `{ pending } | { error } | { response: { status, statusText, headers, body } }`.
+    pub(super) fn http_poll<'gc>(
+        agent: &mut Agent,
+        _this: Value,
+        args: ArgumentsList,
+        gc: GcScope<'gc, '_>,
+    ) -> JsResult<'gc, Value<'gc>> {
+        let handle = match args.get(0) {
+            Value::Integer(i) => u64::try_from(i.into_i64()).unwrap_or(u64::MAX),
+            _ => u64::MAX,
+        };
+        let gc = gc.into_nogc();
+        let obj = OrdinaryObject::create_empty_object(agent, gc);
+        let set_str = |agent: &mut Agent, obj: OrdinaryObject, key: &'static str, value: &str| {
+            let v: Value = JsString::from_str(agent, value, gc).into();
+            let k = PropertyKey::from_static_str(agent, key, gc);
+            unwrap_try(obj.try_define_own_property(
+                agent,
+                k,
+                nova_vm::ecmascript::PropertyDescriptor::new_data_descriptor(v),
+                None,
+                gc,
+            ));
+        };
+        let set_val = |agent: &mut Agent, obj: OrdinaryObject, key: &'static str, value: Value| {
+            let k = PropertyKey::from_static_str(agent, key, gc);
+            unwrap_try(obj.try_define_own_property(
+                agent,
+                k,
+                nova_vm::ecmascript::PropertyDescriptor::new_data_descriptor(value),
+                None,
+                gc,
+            ));
+        };
+        match crate::node::net::client_poll(handle) {
+            crate::node::net::ClientPoll::Pending => {
+                set_val(agent, obj, "pending", Value::Boolean(true));
+            }
+            crate::node::net::ClientPoll::Unknown => {
+                set_str(agent, obj, "error", "unknown client handle");
+            }
+            crate::node::net::ClientPoll::Done(Err(e)) => {
+                set_str(agent, obj, "error", &e);
+            }
+            crate::node::net::ClientPoll::Done(Ok(resp)) => {
+                let response = OrdinaryObject::create_empty_object(agent, gc);
+                set_val(
+                    agent,
+                    response,
+                    "status",
+                    Value::Integer(i32::from(resp.status).into()),
+                );
+                set_str(agent, response, "statusText", &resp.status_text);
+                let pairs: Vec<Value> = resp
+                    .headers
+                    .iter()
+                    .map(|(n, v)| {
+                        let name: Value = JsString::from_str(agent, n, gc).into();
+                        let value: Value = JsString::from_str(agent, v, gc).into();
+                        Array::from_slice(agent, &[name, value], gc).into()
+                    })
+                    .collect();
+                let headers_arr: Value = Array::from_slice(agent, &pairs, gc).into();
+                set_val(agent, response, "headers", headers_arr);
+                let body = std::string::String::from_utf8_lossy(&resp.body);
+                set_str(agent, response, "body", &body);
+                set_val(agent, obj, "response", response.into());
+            }
+        }
+        Ok(obj.into())
+    }
+
+    /// Read a JS `[name, value][]` header array into Rust tuples (defensive: skips non-pair items).
+    fn read_header_pairs(
+        agent: &mut Agent,
+        value: Value,
+        gc: NoGcScope,
+    ) -> Vec<(std::string::String, std::string::String)> {
+        let mut out = Vec::new();
+        let Ok(array) = Array::try_from(value) else {
+            return out;
+        };
+        let len = array.len(agent);
+        for i in 0..len {
+            let key = PropertyKey::Integer(i.into());
+            let pair = get_value(unwrap_try(array.try_get(agent, key, array.into(), None, gc)));
+            let Ok(pair) = Array::try_from(pair) else {
+                continue;
+            };
+            let name_v = get_value(unwrap_try(pair.try_get(
+                agent,
+                PropertyKey::Integer(0.into()),
+                pair.into(),
+                None,
+                gc,
+            )));
+            let value_v = get_value(unwrap_try(pair.try_get(
+                agent,
+                PropertyKey::Integer(1.into()),
+                pair.into(),
+                None,
+                gc,
+            )));
+            out.push((read_str(agent, name_v), read_str(agent, value_v)));
+        }
+        out
     }
 }
 

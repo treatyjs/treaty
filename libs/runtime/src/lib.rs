@@ -942,6 +942,89 @@ mod tests {
     }
 
     #[test]
+    fn node_compat_new_node_builtins_are_requireable() {
+        // The newly-registered Bun/CF `node:` builtins (`stream`/`http`/`https`/`net`/
+        // `child_process`/`zlib`) resolve through `require` and materialize their (scaffold) exports
+        // objects lazily, both bare and `node:`-prefixed — the registry contract holds before the
+        // Build agents fill the bodies.
+        let mut rt = JsRuntime::with_node_compat();
+        assert_eq!(
+            rt.eval(
+                "['stream','http','https','net','child_process','zlib']\
+                 .every(s => typeof require('node:' + s) === 'object' && typeof require(s) === 'object')"
+            )
+            .unwrap(),
+            json!(true)
+        );
+    }
+
+    #[test]
+    fn node_compat_web_globals_materialize_in_user_scope() {
+        // The WinterCG web globals Bun / Cloudflare Workers expose are wired as lazy self-replacing
+        // accessors and materialize on first read, both bare and via `globalThis` — feature detection
+        // (which real code uses to branch) sees the right `typeof` for each.
+        let mut rt = JsRuntime::with_node_compat();
+        assert_eq!(
+            rt.eval(
+                "typeof crypto === 'object' \
+                 && typeof crypto.getRandomValues === 'function' \
+                 && typeof crypto.randomUUID === 'function' \
+                 && typeof crypto.subtle === 'object' \
+                 && typeof Blob === 'function' \
+                 && typeof File === 'function' \
+                 && typeof FormData === 'function' \
+                 && typeof AbortController === 'function' \
+                 && typeof AbortSignal === 'function' \
+                 && typeof Event === 'function' \
+                 && typeof EventTarget === 'function' \
+                 && typeof performance === 'object' \
+                 && typeof performance.now === 'function' \
+                 && typeof btoa === 'function' \
+                 && typeof atob === 'function' \
+                 && typeof globalThis.ReadableStream === 'function' \
+                 && typeof globalThis.WritableStream === 'function' \
+                 && typeof globalThis.TransformStream === 'function'"
+            )
+            .unwrap(),
+            json!(true)
+        );
+    }
+
+    #[test]
+    fn node_compat_web_globals_basic_behaviour() {
+        // Spot-check that the scaffold shells actually work, not just exist: base64 round-trips, an
+        // AbortController fires `abort`, randomUUID is well-formed, and a ReadableStream reads back a
+        // pushed chunk. (The Build agents deepen these; the wiring must be live now.)
+        let mut rt = JsRuntime::with_node_compat();
+        assert_eq!(rt.eval("atob(btoa('treaty'))").unwrap(), json!("treaty"));
+        assert_eq!(
+            rt.eval(
+                "const c = new AbortController(); let hit = false;\
+                 c.signal.addEventListener('abort', () => { hit = true; });\
+                 c.abort(); c.signal.aborted && hit"
+            )
+            .unwrap(),
+            json!(true)
+        );
+        assert_eq!(
+            rt.eval("/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(crypto.randomUUID())")
+                .unwrap(),
+            json!(true)
+        );
+        // A ReadableStream that enqueues one chunk then closes reads it back through a default reader.
+        let value = rt
+            .eval(
+                "globalThis.__rs = 'none';\
+                 const rs = new ReadableStream({ start(c) { c.enqueue(42); c.close(); } });\
+                 rs.getReader().read().then(r => { globalThis.__rs = r.value; });\
+                 'scheduled'",
+            )
+            .unwrap();
+        assert_eq!(value, json!("scheduled"));
+        assert_eq!(rt.eval("globalThis.__rs").unwrap(), json!(42));
+    }
+
+    #[test]
     fn node_compat_installs_global_self_reference() {
         // `globals::install_globals` ran via the realm init hook: Node's `global` aliases globalThis.
         let mut rt = JsRuntime::with_node_compat();

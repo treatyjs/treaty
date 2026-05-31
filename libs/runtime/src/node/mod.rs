@@ -37,13 +37,18 @@ pub(crate) mod module_resolver;
 // Leaf builtin modules — one file each, all exposing the uniform `install` entry.
 pub(crate) mod assert;
 pub(crate) mod buffer;
+pub(crate) mod child_process;
 pub(crate) mod console;
 pub(crate) mod crypto;
 pub(crate) mod events;
 pub(crate) mod fetch;
 pub(crate) mod fs;
 pub(crate) mod fs_promises;
+pub(crate) mod http;
+pub(crate) mod https;
 pub(crate) mod microtask;
+pub(crate) mod net;
+pub(crate) mod node_stream;
 pub(crate) mod os;
 pub(crate) mod path;
 pub(crate) mod process;
@@ -54,6 +59,14 @@ pub(crate) mod text_encoding;
 pub(crate) mod timers;
 pub(crate) mod url;
 pub(crate) mod util;
+pub(crate) mod zlib;
+
+// Globals-only leaf modules — reached only through the lazy global accessors in `globals` (via the
+// hidden native-module slot), never registered in `BUILTINS`. They expose the uniform `install`
+// entry so the globals bootstrap can pull their native primitives exactly like `text_encoding`/
+// `fetch` do.
+pub(crate) mod web_globals;
+pub(crate) mod web_streams;
 
 pub(crate) use crate::node::core::{InstallError, NodeCtx};
 pub(crate) use nova_vm::{
@@ -112,6 +125,13 @@ pub(crate) const BUILTINS: &[(&str, InstallFn)] = &[
     ("querystring", querystring::install),
     ("assert", assert::install),
     ("string_decoder", string_decoder::install),
+    // Bun / Cloudflare Workers (`nodejs_compat`) surface — scaffolded leaves, filled by Build.
+    ("stream", node_stream::install),
+    ("http", http::install),
+    ("https", https::install),
+    ("net", net::install),
+    ("child_process", child_process::install),
+    ("zlib", zlib::install),
 ];
 
 /// Strip the optional `node:` scheme from a specifier, yielding the bare name to match against the
@@ -302,6 +322,12 @@ mod tests {
         assert!(registered(querystring::QuerystringModule::SPECIFIER));
         assert!(registered(assert::AssertModule::SPECIFIER));
         assert!(registered(string_decoder::StringDecoderModule::SPECIFIER));
+        assert!(registered(node_stream::StreamModule::SPECIFIER));
+        assert!(registered(http::HttpModule::SPECIFIER));
+        assert!(registered(https::HttpsModule::SPECIFIER));
+        assert!(registered(net::NetModule::SPECIFIER));
+        assert!(registered(child_process::ChildProcessModule::SPECIFIER));
+        assert!(registered(zlib::ZlibModule::SPECIFIER));
     }
 
     #[test]

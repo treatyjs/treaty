@@ -1,4 +1,4 @@
-//! `node:crypto` — hashing, HMAC, and CSPRNG primitives.
+//! `node:crypto` — hashing, HMAC, symmetric ciphers, key derivation, and CSPRNG primitives.
 //!
 //! ## Architecture
 //!
@@ -8,27 +8,40 @@
 //!   siblings `sha224`/`sha384`/`sha512` which come free with the `sha2` crate).
 //! * [`digest`] — one-shot `digest(alg, data) -> Vec<u8>`.
 //! * [`hmac`] — `HMAC(alg, key, data) -> Vec<u8>`.
+//! * [`cipher_encrypt`] / [`cipher_decrypt`] — AES-128/256-CBC with PKCS#7 padding (RustCrypto
+//!   `aes` + `cbc`), behind `createCipheriv`/`createDecipheriv`.
+//! * [`pbkdf2`] — PBKDF2-HMAC key derivation (RustCrypto `pbkdf2` over the same `hmac`/`sha2`),
+//!   behind `pbkdf2`/`pbkdf2Sync`.
 //! * [`random_bytes`] / [`random_uuid`] — the OS CSPRNG (`getrandom`) behind `randomBytes`,
 //!   `randomFillSync`, and a RFC 4122 v4 `randomUUID`.
 //!
 //! This core is exhaustively unit-tested in isolation (no JS agent needed) — tenet 1 (no `unsafe`)
-//! and tenet 3 (the digest path borrows its input `&[u8]`; the only allocation is the unavoidable
-//! output `Vec<u8>` / `String`).
+//! and tenet 3 (the digest/cipher paths borrow their input `&[u8]`; the only allocation is the
+//! unavoidable output `Vec<u8>` / `String`).
 //!
 //! The JS-facing surface is a thin layer over that core. A handful of Rust-backed
-//! [`nova_vm::ecmascript::RegularFn`] **natives** marshal bytes in and encoded digests / random
-//! bytes out, and a compile-time JS **prelude** assembles the Node `createHash().update().digest()`
-//! object graph, `createHmac`, `randomBytes`, `randomUUID`, `randomFillSync`, and
-//! `timingSafeEqual` over them — exactly how the Buffer module layers its JS API over Rust codecs.
+//! [`nova_vm::ecmascript::RegularFn`] **natives** marshal bytes in and encoded digests / ciphertext /
+//! random bytes out, and a compile-time JS **prelude** assembles the Node `createHash().update()
+//! .digest()` object graph, `createHmac`, `createCipheriv`/`createDecipheriv`, `pbkdf2`/`pbkdf2Sync`,
+//! `randomBytes`, `randomUUID`, `randomFillSync`, and `timingSafeEqual` over them — exactly how the
+//! Buffer module layers its JS API over Rust codecs.
 //!
-//! ## Why incremental `Hash` accumulates JS-side
+//! ## Why incremental `Hash`/`Cipheriv` accumulate JS-side
 //!
 //! A Nova builtin function is a bare `fn` pointer with no captured state, so it cannot hold a live
-//! Rust streaming hasher between `.update()` calls. A `createHash` digest is content-addressable —
-//! `digest === H(chunk0 ++ chunk1 ++ …)` — so the `Hash` JS object collects each `update` chunk and
-//! the digest is computed in a single native call over the concatenation. The result is byte-for-byte
-//! identical to a streaming hash; the difference is purely where the bytes are buffered. This is the
-//! same "JS object graph over Rust hot-path natives" split the `node:buffer` module uses.
+//! Rust streaming hasher/cipher between `.update()` calls. A digest is content-addressable
+//! (`digest === H(chunk0 ++ chunk1 ++ …)`) and a CBC ciphertext is a pure function of the whole
+//! padded input, so the `Hash`/`Cipheriv` JS objects collect each `update` chunk and the result is
+//! computed in a single native call over the concatenation — byte-for-byte identical to a streaming
+//! form, the difference being purely where the bytes are buffered. This is the same "JS object graph
+//! over Rust hot-path natives" split the `node:buffer` module uses.
+//!
+//! ## Documented gaps
+//!
+//! `scrypt`/`scryptSync` need a pure-Rust scrypt crate that is not vendored offline, so they throw a
+//! clear, catchable "not implemented" `Error` rather than returning wrong bytes; they are a tracked
+//! follow-up. AES-GCM / other modes and asymmetric crypto are likewise out of scope for this offline
+//! surface.
 //!
 //! ## Laziness
 //!
@@ -36,6 +49,10 @@
 //! costs one `&'static str` table entry; the prelude is a `&'static str`, so an un-imported runtime
 //! pays nothing for it.
 
+use aes::{Aes128, Aes256};
+use cbc::{Decryptor, Encryptor};
+use cipher::block_padding::Pkcs7;
+use cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use digest::Digest;
 use hmac::{Hmac, Mac};
 use md5::Md5;
@@ -129,8 +146,8 @@ pub(crate) fn hmac(alg: Algorithm, key: &[u8], data: &[u8]) -> Vec<u8> {
     // far simpler to satisfy by naming each concrete digest type than by writing a generic helper.
     macro_rules! run {
         ($d:ty) => {{
-            let mut mac = <Hmac<$d> as Mac>::new_from_slice(key)
-                .expect("HMAC accepts a key of any length");
+            let mut mac =
+                <Hmac<$d> as Mac>::new_from_slice(key).expect("HMAC accepts a key of any length");
             mac.update(data);
             mac.finalize().into_bytes().to_vec()
         }};
@@ -172,6 +189,123 @@ pub(crate) fn random_uuid() -> Result<String, getrandom::Error> {
     // Variant 10xx: top two bits of byte 8.
     b[8] = (b[8] & 0x3f) | 0x80;
     Ok(format_uuid(&b))
+}
+
+// ----- symmetric ciphers (AES-CBC) and key derivation (PBKDF2) -------------------------------
+
+/// A supported symmetric cipher transform. The CBC mode pads with PKCS#7 — the default Node applies
+/// for `createCipheriv("aes-256-cbc", …)` (block ciphers require padding for a full-block output).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Cipher {
+    /// `aes-128-cbc`: 16-byte key, 16-byte IV.
+    Aes128Cbc,
+    /// `aes-256-cbc`: 32-byte key, 16-byte IV.
+    Aes256Cbc,
+}
+
+impl Cipher {
+    /// Resolve a Node cipher name (case-insensitive) to a [`Cipher`], or `None` if unsupported here.
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "aes-128-cbc" | "aes128" => Some(Cipher::Aes128Cbc),
+            "aes-256-cbc" | "aes256" => Some(Cipher::Aes256Cbc),
+            _ => None,
+        }
+    }
+
+    /// The required key length in bytes.
+    pub(crate) fn key_len(self) -> usize {
+        match self {
+            Cipher::Aes128Cbc => 16,
+            Cipher::Aes256Cbc => 32,
+        }
+    }
+
+    /// The required IV length in bytes (the AES block size for CBC).
+    pub(crate) fn iv_len(self) -> usize {
+        16
+    }
+}
+
+/// A cipher operation failure: a wrong-length key/IV, or undecryptable / unpadded ciphertext.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CipherError {
+    /// The key or IV did not match the cipher's required length.
+    BadKeyOrIv,
+    /// Decryption failed (bad padding / corrupt ciphertext / wrong key).
+    BadData,
+}
+
+/// AES-CBC encrypt `data` with PKCS#7 padding, returning the ciphertext.
+///
+/// Validates key/IV length up front (Node throws `RangeError` for a mismatch). The single allocation
+/// is the output `Vec`; no `unsafe` (tenet 1, tenet 3).
+pub(crate) fn cipher_encrypt(
+    cipher: Cipher,
+    key: &[u8],
+    iv: &[u8],
+    data: &[u8],
+) -> Result<Vec<u8>, CipherError> {
+    if key.len() != cipher.key_len() || iv.len() != cipher.iv_len() {
+        return Err(CipherError::BadKeyOrIv);
+    }
+    let out = match cipher {
+        Cipher::Aes128Cbc => {
+            Encryptor::<Aes128>::new(key.into(), iv.into()).encrypt_padded_vec_mut::<Pkcs7>(data)
+        }
+        Cipher::Aes256Cbc => {
+            Encryptor::<Aes256>::new(key.into(), iv.into()).encrypt_padded_vec_mut::<Pkcs7>(data)
+        }
+    };
+    Ok(out)
+}
+
+/// AES-CBC decrypt `data` (PKCS#7-padded), returning the plaintext.
+///
+/// Returns [`CipherError::BadData`] for ciphertext that is not a whole number of blocks or whose
+/// padding does not validate (a wrong key surfaces here) — matching Node's thrown decrypt error.
+pub(crate) fn cipher_decrypt(
+    cipher: Cipher,
+    key: &[u8],
+    iv: &[u8],
+    data: &[u8],
+) -> Result<Vec<u8>, CipherError> {
+    if key.len() != cipher.key_len() || iv.len() != cipher.iv_len() {
+        return Err(CipherError::BadKeyOrIv);
+    }
+    let out = match cipher {
+        Cipher::Aes128Cbc => Decryptor::<Aes128>::new(key.into(), iv.into())
+            .decrypt_padded_vec_mut::<Pkcs7>(data)
+            .map_err(|_| CipherError::BadData)?,
+        Cipher::Aes256Cbc => Decryptor::<Aes256>::new(key.into(), iv.into())
+            .decrypt_padded_vec_mut::<Pkcs7>(data)
+            .map_err(|_| CipherError::BadData)?,
+    };
+    Ok(out)
+}
+
+/// PBKDF2 over HMAC, deriving a `keylen`-byte key.
+///
+/// `crypto.pbkdf2`/`pbkdf2Sync` accept a `digest` name selecting the underlying HMAC. The supported
+/// digests reuse [`Algorithm`]. The single allocation is the output `Vec` (tenet 3).
+pub(crate) fn pbkdf2(
+    alg: Algorithm,
+    password: &[u8],
+    salt: &[u8],
+    iterations: u32,
+    keylen: usize,
+) -> Vec<u8> {
+    let mut out = vec![0u8; keylen];
+    // Monomorphized per digest, mirroring `hmac` above: `pbkdf2_hmac::<D>` is generic over the digest.
+    match alg {
+        Algorithm::Md5 => pbkdf2::pbkdf2_hmac::<Md5>(password, salt, iterations, &mut out),
+        Algorithm::Sha1 => pbkdf2::pbkdf2_hmac::<Sha1>(password, salt, iterations, &mut out),
+        Algorithm::Sha224 => pbkdf2::pbkdf2_hmac::<Sha224>(password, salt, iterations, &mut out),
+        Algorithm::Sha256 => pbkdf2::pbkdf2_hmac::<Sha256>(password, salt, iterations, &mut out),
+        Algorithm::Sha384 => pbkdf2::pbkdf2_hmac::<Sha384>(password, salt, iterations, &mut out),
+        Algorithm::Sha512 => pbkdf2::pbkdf2_hmac::<Sha512>(password, salt, iterations, &mut out),
+    }
+    out
 }
 
 /// Format 16 bytes as a lowercase hyphenated RFC 4122 UUID string (`8-4-4-4-12`).
@@ -292,9 +426,9 @@ const NATIVES_KEY: &str = "__treaty_crypto_natives__";
 /// Uniform per-module entry. Returns the `node:crypto` exports object.
 ///
 /// Steps mirror `node:buffer`: (1) build the natives object with the Rust-backed digest / HMAC /
-/// CSPRNG primitives, (2) stash it on the realm global under a private key, (3) evaluate the JS
-/// prelude (an IIFE that builds and returns the exports object over those natives), (4) delete the
-/// private key, (5) return the exports object.
+/// cipher / PBKDF2 / CSPRNG primitives, (2) stash it on the realm global under a private key, (3)
+/// evaluate the JS prelude (an IIFE that builds and returns the exports object over those natives),
+/// (4) delete the private key, (5) return the exports object.
 pub(crate) fn install<'gc>(
     agent: &mut Agent,
     _ctx: &NodeCtx,
@@ -311,6 +445,9 @@ pub(crate) fn install<'gc>(
         define_fn(agent, natives, "randomFill", native_random_fill, 1, nogc);
         define_fn(agent, natives, "randomUuid", native_random_uuid, 0, nogc);
         define_fn(agent, natives, "supports", native_supports, 1, nogc);
+        define_fn(agent, natives, "cipher", native_cipher, 4, nogc);
+        define_fn(agent, natives, "decipher", native_decipher, 4, nogc);
+        define_fn(agent, natives, "pbkdf2", native_pbkdf2, 5, nogc);
         natives
     };
 
@@ -417,13 +554,15 @@ fn ta_view(agent: &Agent, value: Value) -> Option<(ArrayBuffer<'static>, usize, 
 
 /// Read the bytes of typed-array argument `index` as an owned `Vec<u8>`.
 ///
-/// Owned (not borrowed) so the digest/HMAC computation does not hold a borrow of `agent` while it
-/// later re-borrows `agent` mutably to build the result string/array. Hash inputs are the only copy
-/// in this layer and are bounded by the caller's data.
+/// Owned (not borrowed) so the digest/HMAC/cipher computation does not hold a borrow of `agent` while
+/// it later re-borrows `agent` mutably to build the result string/array. Hash/cipher inputs are the
+/// only copy in this layer and are bounded by the caller's data.
 fn arg_bytes(agent: &Agent, args: &ArgumentsList, index: usize) -> Option<Vec<u8>> {
     let (buf, offset, len) = ta_view(agent, args.get(index))?;
     let slice = buf.as_slice(agent);
-    slice.get(offset..offset.saturating_add(len)).map(<[u8]>::to_vec)
+    slice
+        .get(offset..offset.saturating_add(len))
+        .map(<[u8]>::to_vec)
 }
 
 /// Read a JS string argument into an owned `String`.
@@ -587,6 +726,121 @@ fn native_supports<'gc>(
     Ok(Value::Boolean(ok))
 }
 
+/// `cipher(name: string, key: Uint8Array, iv: Uint8Array, data: Uint8Array) -> number[]` — one-shot
+/// AES-CBC encrypt. The prelude's `createCipheriv(...).update()/.final()` buffers chunks and calls
+/// this once over the concatenation (a block cipher's output is a pure function of the whole input).
+fn native_cipher<'gc>(
+    agent: &mut Agent,
+    _this: Value,
+    args: ArgumentsList,
+    gc: GcScope<'gc, '_>,
+) -> JsResult<'gc, Value<'gc>> {
+    let nogc = gc.into_nogc();
+    let Some(name) = arg_string(agent, &args, 0) else {
+        return Err(type_error(agent, "cipher expects an algorithm name", nogc));
+    };
+    let Some(c) = Cipher::from_name(&name) else {
+        return Err(type_error(agent, "Unsupported cipher", nogc));
+    };
+    let Some(key) = arg_bytes(agent, &args, 1) else {
+        return Err(type_error(agent, "cipher expects a Uint8Array key", nogc));
+    };
+    let Some(iv) = arg_bytes(agent, &args, 2) else {
+        return Err(type_error(agent, "cipher expects a Uint8Array iv", nogc));
+    };
+    let Some(data) = arg_bytes(agent, &args, 3) else {
+        return Err(type_error(agent, "cipher expects a Uint8Array of input", nogc));
+    };
+    match cipher_encrypt(c, &key, &iv, &data) {
+        Ok(out) => Ok(bytes_to_array(agent, &out, nogc).into()),
+        Err(CipherError::BadKeyOrIv) => Err(agent.throw_exception(
+            ExceptionType::RangeError,
+            "Invalid key length or initialization vector length".to_owned(),
+            nogc,
+        )),
+        Err(CipherError::BadData) => Err(agent.throw_exception(
+            ExceptionType::Error,
+            "error while encrypting".to_owned(),
+            nogc,
+        )),
+    }
+}
+
+/// `decipher(name: string, key: Uint8Array, iv: Uint8Array, data: Uint8Array) -> number[]` — one-shot
+/// AES-CBC decrypt with PKCS#7 unpadding.
+fn native_decipher<'gc>(
+    agent: &mut Agent,
+    _this: Value,
+    args: ArgumentsList,
+    gc: GcScope<'gc, '_>,
+) -> JsResult<'gc, Value<'gc>> {
+    let nogc = gc.into_nogc();
+    let Some(name) = arg_string(agent, &args, 0) else {
+        return Err(type_error(agent, "decipher expects an algorithm name", nogc));
+    };
+    let Some(c) = Cipher::from_name(&name) else {
+        return Err(type_error(agent, "Unsupported cipher", nogc));
+    };
+    let Some(key) = arg_bytes(agent, &args, 1) else {
+        return Err(type_error(agent, "decipher expects a Uint8Array key", nogc));
+    };
+    let Some(iv) = arg_bytes(agent, &args, 2) else {
+        return Err(type_error(agent, "decipher expects a Uint8Array iv", nogc));
+    };
+    let Some(data) = arg_bytes(agent, &args, 3) else {
+        return Err(type_error(agent, "decipher expects a Uint8Array of input", nogc));
+    };
+    match cipher_decrypt(c, &key, &iv, &data) {
+        Ok(out) => Ok(bytes_to_array(agent, &out, nogc).into()),
+        Err(CipherError::BadKeyOrIv) => Err(agent.throw_exception(
+            ExceptionType::RangeError,
+            "Invalid key length or initialization vector length".to_owned(),
+            nogc,
+        )),
+        Err(CipherError::BadData) => Err(agent.throw_exception(
+            ExceptionType::Error,
+            "error:1C800064:Provider routines::bad decrypt".to_owned(),
+            nogc,
+        )),
+    }
+}
+
+/// `pbkdf2(alg: string, password: Uint8Array, salt: Uint8Array, iterations: number, keylen: number)
+/// -> number[]` — derive a key. Backs both `pbkdf2Sync` and the async `pbkdf2` (the prelude delivers
+/// the async result on a microtask).
+fn native_pbkdf2<'gc>(
+    agent: &mut Agent,
+    _this: Value,
+    args: ArgumentsList,
+    gc: GcScope<'gc, '_>,
+) -> JsResult<'gc, Value<'gc>> {
+    let nogc = gc.into_nogc();
+    let Some(alg_name) = arg_string(agent, &args, 0) else {
+        return Err(type_error(agent, "pbkdf2 expects a digest name", nogc));
+    };
+    let Some(alg) = Algorithm::from_name(&alg_name) else {
+        return Err(type_error(agent, "Digest method not supported", nogc));
+    };
+    let Some(password) = arg_bytes(agent, &args, 1) else {
+        return Err(type_error(agent, "pbkdf2 expects a Uint8Array password", nogc));
+    };
+    let Some(salt) = arg_bytes(agent, &args, 2) else {
+        return Err(type_error(agent, "pbkdf2 expects a Uint8Array salt", nogc));
+    };
+    let iterations = match args.get(3) {
+        Value::Integer(i) => i.into_i64().max(1) as u32,
+        Value::SmallF64(f) => (f.into_f64() as i64).max(1) as u32,
+        _ => return Err(type_error(agent, "pbkdf2 expects an iterations count", nogc)),
+    };
+    let keylen = match args.get(4) {
+        Value::Integer(i) => i.into_i64().max(0) as usize,
+        Value::SmallF64(f) => (f.into_f64() as i64).max(0) as usize,
+        _ => return Err(type_error(agent, "pbkdf2 expects a key length", nogc)),
+    };
+    let derived = pbkdf2(alg, &password, &salt, iterations, keylen);
+    Ok(bytes_to_array(agent, &derived, nogc).into())
+}
+
 /// Build a JS `Array` whose elements are the given bytes (each a small integer `0..=255`).
 ///
 /// The pinned Nova rev exposes no embedder-side slice-to-`Uint8Array` constructor (every typed-array
@@ -601,7 +855,8 @@ fn bytes_to_array<'gc>(agent: &mut Agent, bytes: &[u8], gc: NoGcScope<'gc, '_>) 
 /// The JS prelude. Built once per runtime; a `&'static str` so an un-imported runtime pays nothing.
 ///
 /// It is an IIFE that reads the Rust natives off the private global key, defines `Hash`, `Hmac`,
-/// `createHash`, `createHmac`, `randomBytes`, `randomFillSync`, `randomUUID`, `randomInt`,
+/// `Cipheriv`, `Decipheriv`, `createHash`, `createHmac`, `createCipheriv`, `createDecipheriv`,
+/// `pbkdf2`/`pbkdf2Sync`, `randomBytes`, `randomFillSync`, `randomUUID`, `randomInt`,
 /// `timingSafeEqual`, and `getHashes`, and returns the module exports object. Kept inline (rather
 /// than a sibling file) so the whole module is one self-contained unit.
 const PRELUDE: &str = r##"
@@ -667,6 +922,49 @@ const PRELUDE: &str = r##"
     }
   }
 
+  // Encode raw bytes to a string per a Node output encoding (the inverse of strToBytes).
+  function bytesToString(u8, encoding) {
+    const e = String(encoding).toLowerCase();
+    switch (e) {
+      case "hex": {
+        let s = ""; const H = "0123456789abcdef";
+        for (let i = 0; i < u8.length; i++) s += H[u8[i] >> 4] + H[u8[i] & 0xf];
+        return s;
+      }
+      case "latin1": case "binary": case "ascii": {
+        let s = ""; for (let i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]); return s;
+      }
+      case "base64": case "base64url": {
+        const alpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789" + (e === "base64url" ? "-_" : "+/");
+        let s = "";
+        for (let i = 0; i < u8.length; i += 3) {
+          const b0 = u8[i], b1 = i + 1 < u8.length ? u8[i + 1] : 0, b2 = i + 2 < u8.length ? u8[i + 2] : 0;
+          const n = (b0 << 16) | (b1 << 8) | b2;
+          s += alpha[(n >> 18) & 63] + alpha[(n >> 12) & 63];
+          s += (i + 1 < u8.length) ? alpha[(n >> 6) & 63] : (e === "base64url" ? "" : "=");
+          s += (i + 2 < u8.length) ? alpha[n & 63] : (e === "base64url" ? "" : "=");
+        }
+        return s;
+      }
+      case "utf8": case "utf-8": {
+        let s = "", i = 0;
+        while (i < u8.length) {
+          const c = u8[i];
+          if (c < 0x80) { s += String.fromCharCode(c); i += 1; }
+          else if (c < 0xe0) { s += String.fromCharCode(((c & 0x1f) << 6) | (u8[i + 1] & 0x3f)); i += 2; }
+          else if (c < 0xf0) { s += String.fromCharCode(((c & 0x0f) << 12) | ((u8[i + 1] & 0x3f) << 6) | (u8[i + 2] & 0x3f)); i += 3; }
+          else {
+            const cp = ((c & 0x07) << 18) | ((u8[i + 1] & 0x3f) << 12) | ((u8[i + 2] & 0x3f) << 6) | (u8[i + 3] & 0x3f);
+            const v = cp - 0x10000;
+            s += String.fromCharCode(0xd800 + (v >> 10), 0xdc00 + (v & 0x3ff)); i += 4;
+          }
+        }
+        return s;
+      }
+      default: throw new TypeError("Unknown encoding: " + encoding);
+    }
+  }
+
   // Wrap a byte array (or byte source) as a Buffer if node:buffer has been loaded; otherwise return
   // a plain Uint8Array (a faithful byte container either way).
   function asBuffer(byteArray) {
@@ -676,6 +974,15 @@ const PRELUDE: &str = r##"
       if (buf && buf.Buffer) return buf.Buffer.from(u8);
     } catch (_) { /* buffer not available; fall through */ }
     return u8;
+  }
+
+  function concatBytes(chunks) {
+    let total = 0;
+    for (const c of chunks) total += c.length;
+    const all = new Uint8Array(total);
+    let pos = 0;
+    for (const c of chunks) { all.set(c, pos); pos += c.length; }
+    return all;
   }
 
   class Hash {
@@ -690,18 +997,10 @@ const PRELUDE: &str = r##"
       this._chunks.push(toBytes(data, inputEncoding));
       return this;
     }
-    _concat() {
-      let total = 0;
-      for (const c of this._chunks) total += c.length;
-      const all = new Uint8Array(total);
-      let pos = 0;
-      for (const c of this._chunks) { all.set(c, pos); pos += c.length; }
-      return all;
-    }
     digest(encoding) {
       if (this._finalized) throw new Error("Digest already called");
       this._finalized = true;
-      const all = this._concat();
+      const all = concatBytes(this._chunks);
       if (encoding === undefined || encoding === null) return asBuffer(N.digestBytes(this._alg, all));
       return N.digestEncoded(this._alg, all, String(encoding).toLowerCase());
     }
@@ -720,18 +1019,10 @@ const PRELUDE: &str = r##"
       this._chunks.push(toBytes(data, inputEncoding));
       return this;
     }
-    _concat() {
-      let total = 0;
-      for (const c of this._chunks) total += c.length;
-      const all = new Uint8Array(total);
-      let pos = 0;
-      for (const c of this._chunks) { all.set(c, pos); pos += c.length; }
-      return all;
-    }
     digest(encoding) {
       if (this._finalized) throw new Error("Digest already called");
       this._finalized = true;
-      const all = this._concat();
+      const all = concatBytes(this._chunks);
       if (encoding === undefined || encoding === null) return asBuffer(N.hmacBytes(this._alg, this._key, all));
       return N.hmacEncoded(this._alg, this._key, all, String(encoding).toLowerCase());
     }
@@ -739,6 +1030,88 @@ const PRELUDE: &str = r##"
 
   function createHash(algorithm, options) { return new Hash(String(algorithm).toLowerCase()); }
   function createHmac(algorithm, key, options) { return new Hmac(String(algorithm).toLowerCase(), key, options); }
+
+  // ----- symmetric ciphers (AES-CBC) -----------------------------------------------------------
+  //
+  // createCipheriv/createDecipheriv return an object that buffers update() chunks and runs the
+  // single native cipher/decipher call on final(). A block cipher's CBC output is a pure function of
+  // the whole padded input, so buffering-then-one-shot is byte-identical to a streaming cipher.
+
+  class Cipheriv {
+    constructor(algorithm, key, iv) {
+      this._alg = String(algorithm).toLowerCase();
+      this._key = toBytes(key);
+      this._iv = toBytes(iv);
+      this._chunks = [];
+      this._final = false;
+    }
+    update(data, inputEncoding, outputEncoding) {
+      if (this._final) throw new Error("Trying to add data in unsupported state");
+      this._chunks.push(toBytes(data, inputEncoding));
+      // Defer all output to final() so the single padded one-shot is byte-exact; update() yields an
+      // empty buffer (Node permits update() to return 0 bytes until a block boundary).
+      return asBuffer(new Uint8Array(0));
+    }
+    final(outputEncoding) {
+      if (this._final) throw new Error("Trying to add data in unsupported state");
+      this._final = true;
+      const out = N.cipher(this._alg, this._key, this._iv, concatBytes(this._chunks));
+      const u8 = Uint8Array.from(out);
+      if (outputEncoding === undefined || outputEncoding === null) return asBuffer(u8);
+      return bytesToString(u8, outputEncoding);
+    }
+  }
+
+  class Decipheriv {
+    constructor(algorithm, key, iv) {
+      this._alg = String(algorithm).toLowerCase();
+      this._key = toBytes(key);
+      this._iv = toBytes(iv);
+      this._chunks = [];
+      this._final = false;
+    }
+    update(data, inputEncoding, outputEncoding) {
+      if (this._final) throw new Error("Trying to add data in unsupported state");
+      this._chunks.push(toBytes(data, inputEncoding));
+      return asBuffer(new Uint8Array(0));
+    }
+    final(outputEncoding) {
+      if (this._final) throw new Error("Trying to add data in unsupported state");
+      this._final = true;
+      const out = N.decipher(this._alg, this._key, this._iv, concatBytes(this._chunks));
+      const u8 = Uint8Array.from(out);
+      if (outputEncoding === undefined || outputEncoding === null) return asBuffer(u8);
+      return bytesToString(u8, outputEncoding);
+    }
+  }
+
+  function createCipheriv(algorithm, key, iv, options) { return new Cipheriv(algorithm, key, iv); }
+  function createDecipheriv(algorithm, key, iv, options) { return new Decipheriv(algorithm, key, iv); }
+
+  // ----- PBKDF2 --------------------------------------------------------------------------------
+
+  function pbkdf2Sync(password, salt, iterations, keylen, digest) {
+    const p = toBytes(password), s = toBytes(salt);
+    const d = String(digest || "sha1").toLowerCase();
+    return asBuffer(N.pbkdf2(d, p, s, iterations >>> 0, keylen >>> 0));
+  }
+
+  function pbkdf2(password, salt, iterations, keylen, digest, callback) {
+    // The 5-arg form (no explicit digest) passes the callback as `digest`.
+    let dig = digest, cb = callback;
+    if (typeof digest === "function") { cb = digest; dig = undefined; }
+    if (typeof cb !== "function") throw new TypeError("callback must be a function");
+    let result, err = null;
+    try { result = pbkdf2Sync(password, salt, iterations, keylen, dig); }
+    catch (e) { err = e; }
+    queueMicrotask(() => err ? cb(err) : cb(null, result));
+    return undefined;
+  }
+
+  // scryptSync / scrypt: no pure-Rust scrypt crate is vendored offline, so these are a documented
+  // follow-up. They throw a clear, catchable Error rather than silently returning wrong bytes.
+  function scryptSync() { throw new Error("crypto.scryptSync is not implemented in this runtime"); }
+  function scrypt() { throw new Error("crypto.scrypt is not implemented in this runtime"); }
 
   // randomBytes(size[, cb]) -> Buffer (or async via callback).
   function randomBytes(size, callback) {
@@ -814,6 +1187,12 @@ const PRELUDE: &str = r##"
   return {
     createHash,
     createHmac,
+    createCipheriv,
+    createDecipheriv,
+    pbkdf2,
+    pbkdf2Sync,
+    scrypt,
+    scryptSync,
     randomBytes,
     randomFillSync,
     randomUUID,
@@ -974,6 +1353,113 @@ mod tests {
         assert_eq!(to_base64(&[0xff]), "/w==");
         assert_eq!(to_base64url(&[0xff]), "_w");
         assert_eq!(to_base64(b""), "");
+    }
+
+    #[test]
+    fn aes_256_cbc_round_trips_with_known_key_iv() {
+        let key = [0x42u8; 32];
+        let iv = [0x24u8; 16];
+        let plaintext = b"attack at dawn -- but only if it is sunny";
+        let ct = cipher_encrypt(Cipher::Aes256Cbc, &key, &iv, plaintext).unwrap();
+        // PKCS#7-padded to a whole number of 16-byte blocks, strictly larger than the input.
+        assert_eq!(ct.len() % 16, 0);
+        assert!(ct.len() >= plaintext.len());
+        assert_ne!(&ct[..], &plaintext[..]);
+        let pt = cipher_decrypt(Cipher::Aes256Cbc, &key, &iv, &ct).unwrap();
+        assert_eq!(pt, plaintext);
+    }
+
+    #[test]
+    fn aes_256_cbc_matches_known_answer_vector() {
+        // NIST SP 800-38A F.2.5 CBC-AES256.Encrypt, first block.
+        let key = hex_to_bytes("603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4");
+        let iv = hex_to_bytes("000102030405060708090a0b0c0d0e0f");
+        let pt = hex_to_bytes("6bc1bee22e409f96e93d7e117393172a");
+        let ct = cipher_encrypt(Cipher::Aes256Cbc, &key, &iv, &pt).unwrap();
+        // SP 800-38A expected first ciphertext block (the PKCS#7 pad adds a second block we ignore).
+        assert_eq!(to_hex(&ct[..16]), "f58c4c04d6e5f1ba779eabfb5f7bfbd6");
+    }
+
+    #[test]
+    fn aes_128_cbc_round_trips() {
+        let key = [0x01u8; 16];
+        let iv = [0x02u8; 16];
+        let pt = b"sixteen-byte-block boundaries are exercised too";
+        let ct = cipher_encrypt(Cipher::Aes128Cbc, &key, &iv, pt).unwrap();
+        assert_eq!(cipher_decrypt(Cipher::Aes128Cbc, &key, &iv, &ct).unwrap(), pt);
+    }
+
+    #[test]
+    fn cipher_rejects_wrong_key_or_iv_length() {
+        assert_eq!(
+            cipher_encrypt(Cipher::Aes256Cbc, &[0u8; 16], &[0u8; 16], b"x"),
+            Err(CipherError::BadKeyOrIv)
+        );
+        assert_eq!(
+            cipher_encrypt(Cipher::Aes256Cbc, &[0u8; 32], &[0u8; 8], b"x"),
+            Err(CipherError::BadKeyOrIv)
+        );
+    }
+
+    #[test]
+    fn decipher_rejects_corrupt_ciphertext() {
+        let key = [0x42u8; 32];
+        let iv = [0x24u8; 16];
+        // 16 zero bytes almost never decrypt to valid PKCS#7 padding.
+        assert_eq!(
+            cipher_decrypt(Cipher::Aes256Cbc, &key, &iv, &[0u8; 16]),
+            Err(CipherError::BadData)
+        );
+        // A non-block-multiple length is always rejected.
+        assert_eq!(
+            cipher_decrypt(Cipher::Aes256Cbc, &key, &iv, &[0u8; 5]),
+            Err(CipherError::BadData)
+        );
+    }
+
+    #[test]
+    fn cipher_name_parsing() {
+        assert_eq!(Cipher::from_name("aes-256-cbc"), Some(Cipher::Aes256Cbc));
+        assert_eq!(Cipher::from_name("AES-128-CBC"), Some(Cipher::Aes128Cbc));
+        assert_eq!(Cipher::from_name("aes-192-cbc"), None);
+        assert_eq!(Cipher::from_name("chacha20"), None);
+    }
+
+    #[test]
+    fn pbkdf2_sha256_known_answer() {
+        // RFC 7914 §11 PBKDF2-HMAC-SHA-256: P="passwd", S="salt", c=1, dkLen=64.
+        let dk = pbkdf2(Algorithm::Sha256, b"passwd", b"salt", 1, 64);
+        assert_eq!(
+            to_hex(&dk),
+            "55ac046e56e3089fec1691c22544b605f94185216dde0465e68b9d57c20dacbc\
+49ca9cccf179b645991664b39d77ef317c71b845b1e30bd509112041d3a19783"
+        );
+    }
+
+    #[test]
+    fn pbkdf2_sha256_second_known_answer() {
+        // RFC 7914 §11 second vector: P="Password", S="NaCl", c=80000, dkLen=64.
+        let dk = pbkdf2(Algorithm::Sha256, b"Password", b"NaCl", 80000, 64);
+        assert_eq!(
+            to_hex(&dk),
+            "4ddcd8f60b98be21830cee5ef22701f9641a4418d04c0414aeff08876b34ab56\
+a1d425a1225833549adb841b51c9b3176a272bdebba1d078478f62b397f33c8d"
+        );
+    }
+
+    #[test]
+    fn pbkdf2_sha1_known_answer() {
+        // RFC 6070 PBKDF2-HMAC-SHA1: P="password", S="salt", c=1, dkLen=20.
+        let dk = pbkdf2(Algorithm::Sha1, b"password", b"salt", 1, 20);
+        assert_eq!(to_hex(&dk), "0c60c80f961f0e71f3a9b524af6012062fe037a6");
+    }
+
+    /// Decode a hex string into bytes (test helper).
+    fn hex_to_bytes(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
     }
 
     // ----- JS-surface integration tests (live engine) -----------------------------------------
@@ -1161,6 +1647,76 @@ mod tests {
     fn unsupported_algorithm_throws() {
         let v = run(
             "(() => { try { C.createHash('sha3-512'); return 'no-throw'; } catch (e) { return 'threw'; } })()",
+        );
+        assert_eq!(v, json!("threw"));
+    }
+
+    #[test]
+    fn aes_256_cbc_encrypt_then_decrypt_round_trips_in_js() {
+        let v = run(
+            "(() => {
+               const Buffer = require('node:buffer').Buffer;
+               const key = new Uint8Array(32).fill(0x42);
+               const iv = new Uint8Array(16).fill(0x24);
+               const c = C.createCipheriv('aes-256-cbc', key, iv);
+               c.update('secret message');
+               const ctHex = c.final('hex');
+               const d = C.createDecipheriv('aes-256-cbc', key, iv);
+               d.update(Buffer.from(ctHex, 'hex'));
+               const pt = d.final('utf8');
+               return pt; })()",
+        );
+        assert_eq!(v, json!("secret message"));
+    }
+
+    #[test]
+    fn aes_256_cbc_known_answer_in_js() {
+        // Same NIST SP 800-38A vector as the Rust core test, driven through the JS surface.
+        let v = run(
+            "(() => {
+               const Buffer = require('node:buffer').Buffer;
+               const key = Buffer.from('603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4', 'hex');
+               const iv = Buffer.from('000102030405060708090a0b0c0d0e0f', 'hex');
+               const c = C.createCipheriv('aes-256-cbc', key, iv);
+               c.update(Buffer.from('6bc1bee22e409f96e93d7e117393172a', 'hex'));
+               const ct = c.final('hex');
+               return ct.slice(0, 32); })()",
+        );
+        assert_eq!(v, json!("f58c4c04d6e5f1ba779eabfb5f7bfbd6"));
+    }
+
+    #[test]
+    fn pbkdf2_sync_known_answer_in_js() {
+        let v = run("C.pbkdf2Sync('passwd', 'salt', 1, 64, 'sha256').toString('hex')");
+        assert_eq!(
+            v,
+            json!("55ac046e56e3089fec1691c22544b605f94185216dde0465e68b9d57c20dacbc49ca9cccf179b645991664b39d77ef317c71b845b1e30bd509112041d3a19783")
+        );
+    }
+
+    #[test]
+    fn pbkdf2_sync_default_digest_is_sha1() {
+        // Node defaults the digest to sha1 when omitted (with a deprecation warning, which we skip).
+        let v = run("C.pbkdf2Sync('password', 'salt', 1, 20).toString('hex')");
+        assert_eq!(v, json!("0c60c80f961f0e71f3a9b524af6012062fe037a6"));
+    }
+
+    #[test]
+    fn create_cipheriv_rejects_wrong_key_length() {
+        let v = run(
+            "(() => { try {
+                 const c = C.createCipheriv('aes-256-cbc', new Uint8Array(16), new Uint8Array(16));
+                 c.update('x'); c.final();
+                 return 'no-throw';
+               } catch (e) { return 'threw'; } })()",
+        );
+        assert_eq!(v, json!("threw"));
+    }
+
+    #[test]
+    fn scrypt_sync_throws_documented_unimplemented() {
+        let v = run(
+            "(() => { try { C.scryptSync('p', 's', 16); return 'no-throw'; } catch (e) { return 'threw'; } })()",
         );
         assert_eq!(v, json!("threw"));
     }
