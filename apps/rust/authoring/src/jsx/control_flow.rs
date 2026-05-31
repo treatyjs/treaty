@@ -17,13 +17,14 @@
 //!     itself** (`track item`) — the only universally-available identity in the callback, and the
 //!     value Angular recommends when a stable id is not otherwise known.
 //!
-//! Angular block control flow written *directly* in the JSX passes through faithfully: because
-//! `@if (c) { … }`, `@for (x of xs; track x) { … }`, `@switch (v) { @case (k) { … } }`, `@empty`,
-//! `@else`, `@case`, `@default` and the implicit `$index` / `$count` / `$first` / `$last` /
-//! `$even` / `$odd` variables are written as JSX *text* (the `@…{`/`}` are text nodes and the body
-//! elements are ordinary JSX children), the template visitor already preserves the markers verbatim
-//! and recurses into the element bodies — no rewriting is needed or wanted. The helpers here are
-//! only for the JSX-expression idioms above, which have no textual Angular spelling.
+//! Angular block control flow written *directly* in the JSX (`@if (c) { … }`,
+//! `@for (x of xs; track x) { … } @empty { … }`, `@switch (v) { @case (k) { … } @default { … } }`,
+//! with `@else`/`@else if` and the implicit `$index` / `$count` / `$first` / `$last` / `$even` /
+//! `$odd` variables) is NOT handled here: a block's `{ … }` body is not a parseable JSX expression
+//! container (a multi-element / text / nested-`@case` body makes the whole TSX parse fail), so it is
+//! lifted out of the source before OXC parsing and lowered by [`super::angular_blocks`], then
+//! restored into the template. The helpers here are only for the JSX-*expression* idioms above
+//! (`&&` / ternary / `.map`), which are ordinary parseable JSX with no textual Angular spelling.
 //!
 //! Statement-level iteration in the render body (`for (…) { list.push(<X/>) }`,
 //! `for (const x of xs) { … }`, `xs.forEach(x => list.push(<X/>))`) that builds a render list also
@@ -406,17 +407,21 @@ mod tests {
         );
     }
 
-    // Ignored: an Angular `@for`/`@if`/`@switch` block written *directly* as JSX uses bare `{ … }`
-    // around element + text children, which OXC's JSX grammar parses as a single expression
-    // container and rejects (the contents are not one expression). Faithful passthrough of these
-    // blocks needs a dedicated Angular-block tokenizer in the JSX front-end, which is a separate,
-    // later phase; the input here is not parseable JSX today, so the test cannot run yet.
+    /// Lower JSX that contains Angular control-flow blocks written *directly* (the `@if`/`@for`/
+    /// `@switch` bare-`{ … }` form). These blocks are not parseable JSX expression containers, so —
+    /// exactly as the `compile` pipeline does — they are lifted out by [`super::super::angular_blocks`]
+    /// before parsing and restored into the lowered template afterward.
+    fn lower_blocks(jsx: &str) -> String {
+        let pre = super::super::angular_blocks::preprocess(jsx);
+        let html = lower(&pre.source);
+        super::super::angular_blocks::restore(&html, &pre.blocks)
+    }
+
     #[test]
-    #[ignore = "Angular block passthrough needs a dedicated tokenizer; bare { } blocks are not parseable JSX in OXC"]
     fn angular_for_block_in_jsx_passes_through_with_track_and_empty() {
-        // An `@for` written directly in JSX (track + @empty) passes through faithfully: the
-        // `@for (…) {`, `@empty {` and `}` are text; the body elements are ordinary JSX children.
-        let out = lower(
+        // An `@for` written directly in JSX (track + @empty) lowers faithfully: the header is
+        // preserved verbatim, `@empty` survives, and the body element/interpolation is lowered.
+        let out = lower_blocks(
             "<ul>@for (item of items; track item.id) { <li>{item.name}</li> } @empty { <li>none</li> }</ul>",
         );
         assert!(
@@ -431,9 +436,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Angular block passthrough needs a dedicated tokenizer; bare { } blocks are not parseable JSX in OXC"]
     fn angular_if_else_block_in_jsx_passes_through() {
-        let out = lower(
+        let out = lower_blocks(
             "<div>@if (c) { <p>a</p> } @else if (d) { <p>b</p> } @else { <p>c</p> }</div>",
         );
         assert!(out.contains("@if (c) {"), "@if not preserved; got {out}");
@@ -442,9 +446,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Angular block passthrough needs a dedicated tokenizer; bare { } blocks are not parseable JSX in OXC"]
     fn angular_switch_block_in_jsx_passes_through() {
-        let out = lower(
+        let out = lower_blocks(
             "<div>@switch (v) { @case (1) { <p>one</p> } @default { <p>other</p> } }</div>",
         );
         assert!(out.contains("@switch (v) {"), "@switch not preserved; got {out}");

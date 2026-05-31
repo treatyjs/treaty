@@ -107,3 +107,27 @@ export interface CompiledAuthoringEntry {
  * `id`.
  */
 export declare function compileMany(files: Array<AuthoringFile>): Array<CompiledAuthoringEntry>
+/**
+ * Execute a Treaty macro through the Nova-backed `treaty_runtime` and return its produced value
+ * as a JSON string.
+ *
+ * `tsSource` is the TypeScript body of a macro (the top-of-file fenced block in a `.treaty` file).
+ * `inputJson` is a JSON string injected as the macro's `input` / `__args` globals (pass `"null"`
+ * for no input). The returned string is the JSON encoding of the macro's produced value (its
+ * default export, explicit `return`, or trailing expression); values with no JSON form encode as
+ * `null`.
+ *
+ * Throws if `inputJson` is not valid JSON, the source cannot be transpiled, or the macro throws.
+ */
+export declare function runMacro(tsSource: string, inputJson: string): string
+/**
+ * Execute a Treaty server function through the Nova-backed `treaty_runtime` and return its result
+ * as a JSON string.
+ *
+ * `tsSource` is the TypeScript body of a server function; `argsJson` is a JSON string (typically an
+ * array of positional arguments) injected as the function's `args` / `__args` globals. The returned
+ * string is the JSON encoding of the value the function returns (or its trailing expression).
+ *
+ * Throws if `argsJson` is not valid JSON, the source cannot be transpiled, or the function throws.
+ */
+export declare function runServerFn(tsSource: string, argsJson: string): string

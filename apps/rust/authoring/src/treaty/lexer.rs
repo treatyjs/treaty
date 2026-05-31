@@ -3,6 +3,21 @@ use std::str::Chars;
 
 use super::token::{ControlFlowKind, DeferKind};
 
+/// Returns the largest byte index `<= index` that lies on a UTF-8 char boundary in `s` (or
+/// `s.len()` when `index` is past the end). This is a stable-Rust stand-in for the unstable
+/// `str::floor_char_boundary`, used to keep every source slice in the lexer panic-free even if a
+/// byte offset were ever computed off a char boundary.
+fn floor_char_boundary(s: &str, index: usize) -> usize {
+    if index >= s.len() {
+        return s.len();
+    }
+    let mut i = index;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LexerState {
     Default,
@@ -101,6 +116,15 @@ impl<'a> Lexer<'a> {
                 self.push_state(LexerState::CSS);
                 self.parse_style()
             }
+            // A `<template>…</template>` wrapper is OPTIONAL per the `.treaty` spec: HTML is detected
+            // by its tags directly and TS/HTML/<style> freely interleave. When an author *does* wrap
+            // their markup in `<template>` (the migration-friendly form), the wrapper itself is not
+            // part of the rendered template — only its CONTENTS are. So unwrap it: lex the inner
+            // markup as the HTML region and drop the surrounding `<template>`/`</template>` tags.
+            '<' if self.starts_with_template_open() => {
+                self.push_state(LexerState::HTML);
+                self.parse_template_wrapper()
+            }
             '<' => {
                 self.push_state(LexerState::HTML);
                 self.parse_html()
@@ -121,7 +145,7 @@ impl<'a> Lexer<'a> {
     /// True if the input at the cursor opens a `<style` tag (with or without attributes), i.e.
     /// `<style>` or `<style ...>`. Used so that `<style lang="scss">` is still recognized as CSS.
     fn starts_with_style_open(&self) -> bool {
-        let rest = &self.input[self.pos..];
+        let rest = self.rest();
         if let Some(after) = rest.strip_prefix("<style") {
             // The next char must be whitespace, `>`, or `/` — otherwise it's e.g. `<styled>`.
             matches!(after.chars().next(), Some(c) if c.is_whitespace() || c == '>' || c == '/')
@@ -129,6 +153,66 @@ impl<'a> Lexer<'a> {
         } else {
             false
         }
+    }
+
+    /// True if the input at the cursor opens a `<template` tag (with or without attributes), i.e.
+    /// `<template>` or `<template …>`. The next char after `template` must be whitespace, `>`, or
+    /// `/` so that e.g. `<templated>` is NOT mistaken for the optional template wrapper.
+    fn starts_with_template_open(&self) -> bool {
+        let rest = self.rest();
+        if let Some(after) = rest.strip_prefix("<template") {
+            matches!(after.chars().next(), Some(c) if c.is_whitespace() || c == '>' || c == '/')
+                || after.is_empty()
+        } else {
+            false
+        }
+    }
+
+    /// Parses an OPTIONAL `<template …>…</template>` wrapper, emitting only its INNER markup as the
+    /// HTML region (the wrapper tags are dropped). The cursor is positioned at the opening
+    /// `<template`. Nested `<template>` elements are balanced so the region ends at the matching
+    /// outer `</template>`. All cursor motion goes through [`Self::advance`], so byte offsets stay on
+    /// UTF-8 char boundaries even when the inner markup contains non-ASCII text.
+    fn parse_template_wrapper(&mut self) -> Option<Token> {
+        // Consume the opening `<template …>` tag (and any attributes), stopping after its `>`.
+        self.advance_by_str("<template");
+        self.consume_until('>');
+        if self.current_char == Some('>') {
+            self.advance(); // Skip '>'
+        }
+
+        let start_pos = self.pos;
+        let mut content_end = self.pos;
+        let mut depth = 1usize;
+
+        while let Some(ch) = self.current_char {
+            if ch == '<' {
+                if self.starts_with("</template>") {
+                    depth -= 1;
+                    if depth == 0 {
+                        // End of the wrapper: the inner markup is everything up to here.
+                        content_end = self.pos;
+                        self.advance_by_str("</template>");
+                        break;
+                    }
+                    self.advance_by_str("</template>");
+                    content_end = self.pos;
+                    continue;
+                }
+                if self.starts_with_template_open() {
+                    depth += 1;
+                    self.advance_by_str("<template");
+                    content_end = self.pos;
+                    continue;
+                }
+            }
+            self.advance();
+            content_end = self.pos;
+        }
+
+        let value = self.slice(start_pos, content_end);
+        self.pop_state(); // Return to the previous state
+        Some(Token::new(TokenKind::HTML(value), start_pos, content_end))
     }
 
     /// Parses a JavaScript block.
@@ -168,7 +252,7 @@ impl<'a> Lexer<'a> {
         }
 
         let end_pos = self.pos;
-        let value = self.input[start_pos..end_pos].to_string();
+        let value = self.slice(start_pos, end_pos);
         self.pop_state(); // Return to the previous state
         Some(Token::new(TokenKind::JavaScript(value), start_pos, end_pos))
     }
@@ -181,7 +265,7 @@ impl<'a> Lexer<'a> {
     fn parse_style(&mut self) -> Option<Token> {
         // Consume the opening `<style …>` tag and capture the `lang` attribute, if present.
         debug_assert!(self.starts_with("<style"));
-        self.advance_by("<style".len());
+        self.advance_by_str("<style");
         let lang = self.consume_style_open_tag();
 
         let start_pos = self.pos;
@@ -199,10 +283,10 @@ impl<'a> Lexer<'a> {
         }
 
         let end_pos = self.pos;
-        let value = self.input[start_pos..end_pos].to_string();
+        let value = self.slice(start_pos, end_pos);
 
         if self.starts_with("</style>") {
-            self.advance_by("</style>".len());
+            self.advance_by_str("</style>");
         }
 
         self.pop_state(); // Return to the previous state
@@ -226,7 +310,7 @@ impl<'a> Lexer<'a> {
                 }
                 // Capture `lang="scss"` / `lang='sass'` (with optional whitespace around `=`).
                 'l' | 'L' if self.starts_with_ignore_ascii_case("lang") => {
-                    self.advance_by("lang".len());
+                    self.advance_by_str("lang");
                     self.consume_whitespace();
                     if self.current_char == Some('=') {
                         self.advance(); // Skip '='
@@ -258,7 +342,7 @@ impl<'a> Lexer<'a> {
     /// body up to the closing ```` ``` ```` fence is captured as `content`.
     fn parse_macro(&mut self) -> Option<Token> {
         let token_start = self.pos;
-        self.advance_by("```".len()); // Skip the opening fence
+        self.advance_by_str("```"); // Skip the opening fence
 
         // The remainder of the opening line is the optional info string.
         let info_raw = self.consume_while(|c| c != '\n' && c != '\r');
@@ -283,10 +367,10 @@ impl<'a> Lexer<'a> {
             }
             self.advance();
         }
-        let content = self.input[content_start..self.pos].to_string();
+        let content = self.slice(content_start, self.pos);
 
         if self.starts_with("```") {
-            self.advance_by("```".len());
+            self.advance_by_str("```");
         }
 
         self.pop_state(); // Return to the previous state
@@ -343,7 +427,7 @@ impl<'a> Lexer<'a> {
         }
 
         let end_pos = self.pos;
-        let value = self.input[start_pos..end_pos].to_string();
+        let value = self.slice(start_pos, end_pos);
         self.pop_state(); // Return to the previous state
         Some(Token::new(TokenKind::HTML(value), start_pos, end_pos))
     }
@@ -374,7 +458,7 @@ impl<'a> Lexer<'a> {
         }
 
         let end_pos = self.pos;
-        let value = self.input[start_pos..end_pos].to_string();
+        let value = self.slice(start_pos, end_pos);
         self.pop_state(); // Return to the previous state
         Some(Token::new(
             TokenKind::TemplateExpression(value.trim().to_string()),
@@ -388,40 +472,40 @@ impl<'a> Lexer<'a> {
         let start_pos = self.pos;
 
         if self.starts_with("@if") {
-            self.advance_by("@if".len());
+            self.advance_by_str("@if");
             return Some(Token::new(TokenKind::ControlFlow(ControlFlowKind::If), start_pos, self.pos));
         } else if self.starts_with("@else if") {
-            self.advance_by("@else if".len());
+            self.advance_by_str("@else if");
             return Some(Token::new(TokenKind::ControlFlow(ControlFlowKind::ElseIf), start_pos, self.pos));
         } else if self.starts_with("@else") {
-            self.advance_by("@else".len());
+            self.advance_by_str("@else");
             return Some(Token::new(TokenKind::ControlFlow(ControlFlowKind::Else), start_pos, self.pos));
         } else if self.starts_with("@for") {
-            self.advance_by("@for".len());
+            self.advance_by_str("@for");
             return Some(Token::new(TokenKind::ControlFlow(ControlFlowKind::For), start_pos, self.pos));
         } else if self.starts_with("@empty") {
-            self.advance_by("@empty".len());
+            self.advance_by_str("@empty");
             return Some(Token::new(TokenKind::ControlFlow(ControlFlowKind::Empty), start_pos, self.pos));
         } else if self.starts_with("@switch") {
-            self.advance_by("@switch".len());
+            self.advance_by_str("@switch");
             return Some(Token::new(TokenKind::ControlFlow(ControlFlowKind::Switch), start_pos, self.pos));
         } else if self.starts_with("@case") {
-            self.advance_by("@case".len());
+            self.advance_by_str("@case");
             return Some(Token::new(TokenKind::ControlFlow(ControlFlowKind::Case), start_pos, self.pos));
         } else if self.starts_with("@default") {
-            self.advance_by("@default".len());
+            self.advance_by_str("@default");
             return Some(Token::new(TokenKind::ControlFlow(ControlFlowKind::Default), start_pos, self.pos));
         } else if self.starts_with("@defer") {
-            self.advance_by("@defer".len());
+            self.advance_by_str("@defer");
             return Some(Token::new(TokenKind::Defer(DeferKind::Defer), start_pos, self.pos));
         } else if self.starts_with("@placeholder") {
-            self.advance_by("@placeholder".len());
+            self.advance_by_str("@placeholder");
             return Some(Token::new(TokenKind::Defer(DeferKind::Placeholder), start_pos, self.pos));
         } else if self.starts_with("@loading") {
-            self.advance_by("@loading".len());
+            self.advance_by_str("@loading");
             return Some(Token::new(TokenKind::Defer(DeferKind::Loading), start_pos, self.pos));
         } else if self.starts_with("@error") {
-            self.advance_by("@error".len());
+            self.advance_by_str("@error");
             return Some(Token::new(TokenKind::Defer(DeferKind::Error), start_pos, self.pos));
         } else {
             // If not a recognized control flow, assume it's JavaScript
@@ -431,18 +515,43 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// The remaining input from the cursor. `self.pos` is always a UTF-8 char boundary (every
+    /// [`Self::advance`] moves it by a whole `char`'s `len_utf8()`), so this slice never panics.
+    fn rest(&self) -> &'a str {
+        &self.input[self.pos..]
+    }
+
+    /// A char-boundary-safe slice of the source. `start`/`end` are byte offsets produced by the
+    /// cursor (hence already on char boundaries); the bounds are floored/ordered defensively so a
+    /// stray offset can never split a multi-byte char and panic.
+    fn slice(&self, start: usize, end: usize) -> String {
+        let lo = floor_char_boundary(self.input, start.min(end));
+        let hi = floor_char_boundary(self.input, end.max(start));
+        self.input[lo..hi].to_string()
+    }
+
     /// Checks if the upcoming characters match the given string.
     fn starts_with(&self, s: &str) -> bool {
-        self.input[self.pos..].starts_with(s)
+        self.rest().starts_with(s)
     }
 
     /// Like [`Self::starts_with`] but ASCII-case-insensitive (used for attribute names).
     fn starts_with_ignore_ascii_case(&self, s: &str) -> bool {
-        let rest = &self.input[self.pos..];
+        let rest = self.rest();
         rest.len() >= s.len() && rest.as_bytes()[..s.len()].eq_ignore_ascii_case(s.as_bytes())
     }
 
-    /// Advances the lexer by a given number of bytes.
+    /// Advances the lexer past exactly the literal `s`, by characters (not bytes), keeping the
+    /// cursor on a UTF-8 char boundary. The caller must have verified the cursor is at `s` (e.g. via
+    /// [`Self::starts_with`]); this is the safe replacement for `advance_by(s.len())`, which would
+    /// over-advance when `s` is multi-byte.
+    fn advance_by_str(&mut self, s: &str) {
+        for _ in s.chars() {
+            self.advance();
+        }
+    }
+
+    /// Advances the lexer by a given number of characters.
     fn advance_by(&mut self, n: usize) {
         for _ in 0..n {
             self.advance();
@@ -491,10 +600,10 @@ impl<'a> Lexer<'a> {
 
     /// Consumes an HTML comment.
     fn consume_html_comment(&mut self) {
-        self.advance_by("<!--".len());
+        self.advance_by_str("<!--");
         while self.current_char.is_some() {
             if self.starts_with("-->") {
-                self.advance_by("-->".len());
+                self.advance_by_str("-->");
                 break;
             }
             self.advance();
@@ -679,6 +788,142 @@ mod tests {
                 TokenKind::HTML(_) | TokenKind::Style { .. } | TokenKind::Macro { .. }
             )),
             "TS-by-default leaked into a non-JS chunk; got {:?}",
+            kinds
+        );
+    }
+
+    #[test]
+    fn floor_char_boundary_floors_into_multibyte_char() {
+        // "é" is two bytes (0xC3 0xA9); byte index 1 is mid-char and must floor back to 0.
+        let s = "é";
+        assert_eq!(floor_char_boundary(s, 0), 0);
+        assert_eq!(floor_char_boundary(s, 1), 0);
+        assert_eq!(floor_char_boundary(s, 2), 2);
+        // Past the end clamps to len.
+        assert_eq!(floor_char_boundary(s, 99), s.len());
+    }
+
+    #[test]
+    fn non_ascii_in_every_region_does_not_panic() {
+        // FIX #1: non-ASCII text in macro / JS / HTML / <style> / interpolation regions must not
+        // trigger a mid-UTF-8-char byte slice. Each region carries an accented word and an emoji.
+        let src = "```rsc\nconst gru\u{00df} = 'caf\u{00e9} \u{1F680}';\nreturn { gru\u{00df} };\n```\n\
+const t\u{00ed}tulo = 'na\u{00ef}ve \u{1F600}';\n\
+<section title=\"caf\u{00e9} \u{1F4A1}\">na\u{00ef}ve \u{1F680} {{ t\u{00ed}tulo }}</section>\n\
+more\u{00e9}TS();\n\
+<style>/* caf\u{00e9} \u{1F680} */ .a { content: \"\u{00e9}\"; }</style>";
+        // The whole token stream must drain without panicking.
+        let kinds = lex(src);
+        // And the non-ASCII content must survive intact in the captured chunks.
+        assert!(
+            kinds.iter().any(|k| matches!(k, TokenKind::Macro { content, .. } if content.contains("caf\u{00e9} \u{1F680}"))),
+            "macro lost its non-ASCII content; got {:?}",
+            kinds
+        );
+        assert!(
+            kinds.iter().any(|k| matches!(k, TokenKind::HTML(h) if h.contains("na\u{00ef}ve \u{1F680}"))),
+            "HTML lost its non-ASCII content; got {:?}",
+            kinds
+        );
+        assert!(
+            kinds.iter().any(|k| matches!(k, TokenKind::Style { content, .. } if content.contains("\u{00e9}"))),
+            "style lost its non-ASCII content; got {:?}",
+            kinds
+        );
+    }
+
+    #[test]
+    fn optional_template_wrapper_is_unwrapped() {
+        // FIX #2: a `<template>…</template>` wrapper is optional. When present, only its INNER markup
+        // is the template region — the wrapper tags are dropped (migration-friendly).
+        let src = "const x = 1;\n<template>\n  <div class=\"c\">hi</div>\n</template>\nconst y = 2;";
+        let kinds = lex(src);
+        let html = kinds
+            .iter()
+            .find_map(|k| match k {
+                TokenKind::HTML(h) => Some(h.clone()),
+                _ => None,
+            })
+            .expect("expected an HTML token");
+        assert!(
+            html.contains("<div class=\"c\">hi</div>"),
+            "inner markup missing; got {:?}",
+            html
+        );
+        assert!(
+            !html.contains("<template") && !html.contains("</template>"),
+            "wrapper tags leaked into the template region; got {:?}",
+            html
+        );
+        // TS on both sides of the wrapper is preserved as JavaScript.
+        assert!(
+            kinds.iter().any(|k| matches!(k, TokenKind::JavaScript(js) if js.contains("const x"))),
+            "leading TS lost; got {:?}",
+            kinds
+        );
+        assert!(
+            kinds.iter().any(|k| matches!(k, TokenKind::JavaScript(js) if js.contains("const y"))),
+            "trailing TS lost; got {:?}",
+            kinds
+        );
+    }
+
+    #[test]
+    fn nested_template_wrapper_balances_to_outer_close() {
+        // A nested `<template>` inside the wrapper stays part of the inner markup; the region ends at
+        // the matching OUTER `</template>`.
+        let src = "<template><div><template>inner</template></div></template>const after = 1;";
+        let kinds = lex(src);
+        let html = kinds
+            .iter()
+            .find_map(|k| match k {
+                TokenKind::HTML(h) => Some(h.clone()),
+                _ => None,
+            })
+            .expect("expected an HTML token");
+        assert!(
+            html.contains("<div><template>inner</template></div>"),
+            "nested template not preserved inside the region; got {:?}",
+            html
+        );
+        assert!(
+            kinds.iter().any(|k| matches!(k, TokenKind::JavaScript(js) if js.contains("const after"))),
+            "TS after the outer close was swallowed; got {:?}",
+            kinds
+        );
+    }
+
+    #[test]
+    fn no_template_wrapper_interleaves_ts_and_html() {
+        // FIX #2: with NO <template> wrapper, TS and HTML freely interleave: TS, an HTML element,
+        // more TS, more HTML. The HTML elements become HTML regions; the TS stays JavaScript.
+        let src = "const a = 1;\n<header>top</header>\nconst b = 2;\n<footer>bot</footer>";
+        let kinds = lex(src);
+        let htmls: Vec<&String> = kinds
+            .iter()
+            .filter_map(|k| match k {
+                TokenKind::HTML(h) => Some(h),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            htmls.iter().any(|h| h.contains("<header>top</header>")),
+            "first HTML region missing; got {:?}",
+            kinds
+        );
+        assert!(
+            htmls.iter().any(|h| h.contains("<footer>bot</footer>")),
+            "second HTML region missing; got {:?}",
+            kinds
+        );
+        assert!(
+            kinds.iter().any(|k| matches!(k, TokenKind::JavaScript(js) if js.contains("const a"))),
+            "first TS region missing; got {:?}",
+            kinds
+        );
+        assert!(
+            kinds.iter().any(|k| matches!(k, TokenKind::JavaScript(js) if js.contains("const b"))),
+            "interleaved TS region missing; got {:?}",
             kinds
         );
     }

@@ -150,6 +150,47 @@ pub fn compile_many(files: Vec<AuthoringFile>) -> Vec<CompiledAuthoringEntry> {
         .collect()
 }
 
+/// Execute a Treaty macro through the Nova-backed [`treaty_runtime`] and return its produced value
+/// as a JSON string.
+///
+/// `ts_source` is the TypeScript body of a macro (the top-of-file fenced block in a `.treaty` file).
+/// `input_json` is a JSON string injected as the macro's `input` / `__args` globals (pass `"null"`
+/// for no input). The returned string is the JSON encoding of the macro's produced value (its
+/// default export, explicit `return`, or trailing expression); values with no JSON form encode as
+/// `null`.
+///
+/// Errors (an invalid `input_json`, a transpile/parse failure, or a thrown macro) surface as a
+/// rejected JS error carrying the underlying message.
+#[napi]
+pub fn run_macro(ts_source: String, input_json: String) -> napi::Result<String> {
+    let input: serde_json::Value = serde_json::from_str(&input_json)
+        .map_err(|e| napi::Error::from_reason(format!("invalid input JSON: {e}")))?;
+    let output = treaty_runtime::run_macro(&ts_source, &input)
+        .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+    serde_json::to_string(output.value())
+        .map_err(|e| napi::Error::from_reason(format!("could not encode macro result: {e}")))
+}
+
+/// Execute a Treaty server function through the Nova-backed [`treaty_runtime`] and return its result
+/// as a JSON string.
+///
+/// `ts_source` is the TypeScript body of a server function; `args_json` is a JSON string (typically
+/// an array of positional arguments) injected as the function's `args` / `__args` globals. The
+/// returned string is the JSON encoding of the value the function `return`s (or its trailing
+/// expression).
+///
+/// Errors (an invalid `args_json`, a transpile/parse failure, or a thrown function) surface as a
+/// rejected JS error carrying the underlying message.
+#[napi]
+pub fn run_server_fn(ts_source: String, args_json: String) -> napi::Result<String> {
+    let args: serde_json::Value = serde_json::from_str(&args_json)
+        .map_err(|e| napi::Error::from_reason(format!("invalid args JSON: {e}")))?;
+    let result = treaty_runtime::run_server_fn(&ts_source, &args)
+        .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+    serde_json::to_string(&result)
+        .map_err(|e| napi::Error::from_reason(format!("could not encode server-fn result: {e}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,5 +251,52 @@ mod tests {
     #[test]
     fn compile_many_empty_input_returns_empty() {
         assert!(compile_many(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn run_macro_executes_and_returns_json_string() {
+        // A TS macro reading its injected input; the addon returns the produced value as JSON text.
+        let src = "const n: number = input.n; return { doubled: n * 2 };";
+        let out = run_macro(src.to_string(), "{\"n\": 21}".to_string())
+            .expect("macro should run");
+        let value: serde_json::Value = serde_json::from_str(&out).expect("valid JSON result");
+        assert_eq!(value, serde_json::json!({ "doubled": 42 }));
+    }
+
+    #[test]
+    fn run_macro_surfaces_thrown_error() {
+        let err = run_macro(
+            "throw new Error('macro blew up');".to_string(),
+            "null".to_string(),
+        )
+        .expect_err("a throwing macro should error");
+        assert!(err.reason.contains("macro blew up"), "got: {}", err.reason);
+    }
+
+    #[test]
+    fn run_macro_rejects_invalid_input_json() {
+        let err = run_macro("return 1;".to_string(), "{ not json".to_string())
+            .expect_err("invalid input JSON should error");
+        assert!(err.reason.contains("invalid input JSON"), "got: {}", err.reason);
+    }
+
+    #[test]
+    fn run_server_fn_executes_with_args() {
+        // A server fn reading positional arguments from `args`; the addon returns its JSON result.
+        let src = "const a: number = args[0]; const b: number = args[1]; return a + b;";
+        let out = run_server_fn(src.to_string(), "[4, 38]".to_string())
+            .expect("server fn should run");
+        let value: serde_json::Value = serde_json::from_str(&out).expect("valid JSON result");
+        assert_eq!(value, serde_json::json!(42));
+    }
+
+    #[test]
+    fn run_server_fn_surfaces_thrown_error() {
+        let err = run_server_fn(
+            "throw new Error('server fn failed');".to_string(),
+            "[]".to_string(),
+        )
+        .expect_err("a throwing server fn should error");
+        assert!(err.reason.contains("server fn failed"), "got: {}", err.reason);
     }
 }

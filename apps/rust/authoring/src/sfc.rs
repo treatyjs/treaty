@@ -898,6 +898,80 @@ console.log('hi')\n";
     }
 
     #[test]
+    fn compiles_treaty_without_template_wrapper_interleaving_ts_and_html() {
+        // FIX #2: NO <template> wrapper. TS, then an HTML element, then more TS, then more HTML —
+        // the HTML regions become the component template; the TS stays in the component body.
+        let source = "const greeting = 'Hi';\n\
+<header>{{ greeting }}</header>\n\
+const footerText = 'Bye';\n\
+<footer>{{ footerText }}</footer>\n";
+        let out = compile_treaty_file(source, "page.treaty");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+
+        assert!(code.contains(DEFINE), "no defineComponent; got: {code}");
+        // Both HTML elements became part of the template (header + footer rendered as DOM).
+        assert!(code.contains("\"header\""), "header element missing from template; got: {code}");
+        assert!(code.contains("\"footer\""), "footer element missing from template; got: {code}");
+        // Both interpolations bind against the component context.
+        assert!(code.contains("ctx.greeting"), "first interpolation not bound; got: {code}");
+        assert!(code.contains("ctx.footerText"), "second interpolation not bound; got: {code}");
+        // The TS bodies are kept (returned bindings include both consts).
+        assert!(
+            code.contains("const greeting = 'Hi';"),
+            "leading TS body missing; got: {code}"
+        );
+        assert!(
+            code.contains("const footerText = 'Bye';"),
+            "interleaved TS body missing; got: {code}"
+        );
+    }
+
+    #[test]
+    fn compiles_treaty_with_optional_template_wrapper() {
+        // FIX #2: a file that DID use <template> still works — the wrapper is unwrapped and only its
+        // inner markup becomes the template (no literal <template> element in the output).
+        let source = "const name = 'World';\n\
+<template>\n  <div>{{ name }}</div>\n</template>\n";
+        let out = compile_treaty_file(source, "wrapped.treaty");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+
+        assert!(code.contains(DEFINE), "no defineComponent; got: {code}");
+        assert!(code.contains("ctx.name"), "interpolation not bound; got: {code}");
+        // The wrapper itself must NOT appear as a rendered element.
+        assert!(
+            !code.contains("\"template\""),
+            "the <template> wrapper leaked into the rendered template; got: {code}"
+        );
+    }
+
+    #[test]
+    fn compiles_treaty_with_non_ascii_without_panicking() {
+        // FIX #1: non-ASCII in the macro, body, template text, attribute, interpolation and <style>
+        // must compile without a mid-UTF-8-char byte-slice panic, and the text must survive.
+        let source = "```\nreturn { saludo: 'Hola caf\u{00e9} \u{1F680}' };\n```\n\
+const titulo = 'na\u{00ef}ve \u{1F600}';\n\
+<section title=\"caf\u{00e9} \u{1F4A1}\">na\u{00ef}ve \u{1F680} {{ $macro.saludo }} \u{2013} {{ titulo }}</section>\n\
+<style>/* caf\u{00e9} \u{1F680} */ .a { content: \"\u{00e9}\"; }</style>\n";
+        let out = compile_treaty_file(source, "intl.treaty");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+
+        assert!(code.contains(DEFINE), "no defineComponent; got: {code}");
+        // The macro ran and its non-ASCII data was injected.
+        assert!(
+            code.contains("Hola caf\u{00e9} \u{1F680}"),
+            "macro non-ASCII data missing; got: {code}"
+        );
+        // The non-ASCII attribute survived into the template.
+        assert!(
+            code.contains("caf\u{00e9} \u{1F4A1}"),
+            "non-ASCII attribute lost; got: {code}"
+        );
+    }
+
+    #[test]
     fn auto_imports_used_component_into_dependencies() {
         // The author imports `Foo` and uses `<Foo>` in the template, with NO manual imports array.
         // `Foo` must land in the emitted `dependencies`; the unused `Bar` import must NOT.
@@ -1041,6 +1115,38 @@ function onClick(user) { return save(user); }\n\
         assert!(
             out.code.contains("client.__server.save.post"),
             "call not rewritten to eden client; got: {}",
+            out.code
+        );
+        assert!(
+            !out.code.contains("db.insert"),
+            "server body leaked into client; got: {}",
+            out.code
+        );
+    }
+
+    #[test]
+    fn treaty_in_function_server_block_extracts_and_rewrites() {
+        // A `server { … }` block nested inside a function body (brace depth > 0) in a `.treaty` SFC
+        // must still be lifted and its call site rewritten — exercising the depth-agnostic block scan.
+        let source = "import { User } from './user';\n\
+function setup(user) {\n\
+  server {\n\
+    async function save(u: User) { return db.insert(u); }\n\
+  }\n\
+  return save(user);\n\
+}\n\
+<div>{{ setup }}</div>\n";
+
+        let out = compile_treaty_authoring(source, "form.treaty");
+
+        let server_module = out.server_module.expect("expected a server module for nested block");
+        assert!(
+            server_module.contains("\"/__server/save\""),
+            "no save route in axum server module; got: {server_module}"
+        );
+        assert!(
+            out.code.contains("'/__server/save'"),
+            "call not rewritten to client binding; got: {}",
             out.code
         );
         assert!(

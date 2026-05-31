@@ -14,6 +14,7 @@
 //! The [`control_flow`] and [`signals`] submodules (JSX `&&`/`.map`/ternary → `@if`/`@for`, and
 //! hook-style signal lowering) are filled in by later phases.
 
+pub mod angular_blocks;
 pub mod control_flow;
 pub mod directives;
 pub mod signals;
@@ -104,10 +105,20 @@ pub fn compile(source: &str, file_name: &str) -> CompiledAuthoring {
     // 1. Lift any server block first, so server-only code never reaches JSX parsing/lowering.
     let extraction = extract_server_block(source);
 
+    // 1b. Lower Angular control-flow blocks written directly inside JSX (`@if`/`@for`/`@switch`)
+    //     out of the source *before* OXC parses it: their `{ … }` bodies are not parseable JSX
+    //     expression containers (a multi-element / text / nested-block body makes the whole TSX
+    //     parse fail). Each block is replaced by a `<treaty-cf-N />` placeholder element (valid JSX)
+    //     and its lowered Angular HTML stashed; the placeholders are restored into the template
+    //     after JSX lowering (step 3b). All later byte-offset work uses this preprocessed source.
+    let preprocessed = angular_blocks::preprocess(&extraction.client_source);
+    let client_source = preprocessed.source;
+    let cf_blocks = preprocessed.blocks;
+
     // 2. Parse the client source as TSX (TypeScript + JSX).
     let allocator = Allocator::default();
     let source_type = SourceType::tsx();
-    let ret = JsParser::new(&allocator, &extraction.client_source, source_type).parse();
+    let ret = JsParser::new(&allocator, &client_source, source_type).parse();
 
     let mut errors: Vec<String> = ret.errors.iter().map(|e| e.to_string()).collect();
 
@@ -120,22 +131,27 @@ pub fn compile(source: &str, file_name: &str) -> CompiledAuthoring {
     // as TS-only would choke on its JSX and yield no imports, so collect imports from `ret.program`.
     let directive_candidates = collect_import_names(&ret.program.body);
     directives::begin_pass(&directive_candidates);
-    let lowered = find_component(&ret.program.body, &extraction.client_source);
+    let lowered = find_component(&ret.program.body, &client_source);
     let directive_refs = directives::take_directive_references();
 
     let (template_html, javascript) = match lowered {
         Some(component) => {
             // The JS body is the client source with the JSX return/body sliced out, so the lowered
             // template is the single source of truth for markup and never leaks into the JS chunk.
-            let body = strip_span(&extraction.client_source, component.return_span);
+            let body = strip_span(&client_source, component.return_span);
             let _ = component.is_arrow_body;
             (component.template_html, body)
         }
         None => {
             errors.push("jsx: no component (default-export or named function returning JSX) found".to_string());
-            (String::new(), extraction.client_source.clone())
+            (String::new(), client_source.clone())
         }
     };
+
+    // 3b. Restore the Angular control-flow blocks lifted in step 1b: swap each `<treaty-cf-N />`
+    //     placeholder back to its lowered `@if`/`@for`/`@switch` HTML. Done before the signals pass
+    //     so block-body interpolations are auto-called consistently with the rest of the template.
+    let template_html = angular_blocks::restore(&template_html, &cf_blocks);
 
     // 4. When a server block was present, emit it and rewrite client call sites — same contract as
     //    the `.treaty` path.
@@ -376,6 +392,58 @@ mod tests {
         assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
         assert!(out.code.contains(DEFINE), "no defineComponent; got: {}", out.code);
         assert!(out.code.contains("App_Template"), "no template fn; got: {}", out.code);
+    }
+
+    #[test]
+    fn in_component_server_block_emits_module_and_rewrites_call_site() {
+        // A `.tsx` COMPONENT whose body declares an in-component `server { … }` block must yield a
+        // non-None server_module and rewrite the client call site to the plugin's client binding —
+        // same contract as a top-level block on the `.treaty` path.
+        let source = "export default function App() {\n\
+  function onSave(user) { return save(user); }\n\
+  server {\n\
+    async function save(user: User) { return db.insert(user); }\n\
+  }\n\
+  return <button onClick={onSave}>save</button>;\n\
+}\n";
+        let out = compile(source, "app.tsx");
+
+        // The in-component server fn is extracted and emitted (Elysia/Eden reference backend).
+        let server_module = out.server_module.expect("expected a server module for in-component block");
+        assert!(
+            server_module.contains(".post('/__server/save'"),
+            "no save route in server module; got: {server_module}"
+        );
+        // The free call to `save` in the component body is rewritten to the Eden client binding,
+        // and the server body never leaks into the client JS.
+        assert!(
+            out.code.contains("client.__server.save.post"),
+            "call site not rewritten to client binding; got: {}",
+            out.code
+        );
+        assert!(
+            !out.code.contains("db.insert"),
+            "server body leaked into client JS; got: {}",
+            out.code
+        );
+    }
+
+    #[test]
+    fn compiles_tsx_with_non_ascii_without_panicking() {
+        // FIX #1: a `.tsx` whose body and JSX template carry non-ASCII text (accented words + an
+        // emoji) must compile without a mid-UTF-8-char byte-slice panic.
+        let source = "export default function Saludo() {\n  \
+const t\u{00ed}tulo = 'caf\u{00e9} \u{1F680}';\n  \
+return <div title=\"na\u{00ef}ve \u{1F4A1}\">Hola caf\u{00e9} \u{1F600}</div>;\n}\n";
+        let out = compile(source, "saludo.tsx");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        assert!(out.code.contains(DEFINE), "no defineComponent; got: {}", out.code);
+        // The non-ASCII template text survived lowering.
+        assert!(
+            out.code.contains("Hola caf\u{00e9}"),
+            "non-ASCII template text lost; got: {}",
+            out.code
+        );
     }
 
     #[test]
@@ -622,6 +690,139 @@ export default function Btn() {\n  return <span>x</span>;\n}\n";
             code.contains("dependencies: [Autofocus]")
                 || code.contains("dependencies:[Autofocus]"),
             "Autofocus directive not auto-imported; got: {code}"
+        );
+    }
+
+    #[test]
+    fn angular_if_block_in_jsx_lowers_and_compiles_to_ivy() {
+        // An Angular `@if` block written DIRECTLY inside the returned JSX (not the `&&`/ternary
+        // idiom) lowers to an Angular `@if` and compiles to Ivy. OXC cannot parse the block's `{ … }`
+        // body as a JSX expression container, so it is lifted out of the source before parsing and
+        // restored into the template after lowering.
+        let source = "export default function App() {\n\
+  const show = true;\n\
+  return <div>@if (show) { <p>hi</p> }</div>;\n\
+}\n";
+        let out = compile(source, "app.tsx");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+        assert!(code.contains(DEFINE), "no defineComponent; got: {code}");
+        // The block lowered to an Ivy conditional / embedded template (the `@if` reached render3).
+        assert!(
+            code.contains("\u{0275}\u{0275}conditional") || code.contains("\u{0275}\u{0275}template"),
+            "@if did not lower to a conditional; got: {code}"
+        );
+        // The condition reached the Ivy conditional binding (`ctx.show ? 1 : -1`).
+        assert!(
+            code.contains("ctx.show"),
+            "@if condition lost; got: {code}"
+        );
+    }
+
+    #[test]
+    fn angular_for_block_in_jsx_lowers_and_compiles_to_ivy() {
+        // An Angular `@for` block written directly inside JSX lowers to `@for` → Ivy repeater.
+        let source = "export default function List() {\n\
+  let xs = [1, 2, 3];\n\
+  return <ul>@for (x of xs; track x) { <li>{x}</li> }</ul>;\n\
+}\n";
+        let out = compile(source, "list.tsx");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+        assert!(code.contains(DEFINE), "no defineComponent; got: {code}");
+        // `@for` lowered to an Ivy repeater.
+        assert!(
+            code.contains("\u{0275}\u{0275}repeaterCreate") || code.contains("\u{0275}\u{0275}repeater"),
+            "@for did not lower to a repeater; got: {code}"
+        );
+    }
+
+    #[test]
+    fn angular_if_else_block_in_jsx_compiles_to_ivy() {
+        // `@if (…) { … } @else { … }` written directly in JSX compiles, exercising the continuation
+        // (`@else`) parsing of the block scanner.
+        let source = "export default function App() {\n\
+  const ok = true;\n\
+  return <div>@if (ok) { <p>yes</p> } @else { <p>no</p> }</div>;\n\
+}\n";
+        let out = compile(source, "app.tsx");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+        assert!(code.contains(DEFINE), "no defineComponent; got: {code}");
+        assert!(
+            code.contains("\u{0275}\u{0275}conditional") || code.contains("\u{0275}\u{0275}template"),
+            "@if/@else did not lower to a conditional; got: {code}"
+        );
+        // The `@else` produced a two-arm conditional: the selector picks branch 1 or 2 on the
+        // condition (`ctx.ok ? 1 : 2`), not the single-arm `? 1 : -1` form.
+        assert!(
+            code.contains("ctx.ok ? 1 : 2"),
+            "@else branch not emitted as a second conditional arm; got: {code}"
+        );
+    }
+
+    #[test]
+    fn angular_for_block_body_signal_read_auto_calls_in_template() {
+        // The restored control-flow block is part of the template HTML *before* the signals pass, so
+        // a `{count}` read inside a `@for` body auto-calls the signal exactly like ordinary template
+        // text. This is asserted at the template layer (the JSX front-end owns it); the render3
+        // backend emits the auto-called read into the block's embedded view function.
+        use std::collections::HashSet;
+        let source = "export default function App() {\n\
+  let count = 0;\n\
+  let xs = [1];\n\
+  return <ul>@for (x of xs; track x) { <li>{count}</li> }</ul>;\n\
+}\n";
+        // Lower the source the way `compile` does up to the template, then run the signals auto-call.
+        let extraction = crate::plugin::extract_server_block(source);
+        let pre = angular_blocks::preprocess(&extraction.client_source);
+        let allocator = Allocator::default();
+        let ret = JsParser::new(&allocator, &pre.source, SourceType::tsx()).parse();
+        let lowered = find_component(&ret.program.body, &pre.source).expect("component");
+        let template = angular_blocks::restore(&lowered.template_html, &pre.blocks);
+        let signals: HashSet<String> = ["count".to_string(), "xs".to_string()].into_iter().collect();
+        let template = signals::auto_call_template(&template, &signals);
+        assert!(
+            template.contains("count()"),
+            "block-body signal read not auto-called in template; got: {template}"
+        );
+        // And the whole thing still compiles to Ivy end to end.
+        let out = compile(source, "app.tsx");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        assert!(out.code.contains(DEFINE), "no defineComponent; got: {}", out.code);
+    }
+
+    #[test]
+    fn angular_switch_block_in_jsx_compiles_to_ivy() {
+        // A `@switch`/`@case`/`@default` block — the form OXC outright rejects (nested `@case` chain
+        // inside the switch braces) — compiles end to end after the block preprocessor lifts it out.
+        let source = "export default function App() {\n\
+  let v = 1;\n\
+  return <div>@switch (v) { @case (1) { <p>one</p> } @default { <p>other</p> } }</div>;\n\
+}\n";
+        let out = compile(source, "app.tsx");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        assert!(out.code.contains(DEFINE), "no defineComponent; got: {}", out.code);
+    }
+
+    #[test]
+    fn angular_block_and_jsx_idioms_coexist() {
+        // A direct `@if` block alongside the `.map` JSX idiom in the same component: the preprocessor
+        // lifts only the `@`-block, leaving the `.map` for the ordinary JSX control-flow lowering.
+        let source = "export default function App() {\n\
+  let show = true;\n\
+  let xs = [1, 2];\n\
+  return <div>@if (show) { <p>hi</p> }<ul>{xs.map(x => <li>{x}</li>)}</ul></div>;\n\
+}\n";
+        let out = compile(source, "app.tsx");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+        assert!(code.contains(DEFINE), "no defineComponent; got: {code}");
+        // The `@if` lowered to a conditional and the `.map` lowered to a repeater.
+        assert!(code.contains("ctx.show"), "@if condition lost; got: {code}");
+        assert!(
+            code.contains("\u{0275}\u{0275}repeaterCreate") || code.contains("\u{0275}\u{0275}repeater"),
+            ".map did not lower to a repeater; got: {code}"
         );
     }
 

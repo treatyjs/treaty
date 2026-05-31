@@ -299,7 +299,10 @@ fn find_server_block(source: &str) -> Option<ServerBlock> {
     let mut i = 0usize;
 
     // A `server` keyword only opens a block when it is a standalone identifier (not e.g. `servery`
-    // or `x.server`) at brace-depth zero, outside any string/comment.
+    // or `x.server`), outside any string/comment. Blocks are matched at *any* brace depth so that a
+    // `server { … }` declared inside a component function body (depth > 0) is lifted exactly like a
+    // top-level one; a leading-token guard (see `server_in_statement_position`) keeps an object
+    // property `server: { … }` or a member access `x.server` from being mistaken for a block.
     let mut scanner = TextScanner::new(source);
     while i < bytes.len() {
         // Advance the scanner state up to `i`, skipping strings/comments wholesale.
@@ -308,7 +311,7 @@ fn find_server_block(source: &str) -> Option<ServerBlock> {
             continue;
         }
 
-        if scanner.depth == 0 && matches_keyword(source, i, "server") {
+        if matches_keyword(source, i, "server") && server_in_statement_position(source, i) {
             // After `server`, allow whitespace, an optional `:IDENT` language tag, more whitespace,
             // then require a `{`.
             let after_kw = i + "server".len();
@@ -397,7 +400,9 @@ fn match_close_brace(source: &str, body_start: usize) -> Option<usize> {
 /// Is `keyword` present at byte `i` as a whole word (not part of a larger identifier)?
 fn matches_keyword(source: &str, i: usize, keyword: &str) -> bool {
     let bytes = source.as_bytes();
-    if !source[i..].starts_with(keyword) {
+    // Byte-level prefix match so this is safe to call at any index, even one that falls inside a
+    // multibyte UTF-8 char (the scanner walks byte-by-byte across non-ASCII text).
+    if bytes.len() < i + keyword.len() || &bytes[i..i + keyword.len()] != keyword.as_bytes() {
         return false;
     }
     // Preceding char must not be an identifier char (so `myserver` does not match).
@@ -417,6 +422,32 @@ fn matches_keyword(source: &str, i: usize, keyword: &str) -> bool {
 
 fn is_ident_byte(b: u8) -> bool {
     b == b'_' || b == b'$' || b.is_ascii_alphanumeric()
+}
+
+/// Is the `server` keyword at byte `i` in statement position, i.e. a place a `server { … }` block
+/// may legally begin?
+///
+/// Because blocks are matched at any brace depth (so in-component blocks lift like top-level ones),
+/// this guards against two non-block uses that `matches_keyword` alone would accept:
+///   * a member access `x.server { … }` (preceding non-space byte is `.`), and
+///   * an object-literal property `{ server: … }` (preceding non-space byte is `,` after another
+///     property — still rejected because the *following* `:`-then-`{` shape is handled by the caller,
+///     but a defensive leading-token check keeps intent clear).
+///
+/// A `server` block legitimately follows the start of input, a statement terminator (`;`), a block
+/// boundary (`{` / `}`), or another statement — all of which leave the preceding non-whitespace byte
+/// as one of `{`, `}`, `;`, or none. Anything else (an identifier byte, `.`, `=`, `(`, etc.) means
+/// `server` is being used as a value, not a block keyword.
+fn server_in_statement_position(source: &str, i: usize) -> bool {
+    let bytes = source.as_bytes();
+    let mut k = i;
+    while k > 0 && bytes[k - 1].is_ascii_whitespace() {
+        k -= 1;
+    }
+    if k == 0 {
+        return true;
+    }
+    matches!(bytes[k - 1], b'{' | b'}' | b';')
 }
 
 /// Tracks lexical context (strings, template literals, comments) while scanning JS/TS text, so the
@@ -1230,6 +1261,49 @@ const greeting = 'hi';\n";
         let extraction = extract_server_block(source);
         assert_eq!(extraction.server_fns.len(), 1);
         assert_eq!(extraction.server_fns[0].transport, TransportKind::Api);
+    }
+
+    #[test]
+    fn extract_in_component_server_block_lifts_from_function_body() {
+        // A `server { … }` block declared *inside* a component function body (brace depth > 0) must
+        // be lifted exactly like a top-level one, leaving the surrounding function intact.
+        let source = "export default function App() {\n\
+  const x = 1;\n\
+  server {\n\
+    async function save(user: User) { return db.insert(user); }\n\
+  }\n\
+  return save(user);\n\
+}\n";
+        let extraction = extract_server_block(source);
+
+        assert_eq!(extraction.server_fns.len(), 1, "in-component server block not lifted");
+        let f = &extraction.server_fns[0];
+        assert_eq!(f.name, "save");
+        assert!(f.is_async);
+        assert!(
+            !extraction.client_source.contains("db.insert"),
+            "server body leaked into client; got: {}",
+            extraction.client_source
+        );
+        assert!(
+            !extraction.client_source.contains("server {"),
+            "server block not removed from component; got: {}",
+            extraction.client_source
+        );
+        // The surrounding component function and its other statements survive.
+        assert!(extraction.client_source.contains("export default function App()"));
+        assert!(extraction.client_source.contains("const x = 1;"));
+        assert!(extraction.client_source.contains("return save(user);"));
+    }
+
+    #[test]
+    fn server_block_not_matched_as_object_property_or_member() {
+        // `{ server: { … } }` is an object property, and `cfg.server` is a member access — neither
+        // opens a `server { … }` block even though blocks are now matched at any depth.
+        let source = "const cfg = { server: { port: 1 } };\nconst p = cfg.server;\n";
+        let extraction = extract_server_block(source);
+        assert!(extraction.server_fns.is_empty(), "false positive server block");
+        assert_eq!(extraction.client_source, source);
     }
 
     #[test]
