@@ -71,11 +71,37 @@ export interface DiscoveredRoute {
 	readonly route: RouteLike
 }
 
+/**
+ * A `getStaticPaths`-style provider: given a parameterized route, return the
+ * param sets to materialize at build time. This is the dynamic counterpart to a
+ * static {@link RouteParamsMap} entry — a route can compute its `:slug` universe
+ * from a CMS, a content directory, or a render-time macro instead of hard-coding
+ * it. It is keyed by the route's declared path so a caller can branch per route.
+ *
+ * Returning `[]` (or `undefined`) for a route materializes none of it. Both the
+ * declared path WITH the leading prefix (`'blog/:slug'`) and the bare segment
+ * are passed so either lookup key resolves.
+ */
+export type StaticPathsProvider = (
+	route: StaticPathsRequest
+) => readonly RouteParams[] | undefined | Promise<readonly RouteParams[] | undefined>
+
+/** The request a {@link StaticPathsProvider} receives for one parameterized route. */
+export interface StaticPathsRequest {
+	/** The full declared route path including parent prefix (`'blog/:slug'`). */
+	readonly routePath: string
+	/** The `:param` names declared in the path (`['slug']`). */
+	readonly params: readonly string[]
+	/** The route node from the config, so the provider can read its `data`/meta. */
+	readonly route: RouteLike
+}
+
 /** Options controlling route discovery. */
 export interface DiscoverRoutesOptions {
 	/**
 	 * Param sets for parameterized routes, keyed by declared path. Routes with
-	 * `:params` and no entry here are skipped.
+	 * `:params` and no entry here (and no {@link DiscoverRoutesOptions.getStaticPaths}
+	 * result) are skipped.
 	 */
 	readonly params?: RouteParamsMap
 	/**
@@ -85,6 +111,17 @@ export interface DiscoverRoutesOptions {
 	 * still walked for their children regardless of this flag.
 	 */
 	readonly includeComponentless?: boolean
+}
+
+/** Async options for {@link discoverRoutesAsync}, adding a static-paths provider. */
+export interface DiscoverRoutesAsyncOptions extends DiscoverRoutesOptions {
+	/**
+	 * A `getStaticPaths`-style provider invoked for each parameterized route to
+	 * compute its param sets at build time. Its results are appended to any static
+	 * {@link DiscoverRoutesOptions.params} entry for the same route (static first,
+	 * then provided), so a route can mix hard-coded and computed params.
+	 */
+	readonly getStaticPaths?: StaticPathsProvider
 }
 
 /** Join a parent URL prefix with a child segment, normalizing slashes. */
@@ -146,6 +183,42 @@ function toUrl(rawPath: string): string {
 	return clean === '' ? '/' : `/${clean}`
 }
 
+/** Whether `route` is a concrete prerenderable node (not a wildcard/redirect). */
+function isRenderable(route: RouteLike, includeComponentless: boolean): boolean {
+	const wildcard = isWildcard(route.path)
+	const pureRedirect = route.redirectTo !== undefined && !hasComponent(route)
+	return (hasComponent(route) || includeComponentless) && !wildcard && !pureRedirect
+}
+
+/** Emit the single {@link DiscoveredRoute} for a static (non-parameterized) node. */
+function staticRoute(route: RouteLike, here: string): DiscoveredRoute {
+	return { url: toUrl(here), routePath: here, parameterized: false, params: {}, route }
+}
+
+/** Emit one {@link DiscoveredRoute} per param set for a parameterized node. */
+function parameterizedRoutes(
+	route: RouteLike,
+	here: string,
+	sets: readonly RouteParams[]
+): DiscoveredRoute[] {
+	return sets.map((params) => ({
+		url: toUrl(substitute(here, params)),
+		routePath: here,
+		parameterized: true,
+		params,
+		route,
+	}))
+}
+
+/** The static param sets declared for a route in {@link DiscoverRoutesOptions.params}. */
+function staticParamSets(
+	options: DiscoverRoutesOptions,
+	route: RouteLike,
+	here: string
+): readonly RouteParams[] {
+	return options.params?.[route.path ?? here] ?? options.params?.[here] ?? []
+}
+
 /**
  * Walk `routes`, accumulating the URL prefix, and collect every concrete
  * prerenderable route. Parameterized routes fan out into one entry per supplied
@@ -162,36 +235,52 @@ function walk(
 	for (const route of routes) {
 		const here = joinPath(prefix, route.path)
 
-		const wildcard = isWildcard(route.path)
-		const pureRedirect = route.redirectTo !== undefined && !hasComponent(route)
-		const renderable = (hasComponent(route) || options.includeComponentless === true) && !wildcard && !pureRedirect
-
-		if (renderable) {
+		if (isRenderable(route, options.includeComponentless === true)) {
 			const names = paramNames(here)
 			if (names.length === 0) {
-				out.push({
-					url: toUrl(here),
-					routePath: here,
-					parameterized: false,
-					params: {},
-					route,
-				})
+				out.push(staticRoute(route, here))
 			} else {
-				const sets = options.params?.[route.path ?? here] ?? options.params?.[here] ?? []
-				for (const params of sets) {
-					out.push({
-						url: toUrl(substitute(here, params)),
-						routePath: here,
-						parameterized: true,
-						params,
-						route,
-					})
-				}
+				out.push(...parameterizedRoutes(route, here, staticParamSets(options, route, here)))
 			}
 		}
 
 		if (route.children && route.children.length > 0) {
 			walk(route.children, here, options, out)
+		}
+	}
+}
+
+/**
+ * Async sibling of {@link walk} that resolves each parameterized route's param
+ * sets through a {@link StaticPathsProvider} (in addition to any static
+ * `params`). Static nodes and recursion are identical to {@link walk}; only the
+ * parameterized branch differs, awaiting the provider per route.
+ */
+async function walkAsync(
+	routes: readonly RouteLike[],
+	prefix: string,
+	options: DiscoverRoutesAsyncOptions,
+	out: DiscoveredRoute[]
+): Promise<void> {
+	for (const route of routes) {
+		const here = joinPath(prefix, route.path)
+
+		if (isRenderable(route, options.includeComponentless === true)) {
+			const names = paramNames(here)
+			if (names.length === 0) {
+				out.push(staticRoute(route, here))
+			} else {
+				const sets = [...staticParamSets(options, route, here)]
+				if (options.getStaticPaths) {
+					const provided = await options.getStaticPaths({ routePath: here, params: names, route })
+					if (provided) sets.push(...provided)
+				}
+				out.push(...parameterizedRoutes(route, here, sets))
+			}
+		}
+
+		if (route.children && route.children.length > 0) {
+			await walkAsync(route.children, here, options, out)
 		}
 	}
 }
@@ -212,5 +301,23 @@ export function discoverRoutes(
 ): DiscoveredRoute[] {
 	const out: DiscoveredRoute[] = []
 	if (routes && routes.length > 0) walk(routes, '', options, out)
+	return out
+}
+
+/**
+ * Async variant of {@link discoverRoutes} that additionally resolves each
+ * parameterized route's param sets through a `getStaticPaths`-style
+ * {@link StaticPathsProvider} (see {@link DiscoverRoutesAsyncOptions}). Static
+ * routes and non-parameterized output are identical to {@link discoverRoutes};
+ * this is the entry the site generator uses so a route can compute its `:slug`
+ * universe (from content, a CMS, a macro) at build time rather than only from a
+ * hard-coded {@link RouteParamsMap}.
+ */
+export async function discoverRoutesAsync(
+	routes: readonly RouteLike[] | undefined,
+	options: DiscoverRoutesAsyncOptions = {}
+): Promise<DiscoveredRoute[]> {
+	const out: DiscoveredRoute[] = []
+	if (routes && routes.length > 0) await walkAsync(routes, '', options, out)
 	return out
 }

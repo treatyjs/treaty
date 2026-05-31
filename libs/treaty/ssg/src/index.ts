@@ -21,15 +21,19 @@
  * job.
  */
 
-// Route discovery.
+// Route discovery (static + async `getStaticPaths`-driven).
 export {
 	discoverRoutes,
+	discoverRoutesAsync,
 	RouteDiscoveryError,
 	type RouteLike,
 	type RouteParams,
 	type RouteParamsMap,
 	type DiscoveredRoute,
 	type DiscoverRoutesOptions,
+	type DiscoverRoutesAsyncOptions,
+	type StaticPathsProvider,
+	type StaticPathsRequest,
 } from './routes.js'
 
 // Render-time data seam (Nova `run_macro` plug-in point) + stub.
@@ -47,10 +51,11 @@ export {
 // Static Ivy → HTML renderer.
 export { renderIvyToHtml } from './render.js'
 
-// Prerender pipeline + entry point.
+// Prerender pipeline + per-route entry points.
 export {
 	prerenderAll,
 	prerenderRoute,
+	prerenderRouteResult,
 	PrerenderError,
 	DEFAULT_OUT_DIR,
 	HYDRATION_MARKER_ATTR,
@@ -58,6 +63,38 @@ export {
 	type PrerenderConfig,
 	type PrerenderManifest,
 	type PrerenderedRoute,
+	type PrerenderRouteResult,
 	type RoutePrerenderInput,
 	type ResolveRouteInput,
+	type HeadMeta,
+	type HydrationIsland,
+	type RouteHydration,
 } from './prerender.js'
+
+// Static asset copying.
+export {
+	copyAssets,
+	createNodeFileSystem,
+	type FileSystemPort,
+	type CopiedAsset,
+} from './assets.js'
+
+// sitemap.xml + robots.txt emit.
+export {
+	buildSitemap,
+	buildRobots,
+	absoluteUrl,
+	type SitemapEntry,
+	type RobotsOptions,
+} from './sitemap.js'
+
+// Whole-site generator + entry point.
+export {
+	prerenderSite,
+	DEFAULT_SITE_OUT_DIR,
+	HYDRATION_MANIFEST_FILE,
+	type SiteConfig,
+	type SiteManifest,
+	type SitePage,
+	type SiteArtifact,
+} from './site.js'
