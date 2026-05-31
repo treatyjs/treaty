@@ -27,9 +27,15 @@ with dead-code elimination + file deletion), bundler plugins for **Vite / Rspack
 | Zoneless / signals-by-default / OnPush | ✅ | done |
 
 ## Workstreams (disjoint territories so they parallelize)
-**A. 100% core compliance** — `libs/render3` only. Iterative rounds (analyze→fan-out by file→verify),
-keep oracle 27. Currently round 4 (`wkah9q0xi`). Target buckets: `@let` inline-const, arrow const-pool,
-projectionDef, i18n, queries via `source_compile` extraction. Goal: 100% of runnable cases.
+**A. 100% compliance — RELENTLESS, the full Angular suite (user 2026-05-31).** Keep running rounds
+until **100%** — do not stop at a partial pass-rate. Use EVERYTHING we have to pass them all: render3's
+view compiler, `source_compile` front-end (extract the metadata the harness needs — queries, host
+bindings, providers, inputs/outputs), AND the file-by-file pipeline where that's what makes a case
+compile. Beyond raising the runnable pass-rate, **EXPAND the runnable set** toward the full 642 (handle
+the currently-skipped cases where a comparable golden exists). The bar: **we KNOW we can compile ANY
+app.** Iterative rounds (analyze→fan-out by disjoint file→verify), oracle stays 27. Progress: 3 → 50/98
+over 6 rounds (32dedc4). Keep going. NOTE: compliance EDITS render3, so it cannot run concurrently with
+the Rust-crate wave (K/M build render3) — interleave them.
 
 **B. File-by-file compilation core** — a TS package `@treaty/compiler` wrapping the NAPI addon
 (`compileTreatyFile`/`compileComponentSource`) with: a `transform(id, code)→IvyJS` per-file API,
