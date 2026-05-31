@@ -21,6 +21,9 @@ use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType};
 
 use crate::compile::{CompiledComponent, RealTemplateBuilder};
+use crate::decorators::registry::{
+    AngularDecoratorKind, ClassMeta, CompileCtx, DecoratorCompiler, DecoratorRegistry,
+};
 use crate::factory::{
     compile_factory_function, FactoryDeps, FactoryTarget, R3ConstructorFactoryMetadata,
     R3FactoryMetadata,
@@ -1218,30 +1221,11 @@ fn statement_class<'a>(stmt: &'a Statement<'a>) -> Option<&'a Class<'a>> {
 }
 
 /// The Ivy emit of ONE decorated class, decomposed so the original module can be re-assembled
-/// around it (rather than replaced by it).
-///
-/// `def_expression` is the `ɵɵdefine*({...})` call render3 already produces — byte-identical to the
-/// historical bare-expression emit. `extra_statements` are the hoisted constant-pool consts /
-/// nested template functions (and, for `@NgModule`, the `ɵɵsetNgModuleScope` / `ɵɵregisterNgModuleType`
-/// side-effect statements). `factory` is the `ɵfac` metadata when the kind carries one. The caller
-/// stitches these AFTER the kept (decorator-stripped) class declaration as
-/// `<pool…>; X.ɵfac = <factory>; X.<static_member> = <def_expression>;`.
-struct ClassEmit {
-    class_name: String,
-    /// The Ivy static property name the definition is assigned to (`ɵcmp`/`ɵdir`/`ɵpipe`/`ɵmod`).
-    static_member: &'static str,
-    def_expression: Expr,
-    extra_statements: Vec<o::Stmt>,
-    /// Whether `extra_statements` must be emitted AFTER the `X.<member> =` assignment. Component /
-    /// directive / pipe hoist constant-pool consts the definition REFERENCES, so they come BEFORE
-    /// (`false`); `@NgModule` emits `ɵɵsetNgModuleScope` / `ɵɵregisterNgModuleType` SIDE EFFECTS that
-    /// run after the definition exists, so they come AFTER (`true`).
-    extra_after_def: bool,
-    /// `ɵfac` factory metadata, when the kind declares a factory (Component/Directive/Pipe/NgModule).
-    factory: Option<R3FactoryMetadata>,
-    /// Non-fatal diagnostics (e.g. template parse warnings) gathered while compiling this class.
-    errors: Vec<String>,
-}
+/// around it. This is the `decorators` layer's [`CompiledDef`] — every [`DecoratorCompiler`]
+/// plugin produces one, and [`class_static_statements`] lowers it into the appended statics. The
+/// historical local name `ClassEmit` is retained as an alias so the per-kind emit helpers and the
+/// assembly path read unchanged.
+use crate::decorators::registry::CompiledDef as ClassEmit;
 
 /// Build a no-dependency constructor [`R3FactoryMetadata`] for a source-front-end class. The SOURCE
 /// front-end does not yet resolve constructor parameters, so the emitted `ɵfac` is the empty-deps
@@ -1617,9 +1601,125 @@ fn collect_sibling_directives(decorated: &[TopStmt]) -> Vec<crate::binder::Selec
     out
 }
 
-/// Compile ONE decorated class to its [`ClassEmit`], dispatching on the decorator kind. The def
-/// block render3 produces is unchanged — `ClassEmit` decomposes it (def expression + pool/side-effect
-/// statements + factory metadata) so the caller can re-assemble the original module around it.
+/// The recognized decorator kind of a top-level class, as the [`DecoratorRegistry`] keys on it.
+/// A 1:1 mapping of the private [`TopLevel`] classification onto the public registry enum.
+impl From<TopLevel> for AngularDecoratorKind {
+    fn from(kind: TopLevel) -> Self {
+        match kind {
+            TopLevel::Component => AngularDecoratorKind::Component,
+            TopLevel::Directive => AngularDecoratorKind::Directive,
+            TopLevel::Pipe => AngularDecoratorKind::Pipe,
+            TopLevel::NgModule => AngularDecoratorKind::NgModule,
+            TopLevel::Injectable => AngularDecoratorKind::Injectable,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Decorator-compiler plugins. Each kind the source front-end emits a definition
+// for is a `DecoratorCompiler` registered in [`decorator_registry`]; the per-class
+// driver dispatches through the registry so adding a kind is a registration, not a
+// `match` arm. Every plugin delegates to the SAME extraction/emit helper the old
+// `match` called, so the emitted definition is byte-identical.
+// ---------------------------------------------------------------------------
+
+/// `@Component` → `ɵɵdefineComponent`. Extracts the component metadata (selector, inline template,
+/// inputs/outputs, queries, host bindings, `hostDirectives`, providers/viewProviders, styles,
+/// encapsulation, animations, foreignImports) and drives [`compile_component_from_metadata`] via
+/// [`compile_component_or_directive`].
+struct ComponentCompiler;
+impl DecoratorCompiler for ComponentCompiler {
+    fn kind(&self) -> AngularDecoratorKind {
+        AngularDecoratorKind::Component
+    }
+    fn compile(&self, c: &ClassMeta, ctx: &CompileCtx) -> Result<ClassEmit, String> {
+        compile_component_or_directive(
+            c.class,
+            TopLevel::Component,
+            c.object,
+            c.class_name.clone(),
+            c.class_name_span.clone(),
+            ctx.auto_import_candidates,
+            ctx.sibling_directives,
+        )
+    }
+}
+
+/// `@Directive` → `ɵɵdefineDirective`. Shares [`compile_component_or_directive`]'s metadata
+/// extraction with the component path but emits via [`compile_directive_from_metadata`] (no
+/// template; view-only metadata such as `viewProviders` is ignored, as Angular does on a directive).
+struct DirectiveCompiler;
+impl DecoratorCompiler for DirectiveCompiler {
+    fn kind(&self) -> AngularDecoratorKind {
+        AngularDecoratorKind::Directive
+    }
+    fn compile(&self, c: &ClassMeta, ctx: &CompileCtx) -> Result<ClassEmit, String> {
+        compile_component_or_directive(
+            c.class,
+            TopLevel::Directive,
+            c.object,
+            c.class_name.clone(),
+            c.class_name_span.clone(),
+            ctx.auto_import_candidates,
+            ctx.sibling_directives,
+        )
+    }
+}
+
+/// `@Pipe` → `ɵɵdefinePipe`. Delegates to [`compile_pipe_class`].
+struct PipeCompiler;
+impl DecoratorCompiler for PipeCompiler {
+    fn kind(&self) -> AngularDecoratorKind {
+        AngularDecoratorKind::Pipe
+    }
+    fn compile(&self, c: &ClassMeta, _ctx: &CompileCtx) -> Result<ClassEmit, String> {
+        compile_pipe_class(c.object, &c.class_name)
+    }
+}
+
+/// `@NgModule` → `ɵɵdefineNgModule` (+ `ɵɵsetNgModuleScope` / `ɵɵregisterNgModuleType` side
+/// effects). Delegates to [`compile_ng_module_class`].
+struct NgModuleCompiler;
+impl DecoratorCompiler for NgModuleCompiler {
+    fn kind(&self) -> AngularDecoratorKind {
+        AngularDecoratorKind::NgModule
+    }
+    fn compile(&self, c: &ClassMeta, _ctx: &CompileCtx) -> Result<ClassEmit, String> {
+        compile_ng_module_class(c.object, &c.class_name)
+    }
+}
+
+/// `@Injectable`. The injectable `ɵfac`/`ɵprov` factory + provider emit lives in the factory
+/// compiler, out of this template-facing front-end's scope; the plugin exists so the kind is a
+/// registered (extensible) entry rather than an inline `unreachable!`, and reports the gap as a
+/// fatal diagnostic exactly as the prior `match` arm did.
+struct InjectableCompiler;
+impl DecoratorCompiler for InjectableCompiler {
+    fn kind(&self) -> AngularDecoratorKind {
+        AngularDecoratorKind::Injectable
+    }
+    fn compile(&self, _c: &ClassMeta, _ctx: &CompileCtx) -> Result<ClassEmit, String> {
+        Err("@Injectable emission not yet supported by the source front-end".to_string())
+    }
+}
+
+/// The default decorator-compiler registry: one plugin per recognized kind. Adding support for a
+/// new decorator kind is a `register` here (mirroring `apps/rust/authoring::AuthoringRegistry`).
+fn decorator_registry() -> DecoratorRegistry {
+    let mut registry = DecoratorRegistry::new();
+    registry.register(Box::new(ComponentCompiler));
+    registry.register(Box::new(DirectiveCompiler));
+    registry.register(Box::new(PipeCompiler));
+    registry.register(Box::new(NgModuleCompiler));
+    registry.register(Box::new(InjectableCompiler));
+    registry
+}
+
+/// Compile ONE decorated class to its [`ClassEmit`] by dispatching through the
+/// [`DecoratorRegistry`]. The class is packaged as a [`ClassMeta`] and the cross-class inputs as a
+/// [`CompileCtx`]; the registry resolves the plugin for the class's [`AngularDecoratorKind`] and
+/// calls [`DecoratorCompiler::compile`]. The emitted definition is byte-identical to the prior
+/// per-kind `match` — the plugins delegate to the same extraction/emit helpers.
 fn compile_decorated_class(
     class: &Class,
     kind: TopLevel,
@@ -1635,25 +1735,22 @@ fn compile_decorated_class(
         None => return Err("decorated class has no name".to_string()),
     };
 
-    let obj = decorator_object(dec);
+    let meta = ClassMeta {
+        class,
+        decorator: dec,
+        object: decorator_object(dec),
+        class_name,
+        class_name_span,
+    };
+    let ctx = CompileCtx {
+        auto_import_candidates,
+        sibling_directives,
+    };
 
-    match kind {
-        TopLevel::Component | TopLevel::Directive => compile_component_or_directive(
-            class,
-            kind,
-            obj,
-            class_name,
-            class_name_span,
-            auto_import_candidates,
-            sibling_directives,
-        ),
-        TopLevel::Pipe => compile_pipe_class(obj, &class_name),
-        TopLevel::NgModule => compile_ng_module_class(obj, &class_name),
-        // `@Injectable` carries no template-facing definition we model yet; the `ɵfac`/`ɵprov`
-        // factory + provider emit lives in the factory compiler, out of this front-end's scope.
-        TopLevel::Injectable => {
-            Err("@Injectable emission not yet supported by the source front-end".to_string())
-        }
+    let kind = AngularDecoratorKind::from(kind);
+    match decorator_registry().for_kind(kind) {
+        Some(plugin) => plugin.compile(&meta, &ctx),
+        None => Err(format!("no decorator compiler registered for {kind:?}")),
     }
 }
 

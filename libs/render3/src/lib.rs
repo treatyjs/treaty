@@ -56,7 +56,26 @@ pub use template_mod::i18n;
 pub use template_mod::ml_parser;
 pub use template_mod::template;
 
-pub mod pipe_module_injector;
+// ---------------------------------------------------------------------------
+// `decorators` subtree (Phase 3). The decorator → definition layer — the
+// instruction emitter (`compile_component_from_metadata` /
+// `compile_directive_from_metadata`), the `@Pipe`/`@NgModule` emit
+// (`pipe_module_injector`), and the `DecoratorCompiler` plugin registry that
+// joins them — now lives under `decorators/`. `compiler` is re-exported via
+// `crate::view::compiler` (from `view/mod.rs`) and `pipe_module_injector` is
+// re-exported from its historical top-level path below, so call sites outside
+// this subtree are unchanged. See `migration/RENDER3-SPLIT-PLAN.md`.
+// ---------------------------------------------------------------------------
+
+/// Decorator → definition layer: the instruction emitter, `@Pipe`/`@NgModule` emit, and the
+/// per-decorator [`decorators::registry::DecoratorCompiler`] plugin registry. Depends on `core`
+/// and `template`.
+pub mod decorators;
+
+// Re-export `pipe_module_injector` from its historical top-level path so `crate::pipe_module_injector::…`
+// resolves exactly as before (the canonical path is now `crate::decorators::pipe_module_injector`).
+pub use decorators::pipe_module_injector;
+
 pub mod view;
 pub mod compile;
 pub mod source_compile;
