@@ -4,7 +4,7 @@
 //! rules whose `dep`/version range cover that bump (see
 //! [`crate::RuleSet::rules_for`]) and rebuilds. This module implements:
 //!
-//! * [`apply_matcher`] / [`apply_rewrite`] — the pure primitives that decide
+//! * [`matcher_hits`] / [`apply_rewrite`] — the pure primitives that decide
 //!   whether a rule fires on a source buffer and how it rewrites it.
 //! * [`CodemodEngine`] — runs an ordered set of rules over a source string,
 //!   returning the rewritten text and the ids of the rules that actually fired.

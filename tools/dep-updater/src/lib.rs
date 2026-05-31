@@ -38,8 +38,9 @@ pub use model::{
     CodemodRule, DepKind, Matcher, Rewrite, SemverClass, UpdatePlan, VerifyResult, VerifyStep,
 };
 pub use orchestrate::{
-    Action, FailingReport, Gate, Mode, Orchestrator, OrchestrationConfig, Outcome, PrDescription,
-    Repo, VerifyPhase,
+    pin_cargo_dependency, pin_npm_dependency, Action, FailingReport, FileSystem, FsRepo, Gate,
+    Mode, Orchestrator, OrchestrationConfig, Outcome, PrDescription, RealFileSystem, Repo,
+    VerifyPhase,
 };
 pub use process::{CommandOutcome, CommandRunner, RealCommandRunner};
 

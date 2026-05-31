@@ -599,7 +599,8 @@ impl<F: Fetcher> RegistryClient for NpmRegistry<F> {
 ///
 /// For each dependency the registry knows about, classifies the
 /// `current → latest` jump; only genuinely outdated dependencies (where
-/// `latest > current`, i.e. a non-[`SemverClass::None`] class) are kept. The
+/// `latest > current`, i.e. a non-[`crate::model::SemverClass::None`] class)
+/// are kept. The
 /// result is sorted deterministically by `(kind, name, manifest)` so identical
 /// inputs always yield an identical plan (idempotency).
 ///

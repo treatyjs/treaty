@@ -16,6 +16,7 @@
 //! mutates the real tree, and a **dry-run** mode plans the actions without
 //! executing any of them.
 
+use crate::codemod::{apply_rewrite, matcher_hits};
 use crate::model::{CodemodRule, UpdatePlan, VerifyResult, VerifyStep};
 use crate::process::{CommandOutcome, CommandRunner};
 use crate::RuleSet;
@@ -107,6 +108,253 @@ pub trait Repo {
 
     /// Absolute repo root the gates run in.
     fn root(&self) -> &str;
+}
+
+// ---------------------------------------------------------------------------
+// Production Repo: real manifest edits + on-disk codemods + real gates.
+// ---------------------------------------------------------------------------
+
+/// The filesystem operations [`FsRepo`] needs, behind a trait so the production
+/// repo is unit-testable with an in-memory fake (no real I/O).
+///
+/// Deliberately tiny: read a file, write a file, and enumerate the `*.rs`
+/// sources a codemod should scan. Keeping fs access behind this seam — exactly
+/// as the registry sits behind [`crate::detect::Fetcher`] — is what lets the
+/// whole apply/codemod path run in a test against an in-memory fake instead of
+/// [`RealFileSystem`].
+pub trait FileSystem {
+    /// Read a UTF-8 file relative to the repo root. `Err` on missing/unreadable.
+    fn read(&self, rel_path: &str) -> Result<String, String>;
+
+    /// Write `contents` to a file relative to the repo root, creating it if
+    /// needed. `Err` if the write fails.
+    fn write(&self, rel_path: &str, contents: &str) -> Result<(), String>;
+
+    /// Every Rust source file (repo-relative path) a codemod should consider.
+    ///
+    /// The orchestration applies each matching codemod to every file this
+    /// returns; `Err` only on an enumeration failure.
+    fn rust_sources(&self) -> Result<Vec<String>, String>;
+}
+
+/// Pin a dependency to `new_version` in a Cargo manifest's source, preserving
+/// the original requirement's operator prefix (`^`, `~`, `=`, none).
+///
+/// Pure: takes the manifest text and returns the edited text plus a summary,
+/// or `Err` if the dependency line could not be located. Handles both the
+/// `name = "req"` and `name = { version = "req", .. }` shapes. Idempotent —
+/// re-pinning to a version already present is a no-op that still reports success.
+pub fn pin_cargo_dependency(
+    manifest_src: &str,
+    dep: &str,
+    new_version: &str,
+) -> Result<(String, String), String> {
+    // Match `dep = "x"` or `dep = { ... version = "x" ... }`. We rewrite only
+    // the version string, keeping any leading operator the author used so the
+    // bump respects their pinning style.
+    let escaped = regex::escape(dep);
+    // First try the inline-table `version = "..."` belonging to this dep.
+    let table_re = regex::Regex::new(&format!(
+        r#"(?m)^(\s*{escaped}\s*=\s*\{{[^}}]*?version\s*=\s*")([\^~=<> ]*)([^"]+)(")"#
+    ))
+    .map_err(|e| e.to_string())?;
+    if let Some(caps) = table_re.captures(manifest_src) {
+        let op = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+        let old = caps.get(3).map(|m| m.as_str()).unwrap_or("");
+        let replaced = table_re.replace(manifest_src, |c: &regex::Captures| {
+            format!("{}{}{}{}", &c[1], op, new_version, &c[4])
+        });
+        let summary = format!("{dep}: \"{op}{old}\" -> \"{op}{new_version}\" (Cargo.toml table)");
+        return Ok((replaced.into_owned(), summary));
+    }
+
+    // Then the bare string form `dep = "..."`.
+    let str_re = regex::Regex::new(&format!(
+        r#"(?m)^(\s*{escaped}\s*=\s*")([\^~=<> ]*)([^"]+)(")"#
+    ))
+    .map_err(|e| e.to_string())?;
+    if let Some(caps) = str_re.captures(manifest_src) {
+        let op = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+        let old = caps.get(3).map(|m| m.as_str()).unwrap_or("");
+        let replaced = str_re.replace(manifest_src, |c: &regex::Captures| {
+            format!("{}{}{}{}", &c[1], op, new_version, &c[4])
+        });
+        let summary = format!("{dep}: \"{op}{old}\" -> \"{op}{new_version}\" (Cargo.toml)");
+        return Ok((replaced.into_owned(), summary));
+    }
+
+    Err(format!("dependency `{dep}` not found in manifest"))
+}
+
+/// Pin a dependency to `new_version` in a `package.json` source, preserving the
+/// original range operator (`^`, `~`, none).
+///
+/// Pure: returns the edited JSON text plus a summary, or `Err` if the
+/// dependency key is absent. Edits the value string in place (rather than
+/// re-serializing) so unrelated formatting in the file is left untouched.
+pub fn pin_npm_dependency(
+    manifest_src: &str,
+    dep: &str,
+    new_version: &str,
+) -> Result<(String, String), String> {
+    let escaped = regex::escape(dep);
+    // `"name": "^1.2.3"` — capture the operator so we keep the author's range style.
+    let re = regex::Regex::new(&format!(
+        r#"("{escaped}"\s*:\s*")([\^~]?)([^"]+)(")"#
+    ))
+    .map_err(|e| e.to_string())?;
+    if let Some(caps) = re.captures(manifest_src) {
+        let op = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+        let old = caps.get(3).map(|m| m.as_str()).unwrap_or("");
+        let replaced = re.replace(manifest_src, |c: &regex::Captures| {
+            format!("{}{}{}{}", &c[1], op, new_version, &c[4])
+        });
+        let summary = format!("{dep}: \"{op}{old}\" -> \"{op}{new_version}\" (package.json)");
+        return Ok((replaced.into_owned(), summary));
+    }
+    Err(format!("dependency `{dep}` not found in package.json"))
+}
+
+/// The production [`Repo`]: edits real manifests, applies codemods to real
+/// source files, and runs the gates as real OS processes.
+///
+/// Filesystem access goes through an injected [`FileSystem`] and command
+/// execution through an injected [`CommandRunner`], so the production wiring is
+/// itself testable against fakes. The default constructor
+/// ([`FsRepo::at`]) wires the real implementations.
+pub struct FsRepo<C: CommandRunner, F: FileSystem> {
+    root: String,
+    runner: C,
+    fs: F,
+}
+
+impl<C: CommandRunner, F: FileSystem> FsRepo<C, F> {
+    /// Build a repo over `root` with explicit runner and filesystem.
+    pub fn new(root: impl Into<String>, runner: C, fs: F) -> Self {
+        FsRepo {
+            root: root.into(),
+            runner,
+            fs,
+        }
+    }
+}
+
+impl<C: CommandRunner, F: FileSystem> Repo for FsRepo<C, F> {
+    fn apply_bump(&mut self, plan: &UpdatePlan) -> Result<String, String> {
+        let src = self.fs.read(&plan.manifest)?;
+        let new_version = plan.latest.to_string();
+        let (edited, summary) = match plan.kind {
+            crate::model::DepKind::Crate => {
+                pin_cargo_dependency(&src, &plan.name, &new_version)?
+            }
+            crate::model::DepKind::Npm => pin_npm_dependency(&src, &plan.name, &new_version)?,
+        };
+        // Skip the write when nothing changed so a re-run stays a true no-op.
+        if edited != src {
+            self.fs.write(&plan.manifest, &edited)?;
+        }
+        Ok(summary)
+    }
+
+    fn apply_codemod(&mut self, rule: &CodemodRule) -> Result<bool, String> {
+        let mut changed_any = false;
+        for path in self.fs.rust_sources()? {
+            let src = self.fs.read(&path)?;
+            if !matcher_hits(&rule.matcher, &src).map_err(|e| e.to_string())? {
+                continue;
+            }
+            let next = apply_rewrite(&rule.rewrite, &src).map_err(|e| e.to_string())?;
+            if next != src {
+                self.fs.write(&path, &next)?;
+                changed_any = true;
+            }
+        }
+        Ok(changed_any)
+    }
+
+    fn runner(&self) -> &dyn CommandRunner {
+        &self.runner
+    }
+
+    fn root(&self) -> &str {
+        &self.root
+    }
+}
+
+/// A real, recursive-walk [`FileSystem`] rooted at a repo directory.
+///
+/// Reads/writes resolve relative to `root`; [`rust_sources`](FileSystem::rust_sources)
+/// walks the tree for `*.rs` files, skipping the usual non-source directories
+/// (`target`, `.git`, `node_modules`) so codemods never touch build artifacts.
+pub struct RealFileSystem {
+    root: std::path::PathBuf,
+}
+
+impl RealFileSystem {
+    /// Root the filesystem at `root`.
+    pub fn new(root: impl Into<std::path::PathBuf>) -> Self {
+        RealFileSystem { root: root.into() }
+    }
+
+    fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<String>) -> Result<(), String> {
+        let entries = std::fs::read_dir(dir).map_err(|e| format!("read_dir {dir:?}: {e}"))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let path = entry.path();
+            let file_type = entry.file_type().map_err(|e| e.to_string())?;
+            if file_type.is_dir() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if matches!(name.as_ref(), "target" | ".git" | "node_modules") {
+                    continue;
+                }
+                Self::walk(&path, root, out)?;
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                if let Ok(rel) = path.strip_prefix(root) {
+                    out.push(rel.to_string_lossy().replace('\\', "/"));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl FileSystem for RealFileSystem {
+    fn read(&self, rel_path: &str) -> Result<String, String> {
+        std::fs::read_to_string(self.root.join(rel_path))
+            .map_err(|e| format!("read {rel_path}: {e}"))
+    }
+
+    fn write(&self, rel_path: &str, contents: &str) -> Result<(), String> {
+        let full = self.root.join(rel_path);
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {parent:?}: {e}"))?;
+        }
+        std::fs::write(&full, contents).map_err(|e| format!("write {rel_path}: {e}"))
+    }
+
+    fn rust_sources(&self) -> Result<Vec<String>, String> {
+        let mut out = Vec::new();
+        if self.root.is_dir() {
+            Self::walk(&self.root, &self.root, &mut out)?;
+        }
+        out.sort();
+        Ok(out)
+    }
+}
+
+impl<C: CommandRunner> FsRepo<C, RealFileSystem> {
+    /// Wire a production repo at `root` with the given runner and a real,
+    /// tree-walking filesystem.
+    pub fn at(root: impl Into<String>, runner: C) -> Self {
+        let root = root.into();
+        let fs = RealFileSystem::new(std::path::PathBuf::from(&root));
+        FsRepo {
+            root,
+            runner,
+            fs,
+        }
+    }
 }
 
 /// Mode the loop runs in.
@@ -415,6 +663,20 @@ impl<'a> Orchestrator<'a> {
         actions
     }
 
+    /// Plan the loop for one plan without a [`Repo`] — a convenience for the
+    /// CLI's `dry-run`, which never touches the working tree.
+    ///
+    /// Always returns [`Outcome::Planned`] (the dry-run outcome), regardless of
+    /// the configured [`Mode`]; the action list is [`plan_actions`].
+    ///
+    /// [`plan_actions`]: Self::plan_actions
+    pub fn run_plan_dry(&self, plan: &UpdatePlan) -> Outcome {
+        Outcome::Planned {
+            plan: plan.clone(),
+            actions: self.plan_actions(plan),
+        }
+    }
+
     /// Run (or, in dry-run mode, plan) the loop for one plan against `repo`.
     ///
     /// Execute mode:
@@ -475,7 +737,7 @@ impl<'a> Orchestrator<'a> {
                     let mut verify = VerifyResult::new(plan.id());
                     verify.codemods_applied = applied.clone();
                     verify.record(VerifyStep::from_exit(
-                        &format!("codemod {}", rule.id),
+                        format!("codemod {}", rule.id),
                         1,
                         e,
                     ));
@@ -989,5 +1251,159 @@ mod tests {
         let calls = repo.runner.calls.borrow();
         assert_eq!(calls.len(), 1);
         assert!(calls[0].starts_with("cargo build --workspace"));
+    }
+
+    // ---- production FsRepo over an in-memory filesystem ----
+
+    /// An in-memory filesystem fake: a path -> contents map plus a fixed list
+    /// of "rust sources". Records writes so tests can assert on disk effects
+    /// without touching the real filesystem.
+    struct MemFs {
+        files: RefCell<HashMap<String, String>>,
+        rust: Vec<String>,
+    }
+
+    impl MemFs {
+        fn new(files: &[(&str, &str)], rust: &[&str]) -> Self {
+            MemFs {
+                files: RefCell::new(
+                    files
+                        .iter()
+                        .map(|(p, c)| (p.to_string(), c.to_string()))
+                        .collect(),
+                ),
+                rust: rust.iter().map(|s| s.to_string()).collect(),
+            }
+        }
+
+        fn get(&self, path: &str) -> String {
+            self.files.borrow().get(path).cloned().unwrap_or_default()
+        }
+    }
+
+    impl FileSystem for MemFs {
+        fn read(&self, rel_path: &str) -> Result<String, String> {
+            self.files
+                .borrow()
+                .get(rel_path)
+                .cloned()
+                .ok_or_else(|| format!("no such file {rel_path}"))
+        }
+
+        fn write(&self, rel_path: &str, contents: &str) -> Result<(), String> {
+            self.files
+                .borrow_mut()
+                .insert(rel_path.to_string(), contents.to_string());
+            Ok(())
+        }
+
+        fn rust_sources(&self) -> Result<Vec<String>, String> {
+            Ok(self.rust.clone())
+        }
+    }
+
+    #[test]
+    fn pin_cargo_string_form_preserves_no_operator() {
+        let src = "[dependencies]\noxc_ast = \"0.29.0\"\nserde = \"1\"\n";
+        let (out, summary) = pin_cargo_dependency(src, "oxc_ast", "0.133.0").unwrap();
+        assert!(out.contains("oxc_ast = \"0.133.0\""));
+        // serde untouched.
+        assert!(out.contains("serde = \"1\""));
+        assert!(summary.contains("0.29.0"));
+        assert!(summary.contains("0.133.0"));
+    }
+
+    #[test]
+    fn pin_cargo_table_form_preserves_operator_and_features() {
+        let src = "[dependencies]\nnapi = { version = \"^2.10.2\", features = [\"napi4\"] }\n";
+        let (out, _) = pin_cargo_dependency(src, "napi", "2.16.0").unwrap();
+        assert!(out.contains("version = \"^2.16.0\""), "got: {out}");
+        // features preserved.
+        assert!(out.contains("features = [\"napi4\"]"));
+    }
+
+    #[test]
+    fn pin_cargo_missing_dep_errors() {
+        let src = "[dependencies]\nserde = \"1\"\n";
+        assert!(pin_cargo_dependency(src, "absent", "1.0.0").is_err());
+    }
+
+    #[test]
+    fn pin_npm_preserves_caret() {
+        let src = "{\n  \"dependencies\": {\n    \"@angular/core\": \"^21.2.15\"\n  }\n}";
+        let (out, _) = pin_npm_dependency(src, "@angular/core", "22.0.0").unwrap();
+        assert!(out.contains("\"@angular/core\": \"^22.0.0\""), "got: {out}");
+    }
+
+    #[test]
+    fn fs_repo_bump_edits_the_manifest_in_place() {
+        let fs = MemFs::new(
+            &[("Cargo.toml", "[dependencies]\noxc_ast = \"0.29.0\"\n")],
+            &[],
+        );
+        let mut repo = FsRepo::new("/repo", ScriptedRunner::always_pass(), fs);
+        let summary = repo.apply_bump(&oxc_plan()).unwrap();
+        assert!(summary.contains("0.133.0"));
+        assert_eq!(
+            repo.fs.get("Cargo.toml"),
+            "[dependencies]\noxc_ast = \"0.133.0\"\n"
+        );
+    }
+
+    #[test]
+    fn fs_repo_codemod_rewrites_only_matching_sources() {
+        let fs = MemFs::new(
+            &[
+                ("src/a.rs", "use oxc_ast::VisitMut;\n"),
+                ("src/b.rs", "fn untouched() {}\n"),
+            ],
+            &["src/a.rs", "src/b.rs"],
+        );
+        let mut repo = FsRepo::new("/repo", ScriptedRunner::always_pass(), fs);
+        let changed = repo.apply_codemod(&visitmut_rule()).unwrap();
+        assert!(changed);
+        assert_eq!(repo.fs.get("src/a.rs"), "use oxc_ast_visit::VisitMut;\n");
+        // The non-matching file is left byte-for-byte alone.
+        assert_eq!(repo.fs.get("src/b.rs"), "fn untouched() {}\n");
+        // Idempotent: a second run changes nothing.
+        assert!(!repo.apply_codemod(&visitmut_rule()).unwrap());
+    }
+
+    #[test]
+    fn fs_repo_drives_a_full_green_run() {
+        // End-to-end through the orchestrator with the production repo over a
+        // fake fs: bump the manifest, build red, codemod fixes it, build green.
+        let rules = RuleSet {
+            rules: vec![visitmut_rule()],
+        };
+        let orch = Orchestrator::new(OrchestrationConfig::execute(), &rules);
+
+        let runner = ScriptedRunner::always_pass();
+        runner.queue(
+            "cargo build",
+            CommandOutcome {
+                exit_code: 1,
+                stdout: String::new(),
+                stderr: "unresolved import oxc_ast::VisitMut".into(),
+            },
+        );
+        let fs = MemFs::new(
+            &[
+                ("Cargo.toml", "[dependencies]\noxc_ast = \"0.29.0\"\n"),
+                ("src/lib.rs", "use oxc_ast::VisitMut;\n"),
+            ],
+            &["src/lib.rs"],
+        );
+        let mut repo = FsRepo::new("/repo", runner, fs);
+
+        let outcome = orch.run_plan(&oxc_plan(), &mut repo);
+
+        assert!(outcome.is_pr_ready(), "got {outcome:?}");
+        // The manifest was bumped and the source codemodded on the real repo.
+        assert_eq!(
+            repo.fs.get("Cargo.toml"),
+            "[dependencies]\noxc_ast = \"0.133.0\"\n"
+        );
+        assert_eq!(repo.fs.get("src/lib.rs"), "use oxc_ast_visit::VisitMut;\n");
     }
 }
