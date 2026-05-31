@@ -124,3 +124,10 @@ pub mod compile;
 /// module, register the per-decorator plugins, dispatch each class through the registry, and
 /// re-assemble the augmented module. Depends on `core`, `template`, and `decorators`.
 pub mod source_compile;
+
+/// The Angular **partial-declaration linker**: rewrite a published library's `ɵɵngDeclare*({...})`
+/// calls into the full AOT `ɵɵdefine*({...})` calls by driving the SAME emit fed from the
+/// declaration object instead of a decorator. Depends on `core`, `template`, and `decorators`.
+pub mod linker;
+
+pub use linker::link_partial;

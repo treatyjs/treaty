@@ -2,6 +2,7 @@
 extern crate napi_derive;
 
 use treaty_ivy::compile::compile_component as r3_compile_component;
+use treaty_ivy::linker::link_partial as r3_link_partial;
 use treaty_ivy::source_compile::compile_component_source_with_map as r3_compile_component_source_with_map;
 
 /// Normalize render3's empty-string "no map" sentinel into `None` (it never emits `{}`).
@@ -57,6 +58,28 @@ pub fn compile_component_source(source: String) -> CompiledComponent {
         code: result.code,
         errors: result.errors,
         map: map_or_none(result.map),
+    }
+}
+
+/// Link an Angular **partial-declaration** module directly to its full AOT form.
+///
+/// Published Angular libraries ship *partial*-compiled: classes emit `ɵɵngDeclare*({...})` calls
+/// instead of the full `ɵɵdefine*({...})`. This is the Rust Angular Linker: it rewrites every
+/// linkable `ɵɵngDeclare*` call (the DI + pipe family — `ɵɵngDeclareFactory`/`Injectable`/
+/// `Injector`/`NgModule`/`Pipe`, plus dropping the dev-only `ɵɵngDeclareClassMetadata`) into the
+/// corresponding `ɵɵdefine*` call by driving the SAME render3 emit fed from the declaration object.
+///
+/// `code` is the module source (typically a `.mjs` fesm chunk); `file_name` selects the parse mode.
+/// The returned `code` is byte-identical to the input outside the rewritten call spans; `errors`
+/// carries diagnostics for any declaration that could not be linked (its call is left untouched).
+#[napi]
+pub fn link_partial(code: String, file_name: String) -> CompiledComponent {
+    let result = r3_link_partial(&code, &file_name);
+    CompiledComponent {
+        code: result.code,
+        errors: result.errors,
+        // Linking is a span rewrite of an existing module; no source map is produced here.
+        map: None,
     }
 }
 
