@@ -1,0 +1,632 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Treaty",
+  "scopeName": "source.treaty",
+  "patterns": [
+    { "include": "#macroBlock" },
+    { "include": "#styleBlock" },
+    { "include": "#htmlTagRegion" },
+    { "include": "#interpolation" },
+    { "include": "#controlFlow" },
+    { "include": "source.ts" }
+  ],
+  "repository": {
+    "macroBlock": {
+      "comment": "Leading ```-fenced compile-time macro block at file top.",
+      "begin": "\\A\\s*(`{3,})\\s*([^\\n`]*)$",
+      "beginCaptures": {
+        "1": { "name": "punctuation.definition.macro.begin.treaty" },
+        "2": { "name": "fenced.code.info.treaty meta.embedded.line.info.treaty" }
+      },
+      "end": "(`{3,})",
+      "endCaptures": {
+        "1": { "name": "punctuation.definition.macro.end.treaty" }
+      },
+      "name": "meta.block.macro.treaty",
+      "contentName": "meta.embedded.block.macro.treaty",
+      "patterns": [
+        { "include": "source.ts" }
+      ]
+    },
+    "styleBlock": {
+      "comment": "<style ...>...</style> region embedding CSS.",
+      "begin": "(<)(style)\\b",
+      "beginCaptures": {
+        "1": { "name": "punctuation.definition.tag.begin.html" },
+        "2": { "name": "entity.name.tag.style.html" }
+      },
+      "end": "(</)(style)\\s*(>)",
+      "endCaptures": {
+        "1": { "name": "punctuation.definition.tag.begin.html" },
+        "2": { "name": "entity.name.tag.style.html" },
+        "3": { "name": "punctuation.definition.tag.end.html" }
+      },
+      "name": "meta.block.style.treaty",
+      "patterns": [
+        {
+          "comment": "Rest of the opening <style ...> tag, including lang attribute.",
+          "begin": "\\G",
+          "end": "(>)",
+          "endCaptures": {
+            "0": { "name": "punctuation.definition.tag.end.html" }
+          },
+          "patterns": [
+            { "include": "#tagAttributes" }
+          ]
+        },
+        {
+          "begin": "(?<=>)",
+          "end": "(?=</style)",
+          "name": "source.css.embedded.treaty",
+          "contentName": "source.css",
+          "patterns": [
+            { "include": "source.css" }
+          ]
+        }
+      ]
+    },
+    "htmlTagRegion": {
+      "comment": "An HTML/Angular template tag and its body.",
+      "patterns": [
+        { "include": "#htmlComment" },
+        { "include": "#tag" }
+      ]
+    },
+    "htmlComment": {
+      "begin": "(<!--)",
+      "beginCaptures": {
+        "1": { "name": "punctuation.definition.comment.html" }
+      },
+      "end": "(-->)",
+      "endCaptures": {
+        "1": { "name": "punctuation.definition.comment.html" }
+      },
+      "name": "comment.block.html"
+    },
+    "tag": {
+      "patterns": [
+        { "include": "#tagClose" },
+        { "include": "#tagOpen" }
+      ]
+    },
+    "tagClose": {
+      "match": "(</)([a-zA-Z][-a-zA-Z0-9_.]*|ng-[a-zA-Z-]+)?\\s*(>)",
+      "captures": {
+        "1": { "name": "punctuation.definition.tag.begin.html" },
+        "2": { "name": "entity.name.tag.html" },
+        "3": { "name": "punctuation.definition.tag.end.html" }
+      },
+      "name": "meta.tag.close.html"
+    },
+    "tagOpen": {
+      "begin": "(<)([a-zA-Z][-a-zA-Z0-9_.]*|ng-[a-zA-Z-]+)",
+      "beginCaptures": {
+        "1": { "name": "punctuation.definition.tag.begin.html" },
+        "2": { "name": "entity.name.tag.html" }
+      },
+      "end": "(/?>)",
+      "endCaptures": {
+        "1": { "name": "punctuation.definition.tag.end.html" }
+      },
+      "name": "meta.tag.html",
+      "patterns": [
+        { "include": "#tagAttributes" }
+      ]
+    },
+    "tagAttributes": {
+      "patterns": [
+        { "include": "#inlineComments" },
+        { "include": "#twoWayBinding" },
+        { "include": "#propertyBinding" },
+        { "include": "#eventBinding" },
+        { "include": "#templateBinding" },
+        { "include": "#interpolation" },
+        { "include": "#plainAttribute" }
+      ]
+    },
+    "propertyBinding": {
+      "begin": "(\\[\\s*@?(?:[-_a-zA-Z0-9.$]+|\\[[^\\[\\]]*]|\\([^()]*\\))*%?\\s*])(=)([\"'])",
+      "beginCaptures": {
+        "1": {
+          "name": "entity.other.attribute-name.html entity.other.ng-binding-name.property.html",
+          "patterns": [ { "include": "#bindingKey" } ]
+        },
+        "2": { "name": "punctuation.separator.key-value.html" },
+        "3": { "name": "string.quoted.html punctuation.definition.string.begin.html" }
+      },
+      "end": "\\3",
+      "endCaptures": {
+        "0": { "name": "string.quoted.html punctuation.definition.string.end.html" }
+      },
+      "name": "meta.ng-binding.property.html",
+      "contentName": "meta.embedded.expression.ng",
+      "patterns": [
+        { "include": "#ngExpression" }
+      ]
+    },
+    "eventBinding": {
+      "begin": "(\\(\\s*@?[-_a-zA-Z0-9.$]*\\s*\\))(=)([\"'])",
+      "beginCaptures": {
+        "1": {
+          "name": "entity.other.attribute-name.html entity.other.ng-binding-name.event.html",
+          "patterns": [ { "include": "#bindingKey" } ]
+        },
+        "2": { "name": "punctuation.separator.key-value.html" },
+        "3": { "name": "string.quoted.html punctuation.definition.string.begin.html" }
+      },
+      "end": "\\3",
+      "endCaptures": {
+        "0": { "name": "string.quoted.html punctuation.definition.string.end.html" }
+      },
+      "name": "meta.ng-binding.event.html",
+      "contentName": "meta.embedded.expression.ng",
+      "patterns": [
+        { "include": "#ngExpression" }
+      ]
+    },
+    "twoWayBinding": {
+      "begin": "(\\[\\s*\\(\\s*@?[-_a-zA-Z0-9.$]*\\s*\\)\\s*\\])(=)([\"'])",
+      "beginCaptures": {
+        "1": {
+          "name": "entity.other.attribute-name.html entity.other.ng-binding-name.two-way.html",
+          "patterns": [ { "include": "#bindingKey" } ]
+        },
+        "2": { "name": "punctuation.separator.key-value.html" },
+        "3": { "name": "string.quoted.html punctuation.definition.string.begin.html" }
+      },
+      "end": "\\3",
+      "endCaptures": {
+        "0": { "name": "string.quoted.html punctuation.definition.string.end.html" }
+      },
+      "name": "meta.ng-binding.two-way.html",
+      "contentName": "meta.embedded.expression.ng",
+      "patterns": [
+        { "include": "#ngExpression" }
+      ]
+    },
+    "templateBinding": {
+      "begin": "(\\*[-_a-zA-Z0-9.$]*)(=)([\"'])",
+      "beginCaptures": {
+        "1": {
+          "name": "entity.other.attribute-name.html entity.other.ng-binding-name.template.html",
+          "patterns": [ { "include": "#bindingKey" } ]
+        },
+        "2": { "name": "punctuation.separator.key-value.html" },
+        "3": { "name": "string.quoted.html punctuation.definition.string.begin.html" }
+      },
+      "end": "\\3",
+      "endCaptures": {
+        "0": { "name": "string.quoted.html punctuation.definition.string.end.html" }
+      },
+      "name": "meta.ng-binding.template.html",
+      "contentName": "meta.embedded.expression.ng",
+      "patterns": [
+        { "include": "#ngExpression" }
+      ]
+    },
+    "bindingKey": {
+      "patterns": [
+        {
+          "match": "([\\[\\(]{1,2}|\\*)(?:\\s*)(@?(?:[-_a-zA-Z0-9.$]+|\\[[^\\[\\]]*]|\\([^()]*\\))*%?)(?:\\s*)([\\]\\)]{1,2})?",
+          "captures": {
+            "1": { "name": "punctuation.definition.ng-binding-name.begin.html" },
+            "2": {
+              "name": "entity.other.ng-binding-name.$2.html",
+              "patterns": [
+                { "match": "\\.", "name": "punctuation.accessor.html" }
+              ]
+            },
+            "3": { "name": "punctuation.definition.ng-binding-name.end.html" }
+          }
+        }
+      ]
+    },
+    "plainAttribute": {
+      "patterns": [
+        {
+          "begin": "(#)([-_a-zA-Z0-9]+)",
+          "beginCaptures": {
+            "1": { "name": "punctuation.definition.ng-template-reference.begin.html" },
+            "2": { "name": "entity.other.attribute-name.reference.html" }
+          },
+          "end": "(?=\\s|/?>)",
+          "name": "meta.ng-reference.html",
+          "patterns": [
+            { "include": "#attributeValue" }
+          ]
+        },
+        {
+          "begin": "([-a-zA-Z0-9_:@.]+)",
+          "beginCaptures": {
+            "1": { "name": "entity.other.attribute-name.html" }
+          },
+          "end": "(?=\\s|/?>)",
+          "name": "meta.attribute.html",
+          "patterns": [
+            { "include": "#attributeValue" }
+          ]
+        }
+      ]
+    },
+    "attributeValue": {
+      "begin": "(=)\\s*([\"'])",
+      "beginCaptures": {
+        "1": { "name": "punctuation.separator.key-value.html" },
+        "2": { "name": "string.quoted.html punctuation.definition.string.begin.html" }
+      },
+      "end": "\\2",
+      "endCaptures": {
+        "0": { "name": "string.quoted.html punctuation.definition.string.end.html" }
+      },
+      "name": "string.quoted.html",
+      "patterns": [
+        { "include": "#interpolation" }
+      ]
+    },
+    "interpolation": {
+      "comment": "{{ ... }} Angular interpolation embedding the expression grammar.",
+      "begin": "({{)",
+      "beginCaptures": {
+        "1": { "name": "punctuation.definition.block.ts" }
+      },
+      "end": "(}})",
+      "endCaptures": {
+        "1": { "name": "punctuation.definition.block.ts" }
+      },
+      "name": "meta.interpolation.treaty",
+      "contentName": "meta.embedded.expression.ng",
+      "patterns": [
+        { "include": "#ngExpression" }
+      ]
+    },
+    "controlFlow": {
+      "comment": "Angular @-prefixed control-flow blocks.",
+      "patterns": [
+        { "include": "#letDeclaration" },
+        { "include": "#caseBlock" },
+        { "include": "#block" }
+      ]
+    },
+    "block": {
+      "begin": "(@)(if|else if|else|defer|placeholder|loading|error|switch|for|empty)\\b\\s*",
+      "beginCaptures": {
+        "1": { "name": "keyword.control.block.transition.ng" },
+        "2": { "name": "keyword.control.block.kind.ng" }
+      },
+      "patterns": [
+        { "include": "#blockExpression" },
+        { "include": "#blockBody" }
+      ],
+      "name": "meta.block.control.treaty control.block.ng",
+      "end": "(?<=\\})"
+    },
+    "caseBlock": {
+      "begin": "(?=@(?:case|default)\\b)",
+      "patterns": [
+        { "include": "#caseExhaustive" },
+        { "include": "#caseHeader" },
+        { "include": "#blockBody" }
+      ],
+      "end": "(?<=\\})",
+      "name": "control.block.case.ng"
+    },
+    "caseHeader": {
+      "begin": "(@)(case|default)\\b\\s*",
+      "beginCaptures": {
+        "1": { "name": "keyword.control.block.transition.ng" },
+        "2": { "name": "keyword.control.block.kind.ng" }
+      },
+      "patterns": [
+        { "include": "#blockExpression" }
+      ],
+      "end": "(?=@|{|})",
+      "name": "control.block.case.header.ng"
+    },
+    "caseExhaustive": {
+      "match": "(@)(default\\s+never)\\s*(;)",
+      "captures": {
+        "1": { "name": "keyword.control.block.transition.ng" },
+        "2": { "name": "keyword.control.block.kind.ng" },
+        "3": { "name": "punctuation.terminator.statement.ng" }
+      },
+      "name": "control.block.case.ng"
+    },
+    "blockExpression": {
+      "begin": "\\(",
+      "beginCaptures": {
+        "0": { "name": "meta.brace.round.ts" }
+      },
+      "contentName": "control.block.expression.ng",
+      "patterns": [
+        { "include": "#blockExpressionOfClause" },
+        { "include": "#blockExpressionLetBinding" },
+        { "include": "#blockExpressionTrackClause" },
+        { "include": "#ngExpression" }
+      ],
+      "end": "\\)",
+      "endCaptures": {
+        "0": { "name": "meta.brace.round.ts" }
+      }
+    },
+    "blockExpressionOfClause": {
+      "begin": "([_$[:alpha:]][_$[:alnum:]]*)\\s+(of)\\b",
+      "beginCaptures": {
+        "1": { "name": "variable.other.constant.ng" },
+        "2": { "name": "keyword.operator.expression.of.ng" }
+      },
+      "end": "(?=[$)])|(?<=;)",
+      "patterns": [
+        { "include": "#ngExpression" }
+      ]
+    },
+    "blockExpressionLetBinding": {
+      "begin": "\\blet\\b",
+      "beginCaptures": {
+        "0": { "name": "storage.type.ng" }
+      },
+      "end": "(?=[$)])|(?<=;)",
+      "patterns": [
+        { "include": "#ngExpression" }
+      ]
+    },
+    "blockExpressionTrackClause": {
+      "begin": "\\btrack\\b",
+      "beginCaptures": {
+        "0": { "name": "keyword.control.track.ng" }
+      },
+      "end": "(?=[$)])|(?<=;)",
+      "patterns": [
+        { "include": "#ngExpression" }
+      ]
+    },
+    "blockBody": {
+      "begin": "\\{",
+      "beginCaptures": {
+        "0": { "name": "punctuation.definition.block.ts" }
+      },
+      "end": "\\}",
+      "endCaptures": {
+        "0": { "name": "punctuation.definition.block.ts" }
+      },
+      "contentName": "control.block.body.ng",
+      "patterns": [
+        { "include": "#caseExhaustive" },
+        { "include": "#caseBlock" },
+        { "include": "#styleBlock" },
+        { "include": "#htmlTagRegion" },
+        { "include": "#interpolation" },
+        { "include": "#letDeclaration" },
+        { "include": "#block" }
+      ]
+    },
+    "letDeclaration": {
+      "name": "meta.definition.variable.ng",
+      "begin": "(@let)\\s+([_$[:alpha:]][_$[:alnum:]]*)\\s*(=)?",
+      "beginCaptures": {
+        "1": { "name": "storage.type.ng" },
+        "2": { "name": "variable.other.constant.ng" },
+        "3": { "name": "keyword.operator.assignment.ng" }
+      },
+      "patterns": [
+        { "include": "#letInitializer" }
+      ],
+      "end": "(?<=;)"
+    },
+    "letInitializer": {
+      "begin": "\\s*",
+      "contentName": "meta.definition.variable.initializer.ng",
+      "patterns": [
+        { "include": "#ngExpression" }
+      ],
+      "end": ";",
+      "endCaptures": {
+        "0": { "name": "punctuation.terminator.statement.ng" }
+      }
+    },
+    "ngExpression": {
+      "name": "meta.expression.ng",
+      "patterns": [
+        { "include": "#ngComment" },
+        { "include": "#string" },
+        { "include": "#numericLiteral" },
+        { "include": "#booleanLiteral" },
+        { "include": "#nullLiteral" },
+        { "include": "#templateLiteral" },
+        { "include": "#expressionOperator" },
+        { "include": "#pipeOperator" },
+        { "include": "#functionCall" },
+        { "include": "#objectLiteral" },
+        { "include": "#arrayLiteral" },
+        { "include": "#parenExpression" },
+        { "include": "#identifiers" },
+        { "include": "#punctuation" }
+      ]
+    },
+    "ngComment": {
+      "patterns": [
+        { "begin": "/\\*", "end": "\\*/", "name": "comment.block.ts" },
+        { "begin": "//", "end": "(?=$)", "name": "comment.line.double-slash.ts" }
+      ]
+    },
+    "string": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.ts",
+          "begin": "\"",
+          "beginCaptures": { "0": { "name": "punctuation.definition.string.begin.ts" } },
+          "end": "\"",
+          "endCaptures": { "0": { "name": "punctuation.definition.string.end.ts" } },
+          "patterns": [ { "match": "\\\\.", "name": "constant.character.escape.ts" } ]
+        },
+        {
+          "name": "string.quoted.single.ts",
+          "begin": "'",
+          "beginCaptures": { "0": { "name": "punctuation.definition.string.begin.ts" } },
+          "end": "'",
+          "endCaptures": { "0": { "name": "punctuation.definition.string.end.ts" } },
+          "patterns": [ { "match": "\\\\.", "name": "constant.character.escape.ts" } ]
+        }
+      ]
+    },
+    "templateLiteral": {
+      "name": "string.template.ts",
+      "begin": "`",
+      "beginCaptures": { "0": { "name": "punctuation.definition.string.template.begin.ts" } },
+      "end": "`",
+      "endCaptures": { "0": { "name": "punctuation.definition.string.template.end.ts" } },
+      "patterns": [
+        {
+          "name": "meta.template.expression.ts",
+          "begin": "\\$\\{",
+          "beginCaptures": { "0": { "name": "punctuation.definition.template-expression.begin.ts" } },
+          "end": "\\}",
+          "endCaptures": { "0": { "name": "punctuation.definition.template-expression.end.ts" } },
+          "patterns": [ { "include": "#ngExpression" } ]
+        },
+        { "match": "\\\\.", "name": "constant.character.escape.ts" }
+      ]
+    },
+    "numericLiteral": {
+      "name": "constant.numeric.ts",
+      "match": "(?<![$[:alnum:]])(?:0[xX][0-9a-fA-F]+|0[bB][01]+|0[oO][0-7]+|(?:[0-9]+\\.?[0-9]*|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?)"
+    },
+    "booleanLiteral": {
+      "patterns": [
+        { "name": "constant.language.boolean.true.ts", "match": "(?<!\\.|\\$)\\btrue\\b(?!\\$)" },
+        { "name": "constant.language.boolean.false.ts", "match": "(?<!\\.|\\$)\\bfalse\\b(?!\\$)" }
+      ]
+    },
+    "nullLiteral": {
+      "patterns": [
+        { "name": "constant.language.null.ts", "match": "(?<!\\.|\\$)\\bnull\\b(?!\\$)" },
+        { "name": "constant.language.undefined.ts", "match": "(?<!\\.|\\$)\\bundefined\\b(?!\\$)" }
+      ]
+    },
+    "expressionOperator": {
+      "patterns": [
+        { "name": "keyword.control.flow.ts", "match": "(?<!\\.|\\$)\\b(await)\\b(?!\\$)" },
+        { "name": "storage.type.ts", "match": "(?<!\\.|\\$)\\b(let)\\b(?!\\$)" },
+        { "name": "keyword.operator.expression.delete.ts", "match": "(?<!\\.|\\$)\\bdelete\\b(?!\\$)" },
+        { "name": "keyword.operator.expression.in.ts", "match": "(?<!\\.|\\$)\\bin\\b(?!\\$)" },
+        { "name": "keyword.operator.expression.of.ts", "match": "(?<!\\.|\\$)\\bof\\b(?!\\$)" },
+        { "name": "keyword.control.as.ts", "match": "(?<!\\.|\\$)\\bas\\b(?!\\$)" },
+        { "name": "keyword.operator.expression.typeof.ts", "match": "(?<!\\.|\\$)\\btypeof\\b(?!\\$)" },
+        { "name": "keyword.control.new.ts", "match": "(?<!\\.|\\$)\\bnew\\b(?!\\$)" },
+        { "name": "keyword.operator.ternary.ts", "match": "\\?|:" },
+        { "name": "keyword.operator.optional.ts", "match": "\\?\\." },
+        { "name": "keyword.operator.nullish-coalescing.ts", "match": "\\?\\?" },
+        { "name": "keyword.operator.assignment.ts", "match": "=" },
+        { "name": "keyword.operator.comparison.ts", "match": "===|!==|==|!=|<=|>=|<|>" },
+        { "name": "keyword.operator.logical.ts", "match": "&&|\\|\\||!" },
+        { "name": "keyword.operator.arithmetic.ts", "match": "\\+|\\-|\\*|/|%" }
+      ]
+    },
+    "pipeOperator": {
+      "match": "((?<!\\|)\\|(?!\\|))\\s?([a-zA-Z0-9\\-\\_\\$]*)",
+      "captures": {
+        "1": { "name": "keyword.operator.logical.ts" },
+        "2": { "name": "entity.name.function.pipe.ng" }
+      }
+    },
+    "functionCall": {
+      "begin": "([_$[:alpha:]][_$[:alnum:]]*)\\s*(\\()",
+      "beginCaptures": {
+        "1": { "name": "entity.name.function.ts" },
+        "2": { "name": "meta.brace.round.ts" }
+      },
+      "end": "\\)",
+      "endCaptures": {
+        "0": { "name": "meta.brace.round.ts" }
+      },
+      "name": "meta.function-call.ts",
+      "patterns": [
+        { "include": "#ngExpression" }
+      ]
+    },
+    "parenExpression": {
+      "begin": "\\(",
+      "beginCaptures": { "0": { "name": "meta.brace.round.ts" } },
+      "end": "\\)",
+      "endCaptures": { "0": { "name": "meta.brace.round.ts" } },
+      "patterns": [
+        { "include": "#ngExpression" }
+      ]
+    },
+    "arrayLiteral": {
+      "name": "meta.array.literal.ts",
+      "begin": "\\[",
+      "beginCaptures": { "0": { "name": "meta.brace.square.ts" } },
+      "end": "\\]",
+      "endCaptures": { "0": { "name": "meta.brace.square.ts" } },
+      "patterns": [
+        { "include": "#ngExpression" }
+      ]
+    },
+    "objectLiteral": {
+      "name": "meta.objectliteral.ts",
+      "begin": "\\{",
+      "beginCaptures": { "0": { "name": "punctuation.definition.block.ts" } },
+      "end": "\\}",
+      "endCaptures": { "0": { "name": "punctuation.definition.block.ts" } },
+      "patterns": [
+        {
+          "match": "([_$[:alpha:]][_$[:alnum:]]*)\\s*(:)",
+          "captures": {
+            "1": { "name": "meta.object-literal.key.ts" },
+            "2": { "name": "punctuation.separator.key-value.ts" }
+          }
+        },
+        { "include": "#ngExpression" }
+      ]
+    },
+    "identifiers": {
+      "patterns": [
+        {
+          "match": "(\\.)\\s*([_$[:alpha:]][_$[:alnum:]]*)(?=\\s*\\()",
+          "captures": {
+            "1": { "name": "punctuation.accessor.ts" },
+            "2": { "name": "entity.name.function.ts" }
+          }
+        },
+        {
+          "match": "(\\.)\\s*([_$[:alpha:]][_$[:alnum:]]*)",
+          "captures": {
+            "1": { "name": "punctuation.accessor.ts" },
+            "2": { "name": "variable.other.property.ts" }
+          }
+        },
+        {
+          "match": "(\\$[_$[:alnum:]]*)\\b",
+          "name": "variable.language.this.ts"
+        },
+        {
+          "match": "[_$[:alpha:]][_$[:alnum:]]*",
+          "name": "variable.other.readwrite.ts"
+        }
+      ]
+    },
+    "punctuation": {
+      "patterns": [
+        { "match": ",", "name": "punctuation.separator.comma.ts" },
+        { "match": ";", "name": "punctuation.terminator.statement.ts" },
+        { "match": "\\.", "name": "punctuation.accessor.ts" }
+      ]
+    },
+    "inlineComments": {
+      "patterns": [
+        {
+          "begin": "/\\*",
+          "captures": { "0": { "name": "punctuation.definition.comment.ts" } },
+          "name": "comment.block.ts",
+          "end": "\\*/"
+        },
+        {
+          "begin": "//",
+          "beginCaptures": { "0": { "name": "punctuation.definition.comment.ts" } },
+          "name": "comment.line.double-slash.ts",
+          "end": "(?=$)"
+        }
+      ]
+    }
+  }
+}

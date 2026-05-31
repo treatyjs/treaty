@@ -1,0 +1,152 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Treaty JSX",
+  "scopeName": "source.tjsx",
+  "patterns": [
+    { "include": "#controlFlow" },
+    { "include": "source.tsx" }
+  ],
+  "repository": {
+    "controlFlow": {
+      "comment": "Angular @-prefixed control-flow blocks appearing inside JSX/TSX.",
+      "patterns": [
+        { "include": "#letDeclaration" },
+        { "include": "#caseBlock" },
+        { "include": "#block" }
+      ]
+    },
+    "block": {
+      "begin": "(?<![$._[:alnum:]])(@)(if|else if|else|defer|placeholder|loading|error|switch|for|empty)\\b\\s*",
+      "beginCaptures": {
+        "1": { "name": "keyword.control.block.transition.ng" },
+        "2": { "name": "keyword.control.block.kind.ng" }
+      },
+      "patterns": [
+        { "include": "#blockExpression" },
+        { "include": "#blockBody" }
+      ],
+      "name": "meta.block.control.tjsx control.block.ng",
+      "end": "(?<=\\})"
+    },
+    "caseBlock": {
+      "begin": "(?=(?<![$._[:alnum:]])@(?:case|default)\\b)",
+      "patterns": [
+        { "include": "#caseExhaustive" },
+        { "include": "#caseHeader" },
+        { "include": "#blockBody" }
+      ],
+      "end": "(?<=\\})",
+      "name": "control.block.case.ng"
+    },
+    "caseHeader": {
+      "begin": "(@)(case|default)\\b\\s*",
+      "beginCaptures": {
+        "1": { "name": "keyword.control.block.transition.ng" },
+        "2": { "name": "keyword.control.block.kind.ng" }
+      },
+      "patterns": [
+        { "include": "#blockExpression" }
+      ],
+      "end": "(?=@|{|})",
+      "name": "control.block.case.header.ng"
+    },
+    "caseExhaustive": {
+      "match": "(@)(default\\s+never)\\s*(;)",
+      "captures": {
+        "1": { "name": "keyword.control.block.transition.ng" },
+        "2": { "name": "keyword.control.block.kind.ng" },
+        "3": { "name": "punctuation.terminator.statement.ng" }
+      },
+      "name": "control.block.case.ng"
+    },
+    "blockExpression": {
+      "begin": "\\(",
+      "beginCaptures": { "0": { "name": "meta.brace.round.ts" } },
+      "contentName": "control.block.expression.ng",
+      "patterns": [
+        { "include": "#blockExpressionOfClause" },
+        { "include": "#blockExpressionLetBinding" },
+        { "include": "#blockExpressionTrackClause" },
+        { "include": "source.tsx#expression" }
+      ],
+      "end": "\\)",
+      "endCaptures": { "0": { "name": "meta.brace.round.ts" } }
+    },
+    "blockExpressionOfClause": {
+      "begin": "([_$[:alpha:]][_$[:alnum:]]*)\\s+(of)\\b",
+      "beginCaptures": {
+        "1": { "name": "variable.other.constant.ng" },
+        "2": { "name": "keyword.operator.expression.of.ng" }
+      },
+      "end": "(?=[$)])|(?<=;)",
+      "patterns": [
+        { "include": "source.tsx#expression" }
+      ]
+    },
+    "blockExpressionLetBinding": {
+      "begin": "\\blet\\b",
+      "beginCaptures": { "0": { "name": "storage.type.ng" } },
+      "end": "(?=[$)])|(?<=;)",
+      "patterns": [
+        { "include": "source.tsx#expression" }
+      ]
+    },
+    "blockExpressionTrackClause": {
+      "begin": "\\btrack\\b",
+      "beginCaptures": { "0": { "name": "keyword.control.track.ng" } },
+      "end": "(?=[$)])|(?<=;)",
+      "patterns": [
+        { "include": "source.tsx#expression" }
+      ]
+    },
+    "blockBody": {
+      "begin": "\\{",
+      "beginCaptures": { "0": { "name": "punctuation.definition.block.ts" } },
+      "end": "\\}",
+      "endCaptures": { "0": { "name": "punctuation.definition.block.ts" } },
+      "contentName": "control.block.body.ng",
+      "patterns": [
+        { "include": "#caseExhaustive" },
+        { "include": "#caseBlock" },
+        { "include": "#letDeclaration" },
+        { "include": "#block" },
+        { "include": "source.tsx" }
+      ]
+    },
+    "letDeclaration": {
+      "name": "meta.definition.variable.ng",
+      "begin": "(?<![$._[:alnum:]])(@let)\\s+([_$[:alpha:]][_$[:alnum:]]*)\\s*(=)?",
+      "beginCaptures": {
+        "1": { "name": "storage.type.ng" },
+        "2": { "name": "variable.other.constant.ng" },
+        "3": { "name": "keyword.operator.assignment.ng" }
+      },
+      "patterns": [
+        { "include": "#letInitializer" }
+      ],
+      "end": "(?<=;)"
+    },
+    "letInitializer": {
+      "begin": "\\s*",
+      "contentName": "meta.definition.variable.initializer.ng",
+      "patterns": [
+        { "include": "source.tsx#expression" }
+      ],
+      "end": ";",
+      "endCaptures": { "0": { "name": "punctuation.terminator.statement.ng" } }
+    }
+  },
+  "injections": {
+    "L:meta.tag.attributes.tsx, L:meta.tag.attributes.ts, L:JSXAttributes": {
+      "patterns": [
+        {
+          "comment": "Treat lowercase `class` as an Angular class binding name on JSX elements.",
+          "match": "(?<![-_$[:alnum:]])(class)(?=\\s*=)",
+          "captures": {
+            "1": { "name": "entity.other.attribute-name.class.tjsx entity.other.ng-binding-name.property.html" }
+          }
+        }
+      ]
+    }
+  }
+}

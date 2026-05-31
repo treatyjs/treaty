@@ -28,7 +28,10 @@ export {
 	createTreatyLanguagePlugin,
 	createTreatyVirtualCode,
 	createJsxVirtualCode,
+	createAngularHtmlVirtualCode,
+	createAngularSourceVirtualCode,
 	EMBEDDED_TS_ID,
+	EMBEDDED_HTML_ID,
 } from './language.js'
 
 export type { TreatyRegion, TreatyRegionKind } from './regions.js'

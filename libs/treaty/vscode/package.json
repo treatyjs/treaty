@@ -1,0 +1,82 @@
+{
+  "name": "@treaty/vscode",
+  "version": "0.0.1",
+  "displayName": "Treaty",
+  "description": "Language support for Treaty (.treaty / .tjsx) and Angular, powered by the Treaty language server.",
+  "publisher": "treaty",
+  "license": "IDGAF-1.0",
+  "author": "Jordan Hall",
+  "categories": [
+    "Programming Languages"
+  ],
+  "keywords": [
+    "treaty",
+    "angular",
+    "tjsx",
+    "jsx",
+    "signals"
+  ],
+  "engines": {
+    "vscode": "^1.88.0",
+    "node": ">=20.19",
+    "bun": ">=1.1"
+  },
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onLanguage:treaty",
+    "onLanguage:treaty-jsx",
+    "onLanguage:typescript",
+    "onLanguage:html"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "treaty",
+        "aliases": [
+          "Treaty"
+        ],
+        "extensions": [
+          ".treaty"
+        ],
+        "configuration": "./language-configuration.json"
+      },
+      {
+        "id": "treaty-jsx",
+        "aliases": [
+          "Treaty JSX"
+        ],
+        "extensions": [
+          ".tjsx"
+        ],
+        "configuration": "./jsx-language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "treaty",
+        "scopeName": "source.treaty",
+        "path": "./syntaxes/treaty.tmLanguage.json"
+      },
+      {
+        "language": "treaty-jsx",
+        "scopeName": "source.tjsx",
+        "path": "./syntaxes/treaty-jsx.tmLanguage.json"
+      }
+    ]
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "watch": "node scripts/build.mjs --watch",
+    "package": "vsce package"
+  },
+  "dependencies": {
+    "@treaty/lsp": "*",
+    "@volar/vscode": "~2.4.0",
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.88.0",
+    "@vscode/vsce": "latest",
+    "esbuild": "latest"
+  }
+}

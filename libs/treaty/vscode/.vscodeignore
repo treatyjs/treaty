@@ -1,0 +1,16 @@
+# Sources and build inputs (only dist/ ships)
+src/**
+scripts/**
+tsconfig.json
+tsconfig.*.json
+moon.yml
+.gitignore
+.vscodeignore
+
+# Dev/test cruft
+node_modules/**
+**/*.map
+**/*.ts
+!dist/**/*.js
+
+# Keep: dist/, syntaxes/, *language-configuration.json, README.md, package.json

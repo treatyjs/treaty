@@ -36,6 +36,12 @@ import { typeScriptRegions } from './regions.js'
 export const EMBEDDED_TS_ID = 'ts'
 
 /**
+ * Stable id of the embedded Angular-template (HTML) virtual code carried by an
+ * external `.html` Angular template's root virtual code.
+ */
+export const EMBEDDED_HTML_ID = 'html'
+
+/**
  * Full {@link CodeInformation} capability set: the embedded TypeScript is a
  * faithful projection of the source spans, so every language feature
  * (verification, completion, semantic, navigation, structure, format) maps
@@ -145,6 +151,61 @@ export function createJsxVirtualCode(
 	}
 }
 
+/**
+ * Build the volarjs {@link VirtualCode} for an external Angular template
+ * (`.html`). The whole file is an Angular HTML template, so the embedded code
+ * is the entire source mapped 1:1 under the `html` language id (the closest
+ * built-in volarjs/TS service language for an Angular template), giving it
+ * syntax highlighting and — where the downstream service supports it — checks.
+ */
+export function createAngularHtmlVirtualCode(
+	languageId: string,
+	snapshot: IScriptSnapshot,
+): VirtualCode {
+	const length = snapshot.getLength()
+	const embedded: VirtualCode = {
+		id: EMBEDDED_HTML_ID,
+		languageId: 'html',
+		snapshot,
+		mappings: [wholeDocumentMapping(length)],
+		embeddedCodes: [],
+	}
+	return {
+		id: 'root',
+		languageId,
+		snapshot,
+		mappings: [wholeDocumentMapping(length)],
+		embeddedCodes: [embedded],
+	}
+}
+
+/**
+ * Build the volarjs {@link VirtualCode} for a plain Angular component source
+ * (`.ts`): the whole file is TypeScript, so the embedded code is the entire
+ * source mapped 1:1 under the `typescript` language id, letting the standard
+ * TypeScript service cover it directly.
+ */
+export function createAngularSourceVirtualCode(
+	languageId: string,
+	snapshot: IScriptSnapshot,
+): VirtualCode {
+	const length = snapshot.getLength()
+	const embedded: VirtualCode = {
+		id: EMBEDDED_TS_ID,
+		languageId: 'typescript',
+		snapshot,
+		mappings: [wholeDocumentMapping(length)],
+		embeddedCodes: [],
+	}
+	return {
+		id: 'root',
+		languageId,
+		snapshot,
+		mappings: [wholeDocumentMapping(length)],
+		embeddedCodes: [embedded],
+	}
+}
+
 /** A single mapping covering `[0, length)` 1:1 with full capabilities. */
 function wholeDocumentMapping(length: number): CodeMapping {
 	return {
@@ -181,12 +242,19 @@ export function createTreatyLanguagePlugin<T = string>(
 
 	const byLanguageId = new Map<string, AuthoringLanguagePlugin>()
 	for (const plugin of plugins) {
-		byLanguageId.set(plugin.languageId, plugin)
+		for (const id of plugin.languageIds ?? [plugin.languageId]) {
+			byLanguageId.set(id, plugin)
+		}
 	}
 
 	return {
 		getLanguageId(scriptId: T): string | undefined {
-			return resolveByExtension(toFileName(scriptId))?.languageId
+			const fileName = toFileName(scriptId)
+			const owner = resolveByExtension(fileName)
+			if (!owner) {
+				return undefined
+			}
+			return owner.languageIdFor?.(fileName) ?? owner.languageId
 		},
 		createVirtualCode(
 			scriptId: T,

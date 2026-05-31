@@ -24,7 +24,12 @@ import type {
 	VirtualCode,
 } from '@volar/language-core'
 import type { Diagnostic } from 'vscode-languageserver'
-import { createJsxVirtualCode, createTreatyVirtualCode } from './language.js'
+import {
+	createAngularHtmlVirtualCode,
+	createAngularSourceVirtualCode,
+	createJsxVirtualCode,
+	createTreatyVirtualCode,
+} from './language.js'
 import { provideDiagnostics, type DiagnosticDocument } from './diagnostics.js'
 
 /**
@@ -57,9 +62,26 @@ export interface AuthoringLanguagePlugin<
 
 	/**
 	 * volarjs language id assigned to source scripts of this format. Mirrors
-	 * `LanguagePlugin.getLanguageId`.
+	 * `LanguagePlugin.getLanguageId`. For a format spanning more than one
+	 * extension/language id (e.g. Angular's `.html` template + `.ts` source),
+	 * this is the default; {@link languageIdFor} refines it per file and
+	 * {@link languageIds} enumerates the full set the plugin can emit.
 	 */
 	readonly languageId: string
+
+	/**
+	 * Every volarjs language id this plugin can emit from {@link languageIdFor}.
+	 * Defaults to `[languageId]` when omitted. The volarjs adapter indexes each
+	 * entry so {@link createVirtualCode} is routed for any of them.
+	 */
+	readonly languageIds?: readonly string[]
+
+	/**
+	 * Refine the volarjs language id for a specific file (by path/extension),
+	 * for formats that map distinct extensions to distinct language ids. Returns
+	 * `undefined` to fall back to {@link languageId}.
+	 */
+	languageIdFor?(fileName: string): string | undefined
 
 	/**
 	 * The {@link ServerLanguageId}s whose diagnostics this format expects to
@@ -206,8 +228,59 @@ const jsxPlugin: AuthoringLanguagePlugin = {
 	},
 }
 
+/**
+ * Plain (non-Treaty) Angular support: external `.html` Angular templates and
+ * ordinary Angular component `.ts` sources, so users can import and edit
+ * regular Angular alongside Treaty.
+ *
+ *  - `.html` → languageId `angular-html`, projected to an `html`-flavoured
+ *    embedded code mapped 1:1 (highlighting + best-effort checks).
+ *  - `.ts` → languageId `typescript`, passed through as a 1:1 TypeScript
+ *    embedded code so the standard TS service covers it. The branch is gated on
+ *    `languageId` so it never shadows volarjs' own TS handling for non-Angular
+ *    `.ts` that the registry did not route here.
+ *
+ * Diagnostics delegate to the shared {@link provideDiagnostics} path (the NAPI
+ * compile entry handles `.ts` via the Rust `AngularSourcePlugin`); a bare
+ * `.html` template is not a compilable module, so it surfaces no compiler
+ * diagnostics of its own.
+ */
+const ANGULAR_HTML_LANGUAGE_ID = 'angular-html'
+
+const angularPlugin: AuthoringLanguagePlugin = {
+	id: 'angular',
+	extensions: ['.html', '.ts'],
+	languageId: ANGULAR_HTML_LANGUAGE_ID,
+	languageIds: [ANGULAR_HTML_LANGUAGE_ID, 'typescript'],
+	languageIdFor(fileName) {
+		return normalizeExtension(extractExtension(fileName)) === '.ts'
+			? 'typescript'
+			: ANGULAR_HTML_LANGUAGE_ID
+	},
+	serverLanguages: ['server:ts'],
+	createVirtualCode(_scriptId, languageId, snapshot) {
+		if (languageId === ANGULAR_HTML_LANGUAGE_ID) {
+			return createAngularHtmlVirtualCode(languageId, snapshot)
+		}
+		if (languageId === 'typescript') {
+			return createAngularSourceVirtualCode(languageId, snapshot)
+		}
+		return undefined
+	},
+	provideDiagnostics(document, rootVirtualCode) {
+		// A bare external template is not a compilable module; only the embedded
+		// HTML highlighting applies. Angular component `.ts` delegates to the
+		// shared compiler path (compileSource → Rust AngularSourcePlugin).
+		if (document.languageId === ANGULAR_HTML_LANGUAGE_ID) {
+			return []
+		}
+		return provideDiagnostics(document, rootVirtualCode)
+	},
+}
+
 registerAuthoringLanguage(treatyPlugin)
 registerAuthoringLanguage(jsxPlugin)
+registerAuthoringLanguage(angularPlugin)
 
 const rustServerPlugin: ServerLanguagePlugin = { id: 'server:rust', lang: 'server:rust' }
 const tsServerPlugin: ServerLanguagePlugin = { id: 'server:ts', lang: 'server:ts' }
