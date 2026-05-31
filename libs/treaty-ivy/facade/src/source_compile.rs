@@ -2214,7 +2214,17 @@ fn compile_component_or_directive(
         .iter()
         .chain(view_queries.iter())
         .any(|q| q.is_signal);
-    let is_signal = inputs.iter().any(|(_, m)| m.is_signal) || has_signal_query;
+    // `signals: true` may be declared EXPLICITLY in the decorator metadata even when the
+    // class has no signal inputs/queries (Angular's signal-component opt-in). Read it as a
+    // boolean literal and OR it with the member-derived signal detection so an explicit
+    // `signals: true` forces the `signals:true` field on, and signal inputs/queries still
+    // force it on without the decorator flag.
+    let explicit_signals = obj
+        .and_then(|o| find_prop(o, "signals"))
+        .map(|e| matches!(e, Expression::BooleanLiteral(b) if b.value))
+        .unwrap_or(false);
+    let is_signal =
+        explicit_signals || inputs.iter().any(|(_, m)| m.is_signal) || has_signal_query;
 
     // Build the base directive metadata. The class-name reference carries the original
     // class-id span so the additive source map can anchor the emitted `type: <ClassName>`
@@ -2737,6 +2747,25 @@ mod tests {
         assert!(code.contains(ZWS), "no defineComponent; got: {code}");
         assert!(code.contains("inputs"), "no inputs map; got: {code}");
         assert!(code.contains("name"), "inputs missing 'name'; got: {code}");
+    }
+
+    #[test]
+    fn explicit_signals_true_emits_signals_field() {
+        // `signals: true` in the decorator with NO signal inputs/queries must still emit
+        // `signals: true` on the define block (Angular's signal-component opt-in flag).
+        let src = r#"@Component({signals:true,selector:"other-cmp",template:""}) export class OtherCmp {}"#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        assert!(out.code.contains("signals: true"), "missing signals:true; got: {}", out.code);
+    }
+
+    #[test]
+    fn signals_false_omits_signals_field() {
+        // An explicit `signals: false` (and the absence of the flag) must NOT emit the field.
+        let src = r#"@Component({signals:false,selector:"a",template:""}) export class C {}"#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        assert!(!out.code.contains("signals: true"), "unexpected signals:true; got: {}", out.code);
     }
 
     #[test]
