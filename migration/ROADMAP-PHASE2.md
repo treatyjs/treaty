@@ -6,24 +6,49 @@ with dead-code elimination + file deletion), bundler plugins for **Vite / Rspack
 **100% compliance at the core**.
 
 ## Where we are (committed this program)
-- render3 engine: direct-to-Ivy, 328+ tests; oracle 27/27; **compliance 14/98 and climbing**.
-- Authoring plugin layer: `.treaty` + JSX are peer authoring plugins → render3 (`016012f`).
-- Nova runtime (`libs/runtime`): macros/RSC (pre)render + server-fn/serverless execution (`587be2c`).
+- render3 engine: direct-to-Ivy, 361 tests; oracle 27/27; **compliance 90/98 of the runnable subset
+  (91.8%) and climbing** (last round flipped the 3 content-projection cases, `5953975`). NOTE: this is
+  the runnable subset (98 cases), NOT the full 642-case corpus (the rest are partial/ngDeclare-only,
+  multi-file, or metadata shapes the source front-end does not yet model). Do not claim 100%.
+- Authoring plugin layer: `.treaty` + JSX are peer authoring plugins → render3, with **full
+  TS-expression support in JSX lowering** (`d68ce81`).
+- **v3 source maps end-to-end for every authoring format** — the base `@Component` `.ts` path plus
+  `.treaty` and `.tsx`/`.tjsx` now all emit additive v3 maps (code byte-identical), with **server-fn
+  body privacy**: server-block bodies are redacted from client `sourcesContent` (`824f846`, `2746911`,
+  `63cb64d`).
+- **Node-compatible Rust runtime on Nova** (`libs/runtime`): `require()` + user-file CJS loader +
+  `node:` builtins (fs/path/process/buffer/os/util/events/console/timers/url/text-encoding/fetch) + an
+  event loop, via `oxc_resolver`. **265/265 tests green** (`4cb9177`). Also serves macros/RSC
+  (pre)render + server-fn/serverless execution.
 - Server fns: markers (`'use server'`/`$$`/`server:<lang>`), **registry-default binding**, **API/WebSocket/Stream**
-  transports, backends **axum (default) / Elysia / Express** (`19c7a0c`). Body never enters the Ivy.
-- LSP foundation `@treaty/lsp` (`a4e7317`). Eden `@treaty/httpclient` signal-resource client.
+  transports, backends **axum (default) / Elysia / Express**. Body never enters the Ivy.
+- **Function chunking** (`f56a0f9`): per-server-fn chunks + client bindings + a manifest, across
+  `@treaty/{vite,rspack,rsbuild,rslib}`; server bodies never enter the client graph.
+- **Module Federation toggle (default-on) + standalone-config eject** (`93d64d8`).
+- **Rust file-routing crate** `treaty_file_routing` (configurable `routes/` + `api/`, `aa7d9de`) and a
+  **Rust SSG core** `treaty_ssg` (`0011ae3`, real SSG in `0ac03bf`).
+- **Full VS Code extension + LSP** — TextMate grammars + Angular-file support (`2fa8a86`). Eden
+  `@treaty/httpclient` signal-resource client.
+- No-AI harnesses: `ngx-maintenance` migration bot (`46137ad`), `render3-sync` drift/codegen harness
+  (`ba575c8`), `dep-updater` (`ca4d63d`). Tooling moved to **tsgo + oxlint, no tsc** (`72b33f3`).
 
 ## README feature matrix → status
 | README feature | Status now | Workstream |
 |---|---|---|
-| Vite support | ✅ (existing) → upgrade to Rust file-by-file | C |
+| Vite support | ✅ | C |
+| Node support (runtime) | ✅ DONE — Node-compatible Rust runtime on Nova (265/265) | runtime |
 | SSR | ✅ | — |
-| SSG | 🚧 planned | G (prerender via Nova macros) |
-| Authoring to Ivy (direct) | ✅ (render3) | A |
-| Server-side function in component | ✅ DONE (update README) | done |
-| function chunking | 🏗️ → server-fn extraction + code-split | B/C |
-| First-class Module Federation | 🏗️ → this phase | D |
-| Build to deploy | 🚧 → bundler build outputs | C/G |
+| SSG | ✅ DONE — `treaty_ssg` Rust core (getStaticPaths, head/SEO, hydration manifest, sitemap/robots) | G |
+| File routing (base + flexible) | ✅ DONE — `treaty_file_routing` Rust crate (`routes/` + `api/`) | — |
+| Authoring to Ivy (direct) | ✅ (render3, ~90/98 runnable / 91.8%) | A |
+| JSX authoring (selectorless, full TS expressions) | ✅ DONE | — |
+| Source maps (all formats, server-body privacy) | ✅ DONE — v3 maps for .treaty/.tsx/.tjsx/.ts | — |
+| Server-side function in component | ✅ DONE | done |
+| function chunking | ✅ DONE — per-fn chunks + manifest across all 4 bundlers | B/C |
+| First-class Module Federation | ✅ DONE — auto zero-config + toggle + standalone eject | D |
+| VS Code extension + LSP | ✅ DONE — extension + grammars + Angular-file support | — |
+| Tooling (tsgo + oxlint, no tsc) | ✅ DONE | L |
+| Build to deploy | 🏗️ underway → bundler build outputs + `@treaty/deploy` | C/G |
 | Zoneless / signals-by-default / OnPush | ✅ | done |
 
 ## Workstreams (disjoint territories so they parallelize)
@@ -33,9 +58,11 @@ view compiler, `source_compile` front-end (extract the metadata the harness need
 bindings, providers, inputs/outputs), AND the file-by-file pipeline where that's what makes a case
 compile. Beyond raising the runnable pass-rate, **EXPAND the runnable set** toward the full 642 (handle
 the currently-skipped cases where a comparable golden exists). The bar: **we KNOW we can compile ANY
-app.** Iterative rounds (analyze→fan-out by disjoint file→verify), oracle stays 27. Progress: 3 → 50/98
-over 6 rounds (32dedc4). Keep going. NOTE: compliance EDITS render3, so it cannot run concurrently with
-the Rust-crate wave (K/M build render3) — interleave them.
+app.** Iterative rounds (analyze→fan-out by disjoint file→verify), oracle stays 27.
+**Status: 🏗️ underway — now 90/98 runnable (91.8%, `5953975`)**, up from 3 over ~13 rounds; not yet
+100% and the headline number is the runnable subset, not the full 642 corpus. Keep going. NOTE:
+compliance EDITS render3, so it cannot run concurrently with the Rust-crate wave (K/M build render3) —
+interleave them.
 
 **B. File-by-file compilation core** — a TS package `@treaty/compiler` wrapping the NAPI addon
 (`compileTreatyFile`/`compileComponentSource`) with: a `transform(id, code)→IvyJS` per-file API,
@@ -63,8 +90,8 @@ reimplementation). Sequenced with H (touches NAPI + render3 + core; after Wave 1
 `@treaty/vite`, `@treaty/rspack`, `@treaty/rsbuild`, `@treaty/rslib`. Per-file transform + HMR/watch +
 handle file deletion + production build (build-to-deploy output). Territory: `libs/treaty/{vite,rspack,rsbuild,rslib}` (new, disjoint per package).
 
-**D. Module Federation (latest, AUTOMATIC + zero-config — user 2026-05-30)** —
-`@module-federation/enhanced` integrated out-of-the-box across the bundler plugins (Rspack native MF;
+**D. Module Federation (latest, AUTOMATIC + zero-config — user 2026-05-30) — 🏗️ underway (toggle +
+standalone eject landed `93d64d8`):** `@module-federation/enhanced` integrated out-of-the-box across the bundler plugins (Rspack native MF;
 Vite via `@module-federation/vite`). **EVERY Treaty app is Module Federation automatically** — the user
 configures NOTHING. A `@treaty/module-federation` helper generates the host/remote config from project
 structure (no hand-written `ModuleFederationPlugin`). Wired via the Angular-CLI integration (I) so
@@ -114,8 +141,9 @@ example, with plugin output viewers. **Depends on B/C/D** (wave 2).
   vite, rspack, rsbuild, rslib, module-federation). `apps/repl` stays an app.
 - Update workspace members, NAPI dep paths, `tsconfig.base.json` paths, moon projects.
 
-**G. Remaining README features** — SSG (prerender via Nova macros at build), build-to-deploy (bundler
-production outputs), function chunking (lazy server-fn/route code-split). Mostly fall out of B/C.
+**G. Remaining README features** — SSG ✅ DONE (`treaty_ssg` Rust core), function chunking ✅ DONE
+(per-server-fn chunks + manifest across all 4 bundlers, `f56a0f9`); build-to-deploy 🏗️ underway
+(bundler production outputs + `@treaty/deploy`). Mostly fall out of B/C.
 
 **H. Performance / parallelism (first-class goal: the FASTEST compiler, user 2026-05-30)** —
 multi-thread and parallelize everywhere it is sound, since file-by-file compiles are independent:
@@ -155,7 +183,7 @@ as a NATIVE RUST binary (supersedes the wave-2 TS @treaty/cli; keep TS until Rus
 New crate (e.g. `apps/cli` or `libs/treaty/cli-rs`), depends on render3/authoring → sequence after a
 compliance round (builds against render3). See [[treaty-angular-cli-federation]], [[treaty-federation-deployment]].
 
-**L. Tooling: tsgo + oxlint, no tsc (user 2026-05-31)** — typecheck every TS package with `tsgo`
+**L. Tooling: tsgo + oxlint, no tsc (user 2026-05-31) — ✅ DONE (`72b33f3`):** typecheck every TS package with `tsgo`
 (`@typescript/native-preview`, the native/Go TypeScript compiler) and lint with `oxlint` (oxc). Sweep
 all `libs/treaty/*` `moon.yml` typecheck tasks off `tsc` -> `tsgo --noEmit`, add `oxlint` lint tasks,
 and update workflow verify steps/agent instructions to use tsgo/oxlint. Do AFTER the running TS
