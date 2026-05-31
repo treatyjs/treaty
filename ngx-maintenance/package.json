@@ -1,0 +1,22 @@
+{
+  "name": "ngx-maintenance",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Deterministic (no-AI) GitHub bot that keeps Angular libraries current and takes over unmaintained ones.",
+  "license": "MIT",
+  "workspaces": [
+    "packages/*",
+    "apps/*",
+    "angular-pkgs/*"
+  ],
+  "scripts": {
+    "build": "turbo run build",
+    "typecheck": "turbo run typecheck",
+    "lint": "turbo run lint",
+    "test": "turbo run test"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

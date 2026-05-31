@@ -1,0 +1,12 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist",
+    "typeRoots": ["../../types"],
+    "paths": {
+      "@ngx-maintenance/registry": ["../registry/src/index.ts"]
+    }
+  },
+  "include": ["src/**/*.ts", "../../types/**/*.d.ts"]
+}

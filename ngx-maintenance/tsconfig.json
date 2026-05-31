@@ -1,0 +1,10 @@
+{
+  "files": [],
+  "references": [
+    { "path": "./packages/registry/tsconfig.lib.json" },
+    { "path": "./packages/migration-engine/tsconfig.lib.json" },
+    { "path": "./packages/takeover/tsconfig.lib.json" },
+    { "path": "./packages/treaty-support/tsconfig.lib.json" },
+    { "path": "./apps/bot/tsconfig.lib.json" }
+  ]
+}

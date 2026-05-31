@@ -1,0 +1,17 @@
+{
+  "name": "@ngx-maintenance/registry",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Opted-in Angular library registry plus stale-lib discovery (behind latest Angular + >6mo inactive).",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsgo --noEmit -p tsconfig.lib.json",
+    "lint": "oxlint -c ../../.oxlintrc.json src",
+    "test": "vitest run"
+  }
+}

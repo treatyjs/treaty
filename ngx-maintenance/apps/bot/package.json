@@ -1,0 +1,28 @@
+{
+  "name": "@ngx-maintenance/bot",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "The ngx-maintenance GitHub App: webhook handlers, scheduler, PR/issue creation and the 2-week takeover timer.",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsgo --noEmit -p tsconfig.lib.json",
+    "lint": "oxlint -c ../../.oxlintrc.json src",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@ngx-maintenance/registry": "workspace:*",
+    "@ngx-maintenance/migration-engine": "workspace:*",
+    "@ngx-maintenance/takeover": "workspace:*",
+    "@ngx-maintenance/treaty-support": "workspace:*"
+  },
+  "devDependencies": {
+    "octokit": "*",
+    "@octokit/webhooks-types": "*",
+    "vitest": "^4.1.7"
+  }
+}
