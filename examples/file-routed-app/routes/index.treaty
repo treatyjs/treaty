@@ -1,0 +1,14 @@
+// Index/page route for the routes root (routes/index.treaty).
+//
+// A base name in the index set (`index` or `page`) becomes its directory's own
+// route. Under the root layout this is the empty-path ("") child -- i.e. the
+// site's landing page at URL "/".
+import { signal } from '@angular/core'
+
+const tagline = signal('A file-routed Treaty app.')
+
+<section class="hero">
+  <h1>Welcome</h1>
+  <p>{{ tagline() }}</p>
+  <a class="cta" routerLink="/blog">Read the blog →</a>
+</section>

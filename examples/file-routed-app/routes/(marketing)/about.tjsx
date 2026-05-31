@@ -1,0 +1,22 @@
+// About page in the marketing group (routes/(marketing)/about.tjsx).
+//
+// A non-index routable leaf file becomes a sibling route; its URL segment is
+// the file's base name ("about"). Authored as JSX (.tjsx): a lowercase function
+// component, used selectorlessly, lowered to a standalone signal-based Ivy
+// component.
+import { signal } from '@angular/core'
+
+export default function about() {
+	const team = signal(['Ada', 'Grace', 'Linus'])
+
+	return (
+		<section class="about">
+			<h1>About us</h1>
+			<ul>
+				@for (member of team(); track member) {
+					<li>{member}</li>
+				}
+			</ul>
+		</section>
+	)
+}

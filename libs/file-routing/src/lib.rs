@@ -16,6 +16,7 @@
 
 pub mod api;
 pub mod config;
+pub mod real_fs;
 pub mod routes;
 pub mod scanner;
 
@@ -24,6 +25,7 @@ pub use config::{
     EntryKind, FederationRemote, FileRoutingConfig, GeneratedRouting, PartialFileRoutingConfig,
     RouteNode, RoutePage,
 };
+pub use real_fs::RealFsDirTree;
 
 /// Run the full file-routing pipeline against `tree` under `config`.
 ///

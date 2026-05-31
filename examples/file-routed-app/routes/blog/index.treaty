@@ -1,0 +1,19 @@
+// Blog index (routes/blog/index.treaty).
+//
+// The blog section's own route. Under the blog layout this is the empty-path
+// child, so it renders at URL "/blog".
+import { signal } from '@angular/core'
+
+const posts = signal([
+  { slug: 'hello-world', title: 'Hello, world' },
+  { slug: 'file-routing', title: 'File routing explained' },
+])
+
+<section class="post-list">
+  <h1>All posts</h1>
+  <ul>
+    @for (post of posts(); track post.slug) {
+      <li><a [routerLink]="['/blog', post.slug]">{{ post.title }}</a></li>
+    }
+  </ul>
+</section>

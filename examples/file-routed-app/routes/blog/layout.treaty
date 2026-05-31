@@ -1,0 +1,13 @@
+// Blog section layout (routes/blog/layout.treaty).
+//
+// This `layout` makes `blog/` a nested parent route (path "blog") under the
+// root layout. The blog index, the dynamic [slug] post, and the [...path]
+// catch-all all nest as its children, each path made relative to this layout.
+
+<div class="blog-shell">
+  <aside class="blog-nav">
+    <h2>Blog</h2>
+    <a routerLink="/blog">All posts</a>
+  </aside>
+  <article class="blog-body"><router-outlet /></article>
+</div>

@@ -1,0 +1,11 @@
+// Route-group index (routes/(marketing)/index.treaty).
+//
+// A directory wrapped in parentheses is a ROUTE GROUP: it organises files
+// without (conceptually) contributing a URL segment, letting marketing pages
+// share a folder. The scanner records the group; downstream tooling flattens
+// it. This is the group's own index route.
+
+<section class="marketing-home">
+  <h1>Marketing</h1>
+  <p>Grouped marketing pages live here.</p>
+</section>

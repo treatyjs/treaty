@@ -1,0 +1,17 @@
+// Dynamic blog post (routes/blog/[slug]/index.treaty).
+//
+// A directory named `[slug]` is a DYNAMIC segment: it matches any single path
+// segment and binds it to the `slug` route parameter. Under the blog layout
+// this nests as the ":slug" child (URL "/blog/:slug"). With the default Bracket
+// style the emitted route path keeps the "[slug]" spelling.
+import { signal } from '@angular/core'
+import { input } from '@angular/core'
+
+// `slug` is bound from the route parameter (withComponentInputBinding).
+const slug = input<string>()
+const title = signal('Loading…')
+
+<article class="post">
+  <h1>{{ title() }}</h1>
+  <p class="slug">post: {{ slug() }}</p>
+</article>

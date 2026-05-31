@@ -1,0 +1,15 @@
+// Catch-all under blog (routes/blog/[...path]/index.treaty).
+//
+// `[...path]` is a CATCH-ALL (catch-all/rest) dynamic segment: it matches the
+// remaining path of any depth and binds it to the `path` parameter. The scanner
+// flags it catch-all; downstream Angular lowering maps a catch-all to a "**"
+// wildcard. Scoped inside the blog layout, it catches unknown /blog/* URLs.
+import { input } from '@angular/core'
+
+const path = input<string>()
+
+<section class="blog-fallback">
+  <h1>No such blog page</h1>
+  <p>requested: /blog/{{ path() }}</p>
+  <a routerLink="/blog">Back to the blog</a>
+</section>
