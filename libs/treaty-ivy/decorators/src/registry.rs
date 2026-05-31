@@ -6,7 +6,7 @@
 //! supplied as a [`ClassMeta`] together with the cross-class [`CompileCtx`] — into a
 //! [`CompiledDef`] (the decomposed Ivy `ɵɵdefine*` emit).
 //!
-//! The per-FILE driver in [`crate::source_compile`] scans every decorated class and dispatches
+//! The per-FILE driver in `source_compile` (in the facade crate `treaty_ivy`) scans every decorated class and dispatches
 //! each one through [`DecoratorRegistry::for_kind`] → [`DecoratorCompiler::compile`] instead of a
 //! hand-written `match`, so **adding a decorator kind is a registration, not an edit**. The
 //! concrete plugins live next to the oxc metadata extraction they delegate to (in
@@ -22,7 +22,7 @@ use crate::output_ast::{self as o, Expr, ParseSourceSpan};
 
 /// The Angular decorator kinds the front-end recognizes on a top-level class. The FIRST recognized
 /// decorator on a class wins (ngtsc's single-trait-per-class rule); see
-/// [`crate::source_compile`]'s class scan.
+/// `source_compile` (in the facade crate `treaty_ivy`)'s class scan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AngularDecoratorKind {
     Component,

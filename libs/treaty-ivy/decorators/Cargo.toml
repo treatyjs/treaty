@@ -1,0 +1,16 @@
+[package]
+name = "treaty_ivy_decorators"
+version = "0.1.0"
+edition = "2024"
+
+# The decorator -> definition layer of Treaty's direct-to-Ivy Angular compiler:
+# the compile_*_from_metadata instruction emitter, @Pipe/@NgModule emit, and the
+# DecoratorCompiler trait + DecoratorRegistry plugin join. Depends on
+# treaty_ivy_core (IR + emit) and treaty_ivy_template (template lowering, the
+# template-definition builder, query generation). Ported from Angular 22.1
+# packages/compiler.
+
+[dependencies]
+treaty_ivy_core = { path = "../core" }
+treaty_ivy_template = { path = "../template" }
+oxc_ast = "0.133.0"

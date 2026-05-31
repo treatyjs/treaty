@@ -15,12 +15,12 @@
 //!
 //! Since the IR in this crate is owned (Box/Vec/String, no arena lifetime), the metadata
 //! structs here are owned too — TS unions become Rust enums, and `{[k]: v}` maps whose
-//! emitted order is observable become [`IndexMap`].
+//! emitted order is observable become `IndexMap`.
 //!
 //! The template emission and host-binding emission are abstracted behind the [`TemplateBuilder`]
 //! trait (template) and [`HostBindingsBuilder`] trait (host bindings), keeping this orchestrator
 //! decoupled from the (large) view compiler. The production wiring lives elsewhere:
-//! [`crate::compile::RealTemplateBuilder`] drives the classic
+//! `compile::RealTemplateBuilder` (in the facade crate `treaty_ivy`) drives the classic
 //! [`crate::view::template::TemplateDefinitionBuilder`], and [`DefaultHostBindingsBuilder`]
 //! generates the `hostBindings` function + `hostAttrs`/`hostVars` directly. The trait-default
 //! [`StubTemplateBuilder`] (empty-bodied template, zero decls/vars/consts) exists only so the
@@ -575,7 +575,7 @@ pub enum Deps {
     None,
     /// `'invalid'` sentinel.
     Invalid,
-    /// Resolved dependency list (uses the factory's [`R3DependencyMetadata`]).
+    /// Resolved dependency list (uses the factory's [`crate::factory::R3DependencyMetadata`]).
     List(Vec<crate::factory::R3DependencyMetadata>),
 }
 
@@ -608,7 +608,7 @@ pub struct SpecialAttrs {
     pub class_attr: Option<String>,
 }
 
-/// `R3HostMetadata` (`api.ts`). Iteration order of the maps is emitted → [`IndexMap`].
+/// `R3HostMetadata` (`api.ts`). Iteration order of the maps is emitted → `IndexMap`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct R3HostMetadata {
     pub attributes: OrderedMap<String, Expr>,
@@ -775,7 +775,7 @@ pub struct R3ComponentMetadata<D: R3TemplateDependency> {
 
 // ---------------------------------------------------------------------------
 // Template builder abstraction. The production implementation is
-// [`crate::compile::RealTemplateBuilder`], driving
+// `compile::RealTemplateBuilder` (in the facade crate `treaty_ivy`), driving
 // [`crate::view::template::TemplateDefinitionBuilder`]; [`StubTemplateBuilder`] is the test stub.
 // ---------------------------------------------------------------------------
 
@@ -806,7 +806,7 @@ pub struct TemplateBuilderResult {
 
 /// Abstraction over template emission (`ingestComponent` → `transform` → `emitTemplateFn`).
 ///
-/// The production implementation, [`crate::compile::RealTemplateBuilder`], runs the classic
+/// The production implementation, `compile::RealTemplateBuilder` (in the facade crate `treaty_ivy`), runs the classic
 /// [`crate::view::template::TemplateDefinitionBuilder`] over the component's template nodes and
 /// returns the emitted function plus its `decls`/`vars`/`consts`/`ngContentSelectors`. The
 /// trait keeps that (large) builder out of this orchestrator and lets it be unit-tested with the

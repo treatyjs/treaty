@@ -18,7 +18,7 @@
 //!                           module, register the per-decorator plugins, dispatch each class through
 //!                           the registry, and assemble the augmented module.
 //!
-//! Depends on [`treaty_ivy_core`], [`crate::template_mod`] and [`crate::decorators`]. The crate root
+//! Depends on [`treaty_ivy_core`], [`treaty_ivy_template`] and [`crate::decorators`]. The crate root
 //! re-exports both members from their historical top-level paths (`crate::compile`,
 //! `crate::source_compile`) so every call site — inside and outside the crate (e.g.
 //! `apps/rust/authoring`) — is unchanged. The split is structural: emitted code is byte-identical.

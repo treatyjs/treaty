@@ -9,6 +9,7 @@ edition = "2024"
 [dependencies]
 treaty_ivy_core = { path = "../treaty-ivy/core" }
 treaty_ivy_template = { path = "../treaty-ivy/template" }
+treaty_ivy_decorators = { path = "../treaty-ivy/decorators" }
 oxc_allocator = "0.133.0"
 oxc_ast = "0.133.0"
 oxc_ast_visit = "0.133.0"

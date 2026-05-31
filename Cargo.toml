@@ -6,6 +6,7 @@ members = [
 	'libs/render3',
 	'libs/treaty-ivy/core',
 	'libs/treaty-ivy/template',
+	'libs/treaty-ivy/decorators',
 	'apps/rust/authoring',
 	'libs/runtime',
 	'apps/treaty-cli',

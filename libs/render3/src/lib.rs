@@ -75,20 +75,23 @@ pub use treaty_ivy_template::template;
 // instruction emitter (`compile_component_from_metadata` /
 // `compile_directive_from_metadata`), the `@Pipe`/`@NgModule` emit
 // (`pipe_module_injector`), and the `DecoratorCompiler` plugin registry that
-// joins them — now lives under `decorators/`. `compiler` is re-exported via
-// `crate::view::compiler` (from `view/mod.rs`) and `pipe_module_injector` is
-// re-exported from its historical top-level path below, so call sites outside
-// this subtree are unchanged. See `migration/RENDER3-SPLIT-PLAN.md`.
+// joins them — is now the separate crate `treaty_ivy_decorators`. It is
+// re-exported here from its historical top-level path `crate::decorators` so
+// call sites inside this (facade) crate (`crate::decorators::registry::…`) and
+// outside it (`treaty_ivy::decorators::…`) keep resolving exactly as before;
+// `compiler` is additionally re-exported via `crate::view::compiler` (from
+// `view/mod.rs`) and `pipe_module_injector` from its historical top-level path
+// below. The split is structural; emitted code is byte-identical.
 // ---------------------------------------------------------------------------
 
 /// Decorator → definition layer: the instruction emitter, `@Pipe`/`@NgModule` emit, and the
-/// per-decorator [`decorators::registry::DecoratorCompiler`] plugin registry. Depends on `core`
-/// and `template`.
-pub mod decorators;
+/// per-decorator [`treaty_ivy_decorators::registry::DecoratorCompiler`] plugin registry. Depends on
+/// `treaty_ivy_core` and `treaty_ivy_template`.
+pub use treaty_ivy_decorators as decorators;
 
 // Re-export `pipe_module_injector` from its historical top-level path so `crate::pipe_module_injector::…`
-// resolves exactly as before (the canonical path is now `crate::decorators::pipe_module_injector`).
-pub use decorators::pipe_module_injector;
+// resolves exactly as before (the canonical path is now `treaty_ivy_decorators::pipe_module_injector`).
+pub use treaty_ivy_decorators::pipe_module_injector;
 
 // `view` is now a pure compatibility facade: every member physically lives in `template_mod`
 // (`view::template` / `view::queries`) or `decorators` (`view::compiler`) and is re-exported from
