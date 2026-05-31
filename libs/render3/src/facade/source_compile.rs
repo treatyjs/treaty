@@ -14,8 +14,8 @@
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    Argument, Class, ClassElement, Decorator, Expression, ObjectPropertyKind, Program,
-    PropertyDefinition, PropertyKey, Statement,
+    Argument, Class, ClassElement, Decorator, Expression, MethodDefinitionKind, ObjectPropertyKind,
+    Program, PropertyDefinition, PropertyKey, Statement, TSType, TSTypeName,
 };
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType};
@@ -25,8 +25,9 @@ use crate::decorators::registry::{
     AngularDecoratorKind, ClassMeta, CompileCtx, DecoratorCompiler, DecoratorRegistry,
 };
 use crate::factory::{
-    compile_factory_function, FactoryDeps, FactoryTarget, R3ConstructorFactoryMetadata,
-    R3FactoryMetadata,
+    compile_factory_function, compile_injectable, FactoryDeps, FactoryTarget, ForwardRefHandling,
+    MaybeForwardRef, R3ConstructorFactoryMetadata, R3DependencyMetadata, R3FactoryMetadata,
+    R3InjectableMetadata,
 };
 use crate::identifiers::R3;
 use crate::output_ast::{self as o, Expr, FnParam, LiteralValue, ParseSourceSpan};
@@ -1227,17 +1228,129 @@ fn statement_class<'a>(stmt: &'a Statement<'a>) -> Option<&'a Class<'a>> {
 /// assembly path read unchanged.
 use crate::decorators::registry::CompiledDef as ClassEmit;
 
-/// Build a no-dependency constructor [`R3FactoryMetadata`] for a source-front-end class. The SOURCE
-/// front-end does not yet resolve constructor parameters, so the emitted `ɵfac` is the empty-deps
-/// form Angular generates for a parameterless constructor: `function X_Factory(t) { return new (t || X)(); }`.
-fn empty_factory(class_name: &str, target: FactoryTarget) -> R3FactoryMetadata {
+/// Build the constructor [`R3FactoryMetadata`] for a source-front-end class, reading the class's
+/// constructor parameters (their token type + `@Inject`/`@Optional`/`@Self`/`@SkipSelf`/`@Host`/
+/// `@Attribute` qualifiers) so the emitted `ɵfac` injects each dependency. A class with no
+/// constructor (or a parameterless one) yields the empty-deps form Angular generates for a
+/// parameterless constructor: `function X_Factory(t) { return new (t || X)(); }`.
+fn class_factory(class: &Class, class_name: &str, target: FactoryTarget) -> R3FactoryMetadata {
     R3FactoryMetadata::Constructor(R3ConstructorFactoryMetadata {
         name: class_name.to_string(),
         ty: directive_ref(class_name),
         type_argument_count: 0,
-        deps: FactoryDeps::Deps(Vec::new()),
+        deps: extract_ctor_deps(class),
         target,
     })
+}
+
+/// Resolve a class's constructor dependencies into the factory [`FactoryDeps`] tri-state, faithful
+/// to ngtsc's `getConstructorDependencies` over the surface syntax:
+///   * no constructor (declaration-only / parameterless) → `Deps([])` (the empty-deps form);
+///   * each parameter's TOKEN is its type-reference identifier (`dep: Foo` → `Foo`), overridable by
+///     an `@Inject(TOKEN)` param decorator; `@Attribute('name')` instead injects the literal name;
+///   * `@Optional`/`@Self`/`@SkipSelf`/`@Host` param decorators set the matching qualifier flags;
+///   * a parameter whose token cannot be resolved (no usable type, no `@Inject`/`@Attribute`) makes
+///     the dep token `None`, which the factory codegen lowers to `ɵɵinvalidFactoryDep(index)`.
+///
+/// Constructor overloads (TS allows several signatures, only the LAST having a body) are folded by
+/// oxc into a single `MethodDefinition`; we read the implementation signature (the one with params)
+/// — the bodiless overload signatures carry no `FormalParameter` items.
+fn extract_ctor_deps(class: &Class) -> FactoryDeps {
+    // Find the constructor's implementation signature: the `MethodDefinition` of kind
+    // `Constructor` that actually declares parameters (the bodiless overloads have none).
+    let ctor = class.body.body.iter().find_map(|element| match element {
+        ClassElement::MethodDefinition(m)
+            if m.kind == MethodDefinitionKind::Constructor && !m.value.params.items.is_empty() =>
+        {
+            Some(m)
+        }
+        _ => None,
+    });
+
+    let Some(ctor) = ctor else {
+        return FactoryDeps::Deps(Vec::new());
+    };
+
+    let deps = ctor
+        .value
+        .params
+        .items
+        .iter()
+        .map(extract_ctor_dep)
+        .collect();
+    FactoryDeps::Deps(deps)
+}
+
+/// Resolve a single constructor parameter into its [`R3DependencyMetadata`].
+fn extract_ctor_dep(param: &oxc_ast::ast::FormalParameter) -> R3DependencyMetadata {
+    let mut dep = R3DependencyMetadata::default();
+
+    // The default token is the parameter's declared type (a type-reference identifier).
+    dep.token = param
+        .type_annotation
+        .as_ref()
+        .and_then(|ann| type_token_expr(&ann.type_annotation));
+
+    // Param decorators refine the dependency: `@Inject(TOKEN)` overrides the token, `@Attribute`
+    // switches to attribute injection, and `@Optional`/`@Self`/`@SkipSelf`/`@Host` set qualifiers.
+    for decorator in &param.decorators {
+        match decorator_name(decorator) {
+            Some("Inject") => {
+                if let Some(token) = decorator_first_arg_expr(decorator) {
+                    dep.token = Some(token);
+                }
+            }
+            Some("Attribute") => {
+                // `@Attribute('name')` injects the attribute value by its literal name; the token IS
+                // that string literal. The `attribute_name_type` (typings-only) carries the same.
+                if let Some(name) = decorator_first_arg_expr(decorator) {
+                    dep.attribute_name_type = Some(name.clone());
+                    dep.token = Some(name);
+                }
+            }
+            Some("Optional") => dep.optional = true,
+            Some("Self") => dep.self_ = true,
+            Some("SkipSelf") => dep.skip_self = true,
+            Some("Host") => dep.host = true,
+            _ => {}
+        }
+    }
+
+    dep
+}
+
+/// The injection-token expression for a constructor parameter's declared type. A bare type
+/// reference `Foo` (or qualified `ns.Foo`) becomes a value read of that name (the imported symbol
+/// Angular injects). Non-reference types (primitives, unions, `any`, …) carry no usable token.
+fn type_token_expr(ty: &TSType) -> Option<Expr> {
+    let TSType::TSTypeReference(reference) = ty else {
+        return None;
+    };
+    type_name_expr(&reference.type_name)
+}
+
+/// Lower a `TSTypeName` (`Foo` / `ns.Foo` / `a.b.C`) to its value-read expression. `this` types
+/// carry no injectable token.
+fn type_name_expr(name: &TSTypeName) -> Option<Expr> {
+    match name {
+        TSTypeName::IdentifierReference(id) => Some(o::variable(id.name.to_string(), None)),
+        TSTypeName::QualifiedName(q) => {
+            let object = type_name_expr(&q.left)?;
+            Some(object.prop(q.right.name.as_str()))
+        }
+        TSTypeName::ThisExpression(_) => None,
+    }
+}
+
+/// The first call-argument of a param decorator `@Foo(arg)` lowered to an [`Expr`]
+/// (`@Inject(TOKEN)` / `@Attribute('name')`). Returns `None` for a bare decorator or an
+/// unconvertible argument.
+fn decorator_first_arg_expr(dec: &Decorator) -> Option<Expr> {
+    let Expression::CallExpression(call) = &dec.expression else {
+        return None;
+    };
+    let arg = call.arguments.first()?.as_expression()?;
+    convert_expr(arg)
 }
 
 /// Lower a [`ClassEmit`] into the `output_ast` statements appended AFTER its kept class declaration:
@@ -1673,7 +1786,7 @@ impl DecoratorCompiler for PipeCompiler {
         AngularDecoratorKind::Pipe
     }
     fn compile(&self, c: &ClassMeta, _ctx: &CompileCtx) -> Result<ClassEmit, String> {
-        compile_pipe_class(c.object, &c.class_name)
+        compile_pipe_class(c.class, c.object, &c.class_name)
     }
 }
 
@@ -1685,22 +1798,214 @@ impl DecoratorCompiler for NgModuleCompiler {
         AngularDecoratorKind::NgModule
     }
     fn compile(&self, c: &ClassMeta, _ctx: &CompileCtx) -> Result<ClassEmit, String> {
-        compile_ng_module_class(c.object, &c.class_name)
+        compile_ng_module_class(c.class, c.object, &c.class_name)
     }
 }
 
-/// `@Injectable`. The injectable `ɵfac`/`ɵprov` factory + provider emit lives in the factory
-/// compiler, out of this template-facing front-end's scope; the plugin exists so the kind is a
-/// registered (extensible) entry rather than an inline `unreachable!`, and reports the gap as a
-/// fatal diagnostic exactly as the prior `match` arm did.
+/// `@Injectable` → `ɵfac` + `X.ɵprov = i0.ɵɵdefineInjectable({token, factory[, providedIn]})`.
+/// Reads the `@Injectable({providedIn, useClass, useFactory, useValue, useExisting, deps})` options
+/// and drives [`compile_injectable`] for the provider definition; the matching `ɵfac` carries the
+/// class's resolved constructor dependencies (target `Injectable` → `ɵɵinject`).
 struct InjectableCompiler;
 impl DecoratorCompiler for InjectableCompiler {
     fn kind(&self) -> AngularDecoratorKind {
         AngularDecoratorKind::Injectable
     }
-    fn compile(&self, _c: &ClassMeta, _ctx: &CompileCtx) -> Result<ClassEmit, String> {
-        Err("@Injectable emission not yet supported by the source front-end".to_string())
+    fn compile(&self, c: &ClassMeta, _ctx: &CompileCtx) -> Result<ClassEmit, String> {
+        compile_injectable_class(c.class, c.object, &c.class_name)
     }
+}
+
+/// Build the `@Injectable` class's `ɵprov` provider definition + `ɵfac` factory.
+///
+/// The provider `factory` is derived from the `use*` option present on `@Injectable({...})`
+/// (`useClass`/`useFactory`/`useValue`/`useExisting`, else the default delegation to the class's own
+/// `ɵfac`); `providedIn` (a string, a type reference, or a `forwardRef(() => Mod)`) is emitted when
+/// present. `deps: [...]` (only meaningful with `useClass`/`useFactory`) is read as an array of
+/// `{token, qualifiers}` entries faithful to ngtsc's `getInjectableMetadata`. The `ɵfac` injects the
+/// CONSTRUCTOR dependencies (independent of the provider `use*` choice).
+fn compile_injectable_class(
+    class: &Class,
+    obj: Option<&oxc_ast::ast::ObjectExpression>,
+    class_name: &str,
+) -> Result<ClassEmit, String> {
+    // `providedIn` — a `null`-literal value means "not provided" (guards the key's emission).
+    let provided_in = match obj.and_then(|o| find_prop(o, "providedIn")) {
+        Some(expr) => injectable_maybe_forward_ref(expr)
+            .ok_or_else(|| "unsupported `providedIn` expression form".to_string())?,
+        None => MaybeForwardRef::none(o::null_expr()),
+    };
+
+    // `deps: [...]` — explicit provider dependencies for `useClass`/`useFactory`. Present-but-empty
+    // (`deps: []`) is distinct from absent (`None`); each entry is a token or a `[token, ...flags]`
+    // array (`new Optional()` &c.), faithful to ngtsc's `getDeps`.
+    let deps = match obj.and_then(|o| find_prop(o, "deps")) {
+        Some(expr) => Some(parse_injectable_deps(expr)?),
+        None => None,
+    };
+
+    let use_class = injectable_use_option(obj, "useClass")?;
+    let use_existing = injectable_use_option(obj, "useExisting")?;
+    let use_value = injectable_use_option(obj, "useValue")?;
+    let use_factory = match obj.and_then(|o| find_prop(o, "useFactory")) {
+        Some(expr) => Some(convert_expr(expr).ok_or_else(|| {
+            "unsupported `useFactory` expression form".to_string()
+        })?),
+        None => None,
+    };
+
+    let meta = R3InjectableMetadata {
+        name: class_name.to_string(),
+        ty: directive_ref(class_name),
+        type_argument_count: 0,
+        provided_in,
+        use_class,
+        use_factory,
+        use_existing,
+        use_value,
+        deps,
+    };
+
+    // `resolveForwardRefs = false` — a `forwardRef(() => X)` carried verbatim into the metadata
+    // (`ForwardRefHandling::Wrapped`) is emitted as-is; nothing here needs the unwrap-and-rewrap path.
+    let compiled = compile_injectable(&meta, false);
+
+    Ok(ClassEmit {
+        class_name: class_name.to_string(),
+        static_member: "\u{0275}prov",
+        def_expression: compiled.expression,
+        extra_statements: compiled.statements,
+        extra_after_def: false,
+        factory: Some(class_factory(class, class_name, FactoryTarget::Injectable)),
+        errors: Vec::new(),
+    })
+}
+
+/// Read a `useClass`/`useExisting`/`useValue` option into a [`MaybeForwardRef`] (the value plus
+/// whether it was a `forwardRef(() => …)`). Absent → `None`; unconvertible → `Err`.
+fn injectable_use_option(
+    obj: Option<&oxc_ast::ast::ObjectExpression>,
+    key: &str,
+) -> Result<Option<MaybeForwardRef>, String> {
+    match obj.and_then(|o| find_prop(o, key)) {
+        None => Ok(None),
+        Some(expr) => injectable_maybe_forward_ref(expr)
+            .map(Some)
+            .ok_or_else(|| format!("unsupported `{key}` expression form")),
+    }
+}
+
+/// Lower an `@Injectable` token-ish option (`providedIn`/`useClass`/`useExisting`/`useValue`) into a
+/// [`MaybeForwardRef`]. A `forwardRef(() => X)` is recognised and carried as `Wrapped` (re-emitted
+/// verbatim); any other convertible expression is `None`-wrapped. Returns `None` when the expression
+/// cannot be converted.
+fn injectable_maybe_forward_ref(expr: &Expression) -> Option<MaybeForwardRef> {
+    if is_forward_ref_call(expr) {
+        return convert_expr(expr).map(|expression| MaybeForwardRef {
+            expression,
+            forward_ref: ForwardRefHandling::Wrapped,
+        });
+    }
+    convert_expr(expr).map(MaybeForwardRef::none)
+}
+
+/// Whether `expr` is a `forwardRef(() => …)` call.
+fn is_forward_ref_call(expr: &Expression) -> bool {
+    match expr {
+        Expression::ParenthesizedExpression(p) => is_forward_ref_call(&p.expression),
+        Expression::CallExpression(call) => {
+            matches!(&call.callee, Expression::Identifier(id) if id.name == "forwardRef")
+        }
+        _ => false,
+    }
+}
+
+/// Parse an `@Injectable({deps: [...]})` array into [`R3DependencyMetadata`]. Each element is either
+/// a bare token (`Dep`) or a `[token, new Optional(), new SkipSelf(), …]` array whose trailing
+/// entries are `new Optional()`/`new Self()`/`new SkipSelf()`/`new Host()` qualifier markers, or a
+/// `new Attribute('name')` token. Faithful to ngtsc's `getDeps`/`getDep`.
+fn parse_injectable_deps(expr: &Expression) -> Result<Vec<R3DependencyMetadata>, String> {
+    let Expression::ArrayExpression(arr) = expr else {
+        return Err("`deps` must be an array literal".to_string());
+    };
+    let mut out = Vec::new();
+    for el in &arr.elements {
+        let Some(inner) = el.as_expression() else {
+            continue;
+        };
+        out.push(parse_injectable_dep(inner)?);
+    }
+    Ok(out)
+}
+
+/// Parse a single `@Injectable` `deps` entry into [`R3DependencyMetadata`].
+fn parse_injectable_dep(expr: &Expression) -> Result<R3DependencyMetadata, String> {
+    // `[token, ...qualifier-markers]`.
+    if let Expression::ArrayExpression(arr) = expr {
+        let mut dep = R3DependencyMetadata::default();
+        let mut first = true;
+        for el in &arr.elements {
+            let Some(inner) = el.as_expression() else {
+                continue;
+            };
+            if first {
+                dep = injectable_dep_token(inner)?;
+                first = false;
+                continue;
+            }
+            apply_injectable_dep_marker(inner, &mut dep);
+        }
+        return Ok(dep);
+    }
+    // A bare token.
+    injectable_dep_token(expr)
+}
+
+/// The token for an `@Injectable` `deps` entry: `new Attribute('name')` → attribute injection;
+/// otherwise the convertible token expression.
+fn injectable_dep_token(expr: &Expression) -> Result<R3DependencyMetadata, String> {
+    if let Expression::NewExpression(new_expr) = expr {
+        if new_expr_callee_is(new_expr, "Attribute") {
+            let name = new_expr
+                .arguments
+                .first()
+                .and_then(|a| a.as_expression())
+                .and_then(convert_expr);
+            return Ok(R3DependencyMetadata {
+                token: name.clone(),
+                attribute_name_type: name,
+                ..Default::default()
+            });
+        }
+    }
+    let token = convert_expr(expr)
+        .ok_or_else(|| "unsupported `deps` token expression form".to_string())?;
+    Ok(R3DependencyMetadata {
+        token: Some(token),
+        ..Default::default()
+    })
+}
+
+/// Apply a trailing `@Injectable` `deps` qualifier marker (`new Optional()`/`new Self()`/
+/// `new SkipSelf()`/`new Host()`) to the dependency.
+fn apply_injectable_dep_marker(expr: &Expression, dep: &mut R3DependencyMetadata) {
+    let Expression::NewExpression(new_expr) = expr else {
+        return;
+    };
+    if new_expr_callee_is(new_expr, "Optional") {
+        dep.optional = true;
+    } else if new_expr_callee_is(new_expr, "Self") {
+        dep.self_ = true;
+    } else if new_expr_callee_is(new_expr, "SkipSelf") {
+        dep.skip_self = true;
+    } else if new_expr_callee_is(new_expr, "Host") {
+        dep.host = true;
+    }
+}
+
+/// Whether a `new X(...)` expression's callee is the bare identifier `name`.
+fn new_expr_callee_is(new_expr: &oxc_ast::ast::NewExpression, name: &str) -> bool {
+    matches!(&new_expr.callee, Expression::Identifier(id) if id.name == name)
 }
 
 /// The default decorator-compiler registry: one plugin per recognized kind. Adding support for a
@@ -1950,6 +2255,7 @@ fn compile_component_or_directive(
                 .filter(|d| d.name != class_name)
                 .cloned()
                 .collect();
+            let factory = class_factory(class, &class_name, FactoryTarget::Component);
             compile_component_meta(
                 base,
                 &template_html.unwrap_or_default(),
@@ -1961,6 +2267,7 @@ fn compile_component_or_directive(
                 animations,
                 foreign_imports,
                 view_providers,
+                factory,
             )
         }
         // R4: @Directive — drive the existing `compile_directive_from_metadata` emitter (no
@@ -1975,7 +2282,8 @@ fn compile_component_or_directive(
                 foreign_imports,
                 view_providers,
             );
-            compile_directive_meta(base)
+            let factory = class_factory(class, &class_name, FactoryTarget::Directive);
+            compile_directive_meta(base, factory)
         }
         _ => unreachable!("compile_component_or_directive only handles Component/Directive"),
     }
@@ -1984,7 +2292,10 @@ fn compile_component_or_directive(
 /// R4: emit a `@Directive` class via the existing [`compile_directive_from_metadata`] +
 /// [`DefaultHostBindingsBuilder`]. The hoisted query-predicate `_cN` pool consts are printed
 /// before the `ɵɵdefineDirective({...})` expression, mirroring the component path.
-fn compile_directive_meta(base: R3DirectiveMetadata) -> Result<ClassEmit, String> {
+fn compile_directive_meta(
+    base: R3DirectiveMetadata,
+    factory: R3FactoryMetadata,
+) -> Result<ClassEmit, String> {
     let class_name = base.name.clone();
     let mut host_builder = DefaultHostBindingsBuilder;
     let compiled = compile_directive_from_metadata(&base, &mut host_builder);
@@ -1995,13 +2306,14 @@ fn compile_directive_meta(base: R3DirectiveMetadata) -> Result<ClassEmit, String
         def_expression: compiled.expression,
         extra_statements: compiled.statements,
         extra_after_def: false,
-        factory: Some(empty_factory(&class_name, FactoryTarget::Directive)),
+        factory: Some(factory),
         errors: Vec::new(),
     })
 }
 
 /// R4: emit a `@Pipe({name, pure?, standalone?})` class via [`compile_pipe_from_metadata`].
 fn compile_pipe_class(
+    class: &Class,
     obj: Option<&oxc_ast::ast::ObjectExpression>,
     class_name: &str,
 ) -> Result<ClassEmit, String> {
@@ -2035,7 +2347,7 @@ fn compile_pipe_class(
         def_expression: compiled.expression,
         extra_statements: compiled.statements,
         extra_after_def: false,
-        factory: Some(empty_factory(class_name, FactoryTarget::Pipe)),
+        factory: Some(class_factory(class, class_name, FactoryTarget::Pipe)),
         errors: Vec::new(),
     })
 }
@@ -2047,6 +2359,7 @@ fn compile_pipe_class(
 /// (`R3SelectorScopeMode::SideEffect`), and an `@NgModule({id})` additionally drives a trailing
 /// `ɵɵregisterNgModuleType(Type, id)` statement.
 fn compile_ng_module_class(
+    class: &Class,
     obj: Option<&oxc_ast::ast::ObjectExpression>,
     class_name: &str,
 ) -> Result<ClassEmit, String> {
@@ -2099,7 +2412,7 @@ fn compile_ng_module_class(
         // statements; they belong AFTER the class's `ɵmod` assignment.
         extra_statements: compiled.statements,
         extra_after_def: true,
-        factory: Some(empty_factory(class_name, FactoryTarget::NgModule)),
+        factory: Some(class_factory(class, class_name, FactoryTarget::NgModule)),
         errors: Vec::new(),
     })
 }
@@ -2273,6 +2586,7 @@ fn compile_component_meta(
     animations: Option<Expr>,
     foreign_imports: Option<Vec<R3ForeignComponentMetadata>>,
     view_providers: Option<Expr>,
+    factory: R3FactoryMetadata,
 ) -> Result<ClassEmit, String> {
     let class_name = base.name.clone();
     let mut errors: Vec<String> = Vec::new();
@@ -2378,7 +2692,7 @@ fn compile_component_meta(
         def_expression: compiled.expression,
         extra_statements: pool_statements,
         extra_after_def: false,
-        factory: Some(empty_factory(&class_name, FactoryTarget::Component)),
+        factory: Some(factory),
         errors,
     })
 }
@@ -3316,6 +3630,119 @@ export class BCmp {}
             "i0 import not at top; got: {code}"
         );
         assert!(code.contains("export class C"), "class not kept; got: {code}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Constructor-dependency injection (`ɵfac`) + `@Injectable` (`ɵprov`).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn component_ctor_dep_factory_injects_each_dependency() {
+        // A component with two constructor deps emits a `ɵfac` that constructs the class with
+        // `ɵɵdirectiveInject(<Token>)` per parameter (component target → directiveInject).
+        let src = r#"@Component({selector:"a",template:"<div></div>"})
+            export class C { constructor(a: ServiceA, b: ServiceB) {} }"#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let flat = normalize_ws(&out.code);
+        assert!(
+            flat.contains("function C_Factory(__ngFactoryType__) { return new (__ngFactoryType__ || C)(i0.\u{0275}\u{0275}directiveInject(ServiceA), i0.\u{0275}\u{0275}directiveInject(ServiceB)); }"),
+            "expected two-dep directiveInject factory; got: {flat}"
+        );
+        // The complete emitted module must still parse.
+        assert_parses(&out.code);
+    }
+
+    #[test]
+    fn component_optional_dep_emits_inject_flags() {
+        // `@Optional()` on a ctor param surfaces as the `8` (OPTIONAL) InjectFlags 2nd argument.
+        let src = r#"@Component({selector:"a",template:"<div></div>"})
+            export class C { constructor(@Optional() dep: Token) {} }"#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let flat = normalize_ws(&out.code);
+        assert!(
+            flat.contains("i0.\u{0275}\u{0275}directiveInject(Token, 8)"),
+            "expected OPTIONAL flag (8) on the inject call; got: {flat}"
+        );
+    }
+
+    #[test]
+    fn directive_inject_token_overrides_param_type() {
+        // `@Inject(TOKEN)` overrides the parameter's declared type as the injection token.
+        let src = r#"@Directive({selector:"[a]"})
+            export class D { constructor(@Inject(MY_TOKEN) value: string) {} }"#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let flat = normalize_ws(&out.code);
+        assert!(
+            flat.contains("i0.\u{0275}\u{0275}directiveInject(MY_TOKEN)"),
+            "expected @Inject token override; got: {flat}"
+        );
+    }
+
+    #[test]
+    fn attribute_dep_uses_inject_attribute() {
+        // `@Attribute('name')` injects the attribute by literal name via `ɵɵinjectAttribute`.
+        let src = r#"@Directive({selector:"[a]"})
+            export class D { constructor(@Attribute("title") t: string) {} }"#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let flat = normalize_ws(&out.code);
+        assert!(
+            flat.contains("i0.\u{0275}\u{0275}injectAttribute(\"title\")"),
+            "expected injectAttribute; got: {flat}"
+        );
+    }
+
+    #[test]
+    fn injectable_provided_in_root_emits_define_injectable() {
+        // `@Injectable({providedIn:'root'})` emits the `ɵfac` + `ɵprov = ɵɵdefineInjectable(...)`.
+        let src = r#"@Injectable({providedIn:"root"})
+            export class MyService { constructor(dep: Dep) {} }"#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let flat = normalize_ws(&out.code);
+        // ɵfac with the ctor dep via ɵɵinject (injectable target, NOT directiveInject).
+        assert!(
+            flat.contains("function MyService_Factory(__ngFactoryType__) { return new (__ngFactoryType__ || MyService)(i0.\u{0275}\u{0275}inject(Dep)); }"),
+            "expected ɵfac injecting the ctor dep via ɵɵinject; got: {flat}"
+        );
+        assert!(flat.contains("MyService.\u{0275}fac ="), "no ɵfac assignment; got: {flat}");
+        // ɵprov = ɵɵdefineInjectable({token, factory, providedIn}).
+        assert!(
+            flat.contains("MyService.\u{0275}prov = /*@__PURE__*/ i0.\u{0275}\u{0275}defineInjectable({ token: MyService, factory: MyService.\u{0275}fac, providedIn: \"root\" })")
+            || flat.contains("MyService.\u{0275}prov = i0.\u{0275}\u{0275}defineInjectable({ token: MyService, factory: MyService.\u{0275}fac, providedIn: \"root\" })"),
+            "expected ɵprov defineInjectable with providedIn root; got: {flat}"
+        );
+        assert_parses(&out.code);
+    }
+
+    #[test]
+    fn injectable_no_provided_in_omits_key() {
+        // A bare `@Injectable()` emits `ɵprov` delegating to its own `ɵfac`, no `providedIn` key.
+        let src = r#"@Injectable() export class MyService {}"#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let flat = normalize_ws(&out.code);
+        assert!(
+            flat.contains("\u{0275}\u{0275}defineInjectable({ token: MyService, factory: MyService.\u{0275}fac })"),
+            "expected default defineInjectable without providedIn; got: {flat}"
+        );
+        assert!(!flat.contains("providedIn"), "providedIn must be omitted; got: {flat}");
+    }
+
+    #[test]
+    fn no_ctor_factory_stays_empty() {
+        // A class with no constructor still emits the empty-deps factory form.
+        let src = r#"@Component({selector:"a",template:"<div></div>"}) export class C {}"#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let flat = normalize_ws(&out.code);
+        assert!(
+            flat.contains("function C_Factory(__ngFactoryType__) { return new (__ngFactoryType__ || C)(); }"),
+            "expected empty-deps factory; got: {flat}"
+        );
     }
 }
 
