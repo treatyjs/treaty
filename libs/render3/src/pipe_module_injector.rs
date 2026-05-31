@@ -338,30 +338,18 @@ pub fn compile_ng_module(meta: &R3NgModuleMetadata) -> R3CompiledExpression {
     }
 
     match common.selector_scope_mode {
-        R3SelectorScopeMode::Inline => {
-            // declarations/imports/exports exist only on Global.
-            if let R3NgModuleMetadata::Global(g) = meta {
-                if !g.declarations.is_empty() {
-                    definition_map.set(
-                        "declarations",
-                        Some(refs_to_array(&g.declarations, g.contains_forward_decls)),
-                    );
-                }
-                if !g.imports.is_empty() {
-                    definition_map.set(
-                        "imports",
-                        Some(refs_to_array(&g.imports, g.contains_forward_decls)),
-                    );
-                }
-                if !g.exports.is_empty() {
-                    definition_map.set(
-                        "exports",
-                        Some(refs_to_array(&g.exports, g.contains_forward_decls)),
-                    );
-                }
-            }
-        }
-        R3SelectorScopeMode::SideEffect => {
+        // Scope emission. Both `Inline` and `SideEffect` route the selector scope
+        // (declarations/imports/exports) through the `ngJitMode`-guarded `ɵɵsetNgModuleScope` side
+        // effect rather than inlining it into the `ɵɵdefineNgModule({...})` call.
+        //
+        // Angular's `Inline` mode literally inlines the scope arrays (a JIT-only, tree-shaking-
+        // hostile form). It is never used for the **Global** (full/partial AOT) kind that the source
+        // front-end produces: the full/local goldens emit `ɵɵdefineNgModule({type[, bootstrap]
+        // [, id]})` with the scope in a separate guarded `ɵɵsetNgModuleScope` so unused declarations
+        // can be tree-shaken. The genuine JIT-inline facade has its own emitter
+        // (`compile_ng_module_declaration_expression`). Treating `Inline` and `SideEffect`
+        // identically here makes the AOT module def match Angular's full/local define-block shape.
+        R3SelectorScopeMode::Inline | R3SelectorScopeMode::SideEffect => {
             if let Some(call) = generate_set_ng_module_scope_call(meta) {
                 statements.push(call);
             }
@@ -899,13 +887,15 @@ mod tests {
             compiled.expression.kind,
             ExprKind::Invoke { pure: true, .. }
         ));
-        // Inline mode -> no side-effect statements (no id, no SideEffect scope).
-        assert!(compiled.statements.is_empty());
+        // Global modules route their selector scope to a guarded `ɵɵsetNgModuleScope` side effect
+        // (full/local AOT shape) under BOTH `Inline` and `SideEffect`, so a non-empty
+        // declarations/imports set produces exactly one IIFE side-effect statement.
+        assert_eq!(compiled.statements.len(), 1);
 
         let entries = map_entries_of_call_arg(&compiled.expression);
         let keys: Vec<&str> = entries.iter().map(|(k, _)| k.as_str()).collect();
-        // type, then declarations + imports (exports empty -> omitted; bootstrap empty -> omitted).
-        assert_eq!(keys, vec!["type", "declarations", "imports"]);
+        // The define block carries ONLY `type` (bootstrap empty -> omitted; scope is side-effected).
+        assert_eq!(keys, vec!["type"]);
     }
 
     #[test]
@@ -964,6 +954,55 @@ mod tests {
         let entries = map_entries_of_call_arg(&compiled.expression);
         let keys: Vec<&str> = entries.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(keys, vec!["type"]);
+    }
+
+    /// Full-compile emit (the shape Angular's full/local goldens carry, e.g. `all_options.ts` /
+    /// `basic_full.ts`): a `SideEffect` scope module that ALSO has `bootstrap` + `id`. The
+    /// `ɵɵdefineNgModule` call must carry ONLY `{type, bootstrap, id}` — declarations/imports/
+    /// exports are routed to the `ɵɵsetNgModuleScope` side effect (NOT inlined) and an `id`
+    /// additionally drives a trailing `ɵɵregisterNgModuleType(Type, id)` statement.
+    #[test]
+    fn full_mode_define_carries_only_type_bootstrap_id() {
+        let meta = R3NgModuleMetadata::Global(R3NgModuleMetadataGlobal {
+            common: R3NgModuleCommon {
+                r#type: ref_to("MyModule"),
+                selector_scope_mode: R3SelectorScopeMode::SideEffect,
+                schemas: None,
+                id: Some(literal(LiteralValue::String("my-module-id".to_string()), None)),
+            },
+            bootstrap: vec![ref_to("MyBootstrap")],
+            declarations: vec![ref_to("MyDecl"), ref_to("MyExport")],
+            public_declaration_types: None,
+            imports: vec![ref_to("MyImport")],
+            include_import_types: true,
+            exports: vec![ref_to("MyExport")],
+            contains_forward_decls: false,
+        });
+        let compiled = compile_ng_module(&meta);
+
+        // The define block carries ONLY type + bootstrap + id — never inline scope arrays.
+        let entries = map_entries_of_call_arg(&compiled.expression);
+        let keys: Vec<&str> = entries.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["type", "bootstrap", "id"]);
+
+        // Two side effects, in order: the JIT-guarded setNgModuleScope IIFE, then the
+        // registerNgModuleType(type, id) call.
+        assert_eq!(compiled.statements.len(), 2);
+        match &compiled.statements[0].kind {
+            crate::output_ast::StmtKind::Expression(e) => match &e.kind {
+                ExprKind::Invoke { callee, .. } => {
+                    assert!(matches!(callee.kind, ExprKind::Function { .. }));
+                }
+                other => panic!("expected IIFE invoke, got {other:?}"),
+            },
+            other => panic!("expected expr stmt, got {other:?}"),
+        }
+        match &compiled.statements[1].kind {
+            crate::output_ast::StmtKind::Expression(e) => {
+                assert_eq!(callee_ref(e).name, "ɵɵregisterNgModuleType");
+            }
+            other => panic!("expected register expr stmt, got {other:?}"),
+        }
     }
 
     #[test]

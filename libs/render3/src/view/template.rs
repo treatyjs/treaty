@@ -4745,6 +4745,36 @@ impl TemplateDefinitionBuilder {
         (o::variable(fn_name, None), decls, vars)
     }
 
+    /// Build the [`I18nChildView`] continuation for a single `@if` branch / `@switch` case body
+    /// when this control-flow block sits inside an `i18n` region, or `None` outside one.
+    ///
+    /// Mirrors the `<ng-template>` / `@for` i18n threading ([`Self::visit_template`] / [`Self::
+    /// build_for_block`]): each body consumes the next sub-template index off the active
+    /// [`I18nBlockCtx`] (DFS order — the SAME order the message-param walk in `resolve_in_view`
+    /// assigns the `*N:sub` block placeholders, so the sub-template indices line up with the
+    /// `goog.getMsg`/`$localize` sentinels) and carries the body's folded interpolation operands.
+    ///
+    /// With this continuation the body view is bracketed in `ɵɵi18nStart(0, msg, subIdx)` …
+    /// `ɵɵi18nEnd()` and its element/text content is subsumed by the i18n placeholder ops, so the
+    /// reported `decls`/`vars` are the i18n-collapsed counts (the fix for over-counting i18n-embedded
+    /// control-flow sub-template `decls`). Advancing `next_sub_template_index` here keeps the cursor
+    /// in lock-step across sibling branches and any nested control-flow further down.
+    fn if_branch_i18n_child_view(&mut self, children: &[Node]) -> Option<I18nChildView> {
+        let child = self.i18n_block_ctx.as_mut().map(|ctx| {
+            let sub = ctx.next_sub_template_index;
+            ctx.next_sub_template_index += 1;
+            I18nChildView {
+                message_index: ctx.message_index,
+                sub_template_index: sub,
+                interpolations: Vec::new(),
+            }
+        });
+        child.map(|mut c| {
+            c.interpolations = self.collect_child_i18n_interpolations(children);
+            c
+        })
+    }
+
     /// Lower an `@if`/`@else if`/`@else` chain (`IfBlock`) to Angular 21's hoisted-template scheme:
     ///
     /// - the *first* branch becomes `ɵɵconditionalCreate(slot, <Name>_Conditional_<slot>_Template,
@@ -4765,8 +4795,23 @@ impl TemplateDefinitionBuilder {
             let slot = self.allocate_data_slot();
             branch_slots.push(slot);
             let fn_name = format!("{}_Conditional_{}_Template", self.base_name, slot);
-            let (fn_ref, decls, vars) =
-                self.build_embedded_view(fn_name, branch.children.clone(), Vec::new(), Vec::new());
+            // When this `@if` chain sits inside an `i18n` block, each branch body becomes an i18n
+            // sub-template continuation: it is allocated the next sub-template index (DFS order,
+            // matching the sentinel resolver / message-param walk in `resolve_in_view`) and its
+            // create ops are bracketed in `ɵɵi18nStart(0, msg, subIdx)` … `ɵɵi18nEnd()`. The body's
+            // element/text nodes are then SUBSUMED by the i18n placeholder ops, so the sub-view's
+            // `decls` collapse to the i18n anchor slot + the bracketed element anchors (e.g. a
+            // `before<span>zero</span>after` branch is `i18nStart` + `element("span")` = 2 decls,
+            // not the 4 raw `text`/`elementStart`/`text`/`elementEnd`/`text` decls of the
+            // non-i18n lowering). Outside i18n the body is a plain embedded view.
+            let branch_child_i18n = self.if_branch_i18n_child_view(&branch.children);
+            let (fn_ref, decls, vars) = self.build_embedded_view_i18n(
+                fn_name,
+                branch.children.clone(),
+                Vec::new(),
+                Vec::new(),
+                branch_child_i18n,
+            );
             // First branch -> ɵɵconditionalCreate, the rest -> ɵɵconditionalBranchCreate. The trailing
             // arg is the branch root element tag (or `null`).
             let reference = if i == 0 {
@@ -4839,8 +4884,18 @@ impl TemplateDefinitionBuilder {
         for (i, group) in block.groups.iter().enumerate() {
             let slot = self.allocate_data_slot();
             let fn_name = format!("{}_Case_{}_Template", self.base_name, slot);
-            let (fn_ref, decls, vars) =
-                self.build_embedded_view(fn_name, group.children.clone(), Vec::new(), Vec::new());
+            // As with `@if` branches (see `build_if_block`): a `@switch` nested inside an `i18n`
+            // block lowers each `@case`/`@default` group body as an i18n sub-template continuation,
+            // so the body's element/text nodes are subsumed by the shared message's placeholder ops
+            // and the sub-view `decls` collapse to the i18n anchor + bracketed element anchors.
+            let case_child_i18n = self.if_branch_i18n_child_view(&group.children);
+            let (fn_ref, decls, vars) = self.build_embedded_view_i18n(
+                fn_name,
+                group.children.clone(),
+                Vec::new(),
+                Vec::new(),
+                case_child_i18n,
+            );
             // `@switch` shares the conditional-create mechanism: first group -> ɵɵconditionalCreate,
             // the rest -> ɵɵconditionalBranchCreate, each with the case root's element tag (or null).
             let reference = if i == 0 {
@@ -4849,10 +4904,13 @@ impl TemplateDefinitionBuilder {
                 R3::ConditionalBranchCreate
             };
             let tag = single_root_tag(&group.children);
-            self.creation_code.push(instruction(
-                reference,
-                vec![num(slot as f64), fn_ref, num(decls as f64), num(vars as f64), tag],
-            ));
+            // `instruction.ts` `conditionalCreate`/`conditionalBranchCreate` trim trailing `null`
+            // arguments (exactly as `build_if_block` does), so a case whose body has no single
+            // element root (e.g. a multi-node `before<span>…</span>after` body inside `i18n`, whose
+            // root tag is `null`) drops the final `null` tag arg rather than emitting `…, 2, 0, null`.
+            let mut params = vec![num(slot as f64), fn_ref, num(decls as f64), num(vars as f64), tag];
+            trim_trailing_nulls(&mut params);
+            self.creation_code.push(instruction(reference, params));
             // Emit one `CaseSlot` per label so every `@case` label of the group gets its own
             // comparison against the shared body slot. A group with no labels (defensive) or a sole
             // `@default` still records a single slot-selecting entry.
@@ -7504,6 +7562,183 @@ mod tests {
         assert_eq!(builder.hoisted_functions().len(), 2);
         // The `@else` default selects slot 1 rather than -1.
         assert!(out.contains("\u{0275}\u{0275}conditional(ctx.cond ? 0 : 1)"), "got: {out}");
+    }
+
+    /// `before<TAG>inner</TAG>after` — a multi-node body (text, element-with-text, text). Its
+    /// root is NOT a single element, so `single_root_tag` is `null`; inside an `i18n` block the
+    /// text nodes are folded into the message and only the `<TAG>` element gets a create op.
+    fn before_el_after(tag: &str) -> Vec<Node> {
+        let text = |v: &str| {
+            Node::Text(Text {
+                value: v.to_string(),
+                source_span: t_span(),
+            })
+        };
+        vec![
+            text("before"),
+            Node::Element(Element {
+                name: tag.to_string(),
+                attributes: vec![],
+                inputs: vec![],
+                outputs: vec![],
+                directives: vec![],
+                children: vec![text("inner")],
+                references: vec![],
+                is_self_closing: false,
+                source_span: t_span(),
+                start_source_span: t_span(),
+                end_source_span: None,
+                is_void: false,
+                i18n: None,
+            }),
+            text("after"),
+        ]
+    }
+
+    /// Wrap `inner` nodes in a translated host element `<div i18n>…</div>`.
+    fn i18n_div(inner: Vec<Node>) -> Vec<Node> {
+        vec![Node::Element(Element {
+            name: "div".to_string(),
+            attributes: vec![],
+            inputs: vec![],
+            outputs: vec![],
+            directives: vec![],
+            children: inner,
+            references: vec![],
+            is_self_closing: false,
+            source_span: t_span(),
+            start_source_span: t_span(),
+            end_source_span: None,
+            is_void: false,
+            i18n: Some(crate::template::r3_ast::I18nMeta),
+        })]
+    }
+
+    #[test]
+    fn i18n_embedded_if_collapses_subtemplate_decls() {
+        // `<div i18n> @if (count===0) { before<span>inner</span>after }
+        //            @else if (count===1) { before<div>inner</div>after }
+        //            @else { before<button>inner</button>after } </div>`
+        // Each branch body sits inside the i18n region, so its text/element nodes are subsumed by
+        // the shared message placeholder ops: the sub-template view is `ɵɵi18nStart(0, 0, sub)`,
+        // `ɵɵelement(1, <tag>)`, `ɵɵi18nEnd()` — decls = 2 (NOT the 4 of the raw DOM lowering),
+        // and the `ɵɵconditionalCreate(slot, Fn, 2, 0)` decls arg follows suit.
+        let block = IfBlock {
+            branches: vec![
+                IfBlockBranch {
+                    expression: Some(prop_read("count")),
+                    children: before_el_after("span"),
+                    expression_alias: None,
+                    spans: block_spans(),
+                    i18n: None,
+                },
+                IfBlockBranch {
+                    expression: Some(prop_read("count")),
+                    children: before_el_after("div"),
+                    expression_alias: None,
+                    spans: block_spans(),
+                    i18n: None,
+                },
+                IfBlockBranch {
+                    expression: None, // @else
+                    children: before_el_after("button"),
+                    expression_alias: None,
+                    spans: block_spans(),
+                    i18n: None,
+                },
+            ],
+            spans: block_spans(),
+        };
+        // Full mode (non-standalone, matching the `standalone: false` compliance fixture), so the
+        // element family is `ɵɵelement*` rather than the DomOnly `ɵɵdomElement*`.
+        let input =
+            TemplateCompilationInput::new("Test_Template", i18n_div(vec![Node::IfBlock(block)]))
+                .with_dom_only(false);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let out = emit_with_hoisted(&builder, &func);
+
+        // The first branch sub-template is an i18n continuation, NOT raw DOM: it brackets a single
+        // element in `ɵɵi18nStart(0, 0, 1)` … `ɵɵi18nEnd()` and never emits a `ɵɵtext` op.
+        assert!(
+            out.contains("\u{0275}\u{0275}i18nStart(0, 0, 1)"),
+            "branch body should open an i18n sub-template, got: {out}"
+        );
+        assert!(
+            out.contains("\u{0275}\u{0275}element(1, \"span\")"),
+            "branch element should be the second data slot, got: {out}"
+        );
+        // The hoisted sub-template fn has NO `ɵɵtext` create op (text is folded into the message).
+        let first_fn = out
+            .split("function Test_Conditional_2_Template")
+            .nth(1)
+            .and_then(|s| s.split("function ").next())
+            .unwrap_or("");
+        assert!(
+            !first_fn.contains("\u{0275}\u{0275}text("),
+            "i18n-embedded branch body must not emit raw text ops, got: {first_fn}"
+        );
+        // The decls counts collapse to 2 across all three chained `conditionalCreate` entries —
+        // the divergence this fix targets (previously 4). The bodies have a multi-node root, so the
+        // trailing `null` tag arg is trimmed.
+        assert!(
+            out.contains(
+                "\u{0275}\u{0275}conditionalCreate(2, Test_Conditional_2_Template, 2, 0)(3, Test_Conditional_3_Template, 2, 0)(4, Test_Conditional_4_Template, 2, 0)"
+            ),
+            "all sub-templates should report decls=2 with the null tag trimmed, got: {out}"
+        );
+    }
+
+    #[test]
+    fn i18n_embedded_switch_collapses_subtemplate_decls() {
+        // `<div i18n> @switch (count) { @case (0) { before<span>inner</span>after }
+        //                              @case (1) { before<div>inner</div>after }
+        //                              @default { before<button>inner</button>after } } </div>`
+        // Same collapse as `@if`: each case body is an i18n sub-template (decls = 2), and the
+        // `ɵɵconditionalCreate(slot, Fn, 2, 0)` decls arg + trailing-null trim follow.
+        let case = |expr: Option<AstNode>, children: Vec<Node>| SwitchBlockCaseGroup {
+            cases: vec![SwitchBlockCase {
+                expression: expr,
+                spans: block_spans(),
+            }],
+            children,
+            spans: block_spans(),
+            i18n: None,
+        };
+        let block = SwitchBlock {
+            expression: prop_read("count"),
+            groups: vec![
+                case(Some(prop_read("count")), before_el_after("span")),
+                case(Some(prop_read("count")), before_el_after("div")),
+                case(None, before_el_after("button")),
+            ],
+            spans: block_spans(),
+            unknown_blocks: vec![],
+            exhaustive_check: None,
+        };
+        let input =
+            TemplateCompilationInput::new("Test_Template", i18n_div(vec![Node::SwitchBlock(block)]))
+                .with_dom_only(false);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let out = emit_with_hoisted(&builder, &func);
+
+        assert!(
+            out.contains("\u{0275}\u{0275}i18nStart(0, 0, 1)"),
+            "case body should open an i18n sub-template, got: {out}"
+        );
+        // All three case sub-templates collapse to decls=2 with the trailing null tag trimmed.
+        assert!(
+            out.contains(
+                "\u{0275}\u{0275}conditionalCreate(2, Test_Case_2_Template, 2, 0)(3, Test_Case_3_Template, 2, 0)(4, Test_Case_4_Template, 2, 0)"
+            ),
+            "all case sub-templates should report decls=2 with the null tag trimmed, got: {out}"
+        );
+        // No raw text op leaks into a case body view.
+        assert!(
+            !out.contains("Test_Case_2_Template(rf, ctx) {\n\tif (rf & 1) {\n\t\t\u{0275}\u{0275}text"),
+            "i18n-embedded case body must not emit raw text ops, got: {out}"
+        );
     }
 
     #[test]

@@ -926,7 +926,27 @@ fn lower_host_property_value(value: &str) -> crate::expression_converter::Conver
     )
 }
 
-/// Parse + lower a host *listener* handler (an action) rooted at `ctx`.
+/// `LocalResolver` for a host-listener handler body: every implicit-receiver read roots at the
+/// component context (`ctx`) EXCEPT `$event`, which Angular's `resolveDollarEvent` keeps as the bare
+/// handler parameter (a `$event` read must NOT become `ctx.$event`). Mirrors the template-side
+/// `ListenerResolver`, restricted to the host case (no `@for` loop vars / cross-view `@let`s).
+struct HostListenerResolver;
+
+impl crate::expression_converter::LocalResolver for HostListenerResolver {
+    fn resolve_implicit_receiver(&self) -> Expr {
+        o::variable(HOST_CONTEXT_NAME, None)
+    }
+
+    fn maybe_resolve_local(&self, name: &str) -> Option<Expr> {
+        if name == HOST_EVENT_NAME {
+            return Some(o::variable(HOST_EVENT_NAME, None));
+        }
+        None
+    }
+}
+
+/// Parse + lower a host *listener* handler (an action) rooted at `ctx`, keeping `$event` a bare
+/// parameter read (Angular `resolveDollarEvent`) rather than a `ctx.$event` property access.
 fn lower_host_listener_value(value: &str) -> crate::expression_converter::ConvertedBinding {
     let parser = crate::expression::parser::Parser::default();
     let parsed = parser.parse_action(
@@ -934,11 +954,7 @@ fn lower_host_listener_value(value: &str) -> crate::expression_converter::Conver
         crate::expression::ast::ParseSourceSpan { start: 0, end: 0 },
         0,
     );
-    crate::expression_converter::convert_action_binding(
-        &parsed.ast,
-        o::variable(HOST_CONTEXT_NAME, None),
-        "",
-    )
+    crate::expression_converter::convert_action_binding_with(&parsed.ast, &HostListenerResolver)
 }
 
 impl HostBindingsBuilder for DefaultHostBindingsBuilder {
@@ -964,21 +980,66 @@ impl HostBindingsBuilder for DefaultHostBindingsBuilder {
         // hostAttrs — the static attributes array, grouped by AttributeMarker (plain pairs first,
         // then the Classes=1 group, then the Styles=2 group). The folded `class`/`style` values are
         // split into individual class names / style key-value pairs under their markers by
-        // `host_attrs_array` (mirroring `parse_extracted_styles` + `serializeAttributes`).
+        // `host_attrs_array` (mirroring `parse_extracted_styles` + `serializeAttributes`). The modern
+        // `animate.enter`/`animate.leave` string host keys are NOT static attributes — they reify to
+        // a CREATE-block `ɵɵanimateEnter`/`ɵɵanimateLeave` instruction below — so `host_attrs_array`
+        // omits them from `hostAttrs`.
         if let Some(attrs) = host_attrs_array(&host.attributes) {
             definition_map.set("hostAttrs", Some(attrs));
         }
 
-        // Build the function body. CREATE: listeners. UPDATE: properties + class/style/attr.
+        // Build the function body. CREATE: animate-string instructions + listeners. UPDATE:
+        // properties + class/style/attr.
         let mut create_stmts: Vec<Stmt> = Vec::new();
         let mut update_stmts: Vec<Stmt> = Vec::new();
         let mut host_vars: u32 = 0;
 
-        // Listeners → `ɵɵlistener(eventName, HostListenerFn)` (CREATE).
+        // Modern `animate.enter`/`animate.leave` host keys with a STRING value: Angular's view
+        // compiler lowers them to a CREATE-block `ɵɵanimateEnter("fade")` / `ɵɵanimateLeave("fade")`
+        // instruction (the `animate*` family in `reify.ts`) rather than a static
+        // `hostAttrs:["animate.enter","fade"]` entry. The value is a literal class-list string passed
+        // verbatim. We read them straight from the attributes map (they are intentionally left there
+        // so the shape is non-mutating; `host_attrs_array` filters them out of `hostAttrs`).
+        for (key, value) in host.attributes.iter() {
+            if !is_animate_host_attr(key) {
+                continue;
+            }
+            let reference = if key == "animate.leave" {
+                R3::AnimationLeave
+            } else {
+                R3::AnimationEnter
+            };
+            create_stmts.push(host_instruction(reference, vec![value.clone()]));
+        }
+
+        // Listeners → `ɵɵlistener(eventName, HostListenerFn)` (CREATE). A modern animation listener
+        // (`(animate.enter)`/`(animate.leave)`) instead reifies to
+        // `ɵɵanimateEnterListener`/`ɵɵanimateLeaveListener` taking ONLY the handler function (no
+        // event-name argument), with the handler named on the SANITIZED event (`.` dropped, so
+        // `animate.enter` → `animateenter`) — faithful to Angular's `reify.ts` + `naming.ts`.
         for (event, handler_src) in host.listeners.iter() {
             let converted = lower_host_listener_value(handler_src);
             let mut body = converted.stmts;
             body.push(Stmt::bare(StmtKind::Return(converted.expr)));
+
+            if event == "animate.enter" || event == "animate.leave" {
+                let handler_name =
+                    format!("{name}_{}_HostBindingHandler", event.replace('.', ""));
+                let handler_fn = o::fn_(
+                    vec![FnParam::new(HOST_EVENT_NAME, None)],
+                    body,
+                    None,
+                    Some(handler_name),
+                );
+                let reference = if event == "animate.leave" {
+                    R3::AnimationLeaveListener
+                } else {
+                    R3::AnimationEnterListener
+                };
+                create_stmts.push(host_instruction(reference, vec![handler_fn]));
+                continue;
+            }
+
             // `naming.ts`: `${name}_${event}_HostBindingHandler`.
             let handler_name = format!("{name}_{}_HostBindingHandler", event.replace('.', "_"));
             let handler_fn = o::fn_(
@@ -1159,6 +1220,13 @@ fn parse_style_value(value: &str) -> Vec<String> {
     styles
 }
 
+/// Whether a host-attribute key is a modern `animate.enter` / `animate.leave` key. Such keys with a
+/// string value are routed to a CREATE-block `ɵɵanimateEnter`/`ɵɵanimateLeave` instruction by the
+/// host-bindings builder and are NOT emitted as a static `hostAttrs` entry.
+fn is_animate_host_attr(key: &str) -> bool {
+    key == "animate.enter" || key == "animate.leave"
+}
+
 /// Build the `hostAttrs` consts-style array from the static attributes map, applying
 /// `AttributeMarker` grouping: plain `name, value` pairs first, then a `Classes` (1) group
 /// (individual class names), then a `Styles` (2) group (`name, value` pairs).
@@ -1178,6 +1246,12 @@ fn host_attrs_array(attributes: &OrderedMap<String, Expr>) -> Option<Expr> {
     let mut styles: Vec<Expr> = Vec::new();
 
     for (key, value) in attributes.iter() {
+        // Modern `animate.enter`/`animate.leave` string host keys are emitted as CREATE-block
+        // `ɵɵanimateEnter`/`ɵɵanimateLeave` instructions by the host-bindings builder, not as static
+        // `hostAttrs` entries — skip them here so they never reach the attributes array.
+        if is_animate_host_attr(key) && matches!(&value.kind, ExprKind::Literal(LiteralValue::String(_))) {
+            continue;
+        }
         // `class`/`style` are only special-cased when the value is a static string literal — a
         // dynamic expression keeps the plain `[name, expr]` shape.
         let string_value = match (key.as_str(), &value.kind) {
@@ -2718,5 +2792,96 @@ mod tests {
             js.contains("hostVars: 3") || js.contains("hostVars:3"),
             "expected hostVars: 3: {js}"
         );
+    }
+
+    #[test]
+    fn host_animate_enter_string_emits_animate_enter_in_create_not_host_attrs() {
+        // `host: { 'animate.enter': 'fade' }` → CREATE-block `ɵɵanimateEnter("fade")`, NOT a static
+        // `hostAttrs: ["animate.enter", "fade"]` entry (mirrors
+        // r3_view_compiler/animations/animate_enter_with_string_host_bindings).
+        let mut meta = directive_meta("ChildComponent", "child-component");
+        meta.host.attributes.insert(
+            "animate.enter".to_string(),
+            o::literal(LiteralValue::String("fade".to_string()), None),
+        );
+        let mut hb = DefaultHostBindingsBuilder;
+        let compiled = compile_directive_from_metadata(&meta, &mut hb);
+        let js = emit_expression(&compiled.expression);
+        assert!(js.contains("hostBindings"), "missing hostBindings fn: {js}");
+        assert!(
+            js.contains("ɵɵanimateEnter(\"fade\")") || js.contains("ɵɵanimateEnter('fade')"),
+            "missing ɵɵanimateEnter(\"fade\"): {js}"
+        );
+        // It must NOT be lowered to a static hostAttrs entry.
+        assert!(!js.contains("hostAttrs"), "animate.enter must not become hostAttrs: {js}");
+        assert!(!js.contains("animate.enter"), "raw key must not appear: {js}");
+        // String animate is not a binding → no host vars.
+        assert!(!js.contains("hostVars"), "animate string should not emit hostVars: {js}");
+    }
+
+    #[test]
+    fn host_animate_leave_string_emits_animate_leave_in_create() {
+        // `host: { 'animate.leave': 'fade' }` → CREATE-block `ɵɵanimateLeave("fade")`.
+        let mut meta = directive_meta("ChildComponent", "child-component");
+        meta.host.attributes.insert(
+            "animate.leave".to_string(),
+            o::literal(LiteralValue::String("fade".to_string()), None),
+        );
+        let mut hb = DefaultHostBindingsBuilder;
+        let compiled = compile_directive_from_metadata(&meta, &mut hb);
+        let js = emit_expression(&compiled.expression);
+        assert!(
+            js.contains("ɵɵanimateLeave(\"fade\")") || js.contains("ɵɵanimateLeave('fade')"),
+            "missing ɵɵanimateLeave(\"fade\"): {js}"
+        );
+        assert!(!js.contains("hostAttrs"), "animate.leave must not become hostAttrs: {js}");
+    }
+
+    #[test]
+    fn host_animate_enter_event_emits_animate_enter_listener() {
+        // `host: { '(animate.enter)': 'fadeFn($event)' }` → CREATE-block
+        // `ɵɵanimateEnterListener(function ChildComponent_animateenter_HostBindingHandler($event) {
+        //   return ctx.fadeFn($event); })` — only the handler fn, no event-name argument; the
+        // handler name sanitizes the `.` away, and `$event` stays a bare parameter (mirrors
+        // animate_enter_with_event_host_bindings).
+        let mut meta = directive_meta("ChildComponent", "child-component");
+        meta.host
+            .listeners
+            .insert("animate.enter".to_string(), "fadeFn($event)".to_string());
+        let mut hb = DefaultHostBindingsBuilder;
+        let compiled = compile_directive_from_metadata(&meta, &mut hb);
+        let js = emit_expression(&compiled.expression);
+        assert!(js.contains("ɵɵanimateEnterListener"), "missing ɵɵanimateEnterListener: {js}");
+        assert!(
+            js.contains("ChildComponent_animateenter_HostBindingHandler"),
+            "missing sanitized handler name: {js}"
+        );
+        // `$event` must stay a bare parameter (resolveDollarEvent), not become ctx.$event.
+        assert!(js.contains("ctx.fadeFn($event)"), "handler should call ctx.fadeFn($event): {js}");
+        assert!(!js.contains("ctx.$event"), "$event must not resolve against ctx: {js}");
+        // The animate listener takes ONLY the handler — no event-name argument and no ɵɵlistener.
+        assert!(!js.contains("ɵɵlistener("), "must not use ɵɵlistener: {js}");
+        assert!(
+            !js.contains("\"animate.enter\"") && !js.contains("'animate.enter'"),
+            "must not pass an event-name argument: {js}"
+        );
+    }
+
+    #[test]
+    fn host_animate_leave_event_emits_animate_leave_listener() {
+        // `host: { '(animate.leave)': 'fadeFn($event)' }` → `ɵɵanimateLeaveListener(...)`.
+        let mut meta = directive_meta("ChildComponent", "child-component");
+        meta.host
+            .listeners
+            .insert("animate.leave".to_string(), "fadeFn($event)".to_string());
+        let mut hb = DefaultHostBindingsBuilder;
+        let compiled = compile_directive_from_metadata(&meta, &mut hb);
+        let js = emit_expression(&compiled.expression);
+        assert!(js.contains("ɵɵanimateLeaveListener"), "missing ɵɵanimateLeaveListener: {js}");
+        assert!(
+            js.contains("ChildComponent_animateleave_HostBindingHandler"),
+            "missing sanitized handler name: {js}"
+        );
+        assert!(!js.contains("ɵɵlistener("), "must not use ɵɵlistener: {js}");
     }
 }

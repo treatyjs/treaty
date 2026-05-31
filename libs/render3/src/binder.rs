@@ -323,22 +323,55 @@ pub enum DirectiveMatcher {
     Selectorless(SelectorlessMatcher<DirectiveMeta>),
 }
 
-/// Reduced `SelectorMatcher`. Each registered selector is decomposed into an optional element name
-/// plus a set of required attribute names. A node matches a selector when the element name agrees
-/// (or the selector has none) and every required attribute is present on the node.
+/// Reduced `SelectorMatcher`. Each registered selector string is decomposed into one or more
+/// comma-separated *groups*. Each group carries an optional element name, required attribute names,
+/// required class names, and `:not(...)` negation groups. A node matches the selector when ANY
+/// positive group matches (element agrees or is unconstrained AND every required attribute/class is
+/// present) and NO `:not` group matches.
 ///
-/// NOTE: this is a *reduced* selector engine (no `:not`, `,` groups, classes, attribute *values*).
-/// It is sufficient for the binder's algorithm and the tests. Full CSS-selector semantics are
-/// deferred to the real `directive_matching` port.
+/// NOTE: still a *reduced* engine — it matches on attribute NAMES only (ignoring attribute values),
+/// which is exactly what `directive_matching` needs for the name-based bindings the source
+/// front-end models — but it now honours comma groups, CSS class selectors (`.cls`), and `:not`.
 #[derive(Default)]
 pub struct SelectorMatcher {
-    entries: Vec<(ParsedSelector, Vec<DirectiveMeta>)>,
+    entries: Vec<(Vec<ParsedSelector>, Vec<DirectiveMeta>)>,
 }
 
-/// A parsed reduced selector: `element[attr1][attr2]...`.
+/// A parsed reduced selector group: `element.class[attr1][attr2]...:not(...)`.
 struct ParsedSelector {
     element: Option<String>,
     attributes: Vec<String>,
+    classes: Vec<String>,
+    /// `:not(...)` negative groups; the node matches only if NONE of these match.
+    not: Vec<ParsedSelector>,
+}
+
+impl ParsedSelector {
+    /// Whether this single group (ignoring `:not`) matches the node's reduced CSS selector.
+    fn group_matches(&self, css: &CssSelector) -> bool {
+        let element_ok = match &self.element {
+            None => true,
+            Some(name) => css.element.as_deref() == Some(name.as_str()),
+        };
+        if !element_ok {
+            return false;
+        }
+        if !self
+            .attributes
+            .iter()
+            .all(|a| css.attributes.iter().any(|x| x == a))
+        {
+            return false;
+        }
+        self.classes
+            .iter()
+            .all(|c| css.classes.iter().any(|x| x == c))
+    }
+
+    /// Full match including `:not(...)` negation.
+    fn matches(&self, css: &CssSelector) -> bool {
+        self.group_matches(css) && !self.not.iter().any(|n| n.group_matches(css))
+    }
 }
 
 impl SelectorMatcher {
@@ -346,23 +379,16 @@ impl SelectorMatcher {
         SelectorMatcher::default()
     }
 
-    /// `addSelectables(CssSelector.parse(selector), payloads)`.
+    /// `addSelectables(CssSelector.parse(selector), payloads)`. The selector string may carry
+    /// comma-separated groups; the node matches if ANY group matches.
     pub fn add_selectables(&mut self, selector: &str, payloads: Vec<DirectiveMeta>) {
-        self.entries.push((parse_selector(selector), payloads));
+        self.entries.push((parse_selector_list(selector), payloads));
     }
 
     /// `match(cssSelector, cb)` — collect every payload whose selector matches the node.
     fn match_node(&self, css: &CssSelector, out: &mut Vec<DirectiveMeta>) {
-        for (sel, payloads) in &self.entries {
-            let element_ok = match &sel.element {
-                None => true,
-                Some(name) => css.element.as_deref() == Some(name.as_str()),
-            };
-            let attrs_ok = sel
-                .attributes
-                .iter()
-                .all(|a| css.attributes.iter().any(|x| x == a));
-            if element_ok && attrs_ok {
+        for (groups, payloads) in &self.entries {
+            if groups.iter().any(|g| g.matches(css)) {
                 out.extend(payloads.iter().cloned());
             }
         }
@@ -400,17 +426,54 @@ impl<T: Clone> Default for SelectorlessMatcher<T> {
     }
 }
 
-/// Reduced `CssSelector` extracted from a node (element name + attribute names). See
+/// Reduced `CssSelector` extracted from a node (element name + attribute names + class names). See
 /// `createCssSelectorFromNode` in `util.ts`.
 struct CssSelector {
     element: Option<String>,
     attributes: Vec<String>,
+    classes: Vec<String>,
 }
 
-/// Parse a reduced selector string of the form `element[a][b]` / `[a]` / `element`.
+/// Split a selector string on top-level `,` (commas inside `:not(...)` are not split) and parse
+/// each comma group. Mirrors `CssSelector.parse`, which returns one selector per comma group.
+fn parse_selector_list(selector: &str) -> Vec<ParsedSelector> {
+    let mut groups = Vec::new();
+    let mut depth = 0usize;
+    let mut current = String::new();
+    for c in selector.chars() {
+        match c {
+            '(' => {
+                depth += 1;
+                current.push(c);
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                current.push(c);
+            }
+            ',' if depth == 0 => {
+                if !current.trim().is_empty() {
+                    groups.push(parse_selector(&current));
+                }
+                current.clear();
+            }
+            _ => current.push(c),
+        }
+    }
+    if !current.trim().is_empty() {
+        groups.push(parse_selector(&current));
+    }
+    if groups.is_empty() {
+        groups.push(parse_selector(""));
+    }
+    groups
+}
+
+/// Parse a reduced single selector group: `element.class[a][b]:not(...)` / `[a]` / `element`.
 fn parse_selector(selector: &str) -> ParsedSelector {
     let mut element: Option<String> = None;
     let mut attributes = Vec::new();
+    let mut classes = Vec::new();
+    let mut not = Vec::new();
     let mut chars = selector.chars().peekable();
     let mut current = String::new();
     while let Some(&c) = chars.peek() {
@@ -442,6 +505,55 @@ fn parse_selector(selector: &str) -> ParsedSelector {
                     attributes.push(attr);
                 }
             }
+            '.' => {
+                chars.next();
+                let mut cls = String::new();
+                while let Some(&d) = chars.peek() {
+                    if matches!(d, '.' | '[' | ':' | ' ') {
+                        break;
+                    }
+                    cls.push(d);
+                    chars.next();
+                }
+                if !cls.is_empty() {
+                    classes.push(cls);
+                }
+            }
+            ':' => {
+                // `:not(<inner>)` — capture the inner selector and parse it as a negation group.
+                chars.next();
+                let mut name = String::new();
+                while let Some(&d) = chars.peek() {
+                    if d == '(' {
+                        break;
+                    }
+                    name.push(d);
+                    chars.next();
+                }
+                if chars.peek() == Some(&'(') {
+                    chars.next();
+                    let mut inner = String::new();
+                    let mut depth = 1usize;
+                    while let Some(&d) = chars.peek() {
+                        match d {
+                            '(' => depth += 1,
+                            ')' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    chars.next();
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        inner.push(d);
+                        chars.next();
+                    }
+                    if name == "not" {
+                        not.extend(parse_selector_list(&inner));
+                    }
+                }
+            }
             _ => {
                 current.push(c);
                 chars.next();
@@ -455,6 +567,8 @@ fn parse_selector(selector: &str) -> ParsedSelector {
     ParsedSelector {
         element,
         attributes,
+        classes,
+        not,
     }
 }
 
@@ -462,10 +576,15 @@ fn parse_selector(selector: &str) -> ParsedSelector {
 /// The element name for a `Template` is `"ng-template"`. Attribute names are gathered from text
 /// attributes, bound-attribute (input) names, output names, and (for templates) template-attr
 /// names — matching what the real `util.ts` feeds the matcher (names only, in our reduced engine).
+/// Static `class="..."` values additionally contribute individual class names.
 fn css_selector_from_element(el: &Element) -> CssSelector {
     let mut attributes = Vec::new();
+    let mut classes = Vec::new();
     for a in &el.attributes {
         attributes.push(a.name.clone());
+        if a.name == "class" {
+            classes.extend(split_class_value(&a.value));
+        }
     }
     for i in &el.inputs {
         attributes.push(i.name.clone());
@@ -476,13 +595,18 @@ fn css_selector_from_element(el: &Element) -> CssSelector {
     CssSelector {
         element: Some(el.name.clone()),
         attributes,
+        classes,
     }
 }
 
 fn css_selector_from_template(tpl: &Template) -> CssSelector {
     let mut attributes = Vec::new();
+    let mut classes = Vec::new();
     for a in &tpl.attributes {
         attributes.push(a.name.clone());
+        if a.name == "class" {
+            classes.extend(split_class_value(&a.value));
+        }
     }
     for i in &tpl.inputs {
         attributes.push(i.name.clone());
@@ -499,7 +623,13 @@ fn css_selector_from_template(tpl: &Template) -> CssSelector {
     CssSelector {
         element: tpl.tag_name.clone(),
         attributes,
+        classes,
     }
+}
+
+/// Split a static `class="a b c"` attribute value into individual class tokens.
+fn split_class_value(value: &str) -> Vec<String> {
+    value.split_whitespace().map(|s| s.to_string()).collect()
 }
 
 // ===========================================================================
@@ -2161,6 +2291,100 @@ impl<'t> R3BoundTarget<'t> {
 }
 
 // ===========================================================================
+// Public CSS-selector dependency resolution (cross-class directive matching).
+// ===========================================================================
+
+/// A sibling-declared or imported `@Directive`/`@Component` candidate, supplied to
+/// [`resolve_selector_dependencies`] for CSS-selector matching against a component's template.
+///
+/// This is the bridge the source front-end needs: it carries the candidate's class `name`
+/// (the symbol that lands in the component's `dependencies` array) and its CSS `selector`
+/// (e.g. `[someDirective]`, `ng-template[directiveA]`, `ng-container[directiveA]`), which the
+/// selectorless matcher cannot see because it keys only on class names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SelectorDirective {
+    /// The directive/component class name (emitted into `dependencies`).
+    pub name: String,
+    /// The CSS selector string from the `@Directive`/`@Component` decorator.
+    pub selector: String,
+    /// Whether the candidate is a `@Component` (vs a `@Directive`).
+    pub is_component: bool,
+}
+
+impl SelectorDirective {
+    pub fn new(name: impl Into<String>, selector: impl Into<String>, is_component: bool) -> Self {
+        SelectorDirective {
+            name: name.into(),
+            selector: selector.into(),
+            is_component,
+        }
+    }
+}
+
+/// Run the real CSS-selector matcher over a bound template and return the class names of every
+/// candidate directive/component whose selector matches a node in the template, in candidate
+/// (declaration) order, deduplicated.
+///
+/// This is the keystone of cross-class directive matching: the selectorless matcher only resolves
+/// dependencies referenced by class NAME (`<Foo>` / `@Foo`); directives matched by an attribute or
+/// property/output binding (`[someDirective]`, `(someDirective)`), on `ng-template`/`ng-container`,
+/// or as a structural directive (`*someDirective`) are matched HERE — by feeding their decorator
+/// selectors into a [`SelectorMatcher`] and binding the template through [`R3TargetBinder`].
+///
+/// Candidates with an empty selector are ignored (a selector is required to participate in
+/// CSS-selector matching). The returned names are exactly those Angular adds to the component's
+/// `dependencies` array for selector-based matches.
+pub fn resolve_selector_dependencies(
+    nodes: &[Node],
+    candidates: &[SelectorDirective],
+) -> Vec<String> {
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    // Build the selector matcher: every candidate's selector registered against its
+    // `DirectiveMeta` (keyed for dedup on the class name via `ref_key`).
+    let mut matcher = SelectorMatcher::new();
+    let mut any = false;
+    for c in candidates {
+        let selector = c.selector.trim();
+        if selector.is_empty() {
+            continue;
+        }
+        let meta = DirectiveMeta::new(c.name.clone(), Some(selector.to_string()), c.is_component);
+        matcher.add_selectables(selector, vec![meta]);
+        any = true;
+    }
+    if !any {
+        return Vec::new();
+    }
+
+    let binder = R3TargetBinder::new(Some(DirectiveMatcher::Selector(matcher)));
+    let bound = binder.bind(Target {
+        template: Some(nodes),
+        host: None,
+    });
+
+    // The set of class names the binder matched anywhere in the template.
+    let used: HashSet<String> = bound
+        .get_used_directives()
+        .into_iter()
+        .map(|d| d.name)
+        .collect();
+
+    // Emit in candidate (declaration) order, deduplicated — mirroring how Angular orders the
+    // `dependencies` array by the scope's declaration order rather than template order.
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for c in candidates {
+        if used.contains(&c.name) && seen.insert(c.name.clone()) {
+            out.push(c.name.clone());
+        }
+    }
+    out
+}
+
+// ===========================================================================
 // Tests.
 // ===========================================================================
 
@@ -2171,7 +2395,8 @@ mod tests {
         AbsoluteSourceSpan, AstNode, ExprKind, ParseSourceSpan, ParseSpan,
     };
     use crate::template::r3_ast::{
-        BoundText, Element, Node, Reference, Template, Variable,
+        BoundAttribute, BoundEvent, BoundText, Element, Node, Reference, Template, TemplateAttr,
+        TextAttribute, Variable,
     };
 
     fn span() -> ParseSourceSpan {
@@ -2556,5 +2781,246 @@ mod tests {
         // But it IS visible in the root scope.
         let root = bound.get_entities_in_scope(None);
         assert!(root.iter().any(|e| e.name() == "x"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Cross-class CSS-selector dependency resolution (`resolve_selector_dependencies`).
+    // -----------------------------------------------------------------------
+
+    fn input_attr(name: &str) -> BoundAttribute {
+        BoundAttribute {
+            name: name.to_string(),
+            kind: crate::expression::ast::BindingType::Property,
+            security_context: crate::expression::ast::SecurityContext::None,
+            value: implicit_read("v"),
+            unit: None,
+            source_span: span(),
+            key_span: span(),
+            value_span: None,
+            i18n: None,
+        }
+    }
+
+    fn text_attr(name: &str, value: &str) -> TextAttribute {
+        TextAttribute {
+            name: name.to_string(),
+            value: value.to_string(),
+            source_span: span(),
+            key_span: None,
+            value_span: None,
+            i18n: None,
+        }
+    }
+
+    fn output_event(name: &str) -> BoundEvent {
+        BoundEvent {
+            name: name.to_string(),
+            kind: crate::expression::ast::ParsedEventType::Regular,
+            handler: implicit_read("noop"),
+            target: None,
+            phase: None,
+            source_span: span(),
+            handler_span: span(),
+            key_span: span(),
+        }
+    }
+
+    /// `[someDirective]="true"` on a `<div>` matches a `[someDirective]` directive (property
+    /// binding). Mirrors `r3_view_compiler_directives/matching/property_binding_directive.ts`.
+    #[test]
+    fn selector_deps_match_on_property_binding() {
+        let mut div = empty_element("div");
+        div.inputs.push(input_attr("someDirective"));
+        let nodes = vec![Node::Element(div)];
+        let deps = resolve_selector_dependencies(
+            &nodes,
+            &[SelectorDirective::new("SomeDirective", "[someDirective]", false)],
+        );
+        assert_eq!(deps, vec!["SomeDirective".to_string()]);
+    }
+
+    /// `(someDirective)="noop()"` on a `<div>` matches a `[someDirective]` directive (output
+    /// binding). Mirrors `output_directive.ts`.
+    #[test]
+    fn selector_deps_match_on_output_binding() {
+        let mut div = empty_element("div");
+        div.outputs.push(output_event("someDirective"));
+        let nodes = vec![Node::Element(div)];
+        let deps = resolve_selector_dependencies(
+            &nodes,
+            &[SelectorDirective::new("SomeDirective", "[someDirective]", false)],
+        );
+        assert_eq!(deps, vec!["SomeDirective".to_string()]);
+    }
+
+    /// `<ng-template directiveA>` matches the element-named selector `ng-template[directiveA]`.
+    /// Mirrors `ng_template_directive.ts`.
+    #[test]
+    fn selector_deps_match_on_ng_template_attr() {
+        let mut tpl = Template {
+            tag_name: Some("ng-template".to_string()),
+            attributes: vec![text_attr("directiveA", "")],
+            inputs: vec![],
+            outputs: vec![],
+            directives: vec![],
+            template_attrs: vec![],
+            children: vec![],
+            references: vec![],
+            variables: vec![],
+            is_self_closing: false,
+            source_span: span(),
+            start_source_span: span(),
+            end_source_span: None,
+            i18n: None,
+        };
+        tpl.attributes.push(text_attr("noise", ""));
+        let nodes = vec![Node::Template(tpl)];
+        let deps = resolve_selector_dependencies(
+            &nodes,
+            &[SelectorDirective::new(
+                "DirectiveA",
+                "ng-template[directiveA]",
+                false,
+            )],
+        );
+        assert_eq!(deps, vec!["DirectiveA".to_string()]);
+    }
+
+    /// `<ng-container directiveA>` matches `ng-container[directiveA]`; an unrelated `[someDirective]`
+    /// candidate does NOT match. Mirrors `ng_container_directive.ts`.
+    #[test]
+    fn selector_deps_match_on_ng_container_attr_and_reject_nonmatch() {
+        let mut container = empty_element("ng-container");
+        container.attributes.push(text_attr("directiveA", ""));
+        let nodes = vec![Node::Element(container)];
+        let deps = resolve_selector_dependencies(
+            &nodes,
+            &[
+                SelectorDirective::new("DirectiveA", "ng-container[directiveA]", false),
+                SelectorDirective::new("SomeDirective", "[someDirective]", false),
+            ],
+        );
+        assert_eq!(deps, vec!["DirectiveA".to_string()]);
+    }
+
+    /// A structural directive desugared onto a wrapping `<ng-template>` carries its key in
+    /// `template_attrs`; `[someDirective]` matches it. Mirrors `structural_directive.ts`.
+    #[test]
+    fn selector_deps_match_structural_directive_on_template_attr() {
+        let inner = empty_element("div");
+        let tpl = Template {
+            tag_name: None,
+            attributes: vec![],
+            inputs: vec![],
+            outputs: vec![],
+            directives: vec![],
+            template_attrs: vec![TemplateAttr::Text(text_attr("someDirective", ""))],
+            children: vec![Node::Element(inner)],
+            references: vec![],
+            variables: vec![],
+            is_self_closing: false,
+            source_span: span(),
+            start_source_span: span(),
+            end_source_span: None,
+            i18n: None,
+        };
+        let nodes = vec![Node::Template(tpl)];
+        let deps = resolve_selector_dependencies(
+            &nodes,
+            &[SelectorDirective::new("SomeDirective", "[someDirective]", false)],
+        );
+        assert_eq!(deps, vec!["SomeDirective".to_string()]);
+    }
+
+    /// Candidate order (declaration order) is preserved and matches are deduplicated even when a
+    /// directive matches multiple nodes.
+    #[test]
+    fn selector_deps_preserve_declaration_order_and_dedup() {
+        let mut a = empty_element("div");
+        a.inputs.push(input_attr("dirB"));
+        let mut b = empty_element("span");
+        b.attributes.push(text_attr("dirA", ""));
+        let mut c = empty_element("p");
+        c.attributes.push(text_attr("dirA", "")); // dirA matches twice
+        let nodes = vec![Node::Element(a), Node::Element(b), Node::Element(c)];
+        let deps = resolve_selector_dependencies(
+            &nodes,
+            &[
+                SelectorDirective::new("DirA", "[dirA]", false),
+                SelectorDirective::new("DirB", "[dirB]", false),
+            ],
+        );
+        // Declaration order: DirA before DirB; DirA appears once despite two matches.
+        assert_eq!(deps, vec!["DirA".to_string(), "DirB".to_string()]);
+    }
+
+    /// A comma-separated selector matches if ANY group matches.
+    #[test]
+    fn selector_matcher_handles_comma_groups() {
+        let div = empty_element("custom-el");
+        let nodes = vec![Node::Element(div)];
+        let deps = resolve_selector_dependencies(
+            &nodes,
+            &[SelectorDirective::new("Multi", "foo, custom-el, bar", true)],
+        );
+        assert_eq!(deps, vec!["Multi".to_string()]);
+    }
+
+    /// A class selector (`.cls`) matches against a static `class="..."` attribute.
+    #[test]
+    fn selector_matcher_handles_class_selector() {
+        let mut div = empty_element("div");
+        div.attributes.push(text_attr("class", "alpha beta"));
+        let nodes = vec![Node::Element(div)];
+        let hit = resolve_selector_dependencies(
+            &nodes,
+            &[SelectorDirective::new("Beta", ".beta", false)],
+        );
+        assert_eq!(hit, vec!["Beta".to_string()]);
+        let miss = resolve_selector_dependencies(
+            &nodes,
+            &[SelectorDirective::new("Gamma", ".gamma", false)],
+        );
+        assert!(miss.is_empty());
+    }
+
+    /// `:not(...)` negation excludes a node whose attributes match the negated group.
+    #[test]
+    fn selector_matcher_handles_not_negation() {
+        let mut excluded = empty_element("div");
+        excluded.attributes.push(text_attr("skip", ""));
+        let plain = empty_element("div");
+        let nodes = vec![Node::Element(excluded), Node::Element(plain)];
+        // `div:not([skip])` matches the plain div but not the one carrying `skip`.
+        let deps = resolve_selector_dependencies(
+            &nodes,
+            &[SelectorDirective::new("Dir", "div:not([skip])", false)],
+        );
+        // It still matches overall because the plain div qualifies.
+        assert_eq!(deps, vec!["Dir".to_string()]);
+
+        // With ONLY the excluded node, `:not([skip])` must reject it entirely.
+        let only_excluded = {
+            let mut e = empty_element("div");
+            e.attributes.push(text_attr("skip", ""));
+            vec![Node::Element(e)]
+        };
+        let none = resolve_selector_dependencies(
+            &only_excluded,
+            &[SelectorDirective::new("Dir", "div:not([skip])", false)],
+        );
+        assert!(none.is_empty());
+    }
+
+    /// A candidate with an empty selector never participates in CSS-selector matching.
+    #[test]
+    fn selector_deps_ignore_empty_selector() {
+        let div = empty_element("div");
+        let nodes = vec![Node::Element(div)];
+        let deps = resolve_selector_dependencies(
+            &nodes,
+            &[SelectorDirective::new("NoSel", "  ", true)],
+        );
+        assert!(deps.is_empty());
     }
 }

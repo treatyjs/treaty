@@ -372,8 +372,6 @@ fn decorator_string_alias(dec: &Decorator) -> Option<String> {
 /// Detected metadata that this front-end refuses to mis-compile. Presence of any of these in the
 /// decorator object means we return an error so the harness can skip the case.
 const UNSUPPORTED_DECORATOR_KEYS: &[&str] = &[
-    "providers",
-    "viewProviders",
     // The legacy `queries: {...}` decorator-object form is distinct from the `@ViewChild`/
     // `@ContentChild` member decorators handled by `collect_decorator_queries`; still unsupported.
     "queries",
@@ -1251,11 +1249,27 @@ fn compile_program(
         }
     }
 
+    // Cross-class CSS-SELECTOR directive matching: a sibling-declared `@Directive`/`@Component`
+    // whose selector matches via an attribute/property/output binding, on `ng-template`/
+    // `ng-container`, or as a structural directive is matched by SELECTOR (not class name), so the
+    // selectorless candidate set above cannot find it. Collect every sibling's `(name, selector,
+    // isComponent)` so [`crate::binder::resolve_selector_dependencies`] can match them against the
+    // bound template and add the matches to the component's `dependencies` (see
+    // `compile_component_meta`).
+    let sibling_directives = collect_sibling_directives(&decorated);
+
     // Single-class fast path preserves the additive source-map behaviour (the map artifact is only
     // meaningful for a single component definition). Multi-class files always emit plainly.
     if decorated.len() == 1 {
         let TopStmt::Decorated(class, kind, dec) = decorated[0];
-        return compile_decorated_class(class, kind, dec, &auto_import_candidates, map);
+        return compile_decorated_class(
+            class,
+            kind,
+            dec,
+            &auto_import_candidates,
+            &sibling_directives,
+            map,
+        );
     }
 
     // R1: emit each decorated class in source order and concatenate. A `map` request degrades to
@@ -1264,7 +1278,8 @@ fn compile_program(
     let mut errors: Vec<String> = Vec::new();
     for item in &decorated {
         let TopStmt::Decorated(class, kind, dec) = *item;
-        let compiled = compile_decorated_class(class, kind, dec, &auto_import_candidates, None);
+        let compiled =
+            compile_decorated_class(class, kind, dec, &auto_import_candidates, &sibling_directives, None);
         errors.extend(compiled.errors);
         if !compiled.code.is_empty() {
             pieces.push(compiled.code);
@@ -1288,12 +1303,44 @@ fn compile_program(
     }
 }
 
+/// Collect the `(name, selector, is_component)` of every sibling `@Directive`/`@Component` class
+/// that carries a non-empty `selector`, for cross-class CSS-selector directive matching. A
+/// directive/component without a selector (selectorless / class-name-only) is excluded — it is
+/// resolved through the selectorless candidate set instead.
+fn collect_sibling_directives(decorated: &[TopStmt]) -> Vec<crate::binder::SelectorDirective> {
+    let mut out = Vec::new();
+    for TopStmt::Decorated(class, kind, dec) in decorated {
+        let is_component = match kind {
+            TopLevel::Component => true,
+            TopLevel::Directive => false,
+            _ => continue,
+        };
+        let Some(id) = &class.id else { continue };
+        let name = id.name.to_string();
+        let selector = decorator_object(dec)
+            .and_then(|o| find_prop(o, "selector"))
+            .and_then(string_value);
+        if let Some(selector) = selector {
+            if !selector.trim().is_empty() {
+                out.push(crate::binder::SelectorDirective::new(
+                    name,
+                    selector,
+                    is_component,
+                ));
+            }
+        }
+    }
+    out
+}
+
 /// Compile ONE decorated class to its Ivy definition, dispatching on the decorator kind.
+#[allow(clippy::too_many_arguments)]
 fn compile_decorated_class(
     class: &Class,
     kind: TopLevel,
     dec: &Decorator,
     auto_import_candidates: &[String],
+    sibling_directives: &[crate::binder::SelectorDirective],
     map: Option<(&MapContext, &mut String)>,
 ) -> CompiledComponent {
     let (class_name, class_name_span) = match &class.id {
@@ -1314,6 +1361,7 @@ fn compile_decorated_class(
             class_name,
             class_name_span,
             auto_import_candidates,
+            sibling_directives,
             map,
         ),
         TopLevel::Pipe => compile_pipe_class(obj, &class_name),
@@ -1338,6 +1386,7 @@ fn compile_component_or_directive(
     class_name: String,
     class_name_span: ParseSourceSpan,
     auto_import_candidates: &[String],
+    sibling_directives: &[crate::binder::SelectorDirective],
     map: Option<(&MapContext, &mut String)>,
 ) -> CompiledComponent {
     // Reject decorator-level metadata we cannot yet model.
@@ -1435,6 +1484,31 @@ fn compile_component_or_directive(
         .and_then(string_value)
         .map(|s| s.split(',').map(|p| p.trim().to_string()).collect::<Vec<_>>());
 
+    // providers: [...] — the directive/component injectable providers. Angular folds this into a
+    // `features: [ɵɵProvidersFeature(providers[, viewProviders])]` entry on the define block; the
+    // emitter (`view::compiler::add_features`) consumes `base.providers` as the FIRST feature
+    // argument. The array expression is copied through verbatim (`WrappedNodeExpr`-style) via
+    // `convert_expr`, matching ngtsc's provider emit. A present-but-unconvertible providers value
+    // bails rather than silently dropping the feature.
+    let providers = match obj.and_then(|o| find_prop(o, "providers")) {
+        None => None,
+        Some(e) => match convert_expr(e) {
+            Some(expr) => Some(expr),
+            None => return err("unsupported `providers` expression form".to_string()),
+        },
+    };
+
+    // viewProviders: [...] — component-only; folded into the SECOND `ɵɵProvidersFeature` argument.
+    // Carried on the component metadata (`R3ComponentMetadata::view_providers`); directives have no
+    // view-provider scope, so Angular ignores it there and so do we.
+    let view_providers = match obj.and_then(|o| find_prop(o, "viewProviders")) {
+        None => None,
+        Some(e) => match convert_expr(e) {
+            Some(expr) => Some(expr),
+            None => return err("unsupported `viewProviders` expression form".to_string()),
+        },
+    };
+
     // inputs / outputs.
     let mut inputs: OrderedMap<String, R3InputMetadata> = OrderedMap::new();
     let mut outputs: OrderedMap<String, String> = OrderedMap::new();
@@ -1480,7 +1554,7 @@ fn compile_component_or_directive(
         uses_inheritance: false,
         control_create: None,
         export_as,
-        providers: None,
+        providers,
         is_standalone: standalone,
         is_signal,
         host_directives,
@@ -1488,21 +1562,41 @@ fn compile_component_or_directive(
     };
 
     match kind {
-        TopLevel::Component => compile_component_meta(
-            base,
-            &template_html.unwrap_or_default(),
-            change_detection,
-            auto_import_candidates,
-            styles,
-            encapsulation,
-            animations,
-            foreign_imports,
-            map,
-        ),
+        TopLevel::Component => {
+            // CSS-selector directive candidates for THIS component: every sibling directive/
+            // component (excluding self) that carries a selector. Fed to the binder's real
+            // CssSelector matcher in `compile_component_meta` to populate `dependencies`.
+            let selector_candidates: Vec<crate::binder::SelectorDirective> = sibling_directives
+                .iter()
+                .filter(|d| d.name != class_name)
+                .cloned()
+                .collect();
+            compile_component_meta(
+                base,
+                &template_html.unwrap_or_default(),
+                change_detection,
+                auto_import_candidates,
+                &selector_candidates,
+                styles,
+                encapsulation,
+                animations,
+                foreign_imports,
+                view_providers,
+                map,
+            )
+        }
         // R4: @Directive — drive the existing `compile_directive_from_metadata` emitter (no
         // template; host bindings + queries + hostDirectives + exportAs come from `base`).
+        // `viewProviders` has no meaning on a directive (no view scope) and Angular drops it there.
         TopLevel::Directive => {
-            let _ = (change_detection, styles, encapsulation, animations, foreign_imports);
+            let _ = (
+                change_detection,
+                styles,
+                encapsulation,
+                animations,
+                foreign_imports,
+                view_providers,
+            );
             compile_directive_meta(base)
         }
         _ => unreachable!("compile_component_or_directive only handles Component/Directive"),
@@ -1568,8 +1662,11 @@ fn compile_pipe_class(
 }
 
 /// R4: emit an `@NgModule({declarations, imports, exports, bootstrap, id})` class via
-/// [`compile_ng_module`]. Uses the inline-scope mode (the common compliance shape) so the
-/// declarations/imports/exports land directly in the `ɵɵdefineNgModule({...})` call.
+/// [`compile_ng_module`]. Drives the FULL-compilation shape Angular's full/local goldens carry:
+/// the `ɵɵdefineNgModule({...})` call holds ONLY `{type[, bootstrap][, id]}`, the selector scope
+/// (declarations/imports/exports) is emitted as a tree-shakeable `ɵɵsetNgModuleScope` side effect
+/// (`R3SelectorScopeMode::SideEffect`), and an `@NgModule({id})` additionally drives a trailing
+/// `ɵɵregisterNgModuleType(Type, id)` statement.
 fn compile_ng_module_class(
     obj: Option<&oxc_ast::ast::ObjectExpression>,
     class_name: &str,
@@ -1591,12 +1688,19 @@ fn compile_ng_module_class(
     let exports = refs_of("exports");
     let bootstrap = refs_of("bootstrap");
 
+    // `id: '<string>'` -> a string-literal expression on the module def. Its presence also drives
+    // the trailing `ɵɵregisterNgModuleType(Type, id)` side effect emitted by `compile_ng_module`.
+    let id = obj
+        .and_then(|o| find_prop(o, "id"))
+        .and_then(string_value)
+        .map(|s| o::literal(LiteralValue::String(s), None));
+
     let meta = R3NgModuleMetadata::Global(R3NgModuleMetadataGlobal {
         common: R3NgModuleCommon {
             r#type: directive_ref(class_name),
-            selector_scope_mode: R3SelectorScopeMode::Inline,
+            selector_scope_mode: R3SelectorScopeMode::SideEffect,
             schemas: None,
-            id: None,
+            id,
         },
         bootstrap,
         declarations,
@@ -1787,10 +1891,12 @@ fn compile_component_meta(
     template_html: &str,
     change_detection: ChangeDetectionStrategy,
     imported_names: &[String],
+    selector_candidates: &[crate::binder::SelectorDirective],
     styles: Vec<String>,
     encapsulation: ViewEncapsulation,
     animations: Option<Expr>,
     foreign_imports: Option<Vec<R3ForeignComponentMetadata>>,
+    view_providers: Option<Expr>,
     map: Option<(&MapContext, &mut String)>,
 ) -> CompiledComponent {
     let mut errors: Vec<String> = Vec::new();
@@ -1816,8 +1922,34 @@ fn compile_component_meta(
     // component's `dependencies`. Unused imports are not emitted.
     let candidates: Vec<String> = imported_names.to_vec();
     let selectorless_nodes = crate::compile::parse_template_selectorless(template_html);
-    let declarations =
+    let mut declarations =
         crate::compile::resolve_template_dependencies(&candidates, &selectorless_nodes);
+
+    // CROSS-CLASS CSS-SELECTOR MATCHING: feed every sibling-declared/imported directive selector
+    // into the binder's real CssSelector matcher over the SAME bound template the component emits.
+    // Directives matched by an attribute/property/output binding, on `ng-template`/`ng-container`,
+    // or as a structural directive (`*dir`) are added to `dependencies` HERE — the selectorless
+    // pass above only finds class-name (`<Foo>`/`@Foo`) references. Matches already present from
+    // the selectorless pass are not duplicated.
+    if !selector_candidates.is_empty() {
+        let already: std::collections::HashSet<String> = declarations
+            .iter()
+            .filter_map(|d| match &d.ty.kind {
+                crate::output_ast::ExprKind::ReadVar { name } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        let matched = crate::binder::resolve_selector_dependencies(&r3.nodes, selector_candidates);
+        for name in matched {
+            if !already.contains(&name) {
+                declarations.push(R3TemplateDependencyMetadata {
+                    kind: crate::view::compiler::R3TemplateDependencyKind::Directive,
+                    ty: o::variable(&name, None),
+                });
+            }
+        }
+    }
+
     let has_directive_dependencies = !declarations.is_empty();
 
     let mut meta: R3ComponentMetadata<R3TemplateDependencyMetadata> = R3ComponentMetadata {
@@ -1836,7 +1968,7 @@ fn compile_component_meta(
         external_styles: None,
         encapsulation,
         animations,
-        view_providers: None,
+        view_providers,
         relative_context_file_path: String::new(),
         i18n_use_external_ids: false,
         change_detection: Some(ChangeDetection::Strategy(change_detection)),
@@ -1936,6 +2068,13 @@ mod tests {
 
     const ZWS: &str = "\u{0275}\u{0275}defineComponent";
 
+    /// Collapse all runs of ASCII whitespace (incl. the emitter's tabs/newlines used to
+    /// pretty-print object/array literals) to a single space so multi-line emitted code can be
+    /// matched against the single-line golden `features:` excerpts.
+    fn normalize_ws(s: &str) -> String {
+        s.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
     #[test]
     fn compiles_basic_component_from_source() {
         let src = r#"@Component({selector:"a",template:"<div>{{x}}</div>"}) export class C { x = 1; }"#;
@@ -2021,11 +2160,83 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_providers_returns_error() {
-        let src = r#"@Component({selector:"a",template:"<p></p>",providers:[X]}) export class C {}"#;
+    fn component_providers_only_emits_providers_feature() {
+        // Mirrors r3_view_compiler_providers/providers_feature_providers_only.ts. Angular folds the
+        // `providers` array into a single `ɵɵProvidersFeature([...])` feature entry.
+        let src = r#"@Component({
+            selector:"my-component",
+            template:"<div></div>",
+            providers:[GreeterEN, { provide: Greeter, useClass: GreeterEN }],
+            standalone:false
+        }) export class MyComponent {}"#;
         let out = compile_component_source(src);
-        assert!(out.code.is_empty(), "expected no code; got: {}", out.code);
-        assert!(!out.errors.is_empty(), "expected an error");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        // The emitter pretty-prints the provider object across lines; collapse whitespace before
+        // matching (the compliance harness normalizes the same way against the golden excerpt).
+        let flat = normalize_ws(&out.code);
+        assert!(
+            flat.contains(
+                "\u{0275}\u{0275}ProvidersFeature([GreeterEN, { provide: Greeter, useClass: GreeterEN }])"
+            ),
+            "expected providers-only ProvidersFeature; got: {flat}"
+        );
+    }
+
+    #[test]
+    fn component_view_providers_only_emits_empty_first_arg() {
+        // Mirrors providers_feature_view_providers_only.ts: viewProviders with no providers emits an
+        // empty array as the first `ɵɵProvidersFeature` argument and the viewProviders as the second.
+        let src = r#"@Component({
+            selector:"my-component",
+            template:"<div></div>",
+            viewProviders:[GreeterEN],
+            standalone:false
+        }) export class MyComponent {}"#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let flat = normalize_ws(&out.code);
+        assert!(
+            flat.contains("\u{0275}\u{0275}ProvidersFeature([], [GreeterEN])"),
+            "expected empty-providers + viewProviders ProvidersFeature; got: {flat}"
+        );
+    }
+
+    #[test]
+    fn component_providers_and_view_providers_emits_both_args() {
+        // Mirrors providers_feature_providers_and_view_providers.ts.
+        let src = r#"@Component({
+            selector:"my-component",
+            template:"<div></div>",
+            providers:[GreeterEN, { provide: Greeter, useClass: GreeterEN }],
+            viewProviders:[GreeterEN],
+            standalone:false
+        }) export class MyComponent {}"#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let flat = normalize_ws(&out.code);
+        assert!(
+            flat.contains(
+                "\u{0275}\u{0275}ProvidersFeature([GreeterEN, { provide: Greeter, useClass: GreeterEN }], [GreeterEN])"
+            ),
+            "expected providers + viewProviders ProvidersFeature; got: {flat}"
+        );
+    }
+
+    #[test]
+    fn directive_providers_emits_providers_feature() {
+        // A `@Directive` carrying `providers` also folds into a ProvidersFeature on defineDirective.
+        let src = r#"@Directive({
+            selector:"[my-dir]",
+            providers:[Svc],
+            standalone:false
+        }) export class MyDir {}"#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let flat = normalize_ws(&out.code);
+        assert!(
+            flat.contains("\u{0275}\u{0275}ProvidersFeature([Svc])"),
+            "expected directive ProvidersFeature; got: {flat}"
+        );
     }
 
     #[test]

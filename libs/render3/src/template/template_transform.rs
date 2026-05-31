@@ -2336,18 +2336,37 @@ impl BindingParser {
                     });
                 }
                 TemplateBinding::Expression { key, value, .. } => {
-                    let aws = value.unwrap_or_else(|| {
-                        self.parser
-                            .wrap_literal_primitive(None, String::new(), absolute_value_offset)
-                    });
-                    parsed_properties.push(ParsedProperty {
-                        name: key.source.clone(),
-                        expression: aws,
-                        ty: ParsedPropertyType::Default,
-                        source_span: prop_span.clone(),
-                        key_span: prop_span.clone(),
-                        value_span: None,
-                    });
+                    match value {
+                        // A microsyntax expression binding WITH a value (`*ngIf="cond"`) is a real
+                        // property binding (`ɵɵproperty("ngIf", cond)`).
+                        Some(aws) => {
+                            parsed_properties.push(ParsedProperty {
+                                name: key.source.clone(),
+                                expression: aws,
+                                ty: ParsedPropertyType::Default,
+                                source_span: prop_span.clone(),
+                                key_span: prop_span.clone(),
+                                value_span: None,
+                            });
+                        }
+                        // A microsyntax expression binding with NO value (`*someDirective`,
+                        // `*ngIf` alone) is a value-LESS marker: Angular's `parseInlineTemplateBinding`
+                        // routes it through `parseLiteralAttr(key, null)` — a `LiteralAttr`
+                        // `ParsedProperty` that becomes a const-attr Template marker, NOT a bound
+                        // property. (Previously this wrapped `None` into a `LiteralPrimitive::Null`,
+                        // which mis-emitted a spurious `ɵɵproperty("someDirective", null)`.)
+                        None => {
+                            self.parse_literal_attr(
+                                &key.source,
+                                "",
+                                source_span,
+                                absolute_value_offset,
+                                &None,
+                                parsed_properties,
+                                source_span,
+                            );
+                        }
+                    }
                 }
             }
         }

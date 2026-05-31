@@ -260,6 +260,64 @@ fn render_flag_check_if_stmt(flags: RenderFlags, statements: Vec<Stmt>) -> Stmt 
 // getQueryPredicate.
 // ---------------------------------------------------------------------------
 
+/// Unwrap a `forwardRef(() => X)` call expression to its bare target `X` (faithful to ngtsc's
+/// `tryUnwrapForwardRef` in `annotations/common/src/util.ts`, as applied at query-predicate
+/// extraction in `directive/src/shared.ts::extractQueryMetadata`).
+///
+/// Returns `Some(X)` when `expr` is an `InvokeFunctionExpr` whose callee names `forwardRef` and
+/// whose single argument is a zero-parameter arrow (`() => X` or `() => { return X; }`); otherwise
+/// `None`. The callee is matched against either a bare `forwardRef` variable read (the form
+/// produced when a decorator predicate is converted verbatim) or an `ɵɵforwardRef`/`forwardRef`
+/// external reference, so the unwrap is robust to either upstream shape.
+///
+/// `X` is returned verbatim (typically a class reference). Per ngtsc, an unwrapped forward ref is
+/// flagged `ForwardRefHandling::Unwrapped`, which `get_query_predicate` emits as the bare
+/// expression — matching the golden `ɵɵviewQuery(SomeDirective, …)` (NOT
+/// `ɵɵviewQuery(ɵɵresolveForwardRef(SomeDirective), …)`).
+fn try_unwrap_forward_ref(expr: &Expr) -> Option<Expr> {
+    let o::ExprKind::Invoke { callee, args, .. } = &expr.kind else {
+        return None;
+    };
+    if !callee_is_forward_ref(callee) {
+        return None;
+    }
+    // `forwardRef(() => X)` — exactly one argument, a zero-param arrow whose body yields `X`.
+    let [arg] = args.as_slice() else {
+        return None;
+    };
+    let o::ExprKind::Arrow { params, body } = &arg.kind else {
+        return None;
+    };
+    if !params.is_empty() {
+        return None;
+    }
+    arrow_returned_expr(body)
+}
+
+/// Whether a call callee references `forwardRef` — either a bare `forwardRef` variable read or a
+/// `forwardRef`/`ɵɵforwardRef` external (`@angular/core`) reference.
+fn callee_is_forward_ref(callee: &Expr) -> bool {
+    match &callee.kind {
+        o::ExprKind::ReadVar { name } => name == "forwardRef",
+        o::ExprKind::External { value, .. } => {
+            value.name == "forwardRef" || value.name == "ɵɵforwardRef"
+        }
+        _ => false,
+    }
+}
+
+/// The expression yielded by a zero-parameter arrow body: `() => X` (expression body) or
+/// `() => { return X; }` (block body with a single trailing `return`).
+fn arrow_returned_expr(body: &o::ArrowBody) -> Option<Expr> {
+    match body {
+        o::ArrowBody::Expr(e) => Some((**e).clone()),
+        o::ArrowBody::Block(stmts) => stmts.iter().rev().find_map(|st| match &st.kind {
+            StmtKind::Return(e) => Some(e.clone()),
+            _ => None,
+        }),
+    }
+}
+
 /// `getQueryPredicate(query, constantPool)` — builds the predicate argument expression.
 pub fn get_query_predicate(query: &R3QueryMetadata, constant_pool: &mut ConstantPool) -> Expr {
     match &query.predicate {
@@ -277,13 +335,27 @@ pub fn get_query_predicate(query: &R3QueryMetadata, constant_pool: &mut Constant
             }
             constant_pool.get_const_literal(o::literal_arr(predicate, None), true)
         }
-        QueryPredicate::Expression(maybe_fwd) => match maybe_fwd.forward_ref {
-            ForwardRefHandling::None | ForwardRefHandling::Unwrapped => {
-                maybe_fwd.expression.clone()
+        QueryPredicate::Expression(maybe_fwd) => {
+            // Faithful to ngtsc's `extractQueryMetadata`: a `forwardRef(() => X)` predicate is
+            // unwrapped to the bare target `X` at extraction time and flagged
+            // `ForwardRefHandling::Unwrapped`, so codegen emits the bare reference. We mirror that
+            // here so a predicate that still carries the raw `forwardRef(() => X)` call (because an
+            // upstream converter copied it through verbatim rather than pre-unwrapping) collapses
+            // to the same golden `ɵɵviewQuery(X, …)` output — never `ɵɵresolveForwardRef(X)`. A
+            // genuinely opaque `Wrapped` expression (no resolvable arrow) keeps Angular's
+            // `ɵɵresolveForwardRef(...)` wrapping.
+            match maybe_fwd.forward_ref {
+                ForwardRefHandling::None | ForwardRefHandling::Unwrapped => {
+                    try_unwrap_forward_ref(&maybe_fwd.expression)
+                        .unwrap_or_else(|| maybe_fwd.expression.clone())
+                }
+                ForwardRefHandling::Wrapped => try_unwrap_forward_ref(&maybe_fwd.expression)
+                    .unwrap_or_else(|| {
+                        import_expr(R3::ResolveForwardRef)
+                            .call_fn(vec![maybe_fwd.expression.clone()], false)
+                    }),
             }
-            ForwardRefHandling::Wrapped => import_expr(R3::ResolveForwardRef)
-                .call_fn(vec![maybe_fwd.expression.clone()], false),
-        },
+        }
     }
 }
 
@@ -753,6 +825,137 @@ mod tests {
         assert!(js.contains("queryRefresh"), "got: {js}");
         assert!(js.contains("loadQuery"), "got: {js}");
         assert!(js.contains(".first"), "got: {js}");
+    }
+
+    /// A `forwardRef(() => SomeDirective)` predicate (callee = bare `forwardRef` var, expression-
+    /// bodied arrow) must unwrap to the bare `SomeDirective` reference and emit
+    /// `ɵɵviewQuery(SomeDirective, 5)` — NOT `ɵɵviewQuery(ɵɵresolveForwardRef(SomeDirective), 5)`
+    /// — matching `view_query_forward_ref.js`.
+    fn forward_ref_call(target: &str) -> Expr {
+        o::variable("forwardRef", None).call_fn(
+            vec![o::arrow_fn(
+                vec![],
+                crate::output_ast::ArrowBody::Expr(Box::new(o::variable(target, None))),
+                None,
+            )],
+            false,
+        )
+    }
+
+    #[test]
+    fn forward_ref_view_query_unwraps_to_bare_ref() {
+        let query = R3QueryMetadata {
+            property_name: "someDir".to_string(),
+            first: true,
+            predicate: QueryPredicate::Expression(MaybeForwardRefExpression {
+                expression: forward_ref_call("SomeDirective"),
+                // ngtsc flags an unwrapped forward ref as `Unwrapped`; we also accept the raw call
+                // arriving under `None` and unwrap it identically.
+                forward_ref: ForwardRefHandling::Unwrapped,
+            }),
+            descendants: true,
+            emit_distinct_changes_only: true,
+            read: None,
+            is_static: false,
+            is_signal: false,
+        };
+        let mut pool = ConstantPool::new();
+        let pred = get_query_predicate(&query, &mut pool);
+        // The predicate is the bare `SomeDirective` variable read — no `resolveForwardRef` wrap.
+        match &pred.kind {
+            ExprKind::ReadVar { name } => assert_eq!(name, "SomeDirective"),
+            other => panic!("expected bare SomeDirective ReadVar, got {other:?}"),
+        }
+
+        // Full create-call: ɵɵviewQuery(SomeDirective, 5) (descendants|emitDistinctChangesOnly).
+        let f = create_view_queries_function(&[query], &mut pool, Some("ViewQueryComponent"));
+        let js = emit_expression(&f);
+        assert!(js.contains("viewQuery"), "got: {js}");
+        assert!(!js.contains("resolveForwardRef"), "must not wrap forwardRef: {js}");
+        assert!(js.contains("SomeDirective"), "got: {js}");
+    }
+
+    /// The raw `forwardRef(() => X)` call arriving under `ForwardRefHandling::None` (an upstream
+    /// converter that copied the predicate through verbatim) must still unwrap to bare `X`.
+    #[test]
+    fn forward_ref_under_none_handling_unwraps() {
+        let query = R3QueryMetadata {
+            property_name: "someDir".to_string(),
+            first: true,
+            predicate: QueryPredicate::Expression(MaybeForwardRefExpression {
+                expression: forward_ref_call("SomeDir"),
+                forward_ref: ForwardRefHandling::None,
+            }),
+            descendants: false,
+            emit_distinct_changes_only: true,
+            read: None,
+            is_static: false,
+            is_signal: false,
+        };
+        let mut pool = ConstantPool::new();
+        let pred = get_query_predicate(&query, &mut pool);
+        match &pred.kind {
+            ExprKind::ReadVar { name } => assert_eq!(name, "SomeDir"),
+            other => panic!("expected bare SomeDir, got {other:?}"),
+        }
+    }
+
+    /// A block-bodied arrow `forwardRef(() => { return X; })` unwraps via the trailing `return`.
+    #[test]
+    fn forward_ref_block_body_arrow_unwraps() {
+        let call = o::variable("forwardRef", None).call_fn(
+            vec![o::arrow_fn(
+                vec![],
+                crate::output_ast::ArrowBody::Block(vec![Stmt::bare(StmtKind::Return(
+                    o::variable("BlockDir", None),
+                ))]),
+                None,
+            )],
+            false,
+        );
+        let unwrapped = super::try_unwrap_forward_ref(&call).expect("should unwrap block arrow");
+        match &unwrapped.kind {
+            ExprKind::ReadVar { name } => assert_eq!(name, "BlockDir"),
+            other => panic!("expected BlockDir, got {other:?}"),
+        }
+    }
+
+    /// A genuinely-opaque `Wrapped` expression (no resolvable `forwardRef(() => X)` arrow) keeps
+    /// Angular's `ɵɵresolveForwardRef(...)` wrapping — do not over-unwrap.
+    #[test]
+    fn opaque_wrapped_predicate_keeps_resolve_forward_ref() {
+        let query = R3QueryMetadata {
+            property_name: "someDir".to_string(),
+            first: true,
+            predicate: QueryPredicate::Expression(MaybeForwardRefExpression {
+                // Not a forwardRef call — just a bare token under Wrapped handling.
+                expression: o::variable("SomeToken", None),
+                forward_ref: ForwardRefHandling::Wrapped,
+            }),
+            descendants: false,
+            emit_distinct_changes_only: false,
+            read: None,
+            is_static: false,
+            is_signal: false,
+        };
+        let mut pool = ConstantPool::new();
+        let pred = get_query_predicate(&query, &mut pool);
+        // Should be ɵɵresolveForwardRef(SomeToken) — an Invoke of an External callee.
+        match &pred.kind {
+            ExprKind::Invoke { callee, args, .. } => {
+                assert!(matches!(callee.kind, ExprKind::External { .. }));
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("expected resolveForwardRef(...) invoke, got {other:?}"),
+        }
+    }
+
+    /// A non-`forwardRef` call expression is left untouched by the unwrap helper.
+    #[test]
+    fn non_forward_ref_call_not_unwrapped() {
+        let call = o::variable("someOtherFn", None)
+            .call_fn(vec![o::variable("X", None)], false);
+        assert!(super::try_unwrap_forward_ref(&call).is_none());
     }
 
     #[test]

@@ -247,6 +247,39 @@ fn binary_expr(op: BinaryOperator, lhs: Expr, rhs: Expr) -> Expr {
     })
 }
 
+/// `recv?.name` — a `ReadPropExpr` with `isOptional=true`, the NATIVE optional-chaining form the
+/// pipeline's `expand_safe_reads` phase produces for a `SafePropertyReadExpr` when
+/// `legacyOptionalChaining` is off (`new o.ReadPropExpr(receiver, name, …, /*isOptional*/ true)`).
+/// `Expr::prop` always sets `optional=false`, so the optional variant is built directly.
+fn prop_optional(recv: Expr, name: String) -> Expr {
+    Expr::bare(ExprKind::ReadProp {
+        receiver: Box::new(recv),
+        name,
+        optional: true,
+    })
+}
+
+/// `recv?.[index]` — a `ReadKeyExpr` with `isOptional=true` (native `SafeKeyedReadExpr` lowering).
+fn key_optional(recv: Expr, index: Expr) -> Expr {
+    Expr::bare(ExprKind::ReadKey {
+        receiver: Box::new(recv),
+        index: Box::new(index),
+        optional: true,
+    })
+}
+
+/// `callee?.(args)` — an `InvokeFunctionExpr` with `isOptional=true` (native `SafeCall` lowering;
+/// the pipeline keeps the optional `InvokeFunctionExpr` unchanged when `legacyOptionalChaining` is
+/// off, and the emitter renders it as native `callee?.(args)`).
+fn call_fn_optional(callee: Expr, args: Vec<Expr>) -> Expr {
+    Expr::bare(ExprKind::Invoke {
+        callee: Box::new(callee),
+        args,
+        pure: false,
+        optional: true,
+    })
+}
+
 /// A pure-function factory parameter reference `a{idx}` — the placeholder a non-constant literal
 /// entry is replaced by in the factory body, supplied as a live `ɵɵpureFunctionN` argument. Mirrors
 /// Angular's `ir.PureFunctionParameterExpr(idx)` (rewritten to `o.variable('a' + idx)` when the
@@ -413,7 +446,25 @@ pub fn convert_property_binding_with<R: LocalResolver>(
     resolver: &R,
 ) -> ConvertedBinding {
     let mut cx = Converter::new(resolver);
-    ConvertedBinding::pure(cx.convert(expr))
+    let expr = cx.convert(expr);
+    cx.finish(expr)
+}
+
+/// Like [`convert_property_binding`] but lowers safe-navigation reads (`a?.b`, `a?.[k]`, `f?.(args)`)
+/// with LEGACY semantics — the `legacyOptionalChaining` compiler flag. Each safe read expands into
+/// the guarded-temporary ternary `($tmpN$ = a) == null ? null : $tmpN$.b` (defaulting to `null`),
+/// and a matching `let $tmpN$;` declaration is returned in [`ConvertedBinding::stmts`] for the
+/// caller to emit ahead of the consuming instruction. The default ([`convert_property_binding`])
+/// uses native optional chaining (`a?.b`, defaulting to `undefined`).
+pub fn convert_property_binding_legacy(
+    expr: &AstNode,
+    implicit_receiver: Expr,
+    _binding_id: &str,
+) -> ConvertedBinding {
+    let resolver = CtxResolver::new(implicit_receiver);
+    let mut cx = Converter::new(&resolver).legacy();
+    let expr = cx.convert(expr);
+    cx.finish(expr)
 }
 
 /// Like [`convert_property_binding_with`] but additionally lowers any
@@ -434,7 +485,8 @@ pub fn convert_property_binding_with_pipes<R: LocalResolver, P: PipeSlotAllocato
     // The property/interpolation binding path is the one Angular's pure-literal-structures phase
     // runs on, so literal arrays/maps here are extracted into const-pool `ɵɵpureFunctionN` factories.
     cx.extract_pure = true;
-    ConvertedBinding::pure(cx.convert(expr))
+    let expr = cx.convert(expr);
+    cx.finish(expr)
 }
 
 /// `convertActionBinding(ast, ...)` — lower an event-handler expression. Event
@@ -473,9 +525,16 @@ pub fn convert_action_binding_with<R: LocalResolver>(
                     stmts.push(lowered.to_stmt());
                 }
             }
-            ConvertedBinding { stmts, expr: tail }
+            // Any legacy safe-navigation temporaries spilled while lowering the chain must be
+            // declared ahead of the chain's statements.
+            let mut decls = cx.temporary_declarations();
+            decls.extend(stmts);
+            ConvertedBinding { stmts: decls, expr: tail }
         }
-        _ => ConvertedBinding::pure(cx.convert(expr)),
+        _ => {
+            let lowered = cx.convert(expr);
+            cx.finish(lowered)
+        }
     }
 }
 
@@ -593,9 +652,10 @@ fn interpolation_refs(kind: InterpolationKind) -> ([R3; 9], R3) {
 
 struct Converter<'r, R: LocalResolver> {
     resolver: &'r R,
-    /// Monotonic counter seeding temporary-variable names (`tmp_0`, `tmp_1`, ...)
-    /// for safe-navigation guard expansion. Mirrors `allocateTemporary()` /
-    /// `_currentTemporary` in the classic `_AstToIrVisitor`.
+    /// Monotonic counter seeding temporary-variable names (`$tmp0$`, `$tmp1$`, ...)
+    /// for legacy safe-navigation guard expansion. Mirrors `allocateTemporary()` /
+    /// `_currentTemporary` in the classic `_AstToIrVisitor` and the `AssignTemporaryExpr`
+    /// naming the pipeline's `expand_safe_reads` phase uses (`$tmp{n}$`).
     next_temp: usize,
     /// Optional pipe-slot allocator. When `Some`, a `BindingPipe` lowers to a
     /// `ɵɵpipeBindN`/`ɵɵpipeBindV` call; when `None`, it falls back to the
@@ -663,6 +723,19 @@ struct Converter<'r, R: LocalResolver> {
     /// `getSharedFunctionReference` names arrow factories `$arrowFn{N}$`, distinct from the `$cN$`
     /// pure-literal namespace, so a view mixing both keeps two independent sequences.
     next_arrow_name: std::cell::Cell<usize>,
+    /// Whether safe-navigation reads (`a?.b`, `a?.[k]`, `f?.(args)`) lower to the LEGACY
+    /// guarded-temporary ternary (`($tmp0$ = a) == null ? null : $tmp0$.b`, defaulting to `null`)
+    /// instead of NATIVE optional chaining (`a?.b`, defaulting to `undefined`). Mirrors the
+    /// `legacyOptionalChaining` compiler flag consumed by the pipeline's `expand_safe_reads` phase:
+    /// when `false` (the default for modern Angular) safe reads emit native `?.`; when `true` they
+    /// expand into the classic ternary and DECLARE a `let $tmpN$;` per minted temporary.
+    legacy_optional_chaining: bool,
+    /// Names of the temporaries minted by [`Self::allocate_temporary`] on the LEGACY safe-navigation
+    /// path, in mint order. The public entry points turn these into `let $tmpN$;` declarations
+    /// (`StmtKind::DeclareVar { value: None }`) prepended to the converted binding's `stmts`, so the
+    /// host-bindings / update statement block declares each guard temporary before the instruction
+    /// that reads it — matching the `let $tmp0$;` line in the legacy golden. Empty on the native path.
+    temporaries: Vec<String>,
 }
 
 impl<'r, R: LocalResolver> Converter<'r, R> {
@@ -679,7 +752,16 @@ impl<'r, R: LocalResolver> Converter<'r, R> {
             pure_slot_fallback: std::cell::Cell::new(0),
             next_const_name: std::cell::Cell::new(0),
             next_arrow_name: std::cell::Cell::new(0),
+            legacy_optional_chaining: false,
+            temporaries: Vec::new(),
         }
+    }
+
+    /// Enable LEGACY safe-navigation lowering (the `legacyOptionalChaining` compiler flag): safe
+    /// reads expand into the guarded-temporary ternary and minted `$tmpN$` temporaries are declared.
+    fn legacy(mut self) -> Self {
+        self.legacy_optional_chaining = true;
+        self
     }
 
     /// Whether `name` is bound by an enclosing arrow-function parameter and thus
@@ -697,12 +779,41 @@ impl<'r, R: LocalResolver> Converter<'r, R> {
     }
 
     /// `allocateTemporary()` — mint a fresh temporary-variable [`Expr`]
-    /// (`ReadVarExpr`). The classic converter names these `tmp` (`pf` for pure
-    /// functions); we suffix with a counter so nested safe chains never collide.
+    /// (`ReadVarExpr`). The pipeline's `expand_safe_reads` phase names each guard temporary
+    /// `$tmp{n}$` (the `AssignTemporaryExpr` xref naming); we suffix with a monotonic counter so
+    /// nested safe chains never collide. The minted name is recorded in [`Self::temporaries`] so the
+    /// caller can emit a matching `let $tmpN$;` declaration ahead of the consuming statement.
     fn allocate_temporary(&mut self) -> Expr {
-        let name = format!("tmp_{}", self.next_temp);
+        let name = format!("$tmp{}$", self.next_temp);
         self.next_temp += 1;
+        self.temporaries.push(name.clone());
         o::variable(name, None)
+    }
+
+    /// Build a `let $tmpN$;` declaration (no initializer) for every temporary minted on the LEGACY
+    /// safe-navigation path, in mint order. Prepended to a converted binding's `stmts` so the
+    /// host-bindings / update block declares each guard temporary before the instruction reads it.
+    fn temporary_declarations(&self) -> Vec<o::Stmt> {
+        self.temporaries
+            .iter()
+            .map(|name| {
+                o::Stmt::bare(o::StmtKind::DeclareVar {
+                    name: name.clone(),
+                    value: None,
+                    ty: None,
+                })
+            })
+            .collect()
+    }
+
+    /// Package a lowered single expression into a [`ConvertedBinding`], prepending the `let $tmpN$;`
+    /// declarations for any legacy safe-navigation temporaries minted while lowering it. On the
+    /// native path no temporaries are minted, so this is an empty-`stmts` (`pure`) result.
+    fn finish(&self, expr: Expr) -> ConvertedBinding {
+        ConvertedBinding {
+            stmts: self.temporary_declarations(),
+            expr,
+        }
     }
 }
 
@@ -736,11 +847,18 @@ impl<R: LocalResolver> Converter<'_, R> {
                 }
             }
 
-            // SafePropertyRead: `a?.b`. Expanded to a guarded temporary —
-            // `(tmp = a) == null ? null : tmp.b` — see `convert_safe`.
+            // SafePropertyRead: `a?.b`. NATIVE optional chaining by default — a `ReadPropExpr` with
+            // `isOptional=true`, which the emitter renders as native `a?.b` (defaulting to
+            // `undefined`). Under `legacyOptionalChaining` it instead expands to the guarded
+            // temporary `($tmpN$ = a) == null ? null : $tmpN$.b` — see `convert_safe`.
             EK::SafePropertyRead { receiver, name, .. } => {
                 let name = name.clone();
-                self.convert_safe(receiver, move |recv| recv.prop(name))
+                if self.legacy_optional_chaining {
+                    self.convert_safe(receiver, move |recv| recv.prop(name))
+                } else {
+                    let recv = self.convert(receiver);
+                    prop_optional(recv, name)
+                }
             }
 
             // KeyedRead: `a[k]`.
@@ -750,10 +868,17 @@ impl<R: LocalResolver> Converter<'_, R> {
                 recv.key(idx)
             }
 
-            // SafeKeyedRead: `a?.[k]` -> `(tmp = a) == null ? null : tmp[k]`.
+            // SafeKeyedRead: `a?.[k]`. NATIVE `a?.[k]` by default (a `ReadKeyExpr` with
+            // `isOptional=true`); under `legacyOptionalChaining` the guarded temporary
+            // `($tmpN$ = a) == null ? null : $tmpN$[k]`.
             EK::SafeKeyedRead { receiver, key } => {
                 let idx = self.convert(key);
-                self.convert_safe(receiver, move |recv| recv.key(idx))
+                if self.legacy_optional_chaining {
+                    self.convert_safe(receiver, move |recv| recv.key(idx))
+                } else {
+                    let recv = self.convert(receiver);
+                    key_optional(recv, idx)
+                }
             }
 
             // Call: `f(args)`.
@@ -763,10 +888,17 @@ impl<R: LocalResolver> Converter<'_, R> {
                 callee.call_fn(args, false)
             }
 
-            // SafeCall: `f?.(args)` -> `(tmp = f) == null ? null : tmp(args)`.
+            // SafeCall: `f?.(args)`. NATIVE `f?.(args)` by default (an `InvokeFunctionExpr` with
+            // `isOptional=true`); under `legacyOptionalChaining` the guarded temporary
+            // `($tmpN$ = f) == null ? null : $tmpN$(args)`.
             EK::SafeCall { receiver, args, .. } => {
                 let args: Vec<Expr> = args.iter().map(|a| self.convert(a)).collect();
-                self.convert_safe(receiver, move |recv| recv.call_fn(args, false))
+                if self.legacy_optional_chaining {
+                    self.convert_safe(receiver, move |recv| recv.call_fn(args, false))
+                } else {
+                    let callee = self.convert(receiver);
+                    call_fn_optional(callee, args)
+                }
             }
 
             // LiteralPrimitive.
@@ -1528,32 +1660,57 @@ mod tests {
         })
     }
 
+    fn safe_keyed(receiver: AstNode, key: AstNode) -> AstNode {
+        node(EK::SafeKeyedRead {
+            receiver: Box::new(receiver),
+            key: Box::new(key),
+        })
+    }
+
+    /// Lower with LEGACY safe-navigation semantics and render the resulting expression. Also returns
+    /// the count of `let $tmpN$;` declarations the lowering emitted.
+    fn emit_legacy(n: &AstNode) -> (String, usize) {
+        let r = convert_property_binding_legacy(n, ctx(), "0");
+        let decls = r
+            .stmts
+            .iter()
+            .filter(|s| matches!(s.kind, o::StmtKind::DeclareVar { .. }))
+            .count();
+        (emit_expression(&r.expr), decls)
+    }
+
+    // -- NATIVE optional chaining (the default modern path). --
+
     #[test]
-    fn safe_property_read_guard_expansion() {
-        // a?.b -> (tmp_0 = ctx.a) == null ? null : tmp_0.b
+    fn safe_property_read_native() {
+        // a?.b -> native `ctx.a?.b`, no temporaries.
         let n = safe_prop(prop("a"), "b");
-        assert_eq!(
-            emit(&n),
-            "(tmp_0 = ctx.a) == null ? null : tmp_0.b;\n"
-        );
+        let r = convert_property_binding(&n, ctx(), "0");
+        assert!(r.stmts.is_empty(), "native path mints no temporaries");
+        assert_eq!(emit_expression(&r.expr), "ctx.a?.b;\n");
     }
 
     #[test]
-    fn safe_property_read_chained() {
-        // a?.b?.c -> nested guard: the inner safe read is the receiver of the outer.
-        // (tmp_1 = (tmp_0 = ctx.a) == null ? null : tmp_0.b) == null ? null : tmp_1.c
+    fn safe_property_read_chained_native() {
+        // a?.b?.c -> native chain `ctx.a?.b?.c`.
         let n = safe_prop(safe_prop(prop("a"), "b"), "c");
-        assert_eq!(
-            emit(&n),
-            "(tmp_1 = (tmp_0 = ctx.a) == null ? null : tmp_0.b) == null ? null : tmp_1.c;\n"
-        );
+        let r = convert_property_binding(&n, ctx(), "0");
+        assert!(r.stmts.is_empty());
+        assert_eq!(emit_expression(&r.expr), "ctx.a?.b?.c;\n");
     }
 
     #[test]
-    fn safe_call_guard_expansion() {
-        // a?.m() -> the receiver `a?.m` is itself a SafePropertyRead, then SafeCall.
-        // SafeCall guards the resolved method: (tmp = <a?.m>) == null ? null : tmp()
-        // a.m?.() form: build SafeCall directly on `a.m` (plain prop) for clarity.
+    fn safe_keyed_read_native() {
+        // a?.[k] -> native `ctx.a?.[ctx.k]`.
+        let n = safe_keyed(prop("a"), prop("k"));
+        let r = convert_property_binding(&n, ctx(), "0");
+        assert!(r.stmts.is_empty());
+        assert_eq!(emit_expression(&r.expr), "ctx.a?.[ctx.k];\n");
+    }
+
+    #[test]
+    fn safe_call_native() {
+        // a.m?.(x) -> native `ctx.a.m?.(ctx.x)`.
         let callee = node(EK::PropertyRead {
             name_span: ab(),
             receiver: Box::new(prop("a")),
@@ -1564,10 +1721,81 @@ mod tests {
             args: vec![prop("x")],
             argument_span: ab(),
         });
+        let r = convert_property_binding(&n, ctx(), "0");
+        assert!(r.stmts.is_empty());
+        assert_eq!(emit_expression(&r.expr), "ctx.a.m?.(ctx.x);\n");
+    }
+
+    /// `getData()?.id` — the host-bindings golden case: native optional chaining on a function-call
+    /// receiver, no temporaries declared.
+    #[test]
+    fn safe_read_on_call_receiver_native() {
+        let get_data = node(EK::Call {
+            receiver: Box::new(prop("getData")),
+            args: vec![],
+            argument_span: ab(),
+        });
+        let n = safe_prop(get_data, "id");
+        let r = convert_property_binding(&n, ctx(), "0");
+        assert!(r.stmts.is_empty());
+        assert_eq!(emit_expression(&r.expr), "ctx.getData()?.id;\n");
+    }
+
+    // -- LEGACY guarded-temporary expansion (`legacyOptionalChaining`). --
+
+    #[test]
+    fn safe_property_read_guard_expansion_legacy() {
+        // a?.b -> ($tmp0$ = ctx.a) == null ? null : $tmp0$.b, declaring `let $tmp0$;`.
+        let n = safe_prop(prop("a"), "b");
+        let (out, decls) = emit_legacy(&n);
+        assert_eq!(out, "($tmp0$ = ctx.a) == null ? null : $tmp0$.b;\n");
+        assert_eq!(decls, 1);
+    }
+
+    #[test]
+    fn safe_property_read_chained_legacy() {
+        // a?.b?.c -> nested guard: the inner safe read is the receiver of the outer.
+        // ($tmp1$ = ($tmp0$ = ctx.a) == null ? null : $tmp0$.b) == null ? null : $tmp1$.c
+        let n = safe_prop(safe_prop(prop("a"), "b"), "c");
+        let (out, decls) = emit_legacy(&n);
         assert_eq!(
-            emit(&n),
-            "(tmp_0 = ctx.a.m) == null ? null : tmp_0(ctx.x);\n"
+            out,
+            "($tmp1$ = ($tmp0$ = ctx.a) == null ? null : $tmp0$.b) == null ? null : $tmp1$.c;\n"
         );
+        assert_eq!(decls, 2);
+    }
+
+    #[test]
+    fn safe_call_guard_expansion_legacy() {
+        // a.m?.(x) -> ($tmp0$ = ctx.a.m) == null ? null : $tmp0$(ctx.x)
+        let callee = node(EK::PropertyRead {
+            name_span: ab(),
+            receiver: Box::new(prop("a")),
+            name: "m".to_string(),
+        });
+        let n = node(EK::SafeCall {
+            receiver: Box::new(callee),
+            args: vec![prop("x")],
+            argument_span: ab(),
+        });
+        let (out, decls) = emit_legacy(&n);
+        assert_eq!(out, "($tmp0$ = ctx.a.m) == null ? null : $tmp0$(ctx.x);\n");
+        assert_eq!(decls, 1);
+    }
+
+    /// The host-bindings legacy golden case (`getData()?.id` with `legacyOptionalChaining`):
+    /// `($tmp0$ = ctx.getData()) == null ? null : $tmp0$.id`, declaring one `let $tmp0$;`.
+    #[test]
+    fn safe_read_on_call_receiver_legacy() {
+        let get_data = node(EK::Call {
+            receiver: Box::new(prop("getData")),
+            args: vec![],
+            argument_span: ab(),
+        });
+        let n = safe_prop(get_data, "id");
+        let (out, decls) = emit_legacy(&n);
+        assert_eq!(out, "($tmp0$ = ctx.getData()) == null ? null : $tmp0$.id;\n");
+        assert_eq!(decls, 1);
     }
 
     #[test]

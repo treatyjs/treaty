@@ -379,6 +379,310 @@ fn import_r3_with_params(id: R3, type_params: Vec<Type>) -> Expr {
 }
 
 // ---------------------------------------------------------------------------
+// @Injectable / @Service compile path.
+//
+// PORT TARGETS:
+//   * `injectable_compiler_2.ts` → `compileInjectable` (`ɵprov = ɵɵdefineInjectable({...})`).
+//   * `service_compiler.ts`       → `compileService`    (`ɵprov = ɵɵdefineService({...})`).
+//
+// Both reuse [`compile_factory_function`] above (the `ɵfac`) and emit a *provider definition*
+// (`ɵprov`) that points at the type's factory — either `Type.ɵfac` (the default / `useClass:Self`),
+// a delegated factory (`useClass`/`useFactory` WITH `deps`), a direct provider expression
+// (`useValue`/`useExisting`), or an arrow that forwards to an alternate type's `.ɵfac`
+// (`useClass`/`useFactory` WITHOUT `deps`, incl. `forwardRef`). The provider-def is a pure call so
+// it tree-shakes when unused.
+// ---------------------------------------------------------------------------
+
+/// `ForwardRefHandling` (`render3/util.ts`) — whether a `MaybeForwardRefExpression` is still wrapped
+/// in a `forwardRef(() => …)` call and, if not, whether the wrap must be re-introduced on emit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForwardRefHandling {
+    /// Never wrapped in `forwardRef()` — the expression is safe to use as-is.
+    None,
+    /// Still wrapped in a `forwardRef()` call (use as-is).
+    Wrapped,
+    /// Was unwrapped from a `forwardRef()` — must be re-wrapped as `forwardRef(() => expr)` on emit.
+    Unwrapped,
+}
+
+/// `MaybeForwardRefExpression` (`render3/util.ts`) — an expression that may reference a not-yet
+/// defined type, tracking whether it was/needs to be wrapped in `forwardRef()`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MaybeForwardRef {
+    /// The unwrapped expression.
+    pub expression: Expr,
+    /// How the `forwardRef()` wrap is/was handled.
+    pub forward_ref: ForwardRefHandling,
+}
+
+impl MaybeForwardRef {
+    /// `createMayBeForwardRefExpression(expression, ForwardRefHandling.None)` — the common case for
+    /// a value that was never a forward ref.
+    pub fn none(expression: Expr) -> MaybeForwardRef {
+        MaybeForwardRef {
+            expression,
+            forward_ref: ForwardRefHandling::None,
+        }
+    }
+}
+
+/// `generateForwardRef(expr)` → `forwardRef(() => expr)`.
+fn generate_forward_ref(expr: Expr) -> Expr {
+    import_r3(R3::ForwardRef).call_fn(
+        vec![o::arrow_fn(vec![], ArrowBody::Expr(Box::new(expr)), None)],
+        false,
+    )
+}
+
+/// `convertFromMaybeForwardRefExpression(meta)` — re-wrap an `Unwrapped` forward ref as
+/// `forwardRef(() => expr)`; `None`/`Wrapped` pass the expression through unchanged.
+fn convert_from_maybe_forward_ref(meta: &MaybeForwardRef) -> Expr {
+    match meta.forward_ref {
+        ForwardRefHandling::None | ForwardRefHandling::Wrapped => meta.expression.clone(),
+        ForwardRefHandling::Unwrapped => generate_forward_ref(meta.expression.clone()),
+    }
+}
+
+/// `R3InjectableMetadata` (`injectable_compiler_2.ts`). `providedIn` is always present (a `null`
+/// literal expression when absent — its presence guards whether the `providedIn` key is emitted).
+#[derive(Debug, Clone, PartialEq)]
+pub struct R3InjectableMetadata {
+    /// String name of the injectable type (names the factory function).
+    pub name: String,
+    /// The type being provided (`token` + `.d.ts` type).
+    pub ty: R3Reference,
+    /// Number of type arguments for the `.d.ts` declaration.
+    pub type_argument_count: u32,
+    /// `providedIn` — a `MaybeForwardRef`; a `null`-literal expression means "no providedIn".
+    pub provided_in: MaybeForwardRef,
+    /// `useClass` delegate (mutually exclusive with the other `use*`).
+    pub use_class: Option<MaybeForwardRef>,
+    /// `useFactory` function expression.
+    pub use_factory: Option<Expr>,
+    /// `useExisting` token.
+    pub use_existing: Option<MaybeForwardRef>,
+    /// `useValue` value.
+    pub use_value: Option<MaybeForwardRef>,
+    /// Explicit `deps: [...]` (only meaningful with `useClass`/`useFactory`). `None` ⇒ not given.
+    pub deps: Option<Vec<R3DependencyMetadata>>,
+}
+
+/// Build the shared `R3FactoryMetadata::Constructor` base (`deps: []`, target Injectable) used as
+/// the seed for every injectable provider variant (`{...factoryMeta, …}` spreads in the TS).
+fn injectable_factory_base(meta: &R3InjectableMetadata) -> R3ConstructorFactoryMetadata {
+    R3ConstructorFactoryMetadata {
+        name: meta.name.clone(),
+        ty: meta.ty.clone(),
+        type_argument_count: meta.type_argument_count,
+        deps: FactoryDeps::Deps(Vec::new()),
+        target: FactoryTarget::Injectable,
+    }
+}
+
+/// `createFactoryFunction(type)` (`injectable_compiler_2.ts`) →
+/// `__ngFactoryType__ => type.ɵfac(__ngFactoryType__)`.
+fn create_delegate_factory_function(ty: Expr) -> Expr {
+    const T_NAME: &str = "__ngFactoryType__";
+    let body = ty
+        .prop("\u{0275}fac")
+        .call_fn(vec![o::variable(T_NAME, None)], false);
+    o::arrow_fn(
+        vec![FnParam::new(T_NAME, Some(o::dynamic_type()))],
+        ArrowBody::Expr(Box::new(body)),
+        None,
+    )
+}
+
+/// `delegateToFactory(type, useType, unwrapForwardRefs)` (`injectable_compiler_2.ts`). When `type`
+/// and `useType` denote the same symbol the provider delegates straight to `useType.ɵfac`; otherwise
+/// it forwards through an arrow (optionally resolving a `forwardRef` first).
+fn delegate_to_factory(ty: &Expr, use_ty: &Expr, unwrap_forward_refs: bool) -> Expr {
+    if ty.is_equivalent(use_ty) {
+        // `factory: type.ɵfac`.
+        return use_ty.clone().prop("\u{0275}fac");
+    }
+    if !unwrap_forward_refs {
+        // `factory: __ngFactoryType__ => useType.ɵfac(__ngFactoryType__)`.
+        return create_delegate_factory_function(use_ty.clone());
+    }
+    // `factory: __ngFactoryType__ => resolveForwardRef(useType).ɵfac(__ngFactoryType__)`.
+    let unwrapped = import_r3(R3::ResolveForwardRef).call_fn(vec![use_ty.clone()], false);
+    create_delegate_factory_function(unwrapped)
+}
+
+/// `compileInjectable(meta, resolveForwardRefs)` — the `ɵprov = ɵɵdefineInjectable({...})` provider
+/// definition. The matching `ɵfac` is produced separately by [`compile_factory_function`].
+pub fn compile_injectable(
+    meta: &R3InjectableMetadata,
+    resolve_forward_refs: bool,
+) -> R3CompiledExpression {
+    let base = injectable_factory_base(meta);
+
+    // Resolve the provider `factory` expression by provider kind, mirroring the TS branch order
+    // (useClass → useFactory → useValue → useExisting → default).
+    let (factory_expr, statements): (Expr, Vec<Stmt>) = if let Some(use_class) = &meta.use_class {
+        let use_class_on_self = use_class.expression.is_equivalent(&meta.ty.value);
+        match &meta.deps {
+            // `deps` present → `new useClass(...deps)` delegated factory.
+            Some(deps) => {
+                let m = R3FactoryMetadata::Delegated {
+                    base: base.clone(),
+                    delegate: use_class.expression.clone(),
+                    delegate_type: R3FactoryDelegateType::Class,
+                    delegate_deps: deps.clone(),
+                };
+                let c = compile_factory_function(&m);
+                (c.expression, c.statements)
+            }
+            // `useClass: Self` with no deps → ignore `useClass`, use the plain constructor factory.
+            None if use_class_on_self => {
+                let m = R3FactoryMetadata::Constructor(base.clone());
+                let c = compile_factory_function(&m);
+                (c.expression, c.statements)
+            }
+            // `useClass: Other` with no deps → forward to `Other.ɵfac`.
+            None => (
+                delegate_to_factory(&meta.ty.value, &use_class.expression, resolve_forward_refs),
+                Vec::new(),
+            ),
+        }
+    } else if let Some(use_factory) = &meta.use_factory {
+        match &meta.deps {
+            // `deps` present → call the user factory with the injected deps.
+            Some(deps) => {
+                let m = R3FactoryMetadata::Delegated {
+                    base: base.clone(),
+                    delegate: use_factory.clone(),
+                    delegate_type: R3FactoryDelegateType::Function,
+                    delegate_deps: deps.clone(),
+                };
+                let c = compile_factory_function(&m);
+                (c.expression, c.statements)
+            }
+            // No `deps` → `() => useFactory()`.
+            None => (
+                o::arrow_fn(
+                    vec![],
+                    ArrowBody::Expr(Box::new(use_factory.clone().call_fn(vec![], false))),
+                    None,
+                ),
+                Vec::new(),
+            ),
+        }
+    } else if let Some(use_value) = &meta.use_value {
+        let m = R3FactoryMetadata::Expression {
+            base: base.clone(),
+            expression: use_value.expression.clone(),
+        };
+        let c = compile_factory_function(&m);
+        (c.expression, c.statements)
+    } else if let Some(use_existing) = &meta.use_existing {
+        // `useExisting` → `inject(token)` provider expression.
+        let m = R3FactoryMetadata::Expression {
+            base: base.clone(),
+            expression: import_r3(R3::Inject).call_fn(vec![use_existing.expression.clone()], false),
+        };
+        let c = compile_factory_function(&m);
+        (c.expression, c.statements)
+    } else {
+        // Default: delegate to the type's own factory.
+        (
+            delegate_to_factory(&meta.ty.value, &meta.ty.value, resolve_forward_refs),
+            Vec::new(),
+        )
+    };
+
+    let mut entries: Vec<(String, bool, Expr)> = Vec::new();
+    entries.push(("token".to_string(), false, meta.ty.value.clone()));
+    entries.push(("factory".to_string(), false, factory_expr));
+
+    // `providedIn` is emitted only when its expression is a non-null value.
+    if !is_null_literal(&meta.provided_in.expression) {
+        entries.push((
+            "providedIn".to_string(),
+            false,
+            convert_from_maybe_forward_ref(&meta.provided_in),
+        ));
+    }
+
+    let expression = import_r3(R3::DefineInjectableField)
+        .call_fn(vec![o::literal_map(entries, None)], /* pure */ true);
+
+    R3CompiledExpression {
+        expression,
+        ty: create_injectable_type(&meta.ty.ty, meta.type_argument_count),
+        statements,
+    }
+}
+
+/// `R3ServiceMetadata` (`service_compiler.ts`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct R3ServiceMetadata {
+    /// String name of the service type.
+    pub name: String,
+    /// The type being provided (`token` + `.d.ts` type).
+    pub ty: R3Reference,
+    /// Number of type arguments for the `.d.ts` declaration.
+    pub type_argument_count: u32,
+    /// `autoProvided` — `Some(false)` emits `autoProvided: false`; `None`/`Some(true)` omit it.
+    pub auto_provided: Option<bool>,
+    /// `factory: () => …` override (the `@Service({factory})` form).
+    pub factory: Option<Expr>,
+}
+
+/// `compileService(meta, resolveForwardRefs)` — the `ɵprov = ɵɵdefineService({...})` provider
+/// definition for an `@Service` class. The matching `ɵfac` is produced separately by
+/// [`compile_factory_function`].
+pub fn compile_service(meta: &R3ServiceMetadata, resolve_forward_refs: bool) -> R3CompiledExpression {
+    let factory_expr = match &meta.factory {
+        // `factory: () => userFactory()`.
+        Some(f) => o::arrow_fn(
+            vec![],
+            ArrowBody::Expr(Box::new(f.clone().call_fn(vec![], false))),
+            None,
+        ),
+        // No factory override → delegate to the type's own `ɵfac`.
+        None => delegate_to_factory(&meta.ty.value, &meta.ty.value, resolve_forward_refs),
+    };
+
+    let mut entries: Vec<(String, bool, Expr)> = Vec::new();
+    entries.push(("token".to_string(), false, meta.ty.value.clone()));
+    entries.push(("factory".to_string(), false, factory_expr));
+
+    // `autoProvided: false` is emitted only on a strict `=== false`.
+    if meta.auto_provided == Some(false) {
+        entries.push(("autoProvided".to_string(), false, bool_literal(false)));
+    }
+
+    let expression = import_r3(R3::DefineService)
+        .call_fn(vec![o::literal_map(entries, None)], /* pure */ true);
+
+    R3CompiledExpression {
+        expression,
+        ty: create_injectable_type(&meta.ty.ty, meta.type_argument_count),
+        statements: Vec::new(),
+    }
+}
+
+/// `createInjectableType(type, typeArgumentCount)` (`injectable_compiler_2.ts`) →
+/// `ɵɵInjectableDeclaration<Type>` (shared by `@Injectable` and `@Service` `.d.ts` emit).
+pub fn create_injectable_type(ty: &Expr, type_argument_count: u32) -> Type {
+    o::expression_type(
+        import_r3_with_params(
+            R3::InjectableDeclaration,
+            vec![type_with_parameters(ty.clone(), type_argument_count)],
+        ),
+        None,
+        None,
+    )
+}
+
+/// Is `expr` the `null` literal? (Guards `providedIn` emission.)
+fn is_null_literal(expr: &Expr) -> bool {
+    matches!(&expr.kind, ExprKind::Literal(LiteralValue::Null))
+}
+
+// ---------------------------------------------------------------------------
 // Dependency injection expression generation.
 // ---------------------------------------------------------------------------
 
@@ -819,5 +1123,330 @@ mod tests {
             &body[2].kind,
             StmtKind::Return(e) if matches!(&e.kind, ExprKind::ReadVar { name } if name == "__ngConditionalFactory__")
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // @Injectable / @Service emit tests.
+    //
+    // These canonicalise the EMITTED `ɵprov`/`ɵfac` JS the same way the compliance harness
+    // (`run-compliance.mjs::canonicalize`) does — strip imports/comments, unify the Ivy ref
+    // prefix (`i0.`/`$r3$.` → ``), normalise quotes, collapse whitespace — and assert the
+    // load-bearing slice of Angular's golden appears verbatim.
+    // -----------------------------------------------------------------------
+
+    use crate::output::emitter::emit_expression;
+
+    /// Mirror of the harness `canonicalize`, restricted to the transforms the DI goldens exercise.
+    fn canon(code: &str) -> String {
+        // Strip import lines.
+        let mut s = String::new();
+        for line in code.lines() {
+            if line.trim_start().starts_with("import ") {
+                continue;
+            }
+            s.push_str(line);
+            s.push('\n');
+        }
+        // Strip block comments (`/* … */`, incl. `/*@__PURE__*/` and `/* @ts-ignore */`).
+        let chars: Vec<char> = s.chars().collect();
+        let mut out = String::new();
+        let mut i = 0;
+        while i < chars.len() {
+            if i + 1 < chars.len() && chars[i] == '/' && chars[i + 1] == '*' {
+                i += 2;
+                while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
+                    i += 1;
+                }
+                i += 2;
+                continue;
+            }
+            out.push(chars[i]);
+            i += 1;
+        }
+        // Normalise single→double quotes, drop the `$r3$.`/`$i0$.` Ivy ref prefix.
+        out = out.replace('\'', "\"");
+        out = out.replace("$r3$.", "").replace("$i0$.", "");
+        // Strip a leading `iN.` namespace prefix on Ivy symbols.
+        let cs: Vec<char> = out.chars().collect();
+        let mut cleaned = String::new();
+        let mut j = 0;
+        while j < cs.len() {
+            if cs[j] == 'i' && (j == 0 || (!cs[j - 1].is_alphanumeric() && cs[j - 1] != '_')) {
+                let mut k = j + 1;
+                while k < cs.len() && cs[k].is_ascii_digit() {
+                    k += 1;
+                }
+                if k > j + 1 && k < cs.len() && cs[k] == '.' {
+                    j = k + 1;
+                    continue;
+                }
+            }
+            cleaned.push(cs[j]);
+            j += 1;
+        }
+        let no_ws: String = cleaned.chars().filter(|c| !c.is_whitespace()).collect();
+        // Drop the trailing expression-statement terminator (the harness does `;+$ -> ''`).
+        no_ws.trim_end_matches(';').to_string()
+    }
+
+    fn ref_(name: &str) -> R3Reference {
+        R3Reference {
+            value: o::variable(name, None),
+            ty: o::variable(name, None),
+        }
+    }
+
+    fn injectable_meta(name: &str) -> R3InjectableMetadata {
+        R3InjectableMetadata {
+            name: name.to_string(),
+            ty: ref_(name),
+            type_argument_count: 0,
+            provided_in: MaybeForwardRef::none(o::null_expr()),
+            use_class: None,
+            use_factory: None,
+            use_existing: None,
+            use_value: None,
+            deps: None,
+        }
+    }
+
+    fn inject_dep(token: &str) -> R3DependencyMetadata {
+        R3DependencyMetadata {
+            token: Some(o::variable(token, None)),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn injectable_factory_prov_default_delegates_to_self_fac() {
+        // injectable_factory.ts → injectable_factory_prov.js:
+        //   ɵɵdefineInjectable({ token: MyService, factory: MyService.ɵfac })
+        let meta = injectable_meta("MyService");
+        let compiled = compile_injectable(&meta, false);
+        let got = canon(&emit_expression(&compiled.expression));
+        assert_eq!(
+            got,
+            canon("$r3$.ɵɵdefineInjectable({ token: MyService, factory: MyService.ɵfac })"),
+            "got: {got}"
+        );
+        assert!(compiled.statements.is_empty());
+    }
+
+    #[test]
+    fn injectable_factory_fac_uses_inject_for_ctor_dep() {
+        // injectable_factory_fac.js — the SEPARATE ɵfac with the constructor dep, target Injectable
+        // (so `ɵɵinject`, not `ɵɵdirectiveInject`), carrying the `@ts-ignore`.
+        let meta = R3FactoryMetadata::Constructor(R3ConstructorFactoryMetadata {
+            name: "MyService".to_string(),
+            ty: ref_("MyService"),
+            type_argument_count: 0,
+            deps: FactoryDeps::Deps(vec![inject_dep("MyDependency")]),
+            target: FactoryTarget::Injectable,
+        });
+        let fac = compile_factory_function(&meta);
+        let got = canon(&emit_expression(&fac.expression));
+        assert!(
+            got.contains(&canon(
+                "function MyService_Factory(__ngFactoryType__){ return new (__ngFactoryType__ || MyService)($r3$.ɵɵinject(MyDependency)); }"
+            )),
+            "got: {got}"
+        );
+    }
+
+    #[test]
+    fn injectable_useclass_with_deps_emits_delegated_class_factory() {
+        // useclass_with_deps.ts → providedIn:'root', useClass:MyAlternateService, deps:[SomeDep].
+        let mut meta = injectable_meta("MyService");
+        meta.provided_in =
+            MaybeForwardRef::none(o::literal(LiteralValue::String("root".to_string()), None));
+        meta.use_class = Some(MaybeForwardRef::none(o::variable("MyAlternateService", None)));
+        meta.deps = Some(vec![inject_dep("SomeDep")]);
+        let compiled = compile_injectable(&meta, false);
+        let got = canon(&emit_expression(&compiled.expression));
+        assert!(got.contains(&canon("ɵɵdefineInjectable({token:MyService,factory:")), "got: {got}");
+        assert!(got.contains(&canon("__ngConditionalFactory__=new__ngFactoryType__()")), "got: {got}");
+        assert!(
+            got.contains(&canon("__ngConditionalFactory__=newMyAlternateService(ɵɵinject(SomeDep))")),
+            "got: {got}"
+        );
+        assert!(got.contains(&canon("providedIn:\"root\"")), "got: {got}");
+    }
+
+    #[test]
+    fn injectable_usefactory_with_deps_emits_function_delegate() {
+        // usefactory_with_deps.ts → factory function delegate, optional dep gets flags 8.
+        let mut meta = injectable_meta("MyService");
+        meta.provided_in =
+            MaybeForwardRef::none(o::literal(LiteralValue::String("root".to_string()), None));
+        let factory = o::arrow_fn(
+            vec![FnParam::new("dep", None), FnParam::new("optional", None)],
+            ArrowBody::Expr(Box::new(
+                o::variable("MyAlternateService", None)
+                    .instantiate(vec![o::variable("dep", None), o::variable("optional", None)]),
+            )),
+            None,
+        );
+        meta.use_factory = Some(factory);
+        let optional = R3DependencyMetadata {
+            token: Some(o::variable("SomeDep", None)),
+            optional: true,
+            ..Default::default()
+        };
+        meta.deps = Some(vec![inject_dep("SomeDep"), optional]);
+        let compiled = compile_injectable(&meta, false);
+        let got = canon(&emit_expression(&compiled.expression));
+        assert!(
+            got.contains(&canon(
+                "((dep, optional) => new MyAlternateService(dep, optional))($r3$.ɵɵinject(SomeDep), $r3$.ɵɵinject(SomeDep, 8))"
+            )),
+            "got: {got}"
+        );
+        assert!(got.contains(&canon("providedIn:\"root\"")), "got: {got}");
+    }
+
+    #[test]
+    fn injectable_useclass_without_deps_forwards_to_alternate_fac() {
+        // useclass_without_deps.js → factory: __ngFactoryType__ => MyAlternateService.ɵfac(__ngFactoryType__)
+        let mut meta = injectable_meta("MyService");
+        meta.provided_in =
+            MaybeForwardRef::none(o::literal(LiteralValue::String("root".to_string()), None));
+        meta.use_class = Some(MaybeForwardRef::none(o::variable("MyAlternateService", None)));
+        let compiled = compile_injectable(&meta, false);
+        let got = canon(&emit_expression(&compiled.expression));
+        assert!(
+            got.contains(&canon(
+                "factory: __ngFactoryType__ => MyAlternateService.ɵfac(__ngFactoryType__)"
+            )),
+            "got: {got}"
+        );
+    }
+
+    #[test]
+    fn injectable_providedin_forwardref_rewraps() {
+        // providedin_forwardref.js → providedIn: $i0$.forwardRef(() => Mod), factory: Service.ɵfac
+        let mut meta = injectable_meta("Service");
+        meta.provided_in = MaybeForwardRef {
+            expression: o::variable("Mod", None),
+            forward_ref: ForwardRefHandling::Unwrapped,
+        };
+        let compiled = compile_injectable(&meta, false);
+        let got = canon(&emit_expression(&compiled.expression));
+        assert!(got.contains(&canon("token: Service, factory: Service.ɵfac")), "got: {got}");
+        assert!(
+            got.contains(&canon("providedIn: $i0$.forwardRef(() => Mod)")),
+            "got: {got}"
+        );
+    }
+
+    #[test]
+    fn injectable_usevalue_emits_expression_factory() {
+        let mut meta = injectable_meta("MyService");
+        meta.use_value = Some(MaybeForwardRef::none(o::literal(
+            LiteralValue::String("v".to_string()),
+            None,
+        )));
+        let compiled = compile_injectable(&meta, false);
+        let got = canon(&emit_expression(&compiled.expression));
+        assert!(got.contains(&canon("__ngConditionalFactory__ = \"v\"")), "got: {got}");
+    }
+
+    #[test]
+    fn injectable_useexisting_injects_token() {
+        let mut meta = injectable_meta("MyService");
+        meta.use_existing = Some(MaybeForwardRef::none(o::variable("Other", None)));
+        let compiled = compile_injectable(&meta, false);
+        let got = canon(&emit_expression(&compiled.expression));
+        assert!(got.contains(&canon("__ngConditionalFactory__ = $r3$.ɵɵinject(Other)")), "got: {got}");
+    }
+
+    #[test]
+    fn service_basic_defines_service_delegating_to_self_fac() {
+        // basic_service.ts → ɵɵdefineService({ token: MyService, factory: MyService.ɵfac })
+        let meta = R3ServiceMetadata {
+            name: "MyService".to_string(),
+            ty: ref_("MyService"),
+            type_argument_count: 0,
+            auto_provided: None,
+            factory: None,
+        };
+        let compiled = compile_service(&meta, false);
+        let got = canon(&emit_expression(&compiled.expression));
+        assert_eq!(
+            got,
+            canon("$r3$.ɵɵdefineService({ token: MyService, factory: MyService.ɵfac })"),
+            "got: {got}"
+        );
+    }
+
+    #[test]
+    fn service_autoprovided_false_emits_key() {
+        // not_provided_service.ts → autoProvided: false.
+        let meta = R3ServiceMetadata {
+            name: "MyService".to_string(),
+            ty: ref_("MyService"),
+            type_argument_count: 0,
+            auto_provided: Some(false),
+            factory: None,
+        };
+        let compiled = compile_service(&meta, false);
+        let got = canon(&emit_expression(&compiled.expression));
+        assert_eq!(
+            got,
+            canon(
+                "$r3$.ɵɵdefineService({ token: MyService, factory: MyService.ɵfac, autoProvided: false })"
+            ),
+            "got: {got}"
+        );
+    }
+
+    #[test]
+    fn service_autoprovided_true_omits_key() {
+        // explicitly_provided_service.ts (autoProvided:true) → key OMITTED.
+        let meta = R3ServiceMetadata {
+            name: "MyService".to_string(),
+            ty: ref_("MyService"),
+            type_argument_count: 0,
+            auto_provided: Some(true),
+            factory: None,
+        };
+        let compiled = compile_service(&meta, false);
+        let got = canon(&emit_expression(&compiled.expression));
+        assert!(!got.contains("autoProvided"), "autoProvided must be omitted; got: {got}");
+    }
+
+    #[test]
+    fn service_with_factory_wraps_user_factory() {
+        // service_with_factory.ts → factory: () => (() => new Alternate())()
+        let user_factory = o::arrow_fn(
+            vec![],
+            ArrowBody::Expr(Box::new(o::variable("Alternate", None).instantiate(vec![]))),
+            None,
+        );
+        let meta = R3ServiceMetadata {
+            name: "MyService".to_string(),
+            ty: ref_("MyService"),
+            type_argument_count: 0,
+            auto_provided: None,
+            factory: Some(user_factory),
+        };
+        let compiled = compile_service(&meta, false);
+        let got = canon(&emit_expression(&compiled.expression));
+        assert!(
+            got.contains(&canon("factory: () => (() => new Alternate())()")),
+            "got: {got}"
+        );
+    }
+
+    #[test]
+    fn injectable_type_is_injectable_declaration() {
+        let meta = injectable_meta("MyService");
+        let compiled = compile_injectable(&meta, false);
+        match &compiled.ty {
+            Type::Expression { value, .. } => {
+                let printed = canon(&emit_expression(value));
+                assert!(printed.contains("ɵɵInjectableDeclaration"), "got: {printed}");
+            }
+            other => panic!("expected expression type, got {other:?}"),
+        }
     }
 }
