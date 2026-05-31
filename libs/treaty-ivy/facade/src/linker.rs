@@ -833,19 +833,31 @@ pub fn link_partial(code: &str, filename: &str) -> LinkResult {
         }
     }
 
-    // Apply replacements back-to-front so earlier byte offsets remain valid. A non-empty `suffix`
-    // (NgModule scope side effects) is inserted after the end of the statement that contains the
-    // call — found by scanning forward to the statement terminator.
+    // Collect the NgModule scope side-effect statements (`ɵɵsetNgModuleScope` /
+    // `ɵɵregisterNgModuleType`). These are MODULE-SCOPE top-level statements in Angular's emit — a
+    // `ɵɵngDeclareNgModule` almost always sits as a `static ɵmod = …` CLASS member, so they cannot
+    // be spliced after the member (a bare call is not a valid class element). They are appended once
+    // at the END of the module, after every class, in declaration order (matching ngtsc).
+    let suffixes: Vec<String> = replacements
+        .iter()
+        .filter(|r| !r.suffix.is_empty())
+        .map(|r| r.suffix.trim_end_matches('\n').to_string())
+        .collect();
+
+    // Apply the span replacements back-to-front so earlier byte offsets remain valid.
     replacements.sort_by(|a, b| b.start.cmp(&a.start));
     let mut out = code.to_string();
     for r in &replacements {
-        if !r.suffix.is_empty() {
-            let insert_at = statement_end_after(&out, r.end);
-            let mut suffix = String::from("\n");
-            suffix.push_str(r.suffix.trim_end_matches('\n'));
-            out.insert_str(insert_at, &suffix);
-        }
         out.replace_range(r.start..r.end, &r.text);
+    }
+
+    // Append the module-scope scope side effects.
+    if !suffixes.is_empty() {
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&suffixes.join("\n"));
+        out.push('\n');
     }
 
     LinkResult { code: out, errors }
@@ -896,30 +908,6 @@ fn first_object_expression<'a>(
         },
         _ => None,
     }
-}
-
-/// The byte offset just past the statement terminator (`;` and a following newline) that ends the
-/// statement containing the call ending at `from`. Falls back to `from` when none is found.
-fn statement_end_after(code: &str, from: usize) -> usize {
-    let bytes = code.as_bytes();
-    let mut i = from;
-    while i < bytes.len() {
-        match bytes[i] {
-            b';' => {
-                i += 1;
-                if i < bytes.len() && bytes[i] == b'\n' {
-                    i += 1;
-                }
-                return i;
-            }
-            b'\n' => {
-                i += 1;
-                return i;
-            }
-            _ => i += 1,
-        }
-    }
-    from
 }
 
 /// Pick the parse `SourceType` for a filename (always a module; TS for `.ts`/`.mts`/`.cts`/`.tsx`).
