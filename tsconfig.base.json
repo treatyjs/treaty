@@ -42,6 +42,12 @@
       "@treaty/module-federation/vite": [
         "libs/treaty/module-federation/src/vite.ts"
       ],
+      "@treaty/federation-deploy": [
+        "libs/treaty/federation-deploy/src/index.ts"
+      ],
+      "@treaty/federation-deploy/runtime": [
+        "libs/treaty/federation-deploy/src/runtime.ts"
+      ],
       "@treaty/build": ["libs/treaty/build/src/index.ts"],
       "@treaty/build/application": ["libs/treaty/build/src/application.ts"],
       "@treaty/build/dev-server": ["libs/treaty/build/src/dev-server.ts"],

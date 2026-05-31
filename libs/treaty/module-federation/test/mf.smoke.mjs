@@ -24,6 +24,8 @@ import {
 	generateMfConfig,
 	toRspackModuleFederation,
 	toViteFederation,
+	deriveExposesFromRoutes,
+	deriveExposesFromLibs,
 	DEFAULT_HOST_NAME,
 	DEFAULT_FILENAME,
 } from '../dist/index.js'
@@ -155,6 +157,86 @@ check('{ name, entry } remote object is honoured verbatim', () => {
 		'dashboard_app@http://localhost:4201/remoteEntry.js',
 		'explicit federation name used in the name@entry string'
 	)
+})
+
+// 10. deriveExposesFromRoutes: two lazy routes -> two entries; eager excluded
+check('deriveExposesFromRoutes exposes lazy routes only', () => {
+	const exposes = deriveExposesFromRoutes([
+		{ path: 'dashboard', loadComponent: () => ({}) },
+		{ path: 'reports', loadChildren: () => ({}) },
+		{ path: 'home', component: {} },
+		{ path: '', redirectTo: 'dashboard', pathMatch: 'full' },
+	])
+	const keys = Object.keys(exposes)
+	assert.equal(keys.length, 2, 'exactly two lazy routes exposed')
+	assert.equal(exposes['./routes/dashboard'], './src/app/dashboard', 'loadComponent route exposed')
+	assert.equal(exposes['./routes/reports'], './src/app/reports', 'loadChildren route exposed')
+	assert.equal(exposes['./routes/home'], undefined, 'eager component route not exposed')
+})
+
+// 11. nested lazy route under an eager layout keeps its full path
+check('deriveExposesFromRoutes walks nested eager routes', () => {
+	const exposes = deriveExposesFromRoutes([
+		{
+			path: 'admin',
+			component: {},
+			children: [{ path: 'users', loadComponent: () => ({}) }],
+		},
+	])
+	assert.equal(exposes['./routes/admin/users'], './src/app/admin/users', 'nested lazy route exposed at full path')
+	assert.equal(Object.keys(exposes).length, 1, 'eager parent not exposed')
+})
+
+// 12. deriveExposesFromLibs: string + object entries
+check('deriveExposesFromLibs exposes each library', () => {
+	const exposes = deriveExposesFromLibs([
+		'./libs/data-access',
+		{ name: 'ui', path: './libs/shared/ui/index.ts' },
+	])
+	assert.equal(exposes['./libs/data-access'], './libs/data-access', 'string lib exposed by trailing segment')
+	assert.equal(exposes['./libs/ui'], './libs/shared/ui/index.ts', 'object lib exposed by explicit name')
+	assert.equal(Object.keys(exposes).length, 2, 'both libs exposed')
+})
+
+// 13. generateMfConfig with routes produces a host whose exposes includes them
+check('generateMfConfig auto-exposes lazy routes + libs', () => {
+	const cfg = generateMfConfig({
+		name: 'shell',
+		routes: [
+			{ path: 'dashboard', loadComponent: () => ({}) },
+			{ path: 'reports', loadChildren: () => ({}) },
+			{ path: 'home', component: {} },
+		],
+		libs: ['./libs/data-access'],
+	})
+	assert.equal(cfg.name, 'shell', 'still a host')
+	assert.equal(cfg.filename, DEFAULT_FILENAME, 'still emits a remote entry')
+	assert.equal(cfg.exposes['./routes/dashboard'], './src/app/dashboard', 'lazy route auto-exposed')
+	assert.equal(cfg.exposes['./routes/reports'], './src/app/reports', 'lazy children auto-exposed')
+	assert.equal(cfg.exposes['./routes/home'], undefined, 'eager route not exposed')
+	assert.equal(cfg.exposes['./libs/data-access'], './libs/data-access', 'lib auto-exposed')
+	assert.ok(cfg.shared['@angular/core'], 'Angular singletons still shared')
+})
+
+// 14. manual exposes win over derived ones; backward compatible without routes
+check('manual exposes win; no routes/libs is unchanged', () => {
+	const overridden = generateMfConfig({
+		routes: [{ path: 'dashboard', loadComponent: () => ({}) }],
+		exposes: { './routes/dashboard': './custom/path.ts' },
+	})
+	assert.equal(overridden.exposes['./routes/dashboard'], './custom/path.ts', 'manual expose wins over derived')
+
+	const bare = generateMfConfig({ name: 'plain' })
+	assert.deepEqual(bare.exposes, {}, 'no routes/libs/exposes => empty exposes (backward compatible)')
+})
+
+// 15. derived exposes flow through the adapters
+check('derived exposes reach the rspack adapter', () => {
+	const opts = toRspackModuleFederation({
+		name: 'shell',
+		routes: [{ path: 'dashboard', loadComponent: () => ({}) }],
+	})
+	assert.equal(opts.exposes['./routes/dashboard'], './src/app/dashboard', 'derived expose forwarded to plugin options')
 })
 
 for (const line of results) console.log(line)

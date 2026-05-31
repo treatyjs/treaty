@@ -16,6 +16,15 @@
  * copy of the framework at runtime.
  */
 
+import {
+	deriveExposesFromLibs,
+	deriveExposesFromRoutes,
+	type DeriveLibsOptions,
+	type DeriveRoutesOptions,
+	type LibEntry,
+	type RouteLike,
+} from './routes.js'
+
 /**
  * Where a remote's entry manifest lives. Either a bare URL string (the common
  * case) or a `{ name, entry }` pair when the remote's federation name differs
@@ -78,6 +87,24 @@ export interface MfOptions {
 	 * version across a set of apps that must agree on one Angular copy.
 	 */
 	readonly angularVersion?: string
+	/**
+	 * The app's Angular routes config. When provided, every **lazy** route
+	 * (`loadComponent`/`loadChildren`) is auto-derived into an `exposes` entry so
+	 * the app exposes each lazy feature as an independently deployable remote
+	 * with no manual `exposes`. See {@link deriveExposesFromRoutes}. Manual
+	 * {@link MfOptions.exposes} entries win over derived ones.
+	 */
+	readonly routes?: readonly RouteLike[]
+	/**
+	 * Workspace libraries to expose as federated modules — each becomes one
+	 * independently versioned/deployable remote. See {@link deriveExposesFromLibs}.
+	 * Manual {@link MfOptions.exposes} entries win over derived ones.
+	 */
+	readonly libs?: readonly LibEntry[]
+	/** Tune how {@link MfOptions.routes} map to expose keys/paths. */
+	readonly routesOptions?: DeriveRoutesOptions
+	/** Tune how {@link MfOptions.libs} map to expose keys. */
+	readonly libsOptions?: DeriveLibsOptions
 }
 
 /** Per-package sharing policy, mirroring the Module Federation `shared` entry. */
@@ -197,6 +224,10 @@ function normalizeShared(value: SharedConfig | true): SharedConfig {
  *     {@link MfOptions.shareAngular} is `false`.
  *   - Merges {@link MfOptions.shared} over the Angular defaults (user wins).
  *   - Normalizes every remote to a `{ name, entry }` pair.
+ *   - Auto-derives `exposes` from {@link MfOptions.routes} (each lazy route) and
+ *     {@link MfOptions.libs} (each library); manual {@link MfOptions.exposes}
+ *     wins. With no `routes`/`libs`/`exposes`, `exposes` is empty — backward
+ *     compatible with callers that never supplied them.
  */
 export function generateMfConfig(options: MfOptions = {}): NormalizedMfConfig {
 	const name = options.name ?? DEFAULT_HOST_NAME
@@ -209,7 +240,14 @@ export function generateMfConfig(options: MfOptions = {}): NormalizedMfConfig {
 		remotes[alias] = normalizeRemote(alias, value)
 	}
 
-	const exposes: Record<string, string> = { ...(options.exposes ?? {}) }
+	// Auto-derive exposes from the route/lib graph (federation = deployment
+	// granularity: every lazy route + lib is an independently deployable remote),
+	// then let any manual `exposes` win so an explicit override is never lost.
+	const exposes: Record<string, string> = {
+		...deriveExposesFromRoutes(options.routes, options.routesOptions),
+		...deriveExposesFromLibs(options.libs, options.libsOptions),
+		...(options.exposes ?? {}),
+	}
 
 	// Angular defaults first, then user overrides so the developer always wins.
 	const shared: Record<string, SharedConfig> = shareAngular

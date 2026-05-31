@@ -9,7 +9,11 @@
  * Three layers, smallest API surface first:
  *   - {@link generateMfConfig} — the framework-agnostic core. Turns simple
  *     {@link MfOptions} into a normalized config with the Angular runtime
- *     shared as eager singletons by default.
+ *     shared as eager singletons by default. When given the app's `routes`
+ *     and/or `libs`, it auto-derives the `exposes` map (via
+ *     {@link deriveExposesFromRoutes} / {@link deriveExposesFromLibs}) so every
+ *     lazy feature route and library becomes an independently deployable remote
+ *     with no hand-written exposes.
  *   - {@link toRspackModuleFederation} — adapter to `@module-federation/enhanced`
  *     `ModuleFederationPlugin` options (Rspack/webpack).
  *   - {@link toViteFederation} — adapter to `@module-federation/vite`
@@ -34,6 +38,20 @@ export type {
 	SharedConfig,
 	RemoteEntry,
 } from './config.js'
+
+export {
+	deriveExposesFromRoutes,
+	deriveExposesFromLibs,
+	DEFAULT_ROUTE_KEY_PREFIX,
+	DEFAULT_ROUTE_PATH_BASE,
+	DEFAULT_LIB_KEY_PREFIX,
+} from './routes.js'
+export type {
+	RouteLike,
+	LibEntry,
+	DeriveRoutesOptions,
+	DeriveLibsOptions,
+} from './routes.js'
 
 export { toRspackModuleFederation } from './rspack.js'
 export type {
