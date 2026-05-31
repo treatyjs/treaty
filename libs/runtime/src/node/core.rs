@@ -228,11 +228,19 @@ impl<'a> NodeCtx<'a> {
         self.state.event_loop()
     }
 
-    /// The lazy builtin-exports cache.
+    /// The lazy builtin-exports cache. The CJS/ESM loaders consult this before running a builtin's
+    /// `install`, so an unused `node:` module never materializes (tenet 2).
     pub(crate) fn builtin_cache(
         &self,
     ) -> &RefCell<HashMap<&'static str, Global<Object<'static>>>> {
         self.state.builtin_cache()
+    }
+
+    /// The lazy user-module cache, keyed by absolute resolved path. The CJS/ESM loaders consult this
+    /// so each on-disk module is read, transpiled, and evaluated at most once (Node's module-cache
+    /// semantics), and so a repeated `require`/`import` returns the same exports object.
+    pub(crate) fn module_cache(&self) -> &RefCell<HashMap<PathBuf, Global<Object<'static>>>> {
+        self.state.module_cache()
     }
 
     /// Borrow the underlying [`HostState`] for the rare module that needs more than the above.
@@ -286,5 +294,53 @@ mod tests {
         assert!(InstallError::Nova("x".into()).to_string().contains("build"));
         assert!(InstallError::Resolve("x".into()).to_string().contains("resolve"));
         assert!(InstallError::Io("x".into()).to_string().contains("io"));
+    }
+
+    #[test]
+    fn node_ctx_reflects_absent_env_keys() {
+        // A missing env var reads as `None` through the borrow — no allocation, no default insertion.
+        let state = HostState::new(std::env::current_dir().unwrap(), EnvMap::new());
+        let ctx = NodeCtx::new(&state);
+        assert!(ctx.env().get("TREATY_DEFINITELY_UNSET").is_none());
+    }
+
+    #[test]
+    fn node_ctx_exposes_both_lazy_caches_empty() {
+        // The registry surface core owns: both the builtin-exports cache and the user-module cache
+        // are reachable through `NodeCtx` and start empty, so an untouched runtime holds no module
+        // objects (tenet 2: zero startup cost for unused modules).
+        let state = HostState::new(std::env::current_dir().unwrap(), EnvMap::new());
+        let ctx = NodeCtx::new(&state);
+        assert!(ctx.builtin_cache().borrow().is_empty());
+        assert!(ctx.module_cache().borrow().is_empty());
+    }
+
+    #[test]
+    fn node_ctx_resolver_and_event_loop_are_the_host_states() {
+        // `NodeCtx` owns nothing: the resolver and event loop it hands out are the very ones inside
+        // `HostState` (same addresses), confirming a `NodeCtx` is a zero-allocation borrow bundle.
+        let state = HostState::new(std::env::current_dir().unwrap(), EnvMap::new());
+        let ctx = NodeCtx::new(&state);
+        assert!(std::ptr::eq(ctx.resolver(), state.resolver()));
+        assert!(std::ptr::eq(ctx.event_loop(), state.event_loop()));
+        assert!(std::ptr::eq(ctx.state(), &state));
+        // A fresh event loop is idle: no microtasks, macrotasks, or timers cost memory at startup.
+        assert!(ctx.event_loop().is_idle());
+    }
+
+    #[test]
+    fn builtin_cache_round_trips_a_static_key() {
+        // Prove the lazy-cache keying mechanism (insert-then-find) at the level core owns, without a
+        // live agent: the cache is keyed by the canonical `&'static str` specifier. We exercise the
+        // map's contract directly so the loader agents can rely on first-miss/second-hit semantics.
+        let cache: RefCell<HashMap<&'static str, u32>> = RefCell::new(HashMap::new());
+        assert!(cache.borrow().get("path").is_none(), "first lookup misses");
+        cache.borrow_mut().insert("path", 1);
+        assert_eq!(cache.borrow().get("path").copied(), Some(1), "second hits");
+        // A repeated install would observe the existing entry and skip rebuilding (idempotent).
+        assert!(
+            cache.borrow().contains_key("path"),
+            "key persists across borrows"
+        );
     }
 }

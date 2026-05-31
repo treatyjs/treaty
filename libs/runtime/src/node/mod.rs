@@ -106,17 +106,55 @@ pub(crate) const BUILTINS: &[(&str, InstallFn)] = &[
     ("url", url::install),
 ];
 
+/// Strip the optional `node:` scheme from a specifier, yielding the bare name to match against the
+/// table.
+///
+/// Borrowing slice work only (tenet 3): returns a sub-slice of the input, never an allocation. An
+/// empty result (the degenerate `"node:"` with nothing after the scheme) is surfaced as `None` so
+/// callers treat it as "not a builtin" rather than matching a hypothetical empty table entry.
+#[inline]
+fn bare_specifier(specifier: &str) -> Option<&str> {
+    let bare = specifier.strip_prefix("node:").unwrap_or(specifier);
+    if bare.is_empty() {
+        None
+    } else {
+        Some(bare)
+    }
+}
+
+/// Resolve a specifier to its canonical table entry, tolerating the optional `node:` prefix.
+///
+/// Returns the `&'static str` canonical bare specifier *and* the [`install`] fn pointer in one scan.
+/// Callers that need the static name (e.g. the resolver, which records `Resolved::Builtin(&'static
+/// str)`) get it without a second table walk. Pure scan over a handful of `&'static str`s — no
+/// allocation, no filesystem touch.
+#[inline]
+pub(crate) fn lookup_canonical(specifier: &str) -> Option<(&'static str, InstallFn)> {
+    let bare = bare_specifier(specifier)?;
+    BUILTINS
+        .iter()
+        .find(|(s, _)| *s == bare)
+        .map(|(s, f)| (*s, *f))
+}
+
 /// Look up a builtin by specifier, tolerating the optional `node:` prefix.
 ///
 /// Returns the module's [`install`] fn pointer on a hit. This is a pure table scan over a handful of
 /// `&'static str`s — no allocation, no filesystem touch — so the module resolver can short-circuit
 /// builtins before reaching for `oxc_resolver`.
+#[inline]
 pub(crate) fn lookup(specifier: &str) -> Option<InstallFn> {
-    let bare = specifier.strip_prefix("node:").unwrap_or(specifier);
-    BUILTINS
-        .iter()
-        .find(|(s, _)| *s == bare)
-        .map(|(_, f)| *f)
+    lookup_canonical(specifier).map(|(_, f)| f)
+}
+
+/// Whether `specifier` names a Treaty `node:` builtin.
+///
+/// The faithful analogue of Node's `module.isBuiltin(id)` / `process.binding`-era checks: both the
+/// bare (`"fs"`) and scheme-qualified (`"node:fs"`) forms report `true`. Used by callers that must
+/// decide builtin-vs-userland without materializing the module.
+#[inline]
+pub(crate) fn is_builtin(specifier: &str) -> bool {
+    lookup_canonical(specifier).is_some()
 }
 
 /// Install the Node-compatibility layer's globals into a freshly created realm's global object.
@@ -144,6 +182,66 @@ mod tests {
     fn lookup_rejects_unknown_specifiers() {
         assert!(lookup("definitely-not-a-builtin").is_none());
         assert!(lookup("./relative").is_none());
+        assert!(lookup("../up").is_none());
+        assert!(lookup("/abs/path").is_none());
+    }
+
+    #[test]
+    fn lookup_rejects_empty_and_bare_scheme() {
+        // The degenerate scheme-only / empty forms must never match a builtin.
+        assert!(lookup("").is_none());
+        assert!(lookup("node:").is_none());
+        assert!(!is_builtin(""));
+        assert!(!is_builtin("node:"));
+    }
+
+    #[test]
+    fn lookup_does_not_double_strip_the_scheme() {
+        // Only one `node:` prefix is stripped; a doubled scheme is not a builtin.
+        assert!(lookup("node:node:path").is_none());
+        // A bare `node` (the package name without a sub-path) is not one of our builtins.
+        assert!(lookup("node").is_none());
+    }
+
+    #[test]
+    fn is_builtin_reports_both_forms() {
+        assert!(is_builtin("os"));
+        assert!(is_builtin("node:os"));
+        assert!(!is_builtin("lodash"));
+    }
+
+    #[test]
+    fn lookup_canonical_returns_static_bare_name() {
+        let (name, _) = lookup_canonical("node:fs/promises").expect("builtin present");
+        // The returned name is the canonical bare specifier, scheme stripped, borrowed from the
+        // static table (no allocation, usable as `&'static str`).
+        assert_eq!(name, "fs/promises");
+        let _static: &'static str = name;
+    }
+
+    #[test]
+    fn lookup_canonical_and_lookup_agree() {
+        for (spec, _) in BUILTINS {
+            let via_canonical = lookup_canonical(spec).map(|(_, f)| f);
+            let via_lookup = lookup(spec);
+            assert_eq!(
+                via_canonical.is_some(),
+                via_lookup.is_some(),
+                "lookup helpers disagree for {spec}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_builtin_specifier_resolves() {
+        // Each registered specifier must round-trip through both the bare and `node:`-prefixed form.
+        for (spec, _) in BUILTINS {
+            assert!(lookup(spec).is_some(), "bare lookup failed for {spec}");
+            let prefixed = format!("node:{spec}");
+            assert!(lookup(&prefixed).is_some(), "node: lookup failed for {prefixed}");
+            let (canonical, _) = lookup_canonical(&prefixed).expect("prefixed resolves");
+            assert_eq!(canonical, *spec, "canonical name drifted for {spec}");
+        }
     }
 
     #[test]
@@ -152,6 +250,37 @@ mod tests {
             for (b, _) in &BUILTINS[i + 1..] {
                 assert_ne!(a, b, "duplicate specifier in BUILTINS: {a}");
             }
+        }
+    }
+
+    #[test]
+    fn builtin_specifiers_match_their_module_trait_constants() {
+        // Lockstep guard: each importable leaf module's declared `NodeModule::SPECIFIER` must equal
+        // the name it is registered under in BUILTINS. Catches drift between a module renaming its
+        // canonical specifier and the table.
+        use crate::node::NodeModule;
+        fn registered(spec: &str) -> bool {
+            BUILTINS.iter().any(|(s, _)| *s == spec)
+        }
+        assert!(registered(path::PathModule::SPECIFIER));
+        assert!(registered(process::ProcessModule::SPECIFIER));
+        assert!(registered(fs::FsModule::SPECIFIER));
+        assert!(registered(fs_promises::FsPromisesModule::SPECIFIER));
+        assert!(registered(buffer::BufferModule::SPECIFIER));
+        assert!(registered(os::OsModule::SPECIFIER));
+        assert!(registered(util::UtilModule::SPECIFIER));
+        assert!(registered(events::EventsModule::SPECIFIER));
+        assert!(registered(console::ConsoleModule::SPECIFIER));
+        assert!(registered(timers::TimersModule::SPECIFIER));
+        assert!(registered(url::UrlModule::SPECIFIER));
+    }
+
+    #[test]
+    fn globals_only_modules_are_not_in_the_import_table() {
+        // `fetch`, `microtask`, `structured_clone`, and `text_encoding` are wired as globals, not as
+        // importable `node:` builtins, so they must NOT appear in BUILTINS.
+        for spec in ["fetch", "microtask", "structured_clone", "text_encoding"] {
+            assert!(lookup(spec).is_none(), "{spec} should not be importable");
         }
     }
 }

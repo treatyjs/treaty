@@ -144,6 +144,44 @@ impl ModuleResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// A self-cleaning temp directory for the filesystem-backed resolution tests.
+    ///
+    /// Uses only `std::fs` (tenet 4) and a process-unique name so parallel test threads never
+    /// collide; `Drop` removes the tree so a test leaves nothing behind. We avoid a `tempfile`
+    /// dependency on purpose — adding crates is out of this module's edit scope.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            static COUNTER: AtomicU32 = AtomicU32::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let mut base = std::env::temp_dir();
+            base.push(format!("treaty_resolver_{}_{}_{}", tag, std::process::id(), n));
+            std::fs::create_dir_all(&base).expect("create temp dir");
+            Self(base)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+
+        fn write(&self, rel: &str, contents: &str) {
+            let p = self.0.join(rel);
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent).expect("create parent dir");
+            }
+            std::fs::write(p, contents).expect("write temp file");
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            // Best-effort cleanup; ignore errors so a failing test still reports its real cause.
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn builtin_specifiers_short_circuit_without_fs() {
@@ -176,5 +214,110 @@ mod tests {
         );
         assert_eq!(ModuleKind::from(Some(ModuleType::Json)), ModuleKind::Json);
         assert_eq!(ModuleKind::from(None), ModuleKind::Unknown);
+        // `Wasm`/`Addon` are not executable JS here, so they fall through to `Unknown` and the
+        // loader rejects them explicitly rather than mislabeling them as ESM/CJS.
+        assert_eq!(ModuleKind::from(Some(ModuleType::Wasm)), ModuleKind::Unknown);
+        assert_eq!(
+            ModuleKind::from(Some(ModuleType::Addon)),
+            ModuleKind::Unknown
+        );
+    }
+
+    #[test]
+    fn resolves_relative_file_to_absolute_path() {
+        let dir = TempDir::new("rel");
+        dir.write("dep.js", "module.exports = 1;\n");
+
+        let resolver = ModuleResolver::new(dir.path());
+        let resolved = resolver
+            .resolve(dir.path(), "./dep")
+            .expect("relative .js should resolve via extension probing");
+
+        match resolved {
+            Resolved::File(path, _) => {
+                assert!(path.is_absolute(), "resolved path must be absolute");
+                assert_eq!(path, dir.path().join("dep.js"));
+            }
+            other => panic!("expected Resolved::File, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classifies_esm_from_package_json_type_module() {
+        let dir = TempDir::new("esm");
+        // `"type": "module"` makes the bare `.js` file resolve as ESM per the Node ESM algorithm,
+        // which `oxc_resolver` reports through `module_type` (enabled in `ModuleResolver::new`).
+        dir.write("package.json", r#"{ "type": "module" }"#);
+        dir.write("mod.js", "export default 1;\n");
+
+        let resolver = ModuleResolver::new(dir.path());
+        let resolved = resolver.resolve(dir.path(), "./mod").expect("resolve esm file");
+
+        assert_eq!(
+            resolved,
+            Resolved::File(dir.path().join("mod.js"), ModuleKind::Esm)
+        );
+    }
+
+    #[test]
+    fn classifies_commonjs_from_package_json_type_commonjs() {
+        let dir = TempDir::new("cjs");
+        dir.write("package.json", r#"{ "type": "commonjs" }"#);
+        dir.write("mod.js", "module.exports = 1;\n");
+
+        let resolver = ModuleResolver::new(dir.path());
+        let resolved = resolver.resolve(dir.path(), "./mod").expect("resolve cjs file");
+
+        assert_eq!(
+            resolved,
+            Resolved::File(dir.path().join("mod.js"), ModuleKind::CommonJs)
+        );
+    }
+
+    #[test]
+    fn resolves_bare_package_via_node_modules_main() {
+        let dir = TempDir::new("pkg");
+        // A minimal installed dependency: `node_modules/dep` with a `main` entry. Proves the
+        // `node_modules` walk + `package.json` `main` field path through `oxc_resolver`.
+        dir.write(
+            "node_modules/dep/package.json",
+            r#"{ "name": "dep", "version": "1.0.0", "main": "lib/index.js" }"#,
+        );
+        dir.write("node_modules/dep/lib/index.js", "module.exports = 42;\n");
+
+        let resolver = ModuleResolver::new(dir.path());
+        let resolved = resolver
+            .resolve(dir.path(), "dep")
+            .expect("bare specifier should resolve through node_modules main");
+
+        match resolved {
+            Resolved::File(path, _) => {
+                assert_eq!(path, dir.path().join("node_modules/dep/lib/index.js"));
+            }
+            other => panic!("expected Resolved::File, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn builtin_short_circuits_even_when_a_node_modules_shadow_exists() {
+        let dir = TempDir::new("shadow");
+        // Even if a userland package named `path` is installed, the `node:` builtin wins: resolution
+        // must short-circuit to `Builtin` before any `node_modules` walk (matching Node semantics
+        // for core specifiers and keeping the filesystem untouched for builtins — tenet 4).
+        dir.write(
+            "node_modules/path/package.json",
+            r#"{ "name": "path", "main": "index.js" }"#,
+        );
+        dir.write("node_modules/path/index.js", "module.exports = {};\n");
+
+        let resolver = ModuleResolver::new(dir.path());
+        assert_eq!(
+            resolver.resolve(dir.path(), "path").unwrap(),
+            Resolved::Builtin("path")
+        );
+        assert_eq!(
+            resolver.resolve(dir.path(), "node:path").unwrap(),
+            Resolved::Builtin("path")
+        );
     }
 }

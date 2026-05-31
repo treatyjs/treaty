@@ -46,9 +46,16 @@ impl PartialOrd for TimerEntry {
 }
 impl Ord for TimerEntry {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.deadline
-            .cmp(&other.deadline)
-            .then(self.seq.cmp(&other.seq))
+        self.sort_key().cmp(&other.sort_key())
+    }
+}
+
+impl TimerEntry {
+    /// The `(deadline, seq)` tuple this entry is ordered by: earliest deadline first, ties broken by
+    /// scheduling order (lower `seq` first). Factored out so the comparator is unit-testable without
+    /// fabricating a [`Job`] (which Nova does not expose a constructor for).
+    fn sort_key(&self) -> (Instant, u64) {
+        (self.deadline, self.seq)
     }
 }
 
@@ -132,7 +139,7 @@ impl EventLoop {
         let mut timers = self.timers.borrow_mut();
         match timers.peek() {
             None => TimerPoll::Empty,
-            Some(Reverse(entry)) if entry.deadline <= now => {
+            Some(Reverse(entry)) if is_due(entry.deadline, now) => {
                 let Reverse(entry) = timers.pop().expect("peeked entry must pop");
                 TimerPoll::Due(entry.job)
             }
@@ -195,10 +202,7 @@ pub(crate) fn run_until_idle<'gc>(
                 if over_deadline(deadline) {
                     return Ok(());
                 }
-                let until = match deadline {
-                    Some(d) if d < when => d,
-                    _ => when,
-                };
+                let until = sleep_until(deadline, when);
                 let now = Instant::now();
                 if until > now {
                     std::thread::sleep(until - now);
@@ -217,6 +221,24 @@ fn over_deadline(deadline: Option<Instant>) -> bool {
     matches!(deadline, Some(d) if Instant::now() >= d)
 }
 
+/// True when a timer scheduled for `deadline` should fire at `now` (its deadline has been reached).
+///
+/// Node fires a timer once `now >= deadline`; the `<=` here is that rule expressed deadline-first.
+fn is_due(deadline: Instant, now: Instant) -> bool {
+    deadline <= now
+}
+
+/// The wake instant for the pump when the nearest timer (`when`) is not yet due.
+///
+/// With no bounding deadline we wake exactly at the timer. With a request `deadline` set we wake at
+/// whichever comes first, so request handling never sleeps past its budget waiting on a later timer.
+fn sleep_until(deadline: Option<Instant>, when: Instant) -> Instant {
+    match deadline {
+        Some(d) if d < when => d,
+        _ => when,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,19 +250,51 @@ mod tests {
     }
 
     #[test]
-    fn timer_ordering_is_earliest_first_then_fifo() {
-        // Pure ordering check on TimerEntry without needing a live agent/job: build entries and
-        // confirm the heap yields earliest-deadline, then lowest-seq.
+    fn timer_sort_key_orders_earliest_first_then_fifo() {
+        // Drive the real comparator via TimerEntry::sort_key (what `Ord` delegates to). A `Job`
+        // cannot be fabricated outside Nova, but the key — which fully determines heap order — does
+        // not need one, so this proves the actual ordering code path rather than a stand-in.
         let now = Instant::now();
+        let key = |ms: u64, seq: u64| (now + Duration::from_millis(ms), seq);
+        // Feed the same triple through a min-heap (Reverse) and confirm pop order.
         let mut heap: BinaryHeap<Reverse<(Instant, u64)>> = BinaryHeap::new();
-        heap.push(Reverse((now + Duration::from_millis(50), 1)));
-        heap.push(Reverse((now + Duration::from_millis(10), 2)));
-        heap.push(Reverse((now + Duration::from_millis(10), 0)));
+        heap.push(Reverse(key(50, 1)));
+        heap.push(Reverse(key(10, 2)));
+        heap.push(Reverse(key(10, 0)));
         let Reverse((_, first)) = heap.pop().unwrap();
         let Reverse((_, second)) = heap.pop().unwrap();
         let Reverse((_, third)) = heap.pop().unwrap();
         // earliest deadline (10ms) ties broken by seq: 0 then 2, then the 50ms timer (seq 1).
         assert_eq!((first, second, third), (0, 2, 1));
+
+        // Direct comparator checks on the tuple key itself.
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        assert_eq!(key(10, 0).cmp(&key(50, 9)), Less, "earlier deadline sorts first");
+        assert_eq!(key(10, 0).cmp(&key(10, 1)), Less, "equal deadline: lower seq first");
+        assert_eq!(key(10, 5).cmp(&key(10, 5)), Equal);
+        assert_eq!(key(99, 0).cmp(&key(10, 0)), Greater);
+    }
+
+    #[test]
+    fn is_due_fires_only_once_deadline_reached() {
+        let now = Instant::now();
+        // Past and exactly-now deadlines are due; a future deadline is not (Node fires at now>=deadline).
+        assert!(is_due(now - Duration::from_millis(1), now));
+        assert!(is_due(now, now));
+        assert!(!is_due(now + Duration::from_millis(1), now));
+    }
+
+    #[test]
+    fn sleep_until_clamps_to_the_earlier_of_timer_and_deadline() {
+        let base = Instant::now();
+        let soon = base + Duration::from_millis(10);
+        let later = base + Duration::from_millis(100);
+        // No bounding deadline: wake exactly at the timer.
+        assert_eq!(sleep_until(None, soon), soon);
+        // Deadline earlier than the timer: wake at the deadline so the request budget is honored.
+        assert_eq!(sleep_until(Some(soon), later), soon);
+        // Deadline later than the timer: wake at the timer (the deadline does not delay it).
+        assert_eq!(sleep_until(Some(later), soon), soon);
     }
 
     #[test]
