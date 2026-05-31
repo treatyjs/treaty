@@ -15,6 +15,11 @@
  *   8. a BARE-JSX .tsx (export default returning JSX, no @Component) lowers to Ivy,
  *   9. the cold-build prewarm runs transformMany in buildStart so the per-file
  *      transform that follows is a cache hit (and is a no-op in dev).
+ *  10. FUNCTION CHUNKING: a transformed file carrying two server fns emits TWO
+ *      code-split chunks (one body each) + a manifest asset, replaces the
+ *      component code with the per-fn client bindings, redirects each binding's
+ *      `./<id>.server.js` import to a client RPC stub (so the server BODY never
+ *      enters the client graph), and the body lives only in its emitted chunk.
  *
  * Run: node libs/treaty/vite/test/vite.smoke.mjs
  */
@@ -183,6 +188,165 @@ await check('prewarm is a no-op for the dev server', async () => {
 	// Even without prewarming, the per-file transform still lowers correctly.
 	const out = p.transform.call({}, code, file)
 	assert.ok(out && out.code.includes('defineComponent'), 'dev per-file transform still works')
+})
+
+// 10. FUNCTION CHUNKING: two server fns -> two emitted chunks + a manifest, with
+//     the client code carrying only bindings (no server-fn body).
+await check('function chunking emits per-fn chunks + manifest, body never in client', async () => {
+	const { splitServerModule } = await import('@treaty/compiler')
+
+	// Unique tokens prove a server-fn body never leaks into client code/stubs.
+	const SAVE_BODY = 'PERSIST_TO_DB'
+	const LOAD_BODY = 'READ_FROM_DB'
+	const FILE = 'dashboard.tsx'
+	const serverModule = [
+		"const express = require('express');",
+		'const app = express();',
+		'async function save(record) {',
+		`  return ${SAVE_BODY}(record);`,
+		'}',
+		'async function loadUser(id) {',
+		`  return ${LOAD_BODY}(id);`,
+		'}',
+		"app.post('/__server/save', async (req, res) => { res.json(await save(req.body)); });",
+		"app.post('/__server/loadUser', async (req, res) => { res.json(await loadUser(req.body)); });",
+		'',
+	].join('\n')
+	const serverChunks = splitServerModule(FILE, serverModule)
+	assert.equal(serverChunks.length, 2, 'fixture must yield two server-fn chunks')
+
+	const CLIENT_CODE = 'export const XComponent = defineComponent();\n'
+
+	// Stub compiler: returns Ivy client code + the two server chunks for our file,
+	// null for anything else. Injected via the `compilerFactory` seam so the test
+	// drives the plugin's real Vite wiring deterministically.
+	const stubCompiler = {
+		transform(id, _code) {
+			if (id !== FILE) return null
+			return { code: CLIENT_CODE, serverChunks, sideEffects: false }
+		},
+		transformMany() {
+			return []
+		},
+		invalidate() {
+			return false
+		},
+		onDelete() {
+			return []
+		},
+		clearCache() {},
+	}
+
+	const p = treaty({ compilerFactory: () => stubCompiler })
+
+	// Build PluginContext capturing emitted chunks/assets.
+	const emitted = []
+	const ctx = {
+		emitFile(file) {
+			emitted.push(file)
+			return file.fileName ?? 'ref'
+		},
+	}
+
+	const out = p.transform.call(ctx, 'source-ignored', FILE)
+	assert.ok(out, 'transform returns a result for the server-fn file')
+
+	// Two server fns -> two emitted CHUNKS, one per fn, with stable file names.
+	const chunkFiles = emitted.filter((f) => f.type === 'chunk')
+	assert.equal(chunkFiles.length, 2, `expected 2 emitted chunks, got ${chunkFiles.length}`)
+	const chunkNames = chunkFiles.map((f) => f.fileName).sort()
+	for (const c of serverChunks) {
+		assert.ok(
+			chunkNames.includes(`${c.id}.server.js`),
+			`a chunk must be emitted for ${c.exportName} (${c.id})`
+		)
+	}
+
+	// The client component code carries ONLY the per-fn bindings; no server body.
+	assert.ok(out.code.includes(CLIENT_CODE.trim()), 'client code retains the Ivy component')
+	for (const c of serverChunks) {
+		assert.ok(out.code.includes(c.clientBinding), `client code carries the ${c.exportName} binding`)
+	}
+	assert.ok(
+		!out.code.includes(SAVE_BODY) && !out.code.includes(LOAD_BODY),
+		'NO server-fn body may appear in the client component code'
+	)
+
+	// resolveId: the binding's `./<id>.server.js` import is redirected to the
+	// per-fn CLIENT stub virtual id (NOT the server body), keeping the body out.
+	const save = serverChunks.find((c) => c.exportName === 'save')
+	const clientId = await p.resolveId.call(ctx, `./${save.id}.server.js`, FILE, {})
+	assert.ok(typeof clientId === 'string', 'client import resolves to a virtual id')
+	assert.ok(
+		clientId.startsWith('\0treaty-server-fn-client:'),
+		'client import redirects to the RPC stub, not the server body'
+	)
+
+	// load: the client stub is a fetch-based binding with NO server body in it.
+	const stub = p.load.call(ctx, clientId)
+	assert.ok(typeof stub === 'string' && stub.includes('fetch('), 'client stub is an RPC binding')
+	assert.ok(stub.includes('/__server/save'), 'client stub targets the fn route')
+	assert.ok(
+		!stub.includes(SAVE_BODY) && !stub.includes(LOAD_BODY),
+		'client stub must NOT contain any server-fn body'
+	)
+
+	// load: the SERVER body virtual id serves the real chunk body (server side).
+	const serverVirtual = `\0treaty-server-fn:${save.id}`
+	const body = p.load.call(ctx, serverVirtual)
+	assert.ok(typeof body === 'string' && body.includes(SAVE_BODY), 'server chunk carries its body')
+
+	// generateBundle: a manifest asset maps every fn id -> chunk file + export name.
+	const genCtx = {
+		emitFile(file) {
+			emitted.push(file)
+			return file.fileName ?? 'ref'
+		},
+	}
+	p.generateBundle.call(genCtx, {}, {})
+	const manifestAsset = emitted.find(
+		(f) => f.type === 'asset' && f.fileName === 'treaty-server-fns.json'
+	)
+	assert.ok(manifestAsset, 'a treaty-server-fns.json manifest asset is emitted')
+	const manifest = JSON.parse(manifestAsset.source)
+	for (const c of serverChunks) {
+		const entry = manifest[c.id]
+		assert.ok(entry, `manifest must contain fn id ${c.id}`)
+		assert.equal(entry.exportName, c.exportName, 'manifest export name matches fn')
+		assert.equal(entry.chunkFile, `${c.id}.server.js`, 'manifest points at the emitted chunk file')
+	}
+	assert.ok(
+		!manifestAsset.source.includes(SAVE_BODY) && !manifestAsset.source.includes(LOAD_BODY),
+		'manifest must NOT embed any server-fn body'
+	)
+	results.push(`INFO chunking emitted ${chunkFiles.length} chunks + manifest`)
+})
+
+// 11. function chunking can be disabled: no chunks/manifest, code unchanged.
+await check('functionChunking:false leaves server fns as a single blob', async () => {
+	const { splitServerModule } = await import('@treaty/compiler')
+	const FILE = 'plain.tsx'
+	const serverModule =
+		"const app = require('express')();\n" +
+		'async function ping() { return PONG_BODY(); }\n' +
+		"app.post('/__server/ping', async (_q, r) => r.json(await ping()));\n"
+	const serverChunks = splitServerModule(FILE, serverModule)
+	const CLIENT = 'export const P = defineComponent();\n'
+	const stub = {
+		transform: (id) => (id === FILE ? { code: CLIENT, serverChunks, sideEffects: false } : null),
+		transformMany: () => [],
+		invalidate: () => false,
+		onDelete: () => [],
+		clearCache() {},
+	}
+	const p = treaty({ functionChunking: false, compilerFactory: () => stub })
+	const emitted = []
+	const ctx = { emitFile: (f) => (emitted.push(f), 'ref') }
+	const out = p.transform.call(ctx, 'x', FILE)
+	assert.equal(out.code, CLIENT, 'code unchanged when chunking is off')
+	assert.equal(emitted.length, 0, 'no chunks emitted when chunking is off')
+	p.generateBundle.call(ctx, {}, {})
+	assert.equal(emitted.length, 0, 'no manifest emitted when chunking is off')
 })
 
 for (const line of results) console.log(line)

@@ -85,9 +85,9 @@ describe('treatyLoader', () => {
 
 	it('reports compiler errors through the loader callback', () => {
 		const { ctx, result } = fakeContext('/abs/Broken.treaty')
-		// A template with a stray closing tag is a real compiler diagnostic.
-		const broken =
-			'<script>const x = 1</script><template><div></template>'
+		// An unterminated <script> block is a real compiler diagnostic (the parser
+		// hits EOF mid-expression), which the loader must surface as an Error.
+		const broken = '<script>const x = (\n<template><div></div></template>'
 		const ret = treatyLoader.call(ctx, broken)
 		expect(ret).toBeUndefined()
 		const { error } = result()

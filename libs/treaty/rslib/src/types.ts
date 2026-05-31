@@ -49,6 +49,38 @@ export interface TreatyTransformDescriptor {
 	readonly test: RegExp
 }
 
+/** A Rspack `sources.Source`-compatible asset payload. */
+export interface TreatyRspackSource {
+	source(): string | Buffer
+	size(): number
+}
+
+/**
+ * The Rspack compilation a `processAssets` callback receives. We only call
+ * `emitAsset` (to add each server-fn chunk + the manifest) and read `assets` to
+ * avoid re-emitting a name. Declared structurally; the real type is a superset.
+ */
+export interface TreatyRspackCompilation {
+	readonly assets: Readonly<Record<string, TreatyRspackSource>>
+	emitAsset(name: string, source: TreatyRspackSource, info?: Record<string, unknown>): void
+}
+
+/** The `sources` namespace Rspack passes into a `processAssets` callback. */
+export interface TreatyRspackSourcesNamespace {
+	readonly RawSource: new (value: string | Buffer) => TreatyRspackSource
+}
+
+/** Arguments rsbuild/rslib passes to a `processAssets` callback. */
+export interface TreatyProcessAssetsArgs {
+	readonly compilation: TreatyRspackCompilation
+	readonly sources: TreatyRspackSourcesNamespace
+}
+
+/** A `processAssets` registration descriptor: which pipeline stage to run in. */
+export interface TreatyProcessAssetsDescriptor {
+	readonly stage?: string
+}
+
 /**
  * The minimal `RsbuildPluginAPI` slice we use: registering a transform. The real
  * type accepts additional hook registrars we do not touch.
@@ -64,6 +96,16 @@ export interface TreatyRsbuildPluginApi {
 	 * absent on the minimal fake api the smoke tests use.
 	 */
 	onBeforeBuild?(callback: () => void | Promise<void>): void
+	/**
+	 * Optional asset-pipeline hook (rsbuild/rslib `processAssets`). Used to emit
+	 * each extracted server fn as its own separately-exported library chunk plus
+	 * the server-fn manifest. Declared optional so the plugin only emits chunks
+	 * when the host exposes it (and the smokes can drive the emit core directly).
+	 */
+	processAssets?(
+		descriptor: TreatyProcessAssetsDescriptor,
+		handler: (args: TreatyProcessAssetsArgs) => void | Promise<void>
+	): void
 }
 
 /**

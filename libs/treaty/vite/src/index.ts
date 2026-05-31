@@ -17,6 +17,7 @@ import { readFile } from 'node:fs/promises'
 import {
 	createTreatyCompiler,
 	classify,
+	type ServerFnChunk,
 	type TransformInput,
 	type TreatyCompiler,
 	type TreatyCompilerOptions,
@@ -27,6 +28,18 @@ import {
 	type ViteFederationOptions,
 } from '@treaty/module-federation'
 import type { Plugin } from 'vite'
+import type { EmittedFile } from 'rollup'
+import {
+	CLIENT_VIRTUAL_PREFIX,
+	MANIFEST_FILE_NAME,
+	SERVER_VIRTUAL_PREFIX,
+	buildBuildManifest,
+	clientStubModule,
+	injectClientBindings,
+	matchServerChunkSpecifier,
+	serverChunkFileName,
+	type TrackedServerFn,
+} from './server-chunks.js'
 
 /** Public options for {@link treaty}. */
 export interface PluginOptions extends TreatyCompilerOptions {
@@ -74,6 +87,28 @@ export interface PluginOptions extends TreatyCompilerOptions {
 	 * the Treaty plugin and the auto-generated federation plugin together.
 	 */
 	readonly moduleFederation?: MfOptions | boolean
+	/**
+	 * Function chunking. When `true` (the default), each server function the
+	 * compiler extracts from an authoring file is emitted as its OWN
+	 * separately-loadable Rollup chunk (`<fn-id>.server.js`), the component code
+	 * keeps only the per-fn client binding, and a `treaty-server-fns.json`
+	 * manifest (fn-id -> chunk file + export name) is emitted as a build asset.
+	 *
+	 * This guarantees a server-fn BODY never lands in the client module graph:
+	 * the body lives only in its emitted chunk, while the client follows the
+	 * binding to a tiny RPC stub that calls the fn's `/__server/<name>` route.
+	 *
+	 * Set `false` to leave server fns as the compiler's single `serverModule`
+	 * blob (no per-fn code-splitting and no manifest).
+	 */
+	readonly functionChunking?: boolean
+	/**
+	 * Factory used to construct the underlying {@link TreatyCompiler}. Defaults to
+	 * `createTreatyCompiler` from `@treaty/compiler`. Provided as a seam so an
+	 * embedder (or a test) can supply an alternative compiler implementation
+	 * without changing the plugin's Vite wiring; production usage never sets this.
+	 */
+	readonly compilerFactory?: (options: TreatyCompilerOptions) => TreatyCompiler
 }
 
 /**
@@ -115,9 +150,44 @@ export default function treaty(options: PluginOptions = {}): Plugin {
 	const esbuildLoaders = options.esbuildLoaders ?? DEFAULT_ESBUILD_LOADERS
 	const prewarmFiles = options.prewarm ?? []
 
-	const compiler: TreatyCompiler = createTreatyCompiler(options)
+	const functionChunking = options.functionChunking ?? true
+
+	const compiler: TreatyCompiler = (options.compilerFactory ?? createTreatyCompiler)(options)
 	// Set by configResolved; gates the cold-build-only prewarm in buildStart.
 	let isColdBuild = false
+
+	// Server-fn registries, populated during `transform` and read by the virtual
+	// `load`/`resolveId` hooks and the manifest emit:
+	//   serverBodies  — virtual server-body module id -> chunk code (server side)
+	//   clientStubs   — virtual client-stub module id -> RPC stub code (client side)
+	//   tracked       — chunk id -> { chunk, fileName }, drives the manifest asset
+	const serverBodies = new Map<string, string>()
+	const clientStubs = new Map<string, string>()
+	const tracked = new Map<string, TrackedServerFn>()
+
+	/**
+	 * Register one extracted server fn as its own code-split chunk: stash the
+	 * body under its server-virtual id and emit it as a Rollup chunk with a
+	 * stable file name; stash the client RPC stub under its client-virtual id;
+	 * and record it for the manifest. `emitFile` is only available on the build
+	 * `PluginContext`, so dev (where it is absent) just registers the virtuals.
+	 */
+	function registerServerChunk(
+		ctx: { emitFile?: (file: EmittedFile) => string },
+		chunk: ServerFnChunk
+	): void {
+		const fileName = serverChunkFileName(chunk)
+		serverBodies.set(`${SERVER_VIRTUAL_PREFIX}${chunk.id}`, chunk.code)
+		clientStubs.set(`${CLIENT_VIRTUAL_PREFIX}${chunk.id}`, clientStubModule(chunk.exportName))
+		tracked.set(chunk.id, { chunk, fileName })
+		if (typeof ctx.emitFile === 'function') {
+			ctx.emitFile({
+				type: 'chunk',
+				id: `${SERVER_VIRTUAL_PREFIX}${chunk.id}`,
+				fileName,
+			})
+		}
+	}
 
 	return {
 		name: PLUGIN_NAME,
@@ -184,6 +254,21 @@ export default function treaty(options: PluginOptions = {}): Plugin {
 		 * actual path resolution to Vite via `this.resolve`.
 		 */
 		async resolveId(source, importer, resolveOptions) {
+			// Server-fn virtual ids resolve to themselves so `load` can serve them.
+			if (source.startsWith(SERVER_VIRTUAL_PREFIX) || source.startsWith(CLIENT_VIRTUAL_PREFIX)) {
+				return source
+			}
+			// A component's client binding imports `./<fn-id>.server.js`. Redirect that
+			// to the per-fn client RPC stub so following the binding never pulls the
+			// server BODY into the client module graph. The body is its own emitted
+			// chunk; only the stub reaches the client.
+			if (functionChunking) {
+				const chunkId = matchServerChunkSpecifier(source)
+				if (chunkId !== null) {
+					const clientId = `${CLIENT_VIRTUAL_PREFIX}${chunkId}`
+					if (clientStubs.has(clientId)) return clientId
+				}
+			}
 			if (!isCandidate(source)) return null
 			// Avoid infinite recursion: skip ids we have already resolved.
 			const resolved = await this.resolve(source, importer, {
@@ -191,6 +276,19 @@ export default function treaty(options: PluginOptions = {}): Plugin {
 				skipSelf: true,
 			})
 			return resolved ? resolved.id : null
+		},
+
+		/**
+		 * Serve the server-fn virtual modules: the server BODY chunk
+		 * (`SERVER_VIRTUAL_PREFIX`) and the client RPC stub
+		 * (`CLIENT_VIRTUAL_PREFIX`). All other ids fall through to Vite.
+		 */
+		load(id) {
+			const body = serverBodies.get(id)
+			if (body !== undefined) return body
+			const stub = clientStubs.get(id)
+			if (stub !== undefined) return stub
+			return null
 		},
 
 		/**
@@ -202,8 +300,20 @@ export default function treaty(options: PluginOptions = {}): Plugin {
 			if (!isCandidate(id)) return null
 			const result = compiler.transform(cleanId(id), code)
 			if (result === null) return null
+
+			// Function chunking: emit each extracted server fn as its own loadable
+			// chunk and replace the component code with the per-fn client bindings,
+			// so the server-fn body never enters this client module.
+			let out = result.code
+			if (functionChunking && result.serverChunks && result.serverChunks.length > 0) {
+				for (const chunk of result.serverChunks) {
+					registerServerChunk(this, chunk)
+				}
+				out = injectClientBindings(out, result.serverChunks)
+			}
+
 			return {
-				code: result.code,
+				code: out,
 				map: emitSourceMap && result.map !== undefined ? result.map : null,
 			}
 		},
@@ -242,6 +352,22 @@ export default function treaty(options: PluginOptions = {}): Plugin {
 			// Changed-in-place: drop the stale cache entry so the reload recompiles.
 			compiler.invalidate(file)
 			return ctx.modules
+		},
+
+		/**
+		 * Emit the server-fn manifest (`treaty-server-fns.json`) once the bundle is
+		 * generated: a map of every extracted fn's stable id to its emitted body
+		 * chunk file and export name, so a server runtime can resolve a fn id to the
+		 * chunk that backs it. No-op when chunking is off or no server fns were seen.
+		 */
+		generateBundle() {
+			if (!functionChunking || tracked.size === 0) return
+			const manifest = buildBuildManifest(tracked.values())
+			this.emitFile({
+				type: 'asset',
+				fileName: MANIFEST_FILE_NAME,
+				source: `${JSON.stringify(manifest, null, 2)}\n`,
+			})
 		},
 	}
 }

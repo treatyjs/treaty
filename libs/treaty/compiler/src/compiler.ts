@@ -32,6 +32,7 @@ import {
 	type CompiledAuthoringEntry,
 } from './addon.js'
 import { contentHash, IncrementalCache, type CacheStats } from './cache.js'
+import { splitServerModule } from './server-chunks.js'
 import {
 	annotatePureFactories,
 	dropUnusedServerFns,
@@ -238,7 +239,7 @@ export class TreatyCompiler {
 		code: string,
 		hash: string
 	): TransformResult {
-		const result = this.postProcess(compiled)
+		const result = this.postProcess(id, compiled)
 		this.recordDependents(id, code)
 		if (this.cacheEnabled) this.cache.set(id, hash, result)
 		return result
@@ -280,14 +281,23 @@ export class TreatyCompiler {
 		return jsx
 	}
 
-	/** Apply tree-shaking annotations to emitted Ivy JS. */
-	private postProcess(compiled: CompiledAuthoring): TransformResult {
+	/**
+	 * Apply tree-shaking annotations to emitted Ivy JS, and — when the file
+	 * declared server functions — decompose the single `serverModule` blob into
+	 * per-fn {@link ServerFnChunk}s so a bundler can code-split each fn into its
+	 * own loadable chunk. `serverModule` is retained as the back-compat blob.
+	 */
+	private postProcess(id: string, compiled: CompiledAuthoring): TransformResult {
 		let out = compiled.code
 		if (this.dropServerFns) out = dropUnusedServerFns(out)
 		if (this.annotatePure) out = annotatePureFactories(out)
-		return compiled.serverModule !== undefined
-			? { code: out, serverModule: compiled.serverModule, sideEffects: false }
-			: { code: out, sideEffects: false }
+		if (compiled.serverModule === undefined) {
+			return { code: out, sideEffects: false }
+		}
+		const serverChunks = splitServerModule(id, compiled.serverModule)
+		return serverChunks.length > 0
+			? { code: out, serverModule: compiled.serverModule, serverChunks, sideEffects: false }
+			: { code: out, serverModule: compiled.serverModule, sideEffects: false }
 	}
 
 	/** Index the importers a module references, for {@link onDelete}. */

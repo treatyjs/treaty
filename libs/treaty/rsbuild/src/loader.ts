@@ -15,12 +15,20 @@
 import { createTreatyCompiler, type TreatyCompiler } from '@treaty/compiler'
 import type { TreatyPluginOptions } from './options.js'
 import { toCompilerOptions } from './options.js'
+import { serverChunkFileName } from './server-chunks.js'
 
 /** Minimal shape of the loader `this` context we depend on. */
 interface LoaderContext {
 	readonly resourcePath: string
 	getOptions?: () => TreatyPluginOptions
 	readonly query?: TreatyPluginOptions | string
+	/**
+	 * Webpack/Rspack additional-asset emit. Present on the real loader context;
+	 * declared optional so the loader still works under the minimal fake context
+	 * the smoke tests use. Used to code-split each server fn into its own chunk
+	 * file (the body never enters the client bundle).
+	 */
+	emitFile?(name: string, content: string): void
 }
 
 /**
@@ -59,5 +67,14 @@ export default function treatyLoader(this: LoaderContext, source: string): strin
 	const options = readOptions(this)
 	const compiler = compilerFor(options)
 	const result = compiler.transform(this.resourcePath, source)
-	return result ? result.code : source
+	if (result === null) return source
+	// Code-split each extracted server fn into its own `<id>.server.js` chunk so
+	// its body is separately loadable and never ships in the client bundle. The
+	// returned `code` is the client module (bodies replaced by client bindings).
+	if (result.serverChunks && typeof this.emitFile === 'function') {
+		for (const chunk of result.serverChunks) {
+			this.emitFile(serverChunkFileName(chunk.id), chunk.code)
+		}
+	}
+	return result.code
 }

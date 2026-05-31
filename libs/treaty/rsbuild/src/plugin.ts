@@ -23,6 +23,7 @@
 import { readFile } from 'node:fs/promises'
 import { createTreatyCompiler, type TransformInput, type TreatyCompiler } from '@treaty/compiler'
 import type {
+	ProcessAssetsArgs,
 	RsbuildConfig,
 	RsbuildPlugin,
 	RsbuildPluginAPI,
@@ -35,6 +36,14 @@ import {
 	toCompilerOptions,
 	type TreatyPluginOptions,
 } from './options.js'
+import { ServerChunkCollector } from './server-chunks.js'
+
+/**
+ * The `processAssets` pipeline stage to emit server-fn chunks at. `'additional'`
+ * runs after the normal asset graph is built, so adding the per-fn chunk files
+ * and the manifest does not race the modules they were extracted from.
+ */
+const SERVER_CHUNK_STAGE = 'additional'
 
 /** Stable plugin name, also asserted by the smoke test. */
 export const PLUGIN_NAME = 'treaty:rsbuild'
@@ -69,6 +78,22 @@ async function prewarm(compiler: TreatyCompiler, files: readonly string[]): Prom
 }
 
 /**
+ * Emit a collector's server-fn chunks + manifest into a `processAssets` pass.
+ * Each `<chunkId>.server.js` and the `treaty-server-fns.json` manifest is added
+ * via `compilation.emitAsset` (wrapped in a `RawSource`), skipping any name the
+ * build already carries so a re-run is idempotent. A no-op when nothing was
+ * collected, so a pure client build emits no extra files.
+ */
+export function emitServerChunks(collector: ServerChunkCollector, args: ProcessAssetsArgs): void {
+	if (collector.isEmpty) return
+	const { compilation, sources } = args
+	for (const asset of collector.assets()) {
+		if (asset.name in compilation.assets) continue
+		compilation.emitAsset(asset.name, new sources.RawSource(asset.source))
+	}
+}
+
+/**
  * Create the Treaty Rsbuild plugin.
  *
  * @param options - Typed plugin options (see {@link TreatyPluginOptions}). All
@@ -93,14 +118,30 @@ export function pluginTreaty(options: TreatyPluginOptions = {}): RsbuildPlugin {
 			// Strategy 1: the first-class transform hook.
 			if (typeof api.transform === 'function') {
 				const compiler = createTreatyCompiler(coreOptions)
+				// Accumulates the per-fn server chunks discovered across the build so
+				// they can be code-split into their own files at asset-emit time.
+				const serverChunks = new ServerChunkCollector()
 				// Cold-build batch prewarm (opt-in), when the host exposes the hook.
 				if (prewarmFiles.length > 0 && typeof api.onBeforeBuild === 'function') {
 					api.onBeforeBuild(() => prewarm(compiler, prewarmFiles))
 				}
 				api.transform({ test }, ({ code, resourcePath }) => {
 					const result = compiler.transform(resourcePath, code)
-					return result ? { code: result.code, map: result.map } : { code }
+					if (result === null) return { code }
+					// Collect this file's server fns for later per-fn chunk emission;
+					// the returned `code` is the CLIENT module (fn bodies already
+					// replaced by the compiler with their client bindings).
+					serverChunks.add(result)
+					return { code: result.code, map: result.map }
 				})
+				// Emit each server fn as its own `<id>.server.js` chunk plus the
+				// manifest, when the host exposes the asset hook. The fn body therefore
+				// never enters the client/Ivy bundle — only the client binding does.
+				if (typeof api.processAssets === 'function') {
+					api.processAssets({ stage: SERVER_CHUNK_STAGE }, (assetArgs) => {
+						emitServerChunks(serverChunks, assetArgs)
+					})
+				}
 				return
 			}
 

@@ -19,6 +19,11 @@ import {
 	type TreatyCompiler,
 } from '@treaty/compiler'
 import type { TreatyLoaderOptions } from './options.js'
+import {
+	emitServerFnChunks,
+	registryFor,
+	type ServerChunkEmitter,
+} from './server-chunks.js'
 
 /**
  * The slice of the webpack/rspack loader context this loader relies on. Declared
@@ -47,6 +52,19 @@ export interface TreatyLoaderContext {
 		content?: string,
 		sourceMap?: unknown
 	) => void
+	/**
+	 * Emit a build asset (server-fn chunk). Present on real Rspack/webpack loader
+	 * contexts; used to write each extracted server fn's body as its own loadable
+	 * output file so it never enters the client chunk. Optional so a minimal test
+	 * context (or a build with no server fns) need not provide it.
+	 */
+	emitFile?: ServerChunkEmitter['emitFile']
+	/**
+	 * The active compilation, when running inside a real build. Used as the key
+	 * for the per-compilation server-fn registry the plugin reads to emit the
+	 * manifest. Absent on minimal contexts (then a process-wide registry is used).
+	 */
+	_compilation?: object
 }
 
 /**
@@ -118,7 +136,30 @@ export const treatyLoader: TreatyLoader = function treatyLoader(
 	// Not a Treaty-owned module (or a plain `.ts` without `@Component`): pass through.
 	if (result === null) return source
 
-	return report(this, null, result.code, parseMap(result))
+	// When the file declared server fns, emit each fn's body as its own loadable
+	// chunk asset and rewrite the client module to carry only the lazy bindings —
+	// the body never enters the client (Ivy) chunk. Falls back to `result.code`
+	// untouched when there are no server fns or no `emitFile` (minimal context).
+	const code = emitClientModule(this, result)
+
+	return report(this, null, code, parseMap(result))
+}
+
+/**
+ * Produce the client module text for a transform result, splitting out server
+ * fns when present. Requires `emitFile` (a real build context) to emit the per-fn
+ * chunk assets; without it the body-free `result.code` is returned as-is so a
+ * minimal/test context still works.
+ */
+function emitClientModule(ctx: TreatyLoaderContext, result: TransformResult): string {
+	if (!result.serverChunks || result.serverChunks.length === 0) return result.code
+	if (typeof ctx.emitFile !== 'function') return result.code
+	const emitter: ServerChunkEmitter = { emitFile: ctx.emitFile.bind(ctx) }
+	// `_compilation` is Rspack/webpack's own loader-context property; the leading
+	// underscore is the framework's API name, not ours.
+	// oxlint-disable-next-line no-underscore-dangle
+	const registry = registryFor(ctx._compilation)
+	return emitServerFnChunks(emitter, registry, result)
 }
 
 /**

@@ -13,11 +13,15 @@
 export { TreatyCompiler, createTreatyCompiler, TreatyCompileError, classify } from './compiler.js'
 
 export type {
+	ServerFnChunk,
 	TransformInput,
 	TransformResult,
 	TreatyCompilerOptions,
 	TreatyFileKind,
 } from './types.js'
+
+export type { ServerFnManifest, ServerFnManifestEntry } from './server-chunks.js'
+export { buildServerFnManifest, serverFnChunkId, splitServerModule } from './server-chunks.js'
 
 export type { CacheStats } from './cache.js'
 export { contentHash, IncrementalCache } from './cache.js'

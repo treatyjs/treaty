@@ -75,6 +75,42 @@ declare module '@rsbuild/core' {
 		[key: string]: unknown
 	}
 
+	/** A Rspack `sources.Source`-compatible asset payload. */
+	export interface RspackSource {
+		source(): string | Buffer
+		size(): number
+	}
+
+	/**
+	 * The Rspack compilation handed to a `processAssets` callback. We only call
+	 * `emitAsset` to add the per-server-fn chunk files and the manifest, and read
+	 * `assets` to detect an already-emitted name (idempotency across stages).
+	 */
+	export interface RspackCompilation {
+		readonly assets: Readonly<Record<string, RspackSource>>
+		emitAsset(name: string, source: RspackSource, info?: Record<string, unknown>): void
+	}
+
+	/** The `sources` namespace Rspack passes into a `processAssets` callback. */
+	export interface RspackSourcesNamespace {
+		readonly RawSource: new (value: string | Buffer) => RspackSource
+	}
+
+	/** Arguments rsbuild passes to a `processAssets` callback. */
+	export interface ProcessAssetsArgs {
+		readonly assets: Readonly<Record<string, RspackSource>>
+		readonly compilation: RspackCompilation
+		readonly sources: RspackSourcesNamespace
+		readonly environment: { readonly name: string }
+	}
+
+	/** A `processAssets` registration descriptor: which pipeline stage to run in. */
+	export interface ProcessAssetsDescriptor {
+		readonly stage?: string
+		readonly targets?: readonly string[]
+		readonly environments?: readonly string[]
+	}
+
 	/** The plugin API surface exposed to `setup(api)`. */
 	export interface RsbuildPluginAPI {
 		/** Register a code transform for matched modules. */
@@ -94,6 +130,16 @@ declare module '@rsbuild/core' {
 		 * prewarms when the host's rsbuild actually provides it.
 		 */
 		onBeforeBuild?(callback: () => void | Promise<void>): void
+		/**
+		 * Late asset-pipeline hook used to emit the per-server-fn chunk files and
+		 * the server-fn manifest collected during `transform`. Optional in this
+		 * declaration so the plugin only emits chunks when the host's rsbuild
+		 * provides it (and the smokes can exercise the emit core directly).
+		 */
+		processAssets?(
+			descriptor: ProcessAssetsDescriptor,
+			handler: (args: ProcessAssetsArgs) => void | Promise<void>
+		): void
 	}
 
 	/** An Rsbuild plugin: a named object with a `setup(api)` entry point. */

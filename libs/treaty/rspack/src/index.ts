@@ -19,7 +19,21 @@ export { default } from './loader.js'
 export type { TreatyLoader, TreatyLoaderContext } from './loader.js'
 
 export { TreatyRspackPlugin, treatyRule } from './plugin.js'
-export type { TreatyCompilerHost } from './plugin.js'
+export type { TreatyCompilerHost, TreatyCompilation } from './plugin.js'
+
+export {
+	emitServerFnChunks,
+	registryFor,
+	serverFnAssetName,
+	serverFnManifestAsset,
+	TreatyServerFnRegistry,
+	SERVER_FN_MANIFEST_ASSET,
+} from './server-chunks.js'
+export type {
+	RspackServerFnManifest,
+	ServerChunkEmitter,
+	ServerFnManifestRecord,
+} from './server-chunks.js'
 
 export {
 	DEFAULT_EXTENSIONS,

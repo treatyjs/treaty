@@ -30,6 +30,11 @@ import {
 	type TreatyLoaderOptions,
 	type TreatyPluginOptions,
 } from './options.js'
+import {
+	registryFor,
+	SERVER_FN_MANIFEST_ASSET,
+	serverFnManifestAsset,
+} from './server-chunks.js'
 
 /** A single `use` entry on a module rule. */
 interface RuleUseEntry {
@@ -57,6 +62,37 @@ export interface TreatyCompilerHost {
 		plugins?: unknown[]
 		[key: string]: unknown
 	}
+	/**
+	 * The compiler hook surface the plugin taps to emit the server-fn manifest.
+	 * Optional + structural so the package typechecks without `@rspack/core` and
+	 * the plugin no-ops on a minimal host (e.g. the resolve/rule unit tests).
+	 */
+	hooks?: {
+		thisCompilation?: {
+			tap(name: string, fn: (compilation: TreatyCompilation) => void): void
+		}
+	}
+	/** Rspack/webpack's own `sources` namespace, used to build a RawSource. */
+	webpack?: { sources?: { RawSource?: RawSourceCtor } }
+}
+
+/** A constructable webpack/rspack `RawSource` (the asset source wrapper). */
+interface RawSourceCtor {
+	new (value: string): unknown
+}
+
+/**
+ * The structural slice of a compilation the plugin uses: the `processAssets`
+ * hook (to run at asset-emit time) and `emitAsset` (to write the manifest). The
+ * real Rspack/webpack `Compilation` is assignable to this.
+ */
+export interface TreatyCompilation {
+	hooks: {
+		processAssets: {
+			tap(options: { name: string; stage?: number }, fn: () => void): void
+		}
+	}
+	emitAsset(name: string, source: unknown): void
 }
 
 /**
@@ -161,6 +197,11 @@ export class TreatyRspackPlugin {
 			if (!existing.includes(ext)) existing.push(ext)
 		}
 
+		// Server-fn chunking: at asset-emit time, write the aggregate fn-id -> chunk
+		// manifest (built from the same per-compilation registry the loader fed) as a
+		// build asset. The per-fn body chunks themselves are emitted by the loader.
+		this.tapServerFnManifest(compiler)
+
 		// Auto Module Federation: default-on, opt-out via moduleFederation: false.
 		const mf = resolveMfOptions(this.options.moduleFederation ?? true)
 		if (mf !== null) {
@@ -180,6 +221,34 @@ export class TreatyRspackPlugin {
 				plugins.push(new ModuleFederationPlugin(federationOptions))
 			}
 		}
+	}
+
+	/**
+	 * Tap the compiler to emit the server-fn manifest. For each compilation it
+	 * hooks `processAssets` and, when the loader recorded any server-fn chunks for
+	 * that compilation, writes them as the {@link SERVER_FN_MANIFEST_ASSET} JSON
+	 * asset. No-ops on a minimal host without the hook surface (the unit tests) so
+	 * the loader/resolve wiring stays usable standalone.
+	 */
+	private tapServerFnManifest(compiler: TreatyCompilerHost): void {
+		const thisCompilation = compiler.hooks?.thisCompilation
+		if (thisCompilation === undefined) return
+		const RawSource = compiler.webpack?.sources?.RawSource
+
+		thisCompilation.tap(TreatyRspackPlugin.NAME, (compilation) => {
+			// PROCESS_ASSETS_STAGE_ADDITIONAL (= 100): emit alongside other added
+			// assets, before optimization stages run.
+			compilation.hooks.processAssets.tap(
+				{ name: TreatyRspackPlugin.NAME, stage: 100 },
+				() => {
+					const registry = registryFor(compilation)
+					if (registry.isEmpty) return
+					const json = serverFnManifestAsset(registry)
+					const source = RawSource !== undefined ? new RawSource(json) : json
+					compilation.emitAsset(SERVER_FN_MANIFEST_ASSET, source)
+				}
+			)
+		})
 	}
 }
 

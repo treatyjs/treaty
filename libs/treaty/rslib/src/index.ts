@@ -19,7 +19,16 @@ export {
 	treatyRsbuildPlugin,
 	TREATY_PLUGIN_NAME,
 	TREATY_TRANSFORM_TEST,
+	emitServerChunks,
 } from './plugin.js'
+
+export type { EmittableAsset } from './server-chunks.js'
+export {
+	ServerChunkCollector,
+	serverChunkFileName,
+	SERVER_FN_MANIFEST_NAME,
+	SERVER_FN_BARREL_NAME,
+} from './server-chunks.js'
 
 export type {
 	DefineTreatyLibOptions,
@@ -33,4 +42,9 @@ export type {
 	TreatyTransformOutput,
 	TreatyTransformHandler,
 	TreatyTransformDescriptor,
+	TreatyProcessAssetsArgs,
+	TreatyProcessAssetsDescriptor,
+	TreatyRspackCompilation,
+	TreatyRspackSource,
+	TreatyRspackSourcesNamespace,
 } from './types.js'
