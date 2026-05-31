@@ -30,12 +30,15 @@ use crate::template::template_transform::{
 };
 use crate::util::{R3CompiledExpression, R3Reference};
 use crate::view::compiler::{
-    compile_component_from_metadata, ChangeDetection, ChangeDetectionStrategy, ComponentTemplate,
-    DeclarationListEmitMode, Deps, Lifecycle, OrderedMap, QueryPredicate, R3ComponentDeferMetadata,
-    R3ComponentMetadata, R3DirectiveMetadata, R3ForeignComponentMetadata, R3HostMetadata,
-    R3InputMetadata, R3QueryMetadata, R3TemplateDependency, R3TemplateDependencyMetadata,
-    StubHostBindingsBuilder, TemplateBuilder, TemplateBuilderResult, ViewEncapsulation,
+    compile_component_from_metadata, compile_directive_from_metadata, parse_host_bindings,
+    ChangeDetection, ChangeDetectionStrategy, ComponentTemplate, DeclarationListEmitMode,
+    DefaultHostBindingsBuilder, Deps, HostValue, Lifecycle, OrderedMap, QueryPredicate,
+    R3ComponentDeferMetadata, R3ComponentMetadata, R3DirectiveMetadata,
+    R3ForeignComponentMetadata, R3HostDirectiveMetadata, R3HostMetadata, R3InputMetadata,
+    R3QueryMetadata, R3TemplateDependency, R3TemplateDependencyMetadata, TemplateBuilder,
+    TemplateBuilderResult, ViewEncapsulation,
 };
+use crate::util::R3Reference as DirRef;
 
 /// Helper to build a `CompiledComponent` carrying a single fatal error and no code.
 fn err(msg: impl Into<String>) -> CompiledComponent {
@@ -65,6 +68,9 @@ fn class_ref_spanned(class_name: &str, span: ParseSourceSpan) -> R3Reference {
 enum TopLevel {
     Component,
     Directive,
+    Pipe,
+    NgModule,
+    Injectable,
 }
 
 /// Returns the callee identifier name of a decorator's expression, whether it's a bare
@@ -368,19 +374,9 @@ fn decorator_string_alias(dec: &Decorator) -> Option<String> {
 const UNSUPPORTED_DECORATOR_KEYS: &[&str] = &[
     "providers",
     "viewProviders",
-    "host",
-    "hostDirectives",
+    // The legacy `queries: {...}` decorator-object form is distinct from the `@ViewChild`/
+    // `@ContentChild` member decorators handled by `collect_decorator_queries`; still unsupported.
     "queries",
-];
-
-/// Property decorators we cannot yet model — their presence on a member is fatal.
-const UNSUPPORTED_PROPERTY_DECORATORS: &[&str] = &[
-    "ViewChild",
-    "ViewChildren",
-    "ContentChild",
-    "ContentChildren",
-    "HostBinding",
-    "HostListener",
 ];
 
 /// Extract inputs/outputs from the class body and populate the metadata maps.
@@ -412,11 +408,6 @@ fn collect_io(
         let mut decorator_alias: Option<String> = None;
         for dec in &prop.decorators {
             if let Some(name) = decorator_name(dec) {
-                if UNSUPPORTED_PROPERTY_DECORATORS.contains(&name) {
-                    return Err(format!(
-                        "unsupported member decorator @{name} on '{member_name}'"
-                    ));
-                }
                 match name {
                     "Input" => {
                         decorated_input = true;
@@ -426,6 +417,8 @@ fn collect_io(
                         decorated_output = true;
                         decorator_alias = decorator_string_alias(dec);
                     }
+                    // `@ViewChild`/`@ContentChild`/`@HostBinding`/`@HostListener` member decorators
+                    // are handled by `collect_decorator_queries` / `collect_member_host_bindings`.
                     _ => {}
                 }
             }
@@ -611,7 +604,7 @@ fn parse_signal_query(prop: &PropertyDefinition) -> Option<(bool, R3QueryMetadat
 
 /// Walk the class body and split signal-query member initializers into content queries and view
 /// queries (in declaration order), faithful to `query_functions.ts`. Decorator-based queries
-/// (`@ViewChild` &c.) are rejected earlier by [`collect_io`], so only the signal forms reach here.
+/// (`@ViewChild` &c.) are collected separately by [`collect_decorator_queries`].
 fn collect_signal_queries(
     class: &Class,
     content_queries: &mut Vec<R3QueryMetadata>,
@@ -629,6 +622,439 @@ fn collect_signal_queries(
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// R3 — decorator-based queries (`@ViewChild`/`@ViewChildren`/`@ContentChild`/`@ContentChildren`).
+// ---------------------------------------------------------------------------
+
+/// The four decorator-query names (`@angular/core`) → `(first, is_content)`. Mirrors ngtsc's
+/// `directive/src/{query,shared}.ts`: `ViewChild`/`ContentChild` are single (`first = true`);
+/// `ViewChildren`/`ContentChildren` are multi. `ContentChild`/`ContentChildren` are content
+/// queries; the `View*` variants are view queries. The legacy decorator `descendants` default is
+/// `true` for `ContentChild`/`ViewChild`/`ViewChildren` and `false` for `ContentChildren`
+/// (faithful to `extractContentQueriesFromDecorators` / `parseDirectiveDecoratorQueries`).
+fn decorator_query_kind(name: &str) -> Option<(bool /*first*/, bool /*is_content*/)> {
+    match name {
+        "ViewChild" => Some((true, false)),
+        "ViewChildren" => Some((false, false)),
+        "ContentChild" => Some((true, true)),
+        "ContentChildren" => Some((false, true)),
+        _ => None,
+    }
+}
+
+/// The `static` boolean from a query decorator options object (2nd arg). Faithful to ngtsc's
+/// `parseQueryStaticness`: only a `true`/`false` literal counts (default `false`); for multi
+/// queries `static` is always `false`.
+fn decorator_query_static(options: Option<&Expression>) -> bool {
+    let Some(Expression::ObjectExpression(obj)) = options else {
+        return false;
+    };
+    matches!(find_prop(obj, "static"), Some(Expression::BooleanLiteral(b)) if b.value)
+}
+
+/// Build the [`R3QueryMetadata`] for a single decorator query.
+///
+/// Mirrors ngtsc's `extractQueryMetadata`: arg0 is the locator (a string of comma-separated
+/// reference names, OR a type/expression token); arg1 (optional) an options object carrying
+/// `read`/`descendants`/`static`. A string locator splits on `,` into a `Selectors([...])`
+/// predicate (each entry trimmed); any other expression becomes an `Expr` predicate. Decorator
+/// queries are always `isSignal: false`, `emitDistinctChangesOnly: true`.
+fn decorator_query_metadata(
+    member_name: &str,
+    dec: &Decorator,
+) -> Option<(bool /*is_content*/, R3QueryMetadata)> {
+    let name = decorator_name(dec)?;
+    let (first, is_content) = decorator_query_kind(name)?;
+    let Expression::CallExpression(call) = &dec.expression else {
+        // A bare `@ViewChild` with no arguments has no locator — skip.
+        return None;
+    };
+    let predicate_node = call.arguments.first().and_then(|a| a.as_expression())?;
+    let options_node = call.arguments.get(1).and_then(|a| a.as_expression());
+
+    let predicate = match predicate_node {
+        Expression::StringLiteral(s) => split_query_selectors(s.value.as_str()),
+        Expression::TemplateLiteral(t) if t.expressions.is_empty() && t.quasis.len() == 1 => {
+            let text = t.quasis[0]
+                .value
+                .cooked
+                .as_ref()
+                .map(|c| c.to_string())
+                .unwrap_or_default();
+            split_query_selectors(&text)
+        }
+        other => QueryPredicate::Expr(convert_expr(other)?),
+    };
+
+    // descendants default: ContentChildren → false, the rest → true.
+    let descendants = query_descendants(options_node, name != "ContentChildren");
+    let read = query_read(options_node);
+    // `static` only applies to single-result queries; multi queries are never static.
+    let static_ = first && decorator_query_static(options_node);
+
+    Some((
+        is_content,
+        R3QueryMetadata {
+            property_name: member_name.to_string(),
+            first,
+            predicate,
+            descendants,
+            emit_distinct_changes_only: true,
+            read,
+            static_,
+            is_signal: false,
+        },
+    ))
+}
+
+/// Split a query string locator (`'a, b, c'`) into a `Selectors([...])` predicate, trimming each
+/// reference name (faithful to ngtsc's `node.text.split(',').map(s => s.trim())`).
+fn split_query_selectors(text: &str) -> QueryPredicate {
+    QueryPredicate::Selectors(text.split(',').map(|s| s.trim().to_string()).collect())
+}
+
+/// Walk the class body and collect every `@ViewChild`/`@ViewChildren`/`@ContentChild`/
+/// `@ContentChildren` member into the content/view query lists (in declaration order). Both
+/// property members (the common case) and accessor/method members carrying the decorator are
+/// considered.
+fn collect_decorator_queries(
+    class: &Class,
+    content_queries: &mut Vec<R3QueryMetadata>,
+    view_queries: &mut Vec<R3QueryMetadata>,
+) {
+    for element in &class.body.body {
+        let (decorators, key) = match element {
+            ClassElement::PropertyDefinition(p) => (&p.decorators, &p.key),
+            ClassElement::AccessorProperty(p) => (&p.decorators, &p.key),
+            _ => continue,
+        };
+        let Some(member_name) = key_name(key) else {
+            continue;
+        };
+        for dec in decorators.iter() {
+            if let Some((is_content, meta)) = decorator_query_metadata(member_name, dec) {
+                if is_content {
+                    content_queries.push(meta);
+                } else {
+                    view_queries.push(meta);
+                }
+            }
+        }
+    }
+}
+
+/// Order a mixed content/view query list to match Angular's emit order.
+///
+/// ngtsc emits SIGNAL queries before LEGACY (decorator) queries (`createQueryCreateCalls` walks the
+/// signal queries first, then the legacy ones); within the legacy group, single-result (`first`)
+/// queries precede multi-result ones; SIGNAL queries keep their declaration order (they are not
+/// single-first sorted — see `signal_queries/query_in_directive`). All groupings are STABLE
+/// (relative declaration order preserved within each bucket).
+fn order_queries_for_emit(queries: &mut Vec<R3QueryMetadata>) {
+    let mut signal: Vec<R3QueryMetadata> = Vec::new();
+    let mut legacy_single: Vec<R3QueryMetadata> = Vec::new();
+    let mut legacy_multi: Vec<R3QueryMetadata> = Vec::new();
+    for q in queries.drain(..) {
+        if q.is_signal {
+            signal.push(q);
+        } else if q.first {
+            legacy_single.push(q);
+        } else {
+            legacy_multi.push(q);
+        }
+    }
+    let mut out = signal;
+    out.extend(legacy_single);
+    out.extend(legacy_multi);
+    *queries = out;
+}
+
+// ---------------------------------------------------------------------------
+// R2 — host bindings (`host: {...}` object, `@HostBinding`/`@HostListener` members).
+// ---------------------------------------------------------------------------
+
+/// Parse the `@Component`/`@Directive` `host: {...}` object literal into the
+/// `OrderedMap<String, HostValue>` that [`parse_host_bindings`] consumes. Faithful to ngtsc's
+/// `extractHostBindings`: each property key is the raw host key (`'(click)'`, `'[id]'`, `'class'`,
+/// `'role'`, …) and the value is its string (the binding expression / static attribute value).
+/// Returns `Err` for a non-object `host` or a non-string value (ngtsc diagnoses both).
+fn parse_host_object(expr: &Expression) -> Result<OrderedMap<String, HostValue>, String> {
+    let Expression::ObjectExpression(obj) = expr else {
+        return Err("`host` must be an object literal".to_string());
+    };
+    let mut out: OrderedMap<String, HostValue> = OrderedMap::new();
+    for p in &obj.properties {
+        let ObjectPropertyKind::ObjectProperty(op) = p else {
+            return Err("unsupported `host` spread/shorthand".to_string());
+        };
+        let key = key_name(&op.key)
+            .ok_or_else(|| "unsupported `host` computed key".to_string())?
+            .to_string();
+        let value = string_value(&op.value)
+            .ok_or_else(|| format!("`host` value for '{key}' must be a string"))?;
+        out.insert(key, HostValue::Str(value));
+    }
+    Ok(out)
+}
+
+/// Accumulator for member-level `@HostBinding`/`@HostListener` host entries, merged on top of the
+/// decorator-object `host` map (ngtsc folds both into one `ParsedHostBindings`).
+#[derive(Default)]
+struct MemberHost {
+    entries: OrderedMap<String, HostValue>,
+}
+
+/// Collect `@HostBinding('prop')` (property/accessor members) and `@HostListener('event', [args])`
+/// (method members) into raw host entries.
+///
+/// Faithful to ngtsc's `extractHostBindings`:
+///   * `@HostBinding('hostProp') member` → key `[hostProp]` (defaulting `hostProp` to the member
+///     name), value the member read `member` (e.g. `[id]: 'dirId'`).
+///   * `@HostListener('event', ['$event.target'])` on `method()` → key `(event)`, value
+///     `method($event.target)` (the listener invokes the handler with the declared args; the bare
+///     `@HostListener('event')` form invokes `method()`).
+fn collect_member_host_bindings(class: &Class, host: &mut MemberHost) {
+    for element in &class.body.body {
+        // `@HostBinding` rides on property/accessor members; `@HostListener` on method members.
+        let (decorators, key) = match element {
+            ClassElement::PropertyDefinition(p) => (&p.decorators, &p.key),
+            ClassElement::AccessorProperty(p) => (&p.decorators, &p.key),
+            ClassElement::MethodDefinition(m) => (&m.decorators, &m.key),
+            _ => continue,
+        };
+        let Some(member_name) = key_name(key) else { continue };
+        for dec in decorators.iter() {
+            match decorator_name(dec) {
+                Some("HostBinding") => {
+                    // `@HostBinding('hostProp')` → bound prop named `hostProp` (or the member
+                    // name); value is the member read expression.
+                    let host_prop =
+                        decorator_string_alias(dec).unwrap_or_else(|| member_name.to_string());
+                    host.entries.insert(
+                        format!("[{host_prop}]"),
+                        HostValue::Str(member_name.to_string()),
+                    );
+                }
+                Some("HostListener") => {
+                    if let Some((event, handler)) = host_listener_entry(dec, member_name) {
+                        host.entries
+                            .insert(format!("({event})"), HostValue::Str(handler));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Build the `(event) -> handler-invocation` pair for a `@HostListener('event', [args])` decorator.
+/// The handler text is `member(arg0, arg1, …)` where each arg is the raw source of the string entry
+/// in the (optional) 2nd-argument array (ngtsc's `bindingPropertyName`/`args` handling). Returns
+/// `None` when the event name is missing.
+fn host_listener_entry(dec: &Decorator, member_name: &str) -> Option<(String, String)> {
+    let Expression::CallExpression(call) = &dec.expression else {
+        return None;
+    };
+    let event = match call.arguments.first().and_then(|a| a.as_expression())? {
+        Expression::StringLiteral(s) => s.value.to_string(),
+        _ => return None,
+    };
+    // Optional args array (each entry a string of source-expression text).
+    let mut args: Vec<String> = Vec::new();
+    if let Some(Expression::ArrayExpression(arr)) =
+        call.arguments.get(1).and_then(|a| a.as_expression())
+    {
+        for el in &arr.elements {
+            if let Some(s) = el.as_expression().and_then(string_value) {
+                args.push(s);
+            }
+        }
+    }
+    let handler = format!("{member_name}({})", args.join(","));
+    Some((event, handler))
+}
+
+/// Parse the `@Component`/`@Directive` `hostDirectives: [...]` array into
+/// [`R3HostDirectiveMetadata`]. Faithful to ngtsc's `extractHostDirectives`: each entry is either
+///   * a bare identifier `HostDir` → `{directive: HostDir}` (no input/output mapping), or
+///   * an object `{directive: HostDir, inputs: ['a','b: c'], outputs: ['x: y']}` → the directive
+///     plus parsed input/output public-name → alias maps (`'a'` aliases to itself; `'a: b'`
+///     maps public `a` to alias `b`).
+/// Entries we cannot name are skipped. Returns `None` when nothing usable is parsed.
+fn parse_host_directives(expr: &Expression) -> Option<Vec<R3HostDirectiveMetadata>> {
+    let Expression::ArrayExpression(arr) = expr else {
+        return None;
+    };
+    let mut out: Vec<R3HostDirectiveMetadata> = Vec::new();
+    for el in &arr.elements {
+        let Some(inner) = el.as_expression() else { continue };
+        if let Some(meta) = host_directive_entry(inner) {
+            out.push(meta);
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+fn host_directive_entry(expr: &Expression) -> Option<R3HostDirectiveMetadata> {
+    match expr {
+        Expression::Identifier(id) => Some(R3HostDirectiveMetadata {
+            directive: directive_ref(id.name.as_str()),
+            is_forward_reference: false,
+            inputs: None,
+            outputs: None,
+        }),
+        Expression::ObjectExpression(obj) => {
+            let directive_expr = find_prop(obj, "directive")?;
+            let (name, is_forward) = directive_name_maybe_forward(directive_expr)?;
+            let inputs = find_prop(obj, "inputs").and_then(host_directive_mapping);
+            let outputs = find_prop(obj, "outputs").and_then(host_directive_mapping);
+            Some(R3HostDirectiveMetadata {
+                directive: directive_ref(&name),
+                is_forward_reference: is_forward,
+                inputs,
+                outputs,
+            })
+        }
+        Expression::ParenthesizedExpression(p) => host_directive_entry(&p.expression),
+        // A bare `forwardRef(() => Dir)` host-directive entry (no input/output mapping).
+        Expression::CallExpression(_) => {
+            let (name, is_forward) = directive_name_maybe_forward(expr)?;
+            Some(R3HostDirectiveMetadata {
+                directive: directive_ref(&name),
+                is_forward_reference: is_forward,
+                inputs: None,
+                outputs: None,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Resolve a directive reference expression to its class name plus whether it was wrapped in
+/// `forwardRef(() => X)` (faithful to ngtsc's `forwardRefResolver`). A bare identifier `X` →
+/// `(X, false)`; `forwardRef(() => X)` → `(X, true)`.
+fn directive_name_maybe_forward(expr: &Expression) -> Option<(String, bool)> {
+    match expr {
+        Expression::Identifier(id) => Some((id.name.to_string(), false)),
+        Expression::ParenthesizedExpression(p) => directive_name_maybe_forward(&p.expression),
+        Expression::CallExpression(call) => {
+            // `forwardRef(() => X)`: the callee is `forwardRef`; the single arg is an arrow/fn
+            // whose returned expression is the target identifier.
+            let is_forward_ref = matches!(&call.callee, Expression::Identifier(id) if id.name == "forwardRef");
+            if !is_forward_ref {
+                return None;
+            }
+            let arg = call.arguments.first().and_then(|a| a.as_expression())?;
+            let name = arrow_returned_identifier(arg)?;
+            Some((name, true))
+        }
+        _ => None,
+    }
+}
+
+/// The identifier returned by a `() => X` arrow (expression body) or `() => { return X; }` arrow /
+/// function body. Used to unwrap `forwardRef(() => X)`.
+fn arrow_returned_identifier(expr: &Expression) -> Option<String> {
+    match expr {
+        Expression::ArrowFunctionExpression(arrow) => {
+            // Expression-bodied arrow: the body is a single `ExpressionStatement`.
+            if arrow.expression {
+                if let Some(Statement::ExpressionStatement(stmt)) = arrow.body.statements.first() {
+                    return identifier_of(&stmt.expression);
+                }
+            }
+            // Block-bodied arrow: find the `return X;`.
+            for stmt in &arrow.body.statements {
+                if let Statement::ReturnStatement(ret) = stmt {
+                    if let Some(arg) = &ret.argument {
+                        return identifier_of(arg);
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// The bare identifier name of an expression (unwrapping parentheses), if it is one.
+fn identifier_of(expr: &Expression) -> Option<String> {
+    match expr {
+        Expression::Identifier(id) => Some(id.name.to_string()),
+        Expression::ParenthesizedExpression(p) => identifier_of(&p.expression),
+        _ => None,
+    }
+}
+
+/// Parse a `hostDirectives` `inputs`/`outputs` mapping array (`['a', 'b: c']`) into an ordered
+/// public-name → alias map. `'a'` aliases to itself; `'b: c'` maps public `b` to alias `c`.
+fn host_directive_mapping(expr: &Expression) -> Option<OrderedMap<String, String>> {
+    let Expression::ArrayExpression(arr) = expr else {
+        return None;
+    };
+    let mut map: OrderedMap<String, String> = OrderedMap::new();
+    for el in &arr.elements {
+        let Some(s) = el.as_expression().and_then(string_value) else { continue };
+        let (public_name, alias) = match s.split_once(':') {
+            Some((p, a)) => (p.trim().to_string(), a.trim().to_string()),
+            None => (s.trim().to_string(), s.trim().to_string()),
+        };
+        map.insert(public_name, alias);
+    }
+    if map.is_empty() {
+        None
+    } else {
+        Some(map)
+    }
+}
+
+/// Whether the class declares an `ngOnChanges` lifecycle method (faithful to ngtsc's
+/// `lifecycle.usesOnChanges` detection driving the `NgOnChangesFeature`). Recognizes the method on
+/// a `MethodDefinition` or a property/accessor whose name is `ngOnChanges`.
+fn class_uses_on_changes(class: &Class) -> bool {
+    class.body.body.iter().any(|element| {
+        let key = match element {
+            ClassElement::MethodDefinition(m) => &m.key,
+            ClassElement::PropertyDefinition(p) => &p.key,
+            ClassElement::AccessorProperty(p) => &p.key,
+            _ => return false,
+        };
+        key_name(key) == Some("ngOnChanges")
+    })
+}
+
+/// A directive self-reference (`value`/`ty` both `Foo`) for `hostDirectives` / `@Directive`
+/// metadata.
+fn directive_ref(name: &str) -> DirRef {
+    DirRef {
+        value: o::variable(name, None),
+        ty: o::variable(name, None),
+    }
+}
+
+/// Build the combined [`R3HostMetadata`] from the decorator-object `host: {...}` (if any) and the
+/// member `@HostBinding`/`@HostListener` entries. The decorator-object entries come first (ngtsc
+/// processes the `host` object then folds member bindings on top), preserving source order.
+fn build_host_metadata(
+    host_obj: Option<&Expression>,
+    class: &Class,
+) -> Result<R3HostMetadata, String> {
+    let mut raw: OrderedMap<String, HostValue> = match host_obj {
+        Some(expr) => parse_host_object(expr)?,
+        None => OrderedMap::new(),
+    };
+    let mut member = MemberHost::default();
+    collect_member_host_bindings(class, &mut member);
+    for (k, v) in member.entries.iter() {
+        raw.insert(k.clone(), v.clone());
+    }
+    parse_host_bindings(raw)
 }
 
 /// Compile a single standalone `@Component`/`@Directive` class from its TypeScript source.
@@ -742,61 +1168,134 @@ fn collect_imported_names(program: &Program) -> Vec<String> {
     names
 }
 
+/// A top-level statement classified for source-order re-assembly.
+enum TopStmt<'a> {
+    /// A class carrying a recognized Angular decorator (the class, its kind, the decorator node).
+    Decorated(&'a Class<'a>, TopLevel, &'a Decorator<'a>),
+}
+
+/// Recognize a class's top-level Angular decorator kind (the FIRST recognized one wins, mirroring
+/// ngtsc's single-trait-per-class rule). Returns the kind and the decorator node.
+fn class_top_level<'a>(class: &'a Class<'a>) -> Option<(TopLevel, &'a Decorator<'a>)> {
+    for dec in &class.decorators {
+        if let Some(name) = decorator_name(dec) {
+            let kind = match name {
+                "Component" => Some(TopLevel::Component),
+                "Directive" => Some(TopLevel::Directive),
+                "Pipe" => Some(TopLevel::Pipe),
+                "NgModule" => Some(TopLevel::NgModule),
+                "Injectable" => Some(TopLevel::Injectable),
+                _ => None,
+            };
+            if let Some(kind) = kind {
+                return Some((kind, dec));
+            }
+        }
+    }
+    None
+}
+
+/// The class declaration of a top-level statement (plain, `export`, or `export default`).
+fn statement_class<'a>(stmt: &'a Statement<'a>) -> Option<&'a Class<'a>> {
+    match stmt {
+        Statement::ClassDeclaration(c) => Some(c.as_ref()),
+        Statement::ExportNamedDeclaration(export) => match &export.declaration {
+            Some(oxc_ast::ast::Declaration::ClassDeclaration(c)) => Some(c.as_ref()),
+            _ => None,
+        },
+        Statement::ExportDefaultDeclaration(export) => {
+            if let oxc_ast::ast::ExportDefaultDeclarationKind::ClassDeclaration(c) =
+                &export.declaration
+            {
+                Some(c.as_ref())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 fn compile_program(
     program: &Program,
     map: Option<(&MapContext, &mut String)>,
 ) -> CompiledComponent {
     let imported_names = collect_imported_names(program);
 
-    // Find all classes (top-level + exported) carrying a recognized decorator.
-    let mut decorated: Vec<(&Class, TopLevel, &Decorator)> = Vec::new();
-
+    // Walk every top-level statement, classifying each decorated class in SOURCE ORDER. R1:
+    // collect EVERY decorated class (not just the first) so multi-class files emit each definition.
+    let mut decorated: Vec<TopStmt> = Vec::new();
+    let mut sibling_class_names: Vec<String> = Vec::new();
     for stmt in &program.body {
-        let class_opt: Option<&Class> = match stmt {
-            Statement::ClassDeclaration(c) => Some(c.as_ref()),
-            Statement::ExportNamedDeclaration(export) => match &export.declaration {
-                Some(oxc_ast::ast::Declaration::ClassDeclaration(c)) => Some(c.as_ref()),
-                _ => None,
-            },
-            Statement::ExportDefaultDeclaration(export) => {
-                if let oxc_ast::ast::ExportDefaultDeclarationKind::ClassDeclaration(c) =
-                    &export.declaration
-                {
-                    Some(c.as_ref())
-                } else {
-                    None
-                }
+        let Some(class) = statement_class(stmt) else { continue };
+        if let Some((kind, dec)) = class_top_level(class) {
+            if let Some(id) = &class.id {
+                sibling_class_names.push(id.name.to_string());
             }
-            _ => None,
-        };
-
-        let Some(class) = class_opt else { continue };
-        for dec in &class.decorators {
-            if let Some(name) = decorator_name(dec) {
-                let kind = match name {
-                    "Component" => Some(TopLevel::Component),
-                    "Directive" => Some(TopLevel::Directive),
-                    _ => None,
-                };
-                if let Some(kind) = kind {
-                    decorated.push((class, kind, dec));
-                }
-            }
+            decorated.push(TopStmt::Decorated(class, kind, dec));
         }
     }
 
     if decorated.is_empty() {
-        return err("no @Component or @Directive decorated class found".to_string());
-    }
-    if decorated.len() > 1 {
-        return err(format!(
-            "multi-class files unsupported: found {} decorated classes",
-            decorated.len()
-        ));
+        return err("no @Component/@Directive/@Pipe/@NgModule decorated class found".to_string());
     }
 
-    let (class, kind, dec) = decorated[0];
+    // Cross-class selectorless auto-import: a component in a multi-class file can reference a
+    // sibling-declared component/directive directly by its class name in the template (no `imports`
+    // array, no selector). Seed the auto-import candidate set with both the file's imported names
+    // AND the sibling class names so `resolve_template_dependencies` can match them.
+    let mut auto_import_candidates = imported_names.clone();
+    for name in &sibling_class_names {
+        if !auto_import_candidates.contains(name) {
+            auto_import_candidates.push(name.clone());
+        }
+    }
 
+    // Single-class fast path preserves the additive source-map behaviour (the map artifact is only
+    // meaningful for a single component definition). Multi-class files always emit plainly.
+    if decorated.len() == 1 {
+        let TopStmt::Decorated(class, kind, dec) = decorated[0];
+        return compile_decorated_class(class, kind, dec, &auto_import_candidates, map);
+    }
+
+    // R1: emit each decorated class in source order and concatenate. A `map` request degrades to
+    // plain emission across classes (no single anchor), so we never thread it here.
+    let mut pieces: Vec<String> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    for item in &decorated {
+        let TopStmt::Decorated(class, kind, dec) = *item;
+        let compiled = compile_decorated_class(class, kind, dec, &auto_import_candidates, None);
+        errors.extend(compiled.errors);
+        if !compiled.code.is_empty() {
+            pieces.push(compiled.code);
+        }
+    }
+
+    if pieces.is_empty() {
+        // Every class declined — surface the collected reasons.
+        if errors.is_empty() {
+            errors.push("no emittable definition produced".to_string());
+        }
+        return CompiledComponent {
+            code: String::new(),
+            errors,
+        };
+    }
+
+    CompiledComponent {
+        code: pieces.join("\n"),
+        errors,
+    }
+}
+
+/// Compile ONE decorated class to its Ivy definition, dispatching on the decorator kind.
+fn compile_decorated_class(
+    class: &Class,
+    kind: TopLevel,
+    dec: &Decorator,
+    auto_import_candidates: &[String],
+    map: Option<(&MapContext, &mut String)>,
+) -> CompiledComponent {
     let (class_name, class_name_span) = match &class.id {
         Some(id) => (
             id.name.to_string(),
@@ -807,6 +1306,40 @@ fn compile_program(
 
     let obj = decorator_object(dec);
 
+    match kind {
+        TopLevel::Component | TopLevel::Directive => compile_component_or_directive(
+            class,
+            kind,
+            obj,
+            class_name,
+            class_name_span,
+            auto_import_candidates,
+            map,
+        ),
+        TopLevel::Pipe => compile_pipe_class(obj, &class_name),
+        TopLevel::NgModule => compile_ng_module_class(obj, &class_name),
+        // `@Injectable` carries no template-facing definition we model yet; the `ɵfac`/`ɵprov`
+        // factory + provider emit lives in the factory compiler, out of this front-end's scope.
+        TopLevel::Injectable => {
+            err("@Injectable emission not yet supported by the source front-end".to_string())
+        }
+    }
+}
+
+/// Compile a `@Component` or `@Directive` class. Shares the common metadata extraction (selector,
+/// inputs/outputs, queries, host bindings, `hostDirectives`, `exportAs`) and then routes to the
+/// component emitter (`compile_component_from_metadata`, with template) or the directive emitter
+/// (`compile_directive_from_metadata`, no template).
+#[allow(clippy::too_many_arguments)]
+fn compile_component_or_directive(
+    class: &Class,
+    kind: TopLevel,
+    obj: Option<&oxc_ast::ast::ObjectExpression>,
+    class_name: String,
+    class_name_span: ParseSourceSpan,
+    auto_import_candidates: &[String],
+    map: Option<(&MapContext, &mut String)>,
+) -> CompiledComponent {
     // Reject decorator-level metadata we cannot yet model.
     if let Some(obj) = obj {
         for k in UNSUPPORTED_DECORATOR_KEYS {
@@ -884,6 +1417,24 @@ fn compile_program(
         .map(parse_foreign_imports)
         .filter(|v| !v.is_empty());
 
+    // R2: host bindings — the `host: {...}` object merged with `@HostBinding`/`@HostListener`
+    // members, parsed into the `R3HostMetadata` the `DefaultHostBindingsBuilder` consumes.
+    let host = match build_host_metadata(obj.and_then(|o| find_prop(o, "host")), class) {
+        Ok(host) => host,
+        Err(e) => return err(e),
+    };
+
+    // R2: hostDirectives -> HostDirectivesFeature.
+    let host_directives = obj
+        .and_then(|o| find_prop(o, "hostDirectives"))
+        .and_then(parse_host_directives);
+
+    // exportAs: 'a' | 'a, b' — the directive's template-reference export names.
+    let export_as = obj
+        .and_then(|o| find_prop(o, "exportAs"))
+        .and_then(string_value)
+        .map(|s| s.split(',').map(|p| p.trim().to_string()).collect::<Vec<_>>());
+
     // inputs / outputs.
     let mut inputs: OrderedMap<String, R3InputMetadata> = OrderedMap::new();
     let mut outputs: OrderedMap<String, String> = OrderedMap::new();
@@ -891,13 +1442,20 @@ fn compile_program(
         return err(e);
     }
 
-    // Signal-based queries (`viewChild`/`viewChildren`/`contentChild`/`contentChildren` member
-    // initializers). Decorator-based queries are rejected upstream by `collect_io`.
+    // Queries: signal-based member initializers (`viewChild`/…) AND R3 decorator members
+    // (`@ViewChild`/…). Both feed the SAME `R3QueryMetadata` lists. Angular emits single-result
+    // (`first`) queries' calls before multi-result ones, so partition stably.
     let mut content_queries: Vec<R3QueryMetadata> = Vec::new();
     let mut view_queries: Vec<R3QueryMetadata> = Vec::new();
     collect_signal_queries(class, &mut content_queries, &mut view_queries);
+    collect_decorator_queries(class, &mut content_queries, &mut view_queries);
+    order_queries_for_emit(&mut content_queries);
+    order_queries_for_emit(&mut view_queries);
 
-    let has_signal_query = content_queries.iter().chain(view_queries.iter()).any(|q| q.is_signal);
+    let has_signal_query = content_queries
+        .iter()
+        .chain(view_queries.iter())
+        .any(|q| q.is_signal);
     let is_signal = inputs.iter().any(|(_, m)| m.is_signal) || has_signal_query;
 
     // Build the base directive metadata. The class-name reference carries the original
@@ -913,17 +1471,19 @@ fn compile_program(
         selector: selector.clone(),
         queries: content_queries,
         view_queries,
-        host: R3HostMetadata::default(),
-        lifecycle: Lifecycle::default(),
+        host,
+        lifecycle: Lifecycle {
+            uses_on_changes: class_uses_on_changes(class),
+        },
         inputs,
         outputs,
         uses_inheritance: false,
         control_create: None,
-        export_as: None,
+        export_as,
         providers: None,
         is_standalone: standalone,
         is_signal,
-        host_directives: None,
+        host_directives,
         legacy_optional_chaining: false,
     };
 
@@ -932,18 +1492,157 @@ fn compile_program(
             base,
             &template_html.unwrap_or_default(),
             change_detection,
-            &imported_names,
+            auto_import_candidates,
             styles,
             encapsulation,
             animations,
             foreign_imports,
             map,
         ),
-        // Directives reuse the component emitter is NOT correct — directives go through a
-        // different define. Not supported by the existing emitter, so bail clearly.
+        // R4: @Directive — drive the existing `compile_directive_from_metadata` emitter (no
+        // template; host bindings + queries + hostDirectives + exportAs come from `base`).
         TopLevel::Directive => {
-            let _ = (change_detection, styles, encapsulation, animations);
-            err("@Directive emission not yet supported (only @Component)".to_string())
+            let _ = (change_detection, styles, encapsulation, animations, foreign_imports);
+            compile_directive_meta(base)
+        }
+        _ => unreachable!("compile_component_or_directive only handles Component/Directive"),
+    }
+}
+
+/// R4: emit a `@Directive` class via the existing [`compile_directive_from_metadata`] +
+/// [`DefaultHostBindingsBuilder`]. The hoisted query-predicate `_cN` pool consts are printed
+/// before the `ɵɵdefineDirective({...})` expression, mirroring the component path.
+fn compile_directive_meta(base: R3DirectiveMetadata) -> CompiledComponent {
+    let mut host_builder = DefaultHostBindingsBuilder;
+    let compiled = compile_directive_from_metadata(&base, &mut host_builder);
+
+    let code = if compiled.statements.is_empty() {
+        emit_expression(&compiled.expression)
+    } else {
+        let mut out = crate::output::emitter::emit_statements(&compiled.statements);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&emit_expression(&compiled.expression));
+        out
+    };
+    CompiledComponent {
+        code,
+        errors: Vec::new(),
+    }
+}
+
+/// R4: emit a `@Pipe({name, pure?, standalone?})` class via [`compile_pipe_from_metadata`].
+fn compile_pipe_class(
+    obj: Option<&oxc_ast::ast::ObjectExpression>,
+    class_name: &str,
+) -> CompiledComponent {
+    let pipe_name = obj
+        .and_then(|o| find_prop(o, "name"))
+        .and_then(string_value);
+    // `pure` defaults to `true` (Angular's `@Pipe` default).
+    let pure = obj
+        .and_then(|o| find_prop(o, "pure"))
+        .map(|e| matches!(e, Expression::BooleanLiteral(b) if b.value))
+        .unwrap_or(true);
+    // `standalone` defaults to `true`.
+    let is_standalone = obj
+        .and_then(|o| find_prop(o, "standalone"))
+        .map(|e| matches!(e, Expression::BooleanLiteral(b) if b.value))
+        .unwrap_or(true);
+
+    let meta = crate::pipe_module_injector::R3PipeMetadata {
+        name: class_name.to_string(),
+        r#type: directive_ref(class_name),
+        type_argument_count: 0,
+        pipe_name,
+        deps: None,
+        pure,
+        is_standalone,
+    };
+    let compiled = crate::pipe_module_injector::compile_pipe_from_metadata(&meta);
+    CompiledComponent {
+        code: emit_expression(&compiled.expression),
+        errors: Vec::new(),
+    }
+}
+
+/// R4: emit an `@NgModule({declarations, imports, exports, bootstrap, id})` class via
+/// [`compile_ng_module`]. Uses the inline-scope mode (the common compliance shape) so the
+/// declarations/imports/exports land directly in the `ɵɵdefineNgModule({...})` call.
+fn compile_ng_module_class(
+    obj: Option<&oxc_ast::ast::ObjectExpression>,
+    class_name: &str,
+) -> CompiledComponent {
+    use crate::pipe_module_injector::{
+        compile_ng_module, R3NgModuleCommon, R3NgModuleMetadata, R3NgModuleMetadataGlobal,
+        R3SelectorScopeMode,
+    };
+
+    // Each scope array (`declarations`/`imports`/`exports`/`bootstrap`) is a list of bare class
+    // identifiers; resolve each to its self-reference. Non-identifier entries are skipped.
+    let refs_of = |key: &str| -> Vec<DirRef> {
+        obj.and_then(|o| find_prop(o, key))
+            .map(identifier_refs)
+            .unwrap_or_default()
+    };
+    let declarations = refs_of("declarations");
+    let imports = refs_of("imports");
+    let exports = refs_of("exports");
+    let bootstrap = refs_of("bootstrap");
+
+    let meta = R3NgModuleMetadata::Global(R3NgModuleMetadataGlobal {
+        common: R3NgModuleCommon {
+            r#type: directive_ref(class_name),
+            selector_scope_mode: R3SelectorScopeMode::Inline,
+            schemas: None,
+            id: None,
+        },
+        bootstrap,
+        declarations,
+        public_declaration_types: None,
+        imports,
+        include_import_types: true,
+        exports,
+        contains_forward_decls: false,
+    });
+    let compiled = compile_ng_module(&meta);
+
+    let code = if compiled.statements.is_empty() {
+        emit_expression(&compiled.expression)
+    } else {
+        let mut out = crate::output::emitter::emit_statements(&compiled.statements);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&emit_expression(&compiled.expression));
+        out
+    };
+    CompiledComponent {
+        code,
+        errors: Vec::new(),
+    }
+}
+
+/// Resolve an array literal of bare class identifiers into their self-references (`Foo` →
+/// `{value: Foo, ty: Foo}`). Nested arrays are flattened; non-identifier entries are skipped.
+fn identifier_refs(expr: &Expression) -> Vec<DirRef> {
+    let mut out: Vec<DirRef> = Vec::new();
+    collect_identifier_refs(expr, &mut out);
+    out
+}
+
+fn collect_identifier_refs(expr: &Expression, out: &mut Vec<DirRef>) {
+    let Expression::ArrayExpression(arr) = expr else {
+        return;
+    };
+    for el in &arr.elements {
+        let Some(inner) = el.as_expression() else { continue };
+        match inner {
+            Expression::ArrayExpression(_) => collect_identifier_refs(inner, out),
+            Expression::Identifier(id) => out.push(directive_ref(id.name.as_str())),
+            Expression::ParenthesizedExpression(p) => collect_identifier_refs(&p.expression, out),
+            _ => {}
         }
     }
 }
@@ -1148,7 +1847,10 @@ fn compile_component_meta(
     };
 
     let mut template_builder = ForeignAwareTemplateBuilder::default();
-    let mut host_builder = StubHostBindingsBuilder;
+    // R2: the production host-bindings generator (was `StubHostBindingsBuilder`). For a component
+    // with no host bindings it is a no-op (emits no `hostBindings`/`hostAttrs`/`hostVars`), so this
+    // is byte-identical to the stub for the existing no-host cases.
+    let mut host_builder = DefaultHostBindingsBuilder;
     let mut pool_statements = Vec::new();
     let compiled: R3CompiledExpression = compile_component_from_metadata(
         &mut meta,
@@ -1502,5 +2204,501 @@ mod tests {
             "empty data.animation missing; got: {}",
             out.code
         );
+    }
+
+    /// Whitespace-free canonical form for substring assertions on emitted code.
+    fn flat(code: &str) -> String {
+        code.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    // -----------------------------------------------------------------------
+    // R1 — multi-class files.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn multi_class_emits_each_definition() {
+        // A component + an NgModule in one file: BOTH definitions emit.
+        let src = r#"
+            @Component({selector: 'a', template: '<div></div>', standalone: false})
+            export class CompA {}
+
+            @NgModule({declarations: [CompA]})
+            export class MyModule {}
+        "#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        assert!(out.code.contains(ZWS), "no defineComponent; got: {}", out.code);
+        assert!(
+            out.code.contains("\u{0275}\u{0275}defineNgModule"),
+            "no defineNgModule; got: {}",
+            out.code
+        );
+        // The module declarations reference the component class.
+        assert!(
+            flat(&out.code).contains("declarations:[CompA]"),
+            "module declarations missing CompA; got: {}",
+            out.code
+        );
+    }
+
+    #[test]
+    fn multi_class_cross_class_auto_import() {
+        // A sibling-declared directive used by class name in another component's template lands in
+        // that component's `dependencies` array WITHOUT any imports array or selector.
+        let src = r#"
+            @Directive({selector: '[sib]', standalone: false})
+            export class Sib {}
+
+            @Component({selector: 'host', template: '<Sib></Sib>', standalone: false})
+            export class HostCmp {}
+        "#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        assert!(
+            out.code.contains("dependencies"),
+            "no dependencies array; got: {}",
+            out.code
+        );
+        assert!(out.code.contains("Sib"), "Sib not referenced; got: {}", out.code);
+    }
+
+    // -----------------------------------------------------------------------
+    // R2 — host bindings.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn host_object_listener_and_property() {
+        // `host: { '(click)': 'onClick()', '[id]': "x" }` emits a hostBindings fn with a listener
+        // (create) and a domProperty (update), plus hostVars.
+        let src = r#"
+            @Component({
+                selector: 'my-cmp',
+                host: { '(click)': 'onClick()', '[id]': 'x' },
+                template: '<div></div>',
+                standalone: false
+            })
+            export class MyComponent { x = 1; onClick() {} }
+        "#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let f = flat(&out.code);
+        assert!(f.contains("hostBindings"), "no hostBindings; got: {}", out.code);
+        assert!(
+            out.code.contains("\u{0275}\u{0275}listener"),
+            "no listener instruction; got: {}",
+            out.code
+        );
+        assert!(
+            out.code.contains("\u{0275}\u{0275}domProperty"),
+            "no domProperty instruction; got: {}",
+            out.code
+        );
+        assert!(f.contains("hostVars:1"), "hostVars:1 missing; got: {}", out.code);
+    }
+
+    #[test]
+    fn host_member_decorators_fold_into_host() {
+        // `@HostBinding('id') dirId = ...` becomes a `[id]` host property bound to `ctx.dirId`.
+        let src = r#"
+            @Directive({selector: '[hostBindingDir]', standalone: false})
+            export class HostBindingDir {
+                @HostBinding('id') dirId = 'some id';
+            }
+        "#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        assert!(
+            out.code.contains("\u{0275}\u{0275}defineDirective"),
+            "no defineDirective; got: {}",
+            out.code
+        );
+        let f = flat(&out.code);
+        assert!(f.contains("hostVars:1"), "hostVars:1 missing; got: {}", out.code);
+        assert!(
+            out.code.contains("\u{0275}\u{0275}domProperty(\"id\",ctx.dirId)")
+                || flat(&out.code).contains("domProperty(\"id\",ctx.dirId)"),
+            "domProperty(id, ctx.dirId) missing; got: {}",
+            out.code
+        );
+    }
+
+    #[test]
+    fn host_directives_emit_feature() {
+        let src = r#"
+            @Component({
+                selector: 'my-cmp',
+                template: '<div></div>',
+                hostDirectives: [DirA, {directive: DirB, inputs: ['value: alias'], outputs: ['ev']}],
+                standalone: false
+            })
+            export class MyComponent {}
+        "#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        assert!(
+            out.code.contains("\u{0275}\u{0275}HostDirectivesFeature"),
+            "no HostDirectivesFeature; got: {}",
+            out.code
+        );
+        let f = flat(&out.code);
+        // DirA shorthand; DirB object with input/output mapping arrays.
+        assert!(f.contains("DirA"), "DirA missing; got: {}", out.code);
+        assert!(
+            f.contains("directive:DirB"),
+            "DirB object missing; got: {}",
+            out.code
+        );
+        assert!(
+            f.contains("inputs:[\"value\",\"alias\"]"),
+            "input mapping wrong; got: {}",
+            out.code
+        );
+        assert!(
+            f.contains("outputs:[\"ev\",\"ev\"]"),
+            "output mapping wrong; got: {}",
+            out.code
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // R3 — decorator queries.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn decorator_view_queries_emit_view_query_fn() {
+        let src = r#"
+            @Component({
+                selector: 'view-query-component',
+                template: '<div #myRef></div><div #myRef1></div>',
+                standalone: false
+            })
+            export class ViewQueryComponent {
+                @ViewChild('myRef') myRef: any;
+                @ViewChildren('myRef1, myRef2, myRef3') myRefs!: any;
+            }
+        "#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        assert!(
+            out.code.contains("\u{0275}\u{0275}viewQuery"),
+            "no viewQuery instruction; got: {}",
+            out.code
+        );
+        // Multi-selector locator splits into three refs.
+        let f = flat(&out.code);
+        assert!(
+            f.contains("[\"myRef1\",\"myRef2\",\"myRef3\"]"),
+            "multi-selector split missing; got: {}",
+            out.code
+        );
+        // Single-result query refreshes `.first`; multi assigns the QueryList directly.
+        assert!(f.contains("ctx.myRef="), "myRef refresh missing; got: {}", out.code);
+        assert!(f.contains("ctx.myRefs="), "myRefs refresh missing; got: {}", out.code);
+    }
+
+    #[test]
+    fn decorator_content_query_with_read_token() {
+        let src = r#"
+            @Directive({selector: '[d]', standalone: false})
+            export class D {
+                @ContentChild('ref', {read: ElementRef}) item: any;
+            }
+        "#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        assert!(
+            out.code.contains("\u{0275}\u{0275}contentQuery"),
+            "no contentQuery; got: {}",
+            out.code
+        );
+        // The `read` token is emitted as the 3rd creation arg.
+        assert!(out.code.contains("ElementRef"), "read token missing; got: {}", out.code);
+    }
+
+    #[test]
+    fn decorator_queries_single_first_ordering() {
+        // Declaration order: single, multi, single. Creation order must be all-singles then multi.
+        let src = r#"
+            @Component({selector: 'c', template: '<div></div>', standalone: false})
+            export class C {
+                @ViewChild('a') a: any;
+                @ViewChildren('b') b!: any;
+                @ViewChild('c2') c2: any;
+            }
+        "#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let f = flat(&out.code);
+        // The `a` and `c2` predicates (singles) must precede `b` (multi) in the create chain.
+        let pos_a = f.find("[\"a\"]").expect("a predicate");
+        let pos_c2 = f.find("[\"c2\"]").expect("c2 predicate");
+        let pos_b = f.find("[\"b\"]").expect("b predicate");
+        assert!(pos_a < pos_b && pos_c2 < pos_b, "single-first ordering wrong; got: {}", out.code);
+    }
+
+    // -----------------------------------------------------------------------
+    // R4 — @Directive / @Pipe / @NgModule emission.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn directive_only_emits_define_directive() {
+        let src = r#"
+            @Directive({selector: '[myDir]', standalone: false})
+            export class MyDir {
+                @Input() foo = 1;
+                @Output() bar = new EventEmitter();
+            }
+        "#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        assert!(
+            out.code.contains("\u{0275}\u{0275}defineDirective"),
+            "no defineDirective; got: {}",
+            out.code
+        );
+        let f = flat(&out.code);
+        assert!(
+            f.contains("selectors:[[\"\",\"myDir\",\"\"]]"),
+            "directive selector wrong; got: {}",
+            out.code
+        );
+        assert!(f.contains("inputs:"), "no inputs; got: {}", out.code);
+        assert!(f.contains("outputs:"), "no outputs; got: {}", out.code);
+        assert!(f.contains("standalone:false"), "standalone:false missing; got: {}", out.code);
+    }
+
+    #[test]
+    fn directive_export_as_emitted() {
+        let src = r#"
+            @Directive({selector: '[d]', exportAs: 'foo', standalone: false})
+            export class D {}
+        "#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        assert!(
+            flat(&out.code).contains("exportAs:[\"foo\"]"),
+            "exportAs missing; got: {}",
+            out.code
+        );
+    }
+
+    #[test]
+    fn pipe_emits_define_pipe() {
+        let src = r#"
+            @Pipe({name: 'myPipe', standalone: false})
+            export class MyPipe { transform(v: any) { return v; } }
+        "#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let f = flat(&out.code);
+        assert!(
+            out.code.contains("\u{0275}\u{0275}definePipe"),
+            "no definePipe; got: {}",
+            out.code
+        );
+        assert!(f.contains("name:\"myPipe\""), "pipe name wrong; got: {}", out.code);
+        assert!(f.contains("type:MyPipe"), "pipe type wrong; got: {}", out.code);
+        assert!(f.contains("pure:true"), "pure default wrong; got: {}", out.code);
+        assert!(f.contains("standalone:false"), "standalone:false missing; got: {}", out.code);
+    }
+
+    #[test]
+    fn ng_module_emits_define_ng_module() {
+        let src = r#"
+            @NgModule({declarations: [CompA, CompB], imports: [CommonModule], exports: [CompA]})
+            export class MyModule {}
+        "#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let f = flat(&out.code);
+        assert!(
+            out.code.contains("\u{0275}\u{0275}defineNgModule"),
+            "no defineNgModule; got: {}",
+            out.code
+        );
+        assert!(f.contains("declarations:[CompA,CompB]"), "declarations wrong; got: {}", out.code);
+        assert!(f.contains("imports:[CommonModule]"), "imports wrong; got: {}", out.code);
+        assert!(f.contains("exports:[CompA]"), "exports wrong; got: {}", out.code);
+    }
+
+    #[test]
+    fn ng_on_changes_emits_feature() {
+        let src = r#"
+            @Component({selector: 'c', template: '<div></div>', standalone: false})
+            export class C { ngOnChanges() {} }
+        "#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        assert!(
+            out.code.contains("\u{0275}\u{0275}NgOnChangesFeature"),
+            "no NgOnChangesFeature; got: {}",
+            out.code
+        );
+    }
+
+    #[test]
+    fn no_ng_on_changes_no_feature() {
+        let src = r#"
+            @Component({selector: 'c', template: '<div></div>', standalone: false})
+            export class C {}
+        "#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        assert!(
+            !out.code.contains("NgOnChangesFeature"),
+            "spurious NgOnChangesFeature; got: {}",
+            out.code
+        );
+    }
+
+    #[test]
+    fn directive_no_host_is_byte_identical_to_legacy_stub() {
+        // A @Directive with no host bindings must NOT emit a hostBindings/hostVars/hostAttrs field
+        // (the DefaultHostBindingsBuilder is a no-op when there is nothing to bind).
+        let src = r#"
+            @Directive({selector: '[d]', standalone: false})
+            export class D { @Input() foo = 1; }
+        "#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        assert!(!out.code.contains("hostBindings"), "spurious hostBindings; got: {}", out.code);
+        assert!(!out.code.contains("hostVars"), "spurious hostVars; got: {}", out.code);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Corpus dump (CARGO-based compliance verification, NOT the live NAPI addon).
+//
+// This `#[cfg(test)]` helper walks Angular's vendored compliance corpus, runs
+// `compile_component_source` over every single-input case, and writes a JSON dump
+// (`{ "<corpus-rel-input-path>": {code, errors} }`) to the path named by the
+// `RENDER3_CORPUS_DUMP` env var. `libs/render3/compliance/run-compliance.mjs`
+// consumes it via `--cargo-dump=<path>`, applying the SAME canonicalize/matchGolden
+// logic — so the score is verified against a freshly-built render3 WITHOUT rebuilding
+// the `authoring_node` addon (which links the sibling-edited `treaty_runtime`).
+//
+// It is gated on the env var so a normal `cargo test -p render3` does not require the
+// corpus to be present. Run with:
+//   RENDER3_CORPUS_DUMP=<abs path> cargo test -p render3 corpus_dump -- --ignored --nocapture
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod corpus_dump {
+    use super::compile_component_source;
+    use std::path::{Path, PathBuf};
+
+    /// JSON-escape a string into `out`.
+    fn json_escape(s: &str, out: &mut String) {
+        out.push('"');
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+    }
+
+    /// Minimal extraction of `"inputFiles": ["x.ts"]` arrays from a TEST_CASES.json blob, returning
+    /// every referenced single input-file name. We avoid a JSON dependency: the schema is fixed and
+    /// we only need the input-file string list per case.
+    fn input_files_in(json: &str) -> Vec<String> {
+        let mut files = Vec::new();
+        let needle = "\"inputFiles\"";
+        let mut idx = 0;
+        while let Some(found) = json[idx..].find(needle) {
+            let start = idx + found + needle.len();
+            // Find the '[' then ']'.
+            let Some(open_rel) = json[start..].find('[') else { break };
+            let open = start + open_rel;
+            let Some(close_rel) = json[open..].find(']') else { break };
+            let close = open + close_rel;
+            let arr = &json[open + 1..close];
+            for piece in arr.split(',') {
+                let t = piece.trim().trim_matches('"');
+                if !t.is_empty() {
+                    files.push(t.to_string());
+                }
+            }
+            idx = close;
+        }
+        files
+    }
+
+    /// Recursively collect every `TEST_CASES.json` under `root`.
+    fn collect_test_cases(root: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(root) else { return };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                collect_test_cases(&p, out);
+            } else if p.file_name().and_then(|n| n.to_str()) == Some("TEST_CASES.json") {
+                out.push(p);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "corpus dump; run explicitly with RENDER3_CORPUS_DUMP set"]
+    fn dump_corpus() {
+        let Ok(dump_path) = std::env::var("RENDER3_CORPUS_DUMP") else {
+            eprintln!("RENDER3_CORPUS_DUMP not set; skipping corpus dump");
+            return;
+        };
+        // libs/render3 -> repo root -> tools/angular-ref/.../test_cases.
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let corpus = manifest
+            .join("..")
+            .join("..")
+            .join("tools/angular-ref/packages/compiler-cli/test/compliance/test_cases");
+        let corpus = corpus.canonicalize().unwrap_or(corpus);
+
+        let mut test_case_files = Vec::new();
+        collect_test_cases(&corpus, &mut test_case_files);
+
+        let mut json = String::from("{\n");
+        let mut first = true;
+        let mut count = 0usize;
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for tc in &test_case_files {
+            let Ok(content) = std::fs::read_to_string(tc) else { continue };
+            let dir = tc.parent().unwrap();
+            for input in input_files_in(&content) {
+                let input_path = dir.join(&input);
+                let Ok(src) = std::fs::read_to_string(&input_path) else { continue };
+                let rel = input_path
+                    .strip_prefix(&corpus)
+                    .unwrap_or(&input_path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if !seen.insert(rel.clone()) {
+                    continue;
+                }
+                let out = compile_component_source(&src);
+                if !first {
+                    json.push_str(",\n");
+                }
+                first = false;
+                json_escape(&rel, &mut json);
+                json.push_str(":{\"code\":");
+                json_escape(&out.code, &mut json);
+                json.push_str(",\"errors\":[");
+                for (i, e) in out.errors.iter().enumerate() {
+                    if i > 0 {
+                        json.push(',');
+                    }
+                    json_escape(e, &mut json);
+                }
+                json.push_str("]}");
+                count += 1;
+            }
+        }
+        json.push_str("\n}\n");
+        std::fs::write(&dump_path, json).expect("write corpus dump");
+        eprintln!("wrote {count} corpus entries to {dump_path}");
     }
 }
