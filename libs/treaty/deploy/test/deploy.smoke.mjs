@@ -30,6 +30,8 @@ import {
 	deployViaPlugin,
 	rollback,
 	FsDeployTarget,
+	isFederationEnabled,
+	manifestModulesFromConfig,
 } from '../dist/index.js'
 
 let failures = 0
@@ -280,6 +282,88 @@ const run = async () => {
 				'https://cdn/shell/0.9.0/remoteEntry.js'
 			)
 			assert.throws(() => rollback(deployed, 'nope', '1.0.0'), /unknown moduleId/)
+		})
+
+		// 12. federation off: deploy is a no-op (uploads nothing, manifest unchanged)
+		await check('deploy: federation:false skips the deploy (no upload, manifest unchanged)', async () => {
+			const out = await mkdtemp(join(tmpdir(), 'treaty-deploy-off-'))
+			try {
+				const artifact = await assembleDeployArtifact({ buildDir, manifest })
+				const target = new FsDeployTarget({ root: out, baseUrl: 'https://cdn' })
+				const res = await deploy(artifact, target, { federation: false })
+				assert.equal(res.partial, false, 'no-op result is not partial')
+				assert.deepEqual(res.modules, {}, 'nothing deployed when federation is off')
+				assert.deepEqual([...res.uploaded], [], 'nothing uploaded when federation is off')
+				assert.equal(res.manifest, artifact.manifest, 'input manifest returned unchanged')
+				// nothing written to disk
+				await assert.rejects(() => readFile(join(out, 'shell/1.0.0/remoteEntry.js'), 'utf8'),
+					'federation:false wrote nothing')
+
+				// { enabled:false } also skips
+				const res2 = await deploy(artifact, target, { federation: { enabled: false } })
+				assert.deepEqual(res2.modules, {}, '{enabled:false} also skips')
+
+				// default (federation undefined) still deploys
+				const res3 = await deploy(artifact, target, {})
+				assert.ok(Object.keys(res3.modules).length > 0, 'default still deploys (federated by default)')
+			} finally {
+				await rm(out, { recursive: true, force: true })
+			}
+		})
+
+		// 12b. deployViaPlugin also honors the toggle
+		await check('deployViaPlugin: federation:false skips the deploy', async () => {
+			const out = await mkdtemp(join(tmpdir(), 'treaty-deploy-off-plugin-'))
+			try {
+				const plugin = new FsDeployPlugin({ root: out, baseUrl: 'https://cdn' })
+				const artifact = await assembleDeployArtifact({ buildDir, manifest, only: ['routes/dashboard'] })
+				const res = await deployViaPlugin(artifact, plugin, { federation: false })
+				assert.deepEqual(res.modules, {}, 'plugin path skips when federation off')
+				assert.equal(res.manifest, artifact.manifest, 'manifest returned unchanged')
+			} finally {
+				await rm(out, { recursive: true, force: true })
+			}
+		})
+
+		// 13. consume an EJECTED standalone config: seed a manifest, then deploy from it
+		await check('deploy: an ejected standalone config seeds a manifest the deploy consumes', async () => {
+			const out = await mkdtemp(join(tmpdir(), 'treaty-deploy-ejected-'))
+			const ejectedBuild = await mkdtemp(join(tmpdir(), 'treaty-ejected-build-'))
+			try {
+				// A user-owned, ejected @module-federation/enhanced config.
+				const ejected = {
+					name: 'shell',
+					filename: 'remoteEntry.js',
+					remotes: {},
+					exposes: { './routes/dashboard': './src/app/dashboard' },
+					shared: { '@angular/core': { singleton: true, eager: true } },
+				}
+				// Re-export bridge turns it into manifest inputs => a manifest.
+				const ejectedManifest = buildManifest(
+					manifestModulesFromConfig(ejected, {
+						version: '1.0.0',
+						urlFor: (id, v) => `https://cdn/${id}/${v}/remoteEntry.js`,
+					}),
+					{ app: 'shell' }
+				)
+				assert.equal(getModule(ejectedManifest, 'shell').version, '1.0.0', 'host seeded from ejected config')
+				assert.equal(getModule(ejectedManifest, './routes/dashboard').version, '1.0.0', 'expose seeded from ejected config')
+
+				// Lay down a build for those module ids and deploy from the ejected manifest.
+				await writeBuild(ejectedBuild, {
+					shell: { 'remoteEntry.js': '// shell' },
+					'./routes/dashboard': { 'remoteEntry.js': '// dashboard' },
+				})
+				const artifact = await assembleDeployArtifact({ buildDir: ejectedBuild, manifest: ejectedManifest })
+				const target = new FsDeployTarget({ root: out, baseUrl: 'https://cdn' })
+				const res = await deploy(artifact, target)
+				assert.deepEqual(Object.keys(res.modules).sort(), ['./routes/dashboard', 'shell'],
+					'deploy covers exactly the modules from the ejected config')
+				assert.ok(isFederationEnabled(undefined), 'toggle reader available from @treaty/deploy')
+			} finally {
+				await rm(out, { recursive: true, force: true })
+				await rm(ejectedBuild, { recursive: true, force: true })
+			}
 		})
 
 		// 11. validation

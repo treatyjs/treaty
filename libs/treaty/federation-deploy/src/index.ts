@@ -34,6 +34,13 @@
  *     returns which modules to compile/test/deploy and the resulting manifest
  *     deltas.
  *
+ * Federation is on by default but **toggleable**: {@link isFederationEnabled}
+ * reads a Treaty config's `federation` toggle so a CI run **skips entirely** when
+ * federation is off. And it is **ejectable**: {@link manifestModulesFromConfig} /
+ * {@link federatedModuleIdsFromConfig} read an ejected standalone
+ * `@module-federation/enhanced` config back into the manifest's module set, so a
+ * user-owned config drives the deploy layer without Treaty re-deriving anything.
+ *
  * The `@module-federation/enhanced/runtime` peer is referenced structurally, so
  * this package typechecks and the manifest helpers run without it installed.
  */
@@ -92,3 +99,14 @@ export type {
 	ManifestChange,
 	VersionPolicy,
 } from './plan.js'
+
+export {
+	isFederationEnabled,
+	federatedModuleIdsFromConfig,
+	manifestModulesFromConfig,
+} from './toggle.js'
+export type {
+	FederationToggle,
+	EjectedFederationConfig,
+	ManifestModulesFromConfigOptions,
+} from './toggle.js'

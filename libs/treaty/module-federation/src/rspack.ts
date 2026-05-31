@@ -84,6 +84,13 @@ export function toRspackModuleFederation(
 ): RspackModuleFederationOptions {
 	const config = isNormalized(input) ? input : generateMfConfig(input)
 
+	// Federation switched off: emit inert options (no remotes/exposes/shared) so a
+	// disabled config never wires the plugin's federation surface. The host
+	// identity is still resolved so the shape stays uniform for callers.
+	if (config.enabled === false) {
+		return { name: config.name, filename: config.filename, remotes: {}, exposes: {}, shared: {} }
+	}
+
 	const remotes: Record<string, string> = {}
 	for (const [alias, remote] of Object.entries(config.remotes)) {
 		remotes[alias] = toRemoteString(remote)

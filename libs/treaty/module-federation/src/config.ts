@@ -252,6 +252,53 @@ function normalizeShared(value: SharedConfig | true): SharedConfig {
  *     wins. With no `routes`/`libs`/`exposes`, `exposes` is empty — backward
  *     compatible with callers that never supplied them.
  */
+/**
+ * The Treaty-config-level federation toggle, as a developer writes it in their
+ * Treaty config. Federation is **on by default**, so omitting it (or `true`)
+ * keeps the zero-config auto-MF behaviour. The two ways to turn it OFF are the
+ * whole point of the toggle:
+ *   - `federation: false` — the terse switch.
+ *   - `federation: { enabled: false }` — keep a federation block (remotes,
+ *     exposes, shared) in source but ship the app un-federated.
+ * Any other object is taken as {@link MfOptions} (federation on, customized).
+ */
+export type FederationConfig = boolean | MfOptions
+
+/**
+ * The single, canonical reader of the {@link FederationConfig} toggle. Every
+ * Treaty surface that wires federation (the Rspack/Vite plugins, the deploy
+ * pipeline) funnels its config through this so "is federation on, and with what
+ * options?" is answered in exactly one place.
+ *
+ * Returns the resolved {@link MfOptions} when federation is **on**, or `null`
+ * when it is **off** — `null` is the explicit "wire nothing" signal:
+ *   - `undefined` / `true` ⇒ `{}` (zero-config auto-MF, the default).
+ *   - `false` ⇒ `null` (off).
+ *   - an {@link MfOptions} with `enabled: false` ⇒ `null` (off, wiring kept in source).
+ *   - any other {@link MfOptions} ⇒ that object (on, customized).
+ *
+ * @example
+ * resolveFederation(undefined)            // {} — on by default
+ * resolveFederation(false)                // null — off
+ * resolveFederation({ enabled: false })   // null — off, block preserved in source
+ * resolveFederation({ name: 'shell' })    // { name: 'shell' } — on
+ */
+export function resolveFederation(config: FederationConfig | undefined): MfOptions | null {
+	if (config === false) return null
+	if (config === true || config === undefined) return {}
+	if (config.enabled === false) return null
+	return config
+}
+
+/**
+ * Whether the {@link FederationConfig} toggle resolves to **on**. A convenience
+ * over `resolveFederation(config) !== null` for call sites that only need the
+ * boolean (e.g. a deploy pipeline deciding whether to run at all).
+ */
+export function isFederationEnabled(config: FederationConfig | undefined): boolean {
+	return resolveFederation(config) !== null
+}
+
 export function generateMfConfig(options: MfOptions = {}): NormalizedMfConfig {
 	const name = options.name ?? DEFAULT_HOST_NAME
 	const filename = options.filename ?? DEFAULT_FILENAME

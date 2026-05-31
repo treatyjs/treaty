@@ -25,11 +25,13 @@
 import {
 	buildManifest,
 	getModule,
+	isFederationEnabled,
 	rollbackModule,
 	setModuleVersion,
 	type DeployModule,
 	type DeployPlugin,
 	type FederationManifest,
+	type FederationToggle,
 	type ModuleDeployment,
 } from '@treaty/federation-deploy'
 import { posix } from 'node:path'
@@ -96,6 +98,14 @@ export interface DeployOptions {
 	readonly dryRun?: boolean
 	/** Target-specific parameters passed through on the context. */
 	readonly params?: Readonly<Record<string, unknown>>
+	/**
+	 * The Treaty config's federation toggle. Federation is on by default; pass
+	 * `false` (or `{ enabled: false }`) to turn it **off**, in which case
+	 * {@link deploy} performs **no upload** and returns an empty, non-partial
+	 * result carrying the input manifest unchanged — the deploy run is skipped, not
+	 * an error. Omit (or pass `true`) for the default federated deploy.
+	 */
+	readonly federation?: FederationToggle
 }
 
 /** One module's result within a {@link DeployResult}. */
@@ -146,6 +156,13 @@ export async function deploy(
 	}
 	if (!target || typeof target.upload !== 'function' || typeof target.urlFor !== 'function') {
 		throw new TypeError('deploy: a DeployTarget with upload() and urlFor() is required')
+	}
+
+	// Federation off: skip the whole deploy. Upload nothing and return the input
+	// manifest untouched — a disabled federation has no federated modules to ship.
+	if (!isFederationEnabled(options.federation)) {
+		options.logger?.('[deploy] federation is disabled; skipping deploy')
+		return { manifest: artifact.manifest, modules: {}, uploaded: [], partial: false }
 	}
 
 	const moduleIds = Object.keys(artifact.modules).sort()
@@ -219,6 +236,13 @@ export async function deployViaPlugin(
 	if (!plugin || typeof plugin.deploy !== 'function') {
 		throw new TypeError('deployViaPlugin: a DeployPlugin with deploy() is required')
 	}
+
+	// Federation off: skip the deploy entirely (see {@link deploy}).
+	if (!isFederationEnabled(options.federation)) {
+		options.logger?.('[deployViaPlugin] federation is disabled; skipping deploy')
+		return { manifest: artifact.manifest, modules: {}, uploaded: [], partial: false }
+	}
+
 	const moduleIds = Object.keys(artifact.modules).sort()
 	if (moduleIds.length === 0) {
 		throw new RangeError('deployViaPlugin: artifact has no modules to deploy')
@@ -271,6 +295,11 @@ export interface DeployViaPluginOptions {
 	readonly logger?: (message: string) => void
 	/** Plugin-specific params passed on the context. */
 	readonly params?: Readonly<Record<string, unknown>>
+	/**
+	 * The federation toggle. `false` / `{ enabled: false }` ⇒ skip the deploy and
+	 * return the input manifest unchanged (see {@link DeployOptions.federation}).
+	 */
+	readonly federation?: FederationToggle
 }
 
 /**

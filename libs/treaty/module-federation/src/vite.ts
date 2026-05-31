@@ -79,6 +79,12 @@ export function toViteFederation(
 ): ViteFederationOptions {
 	const config = isNormalized(input) ? input : generateMfConfig(input)
 
+	// Federation switched off: emit inert options so a disabled config never wires
+	// the `federation()` plugin's surface. The host identity is still resolved.
+	if (config.enabled === false) {
+		return { name: config.name, filename: config.filename, remotes: {}, exposes: {}, shared: {} }
+	}
+
 	const remotes: Record<string, string> = {}
 	for (const [alias, remote] of Object.entries(config.remotes)) {
 		remotes[alias] = toRemoteString(remote)

@@ -25,6 +25,8 @@ import os from 'node:os'
 import path from 'node:path'
 import {
 	generateMfConfig,
+	resolveFederation,
+	isFederationEnabled,
 	toRspackModuleFederation,
 	toViteFederation,
 	deriveExposesFromRoutes,
@@ -32,6 +34,9 @@ import {
 	exportMfConfig,
 	writeMfConfig,
 	renderMfConfigFile,
+	exportFederationConfig,
+	writeFederationConfig,
+	renderFederationConfigFile,
 	DEFAULT_HOST_NAME,
 	DEFAULT_FILENAME,
 } from '../dist/index.js'
@@ -369,6 +374,169 @@ check('writeMfConfig ejects to disk', async () => {
 		assert.equal(onDisk.name, 'shell', 'name written to disk')
 		assert.deepEqual(onDisk.remotes['d'], { name: 'd', entry: 'http://d/r.js' }, 'remote written to disk')
 		assert.deepEqual(returned, onDisk, 'writeMfConfig returns the config it wrote')
+	} finally {
+		await rm(dir, { recursive: true, force: true })
+	}
+})
+
+// 24. resolveFederation toggle: default ON, false/{enabled:false} OFF
+check('resolveFederation reads the on/off toggle', () => {
+	assert.deepEqual(resolveFederation(undefined), {}, 'undefined => on with default options')
+	assert.deepEqual(resolveFederation(true), {}, 'true => on with default options')
+	assert.equal(resolveFederation(false), null, 'false => off (null)')
+	assert.equal(resolveFederation({ enabled: false }), null, '{enabled:false} => off (null)')
+	const opts = { name: 'shell', remotes: { d: 'http://d/r.js' } }
+	assert.equal(resolveFederation(opts), opts, 'options object => on, returned as-is')
+
+	assert.equal(isFederationEnabled(undefined), true, 'default enabled')
+	assert.equal(isFederationEnabled(false), false, 'false disabled')
+	assert.equal(isFederationEnabled({ enabled: false }), false, '{enabled:false} disabled')
+	assert.equal(isFederationEnabled({ name: 'x' }), true, 'options enabled')
+})
+
+// 25. adapters emit inert options for a disabled config (skip federation surface)
+check('rspack/vite adapters honor enabled:false (inert options)', () => {
+	const disabled = {
+		enabled: false,
+		name: 'shell',
+		remotes: { dashboard: 'http://localhost:4201/remoteEntry.js' },
+		routes: [{ path: 'dashboard', loadComponent: () => ({}) }],
+		shared: { lodash: true },
+	}
+	const rspack = toRspackModuleFederation(disabled)
+	assert.equal(rspack.name, 'shell', 'identity preserved when disabled')
+	assert.deepEqual(rspack.remotes, {}, 'no remotes wired when disabled (rspack)')
+	assert.deepEqual(rspack.exposes, {}, 'no exposes wired when disabled (rspack)')
+	assert.deepEqual(rspack.shared, {}, 'nothing shared when disabled (rspack)')
+
+	const vite = toViteFederation(disabled)
+	assert.deepEqual(vite.remotes, {}, 'no remotes wired when disabled (vite)')
+	assert.deepEqual(vite.shared, {}, 'nothing shared when disabled (vite)')
+
+	// enabled (default) still wires through
+	const on = toRspackModuleFederation({ name: 'shell', remotes: { d: 'http://d/r.js' } })
+	assert.ok(on.shared['@angular/core'], 'enabled config still shares Angular')
+	assert.equal(on.remotes['d'], 'd@http://d/r.js', 'enabled config still wires remotes')
+})
+
+// 26. exportFederationConfig: standalone enhanced config from an app graph
+check('exportFederationConfig ejects a standalone enhanced config from an app graph', () => {
+	const config = exportFederationConfig({
+		name: 'shell',
+		routes: [
+			{ path: 'dashboard', loadComponent: () => ({}) },
+			{ path: 'reports', loadChildren: () => ({}) },
+			{ path: 'home', component: {} },
+		],
+		libs: ['./libs/data-access'],
+		remotes: { reports_remote: 'http://localhost:4202/remoteEntry.js' },
+		shared: { lodash: { singleton: true, eager: false } },
+	})
+	// host identity
+	assert.equal(config.name, 'shell', 'host name')
+	assert.equal(config.filename, DEFAULT_FILENAME, 'host filename')
+	// remotes are name@entry strings (enhanced shape)
+	assert.equal(
+		config.remotes['reports_remote'],
+		'reports_remote@http://localhost:4202/remoteEntry.js',
+		'consumed remote rendered as name@entry string'
+	)
+	// lazy routes + libs => exposes (versioned remotes), eager route excluded
+	assert.equal(config.exposes['./routes/dashboard'], './src/app/dashboard', 'lazy route exposed')
+	assert.equal(config.exposes['./routes/reports'], './src/app/reports', 'lazy children exposed')
+	assert.equal(config.exposes['./routes/home'], undefined, 'eager route not exposed')
+	assert.equal(config.exposes['./libs/data-access'], './libs/data-access', 'lib exposed')
+	// shared: Angular singletons + user override
+	assert.equal(config.shared['@angular/core'].singleton, true, 'Angular singleton shared')
+	assert.equal(config.shared['@angular/core'].eager, true, 'Angular eager')
+	assert.equal(config.shared['lodash'].eager, false, 'user shared override carried')
+	// deterministic: keys sorted, no undefined leaks
+	assert.deepEqual(Object.keys(config.exposes), [...Object.keys(config.exposes)].sort(), 'exposes sorted')
+	assert.equal('version' in config.shared['@angular/core'], false, 'no undefined version leaks')
+	// matches the rspack adapter shape exactly (eject == what Treaty would wire)
+	const viaAdapter = toRspackModuleFederation({
+		name: 'shell',
+		routes: [
+			{ path: 'dashboard', loadComponent: () => ({}) },
+			{ path: 'reports', loadChildren: () => ({}) },
+			{ path: 'home', component: {} },
+		],
+		libs: ['./libs/data-access'],
+		remotes: { reports_remote: 'http://localhost:4202/remoteEntry.js' },
+		shared: { lodash: { singleton: true, eager: false } },
+	})
+	assert.deepEqual(config.exposes, viaAdapter.exposes, 'ejected exposes == adapter exposes')
+	assert.deepEqual(config.remotes, viaAdapter.remotes, 'ejected remotes == adapter remotes')
+})
+
+// 27. exportFederationConfig round-trips to a serializable, valid config object
+check('exportFederationConfig round-trips through JSON to a valid standalone config', () => {
+	const config = exportFederationConfig({
+		name: 'shell',
+		routes: [{ path: 'dashboard', loadComponent: () => ({}) }],
+		libs: ['./libs/ui'],
+	})
+	const round = JSON.parse(JSON.stringify(config))
+	assert.deepEqual(round, config, 'config is plain JSON (no functions/undefined)')
+	// expected remotes/exposes/shared survive
+	assert.equal(round.exposes['./routes/dashboard'], './src/app/dashboard', 'route survives round-trip')
+	assert.equal(round.exposes['./libs/ui'], './libs/ui', 'lib survives round-trip')
+	assert.ok(round.shared['@angular/core'], 'shared survives round-trip')
+	assert.equal(round.name, 'shell', 'name survives round-trip')
+})
+
+// 28. disabled app graph ejects an inert standalone config
+check('exportFederationConfig of a disabled graph is inert', () => {
+	const config = exportFederationConfig({
+		enabled: false,
+		name: 'shell',
+		routes: [{ path: 'dashboard', loadComponent: () => ({}) }],
+		remotes: { d: 'http://d/r.js' },
+		libs: ['./libs/ui'],
+	})
+	assert.equal(config.name, 'shell', 'identity preserved')
+	assert.deepEqual(config.remotes, {}, 'no remotes when disabled')
+	assert.deepEqual(config.exposes, {}, 'no exposes when disabled')
+	assert.deepEqual(config.shared, {}, 'nothing shared when disabled')
+})
+
+// 29. renderFederationConfigFile: JSON + a STANDALONE (Treaty-free) TS module
+check('renderFederationConfigFile emits JSON and an import-free TS module', () => {
+	const config = exportFederationConfig({ name: 'shell', libs: ['./libs/ui'] })
+
+	const json = renderFederationConfigFile(config, '/tmp/federation.config.json')
+	const parsed = JSON.parse(json)
+	assert.equal(parsed.name, 'shell', 'JSON parses back to the config')
+	assert.equal(parsed.exposes['./libs/ui'], './libs/ui', 'exposes present in JSON')
+
+	const ts = renderFederationConfigFile(config, '/tmp/federation.config.ts')
+	assert.equal(ts.includes('@treaty/'), false, 'standalone TS module has NO @treaty import (user owns it)')
+	assert.equal(ts.includes('import '), false, 'standalone TS module is import-free')
+	assert.ok(ts.includes('export const federationConfig ='), 'exports the config object literal')
+	assert.ok(ts.includes('export default'), 'has a default export for ModuleFederationPlugin')
+})
+
+// 30. writeFederationConfig ejects a standalone config the user owns
+check('writeFederationConfig ejects a standalone config to disk', async () => {
+	const dir = await (await import('node:fs/promises')).mkdtemp(path.join(os.tmpdir(), 'fed-eject-'))
+	const dest = path.join(dir, 'federation', 'federation.config.json')
+	try {
+		const returned = await writeFederationConfig(
+			{
+				name: 'shell',
+				routes: [{ path: 'dashboard', loadComponent: () => ({}) }],
+				libs: ['./libs/data-access'],
+				remotes: { reports: 'http://r/remoteEntry.js' },
+			},
+			dest
+		)
+		const onDisk = JSON.parse(await readFile(dest, 'utf8'))
+		assert.equal(onDisk.name, 'shell', 'name written to disk')
+		assert.equal(onDisk.remotes['reports'], 'reports@http://r/remoteEntry.js', 'remote written as name@entry')
+		assert.equal(onDisk.exposes['./routes/dashboard'], './src/app/dashboard', 'route expose written')
+		assert.equal(onDisk.exposes['./libs/data-access'], './libs/data-access', 'lib expose written')
+		assert.ok(onDisk.shared['@angular/core'], 'shared written')
+		assert.deepEqual(returned, onDisk, 'writeFederationConfig returns the config it wrote')
 	} finally {
 		await rm(dir, { recursive: true, force: true })
 	}

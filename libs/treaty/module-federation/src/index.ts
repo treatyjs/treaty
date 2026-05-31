@@ -18,9 +18,17 @@
  *     `ModuleFederationPlugin` options (Rspack/webpack).
  *   - {@link toViteFederation} — adapter to `@module-federation/vite`
  *     `federation()` options (Vite).
+ *   - {@link resolveFederation} — the canonical reader of the on/off
+ *     {@link FederationConfig} toggle (`federation: false` / `{ enabled: false }`
+ *     ⇒ off; default ⇒ on). Every surface that wires federation funnels through
+ *     it so the toggle is honored in exactly one place.
  *   - {@link exportMfConfig} / {@link writeMfConfig} — the optional eject path:
  *     serialize the generated config to a human-readable object or file so a dev
- *     can customize it. Never required; zero-config stays the default.
+ *     can customize it (the file re-imports Treaty). Never required.
+ *   - {@link exportFederationConfig} / {@link writeFederationConfig} — eject to a
+ *     **standalone** `@module-federation/enhanced`-compatible config the user
+ *     OWNS: an import-free options object/file that drops straight into a vanilla
+ *     `ModuleFederationPlugin`, so an app can take over MF without Treaty.
  *
  * The bundler peers (`@module-federation/enhanced`, `@module-federation/vite`)
  * are referenced structurally, so this package typechecks and is usable for
@@ -29,6 +37,8 @@
 
 export {
 	generateMfConfig,
+	resolveFederation,
+	isFederationEnabled,
 	DEFAULT_HOST_NAME,
 	DEFAULT_FILENAME,
 	DEFAULT_ANGULAR_VERSION,
@@ -40,6 +50,7 @@ export type {
 	NormalizedMfConfig,
 	SharedConfig,
 	RemoteEntry,
+	FederationConfig,
 } from './config.js'
 
 export {
@@ -67,3 +78,14 @@ export type { ViteFederationOptions, ViteSharedConfig } from './vite.js'
 
 export { exportMfConfig, writeMfConfig, renderMfConfigFile } from './export.js'
 export type { ExportedMfConfig } from './export.js'
+
+export {
+	exportFederationConfig,
+	writeFederationConfig,
+	renderFederationConfigFile,
+} from './eject.js'
+export type {
+	AppGraph,
+	StandaloneFederationConfig,
+	StandaloneSharedConfig,
+} from './eject.js'

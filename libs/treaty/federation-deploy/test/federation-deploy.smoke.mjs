@@ -33,6 +33,9 @@ import {
 	NoopDeployPlugin,
 	FsDeployPlugin,
 	affectedDeployPlan,
+	isFederationEnabled,
+	federatedModuleIdsFromConfig,
+	manifestModulesFromConfig,
 	MANIFEST_SCHEMA,
 } from '../dist/index.js'
 
@@ -488,6 +491,66 @@ await check('affectedDeployPlan + DeployPluginRegistry: plan then deploy each mo
 	} finally {
 		await rm(root, { recursive: true, force: true })
 	}
+})
+
+// ----------------------------------------------------------------------------
+// Federation toggle + ejected-config bridge.
+// ----------------------------------------------------------------------------
+
+// 15. the toggle reader: default ON; false / { enabled:false } => OFF (skip deploy)
+check('isFederationEnabled: default on, false/{enabled:false} off', () => {
+	assert.equal(isFederationEnabled(undefined), true, 'undefined => on (federated by default)')
+	assert.equal(isFederationEnabled(true), true, 'true => on')
+	assert.equal(isFederationEnabled(false), false, 'false => off (skip)')
+	assert.equal(isFederationEnabled({ enabled: false }), false, '{enabled:false} => off (skip)')
+	assert.equal(isFederationEnabled({ name: 'shell' }), true, 'config object without enabled:false => on')
+})
+
+// 16. read module ids out of an ejected standalone @module-federation/enhanced config
+check('federatedModuleIdsFromConfig recovers host + exposes from an ejected config', () => {
+	const ejected = {
+		name: 'shell',
+		filename: 'remoteEntry.js',
+		remotes: { reports: 'reports@http://r/remoteEntry.js' },
+		exposes: {
+			'./routes/dashboard': './src/app/dashboard',
+			'./libs/data-access': './libs/data-access',
+		},
+		shared: { '@angular/core': { singleton: true, eager: true } },
+	}
+	const ids = federatedModuleIdsFromConfig(ejected)
+	assert.deepEqual(ids, ['./libs/data-access', './routes/dashboard', 'shell'], 'host + every expose key, sorted')
+})
+
+// 17. turn an ejected config into manifest inputs and build a manifest from it
+check('manifestModulesFromConfig + buildManifest seed a manifest from an ejected config', () => {
+	const ejected = {
+		name: 'shell',
+		exposes: {
+			'./routes/dashboard': './src/app/dashboard',
+			'./libs/data-access': './libs/data-access',
+		},
+	}
+	const inputs = manifestModulesFromConfig(ejected, {
+		version: '1.2.3',
+		urlFor: (id, v) => `https://cdn/${id}/${v}/remoteEntry.js`,
+	})
+	const m = buildManifest(inputs, { app: 'shell' })
+	// host is classified host; ./libs/* => lib; the rest => route
+	assert.equal(m.kinds['shell'], 'host', 'host kind')
+	assert.equal(m.kinds['./libs/data-access'], 'lib', 'lib kind from ./libs/ prefix')
+	assert.equal(m.kinds['./routes/dashboard'], 'route', 'route kind otherwise')
+	assert.deepEqual(getModule(m, 'shell'), {
+		version: '1.2.3',
+		url: 'https://cdn/shell/1.2.3/remoteEntry.js',
+	}, 'ejected config seeds version + url')
+	assert.equal(Object.keys(m.modules).length, 3, 'host + two exposed modules')
+
+	// defaults: placeholder version + relative versioned path when no options given
+	const def = manifestModulesFromConfig({ name: 'app', exposes: { './x': './x' } })
+	const host = def.find((i) => i.moduleId === 'app')
+	assert.equal(host.version, '0.0.0', 'default placeholder version')
+	assert.equal(host.url, 'app/0.0.0/remoteEntry.js', 'default relative versioned path')
 })
 
 for (const line of results) console.log(line)

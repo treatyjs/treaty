@@ -32,6 +32,13 @@
  * **Partial deploy** is first-class: pass `only` or `changedFiles` + `graph` to
  * {@link assembleDeployArtifact} and the artifact (hence the deploy) covers only
  * the affected modules — the unit of independent deploy/rollback.
+ *
+ * Federation is **toggleable**: pass `options.federation` to {@link deploy} /
+ * {@link deployViaPlugin} and a `false` / `{ enabled: false }` toggle makes the
+ * deploy a no-op (nothing uploaded, manifest returned unchanged). And it is
+ * **ejectable**: {@link manifestModulesFromConfig} (re-exported from
+ * `@treaty/federation-deploy`) seeds a manifest straight from a user-owned,
+ * ejected standalone `@module-federation/enhanced` config.
  */
 
 export {
@@ -59,3 +66,17 @@ export type {
 
 export { FsDeployTarget } from './targets.js'
 export type { FsDeployTargetOptions } from './targets.js'
+
+// Re-exported from `@treaty/federation-deploy` so a deploy caller has the toggle
+// reader and the ejected-config bridge available from one import: skip a deploy
+// when federation is off, or seed a manifest from a user-owned ejected config.
+export {
+	isFederationEnabled,
+	manifestModulesFromConfig,
+	federatedModuleIdsFromConfig,
+} from '@treaty/federation-deploy'
+export type {
+	FederationToggle,
+	EjectedFederationConfig,
+	ManifestModulesFromConfigOptions,
+} from '@treaty/federation-deploy'
