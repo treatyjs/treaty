@@ -149,6 +149,12 @@ as a NATIVE RUST binary (supersedes the wave-2 TS @treaty/cli; keep TS until Rus
 New crate (e.g. `apps/cli` or `libs/treaty/cli-rs`), depends on render3/authoring → sequence after a
 compliance round (builds against render3). See [[treaty-angular-cli-federation]], [[treaty-federation-deployment]].
 
+**L. Tooling: tsgo + oxlint, no tsc (user 2026-05-31)** — typecheck every TS package with `tsgo`
+(`@typescript/native-preview`, the native/Go TypeScript compiler) and lint with `oxlint` (oxc). Sweep
+all `libs/treaty/*` `moon.yml` typecheck tasks off `tsc` -> `tsgo --noEmit`, add `oxlint` lint tasks,
+and update workflow verify steps/agent instructions to use tsgo/oxlint. Do AFTER the running TS
+workflow (it edits the same moon.yml/package files). See [[treaty-tooling-tsgo-oxc]].
+
 ## Harness
 - **File-by-file harness**: compile a corpus of individual `.treaty`/`.tsx`/`.ts` files through `@treaty/compiler`
   and assert each emits valid Ivy + round-trips through each bundler plugin; measure per-file time
