@@ -164,6 +164,57 @@ function canonicalize(code) {
       Object.prototype.hasOwnProperty.call(ATTR_MARKER, name) ? String(ATTR_MARKER[name]) : m,
     );
   }
+  // Angular goldens reference two further FIXED const-enums by the SAME
+  // `__Enum.Member__` placeholder convention, and (unlike AttributeMarker) compose
+  // them with the bitwise-OR operator `|` (e.g. `__QueryFlags.descendants__|
+  // __QueryFlags.emitDistinctChangesOnly__`). Our emitter is FAITHFUL to Angular's
+  // REAL emitted output and writes the single RESOLVED integer (the OR of those flags).
+  // Map each known member to its exact fixed value, then fold any chain composed
+  // PURELY of such resolved members into the evaluated integer so the golden
+  // normalises to the SAME number we emit.
+  //   QueryFlags  (packages/core/src/render3/interfaces/query.ts):
+  //     none=0, descendants=1, isStatic=2, emitDistinctChangesOnly=4.
+  //   SelectorFlags (packages/core/src/render3/interfaces/projection.ts):
+  //     NOT=1, ATTRIBUTE=2, ELEMENT=4, CLASS=8.
+  // STRICT: only a known enum member maps to its fixed integer; an UNKNOWN member
+  // is left intact (so it cannot silently match), and a chain containing any
+  // un-mapped member is left intact (the `|`-fold only fires on all-numeric runs
+  // produced from these maps). This is provably equivalent, never a blanket strip.
+  {
+    const QUERY_FLAGS = {
+      none: 0,
+      descendants: 1,
+      isStatic: 2,
+      emitDistinctChangesOnly: 4,
+    };
+    const SELECTOR_FLAGS = {
+      NOT: 1,
+      ATTRIBUTE: 2,
+      ELEMENT: 4,
+      CLASS: 8,
+    };
+    // Replace a maximal `__Enum.A__|__Enum.B__|...` chain in one pass so we can
+    // OR the members together iff EVERY member of the chain is known. A chain with
+    // an unknown member matches the regex but, since one member fails the map, we
+    // return the original text unchanged.
+    const foldEnum = (enumName, table) => {
+      const memberRe = `__${enumName}\\.[A-Za-z]+__`;
+      const chainRe = new RegExp(`${memberRe}(?:\\|${memberRe})*`, 'g');
+      const oneRe = new RegExp(`__${enumName}\\.([A-Za-z]+)__`, 'g');
+      s = s.replace(chainRe, (chain) => {
+        let value = 0;
+        let allKnown = true;
+        chain.replace(oneRe, (mm, name) => {
+          if (Object.prototype.hasOwnProperty.call(table, name)) value |= table[name];
+          else allKnown = false;
+          return mm;
+        });
+        return allKnown ? String(value) : chain;
+      });
+    };
+    foldEnum('QueryFlags', QUERY_FLAGS);
+    foldEnum('SelectorFlags', SELECTOR_FLAGS);
+  }
   // Canonicalise local-ref / temp identifiers. Angular goldens use `$name$`
   // placeholders and `_rN` view-ref suffixes; our emitter uses its own suffixes.
   // The golden's `$ctx$` placeholder is the template context parameter, which Angular's

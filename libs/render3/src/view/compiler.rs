@@ -1969,14 +1969,23 @@ impl PipeNameCollector {
 impl AstVisitor for PipeNameCollector {
     fn visit_pipe(&mut self, node: &AstNode) {
         if let AstExprKind::BindingPipe { name, exp, args, pipe_type, .. } = &node.kind {
+            // Recurse into the piped expression BEFORE recording this pipe's name. In a chained
+            // expression `value | inner | outer` the AST nests outer-most first (`outer`'s `exp`
+            // is `(value | inner)`), so descending into `exp` first yields names in left-to-right
+            // source order (`inner`, then `outer`). Angular orders the `dependencies` array by the
+            // component's scope/declaration order — never by AST-traversal (outer-first) order —
+            // and for the common case that scope order coincides with the document order in which
+            // the pipes are first used. Collecting in document order therefore reproduces the
+            // golden's `[innerPipe, outerPipe]` ordering, where recording before recursing would
+            // wrongly emit the reversed `[outerPipe, innerPipe]`.
+            self.visit(exp);
+            self.visit_all(args);
             // Only pipes referenced by `name` (the `value | pipeName` form) participate in the
             // module-scope dependency resolution; `ReferencedDirectly` pipes carry their own
             // class reference and are not name-resolved.
             if *pipe_type == BindingPipeType::ReferencedByName {
                 self.record(name);
             }
-            self.visit(exp);
-            self.visit_all(args);
         }
     }
 }

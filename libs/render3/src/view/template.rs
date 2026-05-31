@@ -631,30 +631,6 @@ fn local_ref_var_name(name: &str, counter: usize) -> String {
     format!("${}_{}$", sanitize_identifier(name), counter)
 }
 
-/// Angular `BindingScope.freshReferenceName()` (template-pipeline `naming.ts`,
-/// `SemanticVariableKind.Identifier`): a view-local identifier of the form `<name>_r<id>` (with
-/// `i` inserted before `r` when the identifier is `ctx`, to avoid colliding with the context
-/// variable). Used for the binding const of an *inlined* `@let` whose value is computed directly
-/// (e.g. a `ɵɵpureFunction` literal), which the goldens pin literally as `simple_r1`.
-fn fresh_reference_name(name: &str, counter: usize) -> String {
-    let ident = sanitize_identifier(name);
-    let compat_prefix = if ident == CONTEXT_NAME { "i" } else { "" };
-    format!("{ident}_{compat_prefix}r{counter}")
-}
-
-/// Whether a lowered expression is a *result temp* of a hoisted `ɵɵpureFunctionN` (or pipe-bind)
-/// call — the shape `ɵɵpureFunction1(slot, $cN$, …)`. Angular's `BindingScope` names the binding
-/// const of such a `@let` with the `<name>_r<id>` view-ref form (`fresh_reference_name`), whereas a
-/// plain `@let` value (literal / arithmetic / read) uses the `$name$` expect-emit form.
-fn is_pure_function_result(value: &Expr) -> bool {
-    if let o::ExprKind::Invoke { callee, .. } = &value.kind {
-        if let o::ExprKind::External { value: ext, .. } = &callee.kind {
-            return ext.name.starts_with("\u{0275}\u{0275}pureFunction")
-                || ext.name.starts_with("\u{0275}\u{0275}pipeBind");
-        }
-    }
-    false
-}
 
 /// Pop trailing `null` literal arguments off an instruction's parameter list, mirroring the
 /// `while (args[args.length - 1].isEquivalent(o.NULL_EXPR)) args.pop()` tail in Angular's
@@ -1267,6 +1243,13 @@ pub struct TemplateDefinitionBuilder {
     /// produced view function, mirroring how Angular hoists `ConditionalCreate`/`RepeaterCreate`
     /// template fns onto the const pool (`emit.ts` `emitChildViews` → `pool.statements`).
     hoisted_fns: Vec<Stmt>,
+    /// Shared constant-pool entries hoisted to the top level as `const $cN$ = <value>;` declarations
+    /// (Angular `ConstantPool.getConstLiteral` → `pool.statements`). Distinct from the per-template
+    /// `consts:` array: these are the de-duped, view-global literals an instruction references BY NAME
+    /// (e.g. `ɵɵprojectionDef($c0$)` parsed-selector arrays). Each entry is `(value_expr, name)`; a
+    /// structurally-equivalent value reuses its existing name (Angular returns the SAME reference).
+    /// Surfaced alongside [`Self::hoisted_functions`] so they print before the `ɵɵdefineComponent`.
+    shared_consts: Vec<(Expr, String)>,
     /// The component base name (the parent's name with a trailing `_Template` stripped) used to
     /// derive child view function names (`<Base>_Conditional_<slot>`, `<Base>_For_<slot>`), faithful
     /// to `naming.ts` (which roots child names at `job.componentName`, not the parent fn name).
@@ -1375,6 +1358,7 @@ impl TemplateDefinitionBuilder {
             saved_view_name: None,
             update_prelude: Vec::new(),
             hoisted_fns: Vec::new(),
+            shared_consts: Vec::new(),
             base_name,
             var_counter: 0,
             is_root: true,
@@ -1400,6 +1384,35 @@ impl TemplateDefinitionBuilder {
     /// definition may also surface them at the top level (`pool.statements`).
     pub fn hoisted_functions(&self) -> &[Stmt] {
         &self.hoisted_fns
+    }
+
+    /// Intern a literal into the SHARED constant pool (Angular `ConstantPool.getConstLiteral`),
+    /// returning the `$cN$` reference name an instruction should carry. De-dupes structurally
+    /// equivalent values (returns the existing name) and, on first sight of a value, mints the next
+    /// `$cN$` name and emits a top-level `const $cN$ = <value>;` declaration onto `hoisted_fns` so it
+    /// prints before the `ɵɵdefineComponent` call (the shared-const namespace shares the view-global
+    /// `next_const_name` counter with the pure-literal factories, exactly as Angular's single pool does).
+    fn intern_shared_const(&mut self, value: Expr) -> String {
+        if let Some((_, name)) = self.shared_consts.iter().find(|(v, _)| v.is_equivalent(&value)) {
+            return name.clone();
+        }
+        let n = {
+            let mut state = self.pipes.borrow_mut();
+            let n = state.next_const_name;
+            state.next_const_name = n + 1;
+            n
+        };
+        let name = format!("$c{n}$");
+        self.shared_consts.push((value.clone(), name.clone()));
+        self.hoisted_fns.push(Stmt::with_modifiers(
+            StmtKind::DeclareVar {
+                name: name.clone(),
+                value: Some(value),
+                ty: None,
+            },
+            StmtModifier::FINAL,
+        ));
+        name
     }
 
     /// Lower a binding expression against this view's scope (`ctx` + any in-scope loop variables),
@@ -1826,8 +1839,14 @@ impl TemplateDefinitionBuilder {
                         }
                     })
                     .collect();
+                // Angular `generateProjectionDefs` hoists the parsed selector array into the SHARED
+                // constant pool (`constantPool.getConstLiteral(asLiteral(parsed), true)` → a top-level
+                // `const $cN$ = [...]`) and passes THAT reference — never the per-template `consts:`
+                // index. Mint a `$cN$` shared-const name, emit the top-level declaration as a hoisted
+                // pool statement, and reference it by name.
                 let arr = o::literal_arr(entries, None);
-                vec![num(self.const_pool.intern(arr) as f64)]
+                let name = self.intern_shared_const(arr);
+                vec![o::variable(name, None)]
             };
             self.creation_code
                 .insert(0, instruction(R3::ProjectionDef, params));
@@ -2179,6 +2198,13 @@ impl TemplateDefinitionBuilder {
             // entry (Angular keeps it out of `AttributeMarker.Bindings`), so skip its name.
             if matches!(output.kind, ParsedEventType::Animation) && output.name.starts_with("animate.")
             {
+                continue;
+            }
+            // A legacy animation listener (`(@myAnimation.start)`) is a synthetic `@`-prefixed event
+            // reified as a `ɵɵlistener("@trigger.phase", …)` with NO const-pool entry — Angular keeps
+            // synthetic listeners out of the `AttributeMarker.Bindings` group. The front-end leaves it
+            // a `Regular` event whose name keeps the `@` prefix, so detect it by that prefix.
+            if output.name.starts_with('@') {
                 continue;
             }
             binding_names.push(output.name.clone());
@@ -2849,11 +2875,25 @@ impl TemplateDefinitionBuilder {
         // extracts a const attr.
         let is_animate_listener =
             matches!(output.kind, ParsedEventType::Animation) && output.name.starts_with("animate.");
+        // A LEGACY animation listener (`(@myAnimation.start)`) — Angular's synthetic, `@`-prefixed
+        // output. The front-end parser classifies it as a `Regular` event whose NAME carries the
+        // whole `@trigger.phase` (it does not split the phase), so detect it here by the `@` prefix.
+        // Its `ɵɵlistener` event-name argument is the `prepareSyntheticListenerName` form
+        // `@${trigger}.${phase}` (the raw name, already in that form) and its handler function is
+        // named with the `prepareSyntheticListenerFunctionName` form `animation_${trigger}_${phase}`
+        // (an `animation` prefix; `.`/`@` sanitized to `_`), NOT the raw `@x.y` (invalid JS).
+        let is_legacy_animation_listener = !is_animate_listener && output.name.starts_with('@');
         // Angular `naming.ts`: `${unit.fnName}_${tag.replace('-', '_')}_${event}_${slot}_listener`,
         // with `event` run through `sanitizeIdentifier` (non-word chars → `_`); an animate event's
-        // `.` is removed entirely, giving `animateenter`.
+        // `.` is removed entirely, giving `animateenter`; a legacy animation event becomes
+        // `animation_${trigger}_${phase}`.
         let event_in_name = if is_animate_listener {
             output.name.replace('.', "")
+        } else if is_legacy_animation_listener {
+            // `@myAnimation.start` → `animation_myAnimation_start` (`prepareSyntheticListenerFunctionName`:
+            // strip the leading `@`, prefix `animation_`, map the `.` phase separator to `_`).
+            let trigger_phase = output.name.trim_start_matches('@').replace('.', "_");
+            format!("animation_{trigger_phase}")
         } else {
             output.name.clone()
         };
@@ -2892,11 +2932,18 @@ impl TemplateDefinitionBuilder {
                 .push(instruction(reference, vec![handler_fn]));
             return;
         }
-        let listener_ref = if self.dom_only {
+        // A legacy animation listener reifies to `ɵɵlistener` (Full family) REGARDLESS of the
+        // component's DomOnly mode (`reify.ts`: `domListener` requires `!isLegacyAnimationListener`),
+        // and its event-name argument is the synthetic `@${name}.${phase}` form
+        // (`prepareSyntheticListenerName`). A regular listener reifies to `ɵɵdomListener` in DomOnly
+        // mode / `ɵɵlistener` otherwise, with the raw event name.
+        let listener_ref = if self.dom_only && !is_legacy_animation_listener {
             R3::DomListener
         } else {
             R3::Listener
         };
+        // The event-name argument is the raw event name. For a legacy animation listener the parser
+        // already delivered it in the `@${trigger}.${phase}` synthetic form, so it is used verbatim.
         self.creation_code.push(instruction(
             listener_ref,
             vec![str_lit(&output.name), handler_fn],
@@ -2922,7 +2969,17 @@ impl TemplateDefinitionBuilder {
             let ref_slot = self.allocate_data_slot();
             self.register_local_ref(&r.name, ref_slot);
         }
-        let attrs_index = self.element_attrs_index(&template.attributes, &[]);
+        // A `<ng-template>`'s own `[prop]` inputs are collected — like an element's — under the
+        // `AttributeMarker.Bindings` group of its const attrs (Angular `serializeAttributes`), so
+        // `<ng-template [id]="">` interns `[AttributeMarker.Bindings, "id"]`. Legacy-animation
+        // synthetic (`@`-prefixed) inputs stay out of the const pool, mirroring the element path.
+        let template_binding_names: Vec<String> = template
+            .inputs
+            .iter()
+            .filter(|i| !is_legacy_animation_name(&i.name))
+            .map(|i| i.name.clone())
+            .collect();
+        let attrs_index = self.element_attrs_index(&template.attributes, &template_binding_names);
         let local_refs_index = self.local_refs_index(&template.references);
 
         let tag_name = template
@@ -2966,6 +3023,21 @@ impl TemplateDefinitionBuilder {
             R3::TemplateCreate
         };
         self.creation_code.push(instruction(template_ref, params));
+
+        // A `<ng-template>`'s `[prop]="expr"` inputs bind in the PARENT update block against the
+        // template's data slot (Angular lowers them like an element's property bindings). An
+        // empty-value binding (`[id]=""`) has no expression, so Angular reserves its const-attr
+        // Bindings entry (collected above) but emits NO `ɵɵproperty` update and NO var slot — the
+        // remaining inputs each reserve one var and emit `ɵɵproperty(name, <expr>)` after advancing
+        // to the template slot. Legacy-animation synthetic inputs are handled like elements'.
+        let bound_inputs: Vec<&BoundAttribute> = template
+            .inputs
+            .iter()
+            .filter(|i| !is_empty_binding_value(&i.value))
+            .collect();
+        for input in bound_inputs {
+            self.build_property(slot, input);
+        }
     }
 
     /// Pre-intern every local-reference const in THIS view, in create-op (depth-first pre-order)
@@ -3610,18 +3682,13 @@ impl TemplateDefinitionBuilder {
             // used both for the `const … =` binding and for every read of the let inside this view
             // (resolved through `loop_vars`).
             self.var_counter += 1;
-            // Angular's `BindingScope` mints two different forms for a `@let`'s in-view binding
-            // const depending on the shape of the let's lowered value. A plain `@let` (a literal /
-            // arithmetic / property read, including the cross-view `ɵɵstoreLet` wrapper) takes the
-            // `$name$` expect-emit form the goldens spell as `$result_0$` / `$one_r1$`
-            // (`local_ref_var_name`). A let whose value is a hoisted `ɵɵpureFunctionN` / pipe-bind
-            // *result temp* takes the `<name>_r<id>` view-ref form the goldens pin literally as
-            // `simple_r1` (`fresh_reference_name`).
-            let local_name = if is_pure_function_result(&value) {
-                fresh_reference_name(&decl.name, self.var_counter)
-            } else {
-                local_ref_var_name(&decl.name, self.var_counter)
-            };
+            // Angular's compliance goldens spell EVERY `@let`'s in-view binding const with the
+            // renamable `$<name>_<index>$` expect-emit placeholder (`$result_0$`, `$one_0$`,
+            // `$result_1$`) — including a let whose value is a hoisted `ɵɵpureFunctionN`/pipe-bind
+            // result temp (`let_with_pipe`: `const $result_1$ = ɵɵpipeBind1(1, 1, $one_0$)`). Always
+            // use the `$name$` (`local_ref_var_name`) form; the `_r<id>` view-ref scheme is reserved
+            // for loop variables, not `@let` identifiers.
+            let local_name = local_ref_var_name(&decl.name, self.var_counter);
             self.update_code.push(Stmt::with_modifiers(
                 StmtKind::DeclareVar {
                     name: local_name.clone(),
@@ -4332,6 +4399,12 @@ fn let_used_in_view(nodes: &[Node], decl_index: usize, name: &str) -> bool {
 fn same_view_node_references(node: &Node, name: &str) -> bool {
     match node {
         Node::BoundText(bt) => expr_references_implicit(&bt.value, name),
+        // A `@let other = … name …;` initializer evaluates in this view and reads `name`. Without
+        // this arm an `@let` consumed only by another `@let` in a descendant view (e.g.
+        // `@let two = one + 1;` inside an `@if`, reading the parent's `@let one`) would be missed by
+        // the cross-view analysis, so the parent let would not be hoisted (`ɵɵdeclareLet`/`storeLet`
+        // dropped) and a stray bare `1;` statement would remain.
+        Node::LetDeclaration(l) => expr_references_implicit(&l.value, name),
         Node::Element(el) => {
             el.inputs.iter().any(|i| expr_references_implicit(&i.value, name))
                 || el.directives.iter().any(|d| {
@@ -6362,22 +6435,26 @@ mod tests {
         let func = builder.build_template_function(&input);
         let out = emit_expression(&func);
 
-        // `projectionDef(0)` references the interned selector array const. The default slot emits
-        // `ɵɵprojection(0)` (index elided) and the named slot `ɵɵprojection(1, 1)`. `ɵɵprojection` is
-        // NOT in Angular's `CHAIN_COMPATIBILITY` map, so the two adjacent projection create ops stay
-        // as SEPARATE statements (faithful to Angular's `content_projection` goldens, which emit
-        // `ɵɵprojection(0); ɵɵprojection(1, 1);` un-chained).
-        assert!(out.contains("\u{0275}\u{0275}projectionDef(0)"), "got: {out}");
+        // `projectionDef($c0$)` references the SHARED-pool selector array (Angular
+        // `generateProjectionDefs` → `getConstLiteral(asLiteral(parsed), true)`), NOT a `consts:`
+        // index. The default slot emits `ɵɵprojection(0)` (index elided) and the named slot
+        // `ɵɵprojection(1, 1)`. `ɵɵprojection` is NOT in Angular's `CHAIN_COMPATIBILITY` map, so the
+        // two adjacent projection create ops stay as SEPARATE statements (faithful to Angular's
+        // `content_projection` goldens, which emit `ɵɵprojection(0); ɵɵprojection(1, 1);` un-chained).
+        assert!(out.contains("\u{0275}\u{0275}projectionDef($c0$)"), "got: {out}");
         assert!(out.contains("\u{0275}\u{0275}projection(0)"), "got: {out}");
         assert!(out.contains("\u{0275}\u{0275}projection(1, 1)"), "got: {out}");
         assert!(!out.contains("\u{0275}\u{0275}projection(0)(1, 1)"), "got: {out}");
-        // The const pool holds the specific-selector list.
-        let consts = builder
-            .const_pool()
-            .to_const_array()
-            .map(|e| emit_expression(&e))
-            .unwrap_or_default();
-        assert!(consts.contains("\"header\""), "got consts: {consts}");
+        // The parsed selector array is hoisted as a top-level shared `const $c0$ = [...]`, NOT pushed
+        // into the per-template `consts:` pool.
+        assert!(
+            builder.const_pool().is_empty(),
+            "selectors must not be in consts:, got: {:?}",
+            builder.const_pool().entries()
+        );
+        let hoisted = crate::output::emitter::emit_statements(builder.hoisted_functions());
+        assert!(hoisted.contains("$c0$"), "missing shared const decl, got: {hoisted}");
+        assert!(hoisted.contains("\"header\""), "got hoisted: {hoisted}");
     }
 
     #[test]

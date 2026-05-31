@@ -188,6 +188,15 @@ impl<'a> Lowerer<'a> {
             body,
         );
         let code = Codegen::new().build(&program).code;
+        // Two value-preserving text post-passes over the printed source, each of
+        // which skips string / template / comment (/ regex) spans so only real code
+        // tokens are touched:
+        //  1. `normalize_numeric_literals` undoes oxc_codegen's scientific re-spelling
+        //     of round numbers (`1000` -> `1e3`), restoring the plain decimal form
+        //     Angular's TypeScript printer always emits.
+        //  2. `drop_single_param_arrow_parens` strips the redundant parens oxc puts
+        //     around a lone simple arrow parameter (`(x) =>` -> `x =>`).
+        let code = normalize_numeric_literals(&code);
         drop_single_param_arrow_parens(&code)
     }
 
