@@ -492,11 +492,10 @@ pub(crate) fn install<'gc>(
         InstallError::Nova(format!("failed to parse node:events source: {message}"))
     })?;
 
-    // Evaluate; the completion value is the `EventEmitter` constructor object.
-    let value = script_evaluation(agent, script.unbind(), gc.reborrow())
-        .unbind()
-        .bind(gc.nogc());
-    let value = match value {
+    // Evaluate; the completion value is the `EventEmitter` constructor object. On an abrupt
+    // completion, read the thrown value's string representation (with the still-active `gc`) for the
+    // error message — never panic. The `?`-free match keeps every borrow of `gc` confined to its arm.
+    let value = match script_evaluation(agent, script.unbind(), gc.reborrow()).unbind() {
         Ok(value) => value,
         Err(error) => {
             let message = error
@@ -511,8 +510,10 @@ pub(crate) fn install<'gc>(
         }
     };
 
-    // The IIFE always completes with the constructor object; defend the contract anyway. `value` is
-    // bound to `'gc`, so the produced `Object` carries the function's return lifetime directly.
+    // Rebind the completion value to the function's own `'gc` scope (consuming `gc`), then narrow it
+    // to an `Object`. The IIFE always completes with the constructor object; defend the contract
+    // anyway so a future edit to the source can only return an error, never produce a bad value.
+    let value = value.bind(gc.into_nogc());
     Object::try_from(value).map_err(|_| {
         InstallError::Nova("node:events source did not produce an exports object".to_owned())
     })

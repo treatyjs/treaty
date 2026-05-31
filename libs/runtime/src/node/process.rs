@@ -20,8 +20,11 @@
 //! round-trip. The runtime is single-threaded (one realm per OS thread), so a `thread_local!` is
 //! the correct, lock-free home for it.
 //!
-//! NO `unsafe` lives in this file: the single Node-layer `unsafe` is the documented Nova FFI
-//! lifetime extension in `core.rs`. Everything here is safe Rust over Nova's public API.
+//! NO `unsafe` lives in this module's production code: the single Node-layer `unsafe` is the
+//! documented Nova FFI lifetime extension in `core.rs` (`extend_lifetime`). The only place it appears
+//! below is the `#[cfg(test)]` harness, which reuses that very primitive to stand up an agent exactly
+//! as `JsRuntime::with_node_compat` does. All process functionality here is safe Rust over Nova's
+//! public API.
 
 use std::cell::Cell;
 
@@ -30,16 +33,16 @@ use nova_vm::ecmascript::{
     InternalMethods, JsResult, Number, Object, OrdinaryObject, PropertyDescriptor, PropertyKey,
     Value, create_builtin_function, unwrap_try,
 };
-use nova_vm::engine::Bindable;
+use nova_vm::engine::{Bindable, Scopable};
 
 use crate::node::core::{InstallError, NodeCtx, host_state};
 use crate::node::{GcScope, NodeModule};
 
-/// Process-global mutable state Node lets scripts change after start-up.
-///
-/// `exit_code` backs `process.exitCode` / the argument to `process.exit()`. It is a plain `Cell`
-/// (no atomics, no lock): the runtime is single-threaded per realm, so this is both correct and the
-/// lowest-overhead store. It starts at `0` (Node's default success code).
+// Process-global mutable state Node lets scripts change after start-up.
+//
+// `EXIT_CODE` backs `process.exitCode` / the argument to `process.exit()`. It is a plain `Cell`
+// (no atomics, no lock): the runtime is single-threaded per realm, so this is both correct and the
+// lowest-overhead store. It starts at `0` (Node's default success code).
 thread_local! {
     static EXIT_CODE: Cell<i32> = const { Cell::new(0) };
 }
@@ -114,7 +117,7 @@ fn define_fn(
     unwrap_try(obj.try_define_own_property(
         agent,
         key,
-        PropertyDescriptor::new_data_descriptor(function.into()),
+        PropertyDescriptor::new_data_descriptor(function),
         None,
         gc,
     ));
@@ -170,24 +173,15 @@ pub(crate) fn install<'gc>(
     define_str(agent, obj, "arch", node_arch(), gc);
     define_str(agent, obj, "version", NODE_API_VERSION, gc);
     define_str(agent, obj, "title", "treaty", gc);
-    define_value(
-        agent,
-        obj,
-        "pid",
-        Number::from_i64(agent, i64::from(std::process::id()), gc).into(),
-        gc,
-    );
+    let pid = Number::from_i64(agent, i64::from(std::process::id()), gc).into();
+    define_value(agent, obj, "pid", pid, gc);
     // Node exposes `ppid`; we have no portable parent pid, so report 0 (a documented, safe stand-in
     // that scripts treat as "unknown / detached").
-    define_value(agent, obj, "ppid", Number::from_i64(agent, 0, gc).into(), gc);
+    let ppid = Number::from_i64(agent, 0, gc).into();
+    define_value(agent, obj, "ppid", ppid, gc);
     // `exitCode` reflects the thread-local; initialized to its current value (0 at start-up).
-    define_value(
-        agent,
-        obj,
-        "exitCode",
-        Number::from_i64(agent, i64::from(EXIT_CODE.with(Cell::get)), gc).into(),
-        gc,
-    );
+    let exit_code = Number::from_i64(agent, i64::from(EXIT_CODE.with(Cell::get)), gc).into();
+    define_value(agent, obj, "exitCode", exit_code, gc);
 
     // --- argv / argv0 / execPath ----------------------------------------------------------
     // Node's argv is `[execPath, scriptPath, ...userArgs]`. Treaty embeds the engine, so there is no
@@ -388,137 +382,148 @@ fn process_next_tick<'gc>(
     args: ArgumentsList,
     mut gc: GcScope<'gc, '_>,
 ) -> JsResult<'gc, Value<'gc>> {
-    let callback = args.get(0).bind(gc.nogc());
-    let Ok(callback) = Function::try_from(callback) else {
+    let Ok(callback) = Function::try_from(args.get(0).bind(gc.nogc())) else {
         return Err(agent.throw_exception_with_static_message(
             ExceptionType::TypeError,
             "The \"callback\" argument must be of type function",
             gc.into_nogc(),
         ));
     };
+    // Root the callback across the get/call steps below (each may move the heap).
+    let callback = callback.scope(agent, gc.nogc());
 
-    // Pre-bind any trailing args: `bound = callback.bind(undefined, ...rest)`.
-    let bound: Function = if args.len() > 1 {
-        bind_callback(agent, callback.unbind(), &args, gc.reborrow())?
-            .unbind()
-            .bind(gc.nogc())
+    // Pre-bind any trailing args so they are forwarded to the callback (Node semantics):
+    // `bound = callback.bind(undefined, ...rest)`. With no extra args the callback is used directly.
+    let bound = if args.len() > 1 {
+        let cb = callback.get(agent);
+        let bound = bind_callback(agent, cb, &args, gc.reborrow()).unbind()?;
+        bound.scope(agent, gc.nogc())
     } else {
-        callback
+        callback.clone()
     };
 
-    // `Promise.resolve()` -> `.then(bound)`. We read `Promise` from the realm global, resolve, then
-    // invoke its `then` with the bound reaction. The reaction is enqueued as a microtask by the
-    // engine; nothing runs synchronously here.
-    let promise = resolved_promise(agent, gc.reborrow())?
-        .unbind()
-        .bind(gc.nogc());
-    let then_key = PropertyKey::from_static_str(agent, "then", gc.nogc());
-    let then_fn = promise
-        .unbind()
-        .internal_get(agent, then_key.unbind(), promise.unbind().into(), gc.reborrow())?
-        .unbind()
-        .bind(gc.nogc());
-    let Ok(then_fn) = Function::try_from(then_fn) else {
-        return Err(agent.throw_exception_with_static_message(
-            ExceptionType::TypeError,
-            "Promise.prototype.then is not callable",
-            gc.into_nogc(),
-        ));
-    };
-    then_fn.unbind().call(
-        agent,
-        promise.unbind().into(),
-        &mut [bound.unbind().into()],
-        gc,
-    )?;
+    // `Promise.resolve()` produces a settled promise; `.then(bound)` enqueues `bound` as a microtask
+    // via the engine's promise machinery (routed to our event loop through `enqueue_promise_job`).
+    let promise = resolved_promise(agent, gc.reborrow()).unbind()?;
+    let promise = promise.scope(agent, gc.nogc());
+
+    let then_obj = promise.get(agent).into();
+    let then_fn = get_callable(agent, then_obj, "then", gc.reborrow()).unbind()?;
+    let this = promise.get(agent).into();
+    then_fn.call(agent, this, &mut [bound.get(agent).into()], gc)?;
     Ok(Value::Undefined)
 }
 
-/// `callback.bind(undefined, ...args[1..])` — partial-apply the trailing nextTick arguments.
+/// `callback.bind(undefined, ...args[1..])` — partial-apply the trailing `nextTick` arguments.
 fn bind_callback<'gc>(
     agent: &mut Agent,
     callback: Function,
     args: &ArgumentsList,
     mut gc: GcScope<'gc, '_>,
 ) -> JsResult<'gc, Function<'gc>> {
-    let bind_key = PropertyKey::from_static_str(agent, "bind", gc.nogc());
-    let callback_obj: Object = callback.into();
-    let bind_fn = callback_obj
-        .internal_get(agent, bind_key.unbind(), callback.into(), gc.reborrow())?
-        .unbind()
-        .bind(gc.nogc());
-    let Ok(bind_fn) = Function::try_from(bind_fn) else {
-        return Err(agent.throw_exception_with_static_message(
-            ExceptionType::TypeError,
-            "callback.bind is not a function",
-            gc.into_nogc(),
-        ));
-    };
+    let callback = callback.scope(agent, gc.nogc());
+    let bind_obj = callback.get(agent).into();
+    let bind_fn = get_callable(agent, bind_obj, "bind", gc.reborrow()).unbind()?;
+    let bind_fn = bind_fn.scope(agent, gc.nogc());
     // bind args: [thisArg=undefined, arg1, arg2, ...].
     let mut bind_args: Vec<Value> = Vec::with_capacity(args.len());
     bind_args.push(Value::Undefined);
     for i in 1..args.len() {
-        bind_args.push(args.get(i));
+        bind_args.push(args.get(i).unbind());
     }
+    let this = callback.get(agent).into();
     let bound = bind_fn
-        .unbind()
-        .call(agent, callback.into(), &mut bind_args, gc.reborrow())?;
-    // `Function.prototype.bind` always returns a function; guard defensively and throw rather than
-    // panic if a hostile global replaced `bind`.
-    Function::try_from(bound.unbind()).map_err(|_| {
+        .get(agent)
+        .call(agent, this, &mut bind_args, gc.reborrow())
+        .unbind()?;
+    // `Function.prototype.bind` always returns a function; guard defensively rather than panic.
+    let nogc = gc.into_nogc();
+    Function::try_from(bound.bind(nogc)).map_err(|_| {
         agent.throw_exception_with_static_message(
             ExceptionType::TypeError,
             "callback.bind did not return a function",
-            gc.into_nogc(),
+            nogc,
         )
     })
 }
 
-/// Build a resolved promise via the realm's `Promise.resolve()`.
+/// Build a settled promise via the realm's `Promise.resolve(undefined)`.
 fn resolved_promise<'gc>(
     agent: &mut Agent,
     mut gc: GcScope<'gc, '_>,
 ) -> JsResult<'gc, Object<'gc>> {
-    let global = agent.current_realm(gc.nogc()).global_object(agent);
-    let promise_key = PropertyKey::from_static_str(agent, "Promise", gc.nogc());
-    let promise_ctor = global
-        .unbind()
-        .internal_get(agent, promise_key.unbind(), global.unbind().into(), gc.reborrow())?
-        .unbind()
-        .bind(gc.nogc());
-    let Ok(promise_ctor) = Object::try_from(promise_ctor) else {
-        return Err(agent.throw_exception_with_static_message(
-            ExceptionType::TypeError,
-            "Promise is not available in this realm",
-            gc.into_nogc(),
-        ));
-    };
-    let resolve_key = PropertyKey::from_static_str(agent, "resolve", gc.nogc());
-    let resolve_fn = promise_ctor
-        .unbind()
-        .internal_get(agent, resolve_key.unbind(), promise_ctor.unbind().into(), gc.reborrow())?
-        .unbind()
-        .bind(gc.nogc());
-    let Ok(resolve_fn) = Function::try_from(resolve_fn) else {
-        return Err(agent.throw_exception_with_static_message(
-            ExceptionType::TypeError,
-            "Promise.resolve is not callable",
-            gc.into_nogc(),
-        ));
-    };
-    let promise = resolve_fn.unbind().call(
-        agent,
-        promise_ctor.unbind().into(),
-        &mut [Value::Undefined],
-        gc.reborrow(),
-    )?;
-    Object::try_from(promise.unbind()).map_err(|_| {
+    let global = agent
+        .current_realm(gc.nogc())
+        .global_object(agent)
+        .scope(agent, gc.nogc());
+    let global_obj = global.get(agent).into();
+    let promise_ctor = get_object(agent, global_obj, "Promise", gc.reborrow()).unbind()?;
+    let promise_ctor = promise_ctor.scope(agent, gc.nogc());
+    let ctor_obj = promise_ctor.get(agent).into();
+    let resolve_fn = get_callable(agent, ctor_obj, "resolve", gc.reborrow()).unbind()?;
+    let resolve_fn = resolve_fn.scope(agent, gc.nogc());
+    let this = promise_ctor.get(agent).into();
+    let promise = resolve_fn
+        .get(agent)
+        .call(agent, this, &mut [Value::Undefined], gc.reborrow())
+        .unbind()?;
+    let nogc = gc.into_nogc();
+    Object::try_from(promise.bind(nogc)).map_err(|_| {
         agent.throw_exception_with_static_message(
             ExceptionType::TypeError,
             "Promise.resolve did not return an object",
-            gc.into_nogc(),
+            nogc,
         )
     })
+}
+
+/// Read property `name` off `obj` and require it to be callable, returning it as a [`Function`].
+fn get_callable<'gc>(
+    agent: &mut Agent,
+    obj: Object,
+    name: &'static str,
+    mut gc: GcScope<'gc, '_>,
+) -> JsResult<'gc, Function<'gc>> {
+    let value = get_property(agent, obj, name, gc.reborrow()).unbind()?;
+    let nogc = gc.into_nogc();
+    Function::try_from(value.bind(nogc)).map_err(|_| {
+        agent.throw_exception_with_static_message(
+            ExceptionType::TypeError,
+            "expected a callable property",
+            nogc,
+        )
+    })
+}
+
+/// Read property `name` off `obj` and require it to be an object.
+fn get_object<'gc>(
+    agent: &mut Agent,
+    obj: Object,
+    name: &'static str,
+    mut gc: GcScope<'gc, '_>,
+) -> JsResult<'gc, Object<'gc>> {
+    let value = get_property(agent, obj, name, gc.reborrow()).unbind()?;
+    let nogc = gc.into_nogc();
+    Object::try_from(value.bind(nogc)).map_err(|_| {
+        agent.throw_exception_with_static_message(
+            ExceptionType::TypeError,
+            "expected an object property",
+            nogc,
+        )
+    })
+}
+
+/// `obj[name]` via the object's `[[Get]]`, with `obj` itself as the receiver.
+fn get_property<'gc>(
+    agent: &mut Agent,
+    obj: Object,
+    name: &'static str,
+    gc: GcScope<'gc, '_>,
+) -> JsResult<'gc, Value<'gc>> {
+    let obj = obj.scope(agent, gc.nogc());
+    let key = PropertyKey::from_static_str(agent, name, gc.nogc()).unbind();
+    let receiver = obj.get(agent).into();
+    obj.get(agent).unbind().internal_get(agent, key, receiver, gc)
 }
 
 /// `process.hrtime([prev])` — high-resolution real time as `[seconds, nanoseconds]`.
@@ -530,18 +535,20 @@ fn process_hrtime<'gc>(
     agent: &mut Agent,
     _this: Value,
     args: ArgumentsList,
-    gc: GcScope<'gc, '_>,
+    mut gc: GcScope<'gc, '_>,
 ) -> JsResult<'gc, Value<'gc>> {
-    let gc = gc.into_nogc();
-    let args = args.bind(gc);
+    let prev = Array::try_from(args.get(0).bind(gc.nogc())).ok();
 
     let total_nanos = HR_START.with(|s| s.elapsed().as_nanos());
-    let (mut secs, mut nanos) = ((total_nanos / 1_000_000_000) as i64, (total_nanos % 1_000_000_000) as i64);
+    let mut secs = (total_nanos / 1_000_000_000) as i64;
+    let mut nanos = (total_nanos % 1_000_000_000) as i64;
 
-    // Optional `prev` diff: read elements [0] and [1] of the passed array, treating them as numbers.
-    if let Ok(prev) = Array::try_from(args.get(0)) {
-        let prev_secs = read_array_index_as_i64(agent, prev, 0, gc);
-        let prev_nanos = read_array_index_as_i64(agent, prev, 1, gc);
+    // Optional `prev` diff: read elements [0] and [1] of the passed array as numbers, while a full
+    // `GcScope` is still available (index reads may invoke getters in the general case).
+    if let Some(prev) = prev {
+        let prev = prev.unbind();
+        let prev_secs = read_index_as_i64(agent, prev, 0, gc.reborrow()).unbind()?;
+        let prev_nanos = read_index_as_i64(agent, prev, 1, gc.reborrow()).unbind()?;
         let mut diff_secs = secs - prev_secs;
         let mut diff_nanos = nanos - prev_nanos;
         if diff_nanos < 0 {
@@ -552,6 +559,7 @@ fn process_hrtime<'gc>(
         nanos = diff_nanos;
     }
 
+    let gc = gc.into_nogc();
     let elements = [
         Number::from_i64(agent, secs, gc).into(),
         Number::from_i64(agent, nanos, gc).into(),
@@ -559,23 +567,22 @@ fn process_hrtime<'gc>(
     Ok(Array::from_slice(agent, &elements, gc).into())
 }
 
-/// Read element `index` of `array` coerced to an `i64` (0 when absent / non-numeric). Used to parse
-/// the optional `prev` argument of `process.hrtime` without allocating.
-fn read_array_index_as_i64(
+/// Read element `index` of `array`, coerced to an `i64` (0 when absent / non-numeric). Parses the
+/// optional `prev` argument of `process.hrtime`.
+fn read_index_as_i64<'gc>(
     agent: &mut Agent,
     array: Array,
     index: u32,
-    gc: nova_vm::engine::NoGcScope,
-) -> i64 {
+    gc: GcScope<'gc, '_>,
+) -> JsResult<'gc, i64> {
     let key = PropertyKey::from(index);
-    match array.try_get(agent, key, array.into(), None, gc) {
-        nova_vm::engine::TryResult::Continue(result) => match result.into_value() {
-            Value::Integer(i) => i.into_i64(),
-            Value::SmallF64(f) => f.into_f64() as i64,
-            _ => 0,
-        },
+    let receiver = array.unbind().into();
+    let value = array.unbind().internal_get(agent, key, receiver, gc)?;
+    Ok(match value {
+        Value::Integer(i) => i.into_i64(),
+        Value::SmallF64(f) => f.into_f64() as i64,
         _ => 0,
-    }
+    })
 }
 
 thread_local! {

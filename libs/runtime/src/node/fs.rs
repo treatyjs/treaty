@@ -32,13 +32,13 @@
 //! * **`fd`-based calls** (`openSync`/`readSync`/`writeSync`/`closeSync`) and **watchers**
 //!   (`watch`/`watchFile`) — out of scope for the first synchronous core.
 
-use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use nova_vm::ecmascript::{
-    Agent, ArgumentsList, ExceptionType, InternalMethods, JsResult, Number, Object, OrdinaryObject,
-    PropertyDescriptor, PropertyKey, String as JsString, TryGetResult, Value, unwrap_try,
+    Agent, ArgumentsList, Array, ExceptionType, InternalMethods, JsError, JsResult, Number, Object,
+    OrdinaryObject, PropertyDescriptor, PropertyKey, String as JsString, TryGetResult, Value,
+    unwrap_try,
 };
 use nova_vm::engine::{Bindable, GcScope, NoGcScope};
 
@@ -126,24 +126,23 @@ fn arg_path<'a>(
     Ok(PathBuf::from(s.to_string_lossy(agent).into_owned()))
 }
 
-/// Borrow argument `index` as a `&str` if it is a JS string, else `None`. Zero-allocation when the
-/// string is already a plain UTF-8 `SmallString`/`String` (the common case); falls back to an owned
-/// `Cow` only for strings containing lone surrogates.
-fn arg_opt_str<'agent>(
-    agent: &'agent Agent,
-    args: &ArgumentsList,
-    index: usize,
-) -> Option<Cow<'agent, str>> {
+/// Read argument `index` as an owned UTF-8 `String` if it is a JS string, else `None`.
+///
+/// Returns an owned `String` rather than a borrow because Nova's `String::to_string_lossy` ties its
+/// `Cow` to the `&self` JS-string handle (a local here), so a borrow could not outlive this call.
+/// The values this reads (file contents to write, encoding names) are short-lived and not on a hot
+/// path, so the single owning allocation is negligible; the read itself is one pass over the bytes.
+fn arg_opt_string(agent: &Agent, args: &ArgumentsList, index: usize) -> Option<String> {
     JsString::try_from(args.get(index))
         .ok()
-        .map(|s| s.to_string_lossy(agent))
+        .map(|s| s.to_string_lossy(agent).into_owned())
 }
 
 /// True when argument `index` is a JS string equal (ASCII-case-insensitively) to a UTF-8 encoding
 /// name. Node treats `'utf8'` and `'utf-8'` as the canonical text encodings.
 fn arg_is_utf8(agent: &Agent, args: &ArgumentsList, index: usize) -> bool {
     matches!(
-        arg_opt_str(agent, args, index).as_deref(),
+        arg_opt_string(agent, args, index).as_deref(),
         Some(e) if e.eq_ignore_ascii_case("utf8") || e.eq_ignore_ascii_case("utf-8")
     )
 }
@@ -157,11 +156,7 @@ fn arg_is_true(args: &ArgumentsList, index: usize) -> bool {
 // --- error mapping ----------------------------------------------------------------------------
 
 /// A Node-style `TypeError` for a bad path/argument.
-fn type_error<'a>(
-    agent: &mut Agent,
-    label: &'static str,
-    gc: NoGcScope<'a, '_>,
-) -> nova_vm::ecmascript::JsError<'a> {
+fn type_error<'a>(agent: &mut Agent, label: &'static str, gc: NoGcScope<'a, '_>) -> JsError<'a> {
     agent.throw_exception(
         ExceptionType::TypeError,
         format!("The \"{label}\" argument must be a string"),
@@ -177,7 +172,7 @@ fn io_error<'a>(
     syscall: &str,
     path: &Path,
     gc: NoGcScope<'a, '_>,
-) -> nova_vm::ecmascript::JsError<'a> {
+) -> JsError<'a> {
     let code = errno_code(err);
     let message = format!("{code}: {err}, {syscall} '{}'", path.display());
     // `throw_exception` builds the Error object and returns a (Copy) JsError; capture the thrown
@@ -230,7 +225,7 @@ fn define_number(
     unwrap_try(obj.try_define_own_property(
         agent,
         key,
-        PropertyDescriptor::new_data_descriptor(number.into_value()),
+        PropertyDescriptor::new_data_descriptor(Value::from(number)),
         None,
         gc,
     ));
@@ -357,8 +352,7 @@ fn read_file_sync<'gc>(
             // Decode as UTF-8. `from_utf8_lossy` borrows when the bytes are already valid UTF-8
             // (zero-copy, the common case for text files), allocating only on invalid input.
             let text = String::from_utf8_lossy(&bytes);
-            let js = JsString::from_str(agent, text.as_ref(), gc);
-            Ok(js.into_value())
+            Ok(Value::from(JsString::from_str(agent, text.as_ref(), gc)))
         }
         Err(e) => Err(io_error(agent, &e, "open", &path, gc)),
     }
@@ -373,9 +367,7 @@ fn write_file_sync<'gc>(
     let gc = gc.into_nogc();
     let args = args.bind(gc);
     let path = arg_path(agent, &args, 0, "path", gc)?;
-    let data = arg_opt_str(agent, &args, 1)
-        .map(Cow::into_owned)
-        .unwrap_or_default();
+    let data = arg_opt_string(agent, &args, 1).unwrap_or_default();
     match std::fs::write(&path, data.as_bytes()) {
         Ok(()) => Ok(Value::Undefined),
         Err(e) => Err(io_error(agent, &e, "open", &path, gc)),
@@ -392,9 +384,7 @@ fn append_file_sync<'gc>(
     let gc = gc.into_nogc();
     let args = args.bind(gc);
     let path = arg_path(agent, &args, 0, "path", gc)?;
-    let data = arg_opt_str(agent, &args, 1)
-        .map(Cow::into_owned)
-        .unwrap_or_default();
+    let data = arg_opt_string(agent, &args, 1).unwrap_or_default();
     let open = std::fs::OpenOptions::new().create(true).append(true).open(&path);
     match open.and_then(|mut f| f.write_all(data.as_bytes())) {
         Ok(()) => Ok(Value::Undefined),
@@ -533,14 +523,13 @@ fn readdir_sync<'gc>(
             Ok(e) => {
                 let name = e.file_name();
                 let name = name.to_string_lossy();
-                names.push(JsString::from_str(agent, name.as_ref(), gc).into_value());
+                names.push(Value::from(JsString::from_str(agent, name.as_ref(), gc)));
             }
             Err(e) => return Err(io_error(agent, &e, "scandir", &path, gc)),
         }
     }
 
-    let array = nova_vm::ecmascript::Array::from_slice(agent, &names, gc);
-    Ok(array.into_value())
+    Ok(Value::from(Array::from_slice(agent, &names, gc)))
 }
 
 fn rename_sync<'gc>(
@@ -587,7 +576,7 @@ fn realpath_sync<'gc>(
     match std::fs::canonicalize(&path) {
         Ok(real) => {
             let s = real.to_string_lossy();
-            Ok(JsString::from_str(agent, s.as_ref(), gc).into_value())
+            Ok(Value::from(JsString::from_str(agent, s.as_ref(), gc)))
         }
         Err(e) => Err(io_error(agent, &e, "lstat", &path, gc)),
     }
@@ -621,7 +610,7 @@ fn stat_sync<'gc>(
     let args = args.bind(gc);
     let path = arg_path(agent, &args, 0, "path", gc)?;
     match std::fs::metadata(&path) {
-        Ok(meta) => Ok(build_stats(agent, &meta, gc).into_value()),
+        Ok(meta) => Ok(Value::from(build_stats(agent, &meta, gc))),
         Err(e) => Err(io_error(agent, &e, "stat", &path, gc)),
     }
 }
@@ -637,7 +626,7 @@ fn lstat_sync<'gc>(
     let path = arg_path(agent, &args, 0, "path", gc)?;
     // `lstat` does not follow symlinks: `symlink_metadata` is the matching std call.
     match std::fs::symlink_metadata(&path) {
-        Ok(meta) => Ok(build_stats(agent, &meta, gc).into_value()),
+        Ok(meta) => Ok(Value::from(build_stats(agent, &meta, gc))),
         Err(e) => Err(io_error(agent, &e, "lstat", &path, gc)),
     }
 }

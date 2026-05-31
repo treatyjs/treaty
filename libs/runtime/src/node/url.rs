@@ -28,9 +28,11 @@
 
 use std::borrow::Cow;
 
+use std::ops::ControlFlow;
+
 use nova_vm::ecmascript::{
     Agent, ArgumentsList, ExceptionType, InternalMethods, JsResult, Object, OrdinaryObject,
-    PropertyDescriptor, PropertyKey, RegularFn, String as JsString, Value, unwrap_try,
+    PropertyDescriptor, PropertyKey, RegularFn, String as JsString, TryGetResult, Value, unwrap_try,
 };
 use nova_vm::engine::NoGcScope;
 
@@ -498,6 +500,26 @@ mod js {
         ));
     }
 
+    /// Read own/inherited data property `name` off `obj` as an owned string, without entering a GC
+    /// scope. Used by `url.format` to read the components object. Returns `None` for an absent
+    /// property, a non-string value, or anything that would require calling a getter/Proxy trap (we
+    /// only consult plain data properties — sufficient for the legacy-`Url`-shaped objects Node and
+    /// `parse` produce, and keeps this allocation-light and GC-free).
+    fn read_str_prop(
+        agent: &mut Agent,
+        obj: Object,
+        name: &'static str,
+        gc: NoGcScope,
+    ) -> Option<String> {
+        let key = PropertyKey::from_static_str(agent, name, gc);
+        match obj.try_get(agent, key, obj.into(), None, gc) {
+            ControlFlow::Continue(TryGetResult::Value(v)) => {
+                JsString::try_from(v).ok().map(|s| s.to_string_lossy(agent).into_owned())
+            }
+            _ => None,
+        }
+    }
+
     pub(super) fn file_url_to_path<'gc>(
         agent: &mut Agent,
         _this: Value,
@@ -623,19 +645,13 @@ mod js {
         let Ok(obj) = Object::try_from(value) else {
             return type_error(agent, "The \"urlObject\" argument must be an object or string", gc);
         };
-
-        let read = |agent: &mut Agent, name: &'static str, gc: GcScope<'gc, '_>| -> Option<String> {
-            let key = PropertyKey::from_static_str(agent, name, gc.into_nogc());
-            let v = obj.get(agent, key, gc).ok()?;
-            JsString::try_from(v).ok().map(|s| s.to_string_lossy(agent).into_owned())
-        };
-
-        let protocol = read(agent, "protocol", gc).unwrap_or_default();
-        let hostname = read(agent, "hostname", gc).or_else(|| read(agent, "host", gc));
-        let port = read(agent, "port", gc);
-        let pathname = read(agent, "pathname", gc).unwrap_or_default();
-        let search = read(agent, "search", gc);
-        let hash = read(agent, "hash", gc);
+        let protocol = read_str_prop(agent, obj, "protocol", gc.nogc()).unwrap_or_default();
+        let hostname = read_str_prop(agent, obj, "hostname", gc.nogc())
+            .or_else(|| read_str_prop(agent, obj, "host", gc.nogc()));
+        let port = read_str_prop(agent, obj, "port", gc.nogc());
+        let pathname = read_str_prop(agent, obj, "pathname", gc.nogc()).unwrap_or_default();
+        let search = read_str_prop(agent, obj, "search", gc.nogc());
+        let hash = read_str_prop(agent, obj, "hash", gc.nogc());
 
         let mut out = String::new();
         if !protocol.is_empty() {

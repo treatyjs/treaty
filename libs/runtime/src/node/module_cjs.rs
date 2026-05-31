@@ -39,8 +39,6 @@
 //! file case so callers fail loudly rather than silently. Builtin `require` (the dominant path for
 //! the macro / server-fn runtime) is complete.
 
-use std::borrow::Cow;
-
 use nova_vm::ecmascript::{
     Agent, ArgumentsList, Behaviour, BuiltinFunctionArgs, ExceptionType, InternalMethods, JsResult,
     Object, OrdinaryObject, PropertyDescriptor, PropertyKey, String as JsString, Value,
@@ -61,13 +59,14 @@ const REQUIRE_ARITY: u32 = 1;
 /// exports object via the module's lazy `install`) but holds no `unsafe`: rooting goes through the
 /// safe [`Global`] API and the `&'static str` builtin key keeps the cache allocation-free.
 ///
-/// The shared-vs-mutable borrow split is handled by *phasing* the work, exactly as the leaf builtins
-/// do (e.g. `path::resolve` reads `cwd` off [`NodeCtx`] before taking `&mut Agent`): a [`NodeCtx`]
-/// borrows `&Agent`, so it is recovered, used, and dropped *within* each phase and never held across
-/// the `&mut Agent` calls that build the module. No `unsafe`, no held aliasing borrow.
+/// `ctx` borrows the runtime's [`crate::node::core::HostState`], which is owned by the JsRuntime's
+/// box and lives independently of the `&mut Agent`; the two reference disjoint memory (the host-side
+/// resolver + `RefCell` caches vs. the Nova heap), so they coexist without aliasing and without a
+/// held-borrow conflict. The caller ([`require`]) is responsible for handing in such a decoupled
+/// `ctx` (see its FFI-boundary note).
 ///
-/// * On a [`LoadAction::Builtin`] cache hit, the rooted exports object is returned with no
-///   allocation beyond cloning the cheap `Global` handle.
+/// * On a [`LoadAction::Builtin`] cache hit, the rooted exports object is resolved to the caller's
+///   scope and returned with no allocation.
 /// * On a builtin cache miss, the module's `install` runs once, the result is rooted into the
 ///   builtin cache, and the same object is returned. Subsequent calls hit the cache.
 /// * A [`LoadAction::File`] returns [`InstallError::Resolve`] — user-file CJS evaluation is the
@@ -89,11 +88,14 @@ pub(crate) fn require_specifier<'gc>(
 
     match action {
         LoadAction::Builtin { specifier: canonical, install } => {
-            // Cache hit: return the rooted exports object resolved to the current scope. Cloning the
-            // `Global` handle is cheap; the borrow on the cache is released before `get`.
-            let cached = ctx.builtin_cache().borrow().get(canonical).cloned();
-            if let Some(handle) = cached {
-                return Ok(handle.get(agent, gc.nogc()));
+            // Cache hit: resolve the rooted handle to a live object in the current scope. `Global` is
+            // not `Clone`, so we read it through the `RefCell` borrow directly — sound because the
+            // borrow is over the cache (`&HostState`), disjoint from the `&mut Agent` `get` needs.
+            {
+                let cache = ctx.builtin_cache().borrow();
+                if let Some(handle) = cache.get(canonical) {
+                    return Ok(handle.get(agent, gc.nogc()));
+                }
             }
 
             // Miss: build the exports object exactly once via the module's lazy `install`, then root
@@ -131,9 +133,11 @@ pub(crate) fn require<'gc>(
     args: ArgumentsList,
     mut gc: GcScope<'gc, '_>,
 ) -> JsResult<'gc, Value<'gc>> {
-    // Argument validation first (Node throws `TypeError` for a non-string specifier).
-    let specifier: Cow<'_, str> = match JsString::try_from(args.get(0)) {
-        Ok(s) => s.to_string_lossy(agent),
+    // Argument validation first (Node throws `TypeError` for a non-string specifier). Own the
+    // specifier (a small `String`) so it does not borrow Nova heap state across the `&mut Agent`
+    // resolution + build below.
+    let specifier: String = match JsString::try_from(args.get(0)) {
+        Ok(s) => s.to_string_lossy(agent).into_owned(),
         Err(_) => {
             return Err(agent.throw_exception_with_static_message(
                 ExceptionType::TypeError,
@@ -166,13 +170,14 @@ pub(crate) fn require<'gc>(
     };
     let ctx = NodeCtx::new(state);
 
+    // Drive the core under a reborrow so `gc` is still available to throw on the error path. On
+    // success, rebind the returned object to the caller's `'gc` scope before converting to a `Value`.
     match require_specifier(agent, &ctx, None, &specifier, gc.reborrow()) {
-        Ok(exports) => Ok(exports.into()),
-        Err(err) => Err(agent.throw_exception(
-            ExceptionType::Error,
-            err.to_string(),
-            gc.into_nogc(),
-        )),
+        Ok(exports) => Ok(exports.unbind().bind(gc.into_nogc()).into()),
+        Err(err) => {
+            let message = err.to_string();
+            Err(agent.throw_exception(ExceptionType::Error, message, gc.into_nogc()))
+        }
     }
 }
 
@@ -278,14 +283,20 @@ mod tests {
                 "cache starts empty (nothing required yet)"
             );
 
-            let first = require_specifier(agent, &ctx, None, "path", gc.reborrow()).unwrap();
+            // Unbind each result immediately so it no longer borrows the per-call `gc.reborrow()`,
+            // letting us compare object identity across two `require` calls.
+            let first = require_specifier(agent, &ctx, None, "path", gc.reborrow())
+                .unwrap()
+                .unbind();
             assert_eq!(
                 ctx.builtin_cache().borrow().len(),
                 1,
                 "first require materializes + caches exactly one builtin"
             );
 
-            let second = require_specifier(agent, &ctx, None, "node:path", gc.reborrow()).unwrap();
+            let second = require_specifier(agent, &ctx, None, "node:path", gc.reborrow())
+                .unwrap()
+                .unbind();
             assert_eq!(
                 ctx.builtin_cache().borrow().len(),
                 1,
@@ -294,8 +305,7 @@ mod tests {
 
             // Module identity: repeated require yields the same underlying object (CJS singleton).
             assert_eq!(
-                first.unbind(),
-                second.unbind(),
+                first, second,
                 "require returns the identical cached exports object"
             );
         });

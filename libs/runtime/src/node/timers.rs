@@ -28,13 +28,15 @@
 //! ## Deferred (documented, not silently dropped)
 //!
 //! * **Real wall-clock delays.** Without a `Job`-fed macrotask clock, a delayed callback cannot be
-//!   parked until its deadline and run *after* later-but-shorter microtasks; the faithful ordering
-//!   guarantee Node gives (`setTimeout(_, 10)` fires after `setTimeout(_, 1)`) cannot be honored
-//!   purely on the microtask queue. The bootstrap therefore (a) preserves *relative* ordering by
-//!   sorting same-tick timers by `(delay, seq)` before firing, and (b) collapses positive delays to
-//!   "as soon as the microtask queue drains". Sub-millisecond ordering and true elapsed time are
-//!   the deferred piece; they require an upstream Nova `Job` constructor (or a host shim that owns
-//!   the timer heap) — tracked for when that lands.
+//!   parked until its deadline and run *after* later-but-shorter microtasks; the delay-relative
+//!   ordering Node gives between two timers (`setTimeout(_, 10)` fires after `setTimeout(_, 1)`)
+//!   cannot be honored purely on the microtask queue. The bootstrap collapses positive delays to
+//!   "after the current turn's microtask checkpoint": each timer fire is deferred one extra
+//!   microtask hop, so microtasks (`queueMicrotask`, promise `.then`) scheduled in the same turn
+//!   still run first — matching Node's macrotasks-trail-microtasks ordering. Delay-relative
+//!   ordering between two timers and true elapsed wall-clock time are the deferred piece; they
+//!   require an upstream Nova `Job` constructor (or a host shim that owns the timer heap) — tracked
+//!   for when that lands.
 //! * **`setInterval` does not self-perpetuate across microtask ticks.** A repeating timer that
 //!   re-armed itself via a fresh microtask every fire would spin `run_until_idle` forever (the pump
 //!   drains microtasks to exhaustion). To stay memory-safe and guarantee the pump terminates, an
@@ -140,10 +142,17 @@ const BOOTSTRAP: &str = r#"
     }
   }
 
-  // Park `h` on the microtask queue. We sort same-tick fires by (delay, seq) so relative ordering
-  // between several timers armed in one turn is preserved even though absolute delay is collapsed.
+  // Park `h` so it fires *after* the current turn's microtasks. Node runs timer callbacks in a
+  // macrotask phase that always trails the microtask checkpoint, so a `queueMicrotask` (or a
+  // promise `.then`) scheduled in the same synchronous turn must run first. We have no macrotask
+  // clock to drive (see module docs), so we approximate "after the microtask checkpoint" by
+  // deferring the fire one extra microtask hop: a plain `queueMicrotask`/`then` enqueued this turn
+  // sits ahead of the second hop and therefore drains before the timer callback runs.
   function arm(h) {
     Promise.resolve().then(function () {
+      // First hop: lets same-turn microtasks (which were enqueued before/around this one) settle.
+      return Promise.resolve();
+    }).then(function () {
       if (h._cancelled) return;
       fire(h);
     });

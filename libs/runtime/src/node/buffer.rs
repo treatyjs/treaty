@@ -104,7 +104,7 @@ pub(crate) fn install<'gc>(
         let defined = global.unbind().try_define_own_property(
             agent,
             key.unbind(),
-            PropertyDescriptor::new_data_descriptor(natives.into()),
+            PropertyDescriptor::new_data_descriptor(natives),
             None,
             nogc,
         );
@@ -115,8 +115,10 @@ pub(crate) fn install<'gc>(
         }
     }
 
-    // (3) Evaluate the prelude. It is an IIFE whose completion value is the exports object.
-    let exports = run_prelude(agent, gc.reborrow())?;
+    // (3) Evaluate the prelude. It is an IIFE whose completion value is the exports object. Unbind
+    // it immediately so the cleanup borrow of `gc` below is independent (the handle stays valid: it
+    // is a rooted heap object until GC, and nothing here can collect it).
+    let exports = run_prelude(agent, gc.reborrow())?.unbind();
 
     // (4) Delete the private key so it never leaks to user code. Best-effort: a failure here does
     // not invalidate the exports object, and the key is non-enumerable-noise at worst.
@@ -127,7 +129,7 @@ pub(crate) fn install<'gc>(
         let _ = global.unbind().try_delete(agent, key.unbind(), nogc);
     }
 
-    Ok(exports.unbind().bind(gc.into_nogc()))
+    Ok(exports.bind(gc.into_nogc()))
 }
 
 /// Parse + evaluate [`PRELUDE`] in the current realm and return its completion value as an [`Object`].
@@ -862,20 +864,111 @@ const PRELUDE: &str = r##"
 
 #[cfg(test)]
 mod tests {
-    use crate::JsRuntime;
-    use serde_json::json;
+    use super::*;
+    use crate::node::core::{EnvMap, HostState, NodeCtx};
+    use nova_vm::ecmascript::{
+        AgentOptions, GcAgent, String as JsString, parse_script, script_evaluation,
+    };
+    use serde_json::{json, Value as JsonValue};
 
-    fn run(src: &str) -> serde_json::Value {
-        let mut rt = JsRuntime::with_node_compat();
-        rt.eval(src).expect("eval should succeed")
+    /// Install the `node:buffer` module directly and evaluate `src` against it, returning the JSON
+    /// of the final expression.
+    ///
+    /// This is self-contained: it does not depend on `require`/`import` (the loader is owned by
+    /// other modules). It mirrors `JsRuntime::with_node_compat`'s agent/realm/host-state setup, then
+    /// calls [`install`] and binds the exports object to the global `B` (so test scripts read
+    /// `B.Buffer`, `B.atob`, …) before running the script.
+    ///
+    /// The `HostState` is intentionally leaked for the duration of the test process: a test binary
+    /// is short-lived and a couple of leaked host states cost nothing, which keeps the harness free
+    /// of the `unsafe` drop-order dance that the real `JsRuntime` owns.
+    fn run(src: &str) -> JsonValue {
+        let host_state: &'static HostState = Box::leak(Box::new(HostState::new(
+            std::env::current_dir().unwrap(),
+            EnvMap::new(),
+        )));
+
+        let mut agent = GcAgent::new(
+            AgentOptions {
+                disable_gc: false,
+                print_internals: false,
+                no_block: false,
+            },
+            host_state,
+        );
+
+        let create_global_object: Option<for<'a> fn(&mut Agent, GcScope<'a, '_>) -> Object<'a>> =
+            None;
+        let create_global_this_value: Option<
+            for<'a> fn(&mut Agent, GcScope<'a, '_>) -> Object<'a>,
+        > = None;
+        let initialize_global: Option<fn(&mut Agent, Object, GcScope)> =
+            Some(crate::node::install);
+        let realm = agent.create_realm(
+            create_global_object,
+            create_global_this_value,
+            initialize_global,
+        );
+
+        let out = agent.run_in_realm(&realm, |agent, mut gc| -> String {
+            // Build the ctx from the leaked `&'static HostState` directly, so it does not borrow the
+            // agent (which `install` needs mutably).
+            let ctx = NodeCtx::new(host_state);
+            let exports = install(agent, &ctx, gc.reborrow())
+                .expect("buffer install should succeed")
+                .unbind();
+
+            // Bind exports as the global `B`.
+            {
+                let nogc = gc.nogc();
+                let global = agent.current_realm(nogc).global_object(agent);
+                let key = PropertyKey::from_static_str(agent, "B", nogc);
+                let _ = global.unbind().try_define_own_property(
+                    agent,
+                    key.unbind(),
+                    PropertyDescriptor::new_data_descriptor(exports.bind(nogc)),
+                    None,
+                    nogc,
+                );
+            }
+
+            // Wrap so the completion is the JSON of the final expression.
+            let wrapped = format!("JSON.stringify({{ v: ({src}) }})");
+            let source = JsString::from_string(agent, wrapped, gc.nogc());
+            let current = agent.current_realm(gc.nogc());
+            let script = parse_script(agent, source.unbind(), current.unbind(), true, None, gc.nogc())
+                .expect("test script parses");
+            let value = script_evaluation(agent, script.unbind(), gc.reborrow())
+                .unbind()
+                .bind(gc.nogc());
+            match value {
+                Ok(v) => v
+                    .unbind()
+                    .string_repr(agent, gc.reborrow())
+                    .to_string_lossy(agent)
+                    .into_owned(),
+                Err(e) => panic!(
+                    "test script threw: {}",
+                    e.value()
+                        .unbind()
+                        .string_repr(agent, gc.reborrow())
+                        .to_string_lossy(agent)
+                ),
+            }
+        });
+
+        let envelope: JsonValue = serde_json::from_str(&out).expect("result is JSON");
+        match envelope {
+            JsonValue::Object(mut m) => m.remove("v").unwrap_or(JsonValue::Null),
+            other => other,
+        }
     }
 
     #[test]
     fn buffer_is_a_uint8array_subclass() {
         let v = run(
-            "const { Buffer } = require('node:buffer');
-             const b = Buffer.from([1,2,3]);
-             [b instanceof Uint8Array, b.length, b[0], b[2]]",
+            "(() => { const b = B.Buffer.from([1,2,3]);
+              return [b instanceof Uint8Array, b.length, b[0], b[2]]; })()",
         );
         assert_eq!(v, json!([true, 3, 1, 3]));
     }
@@ -883,9 +976,8 @@ mod tests {
     #[test]
     fn alloc_zero_fills() {
         let v = run(
-            "const { Buffer } = require('buffer');
-             const b = Buffer.alloc(4);
-             [b.length, b[0], b[1], b[2], b[3]]",
+            "(() => { const b = B.Buffer.alloc(4);
+              return [b.length, b[0], b[1], b[2], b[3]]; })()",
         );
         assert_eq!(v, json!([4, 0, 0, 0, 0]));
     }
@@ -893,9 +985,8 @@ mod tests {
     #[test]
     fn hex_round_trip() {
         let v = run(
-            "const { Buffer } = require('node:buffer');
-             const b = Buffer.from('deadbeef', 'hex');
-             [b.length, b[0], b[3], b.toString('hex')]",
+            "(() => { const b = B.Buffer.from('deadbeef', 'hex');
+              return [b.length, b[0], b[3], b.toString('hex')]; })()",
         );
         assert_eq!(v, json!([4, 0xde, 0xef, "deadbeef"]));
     }
@@ -903,10 +994,9 @@ mod tests {
     #[test]
     fn base64_round_trip() {
         let v = run(
-            "const { Buffer } = require('node:buffer');
-             const enc = Buffer.from('hello world').toString('base64');
-             const dec = Buffer.from(enc, 'base64').toString('utf8');
-             [enc, dec]",
+            "(() => { const enc = B.Buffer.from('hello world').toString('base64');
+              const dec = B.Buffer.from(enc, 'base64').toString('utf8');
+              return [enc, dec]; })()",
         );
         assert_eq!(v, json!(["aGVsbG8gd29ybGQ=", "hello world"]));
     }
@@ -914,29 +1004,25 @@ mod tests {
     #[test]
     fn base64url_has_no_padding_and_url_alphabet() {
         // 0xff 0xff 0xff -> "////" in std, "____" in url-safe (no '=').
-        let v = run(
-            "const { Buffer } = require('node:buffer');
-             Buffer.from([255,255,255]).toString('base64url')",
-        );
+        let v = run("B.Buffer.from([255,255,255]).toString('base64url')");
         assert_eq!(v, json!("____"));
     }
 
     #[test]
     fn utf8_round_trip_multibyte() {
         let v = run(
-            "const { Buffer } = require('node:buffer');
-             const b = Buffer.from('héllo €', 'utf8');
-             [b.toString('utf8'), Buffer.byteLength('héllo €', 'utf8')]",
+            "(() => { const b = B.Buffer.from('héllo €', 'utf8');
+              return [b.toString('utf8'), B.Buffer.byteLength('héllo €', 'utf8')]; })()",
         );
-        assert_eq!(v, json!(["héllo €", 9]));
+        // "héllo €" = h(1) é(2) l(1) l(1) o(1) ' '(1) €(3) = 10 UTF-8 bytes.
+        assert_eq!(v, json!(["héllo €", 10]));
     }
 
     #[test]
     fn latin1_round_trip() {
         let v = run(
-            "const { Buffer } = require('node:buffer');
-             const b = Buffer.from('ÿA', 'latin1');
-             [b.length, b[0], b[1], b.toString('latin1')]",
+            "(() => { const b = B.Buffer.from('ÿA', 'latin1');
+              return [b.length, b[0], b[1], b.toString('latin1')]; })()",
         );
         assert_eq!(v, json!([2, 0xff, 0x41, "ÿA"]));
     }
@@ -944,11 +1030,10 @@ mod tests {
     #[test]
     fn equals_and_compare() {
         let v = run(
-            "const { Buffer } = require('node:buffer');
-             const a = Buffer.from([1,2,3]);
-             const b = Buffer.from([1,2,3]);
-             const c = Buffer.from([1,2,4]);
-             [a.equals(b), a.equals(c), Buffer.compare(a, c), Buffer.compare(c, a), a.compare(b)]",
+            "(() => { const a = B.Buffer.from([1,2,3]);
+              const b = B.Buffer.from([1,2,3]);
+              const c = B.Buffer.from([1,2,4]);
+              return [a.equals(b), a.equals(c), B.Buffer.compare(a, c), B.Buffer.compare(c, a), a.compare(b)]; })()",
         );
         assert_eq!(v, json!([true, false, -1, 1, 0]));
     }
@@ -956,9 +1041,8 @@ mod tests {
     #[test]
     fn concat_joins_buffers() {
         let v = run(
-            "const { Buffer } = require('node:buffer');
-             const b = Buffer.concat([Buffer.from([1,2]), Buffer.from([3]), Buffer.from([4,5])]);
-             [b.length, Array.from(b)]",
+            "(() => { const b = B.Buffer.concat([B.Buffer.from([1,2]), B.Buffer.from([3]), B.Buffer.from([4,5])]);
+              return [b.length, Array.from(b)]; })()",
         );
         assert_eq!(v, json!([5, [1, 2, 3, 4, 5]]));
     }
@@ -966,11 +1050,10 @@ mod tests {
     #[test]
     fn read_write_uint_fixed_width() {
         let v = run(
-            "const { Buffer } = require('node:buffer');
-             const b = Buffer.alloc(8);
-             b.writeUInt16BE(0x0102, 0);
-             b.writeUInt32LE(0x0a0b0c0d, 2);
-             [b.readUInt16BE(0), b.readUInt32LE(2), b[0], b[1]]",
+            "(() => { const b = B.Buffer.alloc(8);
+              b.writeUInt16BE(0x0102, 0);
+              b.writeUInt32LE(0x0a0b0c0d, 2);
+              return [b.readUInt16BE(0), b.readUInt32LE(2), b[0], b[1]]; })()",
         );
         assert_eq!(v, json!([0x0102, 0x0a0b0c0d, 0x01, 0x02]));
     }
@@ -979,11 +1062,10 @@ mod tests {
     fn slice_shares_memory() {
         // Node Buffer.slice is a view: mutating the slice mutates the parent.
         let v = run(
-            "const { Buffer } = require('node:buffer');
-             const b = Buffer.from([10,20,30,40]);
-             const s = b.slice(1, 3);
-             s[0] = 99;
-             [s.length, b[1], s[0], s[1]]",
+            "(() => { const b = B.Buffer.from([10,20,30,40]);
+              const s = b.slice(1, 3);
+              s[0] = 99;
+              return [s.length, b[1], s[0], s[1]]; })()",
         );
         assert_eq!(v, json!([2, 99, 99, 30]));
     }
@@ -991,11 +1073,10 @@ mod tests {
     #[test]
     fn fill_and_indexof() {
         let v = run(
-            "const { Buffer } = require('node:buffer');
-             const b = Buffer.alloc(5);
-             b.fill(7);
-             const h = Buffer.from('abcabc');
-             [Array.from(b), h.indexOf('bc'), h.indexOf('bc', 2), h.includes('zz')]",
+            "(() => { const b = B.Buffer.alloc(5);
+              b.fill(7);
+              const h = B.Buffer.from('abcabc');
+              return [Array.from(b), h.indexOf('bc'), h.indexOf('bc', 2), h.includes('zz')]; })()",
         );
         assert_eq!(v, json!([[7, 7, 7, 7, 7], 1, 4, false]));
     }
@@ -1003,30 +1084,24 @@ mod tests {
     #[test]
     fn is_buffer_and_byte_length() {
         let v = run(
-            "const { Buffer } = require('node:buffer');
-             [Buffer.isBuffer(Buffer.alloc(1)), Buffer.isBuffer([1,2,3]), Buffer.byteLength('abc')]",
+            "[B.Buffer.isBuffer(B.Buffer.alloc(1)), B.Buffer.isBuffer([1,2,3]), B.Buffer.byteLength('abc')]",
         );
         assert_eq!(v, json!([true, false, 3]));
     }
 
     #[test]
     fn atob_btoa_exported() {
-        let v = run(
-            "const { atob, btoa } = require('node:buffer');
-             const e = btoa('Hi');
-             [e, atob(e)]",
-        );
+        let v = run("(() => { const e = B.btoa('Hi'); return [e, B.atob(e)]; })()");
         assert_eq!(v, json!(["SGk=", "Hi"]));
     }
 
     #[test]
     fn copy_into_target() {
         let v = run(
-            "const { Buffer } = require('node:buffer');
-             const src = Buffer.from([1,2,3,4]);
-             const dst = Buffer.alloc(4);
-             const n = src.copy(dst, 1, 0, 2);
-             [n, Array.from(dst)]",
+            "(() => { const src = B.Buffer.from([1,2,3,4]);
+              const dst = B.Buffer.alloc(4);
+              const n = src.copy(dst, 1, 0, 2);
+              return [n, Array.from(dst)]; })()",
         );
         assert_eq!(v, json!([2, [0, 1, 2, 0]]));
     }
