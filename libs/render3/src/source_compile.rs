@@ -21,6 +21,7 @@ use oxc_parser::Parser;
 use oxc_span::SourceType;
 
 use crate::compile::{CompiledComponent, RealTemplateBuilder};
+use crate::output::emitter::emit_expression_with_map;
 use crate::identifiers::R3;
 use crate::output::emitter::emit_expression;
 use crate::output_ast::{self as o, Expr, FnParam, LiteralValue, ParseSourceSpan};
@@ -44,9 +45,17 @@ fn err(msg: impl Into<String>) -> CompiledComponent {
     }
 }
 
-fn class_ref(class_name: &str) -> R3Reference {
+/// Build the class self-reference (`value`/`ty`), stamping the original-source `span` of
+/// the class name onto the `value` read. The `value` read is the one cloned into the
+/// emitted `type: <ClassName>` field (`view::compiler` `definition_map.set("type", ...)`),
+/// so this is the anchor the additive source map uses to map the component definition back
+/// to its class declaration. Stamping a span is value-preserving: `ExprMeta.span` does not
+/// affect emitted text, so the plain and map paths emit identical bytes.
+fn class_ref_spanned(class_name: &str, span: ParseSourceSpan) -> R3Reference {
+    let mut value = o::variable(class_name, None);
+    value.meta.span = Some(span);
     R3Reference {
-        value: o::variable(class_name, None),
+        value,
         ty: o::variable(class_name, None),
     }
 }
@@ -637,7 +646,71 @@ pub fn compile_component_source(ts_source: &str) -> CompiledComponent {
         return err(format!("parse error: {}", msgs.join("; ")));
     }
 
-    compile_program(&ret.program)
+    compile_program(&ret.program, None)
+}
+
+/// Context for additive source-map emission: the original authoring source text plus the
+/// names used in the emitted v3 map (`file` for the generated artifact, `source_name` for
+/// the original). Threaded into the compile pipeline so the emitter can map span-carrying
+/// nodes back into `source_content` WITHOUT changing any emitted byte.
+struct MapContext<'a> {
+    file_name: &'a str,
+    source_name: &'a str,
+    source_content: &'a str,
+}
+
+/// A compiled component plus its additive Source Map v3 JSON. `code` is BYTE-IDENTICAL to
+/// [`CompiledComponent::code`] from [`compile_component_source`]; `map` is a SEPARATE,
+/// additive artifact (the Ivy-JS <-> original-authoring-source mapping).
+#[derive(Debug, Clone)]
+pub struct CompiledComponentWithMap {
+    /// The emitted `ɵɵdefineComponent({...})` source (plus any hoisted pool statements).
+    pub code: String,
+    /// The Source Map v3 JSON mapping `code` back to the original authoring source. Empty
+    /// (`{}` is never emitted) when compilation failed; see `errors`.
+    pub map: String,
+    /// Fatal/diagnostic messages (same semantics as [`CompiledComponent::errors`]).
+    pub errors: Vec<String>,
+}
+
+/// Compile a single standalone `@Component` class from TypeScript source AND emit an
+/// additive v3 source map.
+///
+/// `file_name` is the generated artifact name (the map's `file`); `source_name` is the
+/// original source's name (the map's `sources[0]`). The original `ts_source` is embedded as
+/// `sourcesContent[0]`. The returned `code` is byte-identical to
+/// [`compile_component_source`]'s — the map is purely additive.
+pub fn compile_component_source_with_map(
+    ts_source: &str,
+    file_name: &str,
+    source_name: &str,
+) -> CompiledComponentWithMap {
+    let allocator = Allocator::default();
+    let source_type = SourceType::default().with_typescript(true);
+    let ret = Parser::new(&allocator, ts_source, source_type).parse();
+
+    if !ret.errors.is_empty() {
+        let msgs: Vec<String> = ret.errors.iter().map(|e| e.to_string()).collect();
+        let e = err(format!("parse error: {}", msgs.join("; ")));
+        return CompiledComponentWithMap {
+            code: e.code,
+            map: String::new(),
+            errors: e.errors,
+        };
+    }
+
+    let ctx = MapContext {
+        file_name,
+        source_name,
+        source_content: ts_source,
+    };
+    let mut map_out = String::new();
+    let compiled = compile_program(&ret.program, Some((&ctx, &mut map_out)));
+    CompiledComponentWithMap {
+        code: compiled.code,
+        map: map_out,
+        errors: compiled.errors,
+    }
 }
 
 /// Collect the file's imported identifier names — the auto-import candidate set. Mirrors
@@ -669,7 +742,10 @@ fn collect_imported_names(program: &Program) -> Vec<String> {
     names
 }
 
-fn compile_program(program: &Program) -> CompiledComponent {
+fn compile_program(
+    program: &Program,
+    map: Option<(&MapContext, &mut String)>,
+) -> CompiledComponent {
     let imported_names = collect_imported_names(program);
 
     // Find all classes (top-level + exported) carrying a recognized decorator.
@@ -721,8 +797,11 @@ fn compile_program(program: &Program) -> CompiledComponent {
 
     let (class, kind, dec) = decorated[0];
 
-    let class_name = match &class.id {
-        Some(id) => id.name.to_string(),
+    let (class_name, class_name_span) = match &class.id {
+        Some(id) => (
+            id.name.to_string(),
+            ParseSourceSpan::new(id.span.start as usize, id.span.end as usize),
+        ),
         None => return err("decorated class has no name".to_string()),
     };
 
@@ -821,10 +900,13 @@ fn compile_program(program: &Program) -> CompiledComponent {
     let has_signal_query = content_queries.iter().chain(view_queries.iter()).any(|q| q.is_signal);
     let is_signal = inputs.iter().any(|(_, m)| m.is_signal) || has_signal_query;
 
-    // Build the base directive metadata.
+    // Build the base directive metadata. The class-name reference carries the original
+    // class-id span so the additive source map can anchor the emitted `type: <ClassName>`
+    // back to the class declaration. Stamping the span is value-preserving (it never
+    // affects emitted text), so this is identical for the plain and the map paths.
     let base = R3DirectiveMetadata {
         name: class_name.clone(),
-        ty: class_ref(&class_name),
+        ty: class_ref_spanned(&class_name, class_name_span),
         type_argument_count: 0,
         type_source_span: ParseSourceSpan::new(0, 0),
         deps: Deps::None,
@@ -855,6 +937,7 @@ fn compile_program(program: &Program) -> CompiledComponent {
             encapsulation,
             animations,
             foreign_imports,
+            map,
         ),
         // Directives reuse the component emitter is NOT correct — directives go through a
         // different define. Not supported by the existing emitter, so bail clearly.
@@ -1009,6 +1092,7 @@ fn compile_component_meta(
     encapsulation: ViewEncapsulation,
     animations: Option<Expr>,
     foreign_imports: Option<Vec<R3ForeignComponentMetadata>>,
+    map: Option<(&MapContext, &mut String)>,
 ) -> CompiledComponent {
     let mut errors: Vec<String> = Vec::new();
 
@@ -1073,8 +1157,71 @@ fn compile_component_meta(
         &mut pool_statements,
     );
 
-    let code = emit_expression(&compiled.expression);
-    CompiledComponent { code, errors }
+    // Angular emits the `ConstantPool.statements` (hoisted query-predicate `const _cN = [...]`
+    // declarations and nested-view `function …_Template` functions) as top-level siblings BEFORE
+    // the `ɵɵdefineComponent({…})` call. Mirror that: print the pool statements first, then the
+    // definition expression, so the `_cN`/template references the definition makes are declared.
+    //
+    // Map vs. no-map: both branches print the SAME bytes. When a map is requested, the
+    // additive `emit_*_with_map` variants are used; they delegate to the identical lowering
+    // + post-passes, so the code text is byte-for-byte the plain path's. The `*_with_map`
+    // map only covers the slice it emitted, so for the pool-prefixed case we emit the pool
+    // (unmapped, no span-carrying nodes there in practice) and map only the definition
+    // expression — whose generated offset is shifted by the pool prefix length so the
+    // segments point at the correct positions in the final concatenated code.
+    match map {
+        None => {
+            let code = if pool_statements.is_empty() {
+                emit_expression(&compiled.expression)
+            } else {
+                let mut out = crate::output::emitter::emit_statements(&pool_statements);
+                if !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                out.push_str(&emit_expression(&compiled.expression));
+                out
+            };
+            CompiledComponent { code, errors }
+        }
+        Some((ctx, map_out)) => {
+            let code = if pool_statements.is_empty() {
+                let (code, map_json) = emit_expression_with_map(
+                    &compiled.expression,
+                    ctx.file_name,
+                    ctx.source_name,
+                    ctx.source_content,
+                );
+                *map_out = map_json;
+                code
+            } else {
+                let mut out = crate::output::emitter::emit_statements(&pool_statements);
+                if !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                let prefix_len = out.len();
+                let (expr_code, _) = emit_expression_with_map(
+                    &compiled.expression,
+                    ctx.file_name,
+                    ctx.source_name,
+                    ctx.source_content,
+                );
+                out.push_str(&expr_code);
+                // Build the map over the FINAL concatenated code so generated positions are
+                // correct (the definition expression lives after the `prefix_len`-byte pool
+                // prefix). `build_definition_map` re-locates the anchor token in `out`.
+                *map_out = crate::output::emitter::build_definition_map(
+                    ctx.file_name,
+                    ctx.source_name,
+                    ctx.source_content,
+                    &out,
+                    prefix_len,
+                    &compiled.expression,
+                );
+                out
+            };
+            CompiledComponent { code, errors }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1245,6 +1392,96 @@ mod tests {
             out.code
         );
         assert!(flat.contains("encapsulation:2"), "encapsulation 2 missing; got: {}", out.code);
+    }
+
+    // -----------------------------------------------------------------------
+    // Additive source-map emission.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn with_map_code_is_byte_identical_to_plain() {
+        // HARD GATE: the additive map path must not change a single byte of the emitted
+        // code. Compile the same source both ways and byte-compare.
+        let srcs = [
+            r#"@Component({selector:"a",template:"<div>{{x}}</div>"}) export class C { x = 1; }"#,
+            r#"@Component({selector:"a",template:"<div></div>"}) export class C { name = input(); }"#,
+            r#"@Component({selector:"a",template:"<p></p>"})
+                export class Widget {
+                    @Input() foo = 1;
+                    @Output() bar = new EventEmitter();
+                }"#,
+        ];
+        for src in srcs {
+            let plain = compile_component_source(src);
+            let mapped = compile_component_source_with_map(src, "widget.js", "widget.ts");
+            assert!(plain.errors.is_empty(), "plain errors: {:?}", plain.errors);
+            assert!(mapped.errors.is_empty(), "mapped errors: {:?}", mapped.errors);
+            assert_eq!(
+                plain.code, mapped.code,
+                "map path changed emitted bytes for src: {src}"
+            );
+        }
+    }
+
+    #[test]
+    fn with_map_emits_valid_v3_json() {
+        let src =
+            r#"@Component({selector:"app-x",template:"<div>{{x}}</div>"}) export class MyComp { x = 1; }"#;
+        let out = compile_component_source_with_map(src, "my-comp.js", "my-comp.ts");
+        assert!(out.errors.is_empty(), "errors: {:?}", out.errors);
+        let map = &out.map;
+        // version 3.
+        assert!(map.contains("\"version\":3"), "no version 3; got: {map}");
+        // sources non-empty and names the original.
+        assert!(map.contains("\"sources\":[\"my-comp.ts\"]"), "bad sources; got: {map}");
+        // sourcesContent present and carries the original source.
+        assert!(
+            map.contains("export class MyComp"),
+            "sourcesContent missing original; got: {map}"
+        );
+        // file names the generated artifact.
+        assert!(map.contains("\"file\":\"my-comp.js\""), "bad file; got: {map}");
+        // mappings field present.
+        assert!(map.contains("\"mappings\":\""), "no mappings; got: {map}");
+    }
+
+    #[test]
+    fn with_map_maps_class_name_back_to_source() {
+        // The emitted `type: MyComp` token must map back to the class declaration's
+        // `MyComp` position in the original source.
+        let src =
+            r#"@Component({selector:"app-x",template:"<div></div>"}) export class MyComp { }"#;
+        let out = compile_component_source_with_map(src, "my-comp.js", "my-comp.ts");
+        assert!(out.errors.is_empty(), "errors: {:?}", out.errors);
+
+        let mappings = extract_mappings(&out.map);
+        let decoded =
+            crate::output::source_map::decode_mappings(&mappings).expect("decode mappings");
+        assert!(!decoded.is_empty(), "expected at least one segment; map: {}", out.map);
+
+        // The original `MyComp` token starts at this byte offset in `src`.
+        let class_byte = src.find("MyComp").expect("MyComp in source");
+        let expected = crate::output::source_map::byte_offset_to_line_col(src, class_byte);
+
+        // At least one segment must point at the class-name original position.
+        let found = decoded
+            .iter()
+            .any(|&(_, _, _, sl, sc)| sl == expected.line && sc == expected.column);
+        assert!(
+            found,
+            "no segment maps to class-name position (line {}, col {}); decoded: {:?}; map: {}",
+            expected.line, expected.column, decoded, out.map
+        );
+    }
+
+    /// Pull the `mappings` string value out of a v3 JSON blob (test helper — avoids a JSON
+    /// dependency; the blob shape is the small, fixed one `SourceMapBuilder::to_json` emits).
+    fn extract_mappings(map_json: &str) -> String {
+        let key = "\"mappings\":\"";
+        let start = map_json.find(key).expect("mappings key") + key.len();
+        let rest = &map_json[start..];
+        let end = rest.find('"').expect("mappings close quote");
+        rest[..end].to_string()
     }
 
     #[test]

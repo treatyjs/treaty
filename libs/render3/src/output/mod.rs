@@ -3,3 +3,4 @@
 //! `abstract_emitter`/`abstract_js_emitter`. See `migration/render3-specs/02-abstract_emitter.md`.
 
 pub mod emitter;
+pub mod source_map;

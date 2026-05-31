@@ -48,9 +48,10 @@ use oxc_ast::ast::{
 use oxc_codegen::Codegen;
 use oxc_span::{SourceType, SPAN};
 
+use crate::output::source_map::{byte_offset_to_line_col, utf16_columns, SourceMapBuilder};
 use crate::output_ast::{
     self as o, ArrowBody, BinaryOperator, ExprKind, FnParam, ImportUrl, LiteralMapEntry,
-    LiteralValue, StmtKind, StmtModifier, UnaryOperator,
+    LiteralValue, ParseSourceSpan, StmtKind, StmtModifier, UnaryOperator,
 };
 
 // ---------------------------------------------------------------------------
@@ -101,6 +102,183 @@ pub fn emit_expression(expr: &o::Expr) -> String {
     lowerer.codegen(body)
 }
 
+/// An original-source anchor recorded while lowering a span-carrying node.
+///
+/// `token` is the literal text we know the node will print (e.g. a `ReadVar`'s name).
+/// After codegen, [`build_segments`] locates each token in the final code — in
+/// lowering order — and emits a `generated -> original` source-map segment using `span`.
+#[derive(Debug, Clone)]
+struct EmittedAnchor {
+    /// Byte-offset span into the ORIGINAL authoring source (not the generated code).
+    span: ParseSourceSpan,
+    /// The exact token text the lowered node prints into the generated code.
+    token: String,
+}
+
+/// The map-aware counterpart of [`emit_statements`] + [`emit_expression`]. Returns the
+/// SAME code string as `emit_statements`/`emit_expression` together with the anchors
+/// collected for span-carrying nodes, so a caller that owns the original source text can
+/// build a source map without the emitter taking a text dependency.
+///
+/// [`emit_with_anchors_expr`] wraps the input as an expression statement (matching
+/// `emit_expression`); [`emit_with_anchors_stmts`] lowers a statement list (matching
+/// `emit_statements`). Both produce code byte-identical to their plain counterpart.
+fn emit_with_anchors_expr(expr: &o::Expr) -> (String, Vec<EmittedAnchor>) {
+    let allocator = Allocator::default();
+    let lowerer = Lowerer::with_anchor_tracking(&allocator);
+    let oxc_expr = lowerer.lower_expr(expr);
+    let stmt = lowerer.ast.statement_expression(SPAN, oxc_expr);
+    let mut body = lowerer.ast.vec();
+    for import in lowerer.namespace_import_stmts() {
+        body.push(import);
+    }
+    body.push(stmt);
+    let code = lowerer.codegen(body);
+    (code, lowerer.take_anchors())
+}
+
+fn emit_with_anchors_stmts(stmts: &[o::Stmt]) -> (String, Vec<EmittedAnchor>) {
+    let allocator = Allocator::default();
+    let lowerer = Lowerer::with_anchor_tracking(&allocator);
+    let mut lowered = lowerer.ast.vec_with_capacity(stmts.len());
+    for stmt in stmts {
+        lowered.push(lowerer.lower_stmt(stmt));
+    }
+    let mut body = lowerer.ast.vec();
+    for import in lowerer.namespace_import_stmts() {
+        body.push(import);
+    }
+    for stmt in lowered {
+        body.push(stmt);
+    }
+    let code = lowerer.codegen(body);
+    (code, lowerer.take_anchors())
+}
+
+/// Build a [`SourceMapBuilder`] for a compiled component's `(code, map)` pair.
+///
+/// `code` is the FINAL emitted code (byte-identical to `emit_*`). `anchors` are the
+/// span-carrying nodes recorded during lowering. `source_name` / `source_content` describe
+/// the original authoring source the spans index into. Each anchor's `token` is located in
+/// `code` (scanning forward from the previous match so order is respected) and a segment is
+/// emitted from that generated position to the anchor's original position. Anchors whose
+/// token cannot be found are skipped (honest coverage — no fabricated mapping).
+fn build_source_map(
+    file_name: &str,
+    source_name: &str,
+    source_content: &str,
+    code: &str,
+    anchors: &[EmittedAnchor],
+) -> SourceMapBuilder {
+    let mut builder = SourceMapBuilder::new(file_name.to_string());
+    let src_index = builder.add_source(source_name, Some(source_content.to_string()));
+
+    // Precompute generated line-start byte offsets so a byte position -> (line, col) is a
+    // binary search rather than a rescan per anchor.
+    let mut search_from = 0usize;
+    for anchor in anchors {
+        if anchor.token.is_empty() {
+            continue;
+        }
+        let Some(rel) = code[search_from..].find(&anchor.token) else {
+            continue;
+        };
+        let gen_byte = search_from + rel;
+        // Advance the search cursor past this match so repeated tokens map in order.
+        search_from = gen_byte + anchor.token.len();
+
+        let generated = generated_byte_to_line_col(code, gen_byte);
+        let original = byte_offset_to_line_col(source_content, anchor.span.start);
+        builder.add_segment(generated, src_index, original);
+    }
+    builder
+}
+
+/// Convert a byte offset in the GENERATED code into a (line, UTF-16 column) position.
+fn generated_byte_to_line_col(
+    code: &str,
+    byte_offset: usize,
+) -> crate::output::source_map::LineCol {
+    let offset = byte_offset.min(code.len());
+    let mut line: u32 = 0;
+    let mut line_start = 0usize;
+    for (i, b) in code.as_bytes().iter().enumerate() {
+        if i >= offset {
+            break;
+        }
+        if *b == b'\n' {
+            line += 1;
+            line_start = i + 1;
+        }
+    }
+    let column = utf16_columns(&code[line_start..offset]);
+    crate::output::source_map::LineCol::new(line, column)
+}
+
+/// Emit `(code, source_map_json)` for a slice of statements, where `code` is BYTE-IDENTICAL
+/// to [`emit_statements`]. The v3 source map maps span-carrying nodes back into
+/// `source_content` (named `source_name`); the generated file is `file_name`.
+pub fn emit_statements_with_map(
+    stmts: &[o::Stmt],
+    file_name: &str,
+    source_name: &str,
+    source_content: &str,
+) -> (String, String) {
+    let (code, anchors) = emit_with_anchors_stmts(stmts);
+    let map = build_source_map(file_name, source_name, source_content, &code, &anchors);
+    (code, map.to_json())
+}
+
+/// Build a v3 source-map JSON for a definition `expr` that has already been printed into
+/// `full_code` starting at byte offset `expr_offset` (e.g. after a pool-statement prefix).
+///
+/// Re-lowers `expr` purely to recover its span-carrying anchors, then locates each anchor's
+/// token in `full_code` from `expr_offset` onward — so the generated positions are correct
+/// in the FINAL concatenated artifact, not in the isolated expression slice. The code is
+/// never reprinted into `full_code` here; this is map-only and additive.
+pub fn build_definition_map(
+    file_name: &str,
+    source_name: &str,
+    source_content: &str,
+    full_code: &str,
+    expr_offset: usize,
+    expr: &o::Expr,
+) -> String {
+    // Re-lower with anchor tracking to recover the anchors (the printed code is discarded).
+    let (_discarded, anchors) = emit_with_anchors_expr(expr);
+
+    let mut builder = SourceMapBuilder::new(file_name.to_string());
+    let src_index = builder.add_source(source_name, Some(source_content.to_string()));
+    let mut search_from = expr_offset.min(full_code.len());
+    for anchor in &anchors {
+        if anchor.token.is_empty() {
+            continue;
+        }
+        let Some(rel) = full_code[search_from..].find(&anchor.token) else {
+            continue;
+        };
+        let gen_byte = search_from + rel;
+        search_from = gen_byte + anchor.token.len();
+        let generated = generated_byte_to_line_col(full_code, gen_byte);
+        let original = byte_offset_to_line_col(source_content, anchor.span.start);
+        builder.add_segment(generated, src_index, original);
+    }
+    builder.to_json()
+}
+
+/// Emit `(code, source_map_json)` for a single expression, where `code` is BYTE-IDENTICAL
+/// to [`emit_expression`].
+pub fn emit_expression_with_map(
+    expr: &o::Expr,
+    file_name: &str,
+    source_name: &str,
+    source_content: &str,
+) -> (String, String) {
+    let (code, anchors) = emit_with_anchors_expr(expr);
+    let map = build_source_map(file_name, source_name, source_content, &code, &anchors);
+    (code, map.to_json())
+}
+
 // ---------------------------------------------------------------------------
 // Lowerer
 // ---------------------------------------------------------------------------
@@ -112,6 +290,9 @@ pub fn emit_expression(expr: &o::Expr) -> String {
 struct Lowerer<'a> {
     ast: AstBuilder<'a>,
     imports: RefCell<ImportManager>,
+    /// `Some` when this lowering pass should record source-map anchors for span-carrying
+    /// nodes; `None` for the plain `emit_*` path (zero overhead, no behavioural change).
+    anchors: Option<RefCell<Vec<EmittedAnchor>>>,
 }
 
 /// Maps module specifiers (`@angular/core`, ...) to stable namespace import aliases
@@ -141,6 +322,37 @@ impl<'a> Lowerer<'a> {
         Lowerer {
             ast: AstBuilder::new(allocator),
             imports: RefCell::new(ImportManager::default()),
+            anchors: None,
+        }
+    }
+
+    /// Like [`Lowerer::new`] but additionally records source-map anchors for every
+    /// span-carrying node lowered. Used only by the `emit_*_with_map` paths.
+    fn with_anchor_tracking(allocator: &'a Allocator) -> Self {
+        Lowerer {
+            ast: AstBuilder::new(allocator),
+            imports: RefCell::new(ImportManager::default()),
+            anchors: Some(RefCell::new(Vec::new())),
+        }
+    }
+
+    /// Drain the recorded anchors (empty when anchor tracking is off).
+    fn take_anchors(&self) -> Vec<EmittedAnchor> {
+        self.anchors
+            .as_ref()
+            .map(|a| a.borrow().clone())
+            .unwrap_or_default()
+    }
+
+    /// Record an anchor mapping `span` (original-source bytes) to the literal `token`
+    /// the lowered node will print. No-op when anchor tracking is off, so the plain
+    /// `emit_*` path stays allocation-free and byte-identical.
+    fn record_anchor(&self, span: &Option<ParseSourceSpan>, token: &str) {
+        if let (Some(anchors), Some(span)) = (self.anchors.as_ref(), span) {
+            anchors.borrow_mut().push(EmittedAnchor {
+                span: span.clone(),
+                token: token.to_string(),
+            });
         }
     }
 
@@ -248,6 +460,8 @@ impl<'a> Lowerer<'a> {
                 } else {
                     VariableDeclarationKind::Let
                 };
+                // The declared `name` is printed verbatim; anchor it when a span exists.
+                self.record_anchor(&stmt.meta.span, name);
                 self.lower_var_decl(kind, name, value.as_ref())
             }
             StmtKind::DeclareFunction {
@@ -256,6 +470,9 @@ impl<'a> Lowerer<'a> {
                 statements,
                 ..
             } => {
+                // The function declaration prints its `name` token; anchor it when the
+                // front-end recorded a source span for this declaration.
+                self.record_anchor(&stmt.meta.span, name);
                 let id = Some(self.ast.binding_identifier(SPAN, self.ast.ident(name)));
                 let oxc_params = self.lower_params(params);
                 let body = self.lower_fn_body(statements);
@@ -351,7 +568,12 @@ impl<'a> Lowerer<'a> {
 
     fn lower_expr(&self, expr: &o::Expr) -> Expression<'a> {
         match &expr.kind {
-            ExprKind::ReadVar { name } => self.ident_expr(name),
+            ExprKind::ReadVar { name } => {
+                // A read of a named variable prints exactly `name`; if the front-end
+                // recorded where this read came from in the original source, anchor it.
+                self.record_anchor(&expr.meta.span, name);
+                self.ident_expr(name)
+            }
 
             ExprKind::Literal(value) => self.lower_literal(value),
 
@@ -1805,6 +2027,75 @@ mod tests {
         });
         let out = emit_expression(&di);
         assert!(out.contains("import(") && out.contains("./chunk"), "got: {out}");
+    }
+
+    #[test]
+    fn with_map_expression_code_is_byte_identical() {
+        // The additive map path must reproduce `emit_expression` byte-for-byte.
+        let element = import_expr(R3::Element.reference(), None);
+        let call = element.call_fn(vec![num(0.0), str_lit("div")], false);
+        let plain = emit_expression(&call);
+        let (mapped_code, _map) =
+            emit_expression_with_map(&call, "out.js", "src.ts", "const x = 1;");
+        assert_eq!(plain, mapped_code, "map path changed expression bytes");
+    }
+
+    #[test]
+    fn with_map_statements_code_is_byte_identical() {
+        let stmt = Stmt::with_modifiers(
+            StmtKind::DeclareVar {
+                name: "cmp".to_string(),
+                value: Some(num(1.0)),
+                ty: None,
+            },
+            StmtModifier::FINAL,
+        );
+        let plain = emit_statements(std::slice::from_ref(&stmt));
+        let (mapped_code, _map) = emit_statements_with_map(
+            std::slice::from_ref(&stmt),
+            "out.js",
+            "src.ts",
+            "const cmp = 1;",
+        );
+        assert_eq!(plain, mapped_code, "map path changed statement bytes");
+    }
+
+    #[test]
+    fn with_map_anchors_span_carrying_var_decl() {
+        use crate::output::source_map::{byte_offset_to_line_col, decode_mappings};
+        // A DeclareVar carrying an original-source span anchors its emitted `name` token.
+        let source = "let myVar = 1;";
+        let var_byte = source.find("myVar").unwrap();
+        let mut stmt = Stmt::with_modifiers(
+            StmtKind::DeclareVar {
+                name: "myVar".to_string(),
+                value: Some(num(1.0)),
+                ty: None,
+            },
+            StmtModifier::FINAL,
+        );
+        stmt.meta.span = Some(ParseSourceSpan::new(var_byte, var_byte + 5));
+
+        let (_code, map) = emit_statements_with_map(
+            std::slice::from_ref(&stmt),
+            "out.js",
+            "src.ts",
+            source,
+        );
+        // The map is valid v3 with content.
+        assert!(map.contains("\"version\":3"), "{map}");
+        assert!(map.contains("\"sourcesContent\":[\"let myVar = 1;\"]"), "{map}");
+
+        let key = "\"mappings\":\"";
+        let s = map.find(key).unwrap() + key.len();
+        let rest = &map[s..];
+        let mappings = &rest[..rest.find('"').unwrap()];
+        let decoded = decode_mappings(mappings).expect("decode");
+        let expected = byte_offset_to_line_col(source, var_byte);
+        assert!(
+            decoded.iter().any(|&(_, _, _, sl, sc)| sl == expected.line && sc == expected.column),
+            "no segment for myVar; decoded {decoded:?}; map {map}"
+        );
     }
 
     #[test]
