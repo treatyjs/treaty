@@ -29,6 +29,7 @@
 
 use crate::expression::ast::ExprKind as AstExprKind;
 use crate::expression::ast::AstNode;
+use crate::expression::ast::ParsedEventType;
 use crate::expression_converter::{
     convert_action_binding_with, convert_property_binding_with, convert_property_binding_with_pipes,
     LocalResolver, PipeSlotAllocator, PipeSlots,
@@ -38,8 +39,8 @@ use crate::output_ast as o;
 use crate::output_ast::{Expr, FnParam, Stmt, StmtKind, StmtModifier};
 use crate::template::r3_ast::{
     BoundAttribute, BoundEvent, BoundText, Content, DeferredBlock, DeferredBlockTriggers,
-    DeferredTriggerKind, Element, ForLoopBlock, IfBlock, LetDeclaration, Node, SwitchBlock,
-    SwitchBlockCase, Template, Text, TextAttribute, Visitor,
+    DeferredTriggerKind, Element, ForLoopBlock, IfBlock, LetDeclaration, Node,
+    SwitchBlock, SwitchBlockCase, Template, Text, TextAttribute, Visitor,
 };
 
 // ---------------------------------------------------------------------------
@@ -587,6 +588,32 @@ fn num(n: f64) -> Expr {
     o::literal(o::LiteralValue::Number(n), None)
 }
 
+/// The `undefined` literal — the value Angular emits for a *valueless* legacy-animation property
+/// binding (`@bar` / `[@baz]` → `ɵɵproperty("@bar", undefined)`).
+fn undefined_expr() -> Expr {
+    o::literal(o::LiteralValue::Undefined, None)
+}
+
+/// Whether a binding/attribute name targets a legacy animation trigger (Angular's synthetic,
+/// `@`-prefixed properties — `prepareSyntheticProperty`). Such names reify to a property binding
+/// (`ɵɵproperty("@name", …)`) and never enter the element's static-attribute const pool.
+fn is_legacy_animation_name(name: &str) -> bool {
+    name.starts_with('@')
+}
+
+/// Whether a binding expression is "empty" — the parser's representation of `[@baz]` with no
+/// `="…"` value: an empty-string literal primitive or an empty/`EmptyExpr` AST. Such a binding
+/// emits the `undefined` value.
+fn is_empty_binding_value(value: &AstNode) -> bool {
+    use crate::expression::ast::LiteralValue as LV;
+    match &value.kind {
+        AstExprKind::EmptyExpr => true,
+        AstExprKind::LiteralPrimitive { value: LV::Str(s) } => s.is_empty(),
+        AstExprKind::Interpolation { expressions, .. } => expressions.is_empty(),
+        _ => false,
+    }
+}
+
 /// `sanitizeIdentifier(name)` (`parse_util.ts`): replace every non-word char (`/\W/g`, i.e.
 /// anything outside `[A-Za-z0-9_]`) with `_`, so a tag like `ng-template` becomes `ng_template`
 /// when used in a generated view-function name.
@@ -716,6 +743,243 @@ fn ast_to_source(node: &AstNode) -> String {
 
 fn str_lit(s: &str) -> Expr {
     o::literal(o::LiteralValue::String(s.to_string()), None)
+}
+
+/// Angular `SelectorFlags` (`core.ts`) — flags interleaved into an `R3CssSelector` array to mark
+/// negative `:not(...)` sub-selectors and class-matching mode.
+mod selector_flags {
+    pub const NOT: u32 = 0b0001;
+    pub const ATTRIBUTE: u32 = 0b0010;
+    pub const ELEMENT: u32 = 0b0100;
+    pub const CLASS: u32 = 0b1000;
+}
+
+/// A single parsed `CssSelector` (Angular `directive_matching.ts` `CssSelector`).
+#[derive(Default)]
+struct CssSelectorParts {
+    element: Option<String>,
+    attrs: Vec<String>,
+    class_names: Vec<String>,
+    not_selectors: Vec<CssSelectorParts>,
+}
+
+/// `CssSelector.parse(selector)` — split a selector string into one or more `CssSelectorParts`
+/// (comma-separated alternates), recognising tag names, `.class`, `#id` (→ `id` attribute),
+/// `[attr]`/`[attr=value]` and `:not(...)` groups. A faithful port of Angular's `_SELECTOR_REGEXP`
+/// scanner restricted to the forms the compliance corpus uses.
+fn css_selector_parse(selector: &str) -> Vec<CssSelectorParts> {
+    let mut results: Vec<CssSelectorParts> = Vec::new();
+    let mut current_top = CssSelectorParts::default();
+    let mut in_not = false;
+    let chars: Vec<char> = selector.chars().collect();
+    let mut i = 0usize;
+
+    fn add_result(results: &mut Vec<CssSelectorParts>, mut sel: CssSelectorParts) {
+        if !sel.not_selectors.is_empty()
+            && sel.element.is_none()
+            && sel.class_names.is_empty()
+            && sel.attrs.is_empty()
+        {
+            sel.element = Some("*".to_string());
+        }
+        results.push(sel);
+    }
+
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_whitespace() {
+            i += 1;
+            continue;
+        }
+        if c == ':' && selector[char_to_byte_index(&chars, i)..].starts_with(":not(") {
+            in_not = true;
+            current_top.not_selectors.push(CssSelectorParts::default());
+            i += 5;
+            continue;
+        }
+        if c == ')' {
+            in_not = false;
+            i += 1;
+            continue;
+        }
+        if c == ',' {
+            let done = std::mem::take(&mut current_top);
+            add_result(&mut results, done);
+            i += 1;
+            continue;
+        }
+        if c == '[' {
+            let mut j = i + 1;
+            let mut name = String::new();
+            while j < chars.len() && chars[j] != ']' && chars[j] != '=' {
+                name.push(chars[j]);
+                j += 1;
+            }
+            let mut value = String::new();
+            if j < chars.len() && chars[j] == '=' {
+                j += 1;
+                let quote = if j < chars.len() && (chars[j] == '"' || chars[j] == '\'') {
+                    let q = chars[j];
+                    j += 1;
+                    Some(q)
+                } else {
+                    None
+                };
+                while j < chars.len() {
+                    if let Some(q) = quote {
+                        if chars[j] == q {
+                            j += 1;
+                            break;
+                        }
+                    } else if chars[j] == ']' {
+                        break;
+                    }
+                    value.push(chars[j]);
+                    j += 1;
+                }
+            }
+            while j < chars.len() && chars[j] != ']' {
+                j += 1;
+            }
+            j += 1; // consume `]`
+            let target = css_selector_target(&mut current_top, in_not);
+            target.attrs.push(css_unescape_attribute(&name));
+            target.attrs.push(value.to_lowercase());
+            i = j;
+            continue;
+        }
+        if c == '.' || c == '#' || c == '*' || c == '-' || c == '_' || c.is_alphanumeric() {
+            let prefix = if c == '.' || c == '#' { Some(c) } else { None };
+            let mut j = if prefix.is_some() { i + 1 } else { i };
+            let mut tok = String::new();
+            while j < chars.len() {
+                let d = chars[j];
+                if d == '-' || d == '_' || d == '*' || d.is_alphanumeric() {
+                    tok.push(d);
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            let target = css_selector_target(&mut current_top, in_not);
+            match prefix {
+                Some('#') => {
+                    target.attrs.push("id".to_string());
+                    target.attrs.push(tok.to_lowercase());
+                }
+                Some('.') => target.class_names.push(tok.to_lowercase()),
+                _ => target.element = Some(tok),
+            }
+            i = j;
+            continue;
+        }
+        i += 1;
+    }
+    add_result(&mut results, current_top);
+    results
+}
+
+/// Map a char index to a byte index in the original string (for `starts_with` on the slice).
+fn char_to_byte_index(chars: &[char], char_idx: usize) -> usize {
+    chars[..char_idx].iter().map(|c| c.len_utf8()).sum()
+}
+
+/// Resolve the `CssSelectorParts` the current token applies to: the in-progress `:not(...)`
+/// sub-selector when inside one, else the top-level selector.
+fn css_selector_target(top: &mut CssSelectorParts, in_not: bool) -> &mut CssSelectorParts {
+    if in_not {
+        top.not_selectors
+            .last_mut()
+            .expect("`:not(` opened a sub-selector")
+    } else {
+        top
+    }
+}
+
+/// Angular `CssSelector.unescapeAttribute` (the subset that strips `\` escapes).
+fn css_unescape_attribute(attr: &str) -> String {
+    let mut out = String::new();
+    for ch in attr.chars() {
+        if ch == '\\' {
+            continue;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// `parserSelectorToSimpleSelector` — the positive part of one selector: `[element, ...attrs,
+/// (CLASS, ...classNames)?]`. An element of `"*"` or absent becomes `""`.
+fn simple_selector_exprs(sel: &CssSelectorParts) -> Vec<Expr> {
+    let mut parts: Vec<Expr> = Vec::new();
+    let element = match &sel.element {
+        Some(e) if e != "*" => e.clone(),
+        _ => String::new(),
+    };
+    parts.push(str_lit(&element));
+    for a in &sel.attrs {
+        parts.push(str_lit(a));
+    }
+    if !sel.class_names.is_empty() {
+        parts.push(num(selector_flags::CLASS as f64));
+        for c in &sel.class_names {
+            parts.push(str_lit(c));
+        }
+    }
+    parts
+}
+
+/// `parserSelectorToNegativeSelector` — a `:not(...)` sub-selector, flag-prefixed by its mode.
+fn negative_selector_exprs(sel: &CssSelectorParts) -> Vec<Expr> {
+    let mut parts: Vec<Expr> = Vec::new();
+    if let Some(element) = &sel.element {
+        parts.push(num((selector_flags::NOT | selector_flags::ELEMENT) as f64));
+        parts.push(str_lit(element));
+        for a in &sel.attrs {
+            parts.push(str_lit(a));
+        }
+        if !sel.class_names.is_empty() {
+            parts.push(num(selector_flags::CLASS as f64));
+            for c in &sel.class_names {
+                parts.push(str_lit(c));
+            }
+        }
+    } else if !sel.attrs.is_empty() {
+        parts.push(num((selector_flags::NOT | selector_flags::ATTRIBUTE) as f64));
+        for a in &sel.attrs {
+            parts.push(str_lit(a));
+        }
+        if !sel.class_names.is_empty() {
+            parts.push(num(selector_flags::CLASS as f64));
+            for c in &sel.class_names {
+                parts.push(str_lit(c));
+            }
+        }
+    } else if !sel.class_names.is_empty() {
+        parts.push(num((selector_flags::NOT | selector_flags::CLASS) as f64));
+        for c in &sel.class_names {
+            parts.push(str_lit(c));
+        }
+    }
+    parts
+}
+
+/// `parseSelectorToR3Selector(selector)` — the `R3CssSelectorList` literal for one selector string:
+/// an array of per-alternate `R3CssSelector` arrays. E.g. `[spacer]` → `[["", "spacer", ""]]`,
+/// `basic` → `[["basic"]]`.
+fn parse_selector_to_r3_selector(selector: &str) -> Expr {
+    let parsed = css_selector_parse(selector);
+    let lists: Vec<Expr> = parsed
+        .iter()
+        .map(|sel| {
+            let mut parts = simple_selector_exprs(sel);
+            for neg in &sel.not_selectors {
+                parts.extend(negative_selector_exprs(neg));
+            }
+            o::literal_arr(parts, None)
+        })
+        .collect();
+    o::literal_arr(lists, None)
 }
 
 /// `instruction(reference, params)` — `ɵɵfoo(...params)` as an expression statement, mirroring
@@ -1066,6 +1330,11 @@ pub struct TemplateDefinitionBuilder {
     /// is non-empty, [`Self::build_template_function`] prepends a `ɵɵprojectionDef(...)` to the
     /// creation block.
     ng_content_selectors: Vec<String>,
+    /// Every `<ng-content>` projection slot's raw selector in create-block order, INCLUDING
+    /// duplicates and the wildcard `"*"` (Angular `generateProjectionDefs` `selectors.push`). Drives
+    /// the `ɵɵprojectionDef(...)` argument: when `selectors.len() > 1 || selectors[0] != "*"`, each
+    /// entry maps `"*"` → `"*"` else `parseSelectorToR3Selector(s)`, interned as one const.
+    all_projection_selectors: Vec<String>,
     /// Whether a catch-all (`<ng-content>` / `select="*"`) projection slot was reached. Drives
     /// whether the prepended `ɵɵprojectionDef(...)` needs to be emitted in the no-specific-selector
     /// case.
@@ -1118,6 +1387,7 @@ impl TemplateDefinitionBuilder {
             pipes: std::cell::RefCell::new(PipeState::default()),
             current_target_slot: 0,
             ng_content_selectors: Vec::new(),
+            all_projection_selectors: Vec::new(),
             has_default_projection: false,
             projection_count: 0,
             dom_only: input.dom_only,
@@ -1536,14 +1806,27 @@ impl TemplateDefinitionBuilder {
         // present they are interned as a literal string array in the const pool and that const index
         // is passed (the precise `parseSelectorToR3Selector` encoding is a larger subsystem — see the
         // module's i18n/selector scope notes).
-        if self.has_default_projection || !self.ng_content_selectors.is_empty() {
-            let params = if self.ng_content_selectors.is_empty() {
+        if !self.all_projection_selectors.is_empty() {
+            // Angular `generateProjectionDefs`: the argument is elided when there is exactly one slot
+            // and it is the wildcard (`selectors.length === 1 && selectors[0] === "*"`). Otherwise the
+            // selectors array is built in slot order — `"*"` stays `"*"`, every specific selector is
+            // mapped through `parseSelectorToR3Selector(s)` — and interned as one const.
+            let selectors = std::mem::take(&mut self.all_projection_selectors);
+            let elide_arg = selectors.len() == 1 && selectors[0] == "*";
+            let params = if elide_arg {
                 vec![]
             } else {
-                let arr = o::literal_arr(
-                    self.ng_content_selectors.iter().map(|s| str_lit(s)).collect(),
-                    None,
-                );
+                let entries: Vec<Expr> = selectors
+                    .iter()
+                    .map(|s| {
+                        if s == "*" {
+                            str_lit("*")
+                        } else {
+                            parse_selector_to_r3_selector(s)
+                        }
+                    })
+                    .collect();
+                let arr = o::literal_arr(entries, None);
                 vec![num(self.const_pool.intern(arr) as f64)]
             };
             self.creation_code
@@ -1750,6 +2033,9 @@ impl TemplateDefinitionBuilder {
         // `projectionSlotIndex` (0-based, in create-block order), regardless of selector dedup.
         let projection_index = self.projection_count;
         self.projection_count += 1;
+        // Record EVERY slot's selector in create order (with dups + wildcards) for the
+        // `ɵɵprojectionDef` argument (Angular `generateProjectionDefs`).
+        self.all_projection_selectors.push(selector.clone());
         if is_default {
             self.has_default_projection = true;
         } else if !self.ng_content_selectors.iter().any(|s| s == &selector) {
@@ -1813,6 +2099,13 @@ impl TemplateDefinitionBuilder {
         };
         let (reference, params) = text_interpolation_call(&bound.value, &lower);
         self.update_code.push(instruction(reference, params));
+
+        // Any pipe consumed by this text node takes the data slot immediately after it (Angular
+        // `slot_allocation.ts` walks the final create-op list in order, and `ɵɵpipe` ops sit right
+        // after their consuming op). Assign those slots NOW — before the next sibling allocates its
+        // slot — so the layout is `text(N), pipe(N+1), pipe(N+2), <next op>(N+3)` and the
+        // `ɵɵadvance` counts that follow are correct.
+        self.assign_positional_pipe_slots_for(slot);
     }
 
     /// Lower an `Element`. Childless elements collapse to a single
@@ -1826,6 +2119,38 @@ impl TemplateDefinitionBuilder {
     /// creation pass, binding refreshes to the update pass. The names of all bound inputs/outputs are
     /// also collected into the element's const attrs array under `AttributeMarker.Bindings` (`3`).
     fn build_element(&mut self, element: &Element) {
+        self.build_element_inner(element)
+    }
+
+    /// The value expression for a `[style.x]`/`[class.x]` binding. A literal interpolation value
+    /// (`"a{{exp}}b"`) is wrapped in the matching `ɵɵinterpolateN(...)` (Angular `interpolate.ts`
+    /// reifies `StyleProp`/`ClassProp` interpolation through the value-interpolation family); a
+    /// non-interpolation value is passed through as already lowered.
+    fn style_class_binding_value(&mut self, value: &AstNode, already_lowered: Expr) -> Expr {
+        match &value.kind {
+            AstExprKind::Interpolation { strings, expressions } => {
+                // Lower each interpolation expression against this view's scope, in order, then
+                // collate them with the literal string affixes into the `ɵɵinterpolateN` arg list.
+                let lowered: Vec<Expr> = expressions.iter().map(|e| self.lower_expr(e)).collect();
+                let (reference, args) =
+                    value_interpolation_call(strings, &lowered);
+                o::import_expr(reference.reference(), None).call_fn(args, false)
+            }
+            _ => already_lowered,
+        }
+    }
+
+    /// The property-binding instruction for this view's compilation mode: `ɵɵdomProperty` in
+    /// DomOnly mode, `ɵɵproperty` in Full mode (`reify.ts` `reifyDomProperty`/`reifyProperty`).
+    fn property_reference(&self) -> R3 {
+        if self.dom_only {
+            R3::DomProperty
+        } else {
+            R3::Property
+        }
+    }
+
+    fn build_element_inner(&mut self, element: &Element) {
         let slot = self.allocate_data_slot();
         // Each `#ref` on the element reserves one extra data slot (Angular `liftLocalRefs`:
         // `numSlotsUsed += localRefs.length`). The `ɵɵreference(slot)` slot for ref `k` is
@@ -1849,6 +2174,13 @@ impl TemplateDefinitionBuilder {
         use crate::expression::ast::BindingType;
         let mut binding_names: Vec<String> = Vec::new();
         for output in &element.outputs {
+            // A modern animation listener (`(animate.enter)`/`(animate.leave)`) reifies to a
+            // create-block `ɵɵanimateEnterListener`/`ɵɵanimateLeaveListener` with NO const-pool
+            // entry (Angular keeps it out of `AttributeMarker.Bindings`), so skip its name.
+            if matches!(output.kind, ParsedEventType::Animation) && output.name.starts_with("animate.")
+            {
+                continue;
+            }
             binding_names.push(output.name.clone());
         }
         for input in &element.inputs {
@@ -1874,10 +2206,35 @@ impl TemplateDefinitionBuilder {
             {
                 continue;
             }
+            // A legacy-animation property binding (`[@trigger]`) is a synthetic `@`-prefixed
+            // property that reifies to `ɵɵproperty("@trigger", …)` and is NOT extracted into the
+            // element's const attrs (Angular keeps synthetic properties out of `consts`).
+            if is_legacy_animation_name(&input.name) {
+                continue;
+            }
             binding_names.push(input.name.clone());
         }
 
-        let attrs_index = self.element_attrs_index(&element.attributes, &binding_names);
+        // A valueless `@`-prefixed static attribute (`<div @bar>`) is a legacy-animation property
+        // binding with no expression: it reifies to `ɵɵproperty("@bar", undefined)` and, like a
+        // bound `[@trigger]`, is kept OUT of the element's static-attribute const pool. Split those
+        // synthetic names off so the rest of `element.attributes` interns normally.
+        let mut synthetic_static_props: Vec<String> = Vec::new();
+        let static_attrs: Vec<TextAttribute> = element
+            .attributes
+            .iter()
+            .filter(|a| {
+                if is_legacy_animation_name(&a.name) {
+                    synthetic_static_props.push(a.name.clone());
+                    false
+                } else {
+                    true
+                }
+            })
+            .cloned()
+            .collect();
+
+        let attrs_index = self.element_attrs_index(&static_attrs, &binding_names);
         let local_refs_index = self.local_refs_index(&element.references);
 
         let has_children = !element.children.is_empty();
@@ -1948,6 +2305,24 @@ impl TemplateDefinitionBuilder {
         for input in ordered {
             self.build_property(slot, input);
         }
+
+        // Valueless `@`-prefixed static attributes (`<div @bar>`) → `ɵɵproperty("@bar", undefined)`.
+        // These synthetic legacy-animation properties carry no expression, so they reserve one var
+        // slot each (like any property binding) and advance to the host slot before emitting.
+        for name in &synthetic_static_props {
+            self.allocate_binding_slots(1);
+            self.advance_to(slot);
+            self.update_code.push(instruction(
+                self.property_reference(),
+                vec![str_lit(name), undefined_expr()],
+            ));
+        }
+
+        // A pipe consumed by one of this element's bindings takes the data slot immediately after
+        // the element op (its `ɵɵpipe` create op is inserted right after `elementStart`, before the
+        // children). Assign those slots before visiting children so the children get the slots that
+        // follow (Angular `slot_allocation.ts` order).
+        self.assign_positional_pipe_slots_for(slot);
 
         if element.i18n.is_some() {
             // The element is marked for translation: its content is lowered as an i18n block
@@ -2219,6 +2594,27 @@ impl TemplateDefinitionBuilder {
         // The consuming op for any pipe in this binding is the host element; the `ɵɵpipe(...)` create
         // op is inserted right after the element's create op (Angular `addPipeToCreationBlock`).
         self.current_target_slot = slot;
+
+        // A `[@trigger]` legacy-animation property binding (a `Property`/`TwoWay` whose name begins
+        // with `@`) reifies to `ɵɵproperty("@trigger", …)` — NOT through the DOM-property remapping
+        // path (which would mangle the `@` name) and never as an ARIA/class/style binding. A bound
+        // form with an empty value (`[@baz]`) carries the `undefined` value (Angular emits
+        // `ɵɵproperty("@baz", undefined)`).
+        if matches!(input.kind, BindingType::Property | BindingType::TwoWay)
+            && is_legacy_animation_name(&input.name)
+        {
+            let value = if is_empty_binding_value(&input.value) {
+                undefined_expr()
+            } else {
+                self.lower_expr(&input.value)
+            };
+            self.update_code.push(instruction(
+                self.property_reference(),
+                vec![str_lit(&input.name), value],
+            ));
+            return;
+        }
+
         // Lower against this view's scope (`ctx` + any `@for` loop locals). `lower_expr` already
         // spilled any temporary statements the expression needs (safe-navigation guards, chained
         // sub-expressions) into the update buffer ahead of the instruction we push below.
@@ -2266,12 +2662,22 @@ impl TemplateDefinitionBuilder {
                 }
             }
             BindingType::Class => {
+                // A `[class.x]="a{{exp}}b"` interpolation reifies its value through
+                // `ɵɵinterpolateN("a", exp, "b")` (Angular `interpolate.ts` `ClassProp` interpolation),
+                // not a raw string concat. A non-interpolation value passes through unchanged.
+                let value = self.style_class_binding_value(&input.value, lowered);
                 self.update_code
-                    .push(instruction(R3::ClassProp, vec![str_lit(&input.name), lowered]));
+                    .push(instruction(R3::ClassProp, vec![str_lit(&input.name), value]));
             }
             BindingType::Style => {
-                self.update_code
-                    .push(instruction(R3::StyleProp, vec![str_lit(&input.name), lowered]));
+                // As `ClassProp` above: a `[style.x]="a{{exp}}b"` value is wrapped in
+                // `ɵɵinterpolateN(...)`. A `style.x.unit` carries the unit as a trailing argument.
+                let value = self.style_class_binding_value(&input.value, lowered);
+                let mut params = vec![str_lit(&input.name), value];
+                if let Some(unit) = &input.unit {
+                    params.push(str_lit(unit));
+                }
+                self.update_code.push(instruction(R3::StyleProp, params));
             }
             BindingType::Attribute => {
                 // `ɵɵattribute(name, value[, sanitizer])` — `resolve_sanitizers.ts` appends the
@@ -2436,12 +2842,26 @@ impl TemplateDefinitionBuilder {
         };
         body.push(o::Stmt::bare(o::StmtKind::Return(ret)));
 
-        // Angular `naming.ts`: `${unit.fnName}_${tag.replace('-', '_')}_${event}_${slot}_listener`.
+        // A modern animation listener (`(animate.enter)`/`(animate.leave)`) reifies to
+        // `ɵɵanimateEnterListener`/`ɵɵanimateLeaveListener` (Angular `reify.ts`), and its handler is
+        // named with the SANITIZED event (`sanitizeIdentifier`: the `.` is dropped, so
+        // `animate.enter` → `animateenter`). It carries no `(name, …)` event-name argument and never
+        // extracts a const attr.
+        let is_animate_listener =
+            matches!(output.kind, ParsedEventType::Animation) && output.name.starts_with("animate.");
+        // Angular `naming.ts`: `${unit.fnName}_${tag.replace('-', '_')}_${event}_${slot}_listener`,
+        // with `event` run through `sanitizeIdentifier` (non-word chars → `_`); an animate event's
+        // `.` is removed entirely, giving `animateenter`.
+        let event_in_name = if is_animate_listener {
+            output.name.replace('.', "")
+        } else {
+            output.name.clone()
+        };
         let handler_name = format!(
             "{}_{}_{}_{}_listener",
             self.name,
             tag.replace('-', "_"),
-            output.name,
+            event_in_name,
             slot,
         );
         // Only add the `$event` parameter when the handler AST actually references `$event`.
@@ -2457,9 +2877,21 @@ impl TemplateDefinitionBuilder {
             Some(handler_name),
         );
 
-        // A regular template listener reifies to `ɵɵdomListener` in DomOnly mode and `ɵɵlistener`
-        // in Full mode (`reify.ts`: `domListener` iff `mode === DomOnly && !hostListener &&
-        // !isLegacyAnimationListener`). Both take the same `(name, handlerFn)` argument shape.
+        // A modern animation listener reifies to `ɵɵanimateEnterListener`/`ɵɵanimateLeaveListener`
+        // and takes ONLY the handler function (no event-name argument). A regular template listener
+        // reifies to `ɵɵdomListener` in DomOnly mode and `ɵɵlistener` in Full mode (`reify.ts`:
+        // `domListener` iff `mode === DomOnly && !hostListener && !isLegacyAnimationListener`); both
+        // take the `(name, handlerFn)` argument shape.
+        if is_animate_listener {
+            let reference = if output.name.ends_with("leave") {
+                R3::AnimationLeaveListener
+            } else {
+                R3::AnimationEnterListener
+            };
+            self.creation_code
+                .push(instruction(reference, vec![handler_fn]));
+            return;
+        }
         let listener_ref = if self.dom_only {
             R3::DomListener
         } else {
@@ -3267,17 +3699,20 @@ impl TemplateDefinitionBuilder {
         let mut placeholder: Option<(usize, Expr, usize, usize)> = None;
         let mut loading: Option<(usize, Expr, usize, usize)> = None;
         let mut error: Option<(usize, Expr, usize, usize)> = None;
-        if let Some(ph) = &deferred.placeholder {
-            let s = self.allocate_data_slot();
-            let f = format!("{}_DeferPlaceholder_{}_Template", self.base_name, s);
-            let (r, d, v) = self.build_deferred_view(f, ph.children.clone());
-            placeholder = Some((s, r, d, v));
-        }
+        // Slot/view allocation order is LOADING, then PLACEHOLDER, then ERROR (Angular
+        // `ingestDeferBlock` ingests the loading view before the placeholder view), so a block with
+        // all three lays out as `Defer(N), DeferLoading(N+1), DeferPlaceholder(N+2), DeferError(N+3)`.
         if let Some(ld) = &deferred.loading {
             let s = self.allocate_data_slot();
             let f = format!("{}_DeferLoading_{}_Template", self.base_name, s);
             let (r, d, v) = self.build_deferred_view(f, ld.children.clone());
             loading = Some((s, r, d, v));
+        }
+        if let Some(ph) = &deferred.placeholder {
+            let s = self.allocate_data_slot();
+            let f = format!("{}_DeferPlaceholder_{}_Template", self.base_name, s);
+            let (r, d, v) = self.build_deferred_view(f, ph.children.clone());
+            placeholder = Some((s, r, d, v));
         }
         if let Some(er) = &deferred.error {
             let s = self.allocate_data_slot();
@@ -3295,10 +3730,10 @@ impl TemplateDefinitionBuilder {
             this.creation_code.push(instruction(R3::DomTemplate, params));
         };
         emit_template(self, main_slot, main_ref, main_decls, main_vars);
-        if let Some((s, r, d, v)) = &placeholder {
+        if let Some((s, r, d, v)) = &loading {
             emit_template(self, *s, r.clone(), *d, *v);
         }
-        if let Some((s, r, d, v)) = &loading {
+        if let Some((s, r, d, v)) = &placeholder {
             emit_template(self, *s, r.clone(), *d, *v);
         }
         if let Some((s, r, d, v)) = &error {
@@ -4065,6 +4500,53 @@ fn text_interpolation_call(value: &AstNode, lower: &dyn Fn(&AstNode) -> Expr) ->
         8 => (R3::TextInterpolate8, args),
         // `textInterpolateV([s0, e0, s1, …, sN])` — variadic for >8 expressions.
         _ => (R3::TextInterpolateV, vec![o::literal_arr(args, None)]),
+    }
+}
+
+/// Build the value-interpolation call for a `[style.x]`/`[class.x]` (or any non-text)
+/// interpolation: `ɵɵinterpolate{N}(s0, e0, s1, …, sN)` (Angular `interpolate.ts`, the *value*
+/// family — `ɵɵinterpolate1` etc.). `strings` are the literal affixes, `lowered` the already-lowered
+/// expressions; collation mirrors `text_interpolation_call` (single empty-affix collapse, trailing
+/// empty-string trim, arity-selected instruction, `…V` variadic for >8 expressions).
+fn value_interpolation_call(strings: &[String], lowered: &[Expr]) -> (R3, Vec<Expr>) {
+    let mut args: Vec<Expr> =
+        if lowered.len() == 1 && strings.len() == 2 && strings[0].is_empty() && strings[1].is_empty()
+        {
+            vec![lowered[0].clone()]
+        } else {
+            let mut out = Vec::with_capacity(strings.len() + lowered.len());
+            for (idx, expr) in lowered.iter().enumerate() {
+                out.push(str_lit(strings.get(idx).map(String::as_str).unwrap_or("")));
+                out.push(expr.clone());
+            }
+            out.push(str_lit(strings.last().map(String::as_str).unwrap_or("")));
+            out
+        };
+
+    let count = if args.len() == 1 { 0 } else { (args.len() - 1) / 2 };
+
+    if args.len() > 1 {
+        if let Some(last) = args.last() {
+            if matches!(
+                &last.kind,
+                o::ExprKind::Literal(o::LiteralValue::String(s)) if s.is_empty()
+            ) {
+                args.pop();
+            }
+        }
+    }
+
+    match count {
+        0 => (R3::Interpolate, args),
+        1 => (R3::Interpolate1, args),
+        2 => (R3::Interpolate2, args),
+        3 => (R3::Interpolate3, args),
+        4 => (R3::Interpolate4, args),
+        5 => (R3::Interpolate5, args),
+        6 => (R3::Interpolate6, args),
+        7 => (R3::Interpolate7, args),
+        8 => (R3::Interpolate8, args),
+        _ => (R3::InterpolateV, vec![o::literal_arr(args, None)]),
     }
 }
 

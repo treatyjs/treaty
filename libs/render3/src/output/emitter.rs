@@ -897,6 +897,264 @@ impl<'a> Lowerer<'a> {
 }
 
 // ---------------------------------------------------------------------------
+// Numeric-literal de-minification.
+//
+// `oxc_codegen` (in its default, non-TypeScript context) IGNORES the `raw` text we
+// attach to numeric literals and re-derives the shortest spelling via
+// `print_non_negative_float` — so a round integer like `1000` is emitted as `1e3`,
+// `12000` as `12e3`, and large/round values can even appear as hex (`0x...`).
+// Angular's TypeScript printer always emits the plain `Number.prototype.toString()`
+// form (`1000`, `123.456`). This post-pass walks the printed source byte-wise,
+// skipping string / template-literal / comment / regex spans, finds each *token-
+// bounded* numeric literal and reprints it via [`format_number`] (the same routine
+// `lower_literal` used to build the now-ignored `raw`). The rewrite is value-
+// preserving: every recognised token is parsed back to the identical `f64` and
+// re-spelled in the canonical decimal form Angular emits. Tokens we cannot losslessly
+// reparse (BigInt `…n`, separators) are left exactly as printed.
+// ---------------------------------------------------------------------------
+
+/// Format an `f64` the way JavaScript's `Number.prototype.toString()` does, which is
+/// what the TypeScript printer Angular uses produces. This keeps plain
+/// decimals/integers verbatim (`2000`, `1000`, `123.456`) instead of OXC's collapsed
+/// scientific notation (`2e3`).
+///
+/// JS only switches to exponential form when the decimal exponent is `>= 21` or
+/// `<= -7`; for everything in between it emits the fixed form. Realistic Angular
+/// literals fall in the fixed range, so Rust's default `{}` formatting matches JS
+/// exactly there. We special-case the extreme magnitudes to stay faithful for the
+/// rare large/small values.
+fn format_number(n: f64) -> String {
+    if !n.is_finite() {
+        // NaN / Infinity are not valid numeric literals; fall back to a
+        // textual form that round-trips through the printer.
+        if n.is_nan() {
+            return "NaN".to_string();
+        }
+        return if n < 0.0 { "-Infinity".to_string() } else { "Infinity".to_string() };
+    }
+    if n == 0.0 {
+        // Covers both +0.0 and -0.0 (JS prints both as "0").
+        return "0".to_string();
+    }
+
+    let abs = n.abs();
+    // Outside JS's fixed-notation window, defer to Rust's exponential
+    // formatting (close enough for these vanishingly rare values).
+    if abs >= 1e21 || abs < 1e-6 {
+        return format!("{n:e}");
+    }
+
+    // Within the window Rust's default formatting matches JS's output.
+    format!("{n}")
+}
+
+/// Is `b` a byte that can be the FIRST character of a numeric-literal token? Only a
+/// leading decimal digit; the `.5` lead-dot form is handled by the caller (it must look
+/// ahead one byte to confirm a following digit).
+fn is_number_start(b: u8) -> bool {
+    b.is_ascii_digit()
+}
+
+/// Is `b` a byte that may appear inside a numeric-literal token after the first? Covers
+/// decimal digits, the decimal point, exponent marker (`e`/`E`), hex digits, the
+/// `0x`/`0b`/`0o` radix letters, the `_` numeric separator and the BigInt `n` suffix.
+fn is_number_continue(b: u8) -> bool {
+    b.is_ascii_hexdigit()
+        || matches!(b, b'.' | b'e' | b'E' | b'x' | b'X' | b'b' | b'B' | b'o' | b'O' | b'_' | b'n')
+}
+
+/// Parse a JS numeric-literal token (decimal, scientific, hex/oct/bin) into its `f64`
+/// value. Returns `None` for BigInt (`…n`), separator-bearing, or otherwise non-trivially
+/// reparseable tokens so the caller leaves them untouched.
+fn parse_js_number(tok: &str) -> Option<f64> {
+    if tok.is_empty() || tok.contains('_') || tok.ends_with('n') {
+        return None;
+    }
+    // Radix-prefixed integers: 0x.. / 0b.. / 0o..
+    if let Some(hex) = tok.strip_prefix("0x").or_else(|| tok.strip_prefix("0X")) {
+        return u128::from_str_radix(hex, 16).ok().map(|v| v as f64);
+    }
+    if let Some(bin) = tok.strip_prefix("0b").or_else(|| tok.strip_prefix("0B")) {
+        return u128::from_str_radix(bin, 2).ok().map(|v| v as f64);
+    }
+    if let Some(oct) = tok.strip_prefix("0o").or_else(|| tok.strip_prefix("0O")) {
+        return u128::from_str_radix(oct, 8).ok().map(|v| v as f64);
+    }
+    // Decimal / scientific: Rust's f64 parser matches JS's grammar for these.
+    tok.parse::<f64>().ok()
+}
+
+/// Rewrite each minified numeric literal in `code` to its plain-decimal Angular form.
+/// Skips string, template, comment and regex spans so only real numeric tokens in code
+/// positions are considered, and only rewrites a token when it is preceded by a non-
+/// identifier, non-`.` byte (so member chains like `i0.x` and identifiers like `_r1`
+/// are never touched) and reparses losslessly.
+fn normalize_numeric_literals(code: &str) -> String {
+    let bytes = code.as_bytes();
+    let n = bytes.len();
+    let mut out: Vec<u8> = Vec::with_capacity(n);
+    let mut i = 0usize;
+    // The last non-whitespace byte we emitted, used to decide whether a `/` opens a
+    // regex (no preceding operand) or is a division operator, and whether a digit run
+    // is a fresh numeric token vs. the tail of an identifier.
+    let mut prev_significant: u8 = 0;
+    while i < n {
+        let c = bytes[i];
+        match c {
+            // String literals: copy verbatim until the matching unescaped quote.
+            b'"' | b'\'' => {
+                let quote = c;
+                out.push(c);
+                i += 1;
+                while i < n {
+                    let b = bytes[i];
+                    out.push(b);
+                    i += 1;
+                    if b == b'\\' && i < n {
+                        out.push(bytes[i]);
+                        i += 1;
+                    } else if b == quote {
+                        break;
+                    }
+                }
+                prev_significant = quote;
+            }
+            // Template literals: copy verbatim until the matching unescaped backtick.
+            b'`' => {
+                out.push(c);
+                i += 1;
+                while i < n {
+                    let b = bytes[i];
+                    out.push(b);
+                    i += 1;
+                    if b == b'\\' && i < n {
+                        out.push(bytes[i]);
+                        i += 1;
+                    } else if b == b'`' {
+                        break;
+                    }
+                }
+                prev_significant = b'`';
+            }
+            // Line comments.
+            b'/' if i + 1 < n && bytes[i + 1] == b'/' => {
+                while i < n && bytes[i] != b'\n' {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            // Block comments.
+            b'/' if i + 1 < n && bytes[i + 1] == b'*' => {
+                out.push(bytes[i]);
+                out.push(bytes[i + 1]);
+                i += 2;
+                while i < n {
+                    if bytes[i] == b'*' && i + 1 < n && bytes[i + 1] == b'/' {
+                        out.push(bytes[i]);
+                        out.push(bytes[i + 1]);
+                        i += 2;
+                        break;
+                    }
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            // Regex literal: a `/` is a regex iff the previous significant byte cannot
+            // end an operand. Copy the body + flags verbatim so digits inside are left
+            // alone.
+            b'/' if regex_can_follow(prev_significant) => {
+                out.push(c);
+                i += 1;
+                let mut in_class = false;
+                while i < n {
+                    let b = bytes[i];
+                    out.push(b);
+                    i += 1;
+                    if b == b'\\' && i < n {
+                        out.push(bytes[i]);
+                        i += 1;
+                    } else if b == b'[' {
+                        in_class = true;
+                    } else if b == b']' {
+                        in_class = false;
+                    } else if b == b'/' && !in_class {
+                        break;
+                    }
+                }
+                // Copy trailing flag letters.
+                while i < n && bytes[i].is_ascii_alphabetic() {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+                prev_significant = b'/';
+            }
+            // A numeric-literal token: only when not glued to a preceding identifier /
+            // member access (so `_r1`, `i0`, and `obj.field` are never mistaken for a
+            // fresh number).
+            _ if (is_number_start(c)
+                || (c == b'.' && i + 1 < n && bytes[i + 1].is_ascii_digit()))
+                && !is_ident_byte(prev_significant)
+                && prev_significant != b'.' =>
+            {
+                let start = i;
+                // Advance over the optional lead-in `.`.
+                if c == b'.' {
+                    i += 1;
+                }
+                while i < n {
+                    let b = bytes[i];
+                    if is_number_continue(b) {
+                        // `e`/`E` may be followed by an explicit sign.
+                        if (b == b'e' || b == b'E')
+                            && i + 1 < n
+                            && (bytes[i + 1] == b'+' || bytes[i + 1] == b'-')
+                        {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+                let tok = &code[start..i];
+                match parse_js_number(tok) {
+                    Some(v) => {
+                        let canon = format_number(v);
+                        out.extend_from_slice(canon.as_bytes());
+                        prev_significant = *canon.as_bytes().last().unwrap_or(&b'0');
+                    }
+                    None => {
+                        out.extend_from_slice(tok.as_bytes());
+                        prev_significant = *tok.as_bytes().last().unwrap_or(&b'0');
+                    }
+                }
+            }
+            _ => {
+                out.push(c);
+                if !c.is_ascii_whitespace() {
+                    prev_significant = c;
+                }
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| code.to_string())
+}
+
+/// Can a `/` at this position begin a regex literal? True when the previous significant
+/// byte cannot terminate an operand (so the `/` is not a division operator). Standard
+/// lexer heuristic; conservative — a wrong guess only changes whether a span is scanned
+/// as regex vs. code, and numbers inside either are handled correctly regardless.
+fn regex_can_follow(prev: u8) -> bool {
+    match prev {
+        0 => true, // start of input
+        b')' | b']' | b'}' | b'"' | b'\'' | b'`' => false,
+        b => !is_ident_byte(b),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Single-parameter arrow parenthesization.
 //
 // `oxc_codegen` always parenthesizes an arrow's parameter list (it only drops the

@@ -143,11 +143,34 @@ function canonicalize(code) {
   s = s.replace(/\$?r3\$?\./g, '');
   s = s.replace(/\b(core|ng)\.(?=ɵ)/g, '');
   // Angular goldens reference the AttributeMarker enum by a `__AttributeMarker.X__`
-  // placeholder; our emitter emits the numeric marker. Canonicalise the golden token
-  // to a stable form so the *presence* of the marker is compared, not its spelling.
-  s = s.replace(/__AttributeMarker\.[A-Za-z]+__/g, 'AM');
+  // placeholder; our emitter is FAITHFUL to Angular's REAL emitted output and writes the
+  // resolved NUMERIC marker. Map each golden enum-ref to its fixed Angular enum value so
+  // the golden normalises to the SAME number we emit. These are the canonical values of
+  // the `AttributeMarker` enum (packages/core/src/render3/interfaces/attribute_marker.ts):
+  //   NamespaceURI=0, Classes=1, Styles=2, Bindings=3, Template=4, ProjectAs=5, I18n=6.
+  // STRICT: this only maps a known enum member to its exact fixed integer (provably
+  // equivalent); unknown members are left intact so they cannot silently match.
+  {
+    const ATTR_MARKER = {
+      NamespaceURI: 0,
+      Classes: 1,
+      Styles: 2,
+      Bindings: 3,
+      Template: 4,
+      ProjectAs: 5,
+      I18n: 6,
+    };
+    s = s.replace(/__AttributeMarker\.([A-Za-z]+)__/g, (m, name) =>
+      Object.prototype.hasOwnProperty.call(ATTR_MARKER, name) ? String(ATTR_MARKER[name]) : m,
+    );
+  }
   // Canonicalise local-ref / temp identifiers. Angular goldens use `$name$`
   // placeholders and `_rN` view-ref suffixes; our emitter uses its own suffixes.
+  // The golden's `$ctx$` placeholder is the template context parameter, which Angular's
+  // OWN TS printer emits as the LITERAL identifier `ctx` (so does our emitter). Map it
+  // to `ctx` BEFORE the generic `$name$ -> ID` collapse so the golden's $ctx$ compares
+  // EQUAL to our real literal `ctx`. STRICT: only the exact `$ctx$` token.
+  s = s.replace(/\$ctx\$/g, 'ctx');
   s = s.replace(/\$[A-Za-z_][A-Za-z0-9_]*\$/g, 'ID'); // $ctx_r1$, $_r2$, $i0$ already gone
   s = s.replace(/_r\d+\b/g, '_R'); // item_r1 -> item_R
   s = s.replace(/_\d+\b(?=_)/g, '_N'); // intermediate numeric segments in fn names

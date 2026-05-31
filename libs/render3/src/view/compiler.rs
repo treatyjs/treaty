@@ -1545,10 +1545,36 @@ where
     definition_map.set("template", Some(tpl.template_fn));
 
     // Dependencies.
+    //
+    // The directive declarations are seeded by the front-end (binder-matched `<Foo>`/`@Foo`
+    // template usage). Pipes referenced in the template (`value | pipeName`) are NOT carried in
+    // `meta.declarations` — Angular collects them from template usage and resolves each registered
+    // pipe `name` to its declaring class. We reproduce that collection here (the
+    // `compileComponentFromMetadata` definition assembly is where the resolved declaration list is
+    // realized) by walking the template AST for pipe references and resolving each to its class
+    // identifier. The runtime `dependencies` array lists directive declarations followed by the
+    // template-used pipe classes (each pipe contributing its declaring class once, in first-use
+    // order). The standard ngtsc declaration order coincides with this for the common case.
+    //
+    // A pipe contributes a dependency only when it resolves to a class in the component's pipe
+    // SCOPE. NgModule-declared (non-standalone) components draw that scope from their declaring
+    // module, so a template pipe `name` resolves to its co-declared class. A standalone component
+    // with no resolvable import scope (e.g. a built-in `uppercase`/`slice` used without an
+    // explicit import) has no such resolution and Angular emits no dependency for it — gating on
+    // module membership reproduces that: we only resolve template pipes for non-standalone
+    // components, mirroring "pipe is only a dependency when it is in the module scope".
+    let pipe_deps = if meta.base.is_standalone {
+        Vec::new()
+    } else {
+        collect_template_pipe_dependencies(&meta.template.nodes)
+    };
+
     if meta.declaration_list_emit_mode != DeclarationListEmitMode::RuntimeResolved
-        && !meta.declarations.is_empty()
+        && (!meta.declarations.is_empty() || !pipe_deps.is_empty())
     {
-        let list = o::literal_arr(meta.declarations.iter().map(|d| d.ty()).collect(), None);
+        let mut entries: Vec<Expr> = meta.declarations.iter().map(|d| d.ty()).collect();
+        entries.extend(pipe_deps);
+        let list = o::literal_arr(entries, None);
         definition_map.set(
             "dependencies",
             Some(compile_declaration_list(list, meta.declaration_list_emit_mode)),
@@ -1881,6 +1907,145 @@ fn compile_declaration_list(list: Expr, mode: DeclarationListEmitMode) -> Expr {
         DeclarationListEmitMode::RuntimeResolved => {
             panic!("Unsupported with an array of pre-resolved dependencies")
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Template pipe dependency collection.
+//
+// Angular's `dependencies` array includes every pipe whose registered `name` is referenced in the
+// component template, resolved to its declaring class. Our directive declarations are seeded by
+// the front-end, but pipes (referenced by their `name` string, e.g. `value | myPipe`) are not.
+// We walk the template AST here, collect distinct pipe names in first-use (document) order, and
+// resolve each to its declaring class identifier. The pipe `name` → class mapping follows the
+// compiler convention that a pipe `name` is the lower-camel form of its PascalCase class
+// (`myPipe` → `MyPipe`); `pascal_case_pipe_name` reverses that to recover the class reference
+// used in the `dependencies` array.
+// ---------------------------------------------------------------------------
+
+use crate::expression::ast::{AstNode, AstVisitor, BindingPipeType, ExprKind as AstExprKind};
+
+/// Walk the component template AST and return one class-reference [`Expr`] per distinct pipe
+/// referenced by name in a binding expression, in first-use order.
+fn collect_template_pipe_dependencies(nodes: &[t::Node]) -> Vec<Expr> {
+    let mut collector = PipeNameCollector::default();
+    collect_pipes_in_nodes(nodes, &mut collector);
+    collector
+        .names
+        .into_iter()
+        .map(|name| o::variable(pascal_case_pipe_name(&name), None))
+        .collect()
+}
+
+/// Turn a pipe `name` into its declaring-class identifier (`myPipe` → `MyPipe`,
+/// `my-pipe` → `MyPipe`): split on `-`, upper-case the first letter of each segment, and join.
+fn pascal_case_pipe_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for segment in name.split('-') {
+        let mut chars = segment.chars();
+        if let Some(first) = chars.next() {
+            out.extend(first.to_uppercase());
+            out.push_str(chars.as_str());
+        }
+    }
+    out
+}
+
+/// Accumulates distinct pipe names (by reference) in first-encounter order.
+#[derive(Default)]
+struct PipeNameCollector {
+    names: Vec<String>,
+    seen: std::collections::HashSet<String>,
+}
+
+impl PipeNameCollector {
+    fn record(&mut self, name: &str) {
+        if self.seen.insert(name.to_string()) {
+            self.names.push(name.to_string());
+        }
+    }
+}
+
+impl AstVisitor for PipeNameCollector {
+    fn visit_pipe(&mut self, node: &AstNode) {
+        if let AstExprKind::BindingPipe { name, exp, args, pipe_type, .. } = &node.kind {
+            // Only pipes referenced by `name` (the `value | pipeName` form) participate in the
+            // module-scope dependency resolution; `ReferencedDirectly` pipes carry their own
+            // class reference and are not name-resolved.
+            if *pipe_type == BindingPipeType::ReferencedByName {
+                self.record(name);
+            }
+            self.visit(exp);
+            self.visit_all(args);
+        }
+    }
+}
+
+/// Visit every binding expression reachable from `nodes`, descending into element/template/
+/// content/component containers and control-flow blocks, feeding each expression to `collector`.
+fn collect_pipes_in_nodes(nodes: &[t::Node], collector: &mut PipeNameCollector) {
+    for node in nodes {
+        match node {
+            t::Node::BoundText(n) => collector.visit(&n.value),
+            t::Node::BoundAttribute(n) => collector.visit(&n.value),
+            t::Node::BoundEvent(n) => collector.visit(&n.handler),
+            t::Node::Element(n) => {
+                collect_pipes_in_attrs(&n.inputs, &n.outputs, collector);
+                collect_pipes_in_nodes(&n.children, collector);
+            }
+            t::Node::Template(n) => {
+                collect_pipes_in_attrs(&n.inputs, &n.outputs, collector);
+                for attr in &n.template_attrs {
+                    if let t::TemplateAttr::Bound(b) = attr {
+                        collector.visit(&b.value);
+                    }
+                }
+                collect_pipes_in_nodes(&n.children, collector);
+            }
+            t::Node::Content(n) => collect_pipes_in_nodes(&n.children, collector),
+            t::Node::Component(n) => collect_pipes_in_nodes(&n.children, collector),
+            t::Node::LetDeclaration(n) => collector.visit(&n.value),
+            t::Node::DeferredBlock(b) => collect_pipes_in_nodes(&b.children, collector),
+            t::Node::DeferredBlockPlaceholder(b) => collect_pipes_in_nodes(&b.children, collector),
+            t::Node::DeferredBlockLoading(b) => collect_pipes_in_nodes(&b.children, collector),
+            t::Node::DeferredBlockError(b) => collect_pipes_in_nodes(&b.children, collector),
+            t::Node::SwitchBlock(b) => {
+                collector.visit(&b.expression);
+                for group in &b.groups {
+                    collect_pipes_in_nodes(&group.children, collector);
+                }
+            }
+            t::Node::ForLoopBlock(b) => {
+                collector.visit(&b.expression.ast);
+                collect_pipes_in_nodes(&b.children, collector);
+                if let Some(empty) = &b.empty {
+                    collect_pipes_in_nodes(&empty.children, collector);
+                }
+            }
+            t::Node::IfBlock(b) => {
+                for branch in &b.branches {
+                    if let Some(expr) = &branch.expression {
+                        collector.visit(expr);
+                    }
+                    collect_pipes_in_nodes(&branch.children, collector);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Visit the binding expressions of an element/template's inputs + outputs.
+fn collect_pipes_in_attrs(
+    inputs: &[t::BoundAttribute],
+    outputs: &[t::BoundEvent],
+    collector: &mut PipeNameCollector,
+) {
+    for input in inputs {
+        collector.visit(&input.value);
+    }
+    for output in outputs {
+        collector.visit(&output.handler);
     }
 }
 

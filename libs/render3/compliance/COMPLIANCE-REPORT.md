@@ -14,11 +14,11 @@ This harness runs Treaty's Rust/OXC Angular compiler (`render3` crate, via the
 | --- | --- |
 | Total compliance cases | 642 |
 | Compiled (runnable) | 98 |
-| PASS | 54 |
-| DIFF | 44 |
+| PASS | 75 |
+| DIFF | 23 |
 | Skipped (un-runnable) | 544 |
-| **Pass-rate (of runnable subset)** | **55.1%** (54/98) |
-| Pass-rate (of full corpus) | 8.4% (54/642) |
+| **Pass-rate (of runnable subset)** | **76.5%** (75/98) |
+| Pass-rate (of full corpus) | 11.7% (75/642) |
 
 ### How a case is run and matched
 
@@ -43,47 +43,22 @@ from our output. Top entry = implement first to raise the score.
 
 | Count | Category (instruction / shape at first missing fragment) |
 | --- | --- |
-| 9 | `misc-shape` |
-| 7 | `ɵɵelement` |
-| 5 | `ɵɵdomElementStart` |
 | 3 | `ɵɵelementStart` |
+| 3 | `ɵɵdomElementStart` |
 | 3 | `ɵɵi18nPostprocess` |
 | 3 | `ɵɵprojectionDef` |
 | 2 | `ɵɵdomTemplate` |
-| 2 | `ɵɵtext` |
 | 2 | `ɵɵtemplate` |
 | 1 | `ɵɵcontentQuerySignal` |
-| 1 | `ɵɵgetCurrentView` |
+| 1 | `ɵɵelement` |
 | 1 | `ɵɵpipeBind1` |
 | 1 | `ɵɵconditionalCreate` |
-| 1 | `ɵɵdefer` |
 | 1 | `ɵɵpureFunction1` |
 | 1 | `ɵɵforeignComponent` |
-| 1 | `dependencies` |
+| 1 | `misc-shape` |
 
 ### Sample diverging cases
 
-- **`misc-shape`** (9):
-  - r3_view_compiler_styling/component_animations/should pass in the component metadata animations into the component definition
-    - near: `(rf,ID){},encapsulation:2,data:{an`
-  - r3_view_compiler_styling/component_animations/should include animations even if the provided array is empty
-    - near: `(rf,ID){},encapsulation:2,data:{an`
-  - r3_view_compiler_styling/chaining/should chain classProp instruction calls
-    - near: `(rf,ID){`
-- **`ɵɵelement`** (7):
-  - r3_view_compiler_styling/style_bindings/should place initial, multi, singular and application followed by attribute style instructions in the template code in that order
-    - near: `s:[[AM,"opacity","1"]],template:fu`
-  - r3_view_compiler_styling/component_animations/should generate any animation triggers into the component template
-    - near: `ars:3,template:functionMyComponent`
-  - r3_view_compiler_styling/class_bindings/should place initial, multi, singular and application followed by attribute class instructions in the template code in that order
-    - near: `s:[[AM,"grape"]],template:function`
-- **`ɵɵdomElementStart`** (5):
-  - r3_view_compiler_let/should handle an @let used only directly inside i18n
-    - near: `n":"\uFFFD0\uFFFD"},{original_code`
-  - r3_view_compiler_let/should handle an @let referenced inside a child view inside i18n
-    - near: `cls:4,vars:1,consts:()=>{letID;if(`
-  - r3_view_compiler_let/should handle an @let preceded by an element with i18n
-    - near: `n":"\uFFFD0\uFFFD"},{original_code`
 - **`ɵɵelementStart`** (3):
   - r3_view_compiler_styling/component_animations/should generate animation listeners
     - near: `s:1,template:functionMyComponent_T`
@@ -91,6 +66,13 @@ from our output. Top entry = implement first to raise the score.
     - near: `{leti18n_0;if(typeofngI18nClosureM`
   - r3_view_compiler_i18n/blocks/should support @defer blocks
     - near: `{leti18n_0;if(typeofngI18nClosureM`
+- **`ɵɵdomElementStart`** (3):
+  - r3_view_compiler_let/should handle an @let used only directly inside i18n
+    - near: `n":"\uFFFD0\uFFFD"},{original_code`
+  - r3_view_compiler_let/should handle an @let referenced inside a child view inside i18n
+    - near: `cls:4,vars:1,consts:()=>{letID;if(`
+  - r3_view_compiler_let/should handle an @let preceded by an element with i18n
+    - near: `n":"\uFFFD0\uFFFD"},{original_code`
 - **`ɵɵi18nPostprocess`** (3):
   - r3_view_compiler_let/should handle an @let referenced inside i18n and in a child view
     - near: `cls:4,vars:2,consts:()=>{letID;if(`
@@ -102,7 +84,7 @@ from our output. Top entry = implement first to raise the score.
   - r3_compiler_compliance/components_and_directives/content_projection/should support multi-slot content projection with multiple wildcard slots
     - near: `ors:ID,decls:3,vars:0,template:fun`
   - r3_compiler_compliance/components_and_directives/content_projection/should capture the node name of ng-content with a structural directive
-    - near: `ors:ID,decls:1,vars:1,consts:[[AM,`
+    - near: `ors:ID,decls:1,vars:1,consts:[[4,"`
   - r3_compiler_compliance/components_and_directives/content_projection/should support fallback content in ng-content
     - near: `ors:ID,decls:7,vars:2,consts:[[4,"`
 - **`ɵɵdomTemplate`** (2):
@@ -110,40 +92,32 @@ from our output. Top entry = implement first to raise the score.
     - near: `:[[2000],["src","placeholder.gif"]`
   - r3_view_compiler_deferred/should generate a deferred block with loading block parameters
     - near: `:[[2000,500],["src","loading.gif"]`
-- **`ɵɵtext`** (2):
-  - r3_view_compiler_arrow_functions/should handle arrow function that is passed into a pipe
-    - near: `ipe(1,"test");ɵɵdomElement(2,"hr")`
-  - r3_compiler_compliance/components_and_directives/pipes/should render pipes
-    - near: `ipe(1,"myPipe");ɵɵpipe(2,"myPurePi`
 - **`ɵɵtemplate`** (2):
   - r3_compiler_compliance/components_and_directives/should support empty property bindings on ng-template
-    - near: `s:0,consts:[[AM,"id"]],template:fu`
+    - near: `s:0,consts:[[3,"id"]],template:fun`
   - r3_compiler_compliance/components_and_directives/content_projection/should include parsed ngProjectAs selectors into template attrs
     - near: `ars:1,consts:[["ngProjectAs",".som`
 - **`ɵɵcontentQuerySignal`** (1):
   - signal_queries/should generate signal based query instructions for a component
     - near: `contentQueries:functionTestComp_`
-- **`ɵɵgetCurrentView`** (1):
-  - r3_view_compiler_listener/local refs in listeners defined before the local refs
-    - near: `"],[AM,"click"]],template:function`
+- **`ɵɵelement`** (1):
+  - r3_view_compiler_styling/component_animations/should generate any animation triggers into the component template
+    - near: `ars:3,template:functionMyComponent`
 - **`ɵɵpipeBind1`** (1):
   - r3_view_compiler_let/should create a let using a pipe
     - near: `onstID=ɵɵpipeBind1(1,1,ID);ɵɵadvan`
 - **`ɵɵconditionalCreate`** (1):
   - r3_view_compiler_let/should be able to use let declarations in child views
     - near: `cls:2,vars:2,template:functionMyAp`
-- **`ɵɵdefer`** (1):
-  - r3_view_compiler_deferred/should generate a deferred block with secondary blocks
-    - near: `eferLoading_3_Template,1,1)(4,MyAp`
 - **`ɵɵpureFunction1`** (1):
   - r3_view_compiler_arrow_functions/should be able to use arrow functions inside pure values
     - near: `0](1000),"",ɵɵpureFunction1(6,ID,ɵ`
 - **`ɵɵforeignComponent`** (1):
   - r3_compiler_compliance/components_and_directives/standalone/should properly compile foreign component imports in a standalone component
     - near: `ars:0,template:functionTestCmp_Tem`
-- **`dependencies`** (1):
-  - r3_compiler_compliance/components_and_directives/pipes/should use appropriate function for a given no of pipe arguments
-    - near: `;}},dependencies:[MyPipe],encapsul`
+- **`misc-shape`** (1):
+  - r3_compiler_compliance/components_and_directives/pipes/should render pipes
+    - near: `[MyPipe,MyPurePipe],encapsulation:`
 
 ## Skip categories (cases not runnable through the source front-end)
 
@@ -162,11 +136,15 @@ error-expectation cases).
 
 ## Passing cases
 
-54 runnable compliance cases match Angular's golden `ɵɵdefineComponent` block:
+75 runnable compliance cases match Angular's golden `ɵɵdefineComponent` block:
 
 - model_inputs/should capture input/output pair in a component definition
 - output_function/should generate an output mapping for the component
 - r3_compiler_compliance/components_and_directives/lifecycle_hooks/local reference
+- r3_compiler_compliance/components_and_directives/pipes/should use appropriate function for a given no of pipe arguments
+- r3_compiler_compliance/components_and_directives/should not share pure functions between null and array literals
+- r3_compiler_compliance/components_and_directives/should not share pure functions between null and function calls
+- r3_compiler_compliance/components_and_directives/should not share pure functions between null and object literals
 - r3_compiler_compliance/components_and_directives/value_composition/should convert #my-app selector to ["", "id", "my-app"]
 - r3_compiler_compliance/components_and_directives/value_composition/should not treat ElementRef, ViewContainerRef, or ChangeDetectorRef specially when injecting
 - r3_compiler_compliance/components_and_directives/value_composition/should support dollar escape in template
@@ -176,8 +154,10 @@ error-expectation cases).
 - r3_compiler_compliance/elements/should bind to class and style names
 - r3_view_compiler/animations/should generate animate enter instructions on element with a binding
 - r3_view_compiler/animations/should generate animate enter instructions on element with a simple string
+- r3_view_compiler/animations/should generate animate enter instructions on element with an event binding
 - r3_view_compiler/animations/should generate animate leave instructions on element with a binding
 - r3_view_compiler/animations/should generate animate leave instructions on element with a simple string
+- r3_view_compiler/animations/should generate animate leave instructions on element with an event binding
 - r3_view_compiler/animations/should not generate animate leave when using 'animate' as a binding prefix
 - r3_view_compiler_arrow_functions/should handle arrow function returning another arrow function with access across multiple contexts
 - r3_view_compiler_arrow_functions/should handle arrow function returning another arrow function with no context access
@@ -186,6 +166,7 @@ error-expectation cases).
 - r3_view_compiler_arrow_functions/should handle arrow function that accesses @let declarations across view boundaries
 - r3_view_compiler_arrow_functions/should handle arrow function that has a `this` access with same name as parameter
 - r3_view_compiler_arrow_functions/should handle arrow function that is defined inside a @let and used within the template
+- r3_view_compiler_arrow_functions/should handle arrow function that is passed into a pipe
 - r3_view_compiler_arrow_functions/should handle arrow function that only accesses the top-level context
 - r3_view_compiler_arrow_functions/should handle arrow function using $event
 - r3_view_compiler_arrow_functions/should handle arrow function using loop variables
@@ -196,6 +177,7 @@ error-expectation cases).
 - r3_view_compiler_arrow_functions/should handle arrow functions that do not depend on context
 - r3_view_compiler_arrow_functions/should not produce pure functions for arrow function return values
 - r3_view_compiler_deferred/should generate a basic deferred block
+- r3_view_compiler_deferred/should generate a deferred block with secondary blocks
 - r3_view_compiler_input_outputs/should declare inputs/outputs on a component
 - r3_view_compiler_let/should be able to use for loop variables in let declarations
 - r3_view_compiler_let/should be able to use forward references defined after the let declaration
@@ -212,9 +194,22 @@ error-expectation cases).
 - r3_view_compiler_let/should remove a single unused let declaration
 - r3_view_compiler_let/should remove only the unused let declarations from the middle of a chain of declarations
 - r3_view_compiler_let/should share let declarations between parent and child views
+- r3_view_compiler_listener/local refs in listeners defined before the local refs
 - r3_view_compiler_listener/should not generate restore/reset view when listener does not use @let in the same scope
 - r3_view_compiler_providers/should not emit the ProvidersFeature feature when no providers
+- r3_view_compiler_styling/chaining/should break into multiple chains if there are other styling instructions in between
+- r3_view_compiler_styling/chaining/should break into multiple chains if there are other styling interpolation instructions in between
+- r3_view_compiler_styling/chaining/should chain classProp instruction calls
+- r3_view_compiler_styling/chaining/should chain mixed styleProp and classProp calls
+- r3_view_compiler_styling/chaining/should chain style interpolations of multiple kinds
+- r3_view_compiler_styling/chaining/should chain style interpolations of the same kind
+- r3_view_compiler_styling/chaining/should chain styleProp instruction calls
 - r3_view_compiler_styling/class_bindings/should handle bindings to classes with special characters in a template
+- r3_view_compiler_styling/class_bindings/should not generate the styling apply instruction if there are only static style/class attributes
+- r3_view_compiler_styling/class_bindings/should place initial, multi, singular and application followed by attribute class instructions in the template code in that order
+- r3_view_compiler_styling/component_animations/should include animations even if the provided array is empty
+- r3_view_compiler_styling/component_animations/should pass in the component metadata animations into the component definition
 - r3_view_compiler_styling/component_styles/should pass in the component metadata styles into the component definition but skip shimming when style encapsulation is set to shadow dom
 - r3_view_compiler_styling/style_bindings/should assign a sanitizer instance to the element style allocation instruction if any url-based properties are detected
+- r3_view_compiler_styling/style_bindings/should place initial, multi, singular and application followed by attribute style instructions in the template code in that order
 - signal_inputs/should capture signal based input flag in component definition
