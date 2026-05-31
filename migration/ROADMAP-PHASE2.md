@@ -155,6 +155,17 @@ all `libs/treaty/*` `moon.yml` typecheck tasks off `tsc` -> `tsgo --noEmit`, add
 and update workflow verify steps/agent instructions to use tsgo/oxlint. Do AFTER the running TS
 workflow (it edits the same moon.yml/package files). See [[treaty-tooling-tsgo-oxc]].
 
+**M. treaty-packagr — oxc-powered ng-packagr alternative for LIBRARIES (user 2026-05-31)** — a library
+packager that does what ng-packagr does but on the Treaty/oxc compiler. Builds Treaty/Angular libs to
+the **Angular Package Format**: FESM (esm2022) bundles, flattened/`.d.ts` types, a correct
+`package.json` with `exports`, **secondary entry points**, assets/schematics passthrough. Crucially it
+supports **everything the Treaty compiler supports** — ALL authoring plugins (`.treaty`, JSX, plain
+Angular) via `@treaty/compiler` (NAPI → render3), since it is plugin-authoring-aware: anything the
+compiler can compile, treaty-packagr can package. Distinct from `@treaty/rslib` (an rslib preset);
+treaty-packagr is the full APF packager (the ng-packagr replacement). New package `libs/treaty/packagr`
+(`@treaty/packagr`), orchestrating the Treaty compiler + an oxc-based bundler (rolldown/rslib) +
+type emit. Depends on the compiler + bundler plugins. See [[treaty-packagr]].
+
 ## Harness
 - **File-by-file harness**: compile a corpus of individual `.treaty`/`.tsx`/`.ts` files through `@treaty/compiler`
   and assert each emits valid Ivy + round-trips through each bundler plugin; measure per-file time
