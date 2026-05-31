@@ -17,11 +17,12 @@
 //! * **zlib (deflate)** — RFC 1950, a zlib header + DEFLATE body; Node's `deflate`/`inflate`.
 //! * **raw deflate** — RFC 1951, a bare DEFLATE stream with no header; Node's `deflateRaw`/
 //!   `inflateRaw`.
+//! * **brotli** — RFC 7932, Node's `brotliCompressSync`/`brotliDecompressSync`. Backed by the
+//!   pure-Rust [`brotli`] crate (reference encoder/decoder over `alloc-stdlib`), so it stays
+//!   C-toolchain-free and offline-clean like the DEFLATE family.
 //!
-//! Brotli is **not** part of the offline `flate2` backend and no pure-Rust Brotli crate is vendored,
-//! so `brotliCompressSync`/`brotliDecompressSync` are a documented follow-up rather than a stub. The
-//! async (callback / `util.promisify`-able) and streaming `Transform` forms layer onto the same core
-//! and are tracked separately; the synchronous surface is what the conformance corpus exercises.
+//! The async (callback / `util.promisify`-able) and streaming `Transform` forms layer onto the same
+//! core and are tracked separately; the synchronous surface is what the conformance corpus exercises.
 //!
 //! ## Laziness
 //!
@@ -60,7 +61,14 @@ pub(crate) enum Format {
     Zlib,
     /// RFC 1951 raw DEFLATE, no header/trailer. Node `deflateRawSync`/`inflateRawSync`.
     Raw,
+    /// RFC 7932 Brotli. Node `brotliCompressSync`/`brotliDecompressSync`.
+    Brotli,
 }
+
+/// Brotli encoder window size (`lgwin`), in bits. 22 is the reference/Node default (a 4 MiB window).
+const BROTLI_LGWIN: u32 = 22;
+/// I/O buffer size handed to the Brotli `Write` wrappers; 4 KiB matches the crate's own default.
+const BROTLI_BUFFER: usize = 4096;
 
 /// A zlib operation failure. The only fallible part of one-shot (de)compression is malformed input
 /// to a decoder (a truncated stream, a bad header, a CRC/Adler mismatch); compression never fails for
@@ -109,6 +117,22 @@ pub(crate) fn compress(format: Format, data: &[u8], level: i32) -> Result<Vec<u8
             enc.write_all(data).map_err(map)?;
             enc.finish().map_err(map)
         }
+        Format::Brotli => {
+            // Brotli's "level" is the encoder quality (0..=11); Node defaults to 11. `-1`/out-of-range
+            // (the DEFLATE default sentinel) maps to the Brotli default rather than erroring.
+            let quality = match level {
+                0..=11 => level as u32,
+                _ => 11,
+            };
+            let mut out = Vec::new();
+            {
+                let mut enc =
+                    brotli::CompressorWriter::new(&mut out, BROTLI_BUFFER, quality, BROTLI_LGWIN);
+                enc.write_all(data).map_err(map)?;
+                enc.flush().map_err(map)?;
+            }
+            Ok(out)
+        }
     }
 }
 
@@ -129,17 +153,28 @@ pub(crate) fn decompress(format: Format, data: &[u8]) -> Result<Vec<u8>, ZlibErr
         Format::Raw => {
             DeflateDecoder::new(data).read_to_end(&mut out).map_err(map)?;
         }
+        Format::Brotli => {
+            // Feed the framed bytes through the Brotli decompressor `Write` wrapper, collecting the
+            // plaintext. A truncated/garbage stream surfaces as an `io::Error`, matching the
+            // DEFLATE-family decoders (and Node throwing from `brotliDecompressSync`).
+            {
+                let mut dec = brotli::DecompressorWriter::new(&mut out, BROTLI_BUFFER);
+                dec.write_all(data).map_err(map)?;
+                dec.flush().map_err(map)?;
+            }
+        }
     }
     Ok(out)
 }
 
 /// Resolve a one-character format tag (the prelude passes a stable single-letter code rather than a
-/// full method name) to a [`Format`]. `g` = gzip, `z` = zlib, `r` = raw deflate.
+/// full method name) to a [`Format`]. `g` = gzip, `z` = zlib, `r` = raw deflate, `b` = brotli.
 fn format_from_tag(tag: &str) -> Option<Format> {
     match tag {
         "g" => Some(Format::Gzip),
         "z" => Some(Format::Zlib),
         "r" => Some(Format::Raw),
+        "b" => Some(Format::Brotli),
         _ => None,
     }
 }
@@ -418,6 +453,26 @@ const PRELUDE: &str = r##"
   function comp(tag, buf, options) { return asBuffer(N.compress(tag, toBytes(buf), levelOf(options))); }
   function decomp(tag, buf) { return asBuffer(N.decompress(tag, toBytes(buf))); }
 
+  // Brotli quality from a Node options object. Node spells it `{ params: { [BROTLI_PARAM_QUALITY]: q } }`
+  // (BROTLI_PARAM_QUALITY === 1); we also accept a bare `{ quality }` shorthand. Default -1 => the
+  // Rust core's reference default (quality 11).
+  function brotliQuality(options) {
+    if (options && typeof options === "object") {
+      const params = options.params;
+      if (params && typeof params === "object" && params[1] !== undefined && params[1] !== null) {
+        return params[1] | 0;
+      }
+      if (options.quality !== undefined && options.quality !== null) {
+        return options.quality | 0;
+      }
+    }
+    return -1;
+  }
+  function brotliCompressSync(buf, options) {
+    return asBuffer(N.compress("b", toBytes(buf), brotliQuality(options)));
+  }
+  function brotliDecompressSync(buf, options) { return decomp("b", buf); }
+
   function gzipSync(buf, options) { return comp("g", buf, options); }
   function gunzipSync(buf, options) { return decomp("g", buf); }
   function deflateSync(buf, options) { return comp("z", buf, options); }
@@ -440,12 +495,23 @@ const PRELUDE: &str = r##"
     Z_NO_COMPRESSION: 0, Z_BEST_SPEED: 1, Z_BEST_COMPRESSION: 9, Z_DEFAULT_COMPRESSION: -1,
     Z_FILTERED: 1, Z_HUFFMAN_ONLY: 2, Z_RLE: 3, Z_FIXED: 4, Z_DEFAULT_STRATEGY: 0,
     Z_DEFAULT_LEVEL: -1, Z_MIN_LEVEL: -1, Z_MAX_LEVEL: 9,
+    // Brotli parameter ids + quality bounds (RFC 7932 / Node's zlib.constants). BROTLI_PARAM_QUALITY
+    // is the encoder quality knob brotliCompressSync reads out of `options.params`.
+    BROTLI_OPERATION_PROCESS: 0, BROTLI_OPERATION_FLUSH: 1, BROTLI_OPERATION_FINISH: 2,
+    BROTLI_OPERATION_EMIT_METADATA: 3,
+    BROTLI_PARAM_MODE: 0, BROTLI_PARAM_QUALITY: 1, BROTLI_PARAM_LGWIN: 2, BROTLI_PARAM_LGBLOCK: 3,
+    BROTLI_PARAM_DISABLE_LITERAL_CONTEXT_MODELING: 4, BROTLI_PARAM_SIZE_HINT: 5,
+    BROTLI_PARAM_LARGE_WINDOW: 6, BROTLI_PARAM_NPOSTFIX: 7, BROTLI_PARAM_NDIRECT: 8,
+    BROTLI_MODE_GENERIC: 0, BROTLI_MODE_TEXT: 1, BROTLI_MODE_FONT: 2,
+    BROTLI_MIN_QUALITY: 0, BROTLI_MAX_QUALITY: 11, BROTLI_DEFAULT_QUALITY: 11,
+    BROTLI_MIN_WINDOW_BITS: 10, BROTLI_MAX_WINDOW_BITS: 24, BROTLI_DEFAULT_WINDOW: 22,
   };
 
   const exports = {
     gzipSync, gunzipSync,
     deflateSync, inflateSync,
     deflateRawSync, inflateRawSync,
+    brotliCompressSync, brotliDecompressSync,
     unzipSync,
     constants,
   };
@@ -525,7 +591,46 @@ mod tests {
         assert_eq!(format_from_tag("g"), Some(Format::Gzip));
         assert_eq!(format_from_tag("z"), Some(Format::Zlib));
         assert_eq!(format_from_tag("r"), Some(Format::Raw));
+        assert_eq!(format_from_tag("b"), Some(Format::Brotli));
         assert_eq!(format_from_tag("q"), None);
+    }
+
+    #[test]
+    fn brotli_round_trips_a_string() {
+        let msg = b"the quick brown fox jumps over the lazy dog";
+        let z = compress(Format::Brotli, msg, -1).unwrap();
+        assert!(!z.is_empty(), "brotli produced output");
+        let back = decompress(Format::Brotli, &z).unwrap();
+        assert_eq!(back, msg);
+    }
+
+    #[test]
+    fn brotli_round_trips_at_every_quality_and_compresses() {
+        // A highly repetitive buffer must shrink, and every quality (0..=11, plus the -1 default
+        // sentinel) must losslessly round-trip.
+        let data: Vec<u8> = b"the quick brown fox jumps over the lazy dog "
+            .iter()
+            .cycle()
+            .take(4096)
+            .copied()
+            .collect();
+        for quality in -1..=11 {
+            let z = compress(Format::Brotli, &data, quality).unwrap();
+            assert!(z.len() < data.len(), "quality {quality} compressed smaller");
+            assert_eq!(decompress(Format::Brotli, &z).unwrap(), data);
+        }
+    }
+
+    #[test]
+    fn brotli_empty_input_round_trips() {
+        let z = compress(Format::Brotli, b"", -1).unwrap();
+        assert_eq!(decompress(Format::Brotli, &z).unwrap(), b"");
+    }
+
+    #[test]
+    fn brotli_decompress_rejects_garbage() {
+        // A non-brotli byte stream must surface as an error, not silent empty output.
+        assert!(decompress(Format::Brotli, b"\xff\xfe\xfd not a brotli stream at all \x00\x01").is_err());
     }
 
     // ----- JS-surface integration tests (live engine) -----------------------------------------
@@ -670,6 +775,43 @@ mod tests {
                return [dec(gz), dec(zl)]; })()",
         );
         assert_eq!(v, json!(["hello unzip", "hello unzip"]));
+    }
+
+    #[test]
+    fn brotli_compress_then_decompress_round_trips_a_string() {
+        let v = run(
+            "(() => {
+               const s = 'the quick brown fox jumps over the lazy dog '.repeat(16);
+               const z = Z.brotliCompressSync(s);
+               const back = Z.brotliDecompressSync(z);
+               let out = '';
+               for (const b of back) out += String.fromCharCode(b);
+               return [z.length > 0, z.length < s.length, out === s]; })()",
+        );
+        assert_eq!(v, json!([true, true, true]));
+    }
+
+    #[test]
+    fn brotli_quality_option_is_honored() {
+        // The same payload at the lowest quality is no smaller than the highest; both round-trip.
+        let v = run(
+            "(() => {
+               const C = Z.constants;
+               const data = 'a'.repeat(4000);
+               const lo = Z.brotliCompressSync(data, { params: { [C.BROTLI_PARAM_QUALITY]: 0 } });
+               const hi = Z.brotliCompressSync(data, { params: { [C.BROTLI_PARAM_QUALITY]: 11 } });
+               const ok = (b) => { let s=''; for (const x of Z.brotliDecompressSync(b)) s += String.fromCharCode(x); return s === data; };
+               return [hi.length <= lo.length, ok(lo), ok(hi)]; })()",
+        );
+        assert_eq!(v, json!([true, true, true]));
+    }
+
+    #[test]
+    fn brotli_decompress_throws_on_garbage() {
+        let v = run(
+            "(() => { try { Z.brotliDecompressSync(new Uint8Array([255,254,253,1,2,3,4,5])); return 'no-throw'; } catch (e) { return 'threw'; } })()",
+        );
+        assert_eq!(v, json!("threw"));
     }
 
     #[test]

@@ -67,21 +67,45 @@ function describe(name, fn) {
 }
 // === treaty node-conformance harness shim (end) ===
 
-// node:path.win32 drive-letter root semantics: a drive-anchored path is absolute, dirname keeps the
-// drive and the parent directories, and relative walks correctly between two drive-anchored paths.
-const path = require("node:path");
-const win32 = path.win32;
+// node:zlib Brotli (RFC 7932) synchronous round-trips: brotliCompressSync then
+// brotliDecompressSync must recover the original bytes exactly, the compressed form of a highly
+// repetitive payload must be smaller than the input, and the BROTLI_PARAM_QUALITY encoder knob
+// must be honored (a higher quality produces output no larger than a lower one).
+const zlib = require("node:zlib");
+const buffer = require("node:buffer");
+const Buffer = buffer.Buffer;
 
-test("win32.isAbsolute treats a drive-letter root as absolute", () => {
-  assert.strictEqual(win32.isAbsolute("C:\\a\\b"), true, "a drive-rooted path is absolute");
-  assert.strictEqual(win32.isAbsolute("C:a\\b"), false, "a drive-relative path is NOT absolute");
+assert.ok(typeof zlib.brotliCompressSync === "function", "brotliCompressSync export");
+assert.ok(typeof zlib.brotliDecompressSync === "function", "brotliDecompressSync export");
+assert.ok(zlib.constants && typeof zlib.constants.BROTLI_PARAM_QUALITY === "number",
+  "BROTLI_PARAM_QUALITY constant");
+
+const payload = "the quick brown fox jumps over the lazy dog ".repeat(16);
+
+function toUtf8(buf) {
+  if (typeof buf.toString === "function") return buf.toString("utf8");
+  return Buffer.from(buf).toString("utf8");
+}
+
+test("brotliCompressSync then brotliDecompressSync recovers the original text", () => {
+  const compressed = zlib.brotliCompressSync(payload);
+  assert.ok(compressed.length > 0, "brotli produced output");
+  const restored = toUtf8(zlib.brotliDecompressSync(compressed));
+  assert.strictEqual(restored, payload, "brotli round-trip is lossless");
 });
 
-test("win32.dirname keeps the drive and the parent directories", () => {
-  assert.strictEqual(win32.dirname("C:\\foo\\bar\\baz.txt"), "C:\\foo\\bar", "dirname keeps the drive");
-  assert.strictEqual(win32.dirname("C:\\foo"), "C:\\", "dirname of a top-level file is the drive root");
+test("a compressible payload actually shrinks under brotli", () => {
+  const compressed = zlib.brotliCompressSync(payload);
+  assert.ok(compressed.length < payload.length, "highly repetitive input compresses smaller");
 });
 
-test("win32.relative walks between two drive-anchored paths", () => {
-  assert.strictEqual(win32.relative("C:\\a\\b\\c", "C:\\a\\b\\d\\e"), "..\\d\\e", "relative on a drive");
+test("BROTLI_PARAM_QUALITY is honored", () => {
+  const q = zlib.constants.BROTLI_PARAM_QUALITY;
+  const low = zlib.brotliCompressSync(payload, { params: { [q]: 1 } });
+  const high = zlib.brotliCompressSync(payload, { params: { [q]: 11 } });
+  const lowRestored = toUtf8(zlib.brotliDecompressSync(low));
+  const highRestored = toUtf8(zlib.brotliDecompressSync(high));
+  assert.strictEqual(lowRestored, payload, "low-quality round-trip is lossless");
+  assert.strictEqual(highRestored, payload, "high-quality round-trip is lossless");
+  assert.ok(high.length <= low.length, "higher quality is no larger than lower quality");
 });

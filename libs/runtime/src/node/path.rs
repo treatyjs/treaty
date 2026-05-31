@@ -25,9 +25,9 @@ use std::borrow::Cow;
 
 use nova_vm::ecmascript::{
     Agent, ArgumentsList, ExceptionType, InternalMethods, JsResult, Object, OrdinaryObject,
-    PropertyDescriptor, PropertyKey, String as JsString, Value, unwrap_try,
+    PropertyDescriptor, PropertyKey, String as JsString, TryGetResult, Value, unwrap_try,
 };
-use nova_vm::engine::NoGcScope;
+use nova_vm::engine::{Bindable, NoGcScope};
 
 use crate::node::core::{InstallError, NodeCtx};
 use crate::node::globals::define_fn;
@@ -613,7 +613,9 @@ fn install_flavor_fns(agent: &mut Agent, obj: OrdinaryObject, flavor: Flavor, gc
         extname_fn,
         is_absolute_fn,
         relative_fn,
-    ): (_, _, _, _, _, _, _, _) = match flavor {
+        parse_fn,
+        format_fn,
+    ): (_, _, _, _, _, _, _, _, _, _) = match flavor {
         Flavor::Posix => (
             js::join_posix as nova_vm::ecmascript::RegularFn,
             js::resolve_posix as nova_vm::ecmascript::RegularFn,
@@ -623,6 +625,8 @@ fn install_flavor_fns(agent: &mut Agent, obj: OrdinaryObject, flavor: Flavor, gc
             js::extname_posix as nova_vm::ecmascript::RegularFn,
             js::is_absolute_posix as nova_vm::ecmascript::RegularFn,
             js::relative_posix as nova_vm::ecmascript::RegularFn,
+            js::parse_posix as nova_vm::ecmascript::RegularFn,
+            js::format_posix as nova_vm::ecmascript::RegularFn,
         ),
         Flavor::Win32 => (
             js::join_win32 as nova_vm::ecmascript::RegularFn,
@@ -633,6 +637,8 @@ fn install_flavor_fns(agent: &mut Agent, obj: OrdinaryObject, flavor: Flavor, gc
             js::extname_win32 as nova_vm::ecmascript::RegularFn,
             js::is_absolute_win32 as nova_vm::ecmascript::RegularFn,
             js::relative_win32 as nova_vm::ecmascript::RegularFn,
+            js::parse_win32 as nova_vm::ecmascript::RegularFn,
+            js::format_win32 as nova_vm::ecmascript::RegularFn,
         ),
     };
 
@@ -644,6 +650,8 @@ fn install_flavor_fns(agent: &mut Agent, obj: OrdinaryObject, flavor: Flavor, gc
     define_fn(agent, obj, "extname", extname_fn, 1, gc);
     define_fn(agent, obj, "isAbsolute", is_absolute_fn, 1, gc);
     define_fn(agent, obj, "relative", relative_fn, 2, gc);
+    define_fn(agent, obj, "parse", parse_fn, 1, gc);
+    define_fn(agent, obj, "format", format_fn, 1, gc);
 
     define_static_string(agent, obj, "sep", flavor_sep_static(flavor), gc);
     define_static_string(agent, obj, "delimiter", flavor.delimiter(), gc);
@@ -841,6 +849,80 @@ mod js {
         Ok(Value::Boolean(super::is_absolute(flavor, &s)))
     }
 
+    fn parse_impl<'gc>(
+        agent: &mut Agent,
+        args: ArgumentsList,
+        flavor: Flavor,
+        gc: GcScope<'gc, '_>,
+    ) -> JsResult<'gc, Value<'gc>> {
+        let Some(s) = arg_str(agent, &args, 0) else {
+            return type_error(agent, gc);
+        };
+        // Materialize the borrowed slices into owned strings before touching `agent` mutably to build
+        // the result object (the `Parsed` borrows `s`, which we still own here).
+        let parsed = super::parse(flavor, &s);
+        let root = parsed.root.to_owned();
+        let dir = parsed.dir.into_owned();
+        let base = parsed.base.to_owned();
+        let ext = parsed.ext.to_owned();
+        let name = parsed.name.to_owned();
+
+        let nogc = gc.into_nogc();
+        let obj = OrdinaryObject::create_empty_object(agent, nogc);
+        define_own_string(agent, obj, "root", &root, nogc);
+        define_own_string(agent, obj, "dir", &dir, nogc);
+        define_own_string(agent, obj, "base", &base, nogc);
+        define_own_string(agent, obj, "ext", &ext, nogc);
+        define_own_string(agent, obj, "name", &name, nogc);
+        Ok(obj.into())
+    }
+
+    fn format_impl<'gc>(
+        agent: &mut Agent,
+        args: ArgumentsList,
+        flavor: Flavor,
+        gc: GcScope<'gc, '_>,
+    ) -> JsResult<'gc, Value<'gc>> {
+        let Ok(obj) = Object::try_from(args.get(0)) else {
+            return type_error(agent, gc);
+        };
+        let obj = obj.unbind();
+        let nogc = gc.nogc();
+        let root = read_string_prop(agent, obj, "root", nogc);
+        let dir = read_string_prop(agent, obj, "dir", nogc);
+        let base = read_string_prop(agent, obj, "base", nogc);
+        let name = read_string_prop(agent, obj, "name", nogc);
+        let ext = read_string_prop(agent, obj, "ext", nogc);
+        let out = super::format(flavor, &root, &dir, &base, &name, &ext);
+        Ok(ret_string(agent, &out, gc))
+    }
+
+    /// Read property `name` off `obj` as a string, returning `""` when absent or non-string (mirrors
+    /// Node's `path.format`, which treats a missing/empty component as the empty string).
+    fn read_string_prop(agent: &mut Agent, obj: Object, name: &'static str, gc: NoGcScope) -> String {
+        let key = PropertyKey::from_static_str(agent, name, gc);
+        match unwrap_try(obj.try_get(agent, key, obj.into(), None, gc)) {
+            TryGetResult::Value(v) => JsString::try_from(v)
+                .ok()
+                .map(|s| s.to_string_lossy(agent).into_owned())
+                .unwrap_or_default(),
+            _ => String::new(),
+        }
+    }
+
+    /// Define `name = value` (string data property) on `obj`.
+    fn define_own_string(agent: &mut Agent, obj: OrdinaryObject, name: &'static str, value: &str, gc: NoGcScope) {
+        let key = PropertyKey::from_static_str(agent, name, gc);
+        let js = JsString::from_str(agent, value, gc);
+        unwrap_try(obj.try_define_own_property(
+            agent,
+            key,
+            PropertyDescriptor::new_data_descriptor(js),
+            None,
+            gc,
+        ));
+    }
+
     // --- per-flavor monomorphized entry points (RegularFn pointers) -----------------------------
 
     macro_rules! flavored {
@@ -869,6 +951,8 @@ mod js {
     flavored!(relative_posix, relative_win32, relative_impl);
     flavored!(basename_posix, basename_win32, basename_impl);
     flavored!(is_absolute_posix, is_absolute_win32, is_absolute_impl);
+    flavored!(parse_posix, parse_win32, parse_impl);
+    flavored!(format_posix, format_win32, format_impl);
 
     macro_rules! flavored_one {
         ($posix:ident, $win32:ident, $func:path) => {
@@ -1048,6 +1132,48 @@ mod tests {
         assert_eq!(p.base, "file.txt");
         assert_eq!(p.ext, ".txt");
         assert_eq!(p.name, "file");
+    }
+
+    #[test]
+    fn parse_format_roundtrip_win32_drive_root() {
+        // A drive-rooted win32 path decomposes and re-derives exactly (the parse-format contract on
+        // the win32 namespace).
+        let p = parse(W, "C:\\Users\\dev\\notes.md");
+        assert_eq!(p.root, "C:\\");
+        assert_eq!(p.dir, "C:\\Users\\dev");
+        assert_eq!(p.base, "notes.md");
+        assert_eq!(p.ext, ".md");
+        assert_eq!(p.name, "notes");
+        assert_eq!(
+            format(W, p.root, &p.dir, p.base, p.name, p.ext),
+            "C:\\Users\\dev\\notes.md"
+        );
+        // A bare drive root: dir == root, format must not double the separator.
+        let r = parse(W, "C:\\file.txt");
+        assert_eq!(r.root, "C:\\");
+        assert_eq!(r.dir, "C:\\");
+        assert_eq!(format(W, r.root, &r.dir, r.base, r.name, r.ext), "C:\\file.txt");
+    }
+
+    #[test]
+    fn win32_drive_root_contract_matches_corpus() {
+        // The exact assertions the win32-drive-roots conformance file pins down.
+        assert!(is_absolute(W, "C:\\a\\b"));
+        assert_eq!(dirname(W, "C:\\foo\\bar\\baz.txt"), "C:\\foo\\bar");
+        assert_eq!(relative(W, "C:\\", "C:\\a\\b\\c", "C:\\a\\b\\d\\e"), "..\\d\\e");
+    }
+
+    #[test]
+    fn parse_format_unc_root() {
+        // UNC share: the root is the whole `\\server\share`, dir falls back to it for a top-level file.
+        let p = parse(W, "\\\\server\\share\\dir\\f.txt");
+        assert_eq!(p.root, "\\\\server\\share");
+        assert_eq!(p.dir, "\\\\server\\share\\dir");
+        assert_eq!(p.base, "f.txt");
+        assert_eq!(
+            format(W, p.root, &p.dir, p.base, p.name, p.ext),
+            "\\\\server\\share\\dir\\f.txt"
+        );
     }
 
     #[test]
