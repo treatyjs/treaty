@@ -16,9 +16,7 @@
     "in-file skip directive, remove that too). See README.md."
   ],
   "unsupported": [
-    { "pattern": "https-*",          "reason": "node:https pending (no TLS transport; plain node:http loopback IS supported)" },
-    { "pattern": "net-*",            "reason": "node:net (TCP sockets) pending" },
-    { "pattern": "tls-*",            "reason": "node:tls pending" },
+    { "pattern": "net-*",            "reason": "node:net raw TCP sockets (net.Socket/createConnection) pending; the HTTP/TLS transport reactor IS implemented" },
     { "pattern": "dgram-*",          "reason": "node:dgram (UDP) pending" },
     { "pattern": "dns-*",            "reason": "node:dns resolver pending" },
     { "pattern": "worker-threads*",  "reason": "worker_threads is pending (no thread/MessageChannel support yet)" },
