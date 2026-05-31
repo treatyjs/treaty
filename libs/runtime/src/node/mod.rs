@@ -57,6 +57,7 @@ pub(crate) mod string_decoder;
 pub(crate) mod structured_clone;
 pub(crate) mod text_encoding;
 pub(crate) mod timers;
+pub(crate) mod tls;
 pub(crate) mod url;
 pub(crate) mod util;
 pub(crate) mod zlib;
@@ -73,6 +74,103 @@ pub(crate) use nova_vm::{
     ecmascript::{Agent, Object},
     engine::GcScope,
 };
+
+/// Build a builtin's exports object from a JS bootstrap layered on native primitives.
+///
+/// The shared mechanism behind the larger builtins (`node:http`, `node:tls`/`node:https`): a module's
+/// JS object model is authored as one self-contained IIFE that reads its Rust-backed primitives off a
+/// hidden global slot, and whose completion value is the exports object. This helper performs the
+/// uniform three-step dance: (1) build + stash the natives object on `natives_key`, (2) parse and
+/// evaluate `bootstrap` in the current realm, (3) delete the slot so it never leaks to user code. The
+/// `module_name` only flavors error messages.
+///
+/// `build_natives` is the per-module function that materializes the primitives object (the reactor
+/// seam, the codec wrappers, …); it runs once per `require`/`import` of the module (tenet 2).
+pub(crate) fn run_module_bootstrap<'gc>(
+    agent: &mut Agent,
+    mut gc: GcScope<'gc, '_>,
+    natives_key: &'static str,
+    build_natives: for<'b> fn(
+        &mut Agent,
+        GcScope<'b, '_>,
+    ) -> nova_vm::ecmascript::OrdinaryObject<'b>,
+    bootstrap: &'static str,
+    module_name: &'static str,
+) -> Result<Object<'gc>, InstallError> {
+    use nova_vm::ecmascript::{
+        InternalMethods, OrdinaryObject, PropertyDescriptor, PropertyKey, String as JsString,
+        parse_script, script_evaluation,
+    };
+    use nova_vm::engine::Bindable;
+
+    // (1) Build + stash the natives on the hidden slot.
+    let natives = build_natives(agent, gc.reborrow()).unbind();
+    {
+        let nogc = gc.nogc();
+        let global = agent.current_realm(nogc).global_object(agent);
+        let key = PropertyKey::from_static_str(agent, natives_key, nogc);
+        let defined = global.unbind().try_define_own_property(
+            agent,
+            key.unbind(),
+            PropertyDescriptor::new_data_descriptor(natives.bind(nogc)),
+            None,
+            nogc,
+        );
+        if defined.is_break() {
+            return Err(InstallError::Nova(format!(
+                "could not stash {module_name} natives on the global"
+            )));
+        }
+    }
+
+    // (2) Evaluate the bootstrap; its completion value is the exports object.
+    let exports = {
+        let source = JsString::from_static_str(agent, bootstrap, gc.nogc());
+        let realm = agent.current_realm(gc.nogc());
+        let script = parse_script(agent, source.unbind(), realm.unbind(), true, None, gc.nogc())
+            .map_err(|diags| {
+                let msg = diags
+                    .iter()
+                    .map(|d| d.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                InstallError::Nova(format!("{module_name} bootstrap parse error: {msg}"))
+            })?;
+        let value = script_evaluation(agent, script.unbind(), gc.reborrow())
+            .unbind()
+            .bind(gc.nogc());
+        let value = match value {
+            Ok(v) => v.unbind(),
+            Err(err) => {
+                let msg = err
+                    .value()
+                    .unbind()
+                    .string_repr(agent, gc.reborrow())
+                    .to_string_lossy(agent)
+                    .into_owned();
+                return Err(InstallError::Nova(format!(
+                    "{module_name} bootstrap error: {msg}"
+                )));
+            }
+        };
+        let nogc = gc.nogc();
+        let obj = Object::try_from(value.bind(nogc)).map_err(|_| {
+            InstallError::Nova(format!("{module_name} bootstrap did not return an object"))
+        })?;
+        let _ = OrdinaryObject::try_from(obj); // shape sanity is the bootstrap's concern
+        obj.unbind()
+    };
+
+    // (3) Delete the hidden slot.
+    {
+        let nogc = gc.nogc();
+        let global = agent.current_realm(nogc).global_object(agent);
+        let key = PropertyKey::from_static_str(agent, natives_key, nogc);
+        let _ = global.unbind().try_delete(agent, key.unbind(), nogc);
+    }
+
+    Ok(exports.bind(gc.into_nogc()))
+}
 
 /// One Node builtin module.
 ///
@@ -129,6 +227,7 @@ pub(crate) const BUILTINS: &[(&str, InstallFn)] = &[
     ("stream", node_stream::install),
     ("http", http::install),
     ("https", https::install),
+    ("tls", tls::install),
     ("net", net::install),
     ("child_process", child_process::install),
     ("zlib", zlib::install),
@@ -325,6 +424,7 @@ mod tests {
         assert!(registered(node_stream::StreamModule::SPECIFIER));
         assert!(registered(http::HttpModule::SPECIFIER));
         assert!(registered(https::HttpsModule::SPECIFIER));
+        assert!(registered(tls::TlsModule::SPECIFIER));
         assert!(registered(net::NetModule::SPECIFIER));
         assert!(registered(child_process::ChildProcessModule::SPECIFIER));
         assert!(registered(zlib::ZlibModule::SPECIFIER));

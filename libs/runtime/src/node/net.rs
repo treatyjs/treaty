@@ -165,12 +165,37 @@ pub(crate) struct PendingRequest {
     respond: Sender<RawResponse>,
 }
 
-/// A listening HTTP server registered in the [`Reactor`].
+/// A TLS request accepted by a TLS server's background thread, awaiting its JS handler.
+///
+/// Mirrors [`PendingRequest`] but additionally owns the live `rustls` server stream the accept thread
+/// must write the response back on — a TLS stream cannot be `try_clone`d the way a `TcpStream` can, so
+/// the accept thread keeps the stream and the JS thread only sends the [`RawResponse`] across the
+/// one-shot. The accept thread is blocked on `respond` until that arrives.
+pub(crate) struct PendingTlsRequest {
+    /// Stable id within the owning server, used by JS to address its `respond`.
+    pub(crate) request_id: u64,
+    /// The parsed request line + headers + body.
+    pub(crate) request: ParsedRequest,
+    /// The channel the accept thread is blocked on for this request's response.
+    respond: Sender<RawResponse>,
+}
+
+/// The per-server inbox of parked requests, parameterized by transport (plaintext vs TLS) because the
+/// two carry different per-connection state across the reactor boundary.
+enum ServerInbox {
+    /// Plaintext HTTP: the accept thread parks the response one-shot and re-acquires the cloned
+    /// `TcpStream` itself.
+    Plain(Receiver<PendingRequest>),
+    /// TLS: the accept thread owns the live `rustls` server stream and parks only the one-shot.
+    Tls(Receiver<PendingTlsRequest>),
+}
+
+/// A listening HTTP/HTTPS server registered in the [`Reactor`].
 struct ServerEntry {
     /// The local port the listener bound to (resolved even when `listen(0)` was used).
     port: u16,
-    /// Requests parsed by the background accept thread, not yet handed to JS.
-    inbox: Receiver<PendingRequest>,
+    /// Requests parsed by the background accept thread, not yet handed to JS (plaintext or TLS).
+    inbox: ServerInbox,
     /// Set once `close()` is requested; the accept thread observes it (lock-free) and stops. Shared
     /// with the accept thread so it can be flipped without taking the registry lock on the hot path.
     closing: Arc<AtomicBool>,
@@ -286,7 +311,90 @@ pub(crate) fn server_listen(port: u16) -> std::io::Result<(u64, u16)> {
             handle,
             ServerEntry {
                 port: bound_port,
-                inbox,
+                inbox: ServerInbox::Plain(inbox),
+                closing,
+                accept_thread: Some(accept_thread),
+                local_addr,
+            },
+        );
+    }
+    Ok((handle, bound_port))
+}
+
+/// Start a listening TLS server on `127.0.0.1:port` (port `0` selects a free port), serving the
+/// `config`'s certificate. Returns `(handle, bound_port)`. A background thread accepts connections,
+/// performs the TLS handshake + reads one HTTP/1.1 request per connection, and parks each request
+/// (with the live TLS stream held thread-side) while blocking for the JS-produced response.
+///
+/// Symmetric to [`server_listen`] but over TLS; shares the registry, `server_port`, and `server_close`
+/// so a TLS server is closed and joined exactly like a plaintext one. The certificate verification on
+/// the *client* side is the client's concern ([`crate::node::tls::ClientTrust`]); this server presents
+/// its single cert and does not request client auth.
+pub(crate) fn tls_server_listen(
+    port: u16,
+    config: Arc<rustls::ServerConfig>,
+) -> std::io::Result<(u64, u16)> {
+    use crate::node::tls;
+
+    let listener = TcpListener::bind(("127.0.0.1", port))?;
+    let local_addr = listener.local_addr()?;
+    let bound_port = local_addr.port();
+
+    let (tx, inbox) = channel::<PendingTlsRequest>();
+    let handle = {
+        let mut r = reactor().lock().expect("reactor mutex poisoned");
+        r.mint()
+    };
+
+    let closing = Arc::new(AtomicBool::new(false));
+    let accept_closing = Arc::clone(&closing);
+
+    let accept_thread = std::thread::spawn(move || {
+        let mut next_request_id: u64 = 0;
+        for stream in listener.incoming() {
+            if accept_closing.load(Ordering::SeqCst) {
+                break;
+            }
+            let tcp = match stream {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            // Perform the TLS handshake + read one request. A handshake failure (e.g. an untrusted
+            // client that aborts, or a probe with no SNI) drops this connection without wedging the
+            // accept loop.
+            let (request, mut tls_stream) = match tls::accept_tls(tcp, Arc::clone(&config)) {
+                Ok(pair) => pair,
+                Err(_) => continue,
+            };
+            let (resp_tx, resp_rx) = channel::<RawResponse>();
+            let request_id = next_request_id;
+            next_request_id = next_request_id.wrapping_add(1);
+            if tx
+                .send(PendingTlsRequest {
+                    request_id,
+                    request,
+                    respond: resp_tx,
+                })
+                .is_err()
+            {
+                break; // registry dropped the receiver: server is gone.
+            }
+            // Block until the JS thread runs the handler and sends the response back, then write it
+            // over the (thread-owned) TLS stream and close the session.
+            match resp_rx.recv() {
+                Ok(response) => tls::respond_tls(&mut tls_stream, &response),
+                Err(_) => break, // server closed before responding.
+            }
+        }
+    });
+
+    {
+        let mut r = reactor().lock().expect("reactor mutex poisoned");
+        r.servers.insert(
+            handle,
+            ServerEntry {
+                port: bound_port,
+                inbox: ServerInbox::Tls(inbox),
                 closing,
                 accept_thread: Some(accept_thread),
                 local_addr,
@@ -312,8 +420,30 @@ pub(crate) fn server_take_pending(handle: u64) -> Vec<PendingRequest> {
     let mut out = Vec::new();
     if let Ok(r) = reactor().lock() {
         if let Some(server) = r.servers.get(&handle) {
-            while let Ok(req) = server.inbox.try_recv() {
-                out.push(req);
+            if let ServerInbox::Plain(inbox) = &server.inbox {
+                while let Ok(req) = inbox.try_recv() {
+                    out.push(req);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Drain every TLS request parked by `handle`'s accept thread that has not yet been handed to JS.
+///
+/// The TLS counterpart of [`server_take_pending`]. Each returned [`PendingTlsRequest`] carries the
+/// one-shot the accept thread is blocked on; the caller runs the JS handler and later calls
+/// [`tls_request_respond`] with the matching `request_id`. A handle that is not a TLS server yields an
+/// empty vec.
+pub(crate) fn tls_server_take_pending(handle: u64) -> Vec<PendingTlsRequest> {
+    let mut out = Vec::new();
+    if let Ok(r) = reactor().lock() {
+        if let Some(server) = r.servers.get(&handle) {
+            if let ServerInbox::Tls(inbox) = &server.inbox {
+                while let Ok(req) = inbox.try_recv() {
+                    out.push(req);
+                }
             }
         }
     }
@@ -366,6 +496,12 @@ pub(crate) fn request_respond(pending: PendingRequest, response: RawResponse) {
     let _ = pending.respond.send(response);
 }
 
+/// Hand a TLS server's pending request its response (by `request_id`), unblocking the accept thread so
+/// it writes the bytes over the live TLS stream. The TLS counterpart of [`request_respond`].
+pub(crate) fn tls_request_respond(pending: PendingTlsRequest, response: RawResponse) {
+    let _ = pending.respond.send(response);
+}
+
 /// Spawn a background client thread that performs one blocking HTTP/1.1 request and returns a handle
 /// to poll for completion via [`client_poll`].
 pub(crate) fn client_start(req: ParsedRequest, host: String, port: u16) -> u64 {
@@ -374,6 +510,32 @@ pub(crate) fn client_start(req: ParsedRequest, host: String, port: u16) -> u64 {
         let result = http::client_roundtrip(&host, port, &req);
         let _ = tx.send(result);
     });
+    register_client(thread, rx)
+}
+
+/// Spawn a background client thread that performs one blocking TLS handshake + HTTP/1.1 request to
+/// `host:port` (verifying the server cert per `trust`) and returns a handle to poll via [`client_poll`].
+///
+/// Shares the client registry and [`client_poll`]/[`ClientPoll`] with the plaintext [`client_start`]
+/// — the only difference is the transport — so the JS reactor pump drives an https client exactly like
+/// an http one.
+pub(crate) fn tls_client_start(
+    req: ParsedRequest,
+    host: String,
+    port: u16,
+    trust: crate::node::tls::ClientTrust,
+) -> u64 {
+    let (tx, rx) = channel::<Result<RawResponse, String>>();
+    let thread = std::thread::spawn(move || {
+        let result = crate::node::tls::tls_client_roundtrip(&host, port, &req, &trust);
+        let _ = tx.send(result);
+    });
+    register_client(thread, rx)
+}
+
+/// Register a started background client worker in the reactor and mint its poll handle. Shared by the
+/// plaintext and TLS client starts.
+fn register_client(thread: JoinHandle<()>, rx: Receiver<Result<RawResponse, String>>) -> u64 {
     let mut r = reactor().lock().expect("reactor mutex poisoned");
     let handle = r.mint();
     r.clients.insert(

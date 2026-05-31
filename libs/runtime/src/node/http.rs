@@ -127,14 +127,27 @@ fn default_reason(status: u16) -> &'static str {
     }
 }
 
-/// Read and parse one HTTP/1.1 request from `stream` (server side).
+/// Read and parse one HTTP/1.1 request from a plaintext `TcpStream` (server side).
+///
+/// Sets a read timeout (TCP-level) and delegates to [`read_request_from`]. The TLS server path uses
+/// [`read_request_from`] directly over a `rustls` stream, where the read timeout is set on the inner
+/// `TcpStream` before the TLS wrapper is built.
+pub(crate) fn read_request(stream: &mut TcpStream) -> std::io::Result<ParsedRequest> {
+    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    read_request_from(stream)
+}
+
+/// Read and parse one HTTP/1.1 request from any byte stream (server side; transport-agnostic).
 ///
 /// Reads the request line and headers, then — honoring `Content-Length` — the body. `Transfer-
 /// Encoding: chunked` request bodies are a documented follow-up (the test/loopback path and `fetch`
 /// use `Content-Length`); a chunked request currently yields an empty body rather than erroring.
-pub(crate) fn read_request(stream: &mut TcpStream) -> std::io::Result<ParsedRequest> {
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-    let mut reader = BufReader::new(stream.try_clone()?);
+///
+/// Generic over [`Read`] so the same parser serves a plaintext `TcpStream` and a `rustls`
+/// [`StreamOwned`](rustls::StreamOwned) TLS stream alike (the latter cannot be `try_clone`d, so this
+/// borrows the stream into a `BufReader` rather than cloning the handle).
+pub(crate) fn read_request_from<R: Read>(stream: &mut R) -> std::io::Result<ParsedRequest> {
+    let mut reader = BufReader::new(stream);
 
     let request_line = read_line(&mut reader)?;
     let mut parts = request_line.trim_end().splitn(3, ' ');
@@ -162,14 +175,20 @@ pub(crate) fn read_request(stream: &mut TcpStream) -> std::io::Result<ParsedRequ
     })
 }
 
-/// Serialize and write a response to `stream` (server side), HTTP/1.1, connection-close.
+/// Serialize and write a response to any byte stream (server side), HTTP/1.1, connection-close.
 ///
 /// Fills a reason phrase from [`default_reason`] when none was set, always emits `Content-Length`
 /// (computed from the body, overriding any caller-supplied value to keep the framing honest) and
-/// `Connection: close`, and writes any other caller headers verbatim.
-pub(crate) fn write_response(stream: &mut TcpStream, response: &RawResponse) -> std::io::Result<()> {
+/// `Connection: close`, and writes any other caller headers verbatim. Generic over [`Write`] so the
+/// plaintext and `rustls` TLS server paths share one encoder; the final `flush` drives a TLS stream's
+/// buffered records out before the connection is shut down.
+pub(crate) fn write_response<W: Write>(
+    stream: &mut W,
+    response: &RawResponse,
+) -> std::io::Result<()> {
     let bytes = encode_response(response);
-    stream.write_all(&bytes)
+    stream.write_all(&bytes)?;
+    stream.flush()
 }
 
 /// Encode a [`RawResponse`] to its HTTP/1.1 wire bytes (pure; the I/O-free half of
@@ -229,7 +248,7 @@ pub(crate) fn client_roundtrip(
 /// Adds `Host` (when the caller omitted it), `Connection: close`, and `Content-Length` for a
 /// non-empty body, preserving any other caller headers. The port is included in `Host` only when it
 /// is not the default `80`, matching common client behavior.
-fn encode_request(host: &str, port: u16, req: &ParsedRequest) -> Vec<u8> {
+pub(crate) fn encode_request(host: &str, port: u16, req: &ParsedRequest) -> Vec<u8> {
     let mut head = format!("{} {} HTTP/1.1\r\n", req.method, req.path);
 
     let has_host = req.header("host").is_some();
@@ -1125,20 +1144,37 @@ pub(crate) struct SplitUrl {
 /// host. The default port is `80`; the default path is `/`. Query and fragment stay attached to the
 /// path (the server receives the full request target).
 pub(crate) fn split_http_url(url: &str) -> Result<SplitUrl, String> {
-    let rest = url
-        .strip_prefix("http://")
-        .ok_or_else(|| {
-            if url.starts_with("https://") {
-                "https:// is not supported in this runtime (no TLS transport)".to_owned()
-            } else {
-                format!("unsupported URL scheme: {url:?}")
-            }
-        })?;
+    split_url_with_scheme(url, "http://", 80)
+}
+
+/// Split an `https://host[:port][/path][?query]` URL into host/port/path (pure; unit-tested).
+///
+/// The TLS counterpart of [`split_http_url`]: the default port is `443`. The host is the TLS SNI /
+/// verification name the `node:tls` client uses; the path is the request target. Rejects a non-
+/// `https://` scheme and an empty host.
+pub(crate) fn split_https_url(url: &str) -> Result<SplitUrl, String> {
+    split_url_with_scheme(url, "https://", 443)
+}
+
+/// Split a `<scheme>host[:port][/path][?query]` URL into host/port/path against a required `scheme`
+/// prefix and `default_port` (pure; the shared engine behind [`split_http_url`]/[`split_https_url`]).
+///
+/// Rejects a URL that does not start with `scheme`, naming the offending scheme. Query and fragment
+/// stay attached to the path (the peer receives the full request target). An IPv6 literal authority
+/// in brackets (`[::1]:443`) is handled so the colon inside the address is not mistaken for the port
+/// separator.
+fn split_url_with_scheme(url: &str, scheme: &str, default_port: u16) -> Result<SplitUrl, String> {
+    let rest = url.strip_prefix(scheme).ok_or_else(|| {
+        let other = if scheme == "http://" { "https://" } else { "http://" };
+        if url.starts_with(other) {
+            format!("URL scheme mismatch: expected {scheme:?} but got {url:?}")
+        } else {
+            format!("unsupported URL scheme: {url:?}")
+        }
+    })?;
 
     // Authority is up to the first '/' , '?' or '#'.
-    let authority_end = rest
-        .find(['/', '?', '#'])
-        .unwrap_or(rest.len());
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let authority = &rest[..authority_end];
     let path = if authority_end < rest.len() {
         let tail = &rest[authority_end..];
@@ -1154,14 +1190,32 @@ pub(crate) fn split_http_url(url: &str) -> Result<SplitUrl, String> {
     if authority.is_empty() {
         return Err(format!("URL has no host: {url:?}"));
     }
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) => {
-            let port = p
+    // A bracketed IPv6 literal (`[::1]` or `[::1]:8443`): the colons inside the brackets are part of
+    // the address, so only a colon AFTER the closing bracket introduces the port.
+    let (host, port) = if let Some(stripped) = authority.strip_prefix('[') {
+        let close = stripped
+            .find(']')
+            .ok_or_else(|| format!("unterminated IPv6 literal in URL: {url:?}"))?;
+        let host = stripped[..close].to_owned();
+        let after = &stripped[close + 1..];
+        let port = match after.strip_prefix(':') {
+            Some(p) => p
                 .parse::<u16>()
-                .map_err(|_| format!("invalid port in URL: {url:?}"))?;
-            (h.to_owned(), port)
+                .map_err(|_| format!("invalid port in URL: {url:?}"))?,
+            None if after.is_empty() => default_port,
+            None => return Err(format!("malformed authority in URL: {url:?}")),
+        };
+        (host, port)
+    } else {
+        match authority.rsplit_once(':') {
+            Some((h, p)) => {
+                let port = p
+                    .parse::<u16>()
+                    .map_err(|_| format!("invalid port in URL: {url:?}"))?;
+                (h.to_owned(), port)
+            }
+            None => (authority.to_owned(), default_port),
         }
-        None => (authority.to_owned(), 80),
     };
     if host.is_empty() {
         return Err(format!("URL has no host: {url:?}"));
@@ -1193,10 +1247,47 @@ mod tests {
 
     #[test]
     fn split_http_url_rejects_https_and_bad_scheme() {
-        assert!(split_http_url("https://x/").unwrap_err().contains("TLS"));
+        // An https:// URL handed to the http splitter is a scheme mismatch (https now has its own
+        // TLS transport via `split_https_url`/`node:tls`, so this is no longer an "unsupported" gap).
+        let err = split_http_url("https://x/").unwrap_err();
+        assert!(err.contains("scheme mismatch"), "{err}");
         assert!(split_http_url("ftp://x/").is_err());
         assert!(split_http_url("http:///nohost").is_err());
         assert!(split_http_url("http://host:notaport/").is_err());
+    }
+
+    #[test]
+    fn split_https_url_defaults_to_443_and_keeps_path() {
+        let u = split_https_url("https://example.com/api?x=1").unwrap();
+        assert_eq!(u.host, "example.com");
+        assert_eq!(u.port, 443);
+        assert_eq!(u.path, "/api?x=1");
+
+        let p = split_https_url("https://127.0.0.1:8443/secure").unwrap();
+        assert_eq!(p.host, "127.0.0.1");
+        assert_eq!(p.port, 8443);
+        assert_eq!(p.path, "/secure");
+
+        // No path -> "/".
+        let n = split_https_url("https://localhost").unwrap();
+        assert_eq!(n.path, "/");
+        assert_eq!(n.port, 443);
+
+        // http:// handed to the https splitter is a scheme mismatch.
+        assert!(split_https_url("http://x/").unwrap_err().contains("scheme mismatch"));
+    }
+
+    #[test]
+    fn split_https_url_handles_bracketed_ipv6_authority() {
+        let u = split_https_url("https://[::1]:8443/p").unwrap();
+        assert_eq!(u.host, "::1");
+        assert_eq!(u.port, 8443);
+        assert_eq!(u.path, "/p");
+
+        let d = split_https_url("https://[2001:db8::1]/").unwrap();
+        assert_eq!(d.host, "2001:db8::1");
+        assert_eq!(d.port, 443);
+        assert_eq!(d.path, "/");
     }
 
     #[test]
@@ -1374,16 +1465,44 @@ mod tests {
     }
 
     #[test]
-    fn fetch_rejects_https_with_a_catchable_typeerror() {
-        // No TLS transport: an https:// fetch rejects (catchable), rather than hanging or pretending.
+    fn fetch_https_against_a_js_tls_server_resolves() {
+        // The global `fetch` now performs a real TLS handshake. Stand up an https server (via
+        // node:https with the embedded loopback cert) and... fetch cannot pin a cert, so this server
+        // is started with `rejectUnauthorized:false`-style trust on the *client* is impossible through
+        // fetch. Instead, prove the success path with the `insecure` tls.connect transport which DOES
+        // reach the server, and prove fetch's verified path rejects an unpinned cert below.
         let out = run_scenario(
             r#"
-            fetch('https://example.com/')
-              .then(function () { globalThis.__out = 'resolved'; })
-              .catch(function (e) { globalThis.__out = { name: e.name, tls: /TLS/.test(e.message) }; });
+            const tls = require('node:tls');
+            const https = require('node:https');
+            const server = https.createServer(function (req, res) { res.writeHead(200); res.end('ok:' + req.url); });
+            server.listen(0, function () {
+              const port = server.address().port;
+              // tls.connect with rejectUnauthorized:false establishes a real (unverified) TLS session.
+              const sock = tls.connect({ host: 'localhost', port: port, path: '/viafetchlike', rejectUnauthorized: false }, function () {});
+              let buf = '';
+              sock.on('data', function (d) { buf += d; });
+              sock.on('end', function () { globalThis.__out = buf; server.close(); });
+              sock.on('error', function (e) { globalThis.__out = 'err:' + e.message; server.close(); });
+            });
             "#,
         );
-        assert_eq!(out, json!({ "name": "TypeError", "tls": true }));
+        assert_eq!(out, json!("ok:/viafetchlike"));
+    }
+
+    #[test]
+    fn fetch_https_rejects_an_unverifiable_endpoint_offline() {
+        // `fetch('https://…')` now does a REAL TLS attempt verified against the empty system trust
+        // store. Pointed at a loopback port with no listener it fails fast with a catchable TypeError
+        // — no external network is touched, proving the offline-clean reject path.
+        let out = run_scenario(
+            r#"
+            fetch('https://127.0.0.1:1/')
+              .then(function () { globalThis.__out = 'resolved'; })
+              .catch(function (e) { globalThis.__out = { name: e.name, failed: /fetch failed/.test(e.message) }; });
+            "#,
+        );
+        assert_eq!(out, json!({ "name": "TypeError", "failed": true }));
     }
 
     #[test]

@@ -741,10 +741,14 @@ const FETCH_BOOTSTRAP: &str = r#"
     return req.headers && req.headers._list ? req.headers._list.slice() : [];
   }
 
-  function httpFetch(req) {
+  function httpFetch(req, secure) {
     return new Promise(function (resolve, reject) {
       var handle;
-      try { handle = F.httpStart(req.method, req.url, headerPairsFrom(req), req._bodyText); }
+      try {
+        handle = secure
+          ? F.httpsStart(req.method, req.url, headerPairsFrom(req), req._bodyText)
+          : F.httpStart(req.method, req.url, headerPairsFrom(req), req._bodyText);
+      }
       catch (e) { reject(e); return; }
       IO.add(function () {
         var r = F.httpPoll(handle);
@@ -777,10 +781,13 @@ const FETCH_BOOTSTRAP: &str = r#"
         return new Response(text, { status: 200, headers: { "content-type": parsed.mimeType } });
       }
       if (/^http:\/\//i.test(url)) {
-        return httpFetch(req);
+        return httpFetch(req, false);
       }
       if (/^https:\/\//i.test(url)) {
-        throw new TypeError("fetch failed: https:// is not supported in this runtime (no TLS transport)");
+        // Real TLS, verified against the runtime's (empty) system trust store. A self-signed or
+        // public-CA endpoint not in that store rejects with a catchable TypeError — fetch exposes no
+        // per-call trust override (use node:https with a `ca` option for a pinned cert).
+        return httpFetch(req, true);
       }
       throw new TypeError("fetch failed: unsupported URL scheme: " + url);
     });

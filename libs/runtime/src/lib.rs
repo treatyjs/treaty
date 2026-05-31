@@ -943,14 +943,13 @@ mod tests {
 
     #[test]
     fn node_compat_new_node_builtins_are_requireable() {
-        // The newly-registered Bun/CF `node:` builtins (`stream`/`http`/`https`/`net`/
-        // `child_process`/`zlib`) resolve through `require` and materialize their (scaffold) exports
-        // objects lazily, both bare and `node:`-prefixed — the registry contract holds before the
-        // Build agents fill the bodies.
+        // The Bun/CF `node:` builtins (`stream`/`http`/`https`/`tls`/`net`/`child_process`/`zlib`)
+        // resolve through `require` and materialize their exports objects lazily, both bare and
+        // `node:`-prefixed.
         let mut rt = JsRuntime::with_node_compat();
         assert_eq!(
             rt.eval(
-                "['stream','http','https','net','child_process','zlib']\
+                "['stream','http','https','tls','net','child_process','zlib']\
                  .every(s => typeof require('node:' + s) === 'object' && typeof require(s) === 'object')"
             )
             .unwrap(),
