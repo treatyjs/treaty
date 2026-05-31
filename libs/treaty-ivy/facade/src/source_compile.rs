@@ -383,6 +383,26 @@ fn decorator_string_alias(dec: &Decorator) -> Option<String> {
     Some(s.value.to_string())
 }
 
+/// Parse an `@Input(...)` decorator's first argument into `(alias, transform)`. ngtsc accepts two
+/// forms: a string `@Input('publicName')` (alias only), or an options object
+/// `@Input({alias?: 'publicName', transform?: fn, required?: bool})`. Returns the public-name alias
+/// (when present) and the transform function expression (when present and convertible). A transform
+/// we cannot structurally convert (e.g. an inline arrow body) is dropped rather than mis-emitted.
+fn input_decorator_options(dec: &Decorator) -> (Option<String>, Option<Expr>) {
+    let Expression::CallExpression(call) = &dec.expression else {
+        return (None, None);
+    };
+    match call.arguments.first().and_then(|a| a.as_expression()) {
+        Some(Expression::StringLiteral(s)) => (Some(s.value.to_string()), None),
+        Some(Expression::ObjectExpression(obj)) => {
+            let alias = find_prop(obj, "alias").and_then(string_value);
+            let transform = find_prop(obj, "transform").and_then(convert_expr);
+            (alias, transform)
+        }
+        _ => (None, None),
+    }
+}
+
 /// Detected metadata that this front-end refuses to mis-compile. Presence of any of these in the
 /// decorator object means we return an error so the harness can skip the case.
 const UNSUPPORTED_DECORATOR_KEYS: &[&str] = &[
@@ -418,12 +438,16 @@ fn collect_io(
         let mut decorated_input = false;
         let mut decorated_output = false;
         let mut decorator_alias: Option<String> = None;
+        let mut decorator_transform: Option<Expr> = None;
         for dec in &prop.decorators {
             if let Some(name) = decorator_name(dec) {
                 match name {
                     "Input" => {
                         decorated_input = true;
-                        decorator_alias = decorator_string_alias(dec);
+                        // `@Input('alias')` (string) OR `@Input({alias?, transform?})` (object).
+                        let (alias, transform) = input_decorator_options(dec);
+                        decorator_alias = alias;
+                        decorator_transform = transform;
                     }
                     "Output" => {
                         decorated_output = true;
@@ -438,7 +462,9 @@ fn collect_io(
 
         if decorated_input {
             // A renamed `@Input('public') declared` emits the flag-array form
-            // `[0, "public", "declared"]`; the bare form emits the property name as a string.
+            // `[0, "public", "declared"]`; the bare form emits the property name as a string. With
+            // a `transform`, Angular sets the `HasDecoratorInputTransform` flag (value 2) and appends
+            // the transform fn as the 4th array element (`[2, "public", "declared", transform]`).
             let public_name = decorator_alias.clone().unwrap_or_else(|| member_name.clone());
             inputs.insert(
                 member_name.clone(),
@@ -447,7 +473,7 @@ fn collect_io(
                     binding_property_name: public_name,
                     required: false,
                     is_signal: false,
-                    transform_function: None,
+                    transform_function: decorator_transform,
                 },
             );
             continue;
@@ -2832,6 +2858,24 @@ mod tests {
         let tmpl = flat.find("[4,\"if\"]").expect("missing [Template,\"if\"] const");
         assert!(foo < baz && baz < bar, "local-ref order wrong: foo={foo} baz={baz} bar={bar}");
         assert!(bar < tmpl, "nested-view #bar const must precede the [Template,\"if\"] const; got: {flat}");
+    }
+
+    #[test]
+    fn input_object_options_capture_alias_and_transform() {
+        // `@Input({alias, transform: fn})` with an identifier transform emits the 4-element flag
+        // array `[2, "public", "declared", fn]` (HasDecoratorInputTransform = 2). The bare
+        // `@Input('alias')` string form still emits `[0, "alias", "declared"]`.
+        let src = r#"@Directive({selector:"[d]"})
+            export class D {
+                @Input({alias: 'pub', transform: toNumber}) declared: any;
+            }"#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let flat: String = out.code.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            flat.contains("declared:[2,\"pub\",\"declared\",toNumber]"),
+            "input object options not captured; got: {flat}"
+        );
     }
 
     #[test]
