@@ -833,13 +833,21 @@ fn collect_member_host_bindings(class: &Class, host: &mut MemberHost) {
             match decorator_name(dec) {
                 Some("HostBinding") => {
                     // `@HostBinding('hostProp')` → bound prop named `hostProp` (or the member
-                    // name); value is the member read expression.
+                    // name); value is the member read expression. When the member name is NOT a
+                    // valid bare identifier (a quoted property like `'is-a'` / `'is-"b"'`), it must
+                    // be read as a quoted keyed access off the implicit receiver — `this["is-a"]`,
+                    // lowering to `ctx["is-a"]` — NOT spliced raw (`is-a` would parse as the binary
+                    // expression `is - a`). Angular's `extractHostBindings` reads the member off the
+                    // directive instance, so a non-identifier name becomes a bracketed property read.
                     let host_prop =
                         decorator_string_alias(dec).unwrap_or_else(|| member_name.to_string());
-                    host.entries.insert(
-                        format!("[{host_prop}]"),
-                        HostValue::Str(member_name.to_string()),
-                    );
+                    let value = if is_safe_object_key(member_name) {
+                        member_name.to_string()
+                    } else {
+                        format!("this[\"{}\"]", member_name.replace('"', "\\\""))
+                    };
+                    host.entries
+                        .insert(format!("[{host_prop}]"), HostValue::Str(value));
                 }
                 Some("HostListener") => {
                     if let Some((event, handler)) = host_listener_entry(dec, member_name) {
@@ -2809,6 +2817,25 @@ mod tests {
         let tmpl = flat.find("[4,\"if\"]").expect("missing [Template,\"if\"] const");
         assert!(foo < baz && baz < bar, "local-ref order wrong: foo={foo} baz={baz} bar={bar}");
         assert!(bar < tmpl, "nested-view #bar const must precede the [Template,\"if\"] const; got: {flat}");
+    }
+
+    #[test]
+    fn host_binding_quoted_member_name_reads_as_bracketed_access() {
+        // `@HostBinding('class.a') 'is-a'` binds the member named `is-a`; since it is not a valid
+        // identifier the value must read as `ctx["is-a"]` (a quoted keyed access), NOT the binary
+        // expression `ctx.is - ctx.a` produced by splicing the raw member name into the parser.
+        let src = r#"@Directive({selector:"[d]"})
+            export class D {
+                @HostBinding('class.a') 'is-a': any;
+            }"#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+        assert!(
+            code.contains("ctx[\"is-a\"]"),
+            "quoted member did not read as bracketed access; got: {code}"
+        );
+        assert!(!code.contains("ctx.is - ctx.a"), "member name mis-parsed as subtraction; got: {code}");
     }
 
     #[test]
