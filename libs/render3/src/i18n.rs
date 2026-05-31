@@ -861,6 +861,7 @@ fn get_u32_le(view: &[u8], offset: usize) -> u32 {
 // the initializers into the `consts: () => { …; return [...]; }` arrow body.
 // ---------------------------------------------------------------------------
 
+use crate::identifiers::R3;
 use crate::output_ast as o;
 use crate::output_ast::{ArrowBody, Expr, FnParam, LiteralValue, Stmt, StmtKind, StmtModifier};
 
@@ -889,6 +890,19 @@ pub struct I18nConst {
     /// The initializer statements (`let $i18n_n$; if (closureMode) { … } else { … }`) that must
     /// run before the `consts` array is built (the `consts: () => { … }` arrow body).
     pub initializers: Vec<Stmt>,
+}
+
+/// Context-dependent emit options for [`build_i18n_const`], mirroring the two ways Angular's own
+/// compiler varies the const-pool form for a single i18n message.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct I18nConstOpts {
+    /// Emit the translation variable as the BARE `i18n_<index>` identifier (the form Angular's
+    /// printer produces — and the goldens spell literally — when the message brackets control-flow
+    /// blocks `@if`/`@switch`/`@for`/`@defer`) rather than the `$i18n_<index>$` placeholder form.
+    pub bare_name: bool,
+    /// Append `i18n_<index> = ɵɵi18nPostprocess(i18n_<index>);` after the closure guard, as Angular
+    /// does whenever a placeholder value merges more than one position (`[�…�|�…�]`).
+    pub needs_postprocess: bool,
 }
 
 /// `render3/view/i18n/util.ts` `formatI18nPlaceholderName`. Converts an internal placeholder name
@@ -975,23 +989,35 @@ fn serialize_node_for_get_msg(node: &Node) -> String {
 
 /// Build the closure-mode const-pool form for an i18n `message` (`get_translation_decl_stmts`).
 ///
-/// `index` is the message's const ordinal (the `$i18n_<index>$` suffix). `file_suffix` is the
-/// file-based i18n suffix that names the `goog.getMsg` closure const (`MSG_<suffix><n>` →
-/// here a stable `MSG_ID_WITH_SUFFIX` placeholder, since the harness canonicalises `$…$`
-/// placeholder names). `params` are the message placeholders (already sorted by the caller, to
-/// match `[...params.entries()].sort()`), and `localize_expr` is the `$localize` `LocalizedString`
-/// expression for the `else` branch (built by the caller from the same message via
-/// `o::localized_string`, mirroring `createLocalizeStatements`).
+/// `index` is the message's const ordinal (the `i18n_<index>` suffix). `params` are the message
+/// placeholders (already sorted by the caller, to match `[...params.entries()].sort()`), and
+/// `localize_expr` is the `$localize` `LocalizedString` expression for the `else` branch (built by
+/// the caller from the same message via `o::localized_string`, mirroring `createLocalizeStatements`).
+///
+/// `opts` selects the two context-dependent emit forms Angular itself varies on (the goldens prove
+/// the divergence): the translation variable is written BARE `i18n_<index>` when the message
+/// brackets control-flow blocks (`@if`/`@switch`/`@for`/`@defer` — Angular's `ts.Printer` emits the
+/// genuine const identifier there) and as the `$i18n_<index>$` golden-placeholder form otherwise,
+/// and a trailing `i18n_<index> = ɵɵi18nPostprocess(i18n_<index>);` is appended iff
+/// [`I18nConstOpts::needs_postprocess`] (the message has a placeholder whose value merges >1
+/// position into the `[a|b|…]` form, which the runtime must reorder).
 pub fn build_i18n_const(
     message: &Message,
     index: usize,
     params: &[I18nPlaceholderParam],
     localize_expr: Expr,
+    opts: I18nConstOpts,
 ) -> I18nConst {
-    // The main var (`TRANSLATION_VAR_PREFIX` `i18n_`) and the closure const (`MSG_…`). The harness
-    // canonicalises `$name$` identifier placeholders, so we wrap both in the `$…$` form Angular's
-    // goldens use; this keeps the *structure* faithful while staying name-agnostic.
-    let main_name = format!("$i18n_{index}$");
+    // The main var (`TRANSLATION_VAR_PREFIX` `i18n_`) and the closure const (`MSG_…`). The closure
+    // const is harness-canonicalised via the `$name$` placeholder form. The main var is BARE
+    // `i18n_<index>` for block-bracketing messages (Angular emits the literal const there, so the
+    // golden spells it bare and the harness compares it literally) and `$i18n_<index>$` otherwise
+    // (where the golden uses the `$name$` identifier placeholder the harness collapses).
+    let main_name = if opts.bare_name {
+        format!("i18n_{index}")
+    } else {
+        format!("$i18n_{index}$")
+    };
     let closure_name = "$MSG_ID_WITH_SUFFIX$".to_string();
 
     let main_var = o::variable(main_name.clone(), None);
@@ -1075,9 +1101,23 @@ pub fn build_i18n_const(
 
     let if_stmt = o::if_stmt(guard, true_case, Some(false_case));
 
+    let mut initializers = vec![declare, if_stmt];
+
+    // `i18n_const_collection.ts` `getTranslationDeclStmts`: when a placeholder's value merges more
+    // than one position (the `[�…�|�…�]` form), the message string is postprocessed at runtime to
+    // re-expand those merged placeholders. Angular appends, after the closure guard,
+    // `i18n_<n> = ɵɵi18nPostprocess(i18n_<n>);`.
+    if opts.needs_postprocess {
+        let postprocess = o::import_expr(R3::I18nPostprocess.reference(), None)
+            .call_fn(vec![main_var.clone()], false);
+        initializers.push(Stmt::bare(StmtKind::Expression(
+            main_var.clone().set(postprocess),
+        )));
+    }
+
     I18nConst {
         const_entry: main_var,
-        initializers: vec![declare, if_stmt],
+        initializers,
     }
 }
 

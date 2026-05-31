@@ -14,11 +14,11 @@ This harness runs Treaty's Rust/OXC Angular compiler (`render3` crate, via the
 | --- | --- |
 | Total compliance cases | 642 |
 | Compiled (runnable) | 98 |
-| PASS | 87 |
-| DIFF | 11 |
+| PASS | 92 |
+| DIFF | 6 |
 | Skipped (un-runnable) | 544 |
-| **Pass-rate (of runnable subset)** | **88.8%** (87/98) |
-| Pass-rate (of full corpus) | 13.6% (87/642) |
+| **Pass-rate (of runnable subset)** | **93.9%** (92/98) |
+| Pass-rate (of full corpus) | 14.3% (92/642) |
 
 ### How a case is run and matched
 
@@ -43,41 +43,31 @@ from our output. Top entry = implement first to raise the score.
 
 | Count | Category (instruction / shape at first missing fragment) |
 | --- | --- |
-| 3 | `ɵɵi18nPostprocess` |
-| 3 | `ɵɵprojectionDef` |
-| 2 | `ɵɵelementStart` |
 | 2 | `ɵɵpureFunction1` |
-| 1 | `ɵɵdomElementStart` |
+| 1 | `ɵɵadvance` |
+| 1 | `ɵɵconditionalCreate` |
+| 1 | `ɵɵi18nEnd` |
+| 1 | `ɵɵelementStart` |
 
 ### Sample diverging cases
 
-- **`ɵɵi18nPostprocess`** (3):
-  - r3_view_compiler_let/should handle an @let referenced inside i18n and in a child view
-    - near: `cls:4,vars:2,consts:()=>{letID;if(`
-  - r3_view_compiler_i18n/blocks/should support @if blocks
-    - near: `{leti18n_0;if(typeofngI18nClosureM`
-  - r3_view_compiler_i18n/blocks/should support @switch blocks
-    - near: `{leti18n_0;if(typeofngI18nClosureM`
-- **`ɵɵprojectionDef`** (3):
-  - r3_compiler_compliance/components_and_directives/content_projection/should support multi-slot content projection with multiple wildcard slots
-    - near: `ors:ID,decls:3,vars:0,template:fun`
-  - r3_compiler_compliance/components_and_directives/content_projection/should capture the node name of ng-content with a structural directive
-    - near: `ors:ID,decls:1,vars:1,consts:[[4,"`
-  - r3_compiler_compliance/components_and_directives/content_projection/should support fallback content in ng-content
-    - near: `ors:ID,decls:7,vars:2,consts:[[4,"`
-- **`ɵɵelementStart`** (2):
-  - r3_view_compiler_i18n/blocks/should support @for blocks
-    - near: `{leti18n_0;if(typeofngI18nClosureM`
-  - r3_view_compiler_i18n/blocks/should support @defer blocks
-    - near: `{leti18n_0;if(typeofngI18nClosureM`
 - **`ɵɵpureFunction1`** (2):
   - r3_compiler_compliance/components_and_directives/value_composition/should support spread elements in array literals
     - near: `onstsimple_R=ɵɵpureFunction1(4,ID,`
   - r3_compiler_compliance/components_and_directives/value_composition/should support object literals with spread assignments
     - near: `onstsimple_R=ɵɵpureFunction1(4,ID,`
-- **`ɵɵdomElementStart`** (1):
-  - r3_view_compiler_let/should handle an @let referenced inside a child view inside i18n
-    - near: `cls:4,vars:1,consts:()=>{letID;if(`
+- **`ɵɵadvance`** (1):
+  - r3_view_compiler_let/should handle an @let referenced inside i18n and in a child view
+    - near: `);ɵɵadvance();ɵɵi18nExp(ID);ɵɵi18n`
+- **`ɵɵconditionalCreate`** (1):
+  - r3_view_compiler_i18n/blocks/should support @if blocks
+    - near: `ate,2,0)(3,MyApp_Conditional_3_Tem`
+- **`ɵɵi18nEnd`** (1):
+  - r3_view_compiler_i18n/blocks/should support @switch blocks
+    - near: `ate,2,0)(3,MyApp_Case_3_Template,2`
+- **`ɵɵelementStart`** (1):
+  - r3_view_compiler_i18n/blocks/should support @defer blocks
+    - near: `efer(whenisLoaded){","startBlockEr`
 
 ## Skip categories (cases not runnable through the source front-end)
 
@@ -96,11 +86,14 @@ error-expectation cases).
 
 ## Passing cases
 
-87 runnable compliance cases match Angular's golden `ɵɵdefineComponent` block:
+92 runnable compliance cases match Angular's golden `ɵɵdefineComponent` block:
 
 - model_inputs/should capture input/output pair in a component definition
 - output_function/should generate an output mapping for the component
+- r3_compiler_compliance/components_and_directives/content_projection/should capture the node name of ng-content with a structural directive
 - r3_compiler_compliance/components_and_directives/content_projection/should include parsed ngProjectAs selectors into template attrs
+- r3_compiler_compliance/components_and_directives/content_projection/should support fallback content in ng-content
+- r3_compiler_compliance/components_and_directives/content_projection/should support multi-slot content projection with multiple wildcard slots
 - r3_compiler_compliance/components_and_directives/lifecycle_hooks/local reference
 - r3_compiler_compliance/components_and_directives/pipes/should render pipes
 - r3_compiler_compliance/components_and_directives/pipes/should use appropriate function for a given no of pipe arguments
@@ -143,6 +136,7 @@ error-expectation cases).
 - r3_view_compiler_deferred/should generate a deferred block with loading block parameters
 - r3_view_compiler_deferred/should generate a deferred block with placeholder block parameters
 - r3_view_compiler_deferred/should generate a deferred block with secondary blocks
+- r3_view_compiler_i18n/blocks/should support @for blocks
 - r3_view_compiler_input_outputs/should declare inputs/outputs on a component
 - r3_view_compiler_let/should be able to use for loop variables in let declarations
 - r3_view_compiler_let/should be able to use forward references defined after the let declaration
@@ -155,6 +149,7 @@ error-expectation cases).
 - r3_view_compiler_let/should create multiple @let declarations that depend on each other
 - r3_view_compiler_let/should give precedence to local @let definition over one from a parent view
 - r3_view_compiler_let/should handle an @let preceded by an element with i18n
+- r3_view_compiler_let/should handle an @let referenced inside a child view inside i18n
 - r3_view_compiler_let/should handle an @let used only directly inside i18n
 - r3_view_compiler_let/should not optimize away declareLet if expression is using a pipe
 - r3_view_compiler_let/should not remove let declarations that are only used in a child view

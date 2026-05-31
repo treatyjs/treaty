@@ -1266,8 +1266,210 @@ impl I18nSentinelResolver {
                         )?;
                     }
                 }
-                // Other control-flow + ICU shapes are not modelled here (they need
-                // ɵɵi18nPostprocess); bail so the caller omits sentinels rather than emit wrong ones.
+                Node::IfBlock(b) => {
+                    // `build_if_block`: each branch allocates ONE data slot in order and its body is a
+                    // sub-template view. The block placeholder is a TEMPLATE_TAG `*` at the branch's
+                    // own slot, against a freshly-allocated sub-template index (matching the create
+                    // order). Branch names mirror the collector: `if` / `else if` (with condition) /
+                    // `else`.
+                    use crate::i18n::I18nParamValueFlags as F;
+                    for (i, branch) in b.branches.iter().enumerate() {
+                        let (name, params): (&str, Vec<String>) = if i == 0 {
+                            (
+                                "if",
+                                branch.expression.as_ref().map(ast_to_source).into_iter().collect(),
+                            )
+                        } else if branch.expression.is_some() {
+                            (
+                                "else if",
+                                branch.expression.as_ref().map(ast_to_source).into_iter().collect(),
+                            )
+                        } else {
+                            ("else", Vec::new())
+                        };
+                        let header = if_branch_header(name, &params);
+                        let branch_slot = *slot;
+                        *slot += 1;
+                        let start = reg.start_block_placeholder_name(name, &params);
+                        let close = reg.close_block_placeholder_name(name);
+                        let sub = self.next_sub_template_index;
+                        self.next_sub_template_index += 1;
+                        self.record(
+                            &start,
+                            crate::i18n::I18nParamValue {
+                                value: branch_slot,
+                                sub_template_index: Some(sub),
+                                flags: F::TEMPLATE_TAG | F::OPEN_TAG,
+                            },
+                            header,
+                        );
+                        self.record(
+                            &close,
+                            crate::i18n::I18nParamValue {
+                                value: branch_slot,
+                                sub_template_index: Some(sub),
+                                flags: F::TEMPLATE_TAG | F::CLOSE_TAG,
+                            },
+                            "}".to_string(),
+                        );
+                        let mut child_slot = 1usize;
+                        self.resolve_in_view(&branch.children, reg, &mut child_slot, Some(sub))?;
+                    }
+                }
+                Node::SwitchBlock(b) => {
+                    // `build_switch_block`: each `@case`/`@default` GROUP allocates one data slot in
+                    // order; its body is a sub-template view. The switch itself emits no placeholder
+                    // (the collector wraps the groups in a `Container`), so it has no slot/sub of its
+                    // own. Group names mirror the collector: `case` (with its label expressions) /
+                    // `default`.
+                    use crate::i18n::I18nParamValueFlags as F;
+                    for group in &b.groups {
+                        let is_default = group.cases.iter().any(|c| c.expression.is_none());
+                        let (name, params): (&str, Vec<String>) = if is_default {
+                            ("default", Vec::new())
+                        } else {
+                            let ps: Vec<String> = group
+                                .cases
+                                .iter()
+                                .filter_map(|c| c.expression.as_ref().map(ast_to_source))
+                                .collect();
+                            ("case", ps)
+                        };
+                        let header = switch_group_header(name, &params);
+                        let group_slot = *slot;
+                        *slot += 1;
+                        let start = reg.start_block_placeholder_name(name, &params);
+                        let close = reg.close_block_placeholder_name(name);
+                        let sub = self.next_sub_template_index;
+                        self.next_sub_template_index += 1;
+                        self.record(
+                            &start,
+                            crate::i18n::I18nParamValue {
+                                value: group_slot,
+                                sub_template_index: Some(sub),
+                                flags: F::TEMPLATE_TAG | F::OPEN_TAG,
+                            },
+                            header,
+                        );
+                        self.record(
+                            &close,
+                            crate::i18n::I18nParamValue {
+                                value: group_slot,
+                                sub_template_index: Some(sub),
+                                flags: F::TEMPLATE_TAG | F::CLOSE_TAG,
+                            },
+                            "}".to_string(),
+                        );
+                        let mut child_slot = 1usize;
+                        self.resolve_in_view(&group.children, reg, &mut child_slot, Some(sub))?;
+                    }
+                }
+                Node::DeferredBlock(b) => {
+                    // `build_deferred_block`: slots are allocated MAIN, then LOADING, PLACEHOLDER,
+                    // ERROR (the order Angular ingests the views — NOT source order), then the defer op
+                    // reserves two slots. Each present sub-view is a TEMPLATE_TAG `*` at its slot with
+                    // a sub-template index allocated in that same (view-creation) order. The block
+                    // placeholder NAMES, however, are allocated by the collector in SOURCE order
+                    // (`defer`, `placeholder`, `loading`, `error`), so we name in source order while
+                    // assigning slots/subs in view-creation order to match both sides exactly.
+                    use crate::i18n::I18nParamValueFlags as F;
+                    let main_slot = *slot;
+                    *slot += 1;
+                    let loading_slot = b.loading.as_ref().map(|_| {
+                        let s = *slot;
+                        *slot += 1;
+                        s
+                    });
+                    let placeholder_slot = b.placeholder.as_ref().map(|_| {
+                        let s = *slot;
+                        *slot += 1;
+                        s
+                    });
+                    let error_slot = b.error.as_ref().map(|_| {
+                        let s = *slot;
+                        *slot += 1;
+                        s
+                    });
+                    // The defer op reserves two further slots.
+                    *slot += 2;
+                    // Sub-template indices follow view-creation (slot) order: main, loading,
+                    // placeholder, error.
+                    let main_sub = self.next_sub_template_index;
+                    self.next_sub_template_index += 1;
+                    let loading_sub = loading_slot.map(|_| {
+                        let s = self.next_sub_template_index;
+                        self.next_sub_template_index += 1;
+                        s
+                    });
+                    let placeholder_sub = placeholder_slot.map(|_| {
+                        let s = self.next_sub_template_index;
+                        self.next_sub_template_index += 1;
+                        s
+                    });
+                    let error_sub = error_slot.map(|_| {
+                        let s = self.next_sub_template_index;
+                        self.next_sub_template_index += 1;
+                        s
+                    });
+                    // Record each block in SOURCE order so the placeholder-registry suffixes match the
+                    // collector, but with its view-creation slot/sub.
+                    let mut record_block =
+                        |this: &mut Self,
+                         reg: &mut PlaceholderRegistryShim,
+                         keyword: &str,
+                         header: &str,
+                         block_slot: usize,
+                         block_sub: usize| {
+                            let start = reg.start_block_placeholder_name(keyword, &[]);
+                            let close = reg.close_block_placeholder_name(keyword);
+                            this.record(
+                                &start,
+                                crate::i18n::I18nParamValue {
+                                    value: block_slot,
+                                    sub_template_index: Some(block_sub),
+                                    flags: F::TEMPLATE_TAG | F::OPEN_TAG,
+                                },
+                                header.to_string(),
+                            );
+                            this.record(
+                                &close,
+                                crate::i18n::I18nParamValue {
+                                    value: block_slot,
+                                    sub_template_index: Some(block_sub),
+                                    flags: F::TEMPLATE_TAG | F::CLOSE_TAG,
+                                },
+                                "}".to_string(),
+                            );
+                        };
+                    record_block(self, reg, "defer", "@defer {", main_slot, main_sub);
+                    if let (Some(s), Some(sub)) = (placeholder_slot, placeholder_sub) {
+                        record_block(self, reg, "placeholder", "@placeholder {", s, sub);
+                    }
+                    if let (Some(s), Some(sub)) = (loading_slot, loading_sub) {
+                        record_block(self, reg, "loading", "@loading {", s, sub);
+                    }
+                    if let (Some(s), Some(sub)) = (error_slot, error_sub) {
+                        record_block(self, reg, "error", "@error {", s, sub);
+                    }
+                    // Recurse the sub-view bodies in source order (children, placeholder, loading,
+                    // error) so nested element placeholders pick up the right sub-template index.
+                    let mut main_child = 1usize;
+                    self.resolve_in_view(&b.children, reg, &mut main_child, Some(main_sub))?;
+                    if let (Some(ph), Some(sub)) = (&b.placeholder, placeholder_sub) {
+                        let mut cs = 1usize;
+                        self.resolve_in_view(&ph.children, reg, &mut cs, Some(sub))?;
+                    }
+                    if let (Some(ld), Some(sub)) = (&b.loading, loading_sub) {
+                        let mut cs = 1usize;
+                        self.resolve_in_view(&ld.children, reg, &mut cs, Some(sub))?;
+                    }
+                    if let (Some(er), Some(sub)) = (&b.error, error_sub) {
+                        let mut cs = 1usize;
+                        self.resolve_in_view(&er.children, reg, &mut cs, Some(sub))?;
+                    }
+                }
+                // Remaining shapes (ICU expansions, etc.) are not modelled here; bail so the caller
+                // omits sentinels rather than emit wrong ones.
                 _ => return None,
             }
         }
@@ -1767,6 +1969,45 @@ fn instruction(reference: R3, params: Vec<Expr>) -> Stmt {
     o::import_expr(reference.reference(), None)
         .call_fn(params, false)
         .to_stmt()
+}
+
+/// The `original_code` fragment for an `@if`/`@else if`/`@else` branch's START_BLOCK placeholder
+/// (`i18n_parser.ts` records the authored block header). `if`/`else if` carry their condition in
+/// parens; `else` has none.
+fn if_branch_header(name: &str, params: &[String]) -> String {
+    match (name, params.first()) {
+        ("if", Some(cond)) => format!("@if ({cond}) {{"),
+        ("else if", Some(cond)) => format!("@else if ({cond}) {{"),
+        _ => "@else {".to_string(),
+    }
+}
+
+/// The `original_code` fragment for a `@case`/`@default` group's START_BLOCK placeholder. A `case`
+/// group carries its label expression(s) in parens; `default` has none.
+fn switch_group_header(name: &str, params: &[String]) -> String {
+    match (name, params.first()) {
+        ("case", Some(expr)) => format!("@case ({expr}) {{"),
+        ("default", _) => "@default {".to_string(),
+        _ => format!("@{name} {{"),
+    }
+}
+
+/// Whether an i18n message AST contains a `BlockPlaceholder` (a `@if`/`@switch`/`@for`/`@defer`
+/// control-flow block bracketed by the message). Angular emits the translation variable as a BARE
+/// `i18n_n` const for such messages and as the `$i18n_n$` placeholder form otherwise, so the
+/// const-pool builder needs this signal. Recurses through containers and tag/block children since a
+/// block placeholder can nest under any structural node.
+fn message_has_block_placeholder(nodes: &[crate::i18n::Node]) -> bool {
+    use crate::i18n::Node;
+    nodes.iter().any(|n| match n {
+        Node::BlockPlaceholder(_) => true,
+        Node::Container(c) => message_has_block_placeholder(&c.children),
+        Node::TagPlaceholder(t) => message_has_block_placeholder(&t.children),
+        Node::Text(_)
+        | Node::Icu(_)
+        | Node::Placeholder(_)
+        | Node::IcuPlaceholder(_) => false,
+    })
 }
 
 /// Convert a [`o::fn_`] `FunctionExpr` into a top-level `function <name>(…) {…}` declaration
@@ -3529,6 +3770,14 @@ impl TemplateDefinitionBuilder {
 
         let const_index = self.intern_i18n_message(&message, &params);
 
+        // Within this i18n block the relevant `@let`-usage scope is the block's OWN children (the
+        // `@let` declarations sit nested under the i18n host element, not at the view's top level).
+        // Point `current_nodes` at them so `let_used_in_view_now` can see that a folded root
+        // interpolation (e.g. `The result is {{result}}`, whose text lives in the message) reads the
+        // let — which decides whether the let's `ɵɵstoreLet` is captured into a `const` the root
+        // `ɵɵi18nExp` then reads, rather than re-reading `ctx.<name>`. Restored after this block.
+        let saved_nodes = self.current_nodes.replace(children.to_vec());
+
         // Creation block. A self-contained block (text + `{{ }}` only) reifies to a single
         // `ɵɵi18n(slot, constIndex)`; a block that brackets child create ops emits the open/close
         // pair `ɵɵi18nStart(slot, constIndex)` … (bracketed children) … `ɵɵi18nEnd()`.
@@ -3583,6 +3832,9 @@ impl TemplateDefinitionBuilder {
             self.update_code
                 .push(instruction(R3::I18nApply, vec![num(slot as f64)]));
         }
+
+        // Restore the enclosing view's node scope.
+        self.current_nodes = saved_nodes;
     }
 
     /// Lower the `@let` declarations of an i18n block, in source order. An external/pipe let routes
@@ -3826,9 +4078,29 @@ impl TemplateDefinitionBuilder {
                 .cmp(&i18n::format_i18n_placeholder_name(&b.name, true))
         });
 
-        // The message's const ordinal — Angular numbers `$i18n_n$` from the const-array position.
+        // The message's const ordinal — Angular numbers `i18n_n` from the const-array position.
         let index = self.const_pool.entries().len();
-        let i18n_const = i18n::build_i18n_const(message, index, &sorted_params, localize_expr);
+
+        // Two context-dependent emit forms Angular's own compiler chooses between (proven by the
+        // goldens). (1) `bare_name`: a message that brackets control-flow blocks
+        // (`@if`/`@switch`/`@for`/`@defer`) carries `BlockPlaceholder` nodes; Angular emits the
+        // translation variable as the BARE `i18n_n` const there, whereas a message with only
+        // text/interpolation/element-tag placeholders (e.g. an `@let` inside i18n) uses the
+        // `$i18n_n$` form. (2) `needs_postprocess`: when a placeholder's runtime value merges more
+        // than one position the value is serialized in the `[�…�|�…�]` form (leading `[`), and the
+        // message string must be re-expanded at runtime via `ɵɵi18nPostprocess`.
+        let bare_name = message_has_block_placeholder(&message.nodes);
+        let needs_postprocess = sorted_params.iter().any(|p| p.value.starts_with('['));
+        let i18n_const = i18n::build_i18n_const(
+            message,
+            index,
+            &sorted_params,
+            localize_expr,
+            i18n::I18nConstOpts {
+                bare_name,
+                needs_postprocess,
+            },
+        );
         self.const_pool
             .add_const_with_initializers(i18n_const.const_entry, i18n_const.initializers)
     }
