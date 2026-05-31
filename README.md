@@ -1,32 +1,39 @@
 # Treaty
 
-| Feature/Tool                        | Analog                                                         | Treaty                                                     |
-| ----------------------------------- | -------------------------------------------------------------- | ---------------------------------------------------------- |
-| Vite support                        | ✅                                                             | ✅                                                         |
-| First class bun support             | ❌                                                             | ✅                                                         |
-| Node Support                        | ✅                                                             | ✅ (Node-compatible Rust runtime on Nova — require + node: builtins, event loop, oxc_resolver) |
-| SSR                                 | ✅                                                             | ✅                                                         |
-| SSG                                 | ✅                                                             | ✅ (treaty_ssg Rust core — getStaticPaths, head/SEO, hydration manifest, sitemap/robots) |
-| File base routing                   | ✅                                                             | ✅ (treaty_file_routing Rust crate)                        |
-| Flexible File routing               | ❌                                                             | ✅ (configurable routes/ + api/ conventions)               |
-| Custom Authoring - functional       | ✅ (.analog - svelte inspired)                                 | ✅ (.treaty - custom & astro inspired)                     |
-| Authoring - Class                   | ✅ (standard angular )                                         | ✅ (Enhanced Angular authoring )                           |
-| deconstruction of objects to inputs | ❌                                                             | ✅ Supports Singal objects                                 |
-| Authoring to Ivy                    | ❌ (transpiles into Angular class for angular NGTCC to handle) | ✅ (render3 direct-to-Ivy compile)                         |
-| JSX authoring (selectorless)        | ❌                                                             | ✅ (.tsx/.tjsx, selectorless + signal-aware + full TS-expression support, @treaty/jsx) |
-| .treaty SFC authoring               | ✅ (.analog SFC)                                               | ✅ (.treaty single-file component — markup + script + styles) |
-| Source maps                         | ✅                                                             | ✅ (v3 maps end-to-end for every authoring format: .treaty / .tsx / .tjsx / .ts; server-fn bodies redacted from client maps) |
-| Strongly typed HTTP Client          | ❌                                                             | ✅ [@treaty/httpclient](https://jsr.io/@treaty/httpclient) |
-| Server side function in component   | ❌                                                             | ✅ (in-component server{} → server module; axum / Elysia / Express plugins) |
-| function chunking                   | ❌                                                             | ✅ (per-server-fn chunks + client bindings + manifest across Vite / Rspack / Rsbuild / Rslib; bodies never enter the client graph) |
-| First class Module federation       | ❌                                                             | ✅ (auto zero-config MF + @module-federation/enhanced; route-as-remote; toggle + standalone-config eject; partial deploy/rollback) |
-| Zoneless first                      | ❌                                                             | ✅                                                         |
-| Build to deploy                     | ❌                                                             | 🏗️ (work underway — @treaty/deploy artifact + pluggable cloud target) |
-| Bundler plugins                     | Vite                                                          | ✅ (Vite / Rspack / Rsbuild / Rslib)                       |
-| Treaty CLI                          | ❌                                                             | ✅ (treaty dev / build / generate, no angular.json)        |
-| VS Code extension + LSP             | ❌                                                             | ✅ (full extension + TextMate grammars + Angular-file LSP support) |
-| Angular lib auto-migration          | ❌                                                             | ✅ (ngx-maintenance — deterministic no-AI bot)             |
-| Bun Test                            | ❌                                                             | ✅                                                         |
-| [Vitest](https://vitest.dev/)       | ✅                                                             | ❌                                                         |
-| Tooling                             | tsc / ESLint                                                  | ✅ (tsgo + oxlint — no tsc anywhere)                       |
-| compiler                            | Angular CLI                                                    | Enhanced with Rust (render3 + oxc; direct-to-Ivy; ~90/98 of the runnable Angular compliance suite — 91.8% — and climbing) |
+A Rust/OXC Angular compiler and Node-compatible runtime. Treaty compiles
+Angular **directly to Ivy** in Rust (no `tsc`, no `@angular/compiler` at runtime),
+ships its own Node-compatible runtime, and lets you author with `.treaty` SFCs or
+JSX-flavored Angular — signals by default.
+
+> Branch: `migration/v22-oxc133` · OXC 0.133 · Angular 22 targets.
+> Detailed state: [`migration/STATUS.md`](migration/STATUS.md).
+
+## Features
+
+| Area | What | Status |
+| --- | --- | --- |
+| Compiler | `treaty_ivy` — direct-to-Ivy in Rust (4-crate carve: core/template/decorators/facade), `DecoratorCompiler` registry | ✅ 142/185 runnable Angular golden parity (76.8%, climbing) |
+| Authoring → Ivy | `.treaty` SFC + JSX-flavored Angular authoring plugins → `treaty_ivy` | ✅ |
+| Decorators / DI | `@Component/@Directive/@Injectable/@Pipe`, constructor DI (`ɵɵinject`/`ɵɵdirectiveInject` + `InjectFlags`), queries, `@Input({alias,transform})`, host bindings/styling, `signals: true` | ✅ |
+| Consuming Angular libs | Built-in **Angular Linker**: partial `ɵɵngDeclare*` → AOT `ɵɵdefine*`, no JIT, dev + prod | 🏗️ in progress (bundler wiring next) |
+| Runtime | Node-compatible Nova runtime, module-granular `node:` builtins, real `node:tls`/`node:https` over rustls (ring), offline-clean | ✅ 483 tests; conformance 51/0 + corpus 68/0 |
+| SSR / SSG | Server render + static generation cores (Rust-first deterministic logic) | 🏗️ |
+| File-based routing | `treaty_file_routing` crate + CLI; real-engine route generation | ✅ (`examples/file-routed-app`) |
+| Server functions | Inline by default (`server{}` / `'use server'` / `$`), backend-agnostic (axum default, Elysia opt-in); bodies excluded from client source maps | ✅ |
+| Source maps | v3 maps (Ivy JS ↔ authoring source) threaded through addon + bundler plugins | ✅ |
+| Bundler / NAPI | `compileComponent`, `compileComponentSource`, `compileTreatyFile`, `compile`, `compileMany`, `runMacro` (`linkPartial` lands with the linker) | ✅ |
+| Tooling | Typecheck **tsgo**, lint **oxlint**, no `tsc` | ✅ |
+| Build → boot e2e | Real vite build + boot of `everything-app` / `file-routed-app` | ⏳ queued (blocked on linker) |
+
+Legend: ✅ done · 🏗️ in progress · ⏳ queued.
+
+## Examples
+
+- [`examples/everything-app`](examples/everything-app) — broad feature coverage.
+- [`examples/file-routed-app`](examples/file-routed-app) — file-routing engine demo.
+
+## Status
+
+See [`migration/STATUS.md`](migration/STATUS.md) for the full per-workstream
+breakdown (compiler parity, the Angular linker, runtime conformance, file
+routing, examples, tooling) and the prioritized roadmap.
