@@ -217,6 +217,16 @@ pub(crate) fn install_globals(agent: &mut Agent, global: Object, gc: GcScope) {
     // `self` is the WinterCG global self-reference. Installed lazily via the self-replacing-accessor
     // seam as the worked example: zero cost until first read, built at most once.
     define_lazy(agent, global, "self", lazy_self_getter, gc);
+
+    // `require` is the CommonJS module-loading bridge. Node/CJS code assumes it exists without an
+    // import, so it is installed eagerly. Crucially it needs **no host services at install time**:
+    // the function object is a single builtin allocation, and it recovers the `HostState` (resolver
+    // + caches) from the agent only when *called* (see `module_cjs::require`). That is what lets it
+    // be wired here, inside the `initialize_global_object` hook that holds only `&mut Agent`, without
+    // the `HostState` borrow the module-backed eager globals need. Installing it still materializes
+    // **no** module: every `node:` builtin stays lazy until the first `require("node:...")` runs
+    // (tenet 2).
+    crate::node::module_cjs::install_require(agent, global, gc);
 }
 
 #[cfg(test)]

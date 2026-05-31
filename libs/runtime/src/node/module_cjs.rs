@@ -12,7 +12,11 @@
 //!   [`NodeCtx::builtin_cache`]. On first `require("node:fs")` the builtin's lazy `install` runs and
 //!   its exports object is rooted in a [`Global`]; every later `require` of that specifier returns
 //!   the same rooted object. An untouched builtin never materializes (tenet 2: zero startup cost).
-//! * **user files** — keyed by absolute path in [`HostState::module_cache`].
+//! * **user files** — keyed by absolute path in [`HostState::module_cache`]. On first
+//!   `require("./mod")` the resolver reads + lowers the file to JavaScript, the body is evaluated
+//!   inside a CommonJS wrapper (`module`/`exports`/`require`/`__dirname`/`__filename` in scope), and
+//!   `module.exports` is rooted under the resolved absolute path; every later `require` of the same
+//!   file returns the identical object.
 //!
 //! Allocation discipline (tenet 3): the builtin key is a `&'static str` re-derived from the static
 //! `BUILTINS` table (no `String`); a cache hit clones only the cheap `Global` handle, never the
@@ -24,29 +28,32 @@
 //! [`require`] so the global wiring can call it; the resolve→cache→materialize heart lives in
 //! [`require_specifier`], which is engine-driven and unit-tested against a live agent below.
 //!
-//! ### Deferred (documented, never a red tree)
+//! ### User-file evaluation
 //!
-//! Evaluating a *user* `.js`/`.ts`/`.json` file as a CommonJS module — running its body inside a
-//! `(exports, require, module, __filename, __dirname)` wrapper and caching `module.exports` — is
-//! intentionally not wired here. Doing it faithfully needs to re-enter the engine from inside the
-//! `require` builtin (push a script execution context, read the resulting `module.exports` back off
-//! the realm global) using Nova operations that are `pub(crate)` at the pinned rev
-//! (`get_global_object`, `call_function`) and therefore unreachable from this crate without an
-//! `unsafe`/visibility hack that the architecture rules forbid outside the single Nova FFI boundary.
-//! The non-engine half of that work — resolution, `std::fs` reading, TS transpile, JSON wrapping,
-//! and absolute-path cache-key derivation — already lives, fully tested, in
-//! [`crate::node::module_resolver`]; [`require_specifier`] returns a clear `InstallError` for the
-//! file case so callers fail loudly rather than silently. Builtin `require` (the dominant path for
-//! the macro / server-fn runtime) is complete.
+//! A *user* `.js`/`.ts`/`.json` file is loaded by running its (already-lowered-to-JS) body inside a
+//! CommonJS wrapper that supplies the five module locals (`module`, `exports`, `require`,
+//! `__filename`, `__dirname`). The non-engine half — resolution, `std::fs` reading, TS transpile,
+//! JSON wrapping, absolute-path cache-key derivation — is done by [`crate::node::module_resolver`];
+//! the engine half is done here with the same public Nova operations the crate already uses to run a
+//! script ([`parse_script`] + [`script_evaluation`]), so no `pub(crate)`/visibility hack and no
+//! `unsafe` beyond the one shared FFI boundary in [`crate::node::core`]. The wrapper script's
+//! completion value *is* the module's `module.exports`, read back directly. Cycle safety follows
+//! Node: the freshly-created `exports` object is rooted into the module cache **before** the body
+//! evaluates, so a cyclic `require` of the same file mid-evaluation observes the partially-populated
+//! exports rather than recursing forever.
+
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use nova_vm::ecmascript::{
     Agent, ArgumentsList, Behaviour, BuiltinFunctionArgs, ExceptionType, InternalMethods, JsResult,
     Object, OrdinaryObject, PropertyDescriptor, PropertyKey, String as JsString, Value,
-    create_builtin_function, unwrap_try,
+    create_builtin_function, parse_script, script_evaluation, unwrap_try,
 };
 use nova_vm::engine::{Bindable, Global, NoGcScope};
 
 use crate::node::core::{InstallError, NodeCtx};
+use crate::node::globals::define_value;
 use crate::node::module_resolver::{resolve_and_load, LoadAction};
 use crate::node::GcScope;
 
@@ -69,9 +76,12 @@ const REQUIRE_ARITY: u32 = 1;
 ///   scope and returned with no allocation.
 /// * On a builtin cache miss, the module's `install` runs once, the result is rooted into the
 ///   builtin cache, and the same object is returned. Subsequent calls hit the cache.
-/// * A [`LoadAction::File`] returns [`InstallError::Resolve`] — user-file CJS evaluation is the
-///   documented deferred case (see the module docs); resolution itself still succeeds, so the error
-///   message names the file that would have been loaded.
+/// * A [`LoadAction::File`] is loaded as a CommonJS module: on a [`HostState::module_cache`] miss the
+///   lowered source is evaluated inside a `(module, exports, require, __filename, __dirname)` wrapper
+///   ([`eval_cjs_file`]); the resulting `module.exports` is rooted under the resolved absolute path
+///   and returned. A cache hit returns the identical rooted object (CJS singleton semantics).
+///
+/// [`HostState::module_cache`]: crate::node::core::HostState::module_cache
 pub(crate) fn require_specifier<'gc>(
     agent: &mut Agent,
     ctx: &NodeCtx,
@@ -106,12 +116,236 @@ pub(crate) fn require_specifier<'gc>(
             ctx.builtin_cache().borrow_mut().insert(canonical, rooted);
             Ok(live)
         }
-        LoadAction::File { path, .. } => Err(InstallError::Resolve(format!(
-            "user CommonJS modules are not yet loadable via require(); resolved '{specifier}' to \
-             '{}' (deferred: see module_cjs docs)",
-            path.display()
-        ))),
+        LoadAction::File { path, source, .. } => {
+            // Cache hit: the file was already loaded; return its rooted `module.exports`. Read the
+            // handle through the `RefCell` borrow (disjoint from `&mut Agent`); `Global` is not
+            // `Clone`, so resolve it to a live object in the current scope.
+            {
+                let cache = ctx.module_cache().borrow();
+                if let Some(handle) = cache.get(&path) {
+                    return Ok(handle.get(agent, gc.nogc()));
+                }
+            }
+
+            // Miss: evaluate the file as a CommonJS module. `eval_cjs_file` pre-roots the fresh
+            // `exports` object into the module cache (keyed by `path`) *before* running the body, so
+            // a cyclic require resolves to the partial exports instead of recursing; on completion it
+            // updates the cache to the final `module.exports` and returns it.
+            eval_cjs_file(agent, ctx, &path, &source, gc)
+        }
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// User-file CommonJS evaluation.
+// ---------------------------------------------------------------------------------------------
+
+/// Monotonic id source for the per-load temporary global that hands the pre-built `module` object to
+/// the wrapper script. A `u64` counter never realistically wraps within a process; even if it did,
+/// the slot is created and `delete`d within a single synchronous `require`, so reuse is harmless.
+static CJS_LOAD_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Evaluate an already-lowered-to-JS file `source` as a CommonJS module rooted at `path`.
+///
+/// The engine half of user-file `require`, built on the same public Nova operations the crate uses
+/// to run any script ([`parse_script`] + [`script_evaluation`]) — no visibility hack, no `unsafe`.
+///
+/// Mechanics, and why each step is shaped this way:
+///
+/// 1. Build the module locals in Rust: a `module` object whose `exports` is a fresh empty object.
+///    The empty `exports` is rooted into [`crate::node::core::HostState::module_cache`] under `path`
+///    **before** evaluation — Node's cycle-safety contract: a `require` of this same file reached
+///    while the body is still running returns the partially-populated exports rather than recursing.
+/// 2. Hand `module` to the wrapper by parking it on the realm global under a process-unique,
+///    non-enumerable key (`__treaty_cjs_load_<id>`). Passing it through a global is what lets the
+///    body be a plain [`script_evaluation`] (which runs in global scope) without needing the
+///    `pub(crate)` `call_function`. The wrapper `delete`s the key before returning, so the global is
+///    left exactly as it was.
+/// 3. The wrapper is an IIFE that closes the five CommonJS locals over the body and whose trailing
+///    expression is `module.exports`, so [`script_evaluation`]'s completion value *is* the module's
+///    exports — read back directly with no `get_global_object`.
+/// 4. On success, update the cache entry to the final `module.exports` (the body may reassign
+///    `module.exports = ...`) and return it. A thrown error during evaluation removes the speculative
+///    cache entry so a later `require` can retry, and surfaces as [`InstallError::Nova`].
+fn eval_cjs_file<'gc>(
+    agent: &mut Agent,
+    ctx: &NodeCtx,
+    path: &Path,
+    source: &str,
+    mut gc: GcScope<'gc, '_>,
+) -> Result<Object<'gc>, InstallError> {
+    let id = CJS_LOAD_ID.fetch_add(1, Ordering::Relaxed);
+    let slot = format!("__treaty_cjs_load_{id}");
+
+    // --- 1. Build `module = { exports: {} }` and pre-root the empty `exports` (cycle safety). ---
+    let exports = OrdinaryObject::create_empty_object(agent, gc.nogc());
+    let module = OrdinaryObject::create_empty_object(agent, gc.nogc());
+    define_value(agent, module, "exports", exports.into(), gc.nogc());
+
+    let exports_obj: Object = exports.into();
+    let pre_rooted: Global<Object<'static>> = Global::new(agent, exports_obj.unbind());
+    // A second root for the same initial exports, kept on the Rust stack across evaluation. Reused as
+    // the fallback when the body replaces `module.exports` with a non-object primitive, and as a
+    // GC-safe handle to the object (the bare `exports`/`module` locals are bound to a pre-evaluation
+    // `nogc` scope and must not be read after `script_evaluation`, which may move the heap).
+    let initial_exports: Global<Object<'static>> =
+        Global::new(agent, Object::from(exports).unbind());
+    ctx.module_cache()
+        .borrow_mut()
+        .insert(path.to_path_buf(), pre_rooted);
+
+    // --- 2. Park `module` on the realm global under the unique slot key. ---
+    let global = agent.current_realm(gc.nogc()).global_object(agent);
+    define_global_slot(agent, global, &slot, module.into(), gc.nogc());
+
+    // --- 3. Build + evaluate the wrapper; its completion value is `module.exports`. ---
+    let dir = path.parent().unwrap_or_else(|| Path::new(""));
+    let wrapper = build_cjs_wrapper(&slot, source, path, dir);
+
+    let result = run_script(agent, wrapper, gc.reborrow());
+
+    match result {
+        Ok(value) => {
+            // The completion value is `module.exports`. It must be an object for the require contract
+            // (CJS exports is always an object); a non-object would mean the body replaced
+            // `module.exports` with a primitive, which `require` returns as-is — but our cache stores
+            // `Object`, so fall back to the (already-rooted) initial exports for the rare primitive
+            // case rather than failing the whole require.
+            let exports_obj = match Object::try_from(value.unbind().bind(gc.nogc())) {
+                Ok(obj) => obj.unbind(),
+                // Body replaced `module.exports` with a primitive: `require` would return that
+                // primitive, but the cache stores an `Object`, so fall back to the (rooted) initial
+                // exports — read from its GC-safe handle, never the stale pre-eval local.
+                Err(_) => initial_exports.get(agent, gc.nogc()).unbind(),
+            };
+            // Update the cache to the final exports (the body may have reassigned `module.exports`).
+            let rooted: Global<Object<'static>> = Global::new(agent, exports_obj);
+            let live = rooted.get(agent, gc.nogc());
+            ctx.module_cache()
+                .borrow_mut()
+                .insert(path.to_path_buf(), rooted);
+            Ok(live)
+        }
+        Err(message) => {
+            // Evaluation failed: drop the speculative cache entry so a later require can retry, and
+            // surface the thrown message.
+            ctx.module_cache().borrow_mut().remove(path);
+            Err(InstallError::Nova(message))
+        }
+    }
+}
+
+/// Define `value` on `global` as a non-enumerable, configurable data property named `name`.
+///
+/// Used to hand the per-load `module` object to the wrapper script. Non-enumerable so it never shows
+/// up in `Object.keys(globalThis)` during the (brief) window before the wrapper deletes it;
+/// configurable so the wrapper's `delete globalThis[name]` succeeds.
+fn define_global_slot(
+    agent: &mut Agent,
+    global: Object,
+    name: &str,
+    value: Object,
+    gc: NoGcScope,
+) {
+    let key = PropertyKey::from_str(agent, name, gc);
+    let descriptor = PropertyDescriptor {
+        value: Some(value.into()),
+        writable: Some(true),
+        enumerable: Some(false),
+        configurable: Some(true),
+        ..Default::default()
+    };
+    unwrap_try(global.try_define_own_property(agent, key, descriptor, None, gc));
+}
+
+/// Parse + evaluate `source` as a strict-mode script in the current realm, returning its completion
+/// value, or the thrown value's string form on an abrupt completion.
+///
+/// Mirrors the parse→evaluate path in [`crate::JsRuntime::eval_with_input`] so user-file CJS runs
+/// through exactly the same engine entry points the rest of the crate uses.
+fn run_script<'gc>(
+    agent: &mut Agent,
+    source: String,
+    mut gc: GcScope<'gc, '_>,
+) -> Result<Value<'gc>, String> {
+    let source_text = JsString::from_string(agent, source, gc.nogc());
+    let realm = agent.current_realm(gc.nogc());
+    let script = match parse_script(agent, source_text, realm, true, None, gc.nogc()) {
+        Ok(script) => script,
+        Err(diagnostics) => {
+            let message = diagnostics
+                .iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(if message.is_empty() {
+                "failed to parse module".to_owned()
+            } else {
+                message
+            });
+        }
+    };
+
+    match script_evaluation(agent, script.unbind(), gc.reborrow()) {
+        Ok(value) => Ok(value.unbind().bind(gc.into_nogc())),
+        Err(error) => {
+            let message = error
+                .value()
+                .unbind()
+                .string_repr(agent, gc)
+                .to_string_lossy(agent)
+                .into_owned();
+            Err(message)
+        }
+    }
+}
+
+/// Build the CommonJS wrapper script for `source`.
+///
+/// The wrapper reads the pre-built `module` object from the global `slot`, closes the five module
+/// locals over the body via an inner IIFE, deletes the slot, and ends with `module.exports` so the
+/// script's completion value is the module's exports. `__filename`/`__dirname` are embedded as
+/// JS-string literals.
+fn build_cjs_wrapper(slot: &str, source: &str, file: &Path, dir: &Path) -> String {
+    let filename_lit = encode_js_string_literal(&file.to_string_lossy());
+    let dirname_lit = encode_js_string_literal(&dir.to_string_lossy());
+    // The inner IIFE provides the body's `module`/`exports`/`require`/`__filename`/`__dirname`
+    // bindings; the outer IIFE owns the slot read + cleanup and yields `module.exports`.
+    format!(
+        "(function () {{\n\
+           var module = globalThis.{slot};\n\
+           delete globalThis.{slot};\n\
+           var exports = module.exports;\n\
+           (function (module, exports, require, __filename, __dirname) {{\n{source}\n}})\
+             (module, module.exports, require, {filename_lit}, {dirname_lit});\n\
+           return module.exports;\n\
+         }})()"
+    )
+}
+
+/// Encode `s` as a double-quoted JavaScript string literal.
+///
+/// Embeds `__filename`/`__dirname` (and any path bytes) safely into the wrapper source. Mirrors the
+/// escaping in [`crate::node::module_resolver`]: the JS-significant characters plus the C0 controls
+/// and the two line/paragraph separators that would otherwise terminate a string literal.
+fn encode_js_string_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -125,8 +359,10 @@ pub(crate) fn require_specifier<'gc>(
 /// surfaced as a thrown JS `Error` carrying the underlying message, so user code can `try/catch` it.
 ///
 /// `referrer` is `None`: `require` called from a top-level script / `eval` resolves relative to the
-/// runtime CWD, which is correct for the macro and server-fn entry contexts. Per-module referrers
-/// arrive once user-file loading lands (the deferred case).
+/// runtime CWD, which is correct for the macro and server-fn entry contexts. A nested `require` from
+/// within a loaded user file still resolves against the runtime CWD (or an absolute/builtin
+/// specifier); threading each module's own path through as the referrer for relative re-resolution
+/// is a follow-up that does not affect CWD-relative, absolute, or `node:` requires.
 pub(crate) fn require<'gc>(
     agent: &mut Agent,
     _this: Value,
@@ -345,13 +581,15 @@ mod tests {
     }
 
     #[test]
-    fn require_user_file_is_reported_as_deferred_resolve_error() {
-        // Resolution succeeds (the file exists) but loading is the documented deferred case, so the
-        // error names the resolved file rather than failing to resolve.
-        let dir = std::env::temp_dir().join(format!("treaty-cjs-{}", std::process::id()));
+    fn require_user_file_loads_and_is_cached_with_stable_identity() {
+        // A relative user file is resolved, read, evaluated as a CommonJS module, and its
+        // `module.exports` object is returned + cached: a second require yields the identical object
+        // (CJS singleton), and exactly one module-cache slot is occupied.
+        let dir = std::env::temp_dir().join(format!("treaty-cjs-load-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("mod.js");
-        std::fs::write(&file, "module.exports = 1;\n").unwrap();
+        // Export an object so the result is a cacheable `Object` and we can assert identity.
+        std::fs::write(&file, "module.exports = { value: 42 };\n").unwrap();
 
         let cwd = dir.clone();
         let host_state = Box::new(HostState::new(cwd, EnvMap::new()));
@@ -366,18 +604,68 @@ mod tests {
             let state = crate::node::core::host_state(agent).unwrap();
             let state: &HostState = unsafe { extend_lifetime(state) };
             let ctx = NodeCtx::new(state);
-            let err =
-                require_specifier(agent, &ctx, None, "./mod.js", gc.reborrow()).unwrap_err();
-            match err {
-                InstallError::Resolve(msg) => {
-                    assert!(msg.contains("deferred"), "should flag the deferred case: {msg}");
-                    assert!(msg.contains("mod.js"), "should name the resolved file: {msg}");
-                }
-                other => panic!("expected a deferred Resolve error, got {other:?}"),
-            }
+
+            assert!(
+                ctx.module_cache().borrow().is_empty(),
+                "module cache starts empty"
+            );
+
+            let first = require_specifier(agent, &ctx, None, "./mod.js", gc.reborrow())
+                .expect("user file should load as a CommonJS module")
+                .unbind();
+            assert_eq!(
+                ctx.module_cache().borrow().len(),
+                1,
+                "first require evaluates + caches exactly one user module"
+            );
+
+            let second = require_specifier(agent, &ctx, None, "./mod.js", gc.reborrow())
+                .expect("second require should hit the cache")
+                .unbind();
+            assert_eq!(
+                ctx.module_cache().borrow().len(),
+                1,
+                "second require of the same file is a cache hit, not a new entry"
+            );
+
+            // Module identity: repeated require yields the same underlying exports object.
+            assert_eq!(
+                first, second,
+                "require returns the identical cached exports object"
+            );
         });
         drop(agent);
         drop(host_state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn require_user_file_works_end_to_end_through_eval() {
+        // The full public path: `require()` of an absolute-path user `.js` file from an `eval`ed
+        // script reads, evaluates as CommonJS, and exposes its `module.exports` (here exercising the
+        // `module`/`exports`/`__filename` locals the wrapper supplies).
+        use crate::JsRuntime;
+        use serde_json::json;
+
+        let dir = std::env::temp_dir().join(format!("treaty-cjs-e2e-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("dep.js");
+        std::fs::write(
+            &file,
+            "const sum = (a, b) => a + b;\n\
+             module.exports = { sum, name: __filename.length > 0 };\n",
+        )
+        .unwrap();
+
+        // `serde_json` of the path yields a valid JS string literal (escapes Windows backslashes).
+        let lit = serde_json::to_string(&file.to_string_lossy().into_owned()).unwrap();
+        let src = format!(
+            "const dep = require({lit});\
+             [dep.sum(2, 3), dep.name]"
+        );
+
+        let mut rt = JsRuntime::with_node_compat();
+        assert_eq!(rt.eval(&src).unwrap(), json!([5, true]));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -807,4 +807,46 @@ mod tests {
         assert_eq!(value, json!(0));
         assert_eq!(rt.eval("globalThis.__hit").unwrap(), json!(1));
     }
+
+    #[test]
+    fn node_compat_fs_require_relative_and_promise_smoke() {
+        // End-to-end integration smoke exercising the whole Node-compat layer at once:
+        //   1. `require("node:fs")` returns the builtin fs module,
+        //   2. fs writes then reads back a temp file (round-trip through the host),
+        //   3. `require("./fixture.js")` resolves a relative user file via oxc_resolver and
+        //      evaluates it through the CommonJS loader, exposing its `module.exports`,
+        //   4. a Promise (resolved from the fixture's value) settles after the event-loop pump,
+        //      landing its result on a global the next eval observes.
+        let dir = std::env::temp_dir().join(format!("treaty-smoke-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Relative user fixture: a plain CommonJS module the CJS loader will evaluate.
+        let fixture = dir.join("fixture.js");
+        std::fs::write(&fixture, "module.exports = { gift: 21 };\n").unwrap();
+
+        // The temp file fs will write to and read back from inside the script.
+        let data_path = dir.join("data.txt");
+        let data_lit = serde_json::to_string(&data_path.to_string_lossy().into_owned()).unwrap();
+        let fixture_lit =
+            serde_json::to_string(&fixture.to_string_lossy().into_owned()).unwrap();
+
+        let src = format!(
+            "const fs = require(\"node:fs\");\
+             fs.writeFileSync({data_lit}, \"forty-two\");\
+             const roundtrip = fs.readFileSync({data_lit}, \"utf8\");\
+             const dep = require({fixture_lit});\
+             globalThis.__smoke = 0;\
+             Promise.resolve(dep.gift * 2).then((v) => {{ globalThis.__smoke = v; }});\
+             roundtrip"
+        );
+
+        let mut rt = JsRuntime::with_node_compat();
+        // The synchronous fs round-trip is observable in the completion value.
+        assert_eq!(rt.eval(&src).unwrap(), json!("forty-two"));
+        // After the event-loop pump (which `eval` runs post-evaluation), the awaited promise
+        // resolved with the relative-required fixture's value (21 * 2 == 42).
+        assert_eq!(rt.eval("globalThis.__smoke").unwrap(), json!(42));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
