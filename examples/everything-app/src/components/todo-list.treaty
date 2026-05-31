@@ -39,36 +39,39 @@ async function toggle(id: number): Promise<void> {
 
 void refresh()
 
-<template>
-  <section class="todo">
-    <header>
-      <h2>Todos</h2>
-      <small>built {{ meta.buildStamp }} | {{ remaining() }} remaining</small>
-    </header>
+// == View (NO <template> wrapper) ==
+// Per the Treaty no-<template> spec, the view is just tag-HTML interleaved with
+// the TypeScript above: anything NOT inside an HTML tag is TS (the component
+// body), and the lexer segments the HTML regions by their tags directly. The
+// `<section>` below opens the template region; @if/@for are native control flow.
+<section class="todo">
+  <header>
+    <h2>Todos</h2>
+    <small>built {{ meta.buildStamp }} | {{ remaining() }} remaining</small>
+  </header>
 
-    <form (submit)="create()">
-      <input
-        name="title"
-        placeholder="What needs doing?"
-        [value]="draft()"
-        (input)="draft.set($event.target.value)"
-      />
-      <button type="submit">Add</button>
-    </form>
+  <form (submit)="create()">
+    <input
+      name="title"
+      placeholder="What needs doing?"
+      [value]="draft()"
+      (input)="draft.set($event.target.value)"
+    />
+    <button type="submit">Add</button>
+  </form>
 
-    @if (todos().length) {
-      <ul>
-        @for (todo of todos(); track todo.id) {
-          <li [class.done]="todo.done" (click)="toggle(todo.id)">
-            {{ todo.title }}
-          </li>
-        }
-      </ul>
-    } @else {
-      <p class="empty">No todos yet.</p>
-    }
-  </section>
-</template>
+  @if (todos().length) {
+    <ul>
+      @for (todo of todos(); track todo.id) {
+        <li [class.done]="todo.done" (click)="toggle(todo.id)">
+          {{ todo.title }}
+        </li>
+      }
+    </ul>
+  } @else {
+    <p class="empty">No todos yet.</p>
+  }
+</section>
 
 <style lang="scss">
   .todo {

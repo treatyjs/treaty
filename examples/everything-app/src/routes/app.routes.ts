@@ -25,6 +25,13 @@ export const routes: Routes = [
 		path: 'profile',
 		loadChildren: () => import('../features/profile/profile.routes'),
 	},
+	{
+		// Lazy single-component remote (auto-exposed as ./routes/greeter). Its
+		// component hosts the .treaty + .tjsx surfaces and calls an extracted
+		// server fn -- a lazy boundary that becomes a federated remote.
+		path: 'greeter',
+		loadComponent: () => import('../features/greeter/greeter-page.component'),
+	},
 ]
 
 export default routes

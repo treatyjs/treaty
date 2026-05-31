@@ -49,3 +49,35 @@ declare module '@rsbuild/core' {
 		setup(api: unknown): void | Promise<void>
 	}
 }
+
+/**
+ * Authoring-format module shapes for the `.treaty` SFC and `.tjsx` JSX surfaces.
+ *
+ * tsgo cannot parse these authoring extensions directly (the Treaty compiler
+ * lowers them to Ivy components at build time), so importing one from a plain
+ * `.ts` host would otherwise be an unresolved module. These ambient
+ * declarations restate what the compiler emits: each authoring file
+ * default-exports a component VALUE that selectorless auto-import consumes by
+ * reference. The real lowered component is an assignable superset; nothing here
+ * runs. The shipped `@treaty/jsx` types still own intrinsic-element typing for
+ * the `.tjsx`/`.tsx` sources themselves.
+ */
+declare module '*.treaty' {
+	/**
+	 * The lowered, selectorless standalone component the compiler emits. Typed as
+	 * a constructable so it is assignable to Angular's `imports: Type<unknown>[]`
+	 * and usable as a `loadComponent` target; the concrete shape is synthesized.
+	 */
+	const component: new (...args: never[]) => unknown
+	export default component
+}
+
+declare module '*.tjsx' {
+	/**
+	 * The lowered, selectorless standalone component the compiler emits. Typed as
+	 * a constructable so it is assignable to Angular's `imports: Type<unknown>[]`
+	 * and usable as a `loadComponent` target; the concrete shape is synthesized.
+	 */
+	const component: new (...args: never[]) => unknown
+	export default component
+}

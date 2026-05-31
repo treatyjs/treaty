@@ -1,0 +1,79 @@
+/**
+ * JSX authoring on the dedicated `.tjsx` extension (an alias to `.tsx` routed to
+ * the same JSX authoring plugin). This file exercises the JSX-specific surface:
+ *
+ *   - a FUNCTION component (`greetingCard`) -- functions are first-class
+ *     components, not just classes; the compiler synthesizes the component
+ *     (locals -> signals, body fns -> handlers, returned JSX -> template);
+ *   - a LOWERCASE component name used selectorlessly;
+ *   - SIGNAL variables (`name`, `log`) read inline as `name()`;
+ *   - lowercase `class` (the preferred Treaty form, not `className`);
+ *   - a `use:autofocus` directive in the `use:` namespace;
+ *   - Angular CONTROL-FLOW blocks (`@if` / `@for`) written directly in the JSX,
+ *     the same block syntax `.treaty` uses (NOT a `&&`/`.map()` lowering);
+ *   - event handlers as body functions, lowered to Ivy `(input)`/`(click)`;
+ *   - an INLINE server function (`loadGreeting$$`) declared in this same file --
+ *     a separate `.server.ts` is OPTIONAL, not required. The `$$` naming marker
+ *     extracts the body to the backend (axum by default); only the typed client
+ *     binding ships to the browser, the body never enters the Ivy bundle.
+ *
+ * The compiler lowers this to a standalone, signal-based, selectorless Ivy
+ * component -- no @Component, selector, or standalone:true boilerplate.
+ */
+import { signal } from '@angular/core'
+import type { Greeting } from './greeting.types'
+
+/**
+ * INLINE server function ($$ marker) -- no sidecar file needed. The compiler
+ * extracts this whole body (including the server-only `greetings` data) into a
+ * generated server module and replaces it on the client with a typed binding.
+ */
+export async function loadGreeting$$(name: string): Promise<Greeting> {
+	const greetings = ['Hello', 'Welcome', 'Greetings', 'Salutations']
+	const text = `${greetings[name.length % greetings.length]}, ${name}!`
+	return { text, at: Date.now() }
+}
+
+// Lowercase function component -- the whole component is this function.
+export default function greetingCard() {
+	// Body locals are signals-by-default; written here explicitly so the example
+	// also type-checks as plain Angular signal usage.
+	const name = signal('Grace')
+	const log = signal<Greeting[]>([])
+
+	// Event handlers are body functions (lowered to event bindings). Keeping the
+	// DOM cast here in TS -- not in the template expression -- keeps the lowered
+	// `(input)` binding a simple handler reference.
+	const setName = (event: Event): void => {
+		name.set((event.target as HTMLInputElement).value)
+	}
+
+	// A body function becomes a handler. It calls the inline `$$` server fn via
+	// its typed client binding; the server body never ships to the browser.
+	const greet = async (): Promise<void> => {
+		const next = await loadGreeting$$(name())
+		log.update((entries) => [...entries, next])
+	}
+
+	return (
+		<section class="greeting-card">
+			<h2>Greeting card</h2>
+
+			<input class="name" use:autofocus value={name()} onInput={setName} />
+			<button class="greet" onClick={greet}>
+				greet {name()}
+			</button>
+
+			{/* Angular control flow written directly in JSX (no ternary/map). */}
+			@if (log().length) {
+				<ul class="history">
+					@for (entry of log(); track entry.at) {
+						<li class="entry">{entry.text}</li>
+					}
+				</ul>
+			} @else {
+				<p class="empty">no greetings yet</p>
+			}
+		</section>
+	)
+}
