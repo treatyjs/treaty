@@ -80,11 +80,15 @@ fn default_config_matches_readme_tables() {
     let mut flat = Vec::new();
     flatten_routes(&out.routes, 0, &mut flat);
 
+    // Route-group folders `(name)` are stripped from the URL: `(marketing)/index`
+    // lowers to path `""` (the group's index IS the parent's index URL) and
+    // `(marketing)/about` lowers to `about` — the parenthesised group name never
+    // appears in any `path`.
     let expected: Vec<(usize, &str, &str, &str)> = vec![
         (0, "", "layout", "routes/layout.treaty"),
         (1, "", "leaf", "routes/index.treaty"),
-        (1, "(marketing)", "leaf", "routes/(marketing)/index.treaty"),
-        (1, "(marketing)/about", "leaf", "routes/(marketing)/about.tjsx"),
+        (1, "", "leaf", "routes/(marketing)/index.treaty"),
+        (1, "about", "leaf", "routes/(marketing)/about.tjsx"),
         (1, "blog", "layout", "routes/blog/layout.treaty"),
         (2, "", "leaf", "routes/blog/index.treaty"),
         (2, "[...path]", "leaf", "routes/blog/[...path]/index.treaty"),
@@ -114,13 +118,19 @@ fn default_config_matches_readme_tables() {
         .iter()
         .map(|r| (r.name.as_str(), r.route_path.as_str(), r.entry_file.as_str()))
         .collect();
+    // Remote names are globally UNIQUE. Base names derive from the (group-stripped)
+    // route path; the three routes whose path slugifies to `root` (root layout,
+    // root index, marketing index, blog index) are disambiguated by their entry
+    // file: the layout claims bare `root`, the rest take a `root-<hint>` suffix
+    // (`index` for the top-level index, the owning dir name for nested indexes).
+    // `route_path` stays the real, group-stripped path.
     let expected_remotes: Vec<(&str, &str, &str)> = vec![
         ("root", "", "routes/layout.treaty"),
-        ("root", "", "routes/index.treaty"),
-        ("marketing", "(marketing)", "routes/(marketing)/index.treaty"),
-        ("marketing-about", "(marketing)/about", "routes/(marketing)/about.tjsx"),
+        ("root-index", "", "routes/index.treaty"),
+        ("root-marketing", "", "routes/(marketing)/index.treaty"),
+        ("about", "about", "routes/(marketing)/about.tjsx"),
         ("blog", "blog", "routes/blog/layout.treaty"),
-        ("root", "", "routes/blog/index.treaty"),
+        ("root-blog", "", "routes/blog/index.treaty"),
         ("path", "[...path]", "routes/blog/[...path]/index.treaty"),
         ("slug", "[slug]", "routes/blog/[slug]/index.treaty"),
         ("docs-category-page", "docs/[category]/[page]", "routes/docs/[category]/[page]/index.tjsx"),
@@ -133,6 +143,20 @@ fn default_config_matches_readme_tables() {
     );
     // There is exactly one remote per emitted route (10 routes, 10 remotes).
     assert_eq!(out.remotes.len(), flat.len(), "one remote per emitted route");
+    // Every federation remote name is GLOBALLY UNIQUE (a hard MF requirement).
+    let mut names_sorted: Vec<&str> = out.remotes.iter().map(|r| r.name.as_str()).collect();
+    names_sorted.sort_unstable();
+    let unique = names_sorted.len();
+    names_sorted.dedup();
+    assert_eq!(unique, names_sorted.len(), "federation remote names must be unique");
+    // No emitted route `path` retains a parenthesised group segment.
+    assert!(
+        out.routes
+            .iter()
+            .flat_map(|r| std::iter::once(r).chain(descendants(r)))
+            .all(|r| !r.path.contains('(') && !r.path.contains(')')),
+        "route-group parens are stripped from every route path"
+    );
 
     // --- API endpoints -----------------------------------------------------
     // Sorted by path; api dynamic segments always render :param.
@@ -178,11 +202,13 @@ fn colon_style_and_federation_off_overrides_against_real_dir() {
     let mut flat = Vec::new();
     flatten_routes(&out.routes, 0, &mut flat);
     let paths: Vec<&str> = flat.iter().map(|(_, p, _, _)| p.as_str()).collect();
+    // Group folders are stripped here too: `(marketing)/index` -> "" and
+    // `(marketing)/about` -> "about".
     let expected_paths = vec![
         "",
         "",
-        "(marketing)",
-        "(marketing)/about",
+        "",
+        "about",
         "blog",
         "",
         ":...path",
@@ -194,6 +220,10 @@ fn colon_style_and_federation_off_overrides_against_real_dir() {
     assert!(
         flat.iter().all(|(_, p, _, _)| !p.contains('[')),
         "no bracket segments survive under Colon style"
+    );
+    assert!(
+        flat.iter().all(|(_, p, _, _)| !p.contains('(')),
+        "no route-group parens survive in any path"
     );
 
     // Component/layout files are unaffected by the style (they are file paths,

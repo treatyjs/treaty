@@ -27,7 +27,10 @@
 //! * **Not-found file** — emitted as a `path: "**"` wildcard route. At the root
 //!   it is a top-level catch-all; inside a layout it is a scoped catch-all child.
 
+use std::collections::HashMap;
+
 use crate::config::{AngularRoute, FederationRemote, FileRoutingConfig, RouteNode};
+use crate::scanner::is_route_group;
 
 /// Lower the scanned routes tree into top-level Angular routes. An absent root
 /// (`None`) yields an empty `Vec`.
@@ -36,10 +39,109 @@ use crate::config::{AngularRoute, FederationRemote, FileRoutingConfig, RouteNode
 /// `segment`, so its contents land directly at the top level. A root with a
 /// layout still nests its contents under that layout's `""` parent route.
 pub fn build_routes(config: &FileRoutingConfig, root: Option<&RouteNode>) -> Vec<AngularRoute> {
-    match root {
+    let mut routes = match root {
         Some(node) => lower_node(config, node, ""),
         None => Vec::new(),
+    };
+    // Lowering set each federation route's `remote_name` to its *base* slug
+    // (derived from the route path), which is not globally unique — several
+    // routes legitimately share a path slug (e.g. the root layout, the root
+    // index, and a nested layout's index all slugify to `root`). Federation
+    // requires every remote name to be unique, so make a second pass that walks
+    // the tree in emission order and disambiguates duplicates deterministically.
+    if config.federation {
+        let mut used: HashMap<String, usize> = HashMap::new();
+        dedupe_remote_names(&mut routes, &mut used);
     }
+    routes
+}
+
+/// Walk the lowered route tree in emission (depth-first, pre-order) order and
+/// rewrite each route's `remote_name` so every name is globally unique.
+///
+/// The first route to claim a given base slug keeps it verbatim. Any later
+/// route whose base slug is already taken is disambiguated by appending a
+/// hyphen-joined suffix derived from its entry file's parent/stem, and — only
+/// if that is *still* taken — a numeric counter. The walk order is stable, so
+/// the assignment is deterministic for a given tree.
+fn dedupe_remote_names(routes: &mut [AngularRoute], used: &mut HashMap<String, usize>) {
+    for route in routes.iter_mut() {
+        if let Some(base) = route.remote_name.clone() {
+            route.remote_name = Some(unique_name(&base, route, used));
+        }
+        dedupe_remote_names(&mut route.children, used);
+    }
+}
+
+/// Pick a globally-unique remote name for `route` given the `base` slug and the
+/// set of names `used` so far (mapping a claimed name to a numeric counter for
+/// the rare case where even the entry-file-disambiguated name repeats).
+///
+/// Resolution order: the bare `base`, then `base-<file-hint>` derived from the
+/// route's entry file (its containing directory + stem, slugified), then
+/// `base-<file-hint>-<n>` with an incrementing `n`. The first form not already
+/// claimed wins.
+fn unique_name(base: &str, route: &AngularRoute, used: &mut HashMap<String, usize>) -> String {
+    if !used.contains_key(base) {
+        used.insert(base.to_string(), 1);
+        return base.to_string();
+    }
+    // `base` is taken: derive a deterministic hint from the entry file path so
+    // the collision is resolved by *where the file lives*, not an opaque index.
+    let entry = route
+        .component_file
+        .as_deref()
+        .or(route.layout_file.as_deref())
+        .unwrap_or("");
+    let candidate = match file_hint(entry) {
+        Some(hint) if !hint.is_empty() && hint != base => format!("{base}-{hint}"),
+        _ => base.to_string(),
+    };
+    if !used.contains_key(&candidate) {
+        used.insert(candidate.clone(), 1);
+        return candidate;
+    }
+    // Even the file-hinted name repeats; append an incrementing numeric suffix
+    // seeded from the candidate's running counter.
+    let mut n = *used.get(&candidate).unwrap_or(&1);
+    loop {
+        n += 1;
+        let numbered = format!("{candidate}-{n}");
+        if !used.contains_key(&numbered) {
+            used.insert(candidate.clone(), n);
+            used.insert(numbered.clone(), 1);
+            return numbered;
+        }
+    }
+}
+
+/// Build a slug hint from a route entry file path to disambiguate a remote-name
+/// collision, picking the most meaningful component of the path:
+///
+/// * For a directory-index file (`index` / `page`), the owning directory's name
+///   carries the meaning — but the top-level routes directory itself (a path
+///   with a single directory component, e.g. `routes/index.treaty`) is *not* a
+///   meaningful sub-route, so there we fall back to the file stem (`index`).
+/// * For a named page or a `layout` file, the file stem is the meaningful part.
+///
+/// Returns `None` for an empty path or one that slugifies to nothing.
+fn file_hint(entry_file: &str) -> Option<String> {
+    if entry_file.is_empty() {
+        return None;
+    }
+    let no_ext = entry_file.rsplit_once('.').map_or(entry_file, |(s, _)| s);
+    let comps: Vec<&str> = no_ext.split('/').filter(|c| !c.is_empty()).collect();
+    let stem = comps.last().copied().unwrap_or("");
+    let is_index = stem == "index" || stem == "page";
+    // `comps` = [routes_dir, ...sub_dirs, stem]. A real sub-directory exists
+    // only when there is more than one directory component before the stem.
+    let hint = if is_index && comps.len() > 2 {
+        comps[comps.len() - 2]
+    } else {
+        stem
+    };
+    let slug = slugify(hint);
+    if slug.is_empty() { None } else { Some(slug) }
 }
 
 /// Lower a single [`RouteNode`] into the routes it contributes to its parent's
@@ -47,7 +149,17 @@ pub fn build_routes(config: &FileRoutingConfig, root: Option<&RouteNode>) -> Vec
 /// that have *not* yet been materialised as a parent route (i.e. flattened
 /// non-layout ancestors); it is joined ahead of this node's own `segment`.
 fn lower_node(config: &FileRoutingConfig, node: &RouteNode, prefix: &str) -> Vec<AngularRoute> {
-    let dir_path = join_path(prefix, &node.segment);
+    // Route-group folders — `(name)` — are organisational only: they own and
+    // nest their children but contribute *nothing* to the URL. So a group's
+    // effective URL segment is empty, exactly like the routes root. Everything
+    // below (the joined `dir_path`, layout parent path, flattened child prefix)
+    // then naturally omits the group name (Next.js / Analog semantics).
+    let effective_segment = if is_route_group(&node.segment) {
+        ""
+    } else {
+        node.segment.as_str()
+    };
+    let dir_path = join_path(prefix, effective_segment);
 
     if node.layout_file.is_some() {
         // Layout present: this directory becomes one parent route at `dir_path`
@@ -206,27 +318,34 @@ fn remote_name_for(path: &str) -> String {
     if path == "**" {
         return "not-found".to_string();
     }
-    let mut name = String::new();
-    let mut prev_dash = false;
-    for ch in path.chars() {
-        if ch.is_ascii_alphanumeric() {
-            name.push(ch.to_ascii_lowercase());
-            prev_dash = false;
-        } else if !prev_dash && !name.is_empty() {
-            // Collapse any separator run (`/`, `:`, etc.) to a single dash.
-            name.push('-');
-            prev_dash = true;
-        }
-    }
-    // Trim a trailing dash that a path ending in a separator could leave behind.
-    if name.ends_with('-') {
-        name.pop();
-    }
+    let name = slugify(path);
     if name.is_empty() {
         "root".to_string()
     } else {
         name
     }
+}
+
+/// Lowercase, hyphenate, and strip a string to an MF-safe slug: alphanumeric
+/// runs are kept (lowercased), any run of other characters (including `/`, `:`,
+/// `[`, `]`, `.`) collapses to a single `-`, and leading/trailing dashes are
+/// trimmed. Used both for route-path slugs and entry-file disambiguation hints.
+fn slugify(input: &str) -> String {
+    let mut name = String::new();
+    let mut prev_dash = false;
+    for ch in input.chars() {
+        if ch.is_ascii_alphanumeric() {
+            name.push(ch.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !prev_dash && !name.is_empty() {
+            name.push('-');
+            prev_dash = true;
+        }
+    }
+    if name.ends_with('-') {
+        name.pop();
+    }
+    name
 }
 
 #[cfg(test)]
@@ -519,12 +638,19 @@ mod tests {
         // Layout boundary itself is a remote (entry = the layout file), keyed
         // on its path -> "root", plus the nested index and dashboard routes.
         let names: Vec<&str> = remotes.iter().map(|r| r.name.as_str()).collect();
-        // Depth-first: layout parent ("root"), then its "" index child also
-        // slugifies to "root", then "dashboard".
-        assert_eq!(names, vec!["root", "root", "dashboard"]);
+        // Depth-first: the layout parent claims bare "root"; its "" index child
+        // would also slugify to "root" but is disambiguated to "root-index" by
+        // its entry file; then "dashboard". All three names are unique.
+        assert_eq!(names, vec!["root", "root-index", "dashboard"]);
 
-        let layout_remote = remotes.iter().find(|r| r.route_path.is_empty()).unwrap();
+        // The bare-"root" remote is the layout boundary (entry = the layout file);
+        // its sibling index is "root-index" (entry = the index file).
+        let layout_remote = remotes.iter().find(|r| r.name == "root").unwrap();
+        assert_eq!(layout_remote.route_path, "");
         assert_eq!(layout_remote.entry_file, "routes/layout.treaty");
+        let index_remote = remotes.iter().find(|r| r.name == "root-index").unwrap();
+        assert_eq!(index_remote.route_path, "");
+        assert_eq!(index_remote.entry_file, "routes/index.treaty");
 
         let dash_remote = remotes.iter().find(|r| r.route_path == "dashboard").unwrap();
         assert_eq!(dash_remote.entry_file, "routes/dashboard/index.treaty");
@@ -539,5 +665,134 @@ mod tests {
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].path, "**");
         assert!(routes[0].is_wildcard);
+    }
+
+    // --- route groups -------------------------------------------------------
+
+    /// Convenience: a route-group node whose `segment` is the parenthesised
+    /// group name (as the scanner records it).
+    fn group_node(dir_path: &str, group_name: &str) -> RouteNode {
+        let mut n = dir_node(dir_path, &format!("({group_name})"));
+        n.dir_path = dir_path.to_string();
+        n
+    }
+
+    #[test]
+    fn group_folder_is_stripped_from_child_path() {
+        // routes/(marketing)/about.treaty  ->  path "about" (group gone).
+        let c = no_fed();
+        let mut root = dir_node("routes", "");
+        let mut group = group_node("routes/(marketing)", "marketing");
+        group.page_files = vec![page("routes/(marketing)/about.treaty", "about")];
+        root.children = vec![group];
+
+        let routes = build_routes(&c, Some(&root));
+        let paths: Vec<&str> = routes.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(paths, vec!["about"]);
+        assert!(routes.iter().all(|r| !r.path.contains('(')));
+    }
+
+    #[test]
+    fn group_index_lowers_to_empty_path() {
+        // routes/(marketing)/index.treaty  ->  path "" (an index under a group
+        // is the group parent's index URL).
+        let c = no_fed();
+        let mut root = dir_node("routes", "");
+        let mut group = group_node("routes/(marketing)", "marketing");
+        group.index_file = Some("routes/(marketing)/index.treaty".to_string());
+        root.children = vec![group];
+
+        let routes = build_routes(&c, Some(&root));
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].path, "");
+        assert_eq!(
+            routes[0].component_file.as_deref(),
+            Some("routes/(marketing)/index.treaty")
+        );
+    }
+
+    #[test]
+    fn group_with_layout_mounts_children_at_parent_path() {
+        // A group that owns a layout still nests its children, but the group
+        // name never appears: the layout parent mounts at "" and its child
+        // "settings" page is "settings", not "(app)/settings".
+        let c = no_fed();
+        let mut root = dir_node("routes", "");
+        let mut group = group_node("routes/(app)", "app");
+        group.layout_file = Some("routes/(app)/layout.treaty".to_string());
+        group.index_file = Some("routes/(app)/index.treaty".to_string());
+        group.page_files = vec![page("routes/(app)/settings.treaty", "settings")];
+        root.children = vec![group];
+
+        let routes = build_routes(&c, Some(&root));
+        assert_eq!(routes.len(), 1);
+        let parent = &routes[0];
+        assert_eq!(parent.path, ""); // group stripped; layout mounts at root
+        assert_eq!(parent.layout_file.as_deref(), Some("routes/(app)/layout.treaty"));
+        let child_paths: Vec<&str> = parent.children.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(child_paths, vec!["", "settings"]);
+    }
+
+    #[test]
+    fn colliding_route_paths_get_distinct_remote_names() {
+        // Two routes whose paths slugify to the same base ("root"): the root
+        // index and a group index that both lower to "". Federation requires
+        // their remote names to differ.
+        let c = FileRoutingConfig::default(); // federation on
+        let mut root = dir_node("routes", "");
+        root.index_file = Some("routes/index.treaty".to_string());
+        let mut group = group_node("routes/(marketing)", "marketing");
+        group.index_file = Some("routes/(marketing)/index.treaty".to_string());
+        root.children = vec![group];
+
+        let routes = build_routes(&c, Some(&root));
+        let remotes = build_remotes(&c, &routes);
+        // Both route paths are "" (correct), but the remote names are distinct.
+        assert!(remotes.iter().all(|r| r.route_path.is_empty()));
+        let names: Vec<&str> = remotes.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["root", "root-marketing"]);
+        // Uniqueness holds.
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), names.len());
+    }
+
+    #[test]
+    fn identical_base_names_fall_back_to_numeric_suffix() {
+        // Pathological: three routes that all slugify to "root" AND share an
+        // indistinguishable file hint. The third must still get a unique name
+        // via the numeric fallback. We drive `unique_name` directly to force
+        // the case where even the file-hinted candidate repeats.
+        let mut used = HashMap::new();
+        let r = AngularRoute {
+            path: String::new(),
+            component_file: Some("routes/index.treaty".to_string()),
+            layout_file: None,
+            is_wildcard: false,
+            remote_name: None,
+            children: Vec::new(),
+        };
+        // First claim "root".
+        assert_eq!(unique_name("root", &r, &mut used), "root");
+        // Second: base taken -> "root-index".
+        assert_eq!(unique_name("root", &r, &mut used), "root-index");
+        // Third (same base + same file hint): numeric fallback -> "root-index-2".
+        assert_eq!(unique_name("root", &r, &mut used), "root-index-2");
+        // Fourth keeps incrementing deterministically.
+        assert_eq!(unique_name("root", &r, &mut used), "root-index-3");
+    }
+
+    #[test]
+    fn file_hint_picks_meaningful_component() {
+        assert_eq!(file_hint("routes/index.treaty").as_deref(), Some("index"));
+        assert_eq!(file_hint("routes/blog/index.treaty").as_deref(), Some("blog"));
+        assert_eq!(
+            file_hint("routes/(marketing)/index.treaty").as_deref(),
+            Some("marketing")
+        );
+        assert_eq!(file_hint("routes/layout.treaty").as_deref(), Some("layout"));
+        assert_eq!(file_hint("routes/about.tjsx").as_deref(), Some("about"));
+        assert_eq!(file_hint(""), None);
     }
 }

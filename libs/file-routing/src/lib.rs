@@ -239,13 +239,19 @@ mod tests {
 
         // --- FederationRemotes (federation defaults on) ----------------------
         // One remote for the layout boundary + one per lowered leaf route.
-        // Depth-first, route-order: layout("root"), index("root"), about,
-        // users, users-id, not-found.
+        // Depth-first, route-order: layout claims "root", the root index would
+        // collide on "root" so it is disambiguated to "root-index", then about,
+        // users, users-id, not-found. Every name is globally unique.
         let remote_names: Vec<&str> = out.remotes.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(
             remote_names,
-            vec!["root", "root", "about", "users", "users-id", "not-found"]
+            vec!["root", "root-index", "about", "users", "users-id", "not-found"]
         );
+        // Federation remote names must be unique across the whole app.
+        let mut sorted = remote_names.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), remote_names.len(), "remote names are unique");
         let layout_remote = out
             .remotes
             .iter()

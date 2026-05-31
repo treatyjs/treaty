@@ -46,10 +46,14 @@ Naming rules applied to directory and file base names:
   manifest this becomes `*path`. In **routes** a catch-all *directory* lowers to
   a normal dynamic path segment (`[...path]`); only a `not-found` file produces
   the `**` wildcard.
-- **Route group** — `(marketing)` → organises files in a folder. The scanner
-  records the group; the current route lowering treats the parenthesised name as
-  the path segment (so it appears in the path), which a later flattening pass can
-  strip.
+- **Route group** — `(marketing)` → organises files in a folder **without
+  contributing a URL segment** (Next.js / Analog semantics). The parenthesised
+  name is stripped from the generated route `path`: `(marketing)/about` lowers to
+  `about`, and `(marketing)/index` lowers to `""` — the group's index *is* the
+  parent's index URL. The group still owns and nests its children (and, if it has
+  a `layout`, it mounts that layout at the parent path). When a group index and
+  the parent index both resolve to the same URL (`""`), the path is the same by
+  design; they are disambiguated only at the federation-remote layer (see below).
 - **Index/page** — `index.*` / `page.*` → the directory's own route at `""`
   (under a layout) or the directory's joined path (flattened).
 
@@ -61,6 +65,8 @@ directory's path; its index, pages, child dirs, and `not-found` nest as
 is *flattened*: its contents are emitted into the parent's list with the
 directory segment prefixed onto each path. This app shows both: the root and
 `blog/` use layouts (nesting), while `(marketing)/` and `docs/.../` flatten.
+(A route group with **no** layout, like `(marketing)/`, flattens with an *empty*
+segment, so only the group's children — not the group name — reach the URL.)
 
 ## Directory tree
 
@@ -71,9 +77,9 @@ examples/file-routed-app/
 │   ├── layout.treaty            # root layout  -> parent route at ""
 │   ├── index.treaty             # landing page -> "" (child of root layout)
 │   ├── not-found.treaty         # 404          -> "**" wildcard
-│   ├── (marketing)/             # route group  (paren segment kept by lowering)
-│   │   ├── index.treaty         #   -> "(marketing)"
-│   │   └── about.tjsx           #   -> "(marketing)/about"   (JSX authoring)
+│   ├── (marketing)/             # route group  (paren segment STRIPPED from URL)
+│   │   ├── index.treaty         #   -> ""        (group index = parent index URL)
+│   │   └── about.tjsx           #   -> "about"   (JSX authoring; group name gone)
 │   ├── blog/
 │   │   ├── layout.treaty        # blog layout  -> nested parent route at "blog"
 │   │   ├── index.treaty         #   -> "" under blog  (URL /blog)
@@ -104,8 +110,8 @@ the scanner, then lowered).
 | --- | --- | --- |
 | `""` | layout | `routes/layout.treaty` |
 | ` ""` | leaf | `routes/index.treaty` |
-| ` (marketing)` | leaf | `routes/(marketing)/index.treaty` |
-| ` (marketing)/about` | leaf | `routes/(marketing)/about.tjsx` |
+| ` ""` | leaf | `routes/(marketing)/index.treaty` |
+| ` about` | leaf | `routes/(marketing)/about.tjsx` |
 | ` blog` | layout | `routes/blog/layout.treaty` |
 | `  ""` | leaf | `routes/blog/index.treaty` |
 | `  [...path]` | leaf | `routes/blog/[...path]/index.treaty` |
@@ -115,22 +121,39 @@ the scanner, then lowered).
 
 Leading spaces indicate child depth under the root layout / blog layout.
 
+Note that the `(marketing)` route group contributes **no** URL segment: its
+`index` lowers to `""` (sharing the root index's URL) and its `about` page lowers
+to `about`. The two `""` siblings under the root layout are the documented
+group-index/parent-index collision — the URL is `""` for both by design, and the
+authored intent (root landing vs. marketing landing) is the developer's to
+reconcile; their *remote names*, however, are made unique (below).
+
 ### Federation remotes
 
 Depth-first, route-order. Every lazy route and every layout boundary yields one
-remote (`exposedModule` is always `./Route`). Remote names are slugified route
-paths; the empty path slugifies to `root` and `**` to `not-found` — so the root
-layout, the root index, and the blog index all share the name `root` (paths
-differ; names are intentionally path-derived and not required unique).
+remote (`exposedModule` is always `./Route`). Module Federation requires every
+remote name to be **globally unique**, so names are derived in two steps:
+
+1. **Base slug** from the (group-stripped) route path — the empty path slugifies
+   to `root`, `**` to `not-found`, otherwise lowercased/hyphenated segments.
+2. **Disambiguation** when a base is already taken. The *first* route to claim a
+   base keeps it bare; later collisions append a hint derived from the entry
+   file — its owning directory name for a nested `index`/`page`, or the file stem
+   otherwise — and, only if that still collides, a numeric `-2`, `-3`, … suffix.
+
+So the four routes that all slugify to `root` (root layout, root index, the
+`(marketing)` index, and the blog index) become `root`, `root-index`,
+`root-marketing`, and `root-blog`. The `route_path` column is always the **real,
+group-stripped** path (so `(marketing)` never appears in it).
 
 | Remote name | Route path | Entry file |
 | --- | --- | --- |
 | `root` | `""` | `routes/layout.treaty` |
-| `root` | `""` | `routes/index.treaty` |
-| `marketing` | `(marketing)` | `routes/(marketing)/index.treaty` |
-| `marketing-about` | `(marketing)/about` | `routes/(marketing)/about.tjsx` |
+| `root-index` | `""` | `routes/index.treaty` |
+| `root-marketing` | `""` | `routes/(marketing)/index.treaty` |
+| `about` | `about` | `routes/(marketing)/about.tjsx` |
 | `blog` | `blog` | `routes/blog/layout.treaty` |
-| `root` | `""` | `routes/blog/index.treaty` |
+| `root-blog` | `""` | `routes/blog/index.treaty` |
 | `path` | `[...path]` | `routes/blog/[...path]/index.treaty` |
 | `slug` | `[slug]` | `routes/blog/[slug]/index.treaty` |
 | `docs-category-page` | `docs/[category]/[page]` | `routes/docs/[category]/[page]/index.tjsx` |
