@@ -130,7 +130,10 @@ const SAMPLES: readonly SampleInput[] = [
 ]
 
 @Component({
-	// Selectorless -- the Treaty compiler synthesizes the selector.
+	// Explicit selector so the component matches whether it is reached through the
+	// `.treaty` shell (which lowers a `<PluginOutputViewer>` tag to `plugin-output-viewer`)
+	// or any other Ivy host that declares it as a dependency.
+	selector: 'plugin-output-viewer',
 	template: `
 		<section class="plugin-output">
 			<h2>Treaty plugin output</h2>
