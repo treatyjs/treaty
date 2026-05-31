@@ -250,10 +250,13 @@ export default function treaty(options: PluginOptions = {}): Plugin {
  * Resolve the user's `moduleFederation` option to the concrete
  * {@link MfOptions} when federation is enabled, or `null` when it is disabled.
  * `true` (and the default within {@link treatyWithFederation}) ⇒ defaults `{}`.
+ * `false`, or an {@link MfOptions} object carrying `enabled: false`, ⇒ disabled,
+ * so federation can be switched off in config without removing its wiring.
  */
 function resolveMfOptions(value: MfOptions | boolean | undefined): MfOptions | null {
 	if (value === false) return null
 	if (value === true || value === undefined) return {}
+	if (value.enabled === false) return null
 	return value
 }
 

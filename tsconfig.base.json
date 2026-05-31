@@ -47,6 +47,7 @@
       "@treaty/federation-deploy/runtime": [
         "./libs/treaty/federation-deploy/src/runtime.ts"
       ],
+      "@treaty/deploy": ["./libs/treaty/deploy/src/index.ts"],
       "@treaty/build": ["./libs/treaty/build/src/index.ts"],
       "@treaty/build/application": ["./libs/treaty/build/src/application.ts"],
       "@treaty/build/dev-server": ["./libs/treaty/build/src/dev-server.ts"],

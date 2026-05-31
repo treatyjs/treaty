@@ -18,6 +18,9 @@
  *     `ModuleFederationPlugin` options (Rspack/webpack).
  *   - {@link toViteFederation} — adapter to `@module-federation/vite`
  *     `federation()` options (Vite).
+ *   - {@link exportMfConfig} / {@link writeMfConfig} — the optional eject path:
+ *     serialize the generated config to a human-readable object or file so a dev
+ *     can customize it. Never required; zero-config stays the default.
  *
  * The bundler peers (`@module-federation/enhanced`, `@module-federation/vite`)
  * are referenced structurally, so this package typechecks and is usable for
@@ -61,3 +64,6 @@ export type {
 
 export { toViteFederation } from './vite.js'
 export type { ViteFederationOptions, ViteSharedConfig } from './vite.js'
+
+export { exportMfConfig, writeMfConfig, renderMfConfigFile } from './export.js'
+export type { ExportedMfConfig } from './export.js'

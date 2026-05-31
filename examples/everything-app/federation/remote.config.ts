@@ -1,6 +1,12 @@
 /**
  * Module Federation REMOTE config -- the lazy feature routes served standalone.
  *
+ * OPTIONAL EJECT EXAMPLE. Treaty federation is zero-config: you normally write
+ * none of this. These `federation/*.config.ts` files exist only to demonstrate
+ * the eject path — what a hand-customized federation config looks like after a
+ * developer runs `writeMfConfig` (or hand-authors `generateMfConfig`) to take
+ * control. Deleting this directory leaves the app fully auto-federated.
+ *
  * This is the demonstration of zero-config auto-MF: the remote writes NO
  * `exposes` map by hand. It passes the app's route graph to
  * `deriveExposesFromRoutes` and every LAZY boundary

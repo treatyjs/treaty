@@ -46,6 +46,18 @@ export type RemoteEntry =
  */
 export interface MfOptions {
 	/**
+	 * Master on/off switch for Module Federation. Defaults to `true` — Treaty is
+	 * federated by default and the developer configures nothing. Set to `false`
+	 * to fully turn federation OFF *without removing any of the other wiring*:
+	 * the remotes/exposes/shared you have declared are preserved in the options
+	 * but suppressed everywhere downstream. {@link generateMfConfig} returns an
+	 * inert config (empty remotes/exposes/shared) carrying `enabled: false`, and
+	 * the Rspack/Vite plugins skip adding the federation plugin entirely. This is
+	 * the supported way to keep a federation block in source while temporarily
+	 * (or permanently) shipping the app un-federated.
+	 */
+	readonly enabled?: boolean
+	/**
 	 * This app's federation name. Used as the container `name` and as the UMD
 	 * library name. Defaults to {@link DEFAULT_HOST_NAME} (`"app"`) when omitted —
 	 * a single standalone app needs no explicit name to still be a valid host.
@@ -127,6 +139,13 @@ export interface SharedConfig {
  * concrete {@link SharedConfig}, so adapters never have to re-apply defaults.
  */
 export interface NormalizedMfConfig {
+	/**
+	 * Whether Module Federation is active for this app. `true` for the zero-config
+	 * default; `false` when {@link MfOptions.enabled} was set to `false`, in which
+	 * case `remotes`, `exposes` and `shared` are all empty and downstream tooling
+	 * must not wire any federation plugin.
+	 */
+	readonly enabled: boolean
 	/** The container/library name for this app. */
 	readonly name: string
 	/** This app's own remote-entry filename. */
@@ -220,6 +239,10 @@ function normalizeShared(value: SharedConfig | true): SharedConfig {
  *
  * Behaviour:
  *   - Always produces a valid **host** (name + filename), even from `{}`.
+ *   - When {@link MfOptions.enabled} is `false`, returns an **inert** config:
+ *     `enabled: false` with empty `remotes`/`exposes`/`shared` (the `name`/
+ *     `filename` are still resolved so the shape is uniform). The bundler
+ *     plugins read `enabled` and skip wiring federation altogether.
  *   - Shares the Angular runtime as **eager singletons** unless
  *     {@link MfOptions.shareAngular} is `false`.
  *   - Merges {@link MfOptions.shared} over the Angular defaults (user wins).
@@ -234,6 +257,15 @@ export function generateMfConfig(options: MfOptions = {}): NormalizedMfConfig {
 	const filename = options.filename ?? DEFAULT_FILENAME
 	const angularVersion = options.angularVersion ?? DEFAULT_ANGULAR_VERSION
 	const shareAngular = options.shareAngular ?? true
+	const enabled = options.enabled ?? true
+
+	// Federation switched off: keep the resolved identity but suppress every
+	// federation surface so no remotes are consumed, nothing is exposed, and no
+	// deps are shared. The other options are intentionally ignored (not lost from
+	// source) so flipping `enabled` back to `true` restores them verbatim.
+	if (!enabled) {
+		return { enabled: false, name, filename, remotes: {}, exposes: {}, shared: {} }
+	}
 
 	const remotes: Record<string, { name: string; entry: string }> = {}
 	for (const [alias, value] of Object.entries(options.remotes ?? {})) {
@@ -257,5 +289,5 @@ export function generateMfConfig(options: MfOptions = {}): NormalizedMfConfig {
 		shared[pkg] = normalizeShared(value)
 	}
 
-	return { name, filename, remotes, exposes, shared }
+	return { enabled: true, name, filename, remotes, exposes, shared }
 }

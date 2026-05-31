@@ -1,6 +1,12 @@
 /**
  * Module Federation HOST config -- consumes the `profile` remote.
  *
+ * OPTIONAL EJECT EXAMPLE. Treaty federation is zero-config: you normally write
+ * none of this. These `federation/*.config.ts` files exist only to demonstrate
+ * the eject path — what a hand-customized federation config looks like after a
+ * developer runs `writeMfConfig` (or hand-authors `generateMfConfig`) to take
+ * control. Deleting this directory leaves the app fully auto-federated.
+ *
  * Every Treaty app is a federation host automatically; this file shows the host
  * side of a host<-remote pair. The host declares the remotes it consumes (by
  * the local alias used in `import('profile/...')`) and shares the Angular

@@ -20,27 +20,38 @@
  */
 
 import assert from 'node:assert/strict'
+import { readFile, rm } from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
 import {
 	generateMfConfig,
 	toRspackModuleFederation,
 	toViteFederation,
 	deriveExposesFromRoutes,
 	deriveExposesFromLibs,
+	exportMfConfig,
+	writeMfConfig,
+	renderMfConfigFile,
 	DEFAULT_HOST_NAME,
 	DEFAULT_FILENAME,
 } from '../dist/index.js'
 
 let failures = 0
 const results = []
+const pending = []
 
 function check(label, fn) {
-	try {
-		fn()
-		results.push(`PASS ${label}`)
-	} catch (err) {
-		failures++
-		results.push(`FAIL ${label}: ${err.stack ?? err.message}`)
-	}
+	pending.push(
+		(async () => {
+			try {
+				await fn()
+				results.push(`PASS ${label}`)
+			} catch (err) {
+				failures++
+				results.push(`FAIL ${label}: ${err.stack ?? err.message}`)
+			}
+		})()
+	)
 }
 
 // 1. zero-config host with Angular eager singletons
@@ -239,6 +250,131 @@ check('derived exposes reach the rspack adapter', () => {
 	assert.equal(opts.exposes['./routes/dashboard'], './src/app/dashboard', 'derived expose forwarded to plugin options')
 })
 
+// 16. enabled:false yields an inert, disabled config (wiring stays in source)
+check('enabled:false produces a disabled, inert config', () => {
+	const cfg = generateMfConfig({
+		enabled: false,
+		name: 'shell',
+		remotes: { dashboard: 'http://localhost:4201/remoteEntry.js' },
+		routes: [{ path: 'dashboard', loadComponent: () => ({}) }],
+		exposes: { './Widget': './src/app/widget.ts' },
+		shared: { lodash: true },
+	})
+	assert.equal(cfg.enabled, false, 'config reports disabled')
+	assert.equal(cfg.name, 'shell', 'identity still resolved')
+	assert.equal(cfg.filename, DEFAULT_FILENAME, 'filename still resolved')
+	assert.deepEqual(cfg.remotes, {}, 'no remotes when disabled')
+	assert.deepEqual(cfg.exposes, {}, 'no exposes when disabled')
+	assert.deepEqual(cfg.shared, {}, 'nothing shared when disabled (Angular suppressed too)')
+
+	const enabled = generateMfConfig({ name: 'shell' })
+	assert.equal(enabled.enabled, true, 'default is enabled (zero-config federated by default)')
+	assert.ok(enabled.shared['@angular/core'], 'default still shares Angular')
+})
+
+// 17. exportMfConfig round-trips host/remotes/shared
+check('exportMfConfig round-trips host/remotes/shared', () => {
+	const options = {
+		name: 'shell',
+		remotes: { dashboard: 'http://localhost:4201/remoteEntry.js' },
+		shared: { lodash: { singleton: true, eager: false } },
+	}
+	const exported = exportMfConfig(options)
+	assert.equal(exported.enabled, true, 'enabled carried through')
+	assert.equal(exported.name, 'shell', 'name exported')
+	assert.equal(exported.filename, DEFAULT_FILENAME, 'filename exported')
+	assert.deepEqual(
+		exported.remotes['dashboard'],
+		{ name: 'dashboard', entry: 'http://localhost:4201/remoteEntry.js' },
+		'remote normalized + exported'
+	)
+	assert.ok(exported.shared['@angular/core'], 'Angular default exported in shared')
+	assert.equal(exported.shared['lodash'].eager, false, 'user shared override exported')
+
+	// Round-trip: the export is serializable and reproduces the normalized config.
+	const roundTripped = JSON.parse(JSON.stringify(exported))
+	const regenerated = exportMfConfig(
+		generateMfConfig({
+			name: roundTripped.name,
+			filename: roundTripped.filename,
+			remotes: Object.fromEntries(
+				Object.entries(roundTripped.remotes).map(([alias, r]) => [alias, r])
+			),
+			shareAngular: false,
+			shared: roundTripped.shared,
+		})
+	)
+	assert.deepEqual(regenerated.remotes, exported.remotes, 'remotes survive a round-trip')
+	assert.deepEqual(regenerated.shared, exported.shared, 'shared survives a round-trip')
+})
+
+// 18. exportMfConfig keys are sorted + free of undefined for a clean diff
+check('exportMfConfig sorts keys and drops undefined', () => {
+	const exported = exportMfConfig({
+		remotes: { zebra: 'http://z/remoteEntry.js', alpha: 'http://a/remoteEntry.js' },
+	})
+	assert.deepEqual(Object.keys(exported.remotes), ['alpha', 'zebra'], 'remote keys sorted')
+	const core = exported.shared['@angular/core']
+	assert.equal('version' in core, false, 'no undefined version field leaks into the export')
+})
+
+// 19. a routes-derived config exports its exposes
+check('exportMfConfig exports routes-derived exposes', () => {
+	const exported = exportMfConfig({
+		name: 'shell',
+		routes: [
+			{ path: 'dashboard', loadComponent: () => ({}) },
+			{ path: 'reports', loadChildren: () => ({}) },
+			{ path: 'home', component: {} },
+		],
+	})
+	assert.equal(exported.exposes['./routes/dashboard'], './src/app/dashboard', 'lazy route exposed in export')
+	assert.equal(exported.exposes['./routes/reports'], './src/app/reports', 'lazy children exposed in export')
+	assert.equal(exported.exposes['./routes/home'], undefined, 'eager route not exposed')
+})
+
+// 20. exportMfConfig of a disabled config is inert
+check('exportMfConfig reflects a disabled config', () => {
+	const exported = exportMfConfig({ enabled: false, name: 'shell', remotes: { x: 'http://x/r.js' } })
+	assert.equal(exported.enabled, false, 'export reports disabled')
+	assert.deepEqual(exported.remotes, {}, 'disabled export has no remotes')
+	assert.deepEqual(exported.shared, {}, 'disabled export shares nothing')
+})
+
+// 21. renderMfConfigFile emits JSON for a .json target
+check('renderMfConfigFile emits JSON for .json paths', () => {
+	const exported = exportMfConfig({ name: 'shell' })
+	const json = renderMfConfigFile(exported, '/tmp/mf.config.json')
+	const parsed = JSON.parse(json)
+	assert.equal(parsed.name, 'shell', 'JSON file parses back to the config')
+	assert.ok(parsed.shared['@angular/core'], 'shared present in JSON file')
+})
+
+// 22. renderMfConfigFile emits a re-importable TS module for .ts targets
+check('renderMfConfigFile emits a TS module for .ts paths', () => {
+	const exported = exportMfConfig({ name: 'shell' })
+	const ts = renderMfConfigFile(exported, '/tmp/mf.config.ts')
+	assert.ok(ts.includes("from '@treaty/module-federation'"), 'TS module imports the package')
+	assert.ok(ts.includes('generateMfConfig('), 'TS module re-runs generateMfConfig')
+	assert.ok(ts.includes('export default'), 'TS module has a default export')
+})
+
+// 23. writeMfConfig writes a JSON file to disk and returns the exported config
+check('writeMfConfig ejects to disk', async () => {
+	const dir = await (await import('node:fs/promises')).mkdtemp(path.join(os.tmpdir(), 'mf-eject-'))
+	const dest = path.join(dir, 'nested', 'mf.config.json')
+	try {
+		const returned = await writeMfConfig({ name: 'shell', remotes: { d: 'http://d/r.js' } }, dest)
+		const onDisk = JSON.parse(await readFile(dest, 'utf8'))
+		assert.equal(onDisk.name, 'shell', 'name written to disk')
+		assert.deepEqual(onDisk.remotes['d'], { name: 'd', entry: 'http://d/r.js' }, 'remote written to disk')
+		assert.deepEqual(returned, onDisk, 'writeMfConfig returns the config it wrote')
+	} finally {
+		await rm(dir, { recursive: true, force: true })
+	}
+})
+
+await Promise.all(pending)
 for (const line of results) console.log(line)
 if (failures > 0) {
 	console.error(`\nSMOKE TEST FAILED: ${failures} case(s) failed`)

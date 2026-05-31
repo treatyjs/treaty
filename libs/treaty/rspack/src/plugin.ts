@@ -69,11 +69,15 @@ interface ModuleFederationPluginCtor {
 
 /**
  * Resolve the `moduleFederation` option to concrete {@link MfOptions} when
- * enabled, or `null` when disabled. `true`/omitted ⇒ the zero-config defaults.
+ * enabled, or `null` when disabled. `true`/omitted ⇒ the zero-config defaults;
+ * `false` ⇒ disabled. An {@link MfOptions} object with `enabled: false` is also
+ * treated as disabled, so federation can be turned off in the config block
+ * without deleting the rest of its wiring.
  */
 function resolveMfOptions(value: MfOptions | boolean | undefined): MfOptions | null {
 	if (value === false) return null
 	if (value === true || value === undefined) return {}
+	if (value.enabled === false) return null
 	return value
 }
 
