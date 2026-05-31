@@ -22,3 +22,4 @@ pub mod factory;
 pub mod expression;
 pub mod output;
 pub mod expression_converter;
+pub mod digest;

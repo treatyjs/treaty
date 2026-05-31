@@ -1714,7 +1714,7 @@ fn serialize_i18n_template_part(
     let mut meta_block = placeholder.text.clone();
     if let Some(assoc) = &placeholder.associated_message {
         if assoc.legacy_ids.is_empty() {
-            let id = crate::i18n::compute_msg_id(
+            let id = crate::digest::compute_msg_id(
                 &assoc.message_string,
                 assoc.meaning.as_deref().unwrap_or(""),
             );

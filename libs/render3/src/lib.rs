@@ -38,6 +38,7 @@ pub mod core;
 // Re-export every `core` module from its historical top-level path. These aliases
 // keep `crate::output_ast::…`, `crate::output::…`, `crate::factory::…`, etc.
 // resolving exactly as before (the canonical paths are now `crate::core::…`).
+pub use core::digest;
 pub use core::expression;
 pub use core::expression_converter;
 pub use core::factory;

@@ -13,12 +13,12 @@ This harness runs Treaty's Rust/OXC Angular compiler (`render3` crate, via the
 | Metric | Value |
 | --- | --- |
 | Total compliance cases | 642 |
-| Compiled (runnable) | 98 |
-| PASS | 92 |
-| DIFF | 6 |
-| Skipped (un-runnable) | 544 |
-| **Pass-rate (of runnable subset)** | **93.9%** (92/98) |
-| Pass-rate (of full corpus) | 14.3% (92/642) |
+| Compiled (runnable) | 185 |
+| PASS | 142 |
+| DIFF | 43 |
+| Skipped (un-runnable) | 457 |
+| **Pass-rate (of runnable subset)** | **76.8%** (142/185) |
+| Pass-rate (of full corpus) | 22.1% (142/642) |
 
 ### How a case is run and matched
 
@@ -43,31 +43,95 @@ from our output. Top entry = implement first to raise the score.
 
 | Count | Category (instruction / shape at first missing fragment) |
 | --- | --- |
+| 12 | `ɵɵelement` |
+| 9 | `misc-shape` |
+| 3 | `ɵɵclassProp` |
+| 3 | `ɵɵelementStart` |
+| 2 | `ɵɵadvance` |
+| 2 | `ɵɵdomProperty` |
 | 2 | `ɵɵpureFunction1` |
-| 1 | `ɵɵadvance` |
-| 1 | `ɵɵconditionalCreate` |
-| 1 | `ɵɵi18nEnd` |
-| 1 | `ɵɵelementStart` |
+| 2 | `ɵɵviewQuery` |
+| 2 | `ɵɵcontentQuery` |
+| 1 | `ɵɵqueryAdvance` |
+| 1 | `ɵɵsyntheticHostListener` |
+| 1 | `ɵɵstyleProp` |
+| 1 | `nested-fn-shape` |
+| 1 | `ɵɵdefer` |
+| 1 | `ɵɵattribute` |
 
 ### Sample diverging cases
 
+- **`ɵɵelement`** (12):
+  - r3_view_compiler_directives/matching/should not match directives on i18n attribute
+    - near: `cls:1,vars:0,template:functionMyCo`
+  - r3_view_compiler_bindings/control_bindings/should generate control instruction for `field` property bindings
+    - near: `,1);ɵɵcontrolCreate();}if(rf&2){ɵɵ`
+  - r3_view_compiler_bindings/control_bindings/should generate control instruction for `field` property bindings on radio inputs and execute it after the value
+    - near: `",0);ɵɵcontrolCreate();ɵɵelement(1`
+- **`misc-shape`** (9):
+  - signal_inputs/should handle a mix of zone and signal inputs
+    - near: `ias:[2,"publicNameDecorator2","dec`
+  - r3_view_compiler_di/di/should have the pipe factory take precedence over the injectable factory, if a class has multiple decorators
+    - near: `:"myPipe",pure:true,standalone:fal`
+  - r3_view_compiler_arrow_functions/should handle arrow function inside a host listener
+    - near: `ler(){returnctx.someSignal.update(`
+- **`ɵɵclassProp`** (3):
+  - r3_view_compiler_styling/class_bindings/should handle bindings to classes with special characters in a host context
+    - near: `ars:6,hostBindings:functionMyCompo`
+  - r3_view_compiler_bindings/host_bindings/should handle host bindings with the same name as a primitive value
+    - near: `ars:10,hostBindings:functionHostBi`
+  - r3_view_compiler_bindings/host_bindings/should handle host bindings with quoted names
+    - near: `ars:6,hostBindings:functionHostBin`
+- **`ɵɵelementStart`** (3):
+  - r3_view_compiler_i18n/blocks/should support @defer blocks
+    - near: `efer(whenisLoaded){","startBlockEr`
+  - r3_compiler_compliance/components_and_directives/content_projection/should parse the selector that is passed into ngProjectAs
+    - near: `:[["my-app"]],standalone:false,dec`
+  - r3_compiler_compliance/components_and_directives/content_projection/should take the first selector if multiple values are passed into ngProjectAs
+    - near: `:[["my-app"]],standalone:false,dec`
+- **`ɵɵadvance`** (2):
+  - r3_view_compiler_let/should handle an @let referenced inside i18n and in a child view
+    - near: `);ɵɵadvance();ɵɵi18nExp(ID);ɵɵi18n`
+  - r3_view_compiler_i18n/blocks/should support @switch blocks
+    - near: `{letID;ɵɵadvance(2);ɵɵconditional(`
+- **`ɵɵdomProperty`** (2):
+  - r3_view_compiler_bindings/host_bindings/should support host bindings with temporary expressions with legacyOptionalChaining
+    - near: `&2){letID;ɵɵdomProperty("id",(ID=c`
+  - r3_view_compiler_bindings/host_bindings/should support host bindings with pure functions
+    - near: `ars:3,hostBindings:functionHostBin`
 - **`ɵɵpureFunction1`** (2):
   - r3_compiler_compliance/components_and_directives/value_composition/should support spread elements in array literals
     - near: `onstsimple_R=ɵɵpureFunction1(4,ID,`
   - r3_compiler_compliance/components_and_directives/value_composition/should support object literals with spread assignments
     - near: `onstsimple_R=ɵɵpureFunction1(4,ID,`
-- **`ɵɵadvance`** (1):
-  - r3_view_compiler_let/should handle an @let referenced inside i18n and in a child view
-    - near: `);ɵɵadvance();ɵɵi18nExp(ID);ɵɵi18n`
-- **`ɵɵconditionalCreate`** (1):
-  - r3_view_compiler_i18n/blocks/should support @if blocks
-    - near: `ate,2,0)(3,MyApp_Conditional_3_Tem`
-- **`ɵɵi18nEnd`** (1):
-  - r3_view_compiler_i18n/blocks/should support @switch blocks
-    - near: `ate,2,0)(3,MyApp_Case_3_Template,2`
-- **`ɵɵelementStart`** (1):
-  - r3_view_compiler_i18n/blocks/should support @defer blocks
-    - near: `efer(whenisLoaded){","startBlockEr`
+- **`ɵɵviewQuery`** (2):
+  - r3_compiler_compliance/components_and_directives/queries/should support view queries with forwardRefs
+    - near: `"]],viewQuery:functionViewQueryCom`
+  - r3_compiler_compliance/components_and_directives/queries/should support view queries with local refs
+    - near: `ery(ID,5)(ID,5);}if(rf&2){letID;ɵɵ`
+- **`ɵɵcontentQuery`** (2):
+  - r3_compiler_compliance/components_and_directives/queries/should support content queries with forwardRefs
+    - near: `"]],contentQueries:functionContent`
+  - r3_compiler_compliance/components_and_directives/queries/should support content queries with local refs
+    - near: `dex,ID,5)(dirIndex,ID,4);}if(rf&2)`
+- **`ɵɵqueryAdvance`** (1):
+  - signal_queries/should generate signal based query instructions for a directive
+    - near: `uery5,SomeToken,5)(ctx.query6,Some`
+- **`ɵɵsyntheticHostListener`** (1):
+  - r3_view_compiler_styling/component_animations/should generate animation host binding and listener code for directives
+    - near: `){ɵɵsyntheticHostListener("@myAnim`
+- **`ɵɵstyleProp`** (1):
+  - r3_view_compiler_styling/chaining/should chain styling instructions inside host bindings
+    - near: `){ɵɵstyleProp("color",ctx.color)("`
+- **`nested-fn-shape`** (1):
+  - r3_view_compiler_input_outputs/should declare inputs with transform functions
+    - near: `put:[2,"functionDeclarationInput",`
+- **`ɵɵdefer`** (1):
+  - r3_view_compiler_deferred/should generate a deferred block with local dependencies
+    - near: `4,2,ID,3);ɵɵdeferOnIdle();ɵɵelemen`
+- **`ɵɵattribute`** (1):
+  - r3_view_compiler_arrow_functions/should handle arrow function inside a host binding
+    - near: `ars:4,hostBindings:functionTestDir`
 
 ## Skip categories (cases not runnable through the source front-end)
 
@@ -77,42 +141,68 @@ error-expectation cases).
 
 | Count | Skip reason |
 | --- | --- |
-| 477 | `no-full-golden(partial/ngDeclare-only)` |
-| 41 | `fe:multi-class` |
+| 435 | `no-full-golden(partial/ngDeclare-only)` |
 | 17 | `multi-input-file` |
 | 4 | `no-input-file` |
-| 3 | `fe:host/hostDirectives` |
-| 2 | `fe:queries` |
+| 1 | `fe:other(Cannot translate attribute "foo" because)` |
 
 ## Passing cases
 
-92 runnable compliance cases match Angular's golden `ɵɵdefineComponent` block:
+142 runnable compliance cases match Angular's golden `ɵɵdefineComponent` block:
 
 - model_inputs/should capture input/output pair in a component definition
+- model_inputs/should capture input/output pair in a directive definition
+- model_inputs/should handle a mix of zone and model inputs
 - output_function/should generate an output mapping for the component
+- output_function/should generate an output mapping for the directive
+- output_function/should handle a mix of decorator-based and initializer-based outputs
 - r3_compiler_compliance/components_and_directives/content_projection/should capture the node name of ng-content with a structural directive
 - r3_compiler_compliance/components_and_directives/content_projection/should include parsed ngProjectAs selectors into template attrs
+- r3_compiler_compliance/components_and_directives/content_projection/should support content projection in root template
 - r3_compiler_compliance/components_and_directives/content_projection/should support fallback content in ng-content
 - r3_compiler_compliance/components_and_directives/content_projection/should support multi-slot content projection with multiple wildcard slots
 - r3_compiler_compliance/components_and_directives/lifecycle_hooks/local reference
+- r3_compiler_compliance/components_and_directives/lifecycle_hooks/should gen hooks with a few simple components
+- r3_compiler_compliance/components_and_directives/pipes/should generate the proper instruction when injecting ChangeDetectorRef into a pipe
+- r3_compiler_compliance/components_and_directives/pipes/should handle a pipe that does not have a name
 - r3_compiler_compliance/components_and_directives/pipes/should render pipes
 - r3_compiler_compliance/components_and_directives/pipes/should use appropriate function for a given no of pipe arguments
+- r3_compiler_compliance/components_and_directives/should not generate a selectors array if the directive does not have a selector
 - r3_compiler_compliance/components_and_directives/should not share pure functions between null and array literals
 - r3_compiler_compliance/components_and_directives/should not share pure functions between null and function calls
 - r3_compiler_compliance/components_and_directives/should not share pure functions between null and object literals
+- r3_compiler_compliance/components_and_directives/should split multiple `exportAs` values into an array
 - r3_compiler_compliance/components_and_directives/should support empty property bindings on ng-template
+- r3_compiler_compliance/components_and_directives/standalone/should properly compile a standalone directive
+- r3_compiler_compliance/components_and_directives/standalone/should properly compile a standalone pipe
 - r3_compiler_compliance/components_and_directives/standalone/should properly compile foreign component imports in a standalone component
+- r3_compiler_compliance/components_and_directives/template_variables/should generate correct code for for_of directive
 - r3_compiler_compliance/components_and_directives/value_composition/should convert #my-app selector to ["", "id", "my-app"]
+- r3_compiler_compliance/components_and_directives/value_composition/should instantiate directives
 - r3_compiler_compliance/components_and_directives/value_composition/should not treat ElementRef, ViewContainerRef, or ChangeDetectorRef specially when injecting
+- r3_compiler_compliance/components_and_directives/value_composition/should support complex selectors
+- r3_compiler_compliance/components_and_directives/value_composition/should support components without selector
 - r3_compiler_compliance/components_and_directives/value_composition/should support dollar escape in template
 - r3_compiler_compliance/components_and_directives/value_composition/should support rest arguments in a function call
+- r3_compiler_compliance/components_and_directives/value_composition/should support structural directives
 - r3_compiler_compliance/elements/should bind to class and style names
+- r3_compiler_compliance/ng_modules/should define NgModules with imports and exports
+- r3_compiler_compliance/ng_modules/should define a basic NgModule (full/local)
+- r3_compiler_compliance/ng_modules/should define a basic NgModule (linked)
+- r3_compiler_compliance/ng_modules/should define an NgModule and injector with providers
+- r3_compiler_compliance/ng_modules/should define an NgModule with declarations and bootstrap
+- r3_compiler_compliance/ng_modules/should handle NgModules that extend other classes
 - r3_view_compiler/animations/should generate animate enter instructions on element with a binding
 - r3_view_compiler/animations/should generate animate enter instructions on element with a simple string
+- r3_view_compiler/animations/should generate animate enter instructions on element with a structural directive
 - r3_view_compiler/animations/should generate animate enter instructions on element with an event binding
+- r3_view_compiler/animations/should generate animate enter instructions with host binding and event
+- r3_view_compiler/animations/should generate animate enter instructions with host binding and simple string
 - r3_view_compiler/animations/should generate animate leave instructions on element with a binding
 - r3_view_compiler/animations/should generate animate leave instructions on element with a simple string
 - r3_view_compiler/animations/should generate animate leave instructions on element with an event binding
+- r3_view_compiler/animations/should generate animate leave instructions with host binding and event
+- r3_view_compiler/animations/should generate animate leave instructions with host binding and simple string
 - r3_view_compiler/animations/should not generate animate leave when using 'animate' as a binding prefix
 - r3_view_compiler_arrow_functions/should be able to use arrow functions inside pure values
 - r3_view_compiler_arrow_functions/should handle arrow function returning another arrow function with access across multiple contexts
@@ -132,12 +222,30 @@ error-expectation cases).
 - r3_view_compiler_arrow_functions/should handle arrow function with optional reads with legacyOptionalChaining
 - r3_view_compiler_arrow_functions/should handle arrow functions that do not depend on context
 - r3_view_compiler_arrow_functions/should not produce pure functions for arrow function return values
+- r3_view_compiler_bindings/host_bindings/should support host attribute bindings
+- r3_view_compiler_bindings/host_bindings/should support host attributes
+- r3_view_compiler_bindings/host_bindings/should support host attributes together with host classes and styles
+- r3_view_compiler_bindings/host_bindings/should support host bindings
+- r3_view_compiler_bindings/host_bindings/should support host bindings with temporary expressions
 - r3_view_compiler_deferred/should generate a basic deferred block
 - r3_view_compiler_deferred/should generate a deferred block with loading block parameters
 - r3_view_compiler_deferred/should generate a deferred block with placeholder block parameters
 - r3_view_compiler_deferred/should generate a deferred block with secondary blocks
+- r3_view_compiler_directives/host_directives/should create a basic hostDirectives definition
+- r3_view_compiler_directives/host_directives/should create hostDirective definitions for a chain of host directives
+- r3_view_compiler_directives/host_directives/should handle a forwardRef used in hostDirectives
+- r3_view_compiler_directives/host_directives/should handle aliases to aliased `inputs` and `outputs` of a host directive
+- r3_view_compiler_directives/host_directives/should handle the `inputs` and `outputs` options in host directives
+- r3_view_compiler_directives/matching/should match directives on element outputs
+- r3_view_compiler_directives/matching/should match directives on ng-container
+- r3_view_compiler_directives/matching/should match directives on ng-template bindings
+- r3_view_compiler_directives/matching/should match directives on ng-templates
+- r3_view_compiler_directives/matching/should match directives on property bindings
+- r3_view_compiler_directives/matching/should match structural directives
 - r3_view_compiler_i18n/blocks/should support @for blocks
+- r3_view_compiler_i18n/blocks/should support @if blocks
 - r3_view_compiler_input_outputs/should declare inputs/outputs on a component
+- r3_view_compiler_input_outputs/should declare inputs/outputs on a directive
 - r3_view_compiler_let/should be able to use for loop variables in let declarations
 - r3_view_compiler_let/should be able to use forward references defined after the let declaration
 - r3_view_compiler_let/should be able to use let declarations in child views
@@ -179,4 +287,8 @@ error-expectation cases).
 - r3_view_compiler_styling/style_bindings/should assign a sanitizer instance to the element style allocation instruction if any url-based properties are detected
 - r3_view_compiler_styling/style_bindings/should place initial, multi, singular and application followed by attribute style instructions in the template code in that order
 - signal_inputs/should capture signal based input flag in component definition
+- signal_inputs/should capture signal based input flag in directive definition
+- signal_inputs/should not capture the transform function in the compiled JS for signal inputs
+- signal_inputs/should support complex transform functions (unlike the requirements with @Input)
 - signal_queries/should generate signal based query instructions for a component
+- signal_queries/should handle a mix of decorator-based and signal-based queries
