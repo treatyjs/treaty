@@ -564,10 +564,15 @@ impl LocalResolver for ListenerResolver<'_> {
     }
 }
 
-/// Resolver for a generated `@for` custom-trackBy arrow body (`generateTrackFn`). The loop item name
-/// resolves to the arrow's first parameter and `$index` to its second; any other implicit-receiver
-/// read roots at the component context and flags `used_component_instance` (so the runtime binds the
-/// generated trackBy to `this`).
+/// Resolver for a generated `@for` custom-trackBy arrow body (`generateTrackFn`). Faithful to
+/// Angular's `generateTrackVariables` phase: the loop item name resolves to the `$item` parameter
+/// and `$index` stays `$index`; any other implicit-receiver read roots at the component context and
+/// flags `used_component_instance` (so the runtime binds the generated trackBy to `this`).
+///
+/// Param order in the emitted arrow matches `reify.ts` `reifyTrackBy`: `($index, $item)` — index
+/// first (number), item second (dynamic). The author-written item name therefore lowers to `$item`,
+/// NOT to its source name, so the runtime (which invokes `trackBy(index, value)`) binds the item to
+/// the right parameter.
 struct TrackFnResolver<'a> {
     item_name: String,
     used_component_instance: &'a std::cell::Cell<bool>,
@@ -581,9 +586,29 @@ impl LocalResolver for TrackFnResolver<'_> {
     }
 
     fn maybe_resolve_local(&self, name: &str) -> Option<Expr> {
-        if name == self.item_name || name == "$index" {
-            return Some(o::variable(name.to_string(), None));
+        if name == "$index" {
+            return Some(o::variable("$index".to_string(), None));
         }
+        if name == self.item_name {
+            // The loop item variable is renamed to `$item` in the trackBy fn (Angular
+            // `generateTrackVariables`), matching the `($index, $item)` parameter list.
+            return Some(o::variable("$item".to_string(), None));
+        }
+        None
+    }
+}
+
+/// Resolver for lowering the receiver of an optimizable `track fn($index, item)` method call
+/// (`ctx.fn`). The call arguments are dropped, so only the implicit receiver matters here: it roots
+/// at the component context.
+struct TrackByReceiverResolver;
+
+impl LocalResolver for TrackByReceiverResolver {
+    fn resolve_implicit_receiver(&self) -> Expr {
+        o::variable(CONTEXT_NAME, None)
+    }
+
+    fn maybe_resolve_local(&self, _name: &str) -> Option<Expr> {
         None
     }
 }
@@ -5174,9 +5199,10 @@ impl TemplateDefinitionBuilder {
     /// - the loop body becomes a nested embedded-view function (`For_Template`);
     /// - the `@empty` block, when present, becomes a second nested view;
     /// - the `track` expression is optimized: `track $index` → `ɵɵrepeaterTrackByIndex`, `track <item>`
-    ///   → `ɵɵrepeaterTrackByIdentity`; otherwise a custom `track` expression (`track item.id`,
-    ///   `track trackFn($index, item)`) lowers to a generated pure arrow `(<item>, $index) => <expr>`
-    ///   passed directly as the trackBy argument (Angular `optimizeTrackFns`/`generateTrackFn`);
+    ///   → `ɵɵrepeaterTrackByIdentity`; a top-level `track fn($index, item)` method call passes the
+    ///   receiver (`ctx.fn`) directly; otherwise a custom `track` expression (`track item.id`)
+    ///   lowers to a generated pure arrow `($index, $item) => <expr>` (index first, item second —
+    ///   Angular `reify.ts` `reifyTrackBy`) passed as the trackBy argument;
     /// - `ɵɵrepeaterCreate(slot, ForFn, decls, vars, tag, attrs?, trackByFn[, usesComponentInstance,
     ///   EmptyFn, emptyDecls, emptyVars])`, then `ɵɵrepeater(<collection>)` in update.
     fn build_for_block(&mut self, block: &ForLoopBlock) {
@@ -5295,14 +5321,18 @@ impl TemplateDefinitionBuilder {
     /// Build the trackBy argument of `ɵɵrepeaterCreate` for an `@for` block, returning
     /// `(trackByExpr, usesComponentInstance)`.
     ///
-    /// Faithful to Angular `optimizeTrackFns` / `generateTrackFn`:
+    /// Faithful to Angular `optimizeTrackFns` / `reify.ts` `reifyTrackBy`:
     /// - `track $index` (a bare `$index` read) → the shared `ɵɵrepeaterTrackByIndex` helper;
     /// - `track <item>` (a bare read of the loop item variable) → `ɵɵrepeaterTrackByIdentity`;
-    /// - any other expression → a generated arrow `(<itemName>, $index) => <expr>` where the loop
-    ///   item name resolves to the first parameter and `$index` to the second. If the expression
-    ///   reads anything off the component context (a non-item, non-`$index` implicit read), the
-    ///   arrow needs the component instance, so `usesComponentInstance` is `true` (Angular binds the
-    ///   generated trackBy to `this`).
+    /// - a top-level method call on the component context in the form `track fn($index, item)`
+    ///   (one or two args, first `$index`, optional second the item) → the receiver `ctx.fn` is
+    ///   passed directly as the trackBy and `usesComponentInstance` is `true` (the method may use
+    ///   `this`, see Angular #53628);
+    /// - any other expression → a generated arrow `($index, $item) => <expr>` (INDEX FIRST, number;
+    ///   ITEM SECOND, dynamic — `reify.ts:898-901`) where `$index` resolves to the first parameter
+    ///   and the loop item to the `$item` second parameter (`generateTrackVariables`). If the
+    ///   expression reads anything off the component context (a non-item, non-`$index` implicit
+    ///   read), the arrow needs the component instance, so `usesComponentInstance` is `true`.
     fn build_track_fn(&mut self, block: &ForLoopBlock, _slot: usize) -> (Expr, bool) {
         let Some(track) = &block.track_by else {
             return (
@@ -5327,22 +5357,72 @@ impl TemplateDefinitionBuilder {
             }
         }
 
-        // Custom track expression → generate `(<item>, $index) => <expr>`. Reads of the item or
-        // `$index` resolve to the arrow parameters; everything else roots at the component context
-        // (flagging `usesComponentInstance`).
+        // Top-level method call `track fn($index, item)` on the component context: pass the receiver
+        // (`ctx.fn`) directly and flag `usesComponentInstance` (Angular `isTrackByFunctionCall` +
+        // `optimizeTrackFns`). The call must be `ctx.<fn>($index[, <item>])` with the args in that
+        // exact order.
+        if let Some(receiver) = self.track_by_function_call_receiver(&track.ast, &block.item.name) {
+            return (receiver, true);
+        }
+
+        // Custom track expression → generate `($index, $item) => <expr>`. `$index` resolves to the
+        // first parameter and the loop item to the `$item` second parameter; everything else roots
+        // at the component context (flagging `usesComponentInstance`).
         let item_name = block.item.name.clone();
         let uses_ctx = std::cell::Cell::new(false);
         let resolver = TrackFnResolver {
-            item_name: item_name.clone(),
+            item_name,
             used_component_instance: &uses_ctx,
         };
         let body = convert_property_binding_with(&track.ast, &resolver).expr;
         let track_arrow = o::arrow_fn(
-            vec![FnParam::new(item_name, None), FnParam::new("$index", None)],
+            vec![
+                FnParam::new("$index", None),
+                FnParam::new("$item", None),
+            ],
             o::ArrowBody::Expr(Box::new(body)),
             None,
         );
         (track_arrow, uses_ctx.get())
+    }
+
+    /// Detect the optimizable top-level method-call track form `fn($index[, <item>])` where `fn`
+    /// is a property of the component context (`ctx.fn`), mirroring Angular `isTrackByFunctionCall`.
+    /// On a match, returns the lowered receiver expression (`ctx.fn`) to pass directly as the
+    /// trackBy argument; otherwise `None` (the caller falls back to a generated arrow).
+    fn track_by_function_call_receiver(&self, node: &AstNode, item_name: &str) -> Option<Expr> {
+        let AstExprKind::Call { receiver, args, .. } = &node.kind else {
+            return None;
+        };
+        // One or two args: first must be `$index`; the optional second must be the loop item.
+        if args.is_empty() || args.len() > 2 {
+            return None;
+        }
+        if bare_read_name(&args[0]) != Some("$index") {
+            return None;
+        }
+        if args.len() == 2 {
+            // The second argument must be a bare read of the loop item variable.
+            match bare_read_name(&args[1]) {
+                Some(name) if name == item_name => {}
+                _ => return None,
+            }
+        }
+        // The call receiver must be `<implicit>.fn` — a property read off the component context.
+        let AstExprKind::PropertyRead {
+            receiver: prop_receiver,
+            ..
+        } = &receiver.kind
+        else {
+            return None;
+        };
+        if !matches!(prop_receiver.kind, AstExprKind::ImplicitReceiver) {
+            return None;
+        }
+        // Lower the receiver (`ctx.fn`) against a ctx-rooted resolver; the loop item / `$index` do
+        // not appear here (they are the call arguments, which we drop).
+        let resolver = TrackByReceiverResolver;
+        Some(convert_property_binding_with(receiver, &resolver).expr)
     }
 
     /// Determine which `@for` loop variables the body references and build their generated locals
@@ -8061,6 +8141,101 @@ mod tests {
     }
 
     #[test]
+    fn for_block_track_item_field_emits_index_first_arrow() {
+        // `@for (item of items; track item.id) { … }` → `($index, $item) => $item.id`. The item
+        // reference lowers to the `$item` parameter (NOT its source name), and `$index` is the
+        // FIRST parameter, matching Angular `reify.ts` `reifyTrackBy` and the runtime invocation
+        // `trackBy(index, value)`.
+        let item = Variable {
+            name: "item".to_string(),
+            value: "$implicit".to_string(),
+            source_span: t_span(),
+            key_span: t_span(),
+            value_span: None,
+        };
+        // `item.id` — a property read whose receiver is the loop item.
+        let item_id = AstNode::new(
+            ParseSpan::new(0, 0),
+            AbsoluteSourceSpan::new(0, 0),
+            AstExprKind::PropertyRead {
+                name_span: AbsoluteSourceSpan::new(0, 0),
+                receiver: Box::new(prop_read("item")),
+                name: "id".to_string(),
+            },
+        );
+        let block = ForLoopBlock {
+            item,
+            expression: AstWithSource::new(prop_read("items"), None, String::new(), 0, vec![]),
+            track_by: Some(AstWithSource::new(item_id, None, String::new(), 0, vec![])),
+            track_keyword_span: None,
+            context_variables: vec![],
+            children: div_a(),
+            empty: None,
+            main_block_span: t_span(),
+            spans: block_spans(),
+            i18n: None,
+        };
+        let input = TemplateCompilationInput::new("Test_Template", vec![Node::ForLoopBlock(block)]);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let out = emit_expression(&func);
+
+        // INDEX FIRST, item second, item bound to `$item` — `($index, $item) => $item.id`.
+        assert!(out.contains("($index, $item) => $item.id"), "got: {out}");
+        // The track expression reads only the item, so it does NOT need the component instance:
+        // no trailing `true` flag and no shared helper.
+        assert!(
+            !out.contains("\u{0275}\u{0275}repeaterTrackByIdentity")
+                && !out.contains("\u{0275}\u{0275}repeaterTrackByIndex"),
+            "field track should generate an arrow, not a helper, got: {out}"
+        );
+    }
+
+    #[test]
+    fn for_block_track_method_call_passes_receiver_directly() {
+        // `@for (item of items; track trackFn($index, item)) { … }` → the receiver `ctx.trackFn`
+        // is passed directly as the trackBy with the `usesComponentInstance` flag, matching Angular
+        // `isTrackByFunctionCall` / `optimizeTrackFns` (no generated arrow).
+        let item = Variable {
+            name: "item".to_string(),
+            value: "$implicit".to_string(),
+            source_span: t_span(),
+            key_span: t_span(),
+            value_span: None,
+        };
+        // `trackFn($index, item)`.
+        let track_call = AstNode::new(
+            ParseSpan::new(0, 0),
+            AbsoluteSourceSpan::new(0, 0),
+            AstExprKind::Call {
+                receiver: Box::new(prop_read("trackFn")),
+                args: vec![prop_read("$index"), prop_read("item")],
+                argument_span: AbsoluteSourceSpan::new(0, 0),
+            },
+        );
+        let block = ForLoopBlock {
+            item,
+            expression: AstWithSource::new(prop_read("items"), None, String::new(), 0, vec![]),
+            track_by: Some(AstWithSource::new(track_call, None, String::new(), 0, vec![])),
+            track_keyword_span: None,
+            context_variables: vec![],
+            children: div_a(),
+            empty: None,
+            main_block_span: t_span(),
+            spans: block_spans(),
+            i18n: None,
+        };
+        let input = TemplateCompilationInput::new("Test_Template", vec![Node::ForLoopBlock(block)]);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let out = emit_expression(&func);
+
+        // The receiver is passed directly: `…, ctx.trackFn, true)`. No generated arrow.
+        assert!(out.contains("ctx.trackFn, true)"), "got: {out}");
+        assert!(!out.contains("=>"), "method-call track must not generate an arrow, got: {out}");
+    }
+
+    #[test]
     fn for_block_with_empty_emits_empty_view() {
         let item = Variable {
             name: "x".to_string(),
@@ -8860,8 +9035,9 @@ mod tests {
         let func = builder.build_template_function(&input);
         let out = emit_expression(&func);
 
-        // The trackBy is a generated arrow `(x, $index) => ctx.foo`, NOT a shared helper reference.
-        assert!(out.contains("(x, $index) =>"), "got: {out}");
+        // The trackBy is a generated arrow `($index, $item) => ctx.foo`, NOT a shared helper
+        // reference. Param order matches Angular `reify.ts` (index first, item second).
+        assert!(out.contains("($index, $item) =>"), "got: {out}");
         assert!(out.contains("ctx.foo"), "got: {out}");
         assert!(
             !out.contains("\u{0275}\u{0275}repeaterTrackByIdentity")
