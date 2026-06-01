@@ -209,6 +209,52 @@ Exit code `0` on success, `1` on any failed assertion. The harness wires a local
 `.e2e-vite-fixture/` (gitignored, removed on a clean run); it never installs or
 links `@angular/compiler`.
 
+## The unified dev + build gate (`dev.e2e.mjs`)
+
+`dev.e2e.mjs` is the single, repeatable, deterministic gate that proves **both**
+paths green across **every** authoring surface Treaty offers — DEV serve **and**
+full production build — in one run, and prints the explicit pass/fail matrix:
+
+|  surface          | dev (real `vite` dev server) | build (real `vite build`)        |
+| ----------------- | ---------------------------- | -------------------------------- |
+| `.treaty` SFC     | `gauge.treaty` → Ivy         | bundle `ɵɵdefineComponent`       |
+| `.tsx` (JSX)      | `counter.tsx` → Ivy          | `counter.tsx` lowered **once**   |
+| `.tjsx` (JSX)     | `greeting-card.tjsx` → Ivy   | `greeting-card.tjsx` lowered once|
+| `@Component` `.ts`| `app-root` / `log-viewer`→Ivy| bundle `ɵɵdefineComponent`       |
+
+It orchestrates the two committed harnesses (`dev-serve.e2e.mjs` for the DEV path
+— a real `vite` dev server over the whole app, proving the user's
+`@treaty/jsx/jsx-dev-runtime could not be resolved` dep-scan error is gone and
+every surface is served lowered to Ivy with no JIT; `full-build.e2e.mjs` for the
+BUILD path — a real `vite build`, exit `0`, every surface lowered to Ivy once with
+zero residual `ɵɵngDeclare` and no `@angular/compiler` / Babel finisher), then
+aggregates their per-surface results into the matrix above. It additionally proves,
+directly against the `@treaty/compiler` core, that each `.tsx`/`.tjsx` lowers to an
+**Angular Ivy** component (`ɵɵdefineComponent` + Angular `signal()`/`computed()`),
+**not** a React element tree (no `createElement(` / `jsxDEV(` / `React.`) and with
+no foreign `@treaty/jsx` runtime import escaping to the bundler.
+
+The only step NOT asserted as a hard requirement is the **whole-app headless
+boot+render**, which is gated on a documented out-of-scope Rust-compiler gap (the
+JSX `use:`-directive lowering emits an undefined `dependencies: [Autofocus]` /
+`[Highlight]` reference; owned by `libs/treaty-ivy` / `libs/authoring/node`). DEV
+serve and full BUILD of every surface are green regardless; the gate records this
+gap explicitly rather than failing on it.
+
+```bash
+# Unified dev + build gate (every authoring surface, both paths):
+bun run dev:e2e          # == node examples/everything-app/dev.e2e.mjs
+
+# Build-only gate (the real vite build + bundle assertions):
+bun run build:e2e        # == node examples/everything-app/full-build.e2e.mjs
+
+# Dev-only gate (the real vite dev server the unified gate drives):
+bun run e2e:dev-serve    # == node examples/everything-app/dev-serve.e2e.mjs
+```
+
+Exit code `0` on success, `1` if either child harness fails or any matrix cell is
+not green.
+
 ## A note on the REPL plugin-output viewer
 
 A self-contained companion lives at
