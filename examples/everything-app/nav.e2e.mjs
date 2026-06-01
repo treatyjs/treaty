@@ -679,6 +679,16 @@ async function driveRouterHeadless() {
 			!navErr && /Greeter/.test(text),
 			navErr ? String(navErr.message ?? navErr).slice(0, 120) : `outlet="${text.slice(0, 90)}"`,
 		)
+		// SELECTORLESS CHILD render (regression guard for the empty-component bug): the
+		// `<Greeter />` .treaty child — referenced selectorlessly by class name — must actually
+		// INSTANTIATE and paint its own content (its headline `Say hello to Ada`), not render as an
+		// empty `<greeter></greeter>` element. Proves multi-form selector + dependency collection work.
+		const greeterChild = window.document.querySelector('greeter')
+		check(
+			'render: greeter selectorless child <Greeter/> (.treaty) instantiated + painted (not empty)',
+			!navErr && /Say hello to Ada/.test(text) && (greeterChild?.textContent ?? '').trim().length > 0,
+			`<greeter> child text="${(greeterChild?.textContent ?? '').replace(/\s+/g, ' ').trim().slice(0, 90)}"`,
+		)
 	}
 
 	// STYLES in the built output: the global base theme is emitted as a CSS asset

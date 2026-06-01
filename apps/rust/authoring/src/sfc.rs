@@ -33,7 +33,7 @@ use oxc_parser::Parser as JsParser;
 use oxc_span::SourceType;
 
 use treaty_ivy::compile::{CompiledComponent, RealTemplateBuilder};
-use treaty_ivy::output::emitter::{emit_expression, emit_expression_with_map};
+use treaty_ivy::output::emitter::{emit_expression, emit_expression_with_map, emit_statements};
 use treaty_ivy::output_ast::{self as o, ParseSourceSpan};
 use treaty_ivy::template::template_transform::{
     html_ast_to_render3_ast, BindingParser, Render3ParseOptions,
@@ -557,12 +557,19 @@ fn build_module(
     javascript: &str,
     cmp_expression: &str,
     module_scope_names: &[String],
+    pool_statements: &str,
 ) -> String {
     const I0_IMPORT: &str = "import * as i0 from \"@angular/core\";";
     let cmp_expression = cmp_expression
         .strip_prefix(I0_IMPORT)
         .map(str::trim_start)
         .unwrap_or(cmp_expression);
+    // The pool statements are emitted as their own module (with a leading `import * as i0` the
+    // top-level import already covers); strip that duplicate import line and reuse the single i0.
+    let pool_statements = pool_statements
+        .strip_prefix(I0_IMPORT)
+        .map(str::trim_start)
+        .unwrap_or(pool_statements);
 
     let parts = extract_wrapper_parts(javascript, module_scope_names);
 
@@ -576,6 +583,13 @@ fn build_module(
     // emitted here — beside the component class — so the `dependencies: [Foo]` reference resolves.
     for hoisted in &parts.hoisted {
         module.push_str(hoisted);
+    }
+    // Hoisted nested-view template functions + shared const-pool literals the component's template
+    // references. Module-scope siblings, declared before the component (the template reads them at
+    // render time), mirroring how the base `@Component` path emits the ConstantPool statements.
+    if !pool_statements.trim().is_empty() {
+        module.push_str(pool_statements.trim_end());
+        module.push('\n');
     }
     module.push_str(&format!("function {class_name}() {{\n"));
     module.push_str(parts.body.trim());
@@ -1063,7 +1077,18 @@ fn compile_from_parts_inner(
         }
         None => (emit_expression(&compiled.expression), None),
     };
-    let code = build_module(class_name, javascript, &cmp_expression, &local_dependency_names);
+    // The ConstantPool statements — hoisted nested-view `function <Comp>_Conditional_N_Template` /
+    // `_For_N_Template` functions and shared `const _cN = [...]` literals the `ɵɵdefineComponent`
+    // template references — MUST be emitted at module scope (the base `@Component` path emits them via
+    // `extra_statements`; the SFC/JSX path dropped them, so any `.treaty`/`.tjsx` component with
+    // `@if`/`@for`/`@switch` threw `<Comp>_Conditional_N_Template is not defined` at render time).
+    let pool_code = if pool_statements.is_empty() {
+        String::new()
+    } else {
+        emit_statements(&pool_statements)
+    };
+    let code =
+        build_module(class_name, javascript, &cmp_expression, &local_dependency_names, &pool_code);
     (CompiledComponent { code, errors }, map)
 }
 
@@ -1256,6 +1281,42 @@ mod tests {
             "ng-component default must not survive; got: {}",
             out.code
         );
+    }
+
+    #[test]
+    fn treaty_control_flow_hoists_template_fns_to_module_scope() {
+        // Regression (`<Comp>_Conditional_N_Template is not defined` at render): a `.treaty`/`.tjsx`
+        // component with `@if`/`@for`/`@switch` emits hoisted nested-view template functions that the
+        // `ɵɵdefineComponent` template REFERENCES; those ConstantPool statements were collected but
+        // never emitted by the SFC/JSX module assembler, so the reference dangled. They must now be
+        // DEFINED at module scope.
+        let source = "const items = [1, 2, 3];\n\
+<ul>\n\
+  @for (i of items; track i) { <li>{{ i }}</li> }\n\
+  @if (items.length) { <p>has items</p> } @else { <p>empty</p> }\n\
+</ul>";
+        let out = compile_treaty_file(source, "list.treaty");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+        // Every referenced control-flow template fn must ALSO be DEFINED (no dangling reference).
+        for marker in ["_For_", "_Conditional_"] {
+            let mut idx = 0;
+            while let Some(rel) = code[idx..].find(marker) {
+                let at = idx + rel;
+                // Walk back to the identifier start, forward to its end → the full fn name.
+                let start = code[..at].rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).map(|p| p + 1).unwrap_or(0);
+                let end = at + code[at..].find("_Template").map(|p| p + "_Template".len()).unwrap_or(marker.len());
+                let name = &code[start..end];
+                idx = end;
+                if !name.ends_with("_Template") {
+                    continue;
+                }
+                assert!(
+                    code.contains(&format!("function {name}(")),
+                    "control-flow template fn `{name}` is referenced but NOT defined at module scope; got: {code}"
+                );
+            }
+        }
     }
 
     #[test]
