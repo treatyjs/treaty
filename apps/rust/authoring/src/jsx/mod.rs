@@ -86,16 +86,35 @@ fn collect_import_names(body: &[Statement]) -> Vec<String> {
     names
 }
 
-/// The located component and its lowered template: the byte span of the JS to remove (the JSX
-/// return / arrow body) and the rendered Angular template HTML.
+/// The located component and its lowered template.
+///
+/// The JSX front-end deliberately does NOT splice the author's source verbatim into the module: the
+/// author writes `export default function App() { …body…; return <JSX/> }` (or a named-function /
+/// arrow form), and the shared backend ([`crate::sfc::build_module`]) re-wraps a *flat* component
+/// body inside its own `function {Class}() { … return { bindings }; }` envelope. Leaving the
+/// author's enclosing `export default function`/`const X = () =>` in the body produces an illegal
+/// nested export and stray braces (the malformed-module bug). So we lower the component to its
+/// FLAT inner body here — the author's function/arrow envelope and its JSX `return` are dropped,
+/// exactly as the `.treaty` path hands the backend a flat declaration list.
 struct LoweredComponent {
     /// The Angular template HTML lowered from the component's returned JSX.
     template_html: String,
-    /// Byte span in the source whose removal strips the JSX `return`/arrow body from the JS chunk.
-    return_span: (usize, usize),
-    /// When the component is a `return <JSX>` statement, the keyword `return` is kept; we replace
-    /// the whole statement. This flag lets the assembler decide nothing further — kept for clarity.
-    is_arrow_body: bool,
+    /// The byte span of the WHOLE component declaration statement in the (preprocessed) source —
+    /// the `export default function App(){…}` / `function App(){…}` / `const App = () => …;` /
+    /// `export default App;` etc. This entire region is removed from the module-level body and
+    /// replaced by [`Self::component_body`], so no `export default`/function envelope survives.
+    declaration_span: (usize, usize),
+    /// The flattened component-body JavaScript: the statements *inside* the component function/arrow
+    /// body, with the JSX `return`/expression-body sliced out (the lowered template is the single
+    /// source of truth for markup). This is module-top-level shaped — the same flat form the
+    /// `.treaty` path produces — so the shared backend's `build_module` and the signals pass both
+    /// treat its declarations as component state.
+    component_body: String,
+    /// The author's name for the component, when it has one (a named `function App` or a
+    /// `const App = …`). Used to drop a sibling bare `export default App;` statement that re-exports
+    /// the component by name — the backend emits its own `export default {Class};`. A bare default
+    /// export (`export default function () {}` / `export default () => …`) has no name and is `None`.
+    name: Option<String>,
 }
 
 /// Compile a JSX component source into an Angular Ivy component.
@@ -138,10 +157,20 @@ pub fn compile(source: &str, file_name: &str) -> CompiledAuthoring {
 
     let (template_html, javascript) = match lowered {
         Some(component) => {
-            // The JS body is the client source with the JSX return/body sliced out, so the lowered
-            // template is the single source of truth for markup and never leaks into the JS chunk.
-            let body = strip_span(&client_source, component.return_span);
-            let _ = component.is_arrow_body;
+            // Assemble a FLAT module-top-level body: every top-level statement EXCEPT the component
+            // declaration is kept verbatim (this hoists the author's `import`s and sibling helpers),
+            // and the component declaration is replaced by its flattened inner body (the function /
+            // arrow envelope and the JSX `return` are dropped). A bare `export default <Component>;`
+            // statement naming the component is also dropped — the backend's `build_module` emits
+            // its own single top-level `export default {Class};`. The result is the same flat shape
+            // the `.treaty` path hands the shared backend, so no nested `export`/function envelope
+            // can survive into the emitted module.
+            let body = assemble_flat_body(
+                &ret.program.body,
+                &client_source,
+                &component,
+                &class_name,
+            );
             (component.template_html, body)
         }
         None => {
@@ -209,30 +238,46 @@ pub fn compile(source: &str, file_name: &str) -> CompiledAuthoring {
     }
 }
 
+/// The raw lowering of a single component function/arrow, before module assembly: the lowered
+/// template HTML and the component's FLAT inner body (statements inside the function/arrow body with
+/// the JSX `return` removed). `find_component` wraps this with the enclosing declaration's span and
+/// the component name to build a [`LoweredComponent`].
+struct LoweredBody {
+    template_html: String,
+    /// The component function/arrow inner body, JSX `return` removed. Empty for an expression-bodied
+    /// arrow (`() => <JSX/>`), which has no statements besides the returned JSX.
+    inner: String,
+}
+
 /// Scan top-level statements for the component function and lower its returned JSX.
 ///
 /// Recognized component forms:
-///   * `export default function Name() { return <JSX/>; }`
-///   * `export default () => <JSX/>` / `export default () => { return <JSX/>; }`
-///   * a named `function Name() { return <JSX/>; }` declaration
-///   * `const Name = () => <JSX/>` / `const Name = () => { return <JSX/>; }`
+///   * `export default function Name() { …; return <JSX/>; }`
+///   * `export default () => <JSX/>` / `export default () => { …; return <JSX/>; }`
+///   * a named `function Name() { …; return <JSX/>; }` declaration (with optional sibling
+///     `export default Name;`)
+///   * `const Name = () => <JSX/>` / `const Name = () => { …; return <JSX/>; }`
+///   * `export function Name()` / `export const Name = () => …`
 ///
-/// The first form that yields a JSX return wins.
+/// The first form that yields a JSX return wins. The returned [`LoweredComponent`] carries the whole
+/// declaration statement's byte span (so it can be excised from the module-level body) plus the
+/// component's flattened inner body.
 fn find_component(body: &[Statement], source: &str) -> Option<LoweredComponent> {
     // Prefer the default export, then fall back to the first named function/arrow that returns JSX.
     for stmt in body {
         if let Statement::ExportDefaultDeclaration(export) = stmt {
-            let lowered = match &export.declaration {
-                ExportDefaultDeclarationKind::FunctionDeclaration(func) => {
-                    lower_function(func, source)
-                }
+            let (lowered, name) = match &export.declaration {
+                ExportDefaultDeclarationKind::FunctionDeclaration(func) => (
+                    lower_function(func, source),
+                    func.id.as_ref().map(|id| id.name.to_string()),
+                ),
                 ExportDefaultDeclarationKind::ArrowFunctionExpression(arrow) => {
-                    lower_arrow(arrow, source)
+                    (lower_arrow(arrow, source), None)
                 }
-                _ => None,
+                _ => (None, None),
             };
-            if lowered.is_some() {
-                return lowered;
+            if let Some(lowered) = lowered {
+                return Some(component_from(stmt, lowered, name));
             }
         }
     }
@@ -241,14 +286,16 @@ fn find_component(body: &[Statement], source: &str) -> Option<LoweredComponent> 
         match stmt {
             Statement::FunctionDeclaration(func) => {
                 if let Some(lowered) = lower_function(func, source) {
-                    return Some(lowered);
+                    let name = func.id.as_ref().map(|id| id.name.to_string());
+                    return Some(component_from(stmt, lowered, name));
                 }
             }
             Statement::VariableDeclaration(decl) => {
                 for declarator in &decl.declarations {
                     if let Some(Expression::ArrowFunctionExpression(arrow)) = &declarator.init {
                         if let Some(lowered) = lower_arrow(arrow, source) {
-                            return Some(lowered);
+                            let name = declarator.id.get_identifier_name().map(|n| n.to_string());
+                            return Some(component_from(stmt, lowered, name));
                         }
                     }
                 }
@@ -260,7 +307,8 @@ fn find_component(body: &[Statement], source: &str) -> Option<LoweredComponent> 
                     match decl {
                         Declaration::FunctionDeclaration(func) => {
                             if let Some(lowered) = lower_function(func, source) {
-                                return Some(lowered);
+                                let name = func.id.as_ref().map(|id| id.name.to_string());
+                                return Some(component_from(stmt, lowered, name));
                             }
                         }
                         Declaration::VariableDeclaration(var) => {
@@ -269,7 +317,9 @@ fn find_component(body: &[Statement], source: &str) -> Option<LoweredComponent> 
                                     &declarator.init
                                 {
                                     if let Some(lowered) = lower_arrow(arrow, source) {
-                                        return Some(lowered);
+                                        let name =
+                                            declarator.id.get_identifier_name().map(|n| n.to_string());
+                                        return Some(component_from(stmt, lowered, name));
                                     }
                                 }
                             }
@@ -285,53 +335,116 @@ fn find_component(body: &[Statement], source: &str) -> Option<LoweredComponent> 
     None
 }
 
-/// Lower a `function` component: find the `return <JSX>` in its body.
-fn lower_function(func: &Function, source: &str) -> Option<LoweredComponent> {
+/// Build a [`LoweredComponent`] from the located declaration statement, its raw lowering, and the
+/// component's author-given name (if any). The declaration's whole byte span is recorded so the
+/// module assembler can excise it and substitute the flattened inner body.
+fn component_from(stmt: &Statement, lowered: LoweredBody, name: Option<String>) -> LoweredComponent {
+    let span = oxc_span::GetSpan::span(stmt);
+    LoweredComponent {
+        template_html: lowered.template_html,
+        declaration_span: (span.start as usize, span.end as usize),
+        component_body: lowered.inner,
+        name,
+    }
+}
+
+/// Lower a `function` component: find the `return <JSX>` in its body, and extract the body's inner
+/// statements with that return removed.
+fn lower_function(func: &Function, source: &str) -> Option<LoweredBody> {
     let body = func.body.as_deref()?;
-    lower_return_statement(&body.statements, source)
+    let return_span = jsx_return_span(&body.statements, source)?;
+    let inner = body_inner_without_return(
+        body.span.start as usize,
+        body.span.end as usize,
+        return_span,
+        source,
+    );
+    let template_html = lower_jsx_return(&body.statements, source)?;
+    Some(LoweredBody { template_html, inner })
 }
 
 /// Lower an arrow component: either an expression body that is JSX, or a block body with a
 /// `return <JSX>`.
-fn lower_arrow(arrow: &ArrowFunctionExpression, source: &str) -> Option<LoweredComponent> {
+fn lower_arrow(arrow: &ArrowFunctionExpression, source: &str) -> Option<LoweredBody> {
     // An expression-bodied arrow (`() => <JSX/>`) stores the expression as a single `return`
-    // statement in `body.statements` with `expression == true`.
+    // statement in `body.statements` with `expression == true`. Its only content is the returned
+    // JSX, so the flattened inner body is empty.
     if arrow.expression {
         let stmt = arrow.body.statements.first()?;
         if let Statement::ExpressionStatement(expr_stmt) = stmt {
             if let Some(html) = lower_jsx_expression(&expr_stmt.expression, source) {
-                let span = (
-                    expr_stmt.span.start as usize,
-                    expr_stmt.span.end as usize,
-                );
-                return Some(LoweredComponent {
+                return Some(LoweredBody {
                     template_html: html,
-                    return_span: span,
-                    is_arrow_body: true,
+                    inner: String::new(),
                 });
             }
         }
         return None;
     }
-    lower_return_statement(&arrow.body.statements, source)
+    let return_span = jsx_return_span(&arrow.body.statements, source)?;
+    let inner = body_inner_without_return(
+        arrow.body.span.start as usize,
+        arrow.body.span.end as usize,
+        return_span,
+        source,
+    );
+    let template_html = lower_jsx_return(&arrow.body.statements, source)?;
+    Some(LoweredBody { template_html, inner })
 }
 
-/// Find a `return <JSX>` statement among `statements` and lower it.
-fn lower_return_statement(statements: &[Statement], source: &str) -> Option<LoweredComponent> {
+/// The byte span of the first `return <JSX>` statement among `statements`, or `None`.
+fn jsx_return_span(statements: &[Statement], source: &str) -> Option<(usize, usize)> {
     for stmt in statements {
         if let Statement::ReturnStatement(ret) = stmt {
             let argument = ret.argument.as_ref()?;
-            if let Some(html) = lower_jsx_expression(argument, source) {
-                let span = (ret.span.start as usize, ret.span.end as usize);
-                return Some(LoweredComponent {
-                    template_html: html,
-                    return_span: span,
-                    is_arrow_body: false,
-                });
+            if lower_jsx_expression(argument, source).is_some() {
+                return Some((ret.span.start as usize, ret.span.end as usize));
             }
         }
     }
     None
+}
+
+/// Lower the first `return <JSX>` statement among `statements` to template HTML.
+fn lower_jsx_return(statements: &[Statement], source: &str) -> Option<String> {
+    for stmt in statements {
+        if let Statement::ReturnStatement(ret) = stmt {
+            let argument = ret.argument.as_ref()?;
+            if let Some(html) = lower_jsx_expression(argument, source) {
+                return Some(html);
+            }
+        }
+    }
+    None
+}
+
+/// Extract the interior of a function/arrow block body (`{ … }`, spanning `body_start..body_end`),
+/// with the JSX `return` statement (`return_span`) removed. The enclosing braces are dropped so the
+/// result is a flat statement list suitable for the shared backend's own component wrapper.
+fn body_inner_without_return(
+    body_start: usize,
+    body_end: usize,
+    return_span: (usize, usize),
+    source: &str,
+) -> String {
+    // The body span includes the surrounding braces; the inner statements live strictly between
+    // them. Guard the brace trim against a degenerate (empty) body.
+    let inner_start = body_start.saturating_add(1).min(source.len());
+    let inner_end = body_end.saturating_sub(1).max(inner_start);
+    let (ret_start, ret_end) = return_span;
+
+    let mut inner = String::with_capacity(inner_end - inner_start);
+    // Everything from the body's first inner byte up to the JSX return.
+    if ret_start > inner_start {
+        inner.push_str(&source[inner_start..ret_start.min(inner_end)]);
+    }
+    // Everything after the JSX return up to the body's last inner byte. (Anything textually after a
+    // `return` is dead code, but preserving it keeps the body byte-faithful for the rare early
+    // helper-after-return; it is harmless inside the synthesized wrapper.)
+    if ret_end < inner_end {
+        inner.push_str(&source[ret_end..inner_end]);
+    }
+    inner
 }
 
 /// Lower an expression to template HTML if it is a JSX element or fragment.
@@ -348,22 +461,75 @@ fn lower_jsx_expression(expression: &Expression, source: &str) -> Option<String>
     }
 }
 
-/// Remove the byte `span` from `source`, also swallowing one trailing newline so the lifted return
-/// does not leave a dangling blank line in the JS body.
-fn strip_span(source: &str, span: (usize, usize)) -> String {
-    let (start, end) = span;
-    let bytes = source.as_bytes();
-    let mut end = end;
-    if end < bytes.len() && bytes[end] == b'\r' {
-        end += 1;
-    }
-    if end < bytes.len() && bytes[end] == b'\n' {
-        end += 1;
-    }
+/// Assemble the FLAT module-top-level body the shared backend's `build_module` expects, from the
+/// (preprocessed) `source`, the located `component`, and the derived `class_name`.
+///
+/// The shared backend re-wraps a flat component body inside its own `function {Class}() { … return
+/// { bindings }; }` envelope and emits exactly one top-level `export default {Class};`. So the body
+/// handed to it must NOT contain the author's enclosing `export default function`/`const X = () =>`
+/// declaration (that was the malformed-module bug — a nested export + stray braces). This walks the
+/// top-level statements and, for each:
+///   * the located component declaration is REPLACED by its flattened inner body (the function/arrow
+///     envelope and the JSX `return` already removed);
+///   * a sibling bare `export default <Component>;` re-exporting the component by name is DROPPED
+///     (the backend emits its own default export);
+///   * every other statement (the author's `import`s, helper functions, type aliases, …) is kept
+///     verbatim — `build_module` itself hoists any `import` declarations to module scope.
+///
+/// The result is the same flat shape the `.treaty` path produces, so it re-parses as a valid module
+/// once wrapped, with no nested export and no stray braces.
+fn assemble_flat_body(
+    body: &[Statement],
+    source: &str,
+    component: &LoweredComponent,
+    class_name: &str,
+) -> String {
+    let (decl_start, decl_end) = component.declaration_span;
     let mut out = String::with_capacity(source.len());
-    out.push_str(&source[..start]);
-    out.push_str(&source[end..]);
+
+    for stmt in body {
+        let span = oxc_span::GetSpan::span(stmt);
+        let (start, end) = (span.start as usize, span.end as usize);
+
+        // The component declaration → its flattened inner body.
+        if start == decl_start && end == decl_end {
+            out.push_str(component.component_body.trim());
+            out.push('\n');
+            continue;
+        }
+
+        // A bare `export default <Component>;` (or `export default <Component>`) that re-exports the
+        // component by name is dropped — the backend emits `export default {Class};` itself, and a
+        // second top-level default export would be illegal. Match on the export's referenced name so
+        // an unrelated `export default <expr>` is preserved (it would be a second component, out of
+        // scope, and is harmless to keep).
+        if is_default_export_of(stmt, component, class_name) {
+            continue;
+        }
+
+        out.push_str(&source[start..end]);
+        out.push('\n');
+    }
+
     out
+}
+
+/// Whether `stmt` is a bare `export default <Ident>;` re-exporting the located component by its
+/// author name (or by the derived `class_name`, in case the author already named it the class name).
+fn is_default_export_of(
+    stmt: &Statement,
+    component: &LoweredComponent,
+    class_name: &str,
+) -> bool {
+    let Statement::ExportDefaultDeclaration(export) = stmt else {
+        return false;
+    };
+    let ExportDefaultDeclarationKind::Identifier(ident) = &export.declaration else {
+        return false;
+    };
+    let referenced = ident.name.as_str();
+    referenced == class_name
+        || component.name.as_deref() == Some(referenced)
 }
 
 #[cfg(test)]
@@ -376,6 +542,48 @@ mod tests {
     fn pascal_case_from_tsx_name() {
         assert_eq!(to_pascal_case("hello-world.tsx"), "HelloWorld");
         assert_eq!(to_pascal_case("my_widget.tjsx"), "MyWidget");
+    }
+
+    /// Parse `code` as an ES module and assert it is well-formed: no parse errors, exactly one
+    /// top-level `export default`, and no `export`/`import` nested inside a function/block (the
+    /// nested-export class of bug). Returns the parsed-OK result for the caller's further assertions.
+    fn assert_well_formed_module(code: &str) {
+        let allocator = Allocator::default();
+        let module_type = SourceType::default().with_module(true);
+        let parsed = JsParser::new(&allocator, code, module_type).parse();
+        assert!(
+            parsed.errors.is_empty(),
+            "emitted module did not RE-PARSE as a valid ES module: {:?}\n--- code ---\n{code}",
+            parsed.errors
+        );
+
+        // Exactly one top-level `export default` — the backend's `export default {Class};`.
+        let top_level_default_exports = parsed
+            .program
+            .body
+            .iter()
+            .filter(|s| matches!(s, Statement::ExportDefaultDeclaration(_)))
+            .count();
+        assert_eq!(
+            top_level_default_exports, 1,
+            "expected exactly one top-level `export default`, found {top_level_default_exports}\n--- code ---\n{code}"
+        );
+
+        // No `export`/`import` may appear anywhere other than the module top level. Re-parsing a body
+        // that contains a nested `export default function …` succeeds only because OXC is lenient in
+        // some configs; the robust guarantee is that the synthesized component wrapper
+        // `function {Class}() { … }` contains NEITHER an `export` keyword NOR a nested function-scope
+        // `export default`. Assert the wrapper body holds no `export ` token.
+        if let Some(fn_idx) = code.find("function ") {
+            // The component wrapper is the function whose body precedes the `.ɵfac` static assignment.
+            if let Some(fac_idx) = code.find("\u{0275}fac") {
+                let wrapper = &code[fn_idx..fac_idx];
+                assert!(
+                    !wrapper.contains("export "),
+                    "an `export` leaked inside the synthesized component wrapper (nested export bug); got wrapper:\n{wrapper}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -925,5 +1133,132 @@ export default function Btn() {\n  return <span>x</span>;\n}\n";
             code.contains("import { signal, computed } from \"@angular/core\";"),
             "computed not added to import; got: {code}"
         );
+    }
+
+    // --- Module assembly: the emitted module must be a VALID re-parseable ES module ------------
+    // These guard the malformed-module bug: the JSX front-end used to splice the author's
+    // `export default function …` verbatim inside a synthesized `function {Class}() { … }` wrapper,
+    // producing an illegal nested export, stray braces, and an empty `return {}`. The fix flattens
+    // the component body and lets the backend emit exactly one top-level `export default {Class};`.
+
+    #[test]
+    fn reported_bug_about_reparses_as_valid_module() {
+        // The exact reported case: `export default function About(){ const team=[1,2,3]; return
+        // <div>{team.length}</div> }`. It must emit a VALID module — no nested `export default`, no
+        // stray brace, no empty `return {}` — and signals-by-default still applies.
+        let source = "export default function About() {\n\
+  const team = [1, 2, 3];\n\
+  return <div>{team.length}</div>;\n\
+}\n";
+        let out = compile(source, "About.tsx");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+
+        assert_well_formed_module(code);
+        assert!(code.contains(DEFINE), "no defineComponent; got: {code}");
+        // The synthesized wrapper exists and the backend's single default export is the class.
+        assert!(code.contains("function About() {"), "no component wrapper; got: {code}");
+        assert!(code.contains("export default About;"), "no class default export; got: {code}");
+        // The author's `export default function About` does NOT survive as a nested declaration.
+        assert!(
+            !code.contains("export default function About"),
+            "author default-export function leaked into the body; got: {code}"
+        );
+        // signals-by-default lowered the array initializer.
+        assert!(code.contains("team = signal([1, 2, 3])"), "team not a signal; got: {code}");
+    }
+
+    #[test]
+    fn named_function_with_separate_default_export_reparses() {
+        // `function Card(){ … } export default Card;` — the named function is the component and the
+        // sibling `export default Card;` must be DROPPED (the backend emits its own default export),
+        // leaving exactly one top-level default export.
+        let source = "function Card() {\n\
+  const label = 'hi';\n\
+  return <span>{label}</span>;\n\
+}\n\
+export default Card;\n";
+        let out = compile(source, "card.tsx");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+
+        assert_well_formed_module(code);
+        assert!(code.contains(DEFINE), "no defineComponent; got: {code}");
+        assert!(code.contains("export default Card;"), "no class default export; got: {code}");
+        // The author's named `function Card` does not survive as a nested declaration in the wrapper.
+        assert!(
+            !code.contains("return <span>"),
+            "JSX return leaked into body; got: {code}"
+        );
+    }
+
+    #[test]
+    fn const_arrow_with_separate_default_export_reparses() {
+        // `const Widget = () => { … }; export default Widget;` — same contract for the arrow form.
+        let source = "const Widget = () => {\n\
+  const n = 5;\n\
+  return <p>{n}</p>;\n\
+};\n\
+export default Widget;\n";
+        let out = compile(source, "widget.tsx");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+
+        assert_well_formed_module(code);
+        assert!(code.contains(DEFINE), "no defineComponent; got: {code}");
+        assert!(code.contains("export default Widget;"), "no class default export; got: {code}");
+        // signals-by-default applied to the inner declaration.
+        assert!(code.contains("n = signal(5)"), "n not a signal; got: {code}");
+    }
+
+    #[test]
+    fn arrow_expression_body_reparses_as_valid_module() {
+        // `const Widget = () => <span>x</span>;` (no block body): the flattened inner body is empty,
+        // and the emitted module is still valid with one default export.
+        let source = "const Widget = () => <span>x</span>;\n";
+        let out = compile(source, "widget.tsx");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        assert_well_formed_module(&out.code);
+        assert!(out.code.contains("export default Widget;"), "no default export; got: {}", out.code);
+    }
+
+    #[test]
+    fn import_plus_default_export_function_reparses() {
+        // The author's top-level `import` must be HOISTED to module scope (never spliced into the
+        // wrapper), and the `export default function App` must NOT nest. This is the App.tjsx form.
+        let source = "import { Helper } from './helper';\n\
+export default function App() {\n\
+  const greeting = 'hi';\n\
+  return <div>{greeting}</div>;\n\
+}\n";
+        let out = compile(source, "App.tjsx");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+
+        assert_well_formed_module(code);
+        // The user import is hoisted above the wrapper (module scope), not inside it.
+        let import_idx = code
+            .find("import { Helper } from './helper';")
+            .expect("user import missing");
+        let wrapper_idx = code.find("function App() {").expect("no wrapper");
+        assert!(
+            import_idx < wrapper_idx,
+            "user import not hoisted above the wrapper; got: {code}"
+        );
+        assert!(
+            !code.contains("export default function App"),
+            "author default-export function leaked into the body; got: {code}"
+        );
+    }
+
+    #[test]
+    fn capitalized_and_lowercase_names_both_reparse() {
+        // The component name policy is PascalCase of the file stem regardless of the author's casing;
+        // a lowercase authoring name must still yield a valid module.
+        let lower = "export default function about() {\n  return <div>x</div>;\n}\n";
+        let out = compile(lower, "about.tsx");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        assert_well_formed_module(&out.code);
+        assert!(out.code.contains("export default About;"), "wrong default export; got: {}", out.code);
     }
 }
