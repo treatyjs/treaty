@@ -1,0 +1,9 @@
+$schema: https://moonrepo.dev/schemas/toolchain.json
+
+# Enable the node platform so node-command tasks run, but DO NOT let moon manage
+# (download via proto) a Node — use the contributor's already-installed Node 24.
+# Omitting `version` makes moon use the global `node` on PATH instead of proto.
+node:
+  packageManager: npm
+  syncProjectWorkspaceDependencies: false
+  inferTasksFromScripts: false

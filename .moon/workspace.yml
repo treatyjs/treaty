@@ -1,8 +1,15 @@
 $schema: https://moonrepo.dev/schemas/workspace.json
+# Explicit project list (a glob form is avoided on purpose): bare CARGO crates
+# carry no moon.yml but match dir globs, inferring an id from their folder name —
+# which collided in two ways. `libs/*/*` matched the Rust crates' `src/` dirs
+# (all id `src`), and `apps/*` matched the Rust `apps/treaty-cli` crate (id
+# `treaty-cli`, clashing with the TS libs/treaty/cli). Rust crates are cargo-built,
+# not moon projects, so we glob only the dirs that actually hold moon.yml projects.
 projects:
-- apps/*
+- apps/repl
 - packages/*
-- libs/*
-- libs/*/*
+- libs/authoring/*
+- libs/treaty/*
+- libs/typescript/*
 vcs:
   defaultBranch: master
