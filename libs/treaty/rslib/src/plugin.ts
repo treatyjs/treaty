@@ -23,6 +23,7 @@ import type {
 	TreatyTransformOutput,
 } from './types.js'
 import { ServerChunkCollector } from './server-chunks.js'
+import { registerLinkPartialTransform } from './link-partial.js'
 
 /** Stable plugin name reported to rsbuild/rslib. */
 export const TREATY_PLUGIN_NAME = 'treaty:transform'
@@ -93,6 +94,12 @@ export function treatyRsbuildPlugin(
 	return {
 		name: TREATY_PLUGIN_NAME,
 		setup(api: TreatyRsbuildPluginApi): void {
+			// Link published partial-compiled Angular libraries (node_modules `ɵɵngDeclare*`) to AOT
+			// via the SHARED Rust linker, so a downstream app consuming this library needs NO JIT and
+			// NO `@angular/compiler`. Registered first and independent of the authoring transform
+			// below; it only touches partial `node_modules` modules.
+			registerLinkPartialTransform(api)
+
 			// Accumulates the per-fn server chunks discovered across the library build
 			// so each server fn becomes its own separately-exported chunk entry.
 			const serverChunks = new ServerChunkCollector()

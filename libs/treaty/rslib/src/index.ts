@@ -22,6 +22,12 @@ export {
 	emitServerChunks,
 } from './plugin.js'
 
+// The Angular partial-declaration linker. Reuses the shared, Rust-backed linker core from
+// `@treaty/ts-vite` (one source of truth) so published partial Angular libraries this library
+// depends on link to AOT with NO JIT and NO `@angular/compiler`. `treatyRsbuildPlugin` (and so
+// `defineTreatyLib`) registers it automatically; these exports let callers reuse the wiring.
+export { registerLinkPartialTransform, LINK_PARTIAL_TEST, isPartialModule } from './link-partial.js'
+
 export type { EmittableAsset } from './server-chunks.js'
 export {
 	ServerChunkCollector,
