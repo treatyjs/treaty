@@ -61,5 +61,26 @@ export interface TreatyPluginOptions extends TreatyCompilerOptions {
 /** The authoring extensions Treaty owns and the plugin resolves by default. */
 export const DEFAULT_EXTENSIONS: readonly string[] = ['.treaty', '.tsx', '.tjsx']
 
-/** Default `test` matcher for the loader rule: any Treaty authoring extension. */
-export const DEFAULT_TEST: RegExp = /\.(treaty|tsx|tjsx)$/
+/**
+ * Default `test` matcher for the loader rule: every Treaty authoring extension
+ * (`.treaty`/`.tsx`/`.tjsx`) PLUS plain `.ts` (so a `.ts` `@Component`/`@Directive`/
+ * `@Pipe`/`@Injectable`/`@NgModule` is lowered to Ivy), but never a `.d.ts`
+ * declaration file.
+ *
+ * Matching every `.ts` mirrors `@treaty/vite` (whose `classify` claims any non-`.d.ts`
+ * `.ts`) and is SAFE because ownership is decided one level down by the core compiler,
+ * not by this regex: {@link treatyLoader} hands the file to `compiler.transform`, which
+ * AST-screens for an Angular decorator and returns `null` for an ordinary `.ts`. The
+ * loader then returns that source UNCHANGED, so a non-Angular `.ts` falls straight
+ * through to Rspack/webpack's own TS pipeline (e.g. the host's `builtin:swc-loader`) —
+ * the rule running over it is a cheap classify + passthrough, not an interception.
+ *
+ * The `(?<!\.d)` look-behind excludes `.d.ts`: a declaration file carries no runtime
+ * component to lower and must reach the host TS pipeline untouched.
+ *
+ * Without `.ts` here a decorated `.ts` `@Component` in a Treaty app on Rspack never
+ * reached the loader and fell through to a raw decorator transform — shipping a
+ * decorated class with NO Ivy definition, so Angular dropped to its JIT compiler at
+ * runtime. Recognising `.ts` keeps the whole graph AOT, at parity with Vite.
+ */
+export const DEFAULT_TEST: RegExp = /(?<!\.d)\.(treaty|tsx|tjsx|ts)$/
