@@ -286,6 +286,48 @@ function collectJs() {
 		.map((f) => join(outDir, f))
 }
 
+function collectAssets(ext) {
+	if (!existsSync(outDir)) return []
+	return readdirSync(outDir, { recursive: true })
+		.filter((f) => typeof f === 'string' && f.endsWith(ext))
+		.map((f) => join(outDir, f))
+}
+
+// ---------------------------------------------------------------------------
+// Step 3c: STYLES gate (Phase 2 — theming).
+//
+// The app ships a GLOBAL base stylesheet (`src/styles.css`, side-effect-imported
+// from `main.ts`) AND component-scoped styles (the `.treaty` `<style>` block in
+// `gauge.treaty`). `@treaty/vite` owns only the authoring extensions and must NOT
+// claim `.css`, so Vite's native CSS pipeline emits the global theme as a bundled
+// `.css` asset, while the per-component styles ride through the lowered Ivy
+// component (`ɵɵdefineComponent({ ..., styles: [...] })`). Assert BOTH landed in
+// the built output: the global theme's design tokens + app-shell selectors in an
+// emitted `.css` asset, and the gauge's scoped rules in a lowered JS chunk.
+// ---------------------------------------------------------------------------
+function assertStyles() {
+	const cssFiles = collectAssets('.css')
+	const cssText = cssFiles.map((f) => readFileSync(f, 'utf-8')).join('\n')
+	check('build emitted a global CSS asset', cssFiles.length > 0, `${cssFiles.length} .css file(s)`)
+	// The global theme's hooks: a design token, the document base, and the app-shell
+	// selectors authored against app-root.component.ts's template classes.
+	check(
+		'global base stylesheet (styles.css) is emitted in the build (design tokens + app-shell selectors)',
+		/--color-accent/.test(cssText) && /\.app-nav/.test(cssText) && /\.app-main/.test(cssText),
+		cssFiles.length > 0 ? '' : 'no CSS asset emitted',
+	)
+
+	// Component-scoped styles: gauge.treaty's `<style lang="scss">` compiles to the
+	// component's Ivy `styles: [...]`. The SCSS is lowered (the `.gauge` selector and
+	// the `.track`/`.fill` rules survive) and rides in a JS chunk, not the global CSS.
+	const js = collectJs().map((f) => readFileSync(f, 'utf-8')).join('\n')
+	check(
+		'component-scoped styles compile + apply (gauge.treaty <style> -> Ivy styles[] in a JS chunk)',
+		/\.gauge\b/.test(js) && /\.track\b/.test(js) && /\.fill\b/.test(js),
+		/\.gauge\b/.test(js) ? '' : 'gauge scoped styles not found in any JS chunk',
+	)
+}
+
 // ---------------------------------------------------------------------------
 // Step 3: bundle assertions.
 // ---------------------------------------------------------------------------
@@ -626,6 +668,9 @@ async function main() {
 
 	console.log('== Step 3b: each JSX module lowered to Ivy exactly once (valid single-export ES module) ==')
 	assertJsxLoweredOnce()
+
+	console.log('== Step 3c: styles — global base theme emitted as CSS + component-scoped styles in Ivy ==')
+	if (built) assertStyles()
 
 	console.log('== Step 4: headless boot of the built bundle (no JIT; boot+render gated on the reported `use:` Rust gap) ==')
 	if (built) await bootHeadless()

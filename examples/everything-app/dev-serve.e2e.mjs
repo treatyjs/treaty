@@ -512,6 +512,46 @@ async function assertDevServeMimeIsJavascript() {
 }
 
 // ---------------------------------------------------------------------------
+// Step 5: STYLES gate (Phase 2 — theming) over the running dev server.
+//
+// The app has a GLOBAL base stylesheet (`src/styles.css`, side-effect-imported by
+// `main.ts`) plus component-scoped styles (`gauge.treaty`'s `<style>` block).
+// `@treaty/vite` owns only the authoring extensions and must NOT claim `.css`, so
+// Vite's native CSS pipeline serves the global theme. Assert through the REAL
+// dev-serve pipeline: (a) the global stylesheet is SERVED (its design tokens +
+// app-shell selectors), with `@treaty/vite` not interfering with `.css`; and
+// (b) component-scoped styles still compile + apply (gauge.treaty's scoped rules
+// ride in the lowered Ivy component's `styles: [...]`).
+async function assertStyles(server) {
+	const cssCode = await serve(server, '/src/styles.css')
+	check('(Step 5) dev-serve serves the global base stylesheet (src/styles.css)', cssCode.length > 0)
+	check(
+		'(Step 5) global stylesheet passes through Vite CSS untouched by treaty() (design tokens + app-shell selectors)',
+		/--color-accent/.test(cssCode) && /\.app-nav/.test(cssCode) && /\.app-main/.test(cssCode),
+		cssCode.replace(/\s+/g, ' ').slice(0, 120),
+	)
+
+	// The global CSS must be in the module graph via main.ts's side-effect import,
+	// so the dev server injects it. Assert main.ts's served module references it.
+	const mainCode = await serve(server, '/src/main.ts')
+	check(
+		'(Step 5) main.ts imports the global stylesheet so the dev server injects it',
+		mainCode.length > 0 && /styles\.css/.test(mainCode),
+		mainCode.length > 0 ? '' : 'main.ts not served',
+	)
+
+	// Component-scoped styles: gauge.treaty's `<style>` lowers to the component's
+	// Ivy `styles: [...]`; the scoped `.gauge`/`.track`/`.fill` rules survive into
+	// the served module (NOT the global CSS).
+	const gaugeCode = await serve(server, '/src/features/metrics/gauge.treaty')
+	check(
+		'(Step 5) component-scoped styles compile + apply (gauge.treaty <style> -> Ivy styles[])',
+		/styles\s*:/.test(gaugeCode) && /\.gauge\b/.test(gaugeCode) && /\.track\b/.test(gaugeCode),
+		gaugeCode.replace(/\s+/g, ' ').slice(0, 120),
+	)
+}
+
+// ---------------------------------------------------------------------------
 async function main() {
 	console.log('== Step 0: wire local node_modules (incl @treaty/jsx) ==')
 	wireNodeModules()
@@ -540,6 +580,7 @@ async function main() {
 		await assertAuthoringSurfaces(server)
 		await assertPartialAngularLinker(server)
 		await assertDevHtml(server)
+		await assertStyles(server)
 	})
 
 	console.log('== Step 4: REAL HTTP dev server serves .treaty/.tjsx with a JS content-type (the MIME bug) ==')

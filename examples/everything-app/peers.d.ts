@@ -27,6 +27,20 @@
  * `"@treaty/jsx/ambient"`, or `compilerOptions.types`.
  */
 
+/**
+ * Side-effect CSS imports (`import './styles.css'`). Vite handles `.css`
+ * natively (the dev server injects it; the build emits it as an asset) and
+ * `@treaty/vite` does not claim `.css`, so a CSS import has no runtime exports —
+ * it only needs an ambient module declaration so `tsgo` accepts the side-effect
+ * import. This app sets `compilerOptions.types: []`, so Vite's own
+ * `vite/client` `*.css` declaration is not in scope; restate the minimal shape
+ * here (an empty default export, matching Vite's CSS module type).
+ */
+declare module '*.css' {
+	const css: string
+	export default css
+}
+
 declare module '@module-federation/enhanced/runtime' {
 	/** A runtime remote definition the plugin may repoint by name. */
 	export interface FederationRuntimeRemote {

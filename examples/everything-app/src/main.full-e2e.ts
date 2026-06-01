@@ -24,6 +24,11 @@ import { provideZonelessChangeDetection } from '@angular/core'
 import { bootstrapApplication } from '@angular/platform-browser'
 import { provideRouter, type Routes } from '@angular/router'
 
+// Global BASE theme (mirrors the real `main.ts`): a plain `.css` side-effect
+// import that Vite emits as a bundled asset, exercising the global stylesheet
+// through the real `@treaty/vite` build pipeline (which must not claim `.css`).
+import './styles.css'
+
 import { AppRoot } from './app/app-root.component'
 
 // Eagerly pull the standalone JSX authoring surfaces into the build graph so the

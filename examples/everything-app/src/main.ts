@@ -21,6 +21,13 @@ import { provideZonelessChangeDetection } from '@angular/core'
 import { bootstrapApplication } from '@angular/platform-browser'
 import { provideRouter } from '@angular/router'
 
+// Global BASE theme (design tokens + document typography + app-shell layout).
+// A plain `.css` side-effect import: Vite owns CSS natively and `@treaty/vite`
+// does not claim `.css`, so the dev server injects it and the build emits it as
+// a bundled asset. Component-scoped styles (`.treaty` `<style>`, `@Component`
+// `styles`) layer on top of this base.
+import './styles.css'
+
 import { AppRoot } from './app/app-root.component'
 import { routes } from './routes/app.routes'
 
