@@ -447,6 +447,59 @@ function assertJsxLoweredOnce() {
 		check(`${rel}: emits exactly ONE export default (no nested-export parse bug)`, exportDefaults === 1, `exportDefault=${exportDefaults} totalExports=${exportsTotal}`)
 		check(`${rel}: no "no component found" error`, !/no component[^\n]*found/i.test(errors.join(' ') + emitted))
 	}
+
+	// The `use:highlight` directive proof (DE-STUB gate): counter.tsx applies a REAL selectorless
+	// attribute directive via `use:highlight`. Prove the whole chain lowers correctly, by compiling
+	// BOTH the directive source and counter.tsx and parsing the emitted Ivy (no regex-only claims):
+	//   (a) the directive `.ts` lowers to exactly one real `ɵɵdefineDirective` with a NON-EMPTY
+	//       `hostBindings` body (style/attr instructions) — not a no-op — and NO raw `@Directive`
+	//       decorator survives (so it never falls to Angular's JIT);
+	//   (b) counter.tsx lists the resolved `Highlight` directive in its component `dependencies`, so
+	//       the `use:highlight` application binds to the real lowered directive.
+	const dirRel = 'src/components/highlight.directive.ts'
+	const dirCode = readFileSync(join(here, dirRel), 'utf-8')
+	const dirOut = compileUnifiedSource(dirCode, dirRel)
+	const dirEmitted = dirOut.code ?? ''
+	check(`${dirRel}: compiles with zero diagnostics`, (dirOut.errors ?? []).length === 0, (dirOut.errors ?? []).join(' | '))
+	const defineDirectiveCalls = (dirEmitted.match(/ɵɵdefineDirective\s*\(/g) || []).length
+	check(`${dirRel}: lowers to exactly ONE real ɵɵdefineDirective`, defineDirectiveCalls === 1, `defineDirective=${defineDirectiveCalls}`)
+	check(
+		`${dirRel}: no raw @Directive decorator survives (AOT, never JIT)`,
+		!/@Directive\s*\(/.test(dirEmitted),
+	)
+	// The lowered directive must be a REAL implementation: its hostBindings body must carry actual
+	// instructions (style/attr) over the directive's own signals — not an empty no-op body.
+	const hostBindingsBody = (() => {
+		const m = /Highlight_HostBindings\s*\([^)]*\)\s*\{([\s\S]*?)\n\t\}/.exec(dirEmitted)
+		return m ? m[1] : ''
+	})()
+	check(
+		`${dirRel}: hostBindings body is a REAL implementation (style/attr instructions, not a no-op)`,
+		/ɵɵstyleProp|ɵɵattribute/.test(hostBindingsBody),
+		hostBindingsBody ? hostBindingsBody.replace(/\s+/g, ' ').trim().slice(0, 120) : 'no hostBindings body found',
+	)
+	// Parse the emitted directive as TS to prove it is well-formed Ivy (no malformed emit).
+	{
+		let parseOk = true
+		let parseErr = ''
+		try {
+			const esbuild = req('esbuild')
+			esbuild.transformSync(dirEmitted, { loader: 'ts' })
+		} catch (e) {
+			parseOk = false
+			parseErr = String(e?.message ?? e).split('\n').slice(0, 2).join(' ')
+		}
+		check(`${dirRel}: emitted Ivy parses (well-formed module)`, parseOk, parseErr)
+	}
+
+	// counter.tsx must depend on the resolved `Highlight` directive (selectorless auto-import).
+	const counterOut = compileUnifiedSource(readFileSync(join(here, 'src/components/counter.tsx'), 'utf-8'), 'src/components/counter.tsx')
+	const counterDeps = /dependencies:\s*\[([^\]]*)\]/.exec(counterOut.code ?? '')
+	check(
+		'counter.tsx depends on the real Highlight directive (use:highlight resolved + auto-imported)',
+		Boolean(counterDeps) && /\bHighlight\b/.test(counterDeps[1]),
+		counterDeps ? `dependencies: [${counterDeps[1].trim()}]` : 'no dependencies array emitted',
+	)
 }
 
 // ---------------------------------------------------------------------------

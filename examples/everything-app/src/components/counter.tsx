@@ -14,12 +14,15 @@
  */
 import { signal, computed } from '@angular/core'
 import { wsPresence, type PresenceEvent } from '../server/presence.ws'
+import { Highlight } from './highlight.directive'
 
 // A custom attribute directive referenced via `use:highlight` below. In Treaty
-// JSX, `use:` applies a directive to the element; the compiler matches it by name.
-export function highlight(): void {
-	// Directive behavior lives in the lowered output; this stub keeps it in scope.
-}
+// JSX, `use:` applies a directive to the element; the compiler resolves the name
+// (`highlight` -> `Highlight`) to this imported, selectorless directive class and
+// lists it in the lowered component's `dependencies`. `Highlight` is a REAL Ivy
+// directive (it lowers to `ɵɵdefineDirective`) that paints a visible accent
+// affordance on its host -- see `./highlight.directive`.
+void Highlight
 
 // Lowercase component function -- Treaty is case-insensitive for component names.
 export default function counter() {

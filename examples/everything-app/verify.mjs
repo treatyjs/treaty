@@ -37,6 +37,7 @@ const PASSTHROUGH = 'passthrough' // routes / server modules: must compile clean
 const files = [
 	{ rel: 'src/components/todo-list.treaty', expect: COMPONENT },
 	{ rel: 'src/components/counter.tsx', expect: COMPONENT },
+	{ rel: 'src/components/highlight.directive.ts', expect: DIRECTIVE },
 	{ rel: 'src/components/log-viewer.component.ts', expect: COMPONENT },
 	{ rel: 'src/features/dashboard/dashboard.component.ts', expect: COMPONENT },
 	{ rel: 'src/features/profile/profile.component.ts', expect: COMPONENT },
