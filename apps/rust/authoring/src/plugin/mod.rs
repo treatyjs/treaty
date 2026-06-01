@@ -1210,19 +1210,16 @@ fn is_ident_start(b: u8) -> bool {
 /// `exports["./resources"]`), whose surface includes [`RESOURCE_HELPER`].
 pub const RESOURCE_CLIENT_MODULE: &str = "@treaty/httpclient/resources";
 
-/// The single resource helper the axum backend's client bindings reference. `@treaty/httpclient`
-/// exports `edenResource` / `edenHttpResource` (observable, `rxResource`-backed) and
-/// `edenPromiseResource` (promise-backed, `resource()`-backed). Every binding the axum backend emits
-/// is a promise factory (`fetch(...).then(...)` for Api; an `EventSource`/`WebSocket` connection
-/// promise for Stream/WebSocket), so they all wrap the REAL promise-backed `edenPromiseResource`.
+/// The single resource helper the axum backend's request/response client bindings reference.
+/// `@treaty/httpclient` exports `edenResource` / `edenHttpResource` (observable, `rxResource`-backed)
+/// and `edenPromiseResource` (promise-backed, `resource()`-backed). The Api binding is a one-shot
+/// promise factory (`fetch(...).then(...)`), so it wraps the REAL promise-backed `edenPromiseResource`.
 ///
-/// RUNTIME GAP (reported, not papered over with a stub): `@treaty/httpclient` exports NO dedicated
-/// streaming (`edenStreamResource`) or duplex/WebSocket (`edenWebSocket`) resource helper today. The
-/// Stream/WebSocket bindings therefore route their `EventSource`/`WebSocket` connection through this
-/// one-shot `edenPromiseResource` (resolving the connection's first value), which keeps the client
-/// boot-safe using only real exports. A multi-value streaming / duplex resource awaits a dedicated
-/// helper added to `@treaty/httpclient` (out of this change's scope — the runtime package is not
-/// edited here).
+/// The Stream binding is NOT a one-shot resource: a stream-transport server fn is an async generator,
+/// so its client binding is a native async-iterable factory backed by `EventSource` (consumed with
+/// `for await`) — it needs no runtime helper and therefore does not reference this symbol. The
+/// WebSocket binding likewise opens a live `WebSocket`. Only the request/response (Api) transport pulls
+/// this import in (the emitter is keyed on the helper appearing in the emitted code).
 pub const RESOURCE_HELPER: &str = "edenPromiseResource";
 
 /// The runtime symbol the emitted client bindings reference, by transport. Every transport's binding
@@ -1230,12 +1227,12 @@ pub const RESOURCE_HELPER: &str = "edenPromiseResource";
 /// pulls the import in. Kept for transport-driven callers; the code-keyed
 /// [`client_runtime_imports_for_code`] is what the front-ends use.
 pub fn client_runtime_imports(fns: &[ServerFn]) -> String {
-    let needs_resource = fns.iter().any(|f| {
-        matches!(
-            f.transport,
-            TransportKind::Api | TransportKind::Stream | TransportKind::WebSocket
-        )
-    });
+    // Only the request/response (Api) binding wraps the promise-backed [`RESOURCE_HELPER`]; the Stream
+    // binding is a native async-iterable factory and the WebSocket binding opens a live socket, neither
+    // of which references the helper, so neither pulls the import in.
+    let needs_resource = fns
+        .iter()
+        .any(|f| matches!(f.transport, TransportKind::Api));
     client_runtime_imports_for(needs_resource)
 }
 

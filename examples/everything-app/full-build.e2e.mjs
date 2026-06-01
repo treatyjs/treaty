@@ -552,6 +552,49 @@ async function bootHeadless() {
 		}
 	}
 
+	// SERVER-FN STREAM TRANSPORT (real path, no client-side leak). The privacy fix extracts the
+	// `streamLogs` async-generator BODY to the server; the client keeps only an async-iterable binding
+	// that opens an `EventSource('/__server/streamLogs')` and yields each server-sent message. jsdom
+	// ships no `EventSource`, so we install a minimal one that plays the role of the axum SSE endpoint:
+	// it streams the SAME 10 `LogLine` frames the server fn (`src/server/logs.stream.ts`) would emit
+	// (seq 1..10, `message: "log line <seq>"`), then sends the `end` sentinel the binding watches for.
+	// This drives the EXTRACTED stream binding end-to-end at boot — the honest replacement for the old
+	// inlined-on-the-client body. No app/runtime code is touched; only the test host supplies the wire.
+	class TestEventSource {
+		constructor(url) {
+			this.url = String(url)
+			this.onmessage = null
+			this.onerror = null
+			this._listeners = { end: [] }
+			this._closed = false
+			// Emit the stream on microtask/macrotask ticks so the consumer's `for await` interleaves with
+			// Angular's change detection, exactly like a live SSE feed.
+			if (/\/__server\/streamLogs$/.test(this.url)) {
+				const levels = ['info', 'warn', 'error']
+				let seq = 1
+				const pump = () => {
+					if (this._closed) return
+					if (seq > 10) {
+						for (const fn of this._listeners.end) fn({ type: 'end' })
+						return
+					}
+					const data = JSON.stringify({ seq, level: levels[seq % levels.length], message: `log line ${seq}` })
+					if (typeof this.onmessage === 'function') this.onmessage({ data })
+					seq += 1
+					setTimeout(pump, 5)
+				}
+				setTimeout(pump, 5)
+			}
+		}
+		addEventListener(type, fn) {
+			;(this._listeners[type] ??= []).push(fn)
+		}
+		close() {
+			this._closed = true
+		}
+	}
+	setGlobal('EventSource', TestEventSource)
+
 	let consoleError = ''
 	const origError = console.error
 	console.error = (...args) => {
@@ -575,12 +618,13 @@ async function bootHeadless() {
 	await new Promise((r) => setTimeout(r, 600))
 	console.error = origError
 
-	// The LogViewer "" route streams `streamLogs(10)` (its async-generator body is inlined client-side
-	// in this example bundle), pushing 10 lines into the signal over microtasks. Give the generator a
-	// little extra time to fully drain so all 10 `<li>` rows are reconciled before we assert. If the
-	// track key were broken (item-first closure), the repeater reconciliation of equal/"" keys would
-	// have thrown NG0955 during one of these flushes.
-	for (let i = 0; i < 10; i++) {
+	// The LogViewer "" route `for await`s the EXTRACTED `streamLogs(10)` binding — an async iterable
+	// over the `EventSource('/__server/streamLogs')` feed (the body itself lives on the server; the
+	// `TestEventSource` above plays the SSE endpoint). Each yielded line pushes into the signal over
+	// macrotasks. Give the stream time to fully drain so all 10 `<li>` rows are reconciled before we
+	// assert. If the track key were broken (item-first closure), the repeater reconciliation of
+	// equal/"" keys would have thrown NG0955 during one of these flushes.
+	for (let i = 0; i < 16; i++) {
 		await new Promise((r) => setTimeout(r, 60))
 	}
 

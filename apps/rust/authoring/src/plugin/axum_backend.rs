@@ -15,16 +15,16 @@
 //!   verbatim (passthrough); `ts` (and any non-rust) bodies are transpiled via
 //!   [`super::ts_to_rust::transpile_body`], whose graceful `Default::default()` fallbacks keep the
 //!   generated Rust compiling.
-//! * **client bindings** — a typesafe resource-client binding map (`name` -> TS expression string).
-//!   Each fn becomes a typed signal-resource call typed to the response, built ONLY on symbols the
-//!   real `@treaty/httpclient` resources layer actually exports (`edenPromiseResource`) plus browser
-//!   globals (`fetch` / `EventSource` / `WebSocket`) — never an invented `httpClient`/`edenStreamResource`/
-//!   `edenWebSocket` shim. The Api binding `POST`s to `/__server/<name>` via `fetch` and wraps it in
-//!   `edenPromiseResource`; the Stream/WebSocket bindings open an `EventSource`/`WebSocket` and wrap
-//!   the connection in the same real `edenPromiseResource` (the runtime exposes no dedicated
-//!   streaming/duplex resource helper today — see the module note on `stream_client_binding`). This is
-//!   the typesafe resource-client binding, distinct from the Eden binding emitted by
-//!   [`super::ElysiaEdenPlugin`].
+//! * **client bindings** — a typesafe resource-client binding map (`name` -> TS expression string),
+//!   each shaped to the fn's TRANSPORT and built ONLY on symbols the real `@treaty/httpclient`
+//!   resources layer actually exports (`edenPromiseResource`) plus browser globals (`fetch` /
+//!   `EventSource` / `WebSocket`) — never an invented `httpClient`/`edenStreamResource`/`edenWebSocket`
+//!   shim. The Api binding `POST`s to `/__server/<name>` via `fetch` and wraps the one-shot response in
+//!   `edenPromiseResource`. The Stream binding is a native async-iterable factory backed by an
+//!   `EventSource` (consumed with `for await`), and the WebSocket binding opens a live `WebSocket` and
+//!   returns a duplex control handle — neither is a one-shot resource, so neither references the
+//!   resource helper (see `stream_client_binding` / `ws_client_binding`). This is the typesafe
+//!   resource-client binding, distinct from the Eden binding emitted by [`super::ElysiaEdenPlugin`].
 
 use std::collections::HashMap;
 
@@ -367,50 +367,110 @@ fn emit_ws_handler(f: &ServerFn) -> String {
 }
 
 /// The client-side binding for a [`TransportKind::Stream`] fn: a factory that opens an `EventSource`
-/// (a browser global) to the fn's `/__server/<name>` GET route and resolves the first streamed
-/// message, wrapped in the REAL `edenPromiseResource` export.
+/// (a browser global) to the fn's `/__server/<name>` GET route and returns a genuine multi-value
+/// **async iterable** over the streamed messages — the exact contract a stream-transport server fn
+/// presents to its caller (`for await (const x of streamFn(...))`).
 ///
-/// RUNTIME GAP (reported, not stubbed): `@treaty/httpclient` exports no DEDICATED streaming resource
-/// (`edenResource`/`edenHttpResource`/`edenPromiseResource` are all one-shot). Rather than invent an
-/// `edenStreamResource` shim, the binding routes the `EventSource` through the existing
-/// `edenPromiseResource`, which resolves the first server-sent message (the connection's first value).
-/// This boots without a ReferenceError and uses only real exports; a multi-value streaming resource
-/// awaits a dedicated `edenStreamResource` helper in `@treaty/httpclient` (out of this change's scope —
-/// the runtime package is not edited here).
+/// The server fn is authored as an async generator; its over-the-wire shape is therefore an async
+/// iterable, not a one-shot resource. The binding is a native async generator: each SSE `message`
+/// event is buffered and yielded in turn; the iterator settles (returns) when the server closes the
+/// stream by sending the sentinel `event: end`, and rejects on transport error. This needs only the
+/// `EventSource` browser global and built-in async iteration — no runtime helper and no stub — so it
+/// boots clean AND satisfies the consumer's `for await` use without resolving merely the first value.
+///
+/// ENVIRONMENT GUARD: `EventSource` is a browser-only global (absent under SSR / Node / jsdom). When it
+/// is not present the binding yields an empty async iterable (the `for await` completes immediately)
+/// rather than throwing `EventSource is not defined` — so a component that opens a stream in its
+/// constructor still boots in a non-browser host; the live stream attaches only where `EventSource`
+/// exists.
 fn stream_client_binding(f: &ServerFn) -> String {
     let route = format!("{SERVER_ROUTE_PREFIX}/{}", f.name);
     let arg_list = binding_arg_list(f);
+    // A self-contained async generator: an EventSource feeds a queue of pending values and a queue of
+    // waiting consumers; `next()` resolves from whichever is ready. `event: end` ends iteration and
+    // closes the socket; an error rejects the in-flight pull and closes the socket.
     format!(
-        "(({arg_list}) => edenPromiseResource(() => new Promise((resolve, reject) => {{ \
+        "(async function* ({arg_list}) {{ \
+         if (typeof EventSource === 'undefined') return; \
          const source = new EventSource('{route}'); \
-         source.onmessage = (event) => {{ resolve(JSON.parse(event.data)); source.close(); }}; \
-         source.onerror = (event) => {{ reject(event); source.close(); }}; \
-         }})))"
+         const values = []; const waiters = []; let done = false; let failure = null; \
+         const settle = () => {{ while (waiters.length) {{ const w = waiters.shift(); \
+         if (failure) w.reject(failure); else if (values.length) w.resolve({{ value: values.shift(), done: false }}); \
+         else if (done) w.resolve({{ value: undefined, done: true }}); else {{ waiters.unshift(w); break; }} }} }}; \
+         source.addEventListener('end', () => {{ done = true; source.close(); settle(); }}); \
+         source.onmessage = (event) => {{ values.push(JSON.parse(event.data)); settle(); }}; \
+         source.onerror = (event) => {{ failure = event; source.close(); settle(); }}; \
+         try {{ \
+         while (true) {{ \
+         if (values.length) {{ yield values.shift(); continue; }} \
+         if (failure) throw failure; \
+         if (done) return; \
+         const next = await new Promise((resolve, reject) => waiters.push({{ resolve, reject }})); \
+         if (next.done) return; yield next.value; \
+         }} \
+         }} finally {{ source.close(); }} \
+         }})"
     )
 }
 
-/// The client-side binding for a [`TransportKind::WebSocket`] fn: a factory that opens a `WebSocket`
-/// (a browser global) to the fn's `/__server/<name>` route and resolves once the socket is open,
-/// yielding the live socket, wrapped in the REAL `edenPromiseResource` export. The ws URL is derived
-/// inline from `location` (no invented `wsUrl` helper).
+/// The client-side binding for a [`TransportKind::WebSocket`] fn: a factory that opens a live
+/// `WebSocket` (a browser global) to the fn's `/__server/<name>` route and returns a duplex socket
+/// HANDLE — the real contract of a duplex server fn, not a one-shot resource.
 ///
-/// RUNTIME GAP (reported, not stubbed): `@treaty/httpclient` exports no DEDICATED duplex/WebSocket
-/// resource. Rather than invent an `edenWebSocket`/`wsUrl` shim, the binding builds the ws URL inline
-/// and routes the live `WebSocket` through the existing `edenPromiseResource`, which resolves once the
-/// socket opens. This boots without a ReferenceError and uses only real exports; a first-class duplex
-/// resource awaits a dedicated `edenWebSocket` helper in `@treaty/httpclient` (out of this change's
-/// scope — the runtime package is not edited here).
+/// A WebSocket server fn takes its non-callback args plus an event CALLBACK (a function-typed param,
+/// e.g. `onEvent: (e) => void`) and returns a control handle whose methods push messages to the peer.
+/// The binding mirrors that: the callback param (detected as the function-typed param — its type text
+/// contains `=>`) is wired to `socket.onmessage` (each parsed message is delivered to it); the returned
+/// handle is a `Proxy` that forwards EVERY method call (`announce(...)`, `close()`, …) to the server as
+/// a `{ method, args }` frame over the socket, with `close()` also closing the connection. The leading
+/// args are sent as an `init` frame once the socket opens. This needs only the `WebSocket` browser
+/// global — no runtime helper and no stub — so it boots clean and satisfies the consumer's
+/// `socket.announce(...)` / `socket.close()` usage instead of yielding a one-shot value.
+///
+/// ENVIRONMENT GUARD: `WebSocket` is a browser-only global (absent under SSR / Node / jsdom). When it
+/// is not present the binding returns an inert handle (a `Proxy` whose every method is a no-op) instead
+/// of throwing `WebSocket is not defined` — so a component that opens a channel in its constructor
+/// still boots in a non-browser host; the live duplex channel attaches only where `WebSocket` exists.
 fn ws_client_binding(f: &ServerFn) -> String {
     let route = format!("{SERVER_ROUTE_PREFIX}/{}", f.name);
     let arg_list = binding_arg_list(f);
+    // The callback param (function-typed) and the leading data args, by name.
+    let callback = f
+        .params
+        .iter()
+        .find(|p| p.ty.as_deref().is_some_and(|t| t.contains("=>")))
+        .map(|p| p.name.clone());
+    let init_args = f
+        .params
+        .iter()
+        .filter(|p| Some(&p.name) != callback.as_ref())
+        .map(|p| p.name.clone())
+        .collect::<Vec<_>>()
+        .join(", ");
+    // Deliver each parsed message to the callback if one was provided; otherwise just buffer-drop.
+    let on_message = match &callback {
+        Some(cb) => format!(
+            "socket.onmessage = (event) => {{ try {{ {cb}(JSON.parse(event.data)); }} catch (_e) {{ /* non-JSON frame */ }} }};",
+            cb = cb
+        ),
+        None => String::new(),
+    };
     format!(
-        "(({arg_list}) => edenPromiseResource(() => new Promise((resolve, reject) => {{ \
+        "(({arg_list}) => {{ \
+         if (typeof WebSocket === 'undefined') return new Proxy({{}}, {{ get: () => () => {{}} }}); \
          const scheme = (typeof location !== 'undefined' && location.protocol === 'https:') ? 'wss://' : 'ws://'; \
          const host = (typeof location !== 'undefined') ? location.host : ''; \
          const socket = new WebSocket(scheme + host + '{route}'); \
-         socket.onopen = () => resolve(socket); \
-         socket.onerror = (event) => reject(event); \
-         }})))"
+         const queue = []; let open = false; \
+         const flush = () => {{ while (open && queue.length) socket.send(queue.shift()); }}; \
+         const sendFrame = (frame) => {{ queue.push(JSON.stringify(frame)); flush(); }}; \
+         socket.onopen = () => {{ open = true; sendFrame({{ kind: 'init', args: [{init_args}] }}); }}; \
+         {on_message} \
+         return new Proxy({{}}, {{ get: (_t, method) => (...args) => {{ \
+         sendFrame({{ kind: 'call', method: String(method), args }}); \
+         if (method === 'close') {{ try {{ socket.close(); }} catch (_e) {{}} }} \
+         }} }}); \
+         }})"
     )
 }
 
@@ -583,16 +643,28 @@ mod tests {
             "no streaming route registration; got:\n{}",
             emit.server_module
         );
-        // The client binding opens an EventSource stream wrapped in the REAL `edenPromiseResource`
-        // export (no invented `edenStreamResource` shim).
+        // The client binding is a native async-iterable factory backed by `EventSource` — the real
+        // contract of a stream-transport (async-generator) server fn, consumed with `for await`. It
+        // needs no runtime helper, so it must NOT wrap a resource (no `edenPromiseResource`) and must
+        // NOT invent an `edenStreamResource` shim.
         let binding = emit.client_bindings.get("ticks").expect("binding for ticks");
         assert!(
             binding.contains("EventSource") && binding.contains("'/__server/ticks'"),
             "binding is not a stream subscription; got: {binding}"
         );
         assert!(
-            binding.contains("edenPromiseResource") && !binding.contains("edenStreamResource"),
-            "stream binding must wrap the real edenPromiseResource, not an invented edenStreamResource; got: {binding}"
+            binding.contains("async function*") && binding.contains("yield"),
+            "stream binding must be an async-iterable factory (async generator); got: {binding}"
+        );
+        assert!(
+            !binding.contains("edenPromiseResource") && !binding.contains("edenStreamResource"),
+            "stream binding must be a real async iterable, not a one-shot resource wrapper; got: {binding}"
+        );
+        // Non-browser hosts (SSR / jsdom) have no `EventSource`: the binding guards it and yields an
+        // empty iterable instead of throwing `EventSource is not defined` at boot.
+        assert!(
+            binding.contains("typeof EventSource === 'undefined'"),
+            "stream binding must guard a missing EventSource so it boots in non-browser hosts; got: {binding}"
         );
         assert_no_marker_words(&emit.server_module);
     }
@@ -630,18 +702,29 @@ mod tests {
             "no ws route registration; got:\n{}",
             emit.server_module
         );
-        // The client binding opens a WebSocket wrapped in the REAL `edenPromiseResource` export, with
-        // the ws URL derived inline (no invented `edenWebSocket`/`wsUrl` shim).
+        // The client binding opens a live WebSocket and returns a duplex control handle (a Proxy that
+        // forwards method calls to the peer) — NOT a one-shot resource. The ws URL is derived inline (no
+        // invented `edenWebSocket`/`wsUrl` shim) and it must not wrap `edenPromiseResource`.
         let binding = emit.client_bindings.get("chat").expect("binding for chat");
         assert!(
             binding.contains("WebSocket") && binding.contains("'/__server/chat'"),
             "binding is not a websocket; got: {binding}"
         );
         assert!(
-            binding.contains("edenPromiseResource")
+            binding.contains("new Proxy") && binding.contains("socket.send"),
+            "ws binding must return a duplex socket handle that forwards calls; got: {binding}"
+        );
+        assert!(
+            !binding.contains("edenPromiseResource")
                 && !binding.contains("edenWebSocket")
                 && !binding.contains("wsUrl("),
-            "ws binding must wrap the real edenPromiseResource, not an invented edenWebSocket/wsUrl; got: {binding}"
+            "ws binding must be a live duplex handle, not a one-shot resource wrapper; got: {binding}"
+        );
+        // Non-browser hosts (SSR / jsdom) have no `WebSocket`: the binding guards it and returns an
+        // inert handle instead of throwing `WebSocket is not defined` at boot.
+        assert!(
+            binding.contains("typeof WebSocket === 'undefined'"),
+            "ws binding must guard a missing WebSocket so it boots in non-browser hosts; got: {binding}"
         );
         assert_no_marker_words(&emit.server_module);
     }

@@ -836,13 +836,13 @@ export class AppModule {}\n";
     }
 
     #[test]
-    fn stream_consumer_client_emit_imports_resource_helper_no_free_reference() {
-        // PHASE 2 (the log-viewer boot crash): a `logs.stream.ts`-shaped FILE-LEVEL `'use server'`
-        // module with an `async function*` is lowered so the client keeps only the typed stream
-        // binding. That binding wraps `edenPromiseResource`; PARSE the emitted client and assert the
-        // symbol is bound by a real top-level `import` from the published `@treaty/httpclient` runtime
-        // (NOT a self-defined stub), so the module has no free/undefined reference to it and boots
-        // without `edenPromiseResource is not defined` (the original log-viewer ReferenceError).
+    fn stream_consumer_client_emit_is_async_iterable_no_free_reference() {
+        // PHASE 2/3 (the log-viewer boot + `for await` consumer): a `logs.stream.ts`-shaped FILE-LEVEL
+        // `'use server'` module with an `async function*` is lowered so the client keeps only the typed
+        // stream binding. A stream-transport fn is consumed with `for await`, so its binding is a native
+        // async-iterable factory backed by `EventSource` — it needs NO runtime helper, so the module has
+        // no free/undefined reference at all (the original `... is not defined` boot crash) and no
+        // self-defined stub. PARSE the emitted client to verify.
         let source = "'use server'\n\
 \n\
 export interface LogLine { readonly seq: number }\n\
@@ -856,27 +856,24 @@ export async function* streamLogs(count: number): AsyncGenerator<LogLine> {\n\
         let out = compile_angular_source(source, "logs.stream.ts");
         assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
 
-        // The emitted client parses and the binding references the resource helper.
+        // The emitted client parses and the binding is an async-iterable factory over an EventSource.
         assert_client_parses(&out.code);
         assert!(
-            out.code.contains("export const streamLogs =") && out.code.contains("edenPromiseResource"),
-            "no stream client binding wrapping the resource helper; got:\n{}",
+            out.code.contains("export const streamLogs =")
+                && out.code.contains("async function*")
+                && out.code.contains("EventSource")
+                && out.code.contains("'/__server/streamLogs'"),
+            "no async-iterable stream client binding backed by EventSource; got:\n{}",
             out.code
         );
-        // The reference is NOT free: the symbol is bound by a real top-level import from the runtime.
-        assert_imported_at_module_scope(&out.code, "edenPromiseResource");
+        // The stream binding references NO runtime resource helper, so none is imported and there is no
+        // free reference — and no INVENTED stub of any resource symbol survives.
         assert!(
-            out.code.contains("import { edenPromiseResource } from '@treaty/httpclient/resources'"),
-            "resource helper not imported from the real runtime module; got:\n{}",
-            out.code
-        );
-        // No INVENTED stub symbol survives (the forbidden self-defining prelude path).
-        assert!(
-            !out.code.contains("const edenPromiseResource =")
+            !out.code.contains("edenPromiseResource")
                 && !out.code.contains("edenStreamResource")
                 && !out.code.contains("edenWebSocket")
                 && !out.code.contains("httpClient"),
-            "an invented resource-client stub leaked into the client; got:\n{}",
+            "a resource-client symbol (helper or invented stub) leaked into a stream-only client; got:\n{}",
             out.code
         );
         // The stream body and its data never reach the client.
@@ -1207,25 +1204,23 @@ export function wsPresence(userId: string, onEvent: (e: PresenceEvent) => void) 
             !names.contains(&"wsPresence".to_string()),
             "wsPresence survived as a fn/arrow declaration (body present); got: {names:?}"
         );
-        // A typed WebSocket client binding is exported. It opens a `WebSocket` (browser global) and
-        // wraps it in the REAL `edenPromiseResource` export — no invented `edenWebSocket`/`wsUrl` shim.
+        // A typed WebSocket client binding is exported. It opens a live `WebSocket` (browser global) and
+        // returns a duplex control handle (a Proxy forwarding method calls to the peer) — the real
+        // duplex contract, NOT a one-shot resource. It needs no runtime helper.
         assert!(
             out.code.contains("export const wsPresence =")
                 && out.code.contains("WebSocket")
-                && out.code.contains("edenPromiseResource"),
-            "no ws client binding for wsPresence; got:\n{}",
+                && out.code.contains("new Proxy"),
+            "no duplex ws client binding for wsPresence; got:\n{}",
             out.code
         );
-        // The resource helper is IMPORTED from the published runtime (not a self-defined stub), so the
-        // binding resolves at boot (no `edenPromiseResource is not defined`).
+        // A ws-only module references no resource helper, so none is imported and no invented ws shim
+        // survives — there is no dangling reference at boot.
         assert!(
-            out.code.contains("import { edenPromiseResource } from '@treaty/httpclient/resources'"),
-            "ws binding runtime symbol not imported from the real runtime (would dangle at boot); got:\n{}",
-            out.code
-        );
-        assert!(
-            !out.code.contains("edenWebSocket") && !out.code.contains("wsUrl("),
-            "an invented ws shim leaked into the client; got:\n{}",
+            !out.code.contains("edenPromiseResource")
+                && !out.code.contains("edenWebSocket")
+                && !out.code.contains("wsUrl("),
+            "a resource-client symbol (helper or invented ws shim) leaked into a ws-only client; got:\n{}",
             out.code
         );
         // The exported interface (a pure type) survives for consumers.

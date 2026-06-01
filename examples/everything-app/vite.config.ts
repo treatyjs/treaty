@@ -18,11 +18,28 @@
  * then becomes a deployable remote with no other change. `mfConfig` is the exact
  * config that path would generate.
  */
+import { fileURLToPath } from 'node:url'
+import { dirname, join } from 'node:path'
+
 import { defineConfig } from 'vite'
 import treaty, { generateMfConfig } from '@treaty/vite'
 import type { MfOptions } from '@treaty/module-federation'
 
 import { appRoutes } from './federation/routes-bridge'
+
+const here = dirname(fileURLToPath(import.meta.url))
+// The Treaty compiler rewrites lifted server-fn call sites to typed client resource bindings that
+// `import { edenPromiseResource } from '@treaty/httpclient/resources'` — the real published runtime.
+// A consumer app resolves that through the installed `@treaty/httpclient` package's `exports` map; in
+// this monorepo example the runtime package is not built, so we resolve the subpath to its TypeScript
+// source (the same mapping `tsconfig.base.json` already declares for the typechecker). Vite's default
+// esbuild pipeline transforms the plain `.ts` runtime; the Treaty plugin owns only authoring formats.
+const edenSrc = join(here, '../../libs/treaty/edenclient/src')
+const httpclientAliases = [
+	{ find: '@treaty/httpclient/resources', replacement: join(edenSrc, 'resources.ts') },
+	{ find: '@treaty/httpclient/client', replacement: join(edenSrc, 'client.ts') },
+	{ find: '@treaty/httpclient', replacement: join(edenSrc, 'index.ts') },
+]
 
 /**
  * The auto-MF options for this app: a federation HOST that consumes the standalone
@@ -53,6 +70,12 @@ export default defineConfig({
 	build: {
 		target: 'es2022',
 		outDir: 'dist',
+	},
+	resolve: {
+		// `@treaty/httpclient` is a workspace TS package with no built dist in this example; resolve the
+		// resource-client subpath the compiler imports to its source so the lifted server-fn client
+		// bindings (edenPromiseResource) link in the real bundler build (mirrors tsconfig.base.json).
+		alias: httpclientAliases,
 	},
 	plugins: [
 		treaty({
