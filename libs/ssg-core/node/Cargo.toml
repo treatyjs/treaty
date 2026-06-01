@@ -1,0 +1,35 @@
+# `treaty_ssg_node` — the NAPI binding that exposes the pure Rust SSG core
+# (`treaty_ssg`, at `libs/ssg-core`) to JavaScript, so `@treaty/ssg` can become a
+# thin shim over it. See [[rust-core-ts-shim-layering]].
+#
+# DETACHED CRATE: the empty `[workspace]` table below makes this crate its own
+# workspace root, so it is NOT a member of the parent workspace and builds with
+# its OWN `target/` — independent of the in-flight authoring-addon edits a
+# concurrent workflow owns (the main `libs/authoring/node` addon depends on
+# `apps/rust/authoring`, which is dirty). Build with:
+#   napi build --cargo-cwd libs/ssg-core/node ...   (see package.json / build script)
+# or directly:
+#   cargo build --manifest-path libs/ssg-core/node/Cargo.toml --release
+#
+# It depends on `treaty_ssg` by path and carries NO other heavy deps: the binding
+# is pure glue (JSON in -> the `GeneratedSite` JSON out); all deterministic SSG
+# logic stays in `treaty_ssg`.
+[workspace]
+
+[package]
+name = "treaty_ssg_node"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+napi = { version = "2.16", default-features = false, features = ["napi4"] }
+napi-derive = "2.16"
+treaty_ssg = { path = ".." }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lib]
+crate-type = ["cdylib"]
+
+[build-dependencies]
+napi-build = "2.0.1"
