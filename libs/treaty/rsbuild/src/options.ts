@@ -14,14 +14,29 @@ import type { RoutesVirtualModuleOptions } from '@treaty/ts-vite'
 export const TREATY_EXTENSIONS = ['.treaty', '.tsx', '.tjsx'] as const
 
 /**
- * Default `test` regex matching every Treaty authoring extension. Plain `.ts`
- * `@Component` sources are intentionally *not* matched here: the core compiler
- * pre-screens `.ts` for an `@Component` decorator, but matching every `.ts`
- * file in an Rsbuild build would intercept the host's ordinary TypeScript
- * pipeline. Callers who want `.ts` `@Component` lowering can widen
- * {@link TreatyPluginOptions.include} explicitly.
+ * Default `test` regex matching every Treaty authoring extension
+ * (`.treaty`/`.tsx`/`.tjsx`) PLUS plain `.ts` — so a `.ts` Angular decorated class
+ * (`@Component`/`@Directive`/`@Pipe`/`@Injectable`/`@NgModule`) is lowered to its Ivy
+ * definition — while never matching a `.d.ts` declaration file (the `(?<!\.d)`
+ * look-behind).
+ *
+ * Matching every `.ts` is at PARITY with `@treaty/vite` (whose `classify` claims any
+ * non-`.d.ts` `.ts`) and does NOT intercept the host's ordinary TypeScript pipeline:
+ * ownership is decided one level down by the core compiler, not this regex. The
+ * registered `api.transform` handler hands a matched `.ts` to `compiler.transform`,
+ * which AST-screens for an Angular decorator and returns `null` for an ordinary `.ts`;
+ * the handler then returns that file's source UNCHANGED, so Rsbuild's normal SWC `.ts`
+ * loader transpiles it afterward exactly as before. An Angular `.ts` is the only kind
+ * actually rewritten — so the transform over a non-Angular `.ts` is a cheap
+ * classify + passthrough, not an interception.
+ *
+ * Without `.ts` here a decorated `.ts` `@Component` in a Treaty app on Rsbuild never
+ * reached the transform and fell through to SWC's raw decorator transform — shipping a
+ * decorated class with NO Ivy definition, so Angular dropped to its JIT compiler at
+ * runtime. Recognising `.ts` keeps the whole graph AOT. Callers can still narrow this
+ * via {@link TreatyPluginOptions.include}.
  */
-export const DEFAULT_TEST = /\.(treaty|tsx|tjsx)$/
+export const DEFAULT_TEST = /(?<!\.d)\.(treaty|tsx|tjsx|ts)$/
 
 /** Options accepted by {@link pluginTreaty}. */
 export interface TreatyPluginOptions extends TreatyCompilerOptions {
