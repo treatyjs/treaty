@@ -473,6 +473,11 @@ fn lower_jsx_expression(expression: &Expression, source: &str) -> Option<String>
 ///     envelope and the JSX `return` already removed);
 ///   * a sibling bare `export default <Component>;` re-exporting the component by name is DROPPED
 ///     (the backend emits its own default export);
+///   * a sibling NAMED `export` declaration (`export function highlight()`, `export const x = …`,
+///     `export async function loadGreeting$$()`) has its `export ` keyword STRIPPED — only the inner
+///     declaration is kept, so the helper becomes a plain component-body local rather than an illegal
+///     nested `export` inside the synthesized wrapper. A re-export with no inner declaration
+///     (`export { a }`, `export … from '…'`) carries nothing for the body and is dropped;
 ///   * every other statement (the author's `import`s, helper functions, type aliases, …) is kept
 ///     verbatim — `build_module` itself hoists any `import` declarations to module scope.
 ///
@@ -504,6 +509,25 @@ fn assemble_flat_body(
         // an unrelated `export default <expr>` is preserved (it would be a second component, out of
         // scope, and is harmless to keep).
         if is_default_export_of(stmt, component, class_name) {
+            continue;
+        }
+
+        // A sibling NAMED `export` declaration (`export function highlight()`, `export const x = …`,
+        // `export class Foo {}`, `export async function loadGreeting$$()`) is a helper the component
+        // body references (a `use:` directive function, an inline server fn, a constant). Its WHOLE
+        // statement — including the `export ` keyword — would otherwise be spliced into the body that
+        // the shared backend re-wraps in `function {Class}() { … }`, producing an illegal nested
+        // `export`. The backend hoists only `import`s to module scope, not these. So emit ONLY the
+        // inner declaration (sliced from the declaration's own span, which excludes the leading
+        // `export `): the helper becomes a plain component-body local — in scope for the component,
+        // with no surviving `export` keyword. A re-export with no inner declaration (`export { a }`,
+        // `export … from '…'`) carries nothing to keep in the body and is dropped.
+        if let Statement::ExportNamedDeclaration(export) = stmt {
+            if let Some(declaration) = &export.declaration {
+                let decl_span = oxc_span::GetSpan::span(declaration);
+                out.push_str(&source[decl_span.start as usize..decl_span.end as usize]);
+                out.push('\n');
+            }
             continue;
         }
 
@@ -1249,6 +1273,67 @@ export default function App() {\n\
             !code.contains("export default function App"),
             "author default-export function leaked into the body; got: {code}"
         );
+    }
+
+    #[test]
+    fn sibling_export_helper_is_stripped_not_nested() {
+        // The real `counter.tsx` shape: a sibling `export function highlight()` helper alongside the
+        // default-export component. Its `export ` keyword must be STRIPPED (kept as a plain body
+        // local), never spliced verbatim into the synthesized `function {Class}() { … }` wrapper —
+        // a nested `export` is illegal and was the second module-assembly bug.
+        let source = "import { signal } from '@angular/core';\n\
+export function highlight() {}\n\
+export default function counter() {\n\
+  const count = signal(0);\n\
+  return <button use:highlight>{count()}</button>;\n\
+}\n";
+        let out = compile(source, "counter.tsx");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+
+        assert_well_formed_module(code);
+        // The helper survives as a plain (non-export) declaration inside the wrapper.
+        assert!(code.contains("function highlight() {}"), "helper lost; got: {code}");
+        // No sibling `export function highlight` survives anywhere — it was de-exported.
+        assert!(
+            !code.contains("export function highlight"),
+            "sibling export not stripped (nested export bug); got: {code}"
+        );
+        assert!(code.contains("export default Counter;"), "no class default export; got: {code}");
+    }
+
+    #[test]
+    fn sibling_async_export_fn_is_stripped_not_nested() {
+        // The real `greeting-card.tjsx` shape: a sibling `export async function loadGreeting$$()`
+        // alongside the default-export component, referenced from the component body. The `export `
+        // keyword must be stripped so the async helper is a plain body local, not a nested export.
+        // (Helper signature is left untyped: the well-formed-module assertion re-parses as pure JS;
+        // TS annotations in the body are handled by the downstream TS pass and are verified through
+        // the esbuild `loader: 'ts'` JS harness, not here.)
+        let source = "import { signal } from '@angular/core';\n\
+export async function loadGreeting$$(name) {\n\
+  return { text: name };\n\
+}\n\
+export default function greetingCard() {\n\
+  const name = signal('Grace');\n\
+  const greet = async () => { await loadGreeting$$(name()); };\n\
+  return <button onClick={greet}>{name()}</button>;\n\
+}\n";
+        let out = compile(source, "greeting-card.tjsx");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+
+        assert_well_formed_module(code);
+        // The async helper survives as a plain body declaration (no `export` prefix).
+        assert!(
+            code.contains("async function loadGreeting$$"),
+            "async helper lost; got: {code}"
+        );
+        assert!(
+            !code.contains("export async function loadGreeting$$"),
+            "sibling async export not stripped (nested export bug); got: {code}"
+        );
+        assert!(code.contains("export default GreetingCard;"), "no class default export; got: {code}");
     }
 
     #[test]
