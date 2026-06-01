@@ -236,8 +236,70 @@ fn convert_expr<'a>(expr: &'a Expression<'a>) -> Option<Expr> {
             Some(callee.call_fn(args, false))
         }
         Expression::ParenthesizedExpression(p) => convert_expr(&p.expression),
+        // Inline arrow function — `(v) => v + 1`. Appears as an `@Input({transform})` value and
+        // as a host binding/listener handler. Lowered to an output-AST arrow (faithful to ngtsc
+        // copying the function node through to the emitted metadata); the body covers both the
+        // expression-bodied (`x => expr`) and block (`x => { ... }`) forms.
+        Expression::ArrowFunctionExpression(arrow) => {
+            let params = convert_fn_params(&arrow.params)?;
+            let body = convert_arrow_body(arrow)?;
+            Some(o::arrow_fn(params, body, None))
+        }
+        // Inline function expression — `function (v) { return v + 1; }`. The block body is the
+        // only valid form (a function expression always has a body).
+        Expression::FunctionExpression(func) => {
+            let params = convert_fn_params(&func.params)?;
+            let body = convert_fn_body_stmts(func.body.as_ref()?)?;
+            Some(o::fn_(params, body, None, None))
+        }
         _ => None,
     }
+}
+
+/// Convert OXC formal parameters to output-AST [`FnParam`]s. Returns `None` for any non-simple
+/// binding (destructuring, defaults) we do not model — ngtsc only ever copies through the simple
+/// parameter shapes that appear in a `transform`/host-handler function.
+fn convert_fn_params(params: &oxc_ast::ast::FormalParameters) -> Option<Vec<FnParam>> {
+    let mut out = Vec::with_capacity(params.items.len());
+    for item in &params.items {
+        let id = item.pattern.get_binding_identifier()?;
+        out.push(FnParam::new(id.name.to_string(), Some(o::dynamic_type())));
+    }
+    Some(out)
+}
+
+/// Build the [`o::ArrowBody`] for an arrow function: an expression body (`x => expr`) becomes
+/// [`o::ArrowBody::Expr`]; a block body (`x => { ... }`) becomes [`o::ArrowBody::Block`].
+fn convert_arrow_body(arrow: &oxc_ast::ast::ArrowFunctionExpression) -> Option<o::ArrowBody> {
+    if arrow.expression {
+        if let Some(Statement::ExpressionStatement(stmt)) = arrow.body.statements.first() {
+            return Some(o::ArrowBody::Expr(Box::new(convert_expr(&stmt.expression)?)));
+        }
+    }
+    let stmts = convert_fn_body_stmts(&arrow.body)?;
+    Some(o::ArrowBody::Block(stmts))
+}
+
+/// Convert a function/arrow block body's statements. Supports the small statement subset that
+/// appears in transform/host-handler bodies: `return expr;` and bare expression statements.
+fn convert_fn_body_stmts(body: &oxc_ast::ast::FunctionBody) -> Option<Vec<o::Stmt>> {
+    let mut stmts = Vec::with_capacity(body.statements.len());
+    for stmt in &body.statements {
+        match stmt {
+            Statement::ReturnStatement(ret) => {
+                // `StmtKind::Return` carries the returned expression; a value-less `return;` has
+                // no output-AST representation, so decline it (the metadata is dropped, never
+                // mis-emitted).
+                let value = convert_expr(ret.argument.as_ref()?)?;
+                stmts.push(o::Stmt::bare(o::StmtKind::Return(value)));
+            }
+            Statement::ExpressionStatement(stmt) => {
+                stmts.push(convert_expr(&stmt.expression)?.to_stmt());
+            }
+            _ => return None,
+        }
+    }
+    Some(stmts)
 }
 
 /// Parse the `@Component({ foreignImports: [...] })` array into [`R3ForeignComponentMetadata`].
