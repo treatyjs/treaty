@@ -6,7 +6,8 @@
  * through this single seam; the compiler is never reimplemented in TypeScript.
  *
  * The addon's entry points map onto the file kinds Treaty owns:
- *   - `compileTreatyFile`      -> `.treaty` single-file components
+ *   - `compile` (unified)      -> `.treaty` single-file components (server-block
+ *     aware) as well as the `.tsx`/`.tjsx`/`.ts` extensions below
  *   - `compileComponentSource` -> `.ts` `@Component` and legacy authoring
  *   - `compileComponent`       -> template/selector/className triples
  *   - `compile`                -> the *unified* authoring front-end: full source
@@ -24,7 +25,6 @@ import {
 	compileComponent,
 	compileComponentSource,
 	compileMany as compileManyNative,
-	compileTreatyFile,
 } from '@treaty/authoring-node'
 
 /** Result of a single compilation: emitted Ivy JS plus any compiler errors. */
@@ -64,9 +64,23 @@ export interface CompiledAuthoringEntry extends CompiledAuthoring {
 	readonly id: string
 }
 
-/** Compile a `.treaty` single-file component by name. */
-export function compileTreaty(source: string, fileName: string): CompiledComponent {
-	return compileTreatyFile(source, fileName)
+/**
+ * Compile a `.treaty` single-file component by name.
+ *
+ * Routes through the *unified* authoring front-end ({@link compileUnifiedSource})
+ * rather than the raw `compileTreatyFile` entry. The unified path is server-block
+ * aware: it lifts a top-level `server { … }` block out of the `.treaty` source
+ * before lowering, so the emitted client module never carries a raw `server { … }`
+ * statement (nor leaks the body's `import` declarations into the synthesized
+ * component function — which is illegal JS and made esbuild fail with
+ * `Unexpected "{"`), and the extracted backend module is surfaced as
+ * {@link CompiledAuthoring.serverModule}. Behaviour for a `.treaty` file WITHOUT a
+ * server block is identical to the raw entry (the source compiles unchanged), so
+ * this is a strict superset reached by every owned-extension caller via
+ * {@link compileUnifiedSource}.
+ */
+export function compileTreaty(source: string, fileName: string): CompiledAuthoring {
+	return compileUnified(source, fileName)
 }
 
 /**

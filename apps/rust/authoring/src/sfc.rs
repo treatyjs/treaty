@@ -556,7 +556,16 @@ fn compile_treaty_file_inner(
     file_name: &str,
     source_map: Option<(&str, &str)>,
 ) -> (CompiledComponent, Option<String>) {
-    let chunks = split_chunks(source);
+    // A `.treaty` SFC may carry a top-level `server { … }` block. Even on this server-UNAWARE
+    // entry the block must be lifted out of the client source before lowering: left in place it is
+    // not valid JS in the synthesized component function (`server { async function … }` makes the
+    // body JS chunk fail to parse, so `extract_wrapper_parts` extracts nothing and the body's
+    // `import` declarations leak verbatim INTO the component function — illegal, and esbuild rejects
+    // it with `Unexpected "{"`). Stripping the block here keeps every `.treaty` entry point emitting
+    // valid client JS; the server MODULE itself is still emitted only by the server-aware
+    // `compile_treaty_authoring` path.
+    let client_source = extract_server_block(source).client_source;
+    let chunks = split_chunks(&client_source);
     let class_name = to_pascal_case(file_name);
 
     let template_html = chunks.html.join("");
@@ -1401,6 +1410,61 @@ import { Bar } from './bar';\n\
             !code.contains("dependencies"),
             "dependencies emitted for an unused import; got: {code}"
         );
+    }
+
+    #[test]
+    fn treaty_macro_imports_and_server_block_emit_valid_js_on_raw_entry() {
+        // A `.treaty` combining (1) a top ```-fenced macro block, (2) `import` declarations,
+        // (3) a `server { … }` block, and (4) TS-typed body code is the greeter.treaty shape that
+        // crashed the dev-serve esbuild type-strip with `Unexpected "{"`. The cause: the raw
+        // (server-UNAWARE) entry left the `server { … }` block inside the synthesized component
+        // function, which made the body JS chunk fail to parse, so the body's `import` declarations
+        // leaked verbatim INTO the function (illegal). The raw entry must now lift the server block
+        // and hoist imports to module scope so the emit is valid JS.
+        let source = "```\nconst palette = ['#000']\nconst macroMeta = { palette }\n```\n\
+import { signal, computed } from '@angular/core'\n\
+import { type Greeting } from './greeting.types'\n\
+const name = signal('Ada')\n\
+const greeting = signal<Greeting | null>(null)\n\
+server {\n\
+  async function greet(who: string): Promise<Greeting> { return { text: who }; }\n\
+}\n\
+async function sayHello(): Promise<void> { greeting.set(await greet(name())); }\n\
+<section><h2>{{ name() }}</h2></section>\n";
+
+        // The RAW (server-unaware) entry that the dev-serve `.treaty` path historically used.
+        let out = compile_treaty_file(source, "greeter.treaty");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+
+        // No raw `server { … }` statement survives into the client module.
+        assert!(
+            !code.contains("server {"),
+            "raw server block leaked into client module; got: {code}"
+        );
+
+        // Imports are at MODULE scope (before the component function), never inside it.
+        let fn_idx = code.find("function Greeter() {").expect("no component fn wrapper");
+        let signal_import = "import { signal, computed } from '@angular/core'";
+        let import_idx = code.find(signal_import).expect("signal import missing");
+        assert!(
+            import_idx < fn_idx,
+            "an import leaked into the component function body; got: {code}"
+        );
+
+        // PARSE the emit as a TS module via oxc — no stray braces, no in-function imports.
+        let allocator = Allocator::default();
+        let module_type = SourceType::default().with_typescript(true).with_module(true);
+        let parsed = JsParser::new(&allocator, code, module_type).parse();
+        assert!(
+            parsed.errors.is_empty(),
+            "greeter-shaped emit did not parse as valid TS module: {:?}\n--- code ---\n{code}",
+            parsed.errors
+        );
+
+        // The component still lowered (defineComponent present, template bound to ctx.name).
+        assert!(code.contains(DEFINE), "no defineComponent; got: {code}");
+        assert!(code.contains("ctx.name"), "template not bound; got: {code}");
     }
 
     #[test]
