@@ -95,11 +95,9 @@ function wireNodeModules() {
     '@angular/common',
     '@angular/router',
     '@angular/platform-browser',
-    '@angular/compiler-cli',
     'rxjs',
     'tslib',
     'jsdom',
-    '@babel/core',
   ]) {
     linkInto(nm, name, resolvePkgDir(name));
   }
@@ -153,16 +151,17 @@ function collectJs() {
 }
 
 // ---------------------------------------------------------------------------
-// Step 3a: backend primacy assertions.
+// Step 3a: backend assertions.
 //
-// Prove the Rust/NAPI addon (`@treaty/authoring-node`.linkPartial) is the PRIMARY linker and that the
-// Babel (`@angular/compiler-cli`) backend runs ONLY to finish residual `ɵɵngDeclare*` the Rust linker
-// leaves. We exercise the SAME dist module the Vite build loaded (so `getLinkBackend` reads the same
-// in-process backend record the build populated) plus a direct probe of the addon.
+// Linking lives ENTIRELY in Rust now: the complete `@treaty/authoring-node`.linkPartial de-partials
+// every `ɵɵngDeclare*` kind (Factory/Injectable/Injector/NgModule/Pipe/Directive/Component/
+// ClassMetadata) to ZERO residual. There is no Babel finisher on the hot path. We exercise the SAME
+// dist module the Vite build loaded (so `getLinkBackend` reads the same in-process backend record the
+// build populated) plus a direct probe of the addon.
 // ---------------------------------------------------------------------------
 const pluginDistPath = join(repoRoot, 'libs/typescript/vite/dist/index.js');
 function assertBackends() {
-  // (a) The addon's linkPartial export exists and is the primary backend.
+  // (a) The addon's linkPartial export exists and is the only backend.
   let addonLinkPartial = null;
   try {
     addonLinkPartial = req('@treaty/authoring-node').linkPartial;
@@ -170,12 +169,12 @@ function assertBackends() {
     /* reported below */
   }
   check(
-    'Rust addon @treaty/authoring-node.linkPartial is available (primary backend)',
+    'Rust addon @treaty/authoring-node.linkPartial is available (the linker)',
     typeof addonLinkPartial === 'function',
   );
 
-  // (b) The addon links the DI/pipe family to AOT itself, and leaves only the component/directive
-  //     residual for Babel - i.e. Rust does real work as the primary backend, not a pass-through.
+  // (b) The Rust addon links the WHOLE `ɵɵngDeclare*` family itself to zero residual - DI/pipe AND
+  //     directive/component - so there is no residual left for any other backend to finish.
   if (typeof addonLinkPartial === 'function') {
     const probe = [
       `import * as i0 from '@angular/core';`,
@@ -186,24 +185,24 @@ function assertBackends() {
     ].join('\n');
     const out = addonLinkPartial(probe, '/probe/common.mjs');
     check('Rust addon links the DI/pipe family itself (ɵɵdefineInjectable)', out.code.includes('ɵɵdefineInjectable'));
+    check('Rust addon links the directive family itself (ɵɵdefineDirective)', out.code.includes('ɵɵdefineDirective'));
     check(
-      'Rust addon leaves only component/directive residual for Babel to finish',
-      out.code.includes('ɵɵngDeclareDirective'),
+      'Rust addon leaves ZERO residual ɵɵngDeclare* (no Babel finisher needed)',
+      !/ɵɵngDeclare[A-Za-z]+/.test(out.code),
       `residual=${(out.code.match(/ɵɵngDeclare[A-Za-z]+/g) || []).join(',') || 'none'}`,
     );
   }
 
   // (c) Drive the dist plugin's own linker over real Angular library modules and read back which
-  //     backend handled each (same dist module instance, so `getLinkBackend` sees what `linkPartialCode`
-  //     just recorded). The Rust addon is the PRIMARY backend (always tried first) and OWNS every
-  //     module it can fully link (`rust`); Babel links only modules Rust cannot yet fully link
-  //     (`babel`). Proof of primacy: real Angular modules link ENTIRELY via Rust (`rust`), i.e. the
-  //     Rust linker does real work and is not a Babel pass-through.
+  //     backend handled each (same dist module instance, so `getLinkBackend` sees what
+  //     `linkPartialCode` just recorded). The Rust addon is the ONLY backend and OWNS every module it
+  //     links (`rust`). Proof: real Angular modules link ENTIRELY via Rust.
   const dist = req(pluginDistPath);
   check('dist exports getLinkBackend (backend observability)', typeof dist.getLinkBackend === 'function');
   check('dist exports linkPartialCode (linker entry)', typeof dist.linkPartialCode === 'function');
+  check('dist exports isPartialModule (shared partial detector)', typeof dist.isPartialModule === 'function');
   if (typeof dist.getLinkBackend === 'function' && typeof dist.linkPartialCode === 'function') {
-    const counts = { rust: 0, babel: 0 };
+    const counts = { rust: 0 };
     for (const pkg of ['@angular/common', '@angular/router', '@angular/platform-browser']) {
       const dir = resolvePkgDir(pkg);
       if (!dir || !existsSync(join(dir, 'fesm2022'))) continue;
@@ -221,13 +220,9 @@ function assertBackends() {
       }
     }
     check(
-      'Rust primary backend fully links real Angular library modules (real Rust work, not a Babel pass-through)',
+      'Rust linker fully links real Angular library modules (Rust-only, no Babel)',
       counts.rust > 0,
-      `rust=${counts.rust} babel=${counts.babel}`,
-    );
-    check(
-      'every partial Angular module was attributed to a backend (Rust primary, Babel finisher)',
-      counts.rust + counts.babel > 0,
+      `rust=${counts.rust}`,
     );
   }
 }

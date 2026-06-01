@@ -2,6 +2,7 @@ export {
   angular,
   linkAngularPartials,
   getLinkBackend,
+  isPartialModule,
   linkPartialCode,
   type LinkBackend,
 };
@@ -13,7 +14,12 @@ import { DevelopmentPlugin } from './devPlugin';
 import { DevServePlugin } from './devServePlugin';
 import { LinkPartialPlugin } from './linkPartialPlugin';
 import { TsLoaderPlugin } from './tsLoaderPlugin';
-import { getLinkBackend, linkPartialCode, type LinkBackend } from './linkPartial';
+import {
+  getLinkBackend,
+  isPartialModule,
+  linkPartialCode,
+  type LinkBackend,
+} from './linkPartial';
 
 /**
  * The full `@treaty/ts-vite` Angular plugin set.
