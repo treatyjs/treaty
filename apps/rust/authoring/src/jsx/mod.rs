@@ -756,10 +756,10 @@ export default function counter() {\n  return <section>hi</section>;\n}\n";
             "the sibling `highlight` must not become the component class; got: {}",
             out.code
         );
-        // The selector is the kebab filename, not Angular's `ng-component` default.
+        // The selector is the filename-derived multi-form selector, not Angular's `ng-component`.
         assert!(
-            out.code.contains("selectors: [[\"counter\"]]"),
-            "expected derived `counter` selector; got: {}",
+            out.code.contains("\"counter\"") && out.code.contains("\"Counter\""),
+            "expected derived multi-form selector (counter/Counter); got: {}",
             out.code
         );
         assert!(
@@ -781,8 +781,10 @@ export default function counter() {\n  return <section>hi</section>;\n}\n";
             out.code
         );
         assert!(
-            out.code.contains("selectors: [[\"greeting-card\"]]"),
-            "expected derived `greeting-card` selector; got: {}",
+            out.code.contains("\"greeting-card\"")
+                && out.code.contains("\"greetingCard\"")
+                && out.code.contains("\"GreetingCard\""),
+            "expected derived multi-form selector (greeting-card/greetingCard/GreetingCard); got: {}",
             out.code
         );
     }

@@ -268,11 +268,18 @@ pub fn resolve_template_dependencies(
         .map(|d| d.name)
         .collect();
 
-    // `<foo>` / `<foo-bar>` elements: PascalCase-fold each element tag and treat a hit against the
-    // candidate set as a usage (these parse as `Element`, not selectorless `Component`, nodes).
-    let candidate_set: std::collections::HashSet<&str> =
-        ordered.iter().map(String::as_str).collect();
-    collect_element_tag_usages(nodes, &candidate_set, &mut used);
+    // `<foo>` / `<foo-bar>` / `<fooBar>` elements: PascalCase-fold each element tag and treat a hit
+    // against the candidate set as a usage (these parse as `Element`, not selectorless `Component`,
+    // nodes). The candidate import name is itself folded (so a camelCase import like `greetingCard`
+    // — folding to `GreetingCard` — matches a `<greetingCard>`/`<greeting-card>`/`<GreetingCard>`
+    // tag), and the ORIGINAL (unfolded) name is recorded so the final `dependencies` filter, which
+    // keys on the import name, still emits it. Without folding both sides a camelCase-imported
+    // selectorless component is silently dropped from `dependencies` and renders as an empty element.
+    let candidate_by_pascal: std::collections::HashMap<String, &str> = ordered
+        .iter()
+        .map(|n| (tag_to_pascal_case(n), n.as_str()))
+        .collect();
+    collect_element_tag_usages(nodes, &candidate_by_pascal, &mut used);
 
     // Emit one dependency per matched candidate, in candidate (import) order.
     ordered
@@ -289,16 +296,25 @@ pub fn resolve_template_dependencies(
 /// candidate class-name set. Mirrors the selectorless match for kebab/camel-spelled usages.
 fn collect_element_tag_usages(
     nodes: &[crate::template::r3_ast::Node],
-    candidates: &std::collections::HashSet<&str>,
+    candidates: &std::collections::HashMap<String, &str>,
     used: &mut std::collections::HashSet<String>,
 ) {
     use crate::template::r3_ast::Node;
     for node in nodes {
         match node {
             Node::Element(el) => {
-                let pascal = tag_to_pascal_case(&el.name);
-                if candidates.contains(pascal.as_str()) {
-                    used.insert(pascal);
+                // Only a CUSTOM element tag — one that carries an uppercase letter (`greetingCard`)
+                // or a hyphen (`greeting-card`) — can be a selectorless component reference. A plain
+                // lowercase HTML element (`input`, `div`, `span`) is NEVER a component, even when a
+                // same-named symbol is imported (e.g. the `input()` signal-forms function): folding
+                // `<input>` to `Input` must not match an `input` import.
+                let is_custom_tag =
+                    el.name.contains('-') || el.name.chars().any(|c| c.is_ascii_uppercase());
+                if is_custom_tag {
+                    let pascal = tag_to_pascal_case(&el.name);
+                    if let Some(orig) = candidates.get(&pascal) {
+                        used.insert((*orig).to_string());
+                    }
                 }
                 // ATTRIBUTE-selector auto-import: an imported directive whose class name folds to
                 // an attribute used on this element (e.g. `RouterLink` ↔ `routerLink="/x"`, or the
@@ -392,7 +408,7 @@ fn collect_element_tag_usages(
 /// underlying name, so both forms resolve identically here.
 fn collect_attr_name_usages<'a>(
     names: impl Iterator<Item = &'a str>,
-    candidates: &std::collections::HashSet<&str>,
+    candidates: &std::collections::HashMap<String, &str>,
     used: &mut std::collections::HashSet<String>,
 ) {
     for name in names {
@@ -403,8 +419,13 @@ fn collect_attr_name_usages<'a>(
             continue;
         }
         let pascal = tag_to_pascal_case(bare);
-        if candidates.contains(pascal.as_str()) {
-            used.insert(pascal);
+        // Attribute-selector auto-import matches only a PascalCase directive candidate
+        // (`RouterLink` ↔ `routerLink`). A non-Pascal import (a function like `input`) must NOT be
+        // pulled in by a same-folding attribute name, so require the candidate to equal its own fold.
+        if let Some(orig) = candidates.get(&pascal) {
+            if *orig == pascal {
+                used.insert((*orig).to_string());
+            }
         }
     }
 }

@@ -12,7 +12,7 @@ use oxc_span::SourceType;
 use treaty_ivy::source_compile::compile_component_source_with_map_and_selector;
 
 use crate::plugin::{extract_server_block, rewrite_call_sites, PluginRegistry};
-use crate::sfc::to_kebab_case;
+use crate::sfc::to_multi_selector;
 use crate::source_map::redact_server_bodies_in_map;
 use crate::CompiledAuthoring;
 
@@ -165,11 +165,12 @@ pub fn compile_angular_component_with(
     let extraction = extract_server_block(source);
 
     // A SELECTORLESS `@Component` (no `selector` in its decorator) adopts the filename-derived
-    // kebab selector — the same Treaty convention the `.treaty`/`.tsx`/`.tjsx` front-ends apply —
-    // so a bootstrapped selectorless `.ts` component renders a real host tag instead of Angular's
-    // `ng-component` default. A component that DECLARES a selector keeps it (the facade only
-    // substitutes when the decorator omits one), so explicit-selector `.ts` files are untouched.
-    let default_selector = to_kebab_case(file_name);
+    // multi-selector (kebab/camel/Pascal) — the same Treaty convention the `.treaty`/`.tsx`/`.tjsx`
+    // front-ends apply — so a bootstrapped selectorless `.ts` component renders a real host tag
+    // instead of Angular's `ng-component` default, and a parent may reference it by any name spelling.
+    // A component that DECLARES a selector keeps it (the facade only substitutes when the decorator
+    // omits one), so explicit-selector `.ts` files are untouched.
+    let default_selector = to_multi_selector(file_name);
 
     if extraction.server_fns.is_empty() {
         // No server block: compile with the additive v3 map and pass it through UNCHANGED.
@@ -289,7 +290,7 @@ pub fn compile_angular_source(source: &str, file_name: &str) -> CompiledAuthorin
     // definition (`ɵɵdefineDirective`/`ɵɵdefinePipe`/`ɵfac`+`ɵɵdefineInjectable`/`ɵɵdefineNgModule`).
     // These kinds never carry a `server { … }` block, so the cleaned client source IS the source.
     if !kinds.is_empty() {
-        let default_selector = to_kebab_case(file_name);
+        let default_selector = to_multi_selector(file_name);
         let compiled = compile_component_source_with_map_and_selector(
             source,
             GENERATED_NAME,
@@ -651,9 +652,13 @@ export class AppComponent {}\n";
 export class LogViewer { x = 1; }\n";
         let out = compile_angular_source(source, "log-viewer.component.ts");
         assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        // Multi-form selector (kebab/camel/Pascal) so a parent may reference the selectorless
+        // component as `<log-viewer>`, `<logViewer>` OR `<LogViewer>`.
         assert!(
-            out.code.contains("selectors: [[\"log-viewer\"]]"),
-            "expected filename-derived `log-viewer` selector; got: {}",
+            out.code.contains("\"log-viewer\"")
+                && out.code.contains("\"logViewer\"")
+                && out.code.contains("\"LogViewer\""),
+            "expected filename-derived multi-form selector (log-viewer/logViewer/LogViewer); got: {}",
             out.code
         );
         assert!(

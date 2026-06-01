@@ -261,6 +261,41 @@ pub fn to_kebab_case(file_name: &str) -> String {
     }
 }
 
+/// The SELECTORLESS default selector for `file_name`: a comma-separated CSS selector list covering
+/// the component name's kebab-case, camelCase and PascalCase forms, so a parent can reference the
+/// child with ANY of `<greeting-card>`, `<greetingCard>` or `<GreetingCard>` (Treaty's selectorless
+/// convention — "use the class name as the selector in kebab/camel/pascal"). The R3 selector parser
+/// splits the comma list into one selector entry per form (`parse_css_selectors`), so the emitted
+/// `selectors: [["greeting-card"],["greetingCard"],["GreetingCard"]]` matches every spelling.
+/// Single-word names collapse (kebab == camel) to two entries (`greeter, Greeter`).
+pub fn to_multi_selector(file_name: &str) -> String {
+    let kebab = to_kebab_case(file_name);
+    // PascalCase by upper-casing each kebab segment's first letter; camelCase lower-cases Pascal's.
+    let mut pascal = String::new();
+    for seg in kebab.split('-').filter(|s| !s.is_empty()) {
+        let mut chars = seg.chars();
+        if let Some(first) = chars.next() {
+            pascal.extend(first.to_uppercase());
+            pascal.push_str(chars.as_str());
+        }
+    }
+    let camel = {
+        let mut chars = pascal.chars();
+        match chars.next() {
+            Some(first) => first.to_lowercase().chain(chars).collect::<String>(),
+            None => String::new(),
+        }
+    };
+    // Deduplicate while preserving order (kebab, camel, pascal); a single-word name has kebab == camel.
+    let mut forms: Vec<String> = Vec::new();
+    for form in [kebab, camel, pascal] {
+        if !form.is_empty() && !forms.contains(&form) {
+            forms.push(form);
+        }
+    }
+    forms.join(", ")
+}
+
 /// Recognizes a signal initializer call: `input()`, `input.required()`, `model()`,
 /// `model.required()`, `output()`. Returns the base callee identifier (`input`/`model`/`output`)
 /// and whether `.required` was used. Mirrors `treaty_ivy::source_compile::signal_call`.
@@ -942,14 +977,17 @@ fn compile_from_parts_inner(
     // component a real host tag instead of Angular's `ng-component` no-selector default — while
     // sibling components still resolve selectorlessly by class name through the binder, so the
     // derived selector never has to be referenced explicitly in a template.
-    let derived_selector = to_kebab_case(file_name);
+    // A multi-form selector (kebab/camel/Pascal) so a parent can reference this selectorless child as
+    // `<greeting-card>`, `<greetingCard>` OR `<GreetingCard>` and Angular's runtime selector matcher
+    // binds it whichever spelling the author used.
+    let derived_selector = to_multi_selector(file_name);
     let base = R3DirectiveMetadata {
         name: class_name.to_string(),
         ty: class_ref(class_name),
         type_argument_count: 0,
         type_source_span: ParseSourceSpan::new(0, 0),
         deps: Deps::None,
-        // Filename-derived element selector (kebab-case) when the author gives none.
+        // Filename-derived element selector (kebab/camel/Pascal multi-selector) when the author gives none.
         selector: Some(derived_selector),
         queries: Vec::new(),
         view_queries: Vec::new(),
@@ -1207,8 +1245,10 @@ mod tests {
         let out = compile_treaty_file(source, "log-viewer.component.treaty");
         assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
         assert!(
-            out.code.contains("selectors: [[\"log-viewer\"]]"),
-            "expected derived `log-viewer` selector; got: {}",
+            out.code.contains("\"log-viewer\"")
+                && out.code.contains("\"logViewer\"")
+                && out.code.contains("\"LogViewer\""),
+            "expected derived multi-form selector (log-viewer/logViewer/LogViewer); got: {}",
             out.code
         );
         assert!(
@@ -1222,12 +1262,14 @@ mod tests {
     fn compile_from_parts_derives_selector_for_each_format_stem() {
         // The shared backend funnel derives the selector from `file_name` for any selectorless
         // authoring format (the `.tsx`/`.tjsx` paths reach the same `compile_from_parts`).
+        // Each selectorless format derives a multi-form selector: the kebab form plus the PascalCase
+        // form (single-word names collapse kebab == camel, so only kebab + Pascal differ).
         let cases = [
-            ("counter.tsx", "counter"),
-            ("greeting-card.tjsx", "greeting-card"),
-            ("gauge.treaty", "gauge"),
+            ("counter.tsx", "counter", "Counter"),
+            ("greeting-card.tjsx", "greeting-card", "GreetingCard"),
+            ("gauge.treaty", "gauge", "Gauge"),
         ];
-        for (file_name, selector) in cases {
+        for (file_name, kebab, pascal) in cases {
             let compiled = compile_from_parts(
                 "Counter",
                 "const x = 1;",
@@ -1236,10 +1278,9 @@ mod tests {
                 file_name,
             );
             assert!(
-                compiled
-                    .code
-                    .contains(&format!("selectors: [[\"{selector}\"]]")),
-                "{file_name}: expected selector `{selector}`; got: {}",
+                compiled.code.contains(&format!("\"{kebab}\""))
+                    && compiled.code.contains(&format!("\"{pascal}\"")),
+                "{file_name}: expected multi-form selector with `{kebab}` and `{pascal}`; got: {}",
                 compiled.code
             );
         }

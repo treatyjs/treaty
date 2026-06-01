@@ -3659,6 +3659,34 @@ mod tests {
     }
 
     #[test]
+    fn auto_imports_camelcase_selectorless_tag_into_dependencies() {
+        // Regression (empty `<greetingCard>` in the browser): a CAMELCASE selectorless child usage
+        // (`<greetingCard>`, which parses as an Element, not a Component, node) was PascalCase-folded
+        // to "GreetingCard" and compared against the camelCase IMPORT name "greetingCard" — never
+        // equal — so it was silently dropped from `dependencies` and rendered as an empty element.
+        // Folding BOTH the tag AND the candidate import name fixes it: a PascalCase `<Greeter>` AND a
+        // camelCase `<greetingCard>` usage must both land in `dependencies`.
+        let src = r#"
+            import Greeter from "./greeter";
+            import greetingCard from "./greeting-card";
+            @Component({template:"<Greeter></Greeter><greetingCard></greetingCard>"})
+            export class C {}
+        "#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let deps = extract_balanced(&out.code, "dependencies:")
+            .unwrap_or_else(|| panic!("no dependencies array; got: {}", out.code));
+        assert!(
+            deps.contains("Greeter"),
+            "PascalCase <Greeter> missing from dependencies; got: {deps}"
+        );
+        assert!(
+            deps.contains("greetingCard"),
+            "camelCase <greetingCard> dropped from dependencies (FIX B); got: {deps}"
+        );
+    }
+
+    #[test]
     fn auto_imports_attribute_selector_directive_into_dependencies() {
         // BUG 1 regression: `RouterLink` is imported and used ONLY as the `routerLink` attribute on
         // an `<a>` (its conventional `[routerLink]` selector — there is no `<RouterLink>` element).
