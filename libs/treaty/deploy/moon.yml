@@ -34,3 +34,14 @@ tasks:
     inputs:
     - src/**/*
     - $workspaceRoot/.oxlintrc.json
+  test:
+    command: node
+    args:
+    - $projectRoot/test/all.smoke.mjs
+    deps:
+    - ~:build
+    - treaty-federation-deploy:build
+    inputs:
+    - src/**/*
+    - test/**/*
+    - dist/**/*

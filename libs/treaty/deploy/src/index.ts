@@ -20,9 +20,10 @@
  *     and return the manifest to publish. Treaty is a compiler, not a host: this
  *     emits the artifact and invokes a target; it never runs a server.
  *   - {@link FsDeployTarget} — the reference self-hosted target (writes to a local
- *     directory). A {@link CloudDeployTarget} is the same shape over an object
- *     store / static host / the Treaty cloud — "self-hosted and Treaty cloud" are
- *     pluggable.
+ *     directory). {@link HttpDeployTarget} is the concrete cloud / object-store
+ *     target: it `PUT`s each file to `<baseUrl>/<deployPath>` and serves it from
+ *     that url — the credential-free shape behind S3 / GCS / R2 / a static-host
+ *     upload API. A {@link CloudDeployTarget} names that same upload/urlFor shape.
  *   - {@link deployViaPlugin} — drive a release through any
  *     `@treaty/federation-deploy` {@link DeployPlugin} (the existing
  *     `FsDeployPlugin`/`NoopDeployPlugin` + registry) instead of a per-file target.
@@ -76,8 +77,13 @@ export type {
 	DeployAffectedRemotesResult,
 } from './remote.js'
 
-export { FsDeployTarget, FsDeploymentStore } from './targets.js'
-export type { FsDeployTargetOptions, FsDeploymentStoreOptions } from './targets.js'
+export { FsDeployTarget, FsDeploymentStore, HttpDeployTarget } from './targets.js'
+export type {
+	FsDeployTargetOptions,
+	FsDeploymentStoreOptions,
+	HttpDeployTargetOptions,
+	FetchLike,
+} from './targets.js'
 
 // Re-exported from `@treaty/federation-deploy` so a deploy caller has the toggle
 // reader and the ejected-config bridge available from one import: skip a deploy
