@@ -276,11 +276,62 @@ pub fn compile_angular_source(source: &str, file_name: &str) -> CompiledAuthorin
         };
     }
 
-    // No Angular decorator at all (a plain `.ts` module): emit the source verbatim so the bundler
-    // still gets a usable module, with no spurious diagnostics.
+    // No Angular decorator at all (a plain `.ts` module). It may still be a SERVER module: a file-level
+    // `'use server'` directive, an inline `server { … }` block, a `'use server'` body directive, or a
+    // `$$`-suffixed export. Extract every such server fn through the active backend plugin so the
+    // client keeps ONLY the typed RPC bindings and the bodies are lifted to the backend artifact.
+    let extraction = extract_server_block(source);
+    if !extraction.server_fns.is_empty() {
+        return compile_plain_ts_server_module(&extraction, file_name);
+    }
+
+    // A genuinely plain `.ts` module: emit the source verbatim so the bundler still gets a usable
+    // module, with no spurious diagnostics.
     CompiledAuthoring {
         code: source.to_string(),
         server_module: None,
+        errors: Vec::new(),
+        map: None,
+    }
+}
+
+/// Emit a server module + a client stub for a plain (non-Angular) `.ts` module whose top-level
+/// declarations were lifted as server fns (a file-level `'use server'` module, a `$$`-suffixed
+/// export, or an inline `server { … }` block in a plain module).
+///
+/// The backend [`PluginRegistry`] default (axum) generates the server artifact and the per-fn client
+/// bindings. The client module is the source with every server-fn DECLARATION removed
+/// (`extraction.client_source`), then each lifted fn name re-exported as its typed client binding —
+/// so a consumer that `import { streamLogs } from './logs.stream'` receives the RPC stub (an
+/// `EventSource`/`fetch` resource), never the original body. The server-fn body statements are
+/// therefore ABSENT from the emitted client code.
+fn compile_plain_ts_server_module(
+    extraction: &crate::plugin::ServerExtraction,
+    _file_name: &str,
+) -> CompiledAuthoring {
+    let registry = PluginRegistry::with_defaults();
+    let plugin = registry
+        .default_plugin()
+        .expect("registry seeded with a default backend plugin");
+    let emit = plugin.emit(&extraction.server_fns);
+
+    // Start from the client source with every server-fn declaration already removed, then rewrite any
+    // remaining FREE references to a lifted fn to its client binding (so an in-module caller routes
+    // through the backend rather than dangling on the now-absent declaration).
+    let mut code = rewrite_call_sites(&extraction.client_source, &emit.client_bindings);
+
+    // Re-export each lifted server fn as its typed client binding so module consumers keep importing
+    // the same name and transparently get the RPC stub. The binding is the plugin-provided client
+    // expression (a fetch/EventSource resource factory) — the body never appears here.
+    for f in &extraction.server_fns {
+        if let Some(binding) = emit.client_bindings.get(&f.name) {
+            code.push_str(&format!("\nexport const {} = {};\n", f.name, binding));
+        }
+    }
+
+    CompiledAuthoring {
+        code,
+        server_module: Some(emit.server_module),
         errors: Vec::new(),
         map: None,
     }
@@ -650,6 +701,198 @@ export class AppModule {}\n";
             out.code
         );
         assert_parses(&out.code);
+    }
+
+    /// Collect every top-level (and exported) function/arrow-const NAME declared in `code` by walking
+    /// the parsed AST (not a regex). Used to assert that a lifted server fn's DECLARATION is absent
+    /// from the client module — a surviving declaration is a real AST node, not a textual coincidence.
+    fn declared_fn_names(code: &str) -> Vec<String> {
+        let allocator = Allocator::default();
+        let source_type = SourceType::default().with_typescript(true);
+        let ret = Parser::new(&allocator, code, source_type).parse();
+        assert!(ret.errors.is_empty(), "client code did not parse: {code}");
+        let mut names = Vec::new();
+        for stmt in &ret.program.body {
+            match stmt {
+                Statement::FunctionDeclaration(f) => {
+                    if let Some(id) = &f.id {
+                        names.push(id.name.to_string());
+                    }
+                }
+                Statement::VariableDeclaration(d) => collect_arrow_const_names(d, &mut names),
+                Statement::ExportNamedDeclaration(e) => match &e.declaration {
+                    Some(oxc_ast::ast::Declaration::FunctionDeclaration(f)) => {
+                        if let Some(id) = &f.id {
+                            names.push(id.name.to_string());
+                        }
+                    }
+                    Some(oxc_ast::ast::Declaration::VariableDeclaration(v)) => {
+                        collect_arrow_const_names(v, &mut names)
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+        names
+    }
+
+    /// Push the NAME of each `const NAME = (…) => …` arrow-const declarator in `decl` into `names`.
+    fn collect_arrow_const_names(decl: &oxc_ast::ast::VariableDeclaration, names: &mut Vec<String>) {
+        for d in &decl.declarations {
+            if let (Some(name), Some(Expression::ArrowFunctionExpression(_))) =
+                (d.id.get_identifier_name(), &d.init)
+            {
+                names.push(name.to_string());
+            }
+        }
+    }
+
+    /// Parse `code` and assert it has no parse errors (the emitted client module is valid TS).
+    fn assert_client_parses(code: &str) {
+        let allocator = Allocator::default();
+        let source_type = SourceType::default().with_typescript(true);
+        let ret = Parser::new(&allocator, code, source_type).parse();
+        assert!(
+            ret.errors.is_empty(),
+            "emitted client code did not parse: {:?}\n--- code ---\n{code}",
+            ret.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn file_level_use_server_module_extracts_streaming_and_req_resp_fns() {
+        // The headline security fix, on a `logs.stream.ts`-shaped module: a FILE-LEVEL `'use server'`
+        // module exporting an `async function*` (stream) AND a plain `async function` (req/resp). The
+        // client output must contain a typed RPC binding for each fn and NONE of the bodies, while the
+        // server module carries the real bodies.
+        let source = "'use server'\n\
+\n\
+export interface LogLine { readonly seq: number }\n\
+\n\
+export async function* streamLogs(count: number): AsyncGenerator<LogLine> {\n\
+  for (let seq = 1; seq <= count; seq++) {\n\
+    await Promise.resolve();\n\
+    yield { seq };\n\
+  }\n\
+}\n\
+\n\
+export async function loadUser(id: number) {\n\
+  return db.users.findSecretById(id);\n\
+}\n";
+
+        let out = compile_angular_source(source, "logs.stream.ts");
+
+        // A server module is populated and contains BOTH bodies (the whole point: bodies live on the
+        // server, not the client).
+        let server_module = out.server_module.expect("file-level 'use server' must yield a server module");
+        assert!(
+            server_module.contains("yield { seq }") || server_module.contains("yield {seq}")
+                || server_module.contains("for (let seq"),
+            "stream body not carried into server module; got:\n{server_module}"
+        );
+        assert!(
+            server_module.contains("db.users.findSecretById"),
+            "req/resp body not carried into server module; got:\n{server_module}"
+        );
+        // The streaming fn is mounted as an SSE GET route; the req/resp fn as a POST route.
+        assert!(
+            server_module.contains(".route(\"/__server/streamLogs\", get(__server_streamLogs))"),
+            "no streaming route; got:\n{server_module}"
+        );
+        assert!(
+            server_module.contains(".route(\"/__server/loadUser\", post(__server_loadUser))"),
+            "no req/resp route; got:\n{server_module}"
+        );
+
+        // VERIFY EMITTED CLIENT CODE BY PARSING: the client must parse, and the server-fn body
+        // statements must be ABSENT from it.
+        assert_client_parses(&out.code);
+        assert!(
+            !out.code.contains("db.users.findSecretById"),
+            "SECURITY: req/resp body leaked into client; got:\n{}",
+            out.code
+        );
+        assert!(
+            !out.code.contains("await Promise.resolve()"),
+            "SECURITY: stream body leaked into client; got:\n{}",
+            out.code
+        );
+        // The original generator/function declarations are gone from the client AST (a real binding
+        // const may carry the same NAME, but never as a function/arrow declaration with the body).
+        assert!(
+            !out.code.contains("async function* streamLogs")
+                && !out.code.contains("async function streamLogs"),
+            "SECURITY: generator declaration leaked into client; got:\n{}",
+            out.code
+        );
+        assert!(
+            !out.code.contains("async function loadUser"),
+            "SECURITY: req/resp declaration leaked into client; got:\n{}",
+            out.code
+        );
+
+        // A typed client binding for each fn is present in the client module, exported under the same
+        // name a consumer imports. The stream binding opens an EventSource; the req/resp binding POSTs.
+        let names = declared_fn_names(&out.code);
+        assert!(
+            !names.contains(&"streamLogs".to_string()),
+            "streamLogs survived as a fn/arrow declaration (body present); got: {names:?}"
+        );
+        assert!(
+            out.code.contains("export const streamLogs ="),
+            "no exported client binding for streamLogs; got:\n{}",
+            out.code
+        );
+        assert!(
+            out.code.contains("export const loadUser ="),
+            "no exported client binding for loadUser; got:\n{}",
+            out.code
+        );
+        assert!(
+            out.code.contains("EventSource") && out.code.contains("'/__server/streamLogs'"),
+            "stream binding is not an EventSource subscription; got:\n{}",
+            out.code
+        );
+        assert!(
+            out.code.contains("httpClient.post") && out.code.contains("'/__server/loadUser'"),
+            "req/resp binding does not POST to the route; got:\n{}",
+            out.code
+        );
+    }
+
+    #[test]
+    fn plain_ts_with_dollar_suffix_export_extracts_server_fn() {
+        // A plain `.ts` (no Angular decorator, no file-level directive) with a single `$$`-suffixed
+        // exported fn still extracts that one fn and leaves the rest of the module intact.
+        let source = "export const PAGE_SIZE = 20;\n\
+export async function loadPage$$(page: number) {\n\
+  return db.rows.page(page, PAGE_SIZE);\n\
+}\n";
+        let out = compile_angular_source(source, "data.ts");
+        let server_module = out.server_module.expect("$$ export must yield a server module");
+        assert!(
+            server_module.contains("db.rows.page"),
+            "body not in server module; got:\n{server_module}"
+        );
+        assert_client_parses(&out.code);
+        assert!(
+            !out.code.contains("db.rows.page"),
+            "SECURITY: body leaked into client; got:\n{}",
+            out.code
+        );
+        // The non-server export is preserved.
+        assert!(
+            out.code.contains("export const PAGE_SIZE = 20;"),
+            "non-server export lost; got:\n{}",
+            out.code
+        );
+        // A binding is exported for the lifted fn.
+        assert!(
+            out.code.contains("export const loadPage$$ ="),
+            "no client binding for loadPage$$; got:\n{}",
+            out.code
+        );
     }
 
     #[test]

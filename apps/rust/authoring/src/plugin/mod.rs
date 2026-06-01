@@ -223,13 +223,22 @@ pub fn extract_server_block(source: &str) -> ServerExtraction {
     ServerExtraction { client_source, server_fns }
 }
 
-/// Scan top-level declarations of `source` for the two marker conventions that do not use an explicit
+/// Scan top-level declarations of `source` for the marker conventions that do not use an explicit
 /// `server { … }` wrapper, lift them out, and return the source with their declarations removed.
 ///
-/// A top-level declaration is a server fn when it is either:
+/// A top-level declaration is a server fn when any of the following hold:
 ///   * a `function` / `const NAME = (…) => …` whose body's first statement is the bare
-///     `'use server'` string directive (the directive statement is stripped from the lifted source), or
-///   * a `function` / `const NAME = (…) => …` whose **name** ends in two `$` characters.
+///     `'use server'` string directive (the directive statement is stripped from the lifted source);
+///   * a `function` / `const NAME = (…) => …` whose **name** ends in two `$` characters; or
+///   * the **module itself** carries a file-level `'use server'` directive (a `'use server'` string
+///     statement at the very top of the program). In that case EVERY top-level function /
+///     arrow-const declaration in the module — including `export`ed and `export default` ones, and
+///     `async function*` async generators — is a server fn and is lifted out, and the file-level
+///     directive statement is removed from the client source.
+///
+/// Exported forms are unwrapped: `export function f(){…}`, `export const g = () => …`,
+/// `export default function h(){…}`, and `export async function* s(){…}` are all considered, so a
+/// file-level `'use server'` module exporting its server fns is fully extracted.
 ///
 /// The scan parses `source` once with OXC and removes the matched declarations by byte span (highest
 /// span first so earlier offsets stay valid). Only program-top-level declarations are considered.
@@ -242,12 +251,30 @@ fn extract_marker_fns(source: &str) -> (String, Vec<ServerFn>) {
     let source_type = SourceType::default().with_typescript(true);
     let ret = JsParser::new(&allocator, source, source_type).parse();
 
+    // A file-level `'use server'` directive turns the WHOLE module into a server module: every
+    // top-level function/arrow-const declaration is server-only, regardless of per-fn marker.
+    let file_level_server = ret
+        .program
+        .directives
+        .iter()
+        .any(|d| d.expression.value.as_str() == USE_SERVER_DIRECTIVE);
+
     let mut fns = Vec::new();
     // Byte spans of the top-level declarations we remove from the client source.
     let mut removals: Vec<(usize, usize)> = Vec::new();
 
+    // When the module is file-level `'use server'`, strip the directive statement itself from the
+    // client source so the lifted module marker does not survive into the client bundle.
+    if file_level_server {
+        if let Some(d) = ret.program.directives.first() {
+            removals.push((d.span.start as usize, d.span.end as usize));
+        }
+    }
+
     for stmt in &ret.program.body {
-        if let Some((server_fn, span)) = server_fn_from_statement(source, stmt) {
+        // Inside a file-level `'use server'` module no per-fn marker is required; otherwise the
+        // declaration must carry its own marker (`'use server'` body directive or `$$` suffix).
+        if let Some((server_fn, span)) = server_fn_from_top_level(source, stmt, !file_level_server) {
             removals.push(span);
             fns.push(server_fn);
         }
@@ -627,12 +654,49 @@ fn parse_server_fns(body: &str, lang: &str) -> Vec<ServerFn> {
     fns
 }
 
-/// Decide whether a program-top-level statement is a marker-based server fn (`'use server'`
-/// directive or a `$$`-suffixed name) and, if so, build it. Returns the [`ServerFn`] plus the byte
-/// span of the whole declaration (so the caller can remove it from the client source).
-fn server_fn_from_statement(source: &str, stmt: &Statement) -> Option<(ServerFn, (usize, usize))> {
-    // Top-level marker forms (`'use server'` directive, `$$` suffix) always target `rust`.
-    build_server_fn(source, stmt, true, DEFAULT_LANG)
+/// Decide whether a program-top-level statement is a server fn and, if so, build it.
+///
+/// Unwraps `export` / `export default` declarations so an exported `function` / arrow-const /
+/// `async function*` is considered the same as a bare one. `require_marker` is threaded to
+/// [`build_server_fn`]: it is `true` for the per-declaration marker conventions (`'use server'` body
+/// directive or `$$`-suffixed name) and `false` when the enclosing module is file-level
+/// `'use server'` (then every top-level fn is server-only).
+///
+/// Returns the [`ServerFn`] plus the byte span of the WHOLE top-level statement (the `export`
+/// keyword included, when present) so the caller removes the entire declaration from the client
+/// source rather than leaving a dangling `export`.
+fn server_fn_from_top_level(
+    source: &str,
+    stmt: &Statement,
+    require_marker: bool,
+) -> Option<(ServerFn, (usize, usize))> {
+    use oxc_ast::ast::{Declaration, ExportDefaultDeclarationKind};
+    // Top-level marker forms always target `rust` (the default backend language).
+    match stmt {
+        Statement::ExportNamedDeclaration(export) => {
+            let (server_fn, _inner_span) = match export.declaration.as_ref()? {
+                Declaration::FunctionDeclaration(func) => {
+                    build_from_function(source, func, require_marker, DEFAULT_LANG)
+                }
+                Declaration::VariableDeclaration(decl) => {
+                    build_from_var_decl(source, decl, require_marker, DEFAULT_LANG)
+                }
+                _ => None,
+            }?;
+            // Remove the whole `export …` statement (so no dangling `export` remains); the function
+            // source the backend re-emits never includes the `export` keyword.
+            Some((server_fn, (export.span.start as usize, export.span.end as usize)))
+        }
+        Statement::ExportDefaultDeclaration(export) => {
+            let ExportDefaultDeclarationKind::FunctionDeclaration(func) = &export.declaration else {
+                return None;
+            };
+            let (server_fn, _inner_span) =
+                build_from_function(source, func, require_marker, DEFAULT_LANG)?;
+            Some((server_fn, (export.span.start as usize, export.span.end as usize)))
+        }
+        _ => build_server_fn(source, stmt, require_marker, DEFAULT_LANG),
+    }
 }
 
 /// Build a [`ServerFn`] from a `function` declaration or a single-declarator `const NAME = (…) => …`
@@ -640,8 +704,9 @@ fn server_fn_from_statement(source: &str, stmt: &Statement) -> Option<(ServerFn,
 ///
 /// When `require_marker` is true the statement is only treated as a server fn if it carries one of
 /// the markers: a `$$`-suffixed name, or a `'use server'` directive as the first body statement
-/// (which is then stripped from the emitted source). When false (inside a `server { … }` block) the
-/// declaration is always lifted and any leading `'use server'` directive is still stripped.
+/// (which is then stripped from the emitted source). When false (inside a `server { … }` block or a
+/// file-level `'use server'` module) the declaration is always lifted and any leading `'use server'`
+/// directive is still stripped.
 ///
 /// Returns the built fn and the byte span `(start, end)` of the full statement in `source`.
 fn build_server_fn(
@@ -652,97 +717,124 @@ fn build_server_fn(
 ) -> Option<(ServerFn, (usize, usize))> {
     match stmt {
         Statement::FunctionDeclaration(func) => {
-            let id = func.id.as_ref()?;
-            let name = id.name.to_string();
-
-            let directive = func
-                .body
-                .as_deref()
-                .and_then(|body| leading_use_server_span(source, body));
-            let has_marker = name.ends_with("$$") || directive.is_some();
-            if require_marker && !has_marker {
-                return None;
-            }
-
-            let has_ws_directive = func
-                .body
-                .as_deref()
-                .is_some_and(|body| has_leading_directive(body, USE_WEBSOCKET_DIRECTIVE));
-            let body_src = func
-                .body
-                .as_deref()
-                .map(|b| span_text(source, b.span))
-                .unwrap_or_default();
-            let transport =
-                detect_transport(&name, func.generator, has_ws_directive, &body_src);
-
-            let span = (func.span.start as usize, func.span.end as usize);
-            // Strip the `'use server'` directive (by span) then the `'use websocket'` directive (by
-            // content) from the lifted source, so neither marker survives into the emitted body.
-            let src = strip_directive(source, span, directive);
-            let src = strip_leading_directive_text(&src, USE_WEBSOCKET_DIRECTIVE);
-
-            let params = collect_params(source, &func.params);
-            let return_type = func.return_type.as_ref().map(|ann| span_text(source, ann.type_annotation.span()));
-
-            Some((
-                ServerFn {
-                    name,
-                    source: src,
-                    params,
-                    return_type,
-                    is_async: func.r#async,
-                    lang: lang.to_string(),
-                    transport,
-                },
-                span,
-            ))
+            build_from_function(source, func, require_marker, lang)
         }
         Statement::VariableDeclaration(decl) => {
-            // Only a single-declarator `const NAME = (…) => …` is a server-fn candidate.
-            if decl.declarations.len() != 1 {
-                return None;
-            }
-            let declarator = decl.declarations.first()?;
-            let name = declarator.id.get_identifier_name()?.to_string();
-            let Some(Expression::ArrowFunctionExpression(arrow)) = &declarator.init else {
-                return None;
-            };
-
-            let directive = leading_use_server_span(source, &arrow.body);
-            let has_marker = name.ends_with("$$") || directive.is_some();
-            if require_marker && !has_marker {
-                return None;
-            }
-
-            let has_ws_directive = has_leading_directive(&arrow.body, USE_WEBSOCKET_DIRECTIVE);
-            let body_src = span_text(source, arrow.body.span);
-            // Arrow functions cannot be generators (`function*`), so generator detection rests on the
-            // body yielding (an arrow wrapping a generator body) plus the name/directive markers.
-            let transport = detect_transport(&name, false, has_ws_directive, &body_src);
-
-            let span = (decl.span.start as usize, decl.span.end as usize);
-            let src = strip_directive(source, span, directive);
-            let src = strip_leading_directive_text(&src, USE_WEBSOCKET_DIRECTIVE);
-
-            let params = collect_params(source, &arrow.params);
-            let return_type = arrow.return_type.as_ref().map(|ann| span_text(source, ann.type_annotation.span()));
-
-            Some((
-                ServerFn {
-                    name,
-                    source: src,
-                    params,
-                    return_type,
-                    is_async: arrow.r#async,
-                    lang: lang.to_string(),
-                    transport,
-                },
-                span,
-            ))
+            build_from_var_decl(source, decl, require_marker, lang)
         }
         _ => None,
     }
+}
+
+/// Build a [`ServerFn`] from a `function` declaration node (including `async function*` generators).
+/// Shared by the bare-statement, `server { … }`-block, and `export`-wrapped paths.
+fn build_from_function(
+    source: &str,
+    func: &oxc_ast::ast::Function,
+    require_marker: bool,
+    lang: &str,
+) -> Option<(ServerFn, (usize, usize))> {
+    let id = func.id.as_ref()?;
+    let name = id.name.to_string();
+
+    let directive = func
+        .body
+        .as_deref()
+        .and_then(|body| leading_use_server_span(source, body));
+    let has_marker = name.ends_with("$$") || directive.is_some();
+    if require_marker && !has_marker {
+        return None;
+    }
+
+    let has_ws_directive = func
+        .body
+        .as_deref()
+        .is_some_and(|body| has_leading_directive(body, USE_WEBSOCKET_DIRECTIVE));
+    let body_src = func
+        .body
+        .as_deref()
+        .map(|b| span_text(source, b.span))
+        .unwrap_or_default();
+    let transport = detect_transport(&name, func.generator, has_ws_directive, &body_src);
+
+    let span = (func.span.start as usize, func.span.end as usize);
+    // Strip the `'use server'` directive (by span) then the `'use websocket'` directive (by
+    // content) from the lifted source, so neither marker survives into the emitted body.
+    let src = strip_directive(source, span, directive);
+    let src = strip_leading_directive_text(&src, USE_WEBSOCKET_DIRECTIVE);
+
+    let params = collect_params(source, &func.params);
+    let return_type = func
+        .return_type
+        .as_ref()
+        .map(|ann| span_text(source, ann.type_annotation.span()));
+
+    Some((
+        ServerFn {
+            name,
+            source: src,
+            params,
+            return_type,
+            is_async: func.r#async,
+            lang: lang.to_string(),
+            transport,
+        },
+        span,
+    ))
+}
+
+/// Build a [`ServerFn`] from a single-declarator `const NAME = (…) => …` arrow-const variable
+/// declaration. Shared by the bare-statement, `server { … }`-block, and `export`-wrapped paths.
+fn build_from_var_decl(
+    source: &str,
+    decl: &oxc_ast::ast::VariableDeclaration,
+    require_marker: bool,
+    lang: &str,
+) -> Option<(ServerFn, (usize, usize))> {
+    // Only a single-declarator `const NAME = (…) => …` is a server-fn candidate.
+    if decl.declarations.len() != 1 {
+        return None;
+    }
+    let declarator = decl.declarations.first()?;
+    let name = declarator.id.get_identifier_name()?.to_string();
+    let Some(Expression::ArrowFunctionExpression(arrow)) = &declarator.init else {
+        return None;
+    };
+
+    let directive = leading_use_server_span(source, &arrow.body);
+    let has_marker = name.ends_with("$$") || directive.is_some();
+    if require_marker && !has_marker {
+        return None;
+    }
+
+    let has_ws_directive = has_leading_directive(&arrow.body, USE_WEBSOCKET_DIRECTIVE);
+    let body_src = span_text(source, arrow.body.span);
+    // Arrow functions cannot be generators (`function*`), so generator detection rests on the
+    // body yielding (an arrow wrapping a generator body) plus the name/directive markers.
+    let transport = detect_transport(&name, false, has_ws_directive, &body_src);
+
+    let span = (decl.span.start as usize, decl.span.end as usize);
+    let src = strip_directive(source, span, directive);
+    let src = strip_leading_directive_text(&src, USE_WEBSOCKET_DIRECTIVE);
+
+    let params = collect_params(source, &arrow.params);
+    let return_type = arrow
+        .return_type
+        .as_ref()
+        .map(|ann| span_text(source, ann.type_annotation.span()));
+
+    Some((
+        ServerFn {
+            name,
+            source: src,
+            params,
+            return_type,
+            is_async: arrow.r#async,
+            lang: lang.to_string(),
+            transport,
+        },
+        span,
+    ))
 }
 
 /// If the function/arrow body begins with the bare `'use server'` string directive, return its byte
@@ -1438,6 +1530,94 @@ server {\n\
         let extraction = extract_server_block(source);
         assert_eq!(extraction.server_fns.len(), 1, "block comment above server blocked lift");
         assert_eq!(extraction.server_fns[0].name, "f");
+    }
+
+    #[test]
+    fn file_level_use_server_lifts_every_exported_fn() {
+        // A FILE-LEVEL `'use server'` directive (a top-of-module string statement) turns the whole
+        // module into a server module: every exported top-level fn is lifted, the directive itself is
+        // removed, and exported non-fn declarations (an interface) stay in the client.
+        let source = "'use server'\n\
+export interface LogLine { readonly seq: number }\n\
+export async function* streamLogs(count: number): AsyncGenerator<LogLine> {\n\
+  for (let i = 0; i < count; i++) { yield { seq: i }; }\n\
+}\n\
+export async function loadUser(id: number) {\n\
+  return db.users.find(id);\n\
+}\n";
+        let extraction = extract_server_block(source);
+
+        assert_eq!(extraction.server_fns.len(), 2, "both exported fns should lift");
+        let stream = extraction.server_fns.iter().find(|f| f.name == "streamLogs").expect("streamLogs");
+        let load = extraction.server_fns.iter().find(|f| f.name == "loadUser").expect("loadUser");
+        // The async generator is classified as a streaming transport.
+        assert_eq!(stream.transport, TransportKind::Stream, "async generator should be Stream");
+        assert!(stream.is_async, "streamLogs should be async");
+        assert_eq!(stream.params.len(), 1);
+        assert_eq!(stream.params[0].name, "count");
+        // The plain req/resp fn is an Api transport.
+        assert_eq!(load.transport, TransportKind::Api);
+
+        // The lifted bodies leave the client source entirely, and the file-level directive is gone.
+        assert!(
+            !extraction.client_source.contains("yield { seq: i }"),
+            "generator body leaked into client; got: {}",
+            extraction.client_source
+        );
+        assert!(
+            !extraction.client_source.contains("db.users.find"),
+            "req/resp body leaked into client; got: {}",
+            extraction.client_source
+        );
+        assert!(
+            !extraction.client_source.contains("function streamLogs")
+                && !extraction.client_source.contains("function loadUser"),
+            "lifted declarations not removed; got: {}",
+            extraction.client_source
+        );
+        // The leading file-level directive statement is stripped (no dangling `'use server'`).
+        assert!(
+            !extraction.client_source.trim_start().starts_with("'use server'"),
+            "file-level directive not stripped; got: {}",
+            extraction.client_source
+        );
+        // The exported interface (a type, harmless on the client) survives.
+        assert!(
+            extraction.client_source.contains("export interface LogLine"),
+            "exported type declaration lost; got: {}",
+            extraction.client_source
+        );
+    }
+
+    #[test]
+    fn file_level_use_server_strips_directive_but_keeps_non_directive_module() {
+        // Without a file-level directive, an exported plain fn is NOT a server fn (no per-fn marker),
+        // so the module is untouched — proving the file-level directive is what triggers the lift.
+        let source = "export function pure(n: number) { return n + 1; }\n";
+        let extraction = extract_server_block(source);
+        assert!(extraction.server_fns.is_empty(), "no directive => no lift");
+        assert_eq!(extraction.client_source, source);
+    }
+
+    #[test]
+    fn exported_dollar_suffix_fn_lifts_without_file_directive() {
+        // An EXPORTED `$$`-suffixed fn is lifted even without a file-level directive (the per-fn marker
+        // still applies through the export wrapper), and the `export` keyword is removed with it.
+        let source = "export const doThing$$ = async (n: number) => { return n + 1; };\nconst keep = 2;\n";
+        let extraction = extract_server_block(source);
+        assert_eq!(extraction.server_fns.len(), 1, "exported $$ fn should lift");
+        assert_eq!(extraction.server_fns[0].name, "doThing$$");
+        assert!(
+            !extraction.client_source.contains("doThing$$"),
+            "exported marker fn not removed; got: {}",
+            extraction.client_source
+        );
+        assert!(
+            !extraction.client_source.contains("export const"),
+            "dangling export left after lift; got: {}",
+            extraction.client_source
+        );
+        assert!(extraction.client_source.contains("const keep = 2;"));
     }
 
     #[test]
