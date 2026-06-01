@@ -85,7 +85,11 @@ describe('linkPartialCode', () => {
   it('passes through (returns null) when no linker addon is available', () => {
     resetLinkerForTesting(null);
 
-    const out = linkPartialCode(PARTIAL_SOURCE, PARTIAL_NODE_MODULES_ID);
+    // Use a source unique to this test: the content-keyed cache (intentionally) keeps a module
+    // linked once it has been linked, so a body already linked by an earlier test would short-circuit
+    // before the linker is consulted and mask the no-addon path. A never-cached body exercises it.
+    const uniqueSource = `${PARTIAL_SOURCE}\n// no-addon-test-${Math.random()}`;
+    const out = linkPartialCode(uniqueSource, PARTIAL_NODE_MODULES_ID);
 
     expect(out).toBeNull();
   });
