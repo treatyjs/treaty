@@ -421,8 +421,18 @@ fn get_dependency(obj: &ObjectExpression) -> Result<R3DependencyMetadata, String
     })
 }
 
-/// `getDependencies(metaObj, 'deps')` (factory linker) — the `R3DependencyMetadata[] | 'invalid' |
-/// null` tri-state. Absent → `Inherit`; an array → `Deps`; a non-array (string) → `Invalid`.
+/// `getDependencies(metaObj, 'deps')` (factory linker, `partial_factory_linker_1.ts`) — the
+/// `R3DependencyMetadata[] | 'invalid' | null` tri-state, mapped EXACTLY as the reference does:
+///
+/// * key absent          → `null`      (`FactoryDeps::Inherit` — delegate to the base-class factory)
+/// * `deps` is an array  → the deps    (`FactoryDeps::Deps`)
+/// * `deps` is a string  → `'invalid'` (`FactoryDeps::Invalid` — emit `ɵɵinvalidFactory()`)
+/// * any OTHER value (most importantly `deps: null`) → `null` (`FactoryDeps::Inherit`)
+///
+/// The last arm is load-bearing: a class that `extends` a base (e.g. router's
+/// `HistoryStateManager extends StateManager`) emits `deps: null`, which means "no own constructor
+/// deps — inherit the base factory". Treating that `null` as `Invalid` mis-emits `ɵɵinvalidFactory`
+/// (the runtime NG0204 "constructor was not compatible with Dependency Injection"); it must inherit.
 fn get_dependencies(obj: &ObjectExpression) -> Result<FactoryDeps, String> {
     let Some(deps) = find_prop(obj, "deps") else {
         return Ok(FactoryDeps::Inherit);
@@ -441,8 +451,12 @@ fn get_dependencies(obj: &ObjectExpression) -> Result<FactoryDeps, String> {
             }
             Ok(FactoryDeps::Deps(out))
         }
-        // `deps: "invalid"` — at least one dep was unresolvable at partial-compile time.
-        _ => Ok(FactoryDeps::Invalid),
+        // `deps: "invalid"` — at least one dep was unresolvable at partial-compile time. ONLY a
+        // string maps to invalid (reference `deps.isString()`).
+        Expression::StringLiteral(_) | Expression::TemplateLiteral(_) => Ok(FactoryDeps::Invalid),
+        // Any other value — notably `deps: null` for an inheriting class — means "inherit the base
+        // class factory" (reference falls through to `return null`).
+        _ => Ok(FactoryDeps::Inherit),
     }
 }
 
@@ -546,6 +560,12 @@ enum DeclareKind {
     Component,
     /// `ɵɵngDeclareClassMetadata` — dev-only `setClassMetadata`; dropped (replaced with `void 0`).
     ClassMetadata,
+    /// `ɵɵngDeclareClassMetadataAsync` — the async sibling of `ɵɵngDeclareClassMetadata`. It lowers
+    /// (reference `compileOpaqueAsyncClassMetadata`) to a `setClassMetadataAsync(...)` call that, like
+    /// `setClassMetadata`, exists ONLY for the dev/HMR reflection path and is `ngDevMode`-guarded —
+    /// production AOT tree-shakes it. The linker drops it (→ `void 0`) exactly as it drops the
+    /// synchronous form, so no partial-declaration call survives.
+    ClassMetadataAsync,
 }
 
 impl DeclareKind {
@@ -560,6 +580,7 @@ impl DeclareKind {
             "\u{0275}\u{0275}ngDeclareDirective" => Some(DeclareKind::Directive),
             "\u{0275}\u{0275}ngDeclareComponent" => Some(DeclareKind::Component),
             "\u{0275}\u{0275}ngDeclareClassMetadata" => Some(DeclareKind::ClassMetadata),
+            "\u{0275}\u{0275}ngDeclareClassMetadataAsync" => Some(DeclareKind::ClassMetadataAsync),
             _ => None,
         }
     }
@@ -1616,9 +1637,11 @@ pub fn link_partial(code: &str, filename: &str) -> LinkResult {
     let mut replacements: Vec<Replacement> = Vec::new();
 
     for call in &declares {
-        // `ɵɵngDeclareClassMetadata(...)` is the dev-only `setClassMetadata`; the AOT linker drops
-        // it. Replace the call with `void 0` so the surrounding statement stays syntactically valid.
-        if call.kind == DeclareKind::ClassMetadata {
+        // `ɵɵngDeclareClassMetadata(...)` / `ɵɵngDeclareClassMetadataAsync(...)` are the dev-only
+        // `setClassMetadata`/`setClassMetadataAsync` reflection calls; the AOT linker's output is
+        // `ngDevMode`-guarded and tree-shaken in production, so both are dropped. Replace the call
+        // with `void 0` so the surrounding statement stays syntactically valid.
+        if matches!(call.kind, DeclareKind::ClassMetadata | DeclareKind::ClassMetadataAsync) {
             replacements.push(Replacement {
                 start: call.start as usize,
                 end: call.end as usize,
@@ -1696,7 +1719,9 @@ fn link_one(kind: DeclareKind, obj_src: &str) -> Result<LinkedDef, String> {
         DeclareKind::NgModule => link_ng_module(obj),
         DeclareKind::Directive => link_directive(obj),
         DeclareKind::Component => link_component(obj),
-        DeclareKind::ClassMetadata => unreachable!("ClassMetadata handled before link_one"),
+        DeclareKind::ClassMetadata | DeclareKind::ClassMetadataAsync => {
+            unreachable!("ClassMetadata(Async) handled before link_one")
+        }
     }
 }
 
@@ -1796,6 +1821,44 @@ mod tests {
         );
         // Optional dep -> flags 8.
         assert!(out.code.contains("Dep2, 8)"), "got: {}", out.code);
+        assert_no_declare(&out.code);
+        assert_reparses(&out.code);
+    }
+
+    #[test]
+    fn links_factory_deps_null_inherits_base_factory() {
+        // Real shape from @angular/router (`HistoryStateManager extends StateManager`): an inheriting
+        // class emits `deps: null`, which means "inherit the base-class factory" — it must NOT be
+        // treated as `'invalid'` (that mis-emits `ɵɵinvalidFactory()` → runtime NG0204 at boot).
+        let src = r#"X.ɵfac = i0.ɵɵngDeclareFactory({ minVersion: "12.0.0", version: "21.2.15", ngImport: i0, type: X, deps: null, target: i0.ɵɵFactoryTarget.Injectable });"#;
+        let out = link_partial(src, "x.mjs");
+        assert!(out.errors.is_empty(), "errors: {:?}", out.errors);
+        // Inherited factory uses ɵɵgetInheritedFactory, never ɵɵinvalidFactory.
+        assert!(
+            out.code.contains("\u{0275}\u{0275}getInheritedFactory"),
+            "got: {}",
+            out.code
+        );
+        assert!(
+            !out.code.contains("\u{0275}\u{0275}invalidFactory"),
+            "deps:null must inherit, not emit invalidFactory; got: {}",
+            out.code
+        );
+        assert_no_declare(&out.code);
+        assert_reparses(&out.code);
+    }
+
+    #[test]
+    fn links_factory_deps_invalid_string_emits_invalid_factory() {
+        // The only shape that maps to `ɵɵinvalidFactory` is the literal string `deps: "invalid"`.
+        let src = r#"X.ɵfac = i0.ɵɵngDeclareFactory({ version: "21.2.15", ngImport: i0, type: X, deps: "invalid", target: i0.ɵɵFactoryTarget.Injectable });"#;
+        let out = link_partial(src, "x.mjs");
+        assert!(out.errors.is_empty(), "errors: {:?}", out.errors);
+        assert!(
+            out.code.contains("\u{0275}\u{0275}invalidFactory"),
+            "got: {}",
+            out.code
+        );
         assert_no_declare(&out.code);
         assert_reparses(&out.code);
     }
@@ -2129,6 +2192,18 @@ mod tests {
     #[test]
     fn drops_class_metadata() {
         let src = "i0.ɵɵngDeclareClassMetadata({ minVersion: \"12.0.0\", version: \"21.2.15\", ngImport: i0, type: Svc, decorators: [{ type: Injectable }] });\n";
+        let out = link_partial(src, "x.mjs");
+        assert!(out.errors.is_empty(), "errors: {:?}", out.errors);
+        assert!(out.code.contains("void 0"), "got: {}", out.code);
+        assert_no_declare(&out.code);
+        assert_reparses(&out.code);
+    }
+
+    #[test]
+    fn drops_class_metadata_async() {
+        // `ɵɵngDeclareClassMetadataAsync` is the async sibling of the dev-only class-metadata call;
+        // it is dropped to `void 0` exactly like the synchronous form (no partial call survives).
+        let src = "i0.ɵɵngDeclareClassMetadataAsync({ minVersion: \"18.0.0\", version: \"21.2.15\", ngImport: i0, type: Cmp, resolveDeferredDeps: () => [import(\"./x\")], resolveMetadata: (x) => ({ decorators: [{ type: Component }], ctorParameters: null, propDecorators: null }) });\n";
         let out = link_partial(src, "x.mjs");
         assert!(out.errors.is_empty(), "errors: {:?}", out.errors);
         assert!(out.code.contains("void 0"), "got: {}", out.code);
