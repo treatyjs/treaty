@@ -129,6 +129,43 @@ describe('generateRoutesModule', () => {
     }
   });
 
+  it('down-levels the TS route module to plain JS so every bundler can parse it', () => {
+    // A fake generator returning the TS surface the file-routing core emits: a
+    // type-only import, a `: Routes` annotation, and a trailing `as const`.
+    resetRouteGeneratorForTesting({
+      generateRoutes() {
+        return {
+          code: [
+            "import type { Routes } from '@angular/router'",
+            'export const routes: Routes = [',
+            '  { path: "docs/:category", loadComponent: () => import("./docs.treaty") },',
+            ']',
+            'export default routes',
+            'export const federationRemotes = [',
+            '  { "routePath": "docs/:category" },',
+            '] as const',
+          ].join('\n'),
+          files: [],
+          watchFiles: [],
+        };
+      },
+    });
+
+    const { code } = generateRoutesModule({ routesRoot: '/repo/app' });
+
+    // No TS-only syntax survives.
+    expect(code).not.toMatch(/\bimport\s+type\b/);
+    expect(code).not.toMatch(/\bconst\s+routes\s*:/);
+    expect(code).not.toMatch(/\bas\s+const\b/);
+    // The route graph itself is untouched — including a `:` inside a route path,
+    // which the anchored annotation strip must never mistake for a type annotation.
+    expect(code).toContain('export const routes = [');
+    expect(code).toContain('export default routes');
+    expect(code).toContain('export const federationRemotes = [');
+    expect(code).toContain('path: "docs/:category"');
+    expect(code).toContain('"routePath": "docs/:category"');
+  });
+
   it('throws a clear error when the addon is unavailable', () => {
     resetRouteGeneratorForTesting(null);
 

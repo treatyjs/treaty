@@ -43,7 +43,16 @@ async function check(label, fn) {
 	}
 }
 
-const plugin = treaty()
+/**
+ * `treaty(...)` returns an ARRAY of plugins (the authoring plugin plus the shared
+ * Angular partial-declaration linker plugins). Select the authoring plugin
+ * (`treaty:vite`) — the one this suite exercises — from that array.
+ */
+function authoringPluginOf(plugins) {
+	return plugins.find((p) => p && p.name === 'treaty:vite')
+}
+
+const plugin = authoringPluginOf(treaty())
 
 // 1. plugin shape
 await check('factory returns a well-formed Vite plugin', () => {
@@ -99,7 +108,7 @@ await check('transform forwards the v3 source map when the core produces one', (
 
 // 3c. sourceMap:false makes the plugin return a null map so Vite skips map work.
 await check('sourceMap:false returns a null map', () => {
-	const p = treaty({ sourceMap: false })
+	const p = authoringPluginOf(treaty({ sourceMap: false }))
 	const tsComponent =
 		"import { Component } from '@angular/core';\n" +
 		"@Component({ selector: 'app-nm', template: '<div>nm</div>' })\n" +
@@ -126,6 +135,18 @@ await check('transform(bare-JSX .tsx) -> defineComponent', () => {
 	const out = runTransform(bare, 'App.tsx')
 	assert.ok(out, 'bare JSX must compile (no longer rejected)')
 	assert.ok(out.code.includes('defineComponent'), 'bare JSX must lower to Ivy JS')
+})
+
+// 4c. IDEMPOTENCY: feeding a first pass's lowered Ivy output back through the
+//     transform (same owned `.tjsx` id) must NOT recompile — it returns null so the
+//     already-lowered JS passes through untouched, so each module compiles exactly once.
+await check('transform is idempotent: a second pass over lowered Ivy is skipped', () => {
+	const bare = 'export default function About() {\n  return <div>hi</div>\n}\n'
+	const first = runTransform(bare, 'about.tjsx')
+	assert.ok(first && first.code.includes('@angular/core'), 'first pass lowers bare JSX to Ivy')
+	// Without the guard, this second pass throws "no component … returning JSX … found".
+	const second = runTransform(first.code, 'about.tjsx')
+	assert.equal(second, null, 'lowered Ivy is detected and passed through (no recompile)')
 })
 
 // 5. unowned files return null
@@ -189,7 +210,7 @@ await check('cold-build prewarm warms the cache via transformMany', async () => 
 	const code = 'export default () => <section>warm</section>\n'
 	writeFileSync(file, code, 'utf8')
 
-	const p = treaty({ prewarm: [file] })
+	const p = authoringPluginOf(treaty({ prewarm: [file] }))
 	// Mark this as a build (cold) so prewarm is allowed to run.
 	p.configResolved.call({}, { command: 'build', mode: 'production' })
 	// buildStart reads the prewarm files and runs transformMany.
@@ -209,7 +230,7 @@ await check('prewarm is a no-op for the dev server', async () => {
 	const code = 'export default () => <nav>dev</nav>\n'
 	writeFileSync(file, code, 'utf8')
 
-	const p = treaty({ prewarm: [file] })
+	const p = authoringPluginOf(treaty({ prewarm: [file] }))
 	p.configResolved.call({}, { command: 'serve', mode: 'development' })
 	const started = p.buildStart.call({})
 	if (started instanceof Promise) await started
@@ -265,7 +286,7 @@ await check('function chunking emits per-fn chunks + manifest, body never in cli
 		clearCache() {},
 	}
 
-	const p = treaty({ compilerFactory: () => stubCompiler })
+	const p = authoringPluginOf(treaty({ compilerFactory: () => stubCompiler }))
 
 	// Build PluginContext capturing emitted chunks/assets.
 	const emitted = []
@@ -367,7 +388,7 @@ await check('functionChunking:false leaves server fns as a single blob', async (
 		onDelete: () => [],
 		clearCache() {},
 	}
-	const p = treaty({ functionChunking: false, compilerFactory: () => stub })
+	const p = authoringPluginOf(treaty({ functionChunking: false, compilerFactory: () => stub }))
 	const emitted = []
 	const ctx = { emitFile: (f) => (emitted.push(f), 'ref') }
 	const out = p.transform.call(ctx, 'x', FILE)

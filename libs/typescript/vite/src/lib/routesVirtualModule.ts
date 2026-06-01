@@ -93,10 +93,13 @@ interface RoutesVirtualModuleOptions {
 /** The emitted routes module plus the route entry files it references (watch deps). */
 interface GeneratedRoutesModule {
   /**
-   * The emitted TypeScript routes module (`export const routes`, `export default
-   * routes`, `export const federationRemotes`) — byte-identical to the
-   * `treaty-file-routing --emit ts` CLI output because both call the SAME pure-core
-   * emitter through the addon.
+   * The emitted routes module (`export const routes`, `export default routes`,
+   * `export const federationRemotes`), down-levelled to plain JS by {@link toJsModule}
+   * so every bundler can parse the virtual module directly (a virtual module has no
+   * on-disk path and so bypasses a bundler's built-in TS transform). The route graph
+   * is byte-identical to the `treaty-file-routing --emit ts` CLI output — only the TS
+   * type surface (the `import type`, the `: Routes` annotation, the trailing
+   * `as const`) is stripped.
    */
   code: string;
   /**
@@ -208,5 +211,39 @@ function generateRoutesModule(options: RoutesVirtualModuleOptions): GeneratedRou
 
   const result = generator.generateRoutes(root, toConfigJson(options));
   const watchFiles = result.files.map((file) => resolve(root, file));
-  return { code: result.code, files: result.files, watchFiles };
+  return { code: toJsModule(result.code), files: result.files, watchFiles };
+}
+
+/** A top-level `import type { … } from '…'` statement the route emitter prepends. */
+const TYPE_ONLY_IMPORT = /^\s*import\s+type\s+[^;\n]*?from\s*['"][^'"]+['"];?\s*$/gm;
+
+/**
+ * The `: Routes` type annotation on the emitted `export const routes` declaration.
+ * Anchored to the declaration keyword + name so it can never match a `:` inside a
+ * route path string (e.g. `"docs/:category"`).
+ */
+const ROUTES_TYPE_ANNOTATION = /(export\s+const\s+routes\b)\s*:\s*Routes\b/;
+
+/** A trailing TS `as const` assertion (on the emitted `federationRemotes` array). */
+const AS_CONST_ASSERTION = /\bas\s+const\b/g;
+
+/**
+ * Down-level the file-routing core's TypeScript route module to plain JS so EVERY
+ * bundler can parse the `virtual:treaty-routes` module directly — the virtual
+ * module has no on-disk path, which opts it out of a bundler's built-in TS
+ * transform, so the shared shim must hand back JS rather than leaving each bundler
+ * to bolt on its own transpile (previously an example-local `transformWithEsbuild`).
+ *
+ * The route emitter is the single, stable producer of this text, so its TS surface
+ * is exactly: a leading `import type { Routes } from '@angular/router'`, the
+ * `: Routes` annotation on `export const routes`, and a trailing `as const` on the
+ * `federationRemotes` array. Each is stripped precisely (the annotation/`import`
+ * matches are anchored so a `:` inside a route-path string is never touched),
+ * leaving the route graph itself byte-for-byte unchanged.
+ */
+function toJsModule(code: string): string {
+  return code
+    .replace(TYPE_ONLY_IMPORT, '')
+    .replace(ROUTES_TYPE_ANNOTATION, '$1')
+    .replace(AS_CONST_ASSERTION, '');
 }

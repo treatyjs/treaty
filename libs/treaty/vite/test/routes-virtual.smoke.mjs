@@ -71,9 +71,15 @@ check('resolveId -> resolved id, load -> generated route module over the example
 	const loadCtx = { addWatchFile: (f) => watched.push(f) }
 	const out = plugin.load.call(loadCtx, RESOLVED_ID)
 	assert.ok(out && typeof out.code === 'string', 'load returns a { code } module')
-	assert.ok(out.code.includes('export const routes'), 'emits an Angular routes module')
+	assert.ok(/\bexport\b[\s\S]*\broutes\b/.test(out.code), 'emits an Angular routes module')
 	assert.ok(out.code.includes('export default routes'), 'emits a default export')
 	assert.ok(out.code.includes('loadComponent'), 'lazy route loaders present')
+	// The shared shim down-levels the module to plain JS so every bundler can parse
+	// the virtual module directly: no TS-only `import type`, no `: Routes` annotation,
+	// and no trailing `as const` survive.
+	assert.ok(!/\bimport\s+type\b/.test(out.code), 'no TS-only import type in served JS')
+	assert.ok(!/\bconst\s+routes\s*:/.test(out.code), 'no TS type annotation on the routes const')
+	assert.ok(!/\bas\s+const\b/.test(out.code), 'no trailing TS `as const` assertion')
 	assert.equal(out.map, null, 'load returns a null map (generated module needs none)')
 	assert.ok(watched.length > 0, 'route entry files registered via addWatchFile')
 	assert.ok(watched.every((f) => isAbsolute(f)), 'watch files are absolute paths')

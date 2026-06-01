@@ -160,6 +160,33 @@ function cleanId(id: string): string {
 }
 
 /**
+ * The signature of Ivy JS this plugin's compiler emits: the `import * as i0 from
+ * "@angular/core"` namespace import the emitter always prepends, paired with one
+ * of the Ivy definition members it writes (`i0.ɵɵdefine*`, a `.ɵfac =` factory,
+ * or a `.ɵcmp`/`.ɵdir`/`.ɵmod`/`.ɵpipe`/`.ɵinj` static). Authoring source never
+ * writes the `i0` namespace alias against `@angular/core`, so this pair only ever
+ * appears in code this plugin already lowered.
+ */
+const IVY_NAMESPACE_IMPORT = /import\s*\*\s*as\s+i0\s+from\s*["']@angular\/core["']/
+const IVY_DEFINITION = /(?:i0\.ɵɵdefine[A-Za-z]+\b|\.ɵfac\s*=|\.ɵ(?:cmp|dir|mod|pipe|inj|loc)\b)/
+
+/**
+ * Whether `code` is already lowered Ivy output this plugin (or an earlier pass)
+ * produced, rather than raw authoring source. The Treaty `transform` is otherwise
+ * not idempotent: feeding emitted Ivy back through the compiler raises
+ * "no component … returning JSX … found" because the lowered JS has no authoring
+ * component. A `.tjsx`/`.tsx`/`.treaty` module can re-enter the `enforce: 'pre'`
+ * transform with the FIRST pass's Ivy text (the id keeps its authoring extension,
+ * so ownership re-claims it) — e.g. a re-resolved lazy `import()` chunk or the
+ * esbuild `.tjsx` loader handing the transformed module back. Detecting the
+ * emitter's signature lets the second pass skip recompilation and pass the
+ * already-lowered JS straight through, so each module is compiled exactly once.
+ */
+function isLoweredIvy(code: string): boolean {
+	return IVY_NAMESPACE_IMPORT.test(code) && IVY_DEFINITION.test(code)
+}
+
+/**
  * Whether the resolved id is one this plugin should attempt to transform. We
  * rely on the core's {@link classify} so ownership stays in one place; a plain
  * `.ts` is only fully claimed by the core's `transform` (which screens for an
@@ -404,6 +431,13 @@ export default function treaty(options: PluginOptions = {}): Plugin[] {
 		 */
 		transform(code, id) {
 			if (!isCandidate(id)) return null
+			// Idempotency guard: a module whose extension this plugin owns may re-enter
+			// the pre-transform already carrying the FIRST pass's lowered Ivy output
+			// (the id keeps its authoring extension, so `isCandidate` re-claims it).
+			// Recompiling lowered Ivy throws "no component … found", so detect the
+			// emitter's signature and pass the already-lowered JS through untouched —
+			// guaranteeing each authoring module is compiled exactly once.
+			if (isLoweredIvy(code)) return null
 			const result = compiler.transform(cleanId(id), code)
 			if (result === null) return null
 

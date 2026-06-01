@@ -28,42 +28,13 @@
 import { fileURLToPath } from 'node:url'
 import { dirname } from 'node:path'
 
-import { defineConfig, transformWithEsbuild, type Plugin } from 'vite'
+import { defineConfig } from 'vite'
 import treaty from '@treaty/vite'
-import { isTreatyRoutesId } from '@treaty/ts-vite'
 
 const appRoot = dirname(fileURLToPath(import.meta.url))
 // Vite resolves module ids with POSIX separators, so the absolute import base the
 // emitted lazy loaders use must be forward-slashed even on Windows.
 const importBase = appRoot.replace(/\\/g, '/')
-
-/**
- * Transpile the `virtual:treaty-routes` module from the file-routing core's
- * TypeScript emit (`export const routes: Routes`, `import type { Routes }`) down
- * to plain JS so the bundler can parse it. The route module is served as a
- * virtual module (the resolved id is NUL-prefixed), which opts it out of Vite's
- * built-in esbuild TS transform — so a thin companion `transform` hook runs
- * esbuild over just that module. This only strips the TypeScript-only syntax; the
- * route graph itself is unchanged, and the routing logic still lives entirely in
- * the Rust core that produced the module.
- */
-function transpileRoutesVirtualModule(): Plugin {
-	return {
-		name: 'file-routed-app:transpile-routes-vmod',
-		async transform(code, id) {
-			if (!isTreatyRoutesId(id)) return null
-			// Use a synthetic .ts filename: the resolved id is NUL-prefixed, which
-			// esbuild rejects as a source name, and the explicit `ts` loader is what
-			// selects the transform anyway.
-			const out = await transformWithEsbuild(code, 'virtual-treaty-routes.ts', {
-				loader: 'ts',
-				format: 'esm',
-				sourcemap: false,
-			})
-			return { code: out.code, map: null }
-		},
-	}
-}
 
 export default defineConfig({
 	build: {
@@ -99,6 +70,5 @@ export default defineConfig({
 				'routes/docs/[category]/[page]/index.tjsx',
 			],
 		}),
-		transpileRoutesVirtualModule(),
 	],
 })
