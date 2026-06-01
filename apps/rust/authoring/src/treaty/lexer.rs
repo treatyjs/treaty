@@ -18,6 +18,43 @@ fn floor_char_boundary(s: &str, index: usize) -> usize {
     i
 }
 
+/// Decides whether a `/` at the cursor begins a REGEX literal (vs. a division operator), given the
+/// last significant code char before it.
+///
+/// A `/` is a regex start UNLESS the previous token can end an expression — i.e. an identifier /
+/// keyword char, a digit, or a closing `)` / `]` / `}` (after which `/` is division) — or a closing
+/// quote (after a string, `/` is division). At the start of a region (`None`) a `/` is a regex. This
+/// is intentionally conservative: when the previous char ends an expression we treat `/` as divide
+/// (the prior behavior), so this only ADDS regex coverage and never reclassifies real division.
+///
+/// Note this is deliberately distinct from `plugin::can_end_statement` (which governs ASI / `server`
+/// block detection): a digit and a `}` both END an expression for regex-vs-divide purposes (`a[0]/b`,
+/// `obj{}/b`), whereas ASI treats a bare `}` as a statement terminator. Keeping the rule local avoids
+/// coupling two different lexical questions.
+fn regex_allowed_after(last_significant: Option<char>) -> bool {
+    match last_significant {
+        // Start of region: a `/` here can only be a regex (or a comment, handled earlier).
+        None => true,
+        Some(c) => !(c.is_alphanumeric() || c == '_' || c == '$' || matches!(c, ')' | ']' | '}' | '\'' | '"' | '`')),
+    }
+}
+
+/// The HTML void elements: elements that are always empty and have no end tag, so an authored
+/// `<br>` / `<input>` (with or without a trailing `/`) opens AND closes in one tag. Matched
+/// ASCII-case-insensitively (HTML tag names are case-insensitive). Source: the WHATWG HTML "void
+/// elements" list.
+const VOID_ELEMENTS: &[&str] = &[
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source",
+    "track", "wbr",
+];
+
+/// True if `tag_name` is an HTML void element (ASCII-case-insensitive), e.g. `br`, `BR`, `Input`.
+fn is_void_element(tag_name: &str) -> bool {
+    VOID_ELEMENTS
+        .iter()
+        .any(|v| v.eq_ignore_ascii_case(tag_name))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LexerState {
     Default,
@@ -215,39 +252,114 @@ impl<'a> Lexer<'a> {
         Some(Token::new(TokenKind::HTML(value), start_pos, content_end))
     }
 
-    /// Parses a JavaScript block.
+    /// Parses a JavaScript/TypeScript block with a balanced, lexical-state-aware scanner.
+    ///
+    /// The old scanner ended a JS region at the first raw newline / `;`, the first `<` that opened a
+    /// `</`/`<style`, the first `{{`, or the first `@` — with NO tracking of strings, comments, regex
+    /// literals, or bracket nesting. That split a region MID-EXPRESSION whenever any of those bytes
+    /// appeared inside a string, a comment, a regex body, or a balanced `()`/`[]`/`{}` group: a
+    /// multi-line object literal, a `computed(() => { … })` arrow, a regex `/[<{;]/`, or a string
+    /// `"</template>"` would all be torn apart, shoving the tail of the expression into an
+    /// HTML/interpolation/control-flow token and corrupting the JS region.
+    ///
+    /// This scanner instead tracks lexical state — string literals (`'`/`"`/`` ` `` with `\`-escapes
+    /// and `${ … }` template-substitution nesting), line + block comments, REGEX literals
+    /// (disambiguated from division by the last significant code char), and `()`/`[]`/`{}` DEPTH — and
+    /// only treats a region boundary as REAL when the cursor is at top level (depth 0) and outside any
+    /// string/comment/regex. A boundary inside any of those is ordinary JS content and is consumed as
+    /// code. The set of recognized top-level boundaries is unchanged (a real top-level newline / `;`,
+    /// a `</`/`<style` open, a `{{` interpolation, or an `@` control-flow marker), so well-formed TS
+    /// lexes into the same region stream as before — only the false-positive splits are removed.
     fn parse_javascript(&mut self) -> Option<Token> {
         let start_pos = self.pos;
+        // Bracket nesting across `()`, `[]`, and `{}`. A region boundary only counts at depth 0.
+        let mut depth: i32 = 0;
+        // The last significant (non-whitespace, non-comment) code char seen, used to disambiguate a
+        // `/` as the start of a regex literal vs. a division operator.
+        let mut last_significant: Option<char> = None;
+
         while let Some(ch) = self.current_char {
             match ch {
-                // Handle string literals
+                // String / template literals: consume the whole literal (escapes + `${}` nesting for
+                // template strings) so a `<`, `{{`, `;`, newline, or `@` inside it is never a boundary.
                 '\'' | '"' | '`' => {
                     self.consume_string(ch);
+                    last_significant = Some(ch);
                 }
 
-                // Handle comments
+                // Comments and regex literals both begin with `/`.
                 '/' => {
                     if self.starts_with("//") {
                         self.consume_line_comment();
+                        // A line comment is insignificant; `last_significant` is unchanged.
                     } else if self.starts_with("/*") {
                         self.consume_block_comment();
+                        // A block comment is insignificant; `last_significant` is unchanged.
+                    } else if regex_allowed_after(last_significant) {
+                        // `/` in regex position: consume a full regex literal (body honoring
+                        // `\`-escapes and `[ … ]` character classes, then flags). A `<`/`{{`/`;`/`@`
+                        // inside the body is regex content, never a region boundary.
+                        self.consume_regex_literal();
+                        last_significant = Some('/');
                     } else {
+                        // Division operator.
                         self.advance();
+                        last_significant = Some('/');
                     }
                 }
-                '\n' | '\r' | '\u{000C}' | ';' => {
+
+                // ── Region boundaries (only honored at top level / depth 0) ────────────────────────
+                // These arms precede the bracket-nesting arms so that a top-level `{{` is recognized
+                // as an interpolation boundary before the generic `{` depth-opener matches it.
+                '\n' | '\r' | '\u{000C}' | ';' if depth == 0 => {
                     self.advance();
                     break;
                 }
-                '<' if (self.starts_with_style_open() || self.starts_with("</")) => break,
-                '{' if self.starts_with("{{") => break,
-                '@' => {
-                    // Handle the '@' character and transition to control flow state
+                '<' if depth == 0 && (self.starts_with_style_open() || self.starts_with("</")) => {
+                    break
+                }
+                '{' if depth == 0 && self.starts_with("{{") => break,
+                '@' if depth == 0 && self.pos > start_pos => {
+                    // A control-flow marker at top level ends the JS region. Only break when there is
+                    // real JS before it (`self.pos > start_pos`) so a leading `@` is never an empty
+                    // token; the default-state router opens control flow at a leading `@`.
                     self.push_state(LexerState::ControlFlow);
                     break;
                 }
-                // Handle other cases
-                _ => self.advance(),
+
+                // Bracket nesting. A `{` that reaches here is a real code brace (a top-level `{{` was
+                // already handled by the boundary arm above).
+                '(' | '[' | '{' => {
+                    depth += 1;
+                    self.advance();
+                    last_significant = Some(ch);
+                }
+                ')' | ']' | '}' => {
+                    if depth > 0 {
+                        depth -= 1;
+                    }
+                    self.advance();
+                    last_significant = Some(ch);
+                }
+
+                // Inside a bracket group (depth > 0) these are ordinary code, not boundaries — the
+                // depth-0 boundary arms above did not fire, so consume them as code. (`{`/`}`/`<`/`@`
+                // are handled by the arms above/below; this arm covers the statement separators.)
+                '\n' | '\r' | '\u{000C}' | ';' => {
+                    self.advance();
+                    // Whitespace is insignificant; only `;` updates `last_significant`.
+                    if ch == ';' {
+                        last_significant = Some(';');
+                    }
+                }
+
+                // Any other code char.
+                _ => {
+                    self.advance();
+                    if !ch.is_whitespace() {
+                        last_significant = Some(ch);
+                    }
+                }
             }
         }
 
@@ -255,6 +367,42 @@ impl<'a> Lexer<'a> {
         let value = self.slice(start_pos, end_pos);
         self.pop_state(); // Return to the previous state
         Some(Token::new(TokenKind::JavaScript(value), start_pos, end_pos))
+    }
+
+    /// Consumes a regex literal whose opening `/` is at the cursor. The body honors `\`-escapes and
+    /// `[ … ]` character classes (a `/` inside a class is literal, not the terminator), then the
+    /// trailing flag identifier characters. Defensive against an unterminated literal (stops at EOL /
+    /// EOF) so a stray `/` can never spin the scanner.
+    fn consume_regex_literal(&mut self) {
+        self.advance(); // Skip the opening `/`.
+        let mut in_class = false;
+        while let Some(ch) = self.current_char {
+            match ch {
+                '\\' => {
+                    self.advance(); // Skip the backslash.
+                    if self.current_char.is_some() {
+                        self.advance(); // Skip the escaped char.
+                    }
+                }
+                '[' => {
+                    in_class = true;
+                    self.advance();
+                }
+                ']' if in_class => {
+                    in_class = false;
+                    self.advance();
+                }
+                '/' if !in_class => {
+                    self.advance(); // Skip the closing `/`.
+                    break;
+                }
+                // A raw newline cannot appear in a regex literal: bail rather than run away.
+                '\n' | '\r' => break,
+                _ => self.advance(),
+            }
+        }
+        // Consume regex flags (e.g. `gimsuy`).
+        self.consume_while(|c| c.is_ascii_alphabetic());
     }
 
     /// Parses a `<style …>…</style>` block.
@@ -382,6 +530,18 @@ impl<'a> Lexer<'a> {
     }
 
     /// Parses an HTML segment.
+    ///
+    /// The element stack is what keeps the HTML region open until its root element closes. Two
+    /// rough edges from the lexer audit are handled here:
+    ///
+    /// - VOID elements (`<br>`, `<input>`, `<img>`, `<hr>`, `<meta>`, … — the full HTML void set) have
+    ///   no end tag. The old scanner pushed EVERY opening tag and only popped on `/>` or `</tag>`, so a
+    ///   bare `<br>` / `<input>` (no trailing slash) was pushed and never popped — its element stack
+    ///   never emptied and the HTML region swallowed the rest of the file (including the trailing TS).
+    ///   A void element is now treated as self-closing: it is never pushed.
+    /// - `{{ … }}` interpolation is consumed WHOLE (string-aware, brace-balanced) so a `<` inside an
+    ///   interpolation expression (`{{ a < b }}`) is interpolation text, not a tag open — the old
+    ///   scanner saw that `<` as a new element and corrupted the region.
     fn parse_html(&mut self) -> Option<Token> {
         let start_pos = self.pos;
         let mut tag_stack: Vec<String> = Vec::new();
@@ -411,16 +571,24 @@ impl<'a> Lexer<'a> {
                 } else {
                     self.advance(); // Skip '<'
                     let tag_name = self.consume_tag_name();
-                    tag_stack.push(tag_name);
-                    // A self-closing tag (`<img ... />`) closes immediately; mirror the TS lexer
-                    // and pop it back off so it does not keep the HTML region open.
-                    if self.consume_attributes() {
-                        tag_stack.pop();
+                    // A void element (`<br>`, `<input>`, …) has no end tag; do not push it, or the
+                    // element stack never empties and the region runs to EOF. Consume its attributes
+                    // either way so a quoted `>` inside an attribute does not end the tag early.
+                    let is_void = is_void_element(&tag_name);
+                    let self_closing = self.consume_attributes();
+                    if is_void || self_closing {
+                        // The tag opens and closes immediately. If it is the root, the region is done.
                         if tag_stack.is_empty() {
                             break;
                         }
+                    } else {
+                        tag_stack.push(tag_name);
                     }
                 }
+            } else if ch == '{' && self.starts_with("{{") {
+                // `{{ … }}` interpolation stays INSIDE the HTML token (the established contract); a
+                // `<` inside it is interpolation text, not a tag. Consume the whole interpolation.
+                self.consume_interpolation();
             } else {
                 self.advance();
             }
@@ -430,6 +598,35 @@ impl<'a> Lexer<'a> {
         let value = self.slice(start_pos, end_pos);
         self.pop_state(); // Return to the previous state
         Some(Token::new(TokenKind::HTML(value), start_pos, end_pos))
+    }
+
+    /// Consumes a `{{ … }}` interpolation starting at the opening `{{`, stopping just past the
+    /// matching `}}`. Strings inside the expression are consumed whole, so a `}}` or `<` inside a
+    /// string literal is not mistaken for the terminator / a tag. Brace nesting (object literals) is
+    /// balanced. Defensive against an unterminated interpolation (stops at EOF).
+    fn consume_interpolation(&mut self) {
+        self.advance_by(2); // Skip the opening `{{`.
+        let mut brace_depth: i32 = 0;
+        while let Some(ch) = self.current_char {
+            match ch {
+                '\'' | '"' | '`' => self.consume_string(ch),
+                '}' if brace_depth == 0 && self.starts_with("}}") => {
+                    self.advance_by(2); // Skip the closing `}}`.
+                    break;
+                }
+                '{' => {
+                    brace_depth += 1;
+                    self.advance();
+                }
+                '}' => {
+                    if brace_depth > 0 {
+                        brace_depth -= 1;
+                    }
+                    self.advance();
+                }
+                _ => self.advance(),
+            }
+        }
     }
 
     /// Parses a template expression.
@@ -558,8 +755,15 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// Consumes a string literal, handling escaped characters.
+    /// Consumes a string literal, handling escaped characters. A backtick opens a TEMPLATE literal,
+    /// which is delegated to [`Self::consume_template_literal`] so its `${ … }` substitutions (which
+    /// may themselves contain `` ` ``, `'`, `"`, and balanced braces) are balanced correctly rather
+    /// than terminating at the first stray backtick.
     fn consume_string(&mut self, delimiter: char) {
+        if delimiter == '`' {
+            self.consume_template_literal();
+            return;
+        }
         self.advance(); // Skip the opening quote
         while let Some(ch) = self.current_char {
             match ch {
@@ -570,6 +774,59 @@ impl<'a> Lexer<'a> {
                 ch if ch == delimiter => {
                     self.advance(); // Skip the closing quote
                     break;
+                }
+                _ => self.advance(),
+            }
+        }
+    }
+
+    /// Consumes a template literal (`` `…` ``) whose opening backtick is at the cursor, balancing any
+    /// `${ … }` substitution. Inside a substitution the scanner recurses into nested strings /
+    /// template literals and tracks `{`/`}` depth, so a `` ` `` or a `}` inside an inner string does
+    /// not prematurely close the substitution or the outer template. This is what lets a JS region
+    /// hold a multi-line / nested template literal (e.g. `` `Hello, ${ user(`${id}`) }!` ``) intact.
+    fn consume_template_literal(&mut self) {
+        self.advance(); // Skip the opening backtick.
+        while let Some(ch) = self.current_char {
+            match ch {
+                '\\' => {
+                    self.advance(); // Skip the backslash
+                    if self.current_char.is_some() {
+                        self.advance(); // Skip the escaped char
+                    }
+                }
+                '`' => {
+                    self.advance(); // Closing backtick.
+                    break;
+                }
+                '$' if self.peek() == Some('{') => {
+                    self.advance(); // Skip '$'
+                    self.advance(); // Skip '{'
+                    self.consume_template_substitution();
+                }
+                _ => self.advance(),
+            }
+        }
+    }
+
+    /// Consumes the inside of a `${ … }` template substitution after its opening `{` has been
+    /// consumed, stopping just past the matching `}`. Strings and nested template literals inside the
+    /// substitution are consumed whole, and `{`/`}` nesting (object literals, blocks) is balanced.
+    fn consume_template_substitution(&mut self) {
+        let mut depth: i32 = 1;
+        while let Some(ch) = self.current_char {
+            match ch {
+                '\'' | '"' | '`' => self.consume_string(ch),
+                '{' => {
+                    depth += 1;
+                    self.advance();
+                }
+                '}' => {
+                    depth -= 1;
+                    self.advance();
+                    if depth == 0 {
+                        break;
+                    }
                 }
                 _ => self.advance(),
             }
@@ -926,5 +1183,226 @@ more\u{00e9}TS();\n\
             "interleaved TS region missing; got {:?}",
             kinds
         );
+    }
+
+    // ───────────────────────────── R2 balanced-scanner rough edges ─────────────────────────────
+    //
+    // Each test below pins a single rough edge the lexer audit called out. The shared helpers
+    // reconstruct the joined JavaScript / HTML regions exactly the way `sfc::split_chunks` does
+    // (concatenating same-kind token bodies), so a test asserts on the SAME text the compiler
+    // downstream actually receives — never a regex over the source.
+
+    /// Join all `JavaScript` token bodies in order (mirrors `sfc::split_chunks`' `javascript` bucket).
+    fn joined_js(input: &str) -> String {
+        lex(input)
+            .into_iter()
+            .filter_map(|k| match k {
+                TokenKind::JavaScript(js) => Some(js),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    /// Join all `HTML` token bodies in order (mirrors `sfc::split_chunks`' `html` bucket).
+    fn joined_html(input: &str) -> String {
+        lex(input)
+            .into_iter()
+            .filter_map(|k| match k {
+                TokenKind::HTML(h) => Some(h),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    #[test]
+    fn regex_literal_with_close_tag_stays_in_js() {
+        // A regex whose body contains `</` (and `>`) must NOT split the JS region: the `</` is regex
+        // content, not the start of an HTML close tag. The whole `/<\/div>/g` lands in JavaScript and
+        // the following `<div>hi</div>` is its own intact HTML region.
+        let src = "const re = /<\\/div>/g;\n<div>hi</div>";
+        let js = joined_js(src);
+        assert!(
+            js.contains("/<\\/div>/g"),
+            "regex literal was torn out of the JS region; joined JS = {js:?}"
+        );
+        let html = joined_html(src);
+        assert_eq!(
+            html.trim(),
+            "<div>hi</div>",
+            "HTML region was corrupted by the regex's `</`; got {html:?}"
+        );
+    }
+
+    #[test]
+    fn regex_literal_with_metachars_does_not_corrupt_region() {
+        // A regex literal `/[<{;]/` carries every byte the old scanner treated as a hard boundary
+        // (`<`, `{`, `;`). All of it must stay inside the single JavaScript region.
+        let src = "const ok = /[<{;]/.test(input);\n<p>done</p>";
+        let js = joined_js(src);
+        assert!(
+            js.contains("/[<{;]/.test(input)"),
+            "regex metachars split the JS region; joined JS = {js:?}"
+        );
+        assert!(
+            joined_html(src).contains("<p>done</p>"),
+            "trailing HTML lost after a metachar regex"
+        );
+    }
+
+    #[test]
+    fn division_after_value_is_not_a_regex() {
+        // Conservative regex disambiguation: a `/` after a value (ident / `)` / digit) is DIVISION,
+        // not a regex start, so the following `/ b` is not swallowed as a regex body.
+        let src = "const r = (a) / b / c;\n<div>x</div>";
+        let js = joined_js(src);
+        assert!(
+            js.contains("(a) / b / c"),
+            "division was misread as a regex; joined JS = {js:?}"
+        );
+        assert!(joined_html(src).contains("<div>x</div>"), "trailing HTML lost after division");
+    }
+
+    #[test]
+    fn string_containing_close_template_is_safe() {
+        // A string literal whose contents include `</template>` (or `</style>`, or `{{`) must not be
+        // mistaken for a region boundary — the whole literal stays in the JS region.
+        let src = "const s = \"</template> and {{ not interp }} and </style>\";\n<div>ok</div>";
+        let js = joined_js(src);
+        assert!(
+            js.contains("\"</template> and {{ not interp }} and </style>\""),
+            "a boundary-shaped string literal was split; joined JS = {js:?}"
+        );
+        assert!(joined_html(src).contains("<div>ok</div>"), "trailing HTML lost after the string");
+    }
+
+    #[test]
+    fn multiline_balanced_expression_is_not_split_mid_braces() {
+        // A multi-line arrow with a nested block (`computed(() => { … })`) spans newlines and `;`
+        // INSIDE balanced brackets. The depth-aware scanner must keep it whole rather than breaking
+        // at the first interior newline / `;`. The `gauge.treaty` `ratio` computed is exactly this.
+        let src = "const ratio = computed(() => {\n  const span = max() - min();\n  return span <= 0 ? 0 : 1;\n});\n<div>v</div>";
+        let js = joined_js(src);
+        assert!(
+            js.contains("const span = max() - min();") && js.contains("return span <= 0 ? 0 : 1;"),
+            "balanced multi-line body was split mid-expression; joined JS = {js:?}"
+        );
+        assert!(joined_html(src).contains("<div>v</div>"), "trailing HTML lost after the arrow body");
+    }
+
+    #[test]
+    fn nested_template_literal_substitution_is_balanced() {
+        // A template literal with a `${ … }` substitution that itself contains a nested template
+        // literal and an object brace must be consumed whole; its inner `}` / `` ` `` must not close
+        // the outer literal early, and the following HTML must survive.
+        let src = "const msg = `Hi ${ user({ id }) } and ${ `nested ${x}` }!`;\n<span>m</span>";
+        let js = joined_js(src);
+        assert!(
+            js.contains("`Hi ${ user({ id }) } and ${ `nested ${x}` }!`"),
+            "nested template literal was split; joined JS = {js:?}"
+        );
+        assert!(joined_html(src).contains("<span>m</span>"), "trailing HTML lost after template literal");
+    }
+
+    #[test]
+    fn void_element_without_slash_does_not_swallow_trailing_ts() {
+        // A bare `<br>` / `<input>` (no trailing `/`) is a VOID element: it must NOT keep the HTML
+        // region open. The old scanner pushed it and waited for a `</br>` that never comes, swallowing
+        // the rest of the file. Here the void element is nested in a container; the container closes
+        // and the trailing TS stays JavaScript.
+        let src = "<div>before<br>after<input name=\"x\">end</div>\nconst tail = 1;";
+        let html = joined_html(src);
+        assert!(
+            html.contains("<br>") && html.contains("<input name=\"x\">") && html.contains("end"),
+            "void elements + following text not captured in the HTML region; got {html:?}"
+        );
+        assert!(
+            !html.contains("const tail"),
+            "void element swallowed the trailing TS into the HTML region; got {html:?}"
+        );
+        assert!(
+            joined_js(src).contains("const tail = 1"),
+            "trailing TS after a void element was lost; joined JS = {}",
+            joined_js(src)
+        );
+    }
+
+    #[test]
+    fn lone_void_root_element_does_not_run_to_eof() {
+        // Even a void element as the ROOT must terminate the HTML region immediately (it has no end
+        // tag), so a following TS region is preserved rather than swallowed to EOF.
+        let src = "<hr>\nconst after = 2;";
+        assert!(
+            joined_js(src).contains("const after = 2"),
+            "a root void element swallowed the rest of the file; joined JS = {}",
+            joined_js(src)
+        );
+    }
+
+    #[test]
+    fn less_than_inside_interpolation_is_not_a_tag() {
+        // `<` inside `{{ … }}` is interpolation text, not a tag open. The whole element (including the
+        // interpolation and its closing tag) must be ONE HTML region.
+        let src = "<div>{{ a < b }}</div>\nconst z = 9;";
+        let html = joined_html(src);
+        assert!(
+            html.contains("<div>{{ a < b }}</div>"),
+            "interpolation `<` was misread as a tag, splitting the region; got {html:?}"
+        );
+        assert!(
+            joined_js(src).contains("const z = 9"),
+            "trailing TS lost after interpolation with `<`; joined JS = {}",
+            joined_js(src)
+        );
+    }
+
+    #[test]
+    fn greater_than_inside_interpolation_is_not_a_tag_end() {
+        // The companion case: `>` inside an interpolation must not be mistaken for a tag end, and a
+        // `}}` inside a string in the interpolation must not end it early.
+        let src = "<p>{{ a > b ? \"}}\" : x }}</p>\nconst w = 1;";
+        let html = joined_html(src);
+        assert!(
+            html.contains("<p>{{ a > b ? \"}}\" : x }}</p>"),
+            "interpolation with `>` / a `}}`-bearing string was mis-segmented; got {html:?}"
+        );
+        assert!(joined_js(src).contains("const w = 1"), "trailing TS lost");
+    }
+
+    #[test]
+    fn regex_disambiguation_helper() {
+        // Direct table test of the regex-vs-divide decision used by `parse_javascript`.
+        // Regex position (previous token cannot end an expression, or start of region):
+        assert!(regex_allowed_after(None));
+        assert!(regex_allowed_after(Some('=')));
+        assert!(regex_allowed_after(Some('(')));
+        assert!(regex_allowed_after(Some(',')));
+        assert!(regex_allowed_after(Some('{')));
+        assert!(regex_allowed_after(Some('!')));
+        assert!(regex_allowed_after(Some('&')));
+        // Divide position (previous token ends an expression):
+        assert!(!regex_allowed_after(Some('a')));
+        assert!(!regex_allowed_after(Some('Z')));
+        assert!(!regex_allowed_after(Some('0')));
+        assert!(!regex_allowed_after(Some('_')));
+        assert!(!regex_allowed_after(Some('$')));
+        assert!(!regex_allowed_after(Some(')')));
+        assert!(!regex_allowed_after(Some(']')));
+        assert!(!regex_allowed_after(Some('}')));
+        assert!(!regex_allowed_after(Some('\'')));
+        assert!(!regex_allowed_after(Some('"')));
+        assert!(!regex_allowed_after(Some('`')));
+    }
+
+    #[test]
+    fn void_element_set_is_case_insensitive() {
+        assert!(is_void_element("br"));
+        assert!(is_void_element("BR"));
+        assert!(is_void_element("Input"));
+        assert!(is_void_element("IMG"));
+        assert!(!is_void_element("div"));
+        assert!(!is_void_element("span"));
+        assert!(!is_void_element("app-widget"));
     }
 }

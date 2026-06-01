@@ -2031,4 +2031,82 @@ return { title, count };\n\
             parsed.errors
         );
     }
+
+    /// Read an everything-app example `.treaty` file relative to this crate's manifest dir
+    /// (`apps/rust/authoring`), so the gate runs against the REAL authored fixtures the lexer must
+    /// keep working — not a synthetic copy that could drift from the shipped examples.
+    fn read_example(rel_from_repo_root: &str) -> String {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        // `apps/rust/authoring` -> repo root is three levels up.
+        let repo_root = manifest
+            .ancestors()
+            .nth(3)
+            .expect("crate manifest is nested under the repo root");
+        let path = repo_root.join(rel_from_repo_root);
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("could not read example fixture {}: {e}", path.display()))
+    }
+
+    #[test]
+    fn example_treaty_files_compile_to_define_component() {
+        // R2 GATE: the four shipped everything-app `.treaty` examples (gauge under features/metrics,
+        // greeter, todo-list) must still compile through the real `compile_treaty_authoring` seam to a
+        // valid, re-parseable Ivy `ɵɵdefineComponent` module after the balanced-scanner rewrite. These
+        // files exercise the rough edges directly: multi-line `computed(() => { … })` arrows
+        // (gauge/greeter), a `server { … }` block with a `` `Hello, ${who}!` `` template literal
+        // (greeter), interleaved TS/HTML/`<style>` with `@if`/`@for`, and `<input … />` elements.
+        let fixtures = [
+            ("examples/everything-app/src/features/metrics/gauge.treaty", "gauge.treaty"),
+            ("examples/everything-app/src/features/greeter/greeter.treaty", "greeter.treaty"),
+            ("examples/everything-app/src/components/todo-list.treaty", "todo-list.treaty"),
+        ];
+        for (rel, file_name) in fixtures {
+            let source = read_example(rel);
+            let out = compile_treaty_authoring(&source, file_name);
+            assert!(
+                out.errors.is_empty(),
+                "{file_name}: compile reported errors: {:?}",
+                out.errors
+            );
+            // VERIFY EMITTED CODE BY PARSING (oxc), never a regex over the emit.
+            assert_treaty_client_parses(&out.code);
+            assert!(
+                out.code.contains(DEFINE),
+                "{file_name}: emit is not a component (no ɵɵdefineComponent); got:\n{}",
+                out.code
+            );
+            // No raw Angular `@Component(` decorator node survives (AOT, no JIT).
+            assert!(
+                !out.code.contains("@Component("),
+                "{file_name}: a raw @Component decorator survived in the emit; got:\n{}",
+                out.code
+            );
+        }
+    }
+
+    #[test]
+    fn greeter_server_block_template_literal_does_not_leak_to_client() {
+        // The greeter's `server { … }` block holds `const text = `Hello, ${who}!`` — a multi-line
+        // template-literal body. The balanced scanner must keep that literal whole inside the lifted
+        // server fn so it is extracted to the server module and NEVER reaches the client (the precise
+        // privacy contract the everything-app source-validate gate asserts for greeter.treaty).
+        let source = read_example("examples/everything-app/src/features/greeter/greeter.treaty");
+        let out = compile_treaty_authoring(&source, "greeter.treaty");
+
+        let server_module = out
+            .server_module
+            .as_deref()
+            .expect("greeter's server block must yield a server module");
+        assert!(
+            server_module.contains("const text = `Hello, ${who}!`"),
+            "server-fn body not extracted to the server module; got:\n{server_module}"
+        );
+        // The body / template literal must be ABSENT from the client (verified emit re-parses too).
+        assert_treaty_client_parses(&out.code);
+        assert!(
+            !out.code.contains("const text = `Hello, ${who}!`"),
+            "SECURITY: server-fn body template literal leaked into the greeter client; got:\n{}",
+            out.code
+        );
+    }
 }
