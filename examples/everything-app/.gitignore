@@ -2,3 +2,5 @@
 # Both are removed on a clean run; ignored so a crashed run never leaks artifacts.
 .e2e-vite-fixture/
 .e2e-neg/
+# Scratch fixture written by the dev-serve JSX e2e harness (jsx-dev-serve.e2e.mjs).
+.e2e-jsx-fixture/

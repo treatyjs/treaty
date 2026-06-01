@@ -165,6 +165,40 @@ await check('config() registers the .tjsx esbuild loader', () => {
 	assert.equal(loader['.tjsx'], 'tsx', '.tjsx maps to the tsx loader')
 })
 
+// 6b. DEV-SERVE JSX FIX: config() forces esbuild jsx:'preserve' on BOTH the main
+//     transform pass and the dependency scanner, so esbuild's automatic-JSX dev
+//     transform never injects an `@treaty/jsx/jsx-dev-runtime` import that would
+//     escape to Vite's dep-scan unresolvable. Treaty JSX is Ivy (lowered by the
+//     enforce:'pre' transform), NOT React, so JSX must be preserved for the bundler.
+await check("config() forces esbuild jsx:'preserve' (scanner + main pass)", () => {
+	const cfg = plugin.config.call({}, {}, { command: 'serve', mode: 'development' })
+	assert.equal(
+		cfg?.esbuild?.jsx,
+		'preserve',
+		"Vite's main esbuild transform must preserve JSX (drops tsconfig jsxImportSource)"
+	)
+	assert.equal(
+		cfg?.optimizeDeps?.esbuildOptions?.jsx,
+		'preserve',
+		"the dependency scanner must preserve JSX so no @treaty/jsx runtime import is injected"
+	)
+})
+
+// 6c. preserveJsx:false opts out (an embedder wanting real React automatic-runtime
+//     on .tsx); the jsx override is then absent and esbuild keeps its default mode.
+await check('preserveJsx:false leaves esbuild jsx mode untouched', () => {
+	const p = authoringPluginOf(treaty({ preserveJsx: false }))
+	const cfg = p.config.call({}, {}, { command: 'serve', mode: 'development' })
+	assert.equal(cfg?.esbuild, undefined, 'no esbuild.jsx override when preserveJsx is off')
+	assert.equal(
+		cfg?.optimizeDeps?.esbuildOptions?.jsx,
+		undefined,
+		'no scanner jsx override when preserveJsx is off'
+	)
+	// The loader map is still provided regardless of the jsx mode.
+	assert.equal(cfg?.optimizeDeps?.esbuildOptions?.loader['.tjsx'], 'tsx', '.tjsx loader still set')
+})
+
 // 7. handleHotUpdate on a deleted owned file returns affected modules + onDelete
 await check('handleHotUpdate on delete drives onDelete and returns modules', async () => {
 	// Record an importer so logo.treaty has a dependent in the core index.

@@ -64,6 +64,35 @@ export interface PluginOptions extends TreatyCompilerOptions {
 	 */
 	readonly esbuildLoaders?: Readonly<Record<string, 'ts' | 'tsx' | 'js' | 'jsx'>>
 	/**
+	 * Whether to force esbuild's JSX mode to `'preserve'` for the whole app —
+	 * both Vite's main transform pass (`esbuild.jsx`) and the dependency
+	 * optimizer's pre-bundle scanner (`optimizeDeps.esbuildOptions.jsx`).
+	 * Defaults to `true`, and production usage should leave it on.
+	 *
+	 * Treaty JSX is **Ivy, not React**: a `.tsx`/`.tjsx` authoring file is lowered
+	 * to `ɵɵdefineComponent` by this plugin's `enforce: 'pre'` transform, which
+	 * consumes the RAW JSX. It never calls a React-style `jsx()`/`jsxDEV()` runtime
+	 * factory. But a Treaty app's `tsconfig.json` sets `jsx: "react-jsx"` +
+	 * `jsxImportSource: "@treaty/jsx"` so the editor/`tsgo` can type-check the JSX —
+	 * and esbuild's *automatic* JSX dev transform reads that tsconfig and INJECTS an
+	 * `import { jsxDEV } from "@treaty/jsx/jsx-dev-runtime"` into the file. During
+	 * dev that injected import escapes to Vite's dependency scanner as if the
+	 * authoring file imported it, and the scan fails to resolve it (the JSX runtime
+	 * is a types/back-compat shim, not a dep the app actually imports).
+	 *
+	 * Forcing `jsx: 'preserve'` makes esbuild leave the JSX untouched (no factory
+	 * import is ever injected), so the Treaty transform — which already owns and
+	 * lowers these files before esbuild's transform runs — is the only thing that
+	 * ever consumes the JSX. Vite zeros the tsconfig `jsx`/`jsxImportSource` when an
+	 * explicit `esbuild.jsx` is present, so this cleanly overrides the project
+	 * tsconfig for the bundler without changing how `tsgo`/the editor type-check.
+	 *
+	 * Set `false` only if an embedder deliberately wants esbuild to apply a
+	 * React-style automatic-runtime transform to `.tsx` (non-Treaty JSX); a real
+	 * Treaty app never needs this.
+	 */
+	readonly preserveJsx?: boolean
+	/**
 	 * Cold-build prewarm: a list of absolute paths to owned authoring files to
 	 * batch-compile up front via the core's `transformMany` (one parallel round
 	 * trip through the Rust addon). Only runs for a one-shot `build` (not dev),
@@ -343,6 +372,7 @@ function createFileRoutesPlugin(routes: RoutesVirtualModuleOptions): Plugin {
 export default function treaty(options: PluginOptions = {}): Plugin[] {
 	const emitSourceMap = options.sourceMap ?? true
 	const esbuildLoaders = options.esbuildLoaders ?? DEFAULT_ESBUILD_LOADERS
+	const preserveJsx = options.preserveJsx ?? true
 	const prewarmFiles = options.prewarm ?? []
 
 	const functionChunking = options.functionChunking ?? true
@@ -391,16 +421,51 @@ export default function treaty(options: PluginOptions = {}): Plugin[] {
 		enforce: 'pre',
 
 		/**
-		 * Teach esbuild about Treaty's JSX authoring extensions. Without this the
-		 * dependency optimizer / esbuild transform pass would not know how to read
-		 * `.tjsx` files; `.treaty` files are never handed to esbuild because this
-		 * plugin transforms them first.
+		 * Teach esbuild about Treaty's JSX authoring extensions, and force esbuild's
+		 * JSX mode to `'preserve'` so it never applies a React-style automatic-runtime
+		 * transform to Treaty JSX.
+		 *
+		 * The loader map is needed because the dependency optimizer / esbuild
+		 * transform pass would otherwise not know how to read `.tjsx` files
+		 * (`.treaty` files are never handed to esbuild because this plugin transforms
+		 * them first).
+		 *
+		 * The `jsx: 'preserve'` settings are the dev-serve JSX fix. Treaty JSX is
+		 * **Ivy, not React**: this plugin's `enforce: 'pre'` transform lowers a
+		 * `.tsx`/`.tjsx` authoring file to `ɵɵdefineComponent`, consuming the raw JSX
+		 * — it never invokes a React-style `jsx()`/`jsxDEV()` runtime factory. But a
+		 * Treaty app's `tsconfig.json` sets `jsx: "react-jsx"` +
+		 * `jsxImportSource: "@treaty/jsx"` (so the editor/`tsgo` type-check JSX), and
+		 * esbuild's *automatic* JSX transform reads that tsconfig and INJECTS
+		 * `import { jsxDEV } from "@treaty/jsx/jsx-dev-runtime"` into the file. During
+		 * dev that injected import escapes to Vite's dependency scanner as a phantom
+		 * dependency of the authoring file, which then fails to resolve and aborts the
+		 * dep scan. Setting `jsx: 'preserve'` on BOTH the dependency scanner
+		 * (`optimizeDeps.esbuildOptions.jsx`) and Vite's main transform pass
+		 * (`esbuild.jsx`) makes esbuild leave the JSX untouched, so no foreign runtime
+		 * import is ever injected and the Treaty transform stays the sole consumer of
+		 * the JSX. Vite zeros the tsconfig `jsx`/`jsxImportSource` whenever an explicit
+		 * `esbuild.jsx` is present, so this overrides the project tsconfig for the
+		 * bundler without affecting how `tsgo`/the editor type-check.
 		 */
 		config() {
+			const jsx = preserveJsx ? ('preserve' as const) : undefined
 			return {
+				// Vite's MAIN esbuild transform pass: forcing `jsx: 'preserve'` makes
+				// Vite drop the project tsconfig's `jsx`/`jsxImportSource`, so any `.tsx`
+				// that reaches this pass keeps its JSX rather than gaining an injected
+				// `@treaty/jsx` runtime import. (Treaty-owned files are already lowered
+				// by the `enforce: 'pre'` transform before they get here.)
+				...(preserveJsx ? { esbuild: { jsx } } : {}),
 				optimizeDeps: {
 					esbuildOptions: {
 						loader: { ...esbuildLoaders },
+						// The DEP SCANNER path: with `jsx` set here Vite passes `jsx:
+						// 'preserve'` to the scan's esbuild context and zeroes the tsconfig's
+						// `jsx`/`jsxImportSource`, so scanning a `.tsx` authoring file no longer
+						// injects an unresolvable `@treaty/jsx/jsx-dev-runtime` import. This is
+						// the exact site of the dev-serve "could not be resolved" failure.
+						...(preserveJsx ? { jsx } : {}),
 					},
 				},
 			}
