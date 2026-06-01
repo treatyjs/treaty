@@ -1,16 +1,15 @@
-//! Head / SEO emit, plus the two static discovery artifacts: resolve the
-//! effective [`HeadMeta`] for a route (caller overrides winning over
-//! conventional render-data keys), render the `<head>` SEO/meta tags (title,
-//! description, canonical, Open Graph / meta, link), wrap a rendered fragment
-//! in a full, hydration-ready HTML document, and build `sitemap.xml` +
-//! `robots.txt`.
+//! Head / SEO emit: resolve the effective [`HeadMeta`] for a route (caller
+//! overrides winning over conventional render-data keys), render the `<head>`
+//! SEO/meta tags (title, description, canonical, Open Graph / meta, link), and
+//! wrap a rendered fragment in a full, hydration-ready HTML document.
 //!
 //! Ports the head subset of the TS `prerender.ts` (`resolveHead`, `renderHead`,
-//! `wrapDocument`) and the whole of the TS `sitemap.ts` (`buildSitemap`,
-//! `buildRobots`, `absoluteUrl`). Everything here is a pure string builder with
-//! no I/O, so the caller owns when/where to write the output.
+//! `wrapDocument`). Everything here is a pure string builder with no I/O, so the
+//! caller owns when/where to write the output. The crawler artifacts
+//! (`sitemap.xml` / `robots.txt`) live in the [`crate::manifest`] module — their
+//! single owner — so this module stays focused on document head emit.
 
-use crate::types::{HeadMeta, RenderData, SitemapEntry};
+use crate::types::{HeadMeta, RenderData};
 use serde_json::Value;
 
 /// The marker a hydrating client runtime keys off to take over a prerender.
@@ -29,17 +28,6 @@ fn escape_html(value: &str) -> String {
 /// `escapeAttr`: `&` then `"`.
 fn escape_attr(value: &str) -> String {
     value.replace('&', "&amp;").replace('"', "&quot;")
-}
-
-/// Escape text for safe embedding inside XML element bodies / attributes.
-/// Mirrors the TS `escapeXml`: `&`, `<`, `>`, `"`, `'` (in that order).
-fn escape_xml(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
 }
 
 /// Whether a meta key uses the Open Graph `property=` convention. Mirrors the TS
@@ -168,99 +156,9 @@ pub fn wrap_document(fragment: &str, data: &RenderData, head: &HeadMeta) -> Stri
     )
 }
 
-/// Join a site origin (`https://example.com`, possibly trailing-slashed) with a
-/// root-relative URL path (`/about`) into one absolute, deduplicated-slash
-/// location. A path already absolute (`http(s)://…`) is returned verbatim.
-/// Ports the TS `absoluteUrl`.
-pub fn absolute_url(origin: &str, url_path: &str) -> String {
-    let lower = url_path.to_ascii_lowercase();
-    if lower.starts_with("http://") || lower.starts_with("https://") {
-        return url_path.to_string();
-    }
-    let base = origin.trim_end_matches('/');
-    if url_path.starts_with('/') {
-        format!("{base}{url_path}")
-    } else {
-        format!("{base}/{url_path}")
-    }
-}
-
-/// Clamp a sitemap priority into the valid `[0,1]` range; non-finite values fall
-/// back to `0.5`. Mirrors the TS `clampPriority`.
-fn clamp_priority(priority: f64) -> f64 {
-    if !priority.is_finite() {
-        return 0.5;
-    }
-    priority.clamp(0.0, 1.0)
-}
-
-/// Render a sitemap XML document for `entries`, resolving each entry's `url`
-/// against `origin` into an absolute `<loc>`. Output is deterministic (entries
-/// in the order given) and minimal — only the optional fields actually supplied
-/// are emitted. Ports the TS `buildSitemap` (here named `generate_sitemap`).
-pub fn generate_sitemap(origin: &str, entries: &[SitemapEntry]) -> String {
-    let mut lines: Vec<String> = vec![
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>".to_string(),
-        "<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">".to_string(),
-    ];
-    for entry in entries {
-        lines.push("  <url>".to_string());
-        lines.push(format!("    <loc>{}</loc>", escape_xml(&absolute_url(origin, &entry.url))));
-        if let Some(lastmod) = &entry.lastmod {
-            lines.push(format!("    <lastmod>{}</lastmod>", escape_xml(lastmod)));
-        }
-        if let Some(changefreq) = entry.changefreq {
-            lines.push(format!("    <changefreq>{}</changefreq>", changefreq.as_str()));
-        }
-        if let Some(priority) = entry.priority {
-            lines.push(format!("    <priority>{:.1}</priority>", clamp_priority(priority)));
-        }
-        lines.push("  </url>".to_string());
-    }
-    lines.push("</urlset>".to_string());
-    format!("{}\n", lines.join("\n"))
-}
-
-/// Options for [`generate_robots`]. Mirrors the TS `RobotsOptions`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct RobotsOptions {
-    /// The absolute `Sitemap:` URL to advertise. `None` emits no sitemap line
-    /// (e.g. when no `origin` is configured).
-    pub sitemap_url: Option<String>,
-    /// Path prefixes to disallow for all agents (`["/admin", "/draft"]`). Each
-    /// becomes a `Disallow:` line. Empty allows everything.
-    pub disallow: Vec<String>,
-}
-
-/// Render a `robots.txt` body: a single `User-agent: *` group that allows
-/// crawling (with any supplied `disallow` prefixes), optionally followed by a
-/// `Sitemap:` line. Deterministic and dependency-free. Ports the TS
-/// `buildRobots` (here named `generate_robots`).
-pub fn generate_robots(options: &RobotsOptions) -> String {
-    let mut lines: Vec<String> = vec!["User-agent: *".to_string()];
-    if options.disallow.is_empty() {
-        lines.push("Allow: /".to_string());
-    } else {
-        for prefix in &options.disallow {
-            let normalized = if prefix.starts_with('/') {
-                prefix.clone()
-            } else {
-                format!("/{prefix}")
-            };
-            lines.push(format!("Disallow: {normalized}"));
-        }
-    }
-    if let Some(sitemap_url) = &options.sitemap_url {
-        lines.push(String::new());
-        lines.push(format!("Sitemap: {sitemap_url}"));
-    }
-    format!("{}\n", lines.join("\n"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::ChangeFreq;
     use serde_json::json;
     use std::collections::BTreeMap;
 
@@ -372,102 +270,5 @@ mod tests {
         let lower = doc.to_ascii_lowercase();
         assert_eq!(lower.matches("</script").count(), 1);
         assert!(doc.contains("&lt;/script&gt;&lt;script&gt;"));
-    }
-
-    #[test]
-    fn absolute_url_joins_origin_and_path_deduping_slashes() {
-        assert_eq!(absolute_url("https://e.com/", "/about"), "https://e.com/about");
-        assert_eq!(absolute_url("https://e.com", "about"), "https://e.com/about");
-        assert_eq!(absolute_url("https://e.com//", "/"), "https://e.com/");
-    }
-
-    #[test]
-    fn absolute_url_passes_through_already_absolute_paths() {
-        assert_eq!(absolute_url("https://e.com", "https://cdn.x/y"), "https://cdn.x/y");
-        assert_eq!(absolute_url("https://e.com", "HTTP://cdn.x/y"), "HTTP://cdn.x/y");
-    }
-
-    #[test]
-    fn generate_sitemap_emits_urls_in_order_with_absolute_loc() {
-        let entries = vec![SitemapEntry::new("/"), SitemapEntry::new("/blog/hello")];
-        let xml = generate_sitemap("https://e.com", &entries);
-        assert!(xml.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"));
-        assert!(xml.contains("<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">"));
-        let home = xml.find("<loc>https://e.com/</loc>").expect("home loc");
-        let blog = xml.find("<loc>https://e.com/blog/hello</loc>").expect("blog loc");
-        assert!(home < blog, "entries must be emitted in the given order");
-        assert!(xml.ends_with("</urlset>\n"));
-    }
-
-    #[test]
-    fn generate_sitemap_emits_only_supplied_optional_fields() {
-        let entry = SitemapEntry {
-            url: "/x".to_string(),
-            lastmod: Some("2026-05-31".to_string()),
-            changefreq: Some(ChangeFreq::Weekly),
-            priority: Some(0.8),
-        };
-        let xml = generate_sitemap("https://e.com", &[entry]);
-        assert!(xml.contains("<lastmod>2026-05-31</lastmod>"));
-        assert!(xml.contains("<changefreq>weekly</changefreq>"));
-        assert!(xml.contains("<priority>0.8</priority>"));
-
-        // A bare entry emits none of the optional tags.
-        let bare = generate_sitemap("https://e.com", &[SitemapEntry::new("/y")]);
-        assert!(!bare.contains("<lastmod>"));
-        assert!(!bare.contains("<changefreq>"));
-        assert!(!bare.contains("<priority>"));
-    }
-
-    #[test]
-    fn generate_sitemap_clamps_priority_and_handles_non_finite() {
-        let high = SitemapEntry { priority: Some(5.0), ..SitemapEntry::new("/a") };
-        let low = SitemapEntry { priority: Some(-1.0), ..SitemapEntry::new("/b") };
-        let nan = SitemapEntry { priority: Some(f64::NAN), ..SitemapEntry::new("/c") };
-        let xml = generate_sitemap("https://e.com", &[high, low, nan]);
-        assert!(xml.contains("<priority>1.0</priority>"));
-        assert!(xml.contains("<priority>0.0</priority>"));
-        assert!(xml.contains("<priority>0.5</priority>"));
-    }
-
-    #[test]
-    fn generate_sitemap_escapes_loc_and_lastmod() {
-        let entry = SitemapEntry {
-            url: "/search?q=a&b<c".to_string(),
-            lastmod: Some("a&b".to_string()),
-            ..SitemapEntry::new("/ignored")
-        };
-        let xml = generate_sitemap("https://e.com", &[entry]);
-        assert!(xml.contains("<loc>https://e.com/search?q=a&amp;b&lt;c</loc>"));
-        assert!(xml.contains("<lastmod>a&amp;b</lastmod>"));
-    }
-
-    #[test]
-    fn generate_robots_allows_all_by_default() {
-        let txt = generate_robots(&RobotsOptions::default());
-        assert_eq!(txt, "User-agent: *\nAllow: /\n");
-    }
-
-    #[test]
-    fn generate_robots_emits_disallow_and_normalizes_leading_slash() {
-        let options = RobotsOptions {
-            disallow: vec!["/admin".to_string(), "draft".to_string()],
-            ..RobotsOptions::default()
-        };
-        let txt = generate_robots(&options);
-        assert!(txt.contains("Disallow: /admin\n"));
-        assert!(txt.contains("Disallow: /draft\n"));
-        // With disallows present, the blanket Allow line is omitted.
-        assert!(!txt.contains("Allow: /\n"));
-    }
-
-    #[test]
-    fn generate_robots_advertises_sitemap_after_blank_line() {
-        let options = RobotsOptions {
-            sitemap_url: Some("https://e.com/sitemap.xml".to_string()),
-            ..RobotsOptions::default()
-        };
-        let txt = generate_robots(&options);
-        assert_eq!(txt, "User-agent: *\nAllow: /\n\nSitemap: https://e.com/sitemap.xml\n");
     }
 }
