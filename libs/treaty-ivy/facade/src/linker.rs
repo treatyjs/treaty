@@ -1654,6 +1654,10 @@ fn link_component(obj: &ObjectExpression) -> Result<LinkedDef, String> {
         has_directive_dependencies,
         raw_imports: None,
         foreign_imports: None,
+        // A partial `ɵɵngDeclareComponent` already lists its resolved pipe/directive `dependencies`
+        // verbatim (carried into `declarations` above), so the linker never re-resolves pipes from
+        // imports — leave the import-scope empty.
+        imported_directive_names: Vec::new(),
     };
 
     let mut template_builder = RealTemplateBuilder;

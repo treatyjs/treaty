@@ -772,6 +772,14 @@ pub struct R3ComponentMetadata<D: R3TemplateDependency> {
     pub has_directive_dependencies: bool,
     pub raw_imports: Option<Expr>,
     pub foreign_imports: Option<Vec<R3ForeignComponentMetadata>>,
+    /// The class names this component imports (its `imports: [...]` entries plus, for a multi-class
+    /// file, the sibling-declared class names). Used to resolve a STANDALONE component's
+    /// template-used pipe (`value | pipeName`) to the imported class that declares it, so that
+    /// imported pipe is listed in the runtime `dependencies` array. A pipe is referenced by its
+    /// registered `name`, not its class, so the class is recovered by matching the imported names
+    /// against the pipe name (`percent01` → `Percent01Pipe` / `Percent01`). Empty for the
+    /// NgModule-scoped (non-standalone) path, which resolves pipes from module scope instead.
+    pub imported_directive_names: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1819,14 +1827,20 @@ where
     // order). The standard ngtsc declaration order coincides with this for the common case.
     //
     // A pipe contributes a dependency only when it resolves to a class in the component's pipe
-    // SCOPE. NgModule-declared (non-standalone) components draw that scope from their declaring
-    // module, so a template pipe `name` resolves to its co-declared class. A standalone component
-    // with no resolvable import scope (e.g. a built-in `uppercase`/`slice` used without an
-    // explicit import) has no such resolution and Angular emits no dependency for it — gating on
-    // module membership reproduces that: we only resolve template pipes for non-standalone
-    // components, mirroring "pipe is only a dependency when it is in the module scope".
+    // SCOPE. The scope differs by component kind:
+    //
+    //   * A STANDALONE component draws its scope from its own `imports: [...]` (plus, in a
+    //     multi-class file, its sibling classes). A template pipe `value | pipeName` is a dependency
+    //     exactly when one of those imported classes is the pipe registered under `pipeName`. The
+    //     pipe is referenced by its registered NAME, not its class, so we recover the class by
+    //     matching the imported class names against the pipe name (`percent01` resolves to the
+    //     imported `Percent01Pipe` / `Percent01`). A used pipe whose name matches no import (e.g. a
+    //     built-in `slice` used without importing it) yields no dependency — Angular reports that as
+    //     a template error rather than emitting a bogus dependency.
+    //   * A NgModule-declared (NON-standalone) component draws its scope from its declaring module,
+    //     so a template pipe `name` resolves to its co-declared class via the name→class convention.
     let pipe_deps = if meta.base.is_standalone {
-        Vec::new()
+        resolve_standalone_pipe_dependencies(&meta.template.nodes, &meta.imported_directive_names)
     } else {
         collect_template_pipe_dependencies(&meta.template.nodes)
     };
@@ -2197,6 +2211,52 @@ fn collect_template_pipe_dependencies(nodes: &[t::Node]) -> Vec<Expr> {
         .into_iter()
         .map(|name| o::variable(pascal_case_pipe_name(&name), None))
         .collect()
+}
+
+/// Resolve a STANDALONE component's template-used pipes to the imported classes that declare them.
+///
+/// A standalone component lists its pipes in `imports: [...]`; a template pipe `value | pipeName`
+/// is a dependency exactly when one of those imported classes is the pipe registered under
+/// `pipeName`. The pipe is referenced by its registered NAME, not its class, so we recover the
+/// class by matching the imported class names against the pipe name: the imported class
+/// `Percent01Pipe` (or `Percent01`) is the declarer of the pipe named `percent01`. Used pipes whose
+/// name matches no import contribute no dependency (a built-in used without importing it is a
+/// template error in Angular, not a synthesized dependency). Resolution is in first-use order to
+/// match the directive-declaration ordering of the `dependencies` array, and each imported class is
+/// listed at most once even if its pipe is used several times.
+fn resolve_standalone_pipe_dependencies(nodes: &[t::Node], imported_names: &[String]) -> Vec<Expr> {
+    let mut collector = PipeNameCollector::default();
+    collect_pipes_in_nodes(nodes, &mut collector);
+    let mut out: Vec<Expr> = Vec::new();
+    let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for name in &collector.names {
+        if let Some(class) = resolve_pipe_name_to_import(name, imported_names) {
+            if used.insert(class.clone()) {
+                out.push(o::variable(&class, None));
+            }
+        }
+    }
+    out
+}
+
+/// Find the imported class that declares the pipe registered under `pipe_name`, by name shape.
+///
+/// A pipe `name` is the lower-camel/kebab form of its PascalCase class. Treaty's convention also
+/// permits a trailing `Pipe` on the class (`percent01` → `Percent01Pipe`), so an imported class
+/// matches `pipe_name` when it equals the PascalCase of the name, that PascalCase plus a `Pipe`
+/// suffix, or — defensively — the class with a trailing `Pipe` stripped equals the PascalCase. The
+/// first matching import (in `imports` order) wins.
+fn resolve_pipe_name_to_import(pipe_name: &str, imported_names: &[String]) -> Option<String> {
+    let pascal = pascal_case_pipe_name(pipe_name);
+    let with_suffix = format!("{pascal}Pipe");
+    imported_names
+        .iter()
+        .find(|class| {
+            **class == pascal
+                || **class == with_suffix
+                || class.strip_suffix("Pipe").map(|c| c == pascal).unwrap_or(false)
+        })
+        .cloned()
 }
 
 /// Turn a pipe `name` into its declaring-class identifier (`myPipe` → `MyPipe`,
@@ -2570,6 +2630,7 @@ mod tests {
             has_directive_dependencies: false,
             raw_imports: None,
             foreign_imports: None,
+            imported_directive_names: Vec::new(),
         }
     }
 

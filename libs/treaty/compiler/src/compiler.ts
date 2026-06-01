@@ -69,12 +69,26 @@ export function classify(id: string): TreatyFileKind | null {
 
 /**
  * A plain `.ts` file is only Treaty's to compile when it declares an Angular
- * component. We cheaply pre-screen for an `@Component` decorator so that
- * ordinary TypeScript modules are left untouched (the compiler returns `null`
- * for them, letting the bundler's normal TS pipeline handle them).
+ * decorated class — a `@Component`, `@Directive`, `@Pipe`, `@Injectable`, or
+ * `@NgModule`. We cheaply pre-screen for ANY of those decorators so that the
+ * unified authoring front-end lowers each to its Ivy definition
+ * (`ɵɵdefineComponent` / `ɵɵdefineDirective` / `ɵɵdefinePipe` / `ɵfac` +
+ * `ɵɵdefineInjectable` / `ɵɵdefineNgModule`) AOT. A `.ts` carrying none of these
+ * is an ordinary TypeScript module: the compiler returns `null` for it, letting
+ * the bundler's normal TS pipeline handle it.
+ *
+ * Screening only `@Component` (the previous behaviour) left a `@Directive`/`@Pipe`/
+ * `@Injectable`/`@NgModule` `.ts` to fall through to esbuild's raw decorator
+ * transform (`__decorateClass([Directive({…})], …)`), shipping a decorated class
+ * with NO Ivy definition — so Angular fell to its JIT compiler at runtime and
+ * crashed ("needs to be compiled using the JIT compiler"). Recognising every kind
+ * keeps the whole module graph AOT. The regex is a deliberately cheap pre-screen
+ * (a false positive merely routes a module to the Rust front-end, which itself
+ * AST-detects the real decorators and passes a non-Angular `.ts` through unchanged).
  */
-function isAngularComponentSource(code: string): boolean {
-	return /@Component\s*\(/.test(code)
+const ANGULAR_DECORATOR_RE = /@(?:Component|Directive|Pipe|Injectable|NgModule)\s*\(/
+function isAngularDecoratorSource(code: string): boolean {
+	return ANGULAR_DECORATOR_RE.test(code)
 }
 
 /**
@@ -116,7 +130,7 @@ export class TreatyCompiler {
 		if (kind === null) return false
 		if (kind === 'component') {
 			// Without source we can't be sure; assume yes and let transform decide.
-			return code === undefined ? true : isAngularComponentSource(code)
+			return code === undefined ? true : isAngularDecoratorSource(code)
 		}
 		return true
 	}
@@ -131,7 +145,7 @@ export class TreatyCompiler {
 	transform(id: string, code: string): TransformResult | null {
 		const kind = classify(id)
 		if (kind === null) return null
-		if (kind === 'component' && !isAngularComponentSource(code)) return null
+		if (kind === 'component' && !isAngularDecoratorSource(code)) return null
 
 		const hash = contentHash(code)
 		if (this.cacheEnabled) {
@@ -177,7 +191,7 @@ export class TreatyCompiler {
 			const { id, code } = files[i]!
 			const kind = classify(id)
 			if (kind === null) continue
-			if (kind === 'component' && !isAngularComponentSource(code)) continue
+			if (kind === 'component' && !isAngularDecoratorSource(code)) continue
 
 			const hash = contentHash(code)
 			// Cache hit: serve and skip the batch, exactly like transform().
@@ -210,11 +224,12 @@ export class TreatyCompiler {
 				const slot = batch[b]!
 				let entry: CompiledAuthoring = compiled[b]!
 				// Mirror the per-file `.tsx` fallback: a batched JSX module that is
-				// really an `@Component` class retries via the `@Component`-source path.
+				// really a classic decorated class (no JSX return) retries via the
+				// `@Component`-source path, which lowers every Angular decorator kind.
 				if (
 					entry.errors.length > 0 &&
 					isMissingJsxComponentError(entry.errors) &&
-					isAngularComponentSource(slot.code)
+					isAngularDecoratorSource(slot.code)
 				) {
 					entry = compileSource(slot.code)
 				}
@@ -266,15 +281,16 @@ export class TreatyCompiler {
 	/**
 	 * Lower a `.tsx`/`.tjsx` module. Tries the unified JSX front-end first (so
 	 * bare JSX lowers to Ivy); if it reports only the "no JSX component" diagnostic
-	 * and the source carries an `@Component`, retries via the `@Component`-source
-	 * entry point. Any other diagnostic is returned as-is for the caller to throw.
+	 * and the source carries a classic Angular decorator, retries via the
+	 * `@Component`-source entry point (which lowers every Angular decorator kind).
+	 * Any other diagnostic is returned as-is for the caller to throw.
 	 */
 	private lowerJsx(id: string, code: string): CompiledAuthoring {
 		const jsx = compileUnifiedSource(code, id)
 		if (
 			jsx.errors.length > 0 &&
 			isMissingJsxComponentError(jsx.errors) &&
-			isAngularComponentSource(code)
+			isAngularDecoratorSource(code)
 		) {
 			return compileSource(code)
 		}

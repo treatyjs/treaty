@@ -937,6 +937,9 @@ fn compile_from_parts_inner(
         has_directive_dependencies,
         raw_imports: None,
         foreign_imports: None,
+        // The `.treaty` JS chunk's imported identifiers, so a standalone SFC that pipes through an
+        // imported pipe (`value | percent01`) lists that pipe class in `dependencies`.
+        imported_directive_names: candidates.clone(),
     };
 
     // 4. Emit the definition.

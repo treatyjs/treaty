@@ -3200,6 +3200,11 @@ fn compile_component_meta(
         has_directive_dependencies,
         raw_imports: None,
         foreign_imports,
+        // The importable class names (the component's `imports: [...]` plus sibling classes). A
+        // STANDALONE component resolves its template-used pipes against these so an imported pipe
+        // (`Percent01Pipe` for `value | percent01`) is listed in `dependencies` — without this the
+        // pipe was dropped and Ivy's `ɵɵpipe` threw `undefined.onDestroy` at render time.
+        imported_directive_names: imported_names.to_vec(),
     };
 
     let mut template_builder = ForeignAwareTemplateBuilder::default();

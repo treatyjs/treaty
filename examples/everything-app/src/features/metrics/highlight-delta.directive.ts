@@ -5,11 +5,11 @@
  * `standalone: true` -- the compiler fills those defaults in. It is consumed
  * SELECTORLESSLY: the host (`metrics-panel.component.ts`) lists the directive
  * CLASS by value in its `imports` and references it by NAME in the template
- * (`<span HighlightDelta ...>`), so there is no string selector to match. The
- * directive bodies are lowered to an Ivy directive definition downstream; at the
- * Treaty compiler stage a standalone `@Directive` source is a clean pass-through
- * (only components lower to `ɵɵdefineComponent` here), so `verify.mjs` registers
- * it as PASSTHROUGH and the selectorless WIRING is proven by the host component.
+ * (`<strong HighlightDelta ...>`), so there is no string selector to match. The
+ * Treaty compiler lowers this `@Directive` source to a real Ivy `ɵɵdefineDirective`
+ * (+ `ɵfac`) AOT -- no raw `@Directive` decorator survives, so it never falls to
+ * Angular's JIT at runtime -- and the host lists it in its component
+ * `dependencies` so the selectorless `HighlightDelta` reference binds.
  *
  * Behavior: paints its host green when the bound `delta` is positive, red when
  * negative, and clears the color at zero -- a tiny, real "trend" affordance.

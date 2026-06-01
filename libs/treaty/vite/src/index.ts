@@ -481,10 +481,20 @@ export default function treaty(options: PluginOptions = {}): Plugin[] {
 		clientStubs.set(`${CLIENT_VIRTUAL_PREFIX}${chunk.id}`, clientStubModule(chunk.exportName))
 		tracked.set(chunk.id, { chunk, fileName })
 		if (typeof ctx.emitFile === 'function') {
+			// Emit the server body as a Rollup ASSET (verbatim `source`), NOT a
+			// `chunk`. A server-fn body is a BACKEND module -- the default axum
+			// backend emits a Rust/axum service. Emitting it as `type: 'chunk'`
+			// made Rollup PARSE it as client JavaScript, which threw `Expected
+			// ';'` on the first non-JS token (the Rust `use`) and failed the whole
+			// client build. The client never imports this body -- the component's
+			// `clientBinding` import of `./<id>.server.js` is redirected to the RPC
+			// stub by `resolveId`, so the body stays out of the client JS graph. As
+			// an asset it is written verbatim to its stable file name (for a server
+			// runtime to consume via the manifest) and Rollup never parses it.
 			ctx.emitFile({
-				type: 'chunk',
-				id: `${SERVER_VIRTUAL_PREFIX}${chunk.id}`,
+				type: 'asset',
 				fileName,
+				source: chunk.code,
 			})
 		}
 	}

@@ -626,6 +626,10 @@ pub fn compile_component(
         has_directive_dependencies: false,
         raw_imports: None,
         foreign_imports: None,
+        // This selectorless pipeline carries no import scope (see above), so no imported pipe can
+        // be resolved here; the source-driven `compile_component_meta` path threads the real
+        // `imports` for pipe-dependency resolution.
+        imported_directive_names: Vec::new(),
     };
 
     // 4. Assemble the definition (real template builder + stub host bindings).

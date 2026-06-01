@@ -11,25 +11,24 @@
  * work, the lazy route components load through the router, and each route view
  * renders.
  *
- * It builds against the subset of routes whose authoring sources the Rust
- * compiler currently lowers to VALID, parseable Ivy (mirrors `main.full-e2e.ts`):
+ * It builds against the FULL route graph — every authoring source the Rust
+ * compiler now lowers to VALID, parseable Ivy (mirrors `app.routes.ts`):
  *
  *   - `''`        eager  → log-viewer.component.ts   (@Component .ts, the index)
  *   - `dashboard` lazy   → dashboard.component.ts     (@Component .ts)
  *   - `metrics`   lazy   → metrics-panel.component.ts (@Component .ts hosting the
- *                          `.treaty` Gauge + a pipe + a selectorless directive)
+ *                          `.treaty` Gauge + a pipe + a selectorless directive,
+ *                          both now lowered to real Ivy `ɵɵdefinePipe` /
+ *                          `ɵɵdefineDirective` defs)
+ *   - `greeter`   lazy   → greeter-page.component.ts  (hosts the `.treaty` SFC
+ *                          whose inline `server { … }` block is now extracted to a
+ *                          typed binding, so the SFC lowers to valid client JS)
  *   - `profile`   lazy   → profile.routes.ts          (loadChildren nested routes)
  *
- * The `greeter` route is DELIBERATELY omitted here because its `.treaty` SFC
- * (`greeter.treaty`) hits a Rust-compiler lowering gap: its inline
- * `server { … }` server-fn block is emitted VERBATIM into the lowered module
- * instead of being extracted, producing non-parseable JS (`server { async
- * function … }` → esbuild type-strip throws `Unexpected "{"`), so any bundler —
- * dev-serve transform or `vite build` — fails to lower it. `nav.e2e.mjs`
- * REPORTS that Rust gap precisely (it is owned by `libs/treaty-ivy` /
- * `libs/authoring/node`, out of scope to edit) and proves the reported dev-serve
- * MIME fix for `.treaty` separately over the real HTTP server, while this entry
- * drives the router across every route that lowers cleanly.
+ * The greeter route was previously omitted because `greeter.treaty`'s inline
+ * `server { … }` block was emitted VERBATIM (non-parseable JS — esbuild threw
+ * `Unexpected "{"`); that extraction now lands in Rust, so the route is included
+ * and `nav.e2e.mjs` drives the router across the WHOLE graph.
  */
 import { ApplicationRef, provideZonelessChangeDetection } from '@angular/core'
 import { bootstrapApplication } from '@angular/platform-browser'
@@ -42,9 +41,10 @@ import './styles.css'
 
 import { AppRoot } from './app/app-root.component'
 
-// The working subset of the app's routes (mirrors app.routes.ts minus the
-// greeter route, whose .treaty SFC is blocked by the reported Rust `server {}`
-// extraction gap). Each lazy boundary is a real dynamic import the router loads.
+// The FULL app route graph (mirrors app.routes.ts). Each lazy boundary is a real
+// dynamic import the router loads — including the greeter route, now that its
+// `.treaty` SFC's inline `server {}` block is extracted and the SFC lowers to
+// valid client JS.
 const routes: Routes = [
 	{
 		path: '',
@@ -57,6 +57,10 @@ const routes: Routes = [
 	{
 		path: 'metrics',
 		loadComponent: () => import('./features/metrics/metrics-panel.component'),
+	},
+	{
+		path: 'greeter',
+		loadComponent: () => import('./features/greeter/greeter-page.component'),
 	},
 	{
 		path: 'profile',

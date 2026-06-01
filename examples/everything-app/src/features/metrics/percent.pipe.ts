@@ -3,12 +3,12 @@
  *
  * Authored WITHOUT `standalone: true` -- the compiler fills that default in (a
  * pipe carries a real `name`, since that name is how the template references it,
- * but no standalone boilerplate). It is consumed by NAME in the `.treaty`
- * gauge's template (`{{ value() | percent01 }}`) and listed by CLASS in the
- * host component's `imports`. As with directives, a standalone `@Pipe` source is
- * a clean pass-through at the Treaty compiler stage (only components lower to
- * `ɵɵdefineComponent` here), so `verify.mjs` registers it as PASSTHROUGH; its
- * USAGE is exercised by the `.treaty` component that pipes through it.
+ * but no standalone boilerplate). It is consumed by NAME in the metrics panel's
+ * template (`{{ load() | percent01 }}`) and listed by CLASS in the host
+ * component's `imports`. The Treaty compiler lowers this `@Pipe` source to a real
+ * Ivy `ɵɵdefinePipe` (+ `ɵfac`) AOT -- no raw `@Pipe` decorator survives, so it
+ * never falls to Angular's JIT at runtime -- and a host that imports it lists the
+ * pipe class in its component `dependencies`, so `{{ … | percent01 }}` resolves.
  *
  * Behavior: formats a 0..1 ratio as a whole-number percentage (`0.4237` ->
  * `"42%"`), with an optional fraction-digits argument (`value | percent01:1`).

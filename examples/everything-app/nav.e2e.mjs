@@ -93,29 +93,26 @@ function check(label, condition, detail) {
 	return ok
 }
 
-// The greeter route's full module-load + render is BLOCKED by the reported Rust
-// `server {}` extraction gap (see the file header). The MIME fix for `.treaty`
-// IS proven for the greeter request (it now reaches the JS transform branch);
-// only the residual Rust transform gap blocks its render. Kept as an explicit
-// regression switch: when the `server {}` extraction lands in Rust, flip to
-// `false` and the greeter route joins the hard render matrix.
-const GREETER_BLOCKED = true
+// The greeter route's `server {}` extraction gap is now CLOSED in Rust: the
+// `.treaty` SFC path lifts the inline `server { … }` block to a typed binding
+// (the served module opens `import { greet } from "/@id/__x00__treaty-server-fn…"`)
+// and emits valid client JS that esbuild type-strips without the prior
+// `Unexpected "{"`. The greeter route therefore now LOADS + RENDERS like any other
+// — kept as `false` so the harness HARD-asserts that (a regression that re-broke
+// the extraction would flip this assertion red).
+const GREETER_BLOCKED = false
 
-// The metrics route's component module + the `.treaty` Gauge it hosts BOTH load +
-// lower to Ivy cleanly (proven over HTTP in Step 2). Its in-browser RENDER, however,
-// is blocked by a SECOND reported Rust-compiler gap: the Treaty compiler lowers only
-// COMPONENTS (`@Component` / `.treaty` / JSX → `ɵɵdefineComponent`) to Ivy — a
-// standalone `@Pipe` (`Percent01Pipe`) or `@Directive` (`HighlightDelta`) is a
-// PASS-THROUGH (the core's `transform` returns null), so it ships as a raw decorated
-// class with NO Ivy `ɵpipe` / `ɵdir` definition. The metrics template both pipes
-// through `percent01` and applies the `HighlightDelta` directive, so at render time
-// Ivy's `ɵɵpipe` reads the missing pipe def and throws
-// `Cannot read properties of undefined (reading 'onDestroy')`. That pipe/directive
-// AOT lowering lives in `libs/treaty-ivy` / `libs/authoring/node` (out of scope to
-// edit). This harness REPORTS the gap precisely and keeps the metrics route's
-// module-LOAD + MIME assertions as HARD requirements. Flip to `false` when the Rust
-// compiler lowers standalone `@Pipe`/`@Directive` to Ivy.
-const METRICS_BLOCKED = true
+// The metrics route's standalone-`@Pipe`/`@Directive` Ivy-lowering gap is now
+// CLOSED in Rust: the unified `.ts` authoring router lowers EVERY decorator kind —
+// a standalone `@Pipe` (`Percent01Pipe`) → `ɵɵdefinePipe` (+ `ɵfac`) and a
+// standalone `@Directive` (`HighlightDelta`) → `ɵɵdefineDirective` (+ `ɵfac`), no
+// surviving raw decorator. The metrics template pipes through `percent01` and
+// applies the `HighlightDelta` directive, and both now carry real Ivy defs, so the
+// prior `ɵɵpipe` → `Cannot read properties of undefined (reading 'onDestroy')` is
+// gone and the route RENDERS. Kept as `false` so the harness HARD-asserts the
+// metrics render (and a regression that dropped a kind back to pass-through would
+// flip it red).
+const METRICS_BLOCKED = false
 
 // ---------------------------------------------------------------------------
 // Step 0: wire a local node_modules symlink farm (mirrors dev-serve.e2e.mjs).
@@ -605,6 +602,11 @@ async function driveRouterHeadless() {
 		["'' (logs)", '/', /Server logs|waiting for stream/i],
 		['dashboard', '/dashboard', /Dashboard|active widgets/i],
 		['profile', '/profile', /Profile|name:/i],
+		// metrics joins the HARD matrix now that the standalone @Pipe (`percent01`)
+		// and @Directive (`HighlightDelta`) lower to real Ivy defs: the route renders
+		// `Metrics` and the pipe formats the 0..1 load ratio to `load: 0%` (proving
+		// the pipe ran — a missing pipe def would throw before any text painted).
+		...(METRICS_BLOCKED ? [] : [['metrics', '/metrics', /Metrics[\s\S]*load:\s*0%/i]]),
 	]
 	// `prev` tracks the last successfully-rendered outlet so the "changed" check
 	// proves each live nav link swaps the view (not a static page).
@@ -742,13 +744,13 @@ async function main() {
 	console.log(
 		'NAV E2E PASSED: every route LOADS its lazy component module over a REAL HTTP dev server with a JavaScript content-type ' +
 			'(the reported NS_ERROR_CORRUPTED_CONTENT / "disallowed MIME type ()" is GONE for .treaty/.tjsx — the bare greeter.treaty ' +
-			'request now reaches the JS transform branch instead of being served raw with an empty content-type), and the routes that ' +
-			'lower cleanly (`` index/logs, dashboard, profile) RENDER their view in the outlet when navigated to through the real Angular ' +
-			'Router (the nav links work). The global base stylesheet is served + emitted and component-scoped styles apply. Two routes ' +
-			'are recorded as RENDER-blocked by reported Rust-compiler gaps (modules LOAD + MIME proven; out of scope to edit, owned by ' +
-			'libs/treaty-ivy / libs/authoring/node): greeter — its greeter.treaty inline `server {}` block is emitted verbatim instead of ' +
-			'extracted (invalid JS); metrics — its consumed standalone @Pipe (percent01) / @Directive (HighlightDelta) are pass-through ' +
-			'with no Ivy ɵpipe/ɵdir def, so ɵɵpipe throws at render time.',
+			'request now reaches the JS transform branch instead of being served raw with an empty content-type), and EVERY route ' +
+			'— `` index/logs, dashboard, profile, metrics, and greeter — RENDERS its view in the outlet when navigated to ' +
+			'through the real Angular Router (the nav links work). The global base stylesheet is served + emitted and component-scoped ' +
+			'styles apply. The two previously Rust-blocked routes now render: greeter — its greeter.treaty inline `server {}` block ' +
+			'is extracted to a typed binding so the SFC lowers to valid client JS; metrics — its consumed standalone @Pipe ' +
+			'(percent01) lowers to \u0275\u0275definePipe and @Directive (HighlightDelta) to \u0275\u0275defineDirective AOT, both ' +
+			'listed in the component `dependencies`, so the pipe formats `load: 0%` and the directive applies with no JIT error.',
 	)
 }
 
