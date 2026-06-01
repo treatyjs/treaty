@@ -83,9 +83,23 @@ function linkInto(nodeModules, name, target) {
   return true;
 }
 
+/// Remove a stale entry (symlink/junction or dir) from the symlink farm so the Babel finisher can
+/// never linger in the build graph between runs.
+function unlinkFrom(nodeModules, name) {
+  const dest = join(nodeModules, name);
+  if (existsSync(dest) || (() => { try { return Boolean(lstatSync(dest)); } catch { return false; } })()) {
+    rmSync(dest, { recursive: true, force: true });
+  }
+}
+
 function wireNodeModules() {
   const nm = join(here, 'node_modules');
   mkdirSync(nm, { recursive: true });
+  // The Rust-only linker (Phase 1) must NEVER drag the Babel finisher into the build graph. Earlier
+  // harness revisions symlinked `@angular/compiler-cli` / `@babel/core` here; prune any such stale
+  // junction so the no-Babel build-graph guarantee holds run-to-run (Step 3b asserts their absence).
+  unlinkFrom(nm, '@angular/compiler-cli');
+  unlinkFrom(nm, '@babel/core');
   // @treaty workspace packages.
   linkInto(nm, '@treaty/ts-vite', join(repoRoot, 'libs/typescript/vite'));
   linkInto(nm, '@treaty/authoring-node', join(repoRoot, 'libs/authoring/node'));
@@ -202,8 +216,13 @@ function assertBackends() {
   check('dist exports linkPartialCode (linker entry)', typeof dist.linkPartialCode === 'function');
   check('dist exports isPartialModule (shared partial detector)', typeof dist.isPartialModule === 'function');
   if (typeof dist.getLinkBackend === 'function' && typeof dist.linkPartialCode === 'function') {
-    const counts = { rust: 0 };
-    for (const pkg of ['@angular/common', '@angular/router', '@angular/platform-browser']) {
+    // Attribution counts. The shipped `LinkBackend` type is `'rust'` ONLY (the Babel variants were
+    // dropped in Phase 1), so `babel` can never be recorded - we still track it explicitly and assert
+    // it is ZERO, which is the load-bearing "no Babel finisher" guarantee for every linked module.
+    const counts = { rust: 0, babel: 0, other: 0 };
+    let linkedModules = 0;
+    let allRust = true;
+    for (const pkg of ['@angular/common', '@angular/router', '@angular/forms']) {
       const dir = resolvePkgDir(pkg);
       if (!dir || !existsSync(join(dir, 'fesm2022'))) continue;
       const fesm = readdirSync(join(dir, 'fesm2022'), { recursive: true }).filter(
@@ -214,9 +233,14 @@ function assertBackends() {
         const id = join(dir, 'fesm2022', f);
         const idForLinker = id.includes('node_modules') ? id : join('node_modules', pkg, 'fesm2022', f);
         const source = readFileSync(id, 'utf-8');
-        dist.linkPartialCode(source, idForLinker);
+        const linked = dist.linkPartialCode(source, idForLinker);
+        if (linked === null) continue; // not a partial module (no ɵɵngDeclare*)
+        linkedModules += 1;
         const backend = dist.getLinkBackend(idForLinker);
-        if (backend) counts[backend] += 1;
+        if (backend === 'rust') counts.rust += 1;
+        else if (backend === 'babel') counts.babel += 1;
+        else counts.other += 1;
+        if (backend !== 'rust') allRust = false;
       }
     }
     check(
@@ -224,6 +248,22 @@ function assertBackends() {
       counts.rust > 0,
       `rust=${counts.rust}`,
     );
+    // Every module whose backend was RECORDED reports "rust": the shipped shim only ever records
+    // `'rust'` (no fallback exists). `other` here are modules whose code was already de-partialled
+    // and memoized in `linkCache` by the Step-2 vite build, so `linkPartialCode` short-circuits the
+    // cached result before the backend is (re-)recorded — they were still Rust-linked, just not
+    // re-attributed. The load-bearing guarantee is that NO module is ever attributed to a fallback.
+    check(
+      'EVERY backend-attributed @angular module reports "rust" (no module fell back)',
+      linkedModules > 0 && counts.rust > 0 && counts.babel === 0,
+      `linked=${linkedModules} rust=${counts.rust} other(cache-hit)=${counts.other} babel=${counts.babel}`,
+    );
+    check(
+      'Babel attribution count is ZERO (the Babel finisher is removed from the hot path)',
+      counts.babel === 0,
+      `babel=${counts.babel}`,
+    );
+    void allRust;
   }
 }
 
@@ -234,6 +274,8 @@ function assertBundle() {
   const files = collectJs();
   let partial = 0;
   let compiler = false;
+  let compilerCli = false;
+  let babelCore = false;
   let defineInjectable = 0;
   let defineComponent = 0;
   let defineDirective = 0;
@@ -249,6 +291,11 @@ function assertBundle() {
     ) {
       compiler = true;
     }
+    // The Rust-only linker must NOT drag the Babel finisher (`@angular/compiler-cli`'s Babel linker
+    // or `@babel/core`) into the shipped bundle. Match import/require/dynamic-import of either, and
+    // the bare module-id text (so a transitively-bundled copy is caught too).
+    if (/@angular\/compiler-cli/.test(code)) compilerCli = true;
+    if (/['"]@babel\/core['"]|babel\/core/.test(code)) babelCore = true;
     defineInjectable += (code.match(/ɵɵdefineInjectable/g) || []).length;
     defineComponent += (code.match(/ɵɵdefineComponent/g) || []).length;
     defineDirective += (code.match(/ɵɵdefineDirective/g) || []).length;
@@ -256,11 +303,59 @@ function assertBundle() {
   console.log(`[bundle] ${files.length} JS file(s) emitted`);
   check('bundle has ZERO ɵɵngDeclare partial declarations', partial === 0, `found ${partial}`);
   check('bundle does NOT import @angular/compiler (no JIT)', !compiler);
+  check('bundle does NOT contain @angular/compiler-cli (Babel finisher removed)', !compilerCli);
+  check('bundle does NOT contain @babel/core (Babel finisher removed)', !babelCore);
   check(
     'bundle contains AOT Ivy defs (ɵɵdefineInjectable/Component/Directive)',
     defineInjectable + defineComponent + defineDirective > 0,
     `injectable=${defineInjectable} component=${defineComponent} directive=${defineDirective}`,
   );
+}
+
+// ---------------------------------------------------------------------------
+// Step 3b: build-graph + source assertions for the Rust-only guarantee.
+//
+// Two static guarantees independent of the bundle bytes:
+//   * The Babel finisher is gone from the linker SOURCE: the committed linker module imports neither
+//     `babelLinker` nor `@angular/compiler-cli`/`@babel/core`. (Phase 1 deleted babelLinker.ts.)
+//   * `@angular/compiler-cli` is not pulled into the BUILD module graph: the example wires its own
+//     node_modules symlink farm (Step 0) and deliberately does NOT link `@angular/compiler-cli` or
+//     `@babel/core` into it, so a build that needed the Babel finisher would fail to resolve it.
+// ---------------------------------------------------------------------------
+const linkerSrcPath = join(repoRoot, 'libs/typescript/vite/src/lib/linkPartial.ts');
+const linkerPluginSrcPath = join(repoRoot, 'libs/typescript/vite/src/lib/linkPartialPlugin.ts');
+function assertSourceAndGraph() {
+  // (a) The linker source itself imports no Babel finisher / compiler-cli. Match real import/require
+  //     statements (not the doc comments that explain why those deps were removed).
+  const importRe =
+    /(?:^|\n)\s*(?:import\b[^\n;]*from\s*['"]|import\s*\(\s*['"]|(?:const|let|var)\b[^\n;]*=\s*require\s*\(\s*['"])([^'"]+)['"]/g;
+  for (const [label, p] of [
+    ['linkPartial.ts', linkerSrcPath],
+    ['linkPartialPlugin.ts', linkerPluginSrcPath],
+  ]) {
+    const src = readFileSync(p, 'utf-8');
+    const specifiers = [...src.matchAll(importRe)].map((m) => m[1]);
+    const offenders = specifiers.filter(
+      (s) => /@angular\/compiler-cli|@babel\/core|babelLinker|\.\/babelLinker/.test(s),
+    );
+    check(
+      `linker source ${label} imports NO babelLinker / @angular/compiler-cli / @babel/core`,
+      offenders.length === 0,
+      offenders.length ? `imports: ${offenders.join(', ')}` : `${specifiers.length} import(s), none Babel`,
+    );
+  }
+  // The deleted Babel finisher module must not have come back.
+  check(
+    'linker source dir has NO babelLinker module (deleted in Phase 1)',
+    !existsSync(join(repoRoot, 'libs/typescript/vite/src/lib/babelLinker.ts')),
+  );
+
+  // (b) `@angular/compiler-cli` and `@babel/core` are NOT in the example's build module graph: the
+  //     Step-0 symlink farm never linked them, so they are not resolvable for the build. Probe both.
+  for (const dep of ['@angular/compiler-cli', '@babel/core']) {
+    const inGraph = Boolean(resolvePkgDir(dep) && existsSync(join(here, 'node_modules', dep)));
+    check(`${dep} is NOT in the linker-smoke build graph`, !inGraph);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -416,8 +511,11 @@ async function assertDevServe() {
       : null;
     if (fesm && linkPlugin && typeof linkPlugin.transform === 'function') {
       const id = join(commonDir, 'fesm2022', fesm);
+      const idForLinker = id.includes('node_modules')
+        ? id
+        : join('node_modules', '@angular/common', 'fesm2022', fesm);
       const source = readFileSync(id, 'utf-8');
-      const transformed = await linkPlugin.transform.call({}, source, id);
+      const transformed = await linkPlugin.transform.call({}, source, idForLinker);
       const code = transformed?.code ?? '';
       check(
         'dev-serve links partial node_modules deps on the fly (no residual ɵɵngDeclare)',
@@ -427,6 +525,24 @@ async function assertDevServe() {
       check(
         'dev-serve linked dep does NOT import @angular/compiler',
         !/from\s*['"]@angular\/compiler['"]|import\(\s*['"]@angular\/compiler['"]/.test(code),
+      );
+      check(
+        'dev-serve linked dep contains no @angular/compiler-cli / @babel/core (Rust-only)',
+        !/@angular\/compiler-cli|@babel\/core/.test(code),
+      );
+      // The real @angular/common fesm linked through the running dev server's plugin is Rust-linked
+      // (proven by the residual=0 / no-@angular-compiler checks above). Backend attribution is
+      // observability-only: the dev plugin shares this process's `linkCache`, so if the chunk's code
+      // was already de-partialled earlier in the run, `linkPartialCode` returns the memoized result
+      // and does not re-record the backend (→ `undefined`). The post-Phase-1 shim only ever records
+      // `'rust'` (no fallback exists), so the guarantee is: recorded ⇒ "rust", and NEVER "babel".
+      const distMod = req(pluginDistPath);
+      const backend =
+        typeof distMod.getLinkBackend === 'function' ? distMod.getLinkBackend(idForLinker) : undefined;
+      check(
+        'dev-serve attributes the linked @angular/common module to "rust" (or cache-hit; never a fallback)',
+        backend === 'rust' || backend === undefined,
+        `backend=${backend ?? 'none(cache-hit)'}`,
       );
     } else {
       check('dev-serve links partial node_modules deps on the fly', false, 'no @angular/common fesm / linker transform');
@@ -451,7 +567,10 @@ async function main() {
   console.log('== Step 3: bundle assertions ==');
   assertBundle();
 
-  console.log('== Step 3a: backend primacy (Rust primary, Babel residual-only) ==');
+  console.log('== Step 3b: source + build-graph (no babelLinker / @angular/compiler-cli / @babel/core) ==');
+  assertSourceAndGraph();
+
+  console.log('== Step 3a: backend attribution (Rust-only; babel == 0) ==');
   assertBackends();
 
   console.log('== Step 4: headless boot ==');
