@@ -246,7 +246,7 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
-const { compileComponent, compileComponentSource, compileTreatyFile, compile, compileMany, runMacro, runServerFn } = nativeBinding
+const { compileComponent, compileComponentSource, compileTreatyFile, compile, compileMany, runMacro, runServerFn, linkPartial } = nativeBinding
 
 module.exports.compileComponent = compileComponent
 module.exports.compileComponentSource = compileComponentSource
@@ -255,3 +255,4 @@ module.exports.compile = compile
 module.exports.compileMany = compileMany
 module.exports.runMacro = runMacro
 module.exports.runServerFn = runServerFn
+module.exports.linkPartial = linkPartial

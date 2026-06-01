@@ -151,3 +151,15 @@ export declare function runMacro(tsSource: string, inputJson: string): string
  * Throws if `argsJson` is not valid JSON, the source cannot be transpiled, or the function throws.
  */
 export declare function runServerFn(tsSource: string, argsJson: string): string
+/**
+ * Link a partial-compiled Angular module to full AOT Ivy via the Rust `treaty_ivy` linker.
+ *
+ * `code` is the source of a published Angular library module that may contain partial-declaration
+ * calls (the `ɵɵngDeclareFactory` / `ɵɵngDeclareInjectable` / `ɵɵngDeclareInjector` /
+ * `ɵɵngDeclareNgModule` / `ɵɵngDeclareComponent` / `ɵɵngDeclareDirective` / `ɵɵngDeclarePipe` /
+ * `ɵɵngDeclareClassMetadata` family); `fileName` is its path (for diagnostics). Each declaration is
+ * rewritten in place to the corresponding full AOT `ɵɵdefine*` call so the library runs with NO JIT
+ * and NO `@angular/compiler` at runtime, in dev and production. Non-partial code passes through
+ * byte-identical; `errors` is empty on success.
+ */
+export declare function linkPartial(code: string, fileName: string): CompiledComponent
