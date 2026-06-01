@@ -2409,18 +2409,20 @@ pub fn validate_no_event_bindings(bindings: &ParsedHostBindings) -> Vec<String> 
 /// `compileStyles(styles, selector, hostSelector)`.
 ///
 /// Angular runs each style through `new ShadowCss().shimCssText(style, selector, hostSelector)`
-/// to scope emulated-encapsulation CSS to the component (`[_ngcontent-%COMP%]` / host attrs). The
-/// `ShadowCss` rewriter (`../../shadow_css`, a standalone ~1k-line CSS parser) is a separate
-/// subsystem and is not part of this crate yet, so styles pass through unshimmed. This matches
-/// Angular's output for selector-free / already-scoped CSS; see `remaining`.
-fn compile_styles(styles: &[String], _selector: &str, _host_selector: &str) -> Vec<String> {
-    styles.to_vec()
+/// to scope emulated-encapsulation CSS to the component (`[_ngcontent-%COMP%]` / host attrs). This
+/// delegates to the ported [`crate::shadow_css`] rewriter so each selector gains the content
+/// attribute and `:host` / `:host-context` rules become host-attribute selectors.
+fn compile_styles(styles: &[String], selector: &str, host_selector: &str) -> Vec<String> {
+    styles
+        .iter()
+        .map(|style| crate::shadow_css::shim_css_text(style, selector, host_selector))
+        .collect()
 }
 
-/// `encapsulateStyle(style, componentIdentifier?)`. Like [`compile_styles`], the real `ShadowCss`
-/// shim is a separate subsystem; styles pass through unshimmed for now.
+/// `encapsulateStyle(style, componentIdentifier?)`. Scopes a single style via [`crate::shadow_css`]
+/// using the component-id token (`%COMP%`) attributes.
 pub fn encapsulate_style(style: &str, _component_identifier: Option<&str>) -> String {
-    style.to_string()
+    crate::shadow_css::shim_css_text(style, &content_attr(), &host_attr())
 }
 
 // ---------------------------------------------------------------------------
@@ -2714,6 +2716,26 @@ mod tests {
         let js = emit_expression(&compiled.expression);
         assert!(js.contains("styles"), "styles missing: {js}");
         assert!(!js.contains("encapsulation"), "encapsulation should be omitted: {js}");
+        // Emulated encapsulation scopes the raw `.a{...}` to the component via the content attr.
+        assert!(
+            js.contains(".a[_ngcontent-%COMP%]"),
+            "style not scoped via ShadowCss: {js}"
+        );
+    }
+
+    #[test]
+    fn emulated_host_style_scopes_to_host_attr() {
+        let mut meta = component_meta("C", "c");
+        meta.styles = vec![":host{display:block}".to_string()];
+        let mut tb = StubTemplateBuilder;
+        let mut hb = StubHostBindingsBuilder;
+        let mut pool = Vec::new();
+        let compiled = compile_component_from_metadata(&mut meta, &mut tb, &mut hb, &mut pool);
+        let js = emit_expression(&compiled.expression);
+        assert!(
+            js.contains("[_nghost-%COMP%]"),
+            ":host not rewritten to host attr: {js}"
+        );
     }
 
     #[test]

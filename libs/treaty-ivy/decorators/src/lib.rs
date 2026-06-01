@@ -47,6 +47,7 @@ pub use treaty_ivy_template::template;
 pub mod compiler;
 pub mod pipe_module_injector;
 pub mod registry;
+pub mod shadow_css;
 
 // `view` is the historical compatibility facade. Within this crate the
 // instruction emitter is the local [`compiler`] module, while the
