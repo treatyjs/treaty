@@ -88,7 +88,7 @@ function check(label, condition, detail) {
 // defined` at bootstrap. The BUILD + JSX-lowered-once proofs are unaffected and remain green. Flip
 // this to `false` once the Rust compiler imports/synthesizes the `use:` directive class (or drops
 // unresolved `use:` names) and the boot will be asserted as a hard requirement.
-const BOOT_BLOCKED = true
+const BOOT_BLOCKED = false
 
 // ---------------------------------------------------------------------------
 // Step 0: wire a local node_modules symlink farm.

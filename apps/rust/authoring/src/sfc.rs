@@ -267,18 +267,32 @@ fn collect_imported_names(javascript: &str) -> Vec<String> {
 /// Mirrors `createWrapper`/`extractImportStrings`/`removeImportsFromCode` in
 /// `apps/repl/src/tools/treaty-sfc/treat-to-ivy.ts`:
 ///   * `imports` — the import declarations, sliced verbatim from the source.
-///   * `body`    — the JS chunk with its import declarations removed.
-///   * `bindings`— top-level `const`/`function` declaration names, for the returned object.
+///   * `hoisted` — top-level declarations whose name is referenced by the component's
+///     `dependencies: […]` (a locally-declared directive). These MUST live at MODULE scope — beside
+///     the component class — because `<Comp>.ɵcmp = ɵɵdefineComponent({ dependencies: [Foo] })` reads
+///     `Foo` at module scope; left inside the synthesized `function <Comp>() { … }` wrapper they would
+///     be wrapper-locals and `dependencies: [Foo]` would dangle (`Foo is not defined` at boot).
+///   * `body`    — the JS chunk with its import declarations AND hoisted declarations removed.
+///   * `bindings`— the remaining top-level `const`/`function` declaration names, for the returned
+///     object (component state). Hoisted directive declarations are NOT component state, so they are
+///     excluded from `bindings`.
 #[derive(Default)]
 struct WrapperParts {
     imports: Vec<String>,
+    hoisted: Vec<String>,
     body: String,
     bindings: Vec<String>,
 }
 
-/// Parse the component-body JS chunk and collect import statements (verbatim), the body with
-/// imports stripped, and the top-level `const`/`function` declaration names.
-fn extract_wrapper_parts(javascript: &str) -> WrapperParts {
+/// Parse the component-body JS chunk and collect: import statements (verbatim, module scope), any
+/// top-level declaration whose name is in `module_scope_names` (verbatim, hoisted to module scope),
+/// the body with both removed, and the remaining top-level `const`/`function` declaration names
+/// (component state bindings).
+///
+/// `module_scope_names` is the set of `dependencies: […]` identifiers the component references — a
+/// locally-declared directive (e.g. `counter.tsx`'s `highlight`) must be emitted beside the component
+/// class, not buried in its wrapper, so the dependency reference resolves.
+fn extract_wrapper_parts(javascript: &str, module_scope_names: &[String]) -> WrapperParts {
     let mut parts = WrapperParts::default();
     if javascript.trim().is_empty() {
         return parts;
@@ -288,8 +302,11 @@ fn extract_wrapper_parts(javascript: &str) -> WrapperParts {
     let source_type = SourceType::default().with_typescript(true);
     let ret = JsParser::new(&allocator, javascript, source_type).parse();
 
-    // Byte ranges of import declarations, to splice out of the body.
-    let mut import_ranges: Vec<(usize, usize)> = Vec::new();
+    let is_module_scope = |name: &str| module_scope_names.iter().any(|n| n == name);
+
+    // Byte ranges to splice out of the body: import declarations (always) and hoisted module-scope
+    // declarations (a locally-declared directive referenced by `dependencies`).
+    let mut removed_ranges: Vec<(usize, usize)> = Vec::new();
 
     for stmt in &ret.program.body {
         match stmt {
@@ -297,33 +314,71 @@ fn extract_wrapper_parts(javascript: &str) -> WrapperParts {
                 let start = import.span.start as usize;
                 let end = import.span.end as usize;
                 parts.imports.push(javascript[start..end].to_string());
-                import_ranges.push((start, end));
+                removed_ranges.push((start, end));
             }
             oxc_ast::ast::Statement::VariableDeclaration(decl) => {
-                for declarator in &decl.declarations {
-                    if let Some(name) = declarator.id.get_identifier_name() {
-                        parts.bindings.push(name.to_string());
-                    }
+                // A single-declarator `const Foo = …` whose name is a module-scope directive is
+                // hoisted whole; otherwise its declarator names are component-state bindings.
+                let names: Vec<String> = decl
+                    .declarations
+                    .iter()
+                    .filter_map(|d| d.id.get_identifier_name().map(|n| n.to_string()))
+                    .collect();
+                if names.len() == 1 && is_module_scope(&names[0]) {
+                    let start = decl.span.start as usize;
+                    let end = decl.span.end as usize;
+                    parts.hoisted.push(javascript[start..end].to_string());
+                    parts.hoisted.push("\n".to_string());
+                    removed_ranges.push((start, end));
+                } else {
+                    parts.bindings.extend(names);
                 }
             }
             oxc_ast::ast::Statement::FunctionDeclaration(func) => {
                 if let Some(id) = &func.id {
-                    parts.bindings.push(id.name.to_string());
+                    let name = id.name.to_string();
+                    if is_module_scope(&name) {
+                        let start = func.span.start as usize;
+                        let end = func.span.end as usize;
+                        parts.hoisted.push(javascript[start..end].to_string());
+                        parts.hoisted.push("\n".to_string());
+                        removed_ranges.push((start, end));
+                    } else {
+                        parts.bindings.push(name);
+                    }
+                }
+            }
+            oxc_ast::ast::Statement::ClassDeclaration(class) => {
+                // A locally-declared directive may be a `class`; hoist it to module scope when it is
+                // a referenced dependency. (A non-dependency class stays in the wrapper body verbatim
+                // and is not a component-state binding.)
+                if let Some(id) = &class.id {
+                    let name = id.name.to_string();
+                    if is_module_scope(&name) {
+                        let start = class.span.start as usize;
+                        let end = class.span.end as usize;
+                        parts.hoisted.push(javascript[start..end].to_string());
+                        parts.hoisted.push("\n".to_string());
+                        removed_ranges.push((start, end));
+                    }
                 }
             }
             _ => {}
         }
     }
 
-    // Body = source with the import declaration byte ranges removed.
-    if import_ranges.is_empty() {
+    // Body = source with the removed (import + hoisted) byte ranges spliced out, in source order.
+    removed_ranges.sort_by_key(|(start, _)| *start);
+    if removed_ranges.is_empty() {
         parts.body = javascript.to_string();
     } else {
         let mut body = String::with_capacity(javascript.len());
         let mut cursor = 0usize;
-        for (start, end) in &import_ranges {
-            body.push_str(&javascript[cursor..*start]);
-            cursor = *end;
+        for (start, end) in &removed_ranges {
+            if *start >= cursor {
+                body.push_str(&javascript[cursor..*start]);
+                cursor = *end;
+            }
         }
         body.push_str(&javascript[cursor..]);
         parts.body = body;
@@ -337,20 +392,30 @@ fn extract_wrapper_parts(javascript: &str) -> WrapperParts {
 /// `render3`'s `emit_expression` prefixes the defineComponent expression with its own
 /// `import * as i0 from "@angular/core";` line; the module emits that import once at the top, so
 /// any such leading prefix is stripped from the `.ɵcmp` value here.
-fn build_module(class_name: &str, javascript: &str, cmp_expression: &str) -> String {
+fn build_module(
+    class_name: &str,
+    javascript: &str,
+    cmp_expression: &str,
+    module_scope_names: &[String],
+) -> String {
     const I0_IMPORT: &str = "import * as i0 from \"@angular/core\";";
     let cmp_expression = cmp_expression
         .strip_prefix(I0_IMPORT)
         .map(str::trim_start)
         .unwrap_or(cmp_expression);
 
-    let parts = extract_wrapper_parts(javascript);
+    let parts = extract_wrapper_parts(javascript, module_scope_names);
 
     let mut module = String::new();
     module.push_str("import * as i0 from \"@angular/core\";\n");
     for import in &parts.imports {
         module.push_str(import);
         module.push('\n');
+    }
+    // Module-scope declarations (a locally-declared directive referenced by `dependencies`) are
+    // emitted here — beside the component class — so the `dependencies: [Foo]` reference resolves.
+    for hoisted in &parts.hoisted {
+        module.push_str(hoisted);
     }
     module.push_str(&format!("function {class_name}() {{\n"));
     module.push_str(parts.body.trim());
@@ -719,6 +784,20 @@ fn compile_from_parts_inner(
     }
     let has_directive_dependencies = !declarations.is_empty();
 
+    // The dependency identifiers that are NOT imported are LOCAL declarations (e.g. a directive
+    // declared in the same authoring file). Those must be hoisted to module scope by `build_module`
+    // so the emitted `dependencies: [Foo]` reference — read at module scope — resolves to a real
+    // declaration instead of dangling. Imported dependencies are already module-scope, so exclude
+    // them. (`candidates` is the JS chunk's imported-identifier set from step 2b.)
+    let local_dependency_names: Vec<String> = declarations
+        .iter()
+        .filter_map(|d| match &d.ty.kind {
+            treaty_ivy::output_ast::ExprKind::ReadVar { name } => Some(name.clone()),
+            _ => None,
+        })
+        .filter(|name| !candidates.iter().any(|c| c == name))
+        .collect();
+
     // 3. Standalone, selectorless component metadata.
     let base = R3DirectiveMetadata {
         name: class_name.to_string(),
@@ -799,7 +878,7 @@ fn compile_from_parts_inner(
         }
         None => (emit_expression(&compiled.expression), None),
     };
-    let code = build_module(class_name, javascript, &cmp_expression);
+    let code = build_module(class_name, javascript, &cmp_expression, &local_dependency_names);
     (CompiledComponent { code, errors }, map)
 }
 

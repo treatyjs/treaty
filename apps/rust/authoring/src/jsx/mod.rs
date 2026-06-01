@@ -86,6 +86,90 @@ fn collect_import_names(body: &[Statement]) -> Vec<String> {
     names
 }
 
+/// Collect the names declared by a single (possibly `export`-wrapped) declaration into `out`: a
+/// `function`/`class` declaration contributes its id, and a `const`/`let`/`var` declaration each of
+/// its bound identifier names (a simple `const x = …` binding; destructuring patterns carry no
+/// single directive identifier and are skipped). Shared by [`collect_local_declaration_names`] for
+/// both bare and `export`-prefixed declarations.
+fn collect_declaration_names(decl: &Declaration, out: &mut Vec<String>) {
+    match decl {
+        Declaration::FunctionDeclaration(func) => {
+            if let Some(id) = &func.id {
+                out.push(id.name.to_string());
+            }
+        }
+        Declaration::ClassDeclaration(class) => {
+            if let Some(id) = &class.id {
+                out.push(id.name.to_string());
+            }
+        }
+        Declaration::VariableDeclaration(var) => {
+            for declarator in &var.declarations {
+                if let Some(name) = declarator.id.get_identifier_name() {
+                    out.push(name.to_string());
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Collect the names of every top-level local declaration in the module: bare `function`/`class`/
+/// `const` declarations AND those wrapped in an `export` (`export function highlight()`,
+/// `export const Tooltip = …`). These are the IN-SCOPE symbols — alongside the imported names — that
+/// a `use:`/capitalized/structural directive reference can resolve to. A directive declared locally
+/// (e.g. `counter.tsx`'s `export function highlight()`) survives into the emitted module via
+/// [`assemble_flat_body`], so its name is a valid dependency target; collecting it here lets the
+/// directive lowering reference the REAL identifier (`highlight`) instead of a fabricated `Highlight`.
+fn collect_local_declaration_names(body: &[Statement]) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for stmt in body {
+        match stmt {
+            Statement::FunctionDeclaration(func) => {
+                if let Some(id) = &func.id {
+                    names.push(id.name.to_string());
+                }
+            }
+            Statement::ClassDeclaration(class) => {
+                if let Some(id) = &class.id {
+                    names.push(id.name.to_string());
+                }
+            }
+            Statement::VariableDeclaration(var) => {
+                for declarator in &var.declarations {
+                    if let Some(name) = declarator.id.get_identifier_name() {
+                        names.push(name.to_string());
+                    }
+                }
+            }
+            Statement::ExportNamedDeclaration(export) => {
+                if let Some(decl) = &export.declaration {
+                    collect_declaration_names(decl, &mut names);
+                }
+            }
+            Statement::ExportDefaultDeclaration(export) => {
+                // A named default-export declaration (`export default function highlight() {}`)
+                // also contributes its id as an in-scope symbol.
+                match &export.declaration {
+                    ExportDefaultDeclarationKind::FunctionDeclaration(func) => {
+                        if let Some(id) = &func.id {
+                            names.push(id.name.to_string());
+                        }
+                    }
+                    ExportDefaultDeclarationKind::ClassDeclaration(class) => {
+                        if let Some(id) = &class.id {
+                            names.push(id.name.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    names
+}
+
 /// The located component and its lowered template.
 ///
 /// The JSX front-end deliberately does NOT splice the author's source verbatim into the module: the
@@ -149,11 +233,21 @@ pub fn compile(source: &str, file_name: &str) -> CompiledAuthoring {
     //    and so every applied directive is collected for selectorless auto-import.
     let class_name = to_pascal_case(file_name);
     // Candidates come from the JSX-aware parse already in hand (`ret`): re-parsing the client source
-    // as TS-only would choke on its JSX and yield no imports, so collect imports from `ret.program`.
-    let directive_candidates = collect_import_names(&ret.program.body);
+    // as TS-only would choke on its JSX and yield no imports, so collect from `ret.program`. The
+    // candidate set is the full IN-SCOPE symbol set — imported bindings AND top-level local
+    // declarations — so a directive reference resolves to the REAL emitted identifier (`use:highlight`
+    // → the local `highlight` function, `use:tooltip` → the imported `Tooltip`) rather than a
+    // fabricated PascalCase name that is never defined.
+    let mut directive_candidates = collect_import_names(&ret.program.body);
+    directive_candidates.extend(collect_local_declaration_names(&ret.program.body));
     directives::begin_pass(&directive_candidates);
     let lowered = find_component(&ret.program.body, &client_source);
     let directive_refs = directives::take_directive_references();
+    // A `use:`/capitalized/structural directive whose name matched no in-scope symbol resolves to
+    // NOTHING: emitting `dependencies: [<Name>]` for it would dangle (the class is never imported or
+    // declared), so the lowering dropped it from the dependency set and recorded it here. Surface a
+    // diagnostic so the gap is explicit rather than a runtime `<Name> is not defined` at boot.
+    let unresolved_directives = directives::take_unresolved_directives();
 
     let (template_html, javascript) = match lowered {
         Some(component) => {
@@ -228,6 +322,16 @@ pub fn compile(source: &str, file_name: &str) -> CompiledAuthoring {
     let map = map.map(|m| redact_server_bodies_in_map(&m, &server_bodies));
 
     let mut all_errors = errors;
+    // Surface every value-binding / structural `use:` directive that resolved to no in-scope symbol
+    // (a genuinely dangling directive). The dependency was already dropped so the module does not
+    // throw `<Name> is not defined` at boot, but the author still bound an input on / wrapped the
+    // host with a directive that does not exist — report it so the gap is explicit at compile time.
+    for name in &unresolved_directives {
+        all_errors.push(format!(
+            "jsx: directive `{name}` is applied with a binding but is not imported or declared in this module; \
+             import the directive class so it resolves (the reference was dropped from `dependencies` to avoid a runtime `{name} is not defined`)"
+        ));
+    }
     all_errors.extend(compiled.errors);
 
     CompiledAuthoring {
@@ -805,8 +909,11 @@ return <div title=\"na\u{00ef}ve \u{1F4A1}\">Hola caf\u{00e9} \u{1F600}</div>;\n
     #[test]
     fn directive_namespace_form_applies_and_auto_imports() {
         // PREFERRED form: `use:autofocus` applies the `Autofocus` directive and auto-imports it into
-        // the component's dependencies via selectorless resolution (no manual imports array).
-        let source = "export default function Form() {\n  return <input use:autofocus />;\n}\n";
+        // the component's dependencies via selectorless resolution (no manual imports array). The
+        // directive class must be in scope (imported) so the dependency names a real symbol — the
+        // selectorless contract drops the `imports: []` array, NOT the directive's import.
+        let source = "import { Autofocus } from './autofocus';\n\
+export default function Form() {\n  return <input use:autofocus />;\n}\n";
         let out = compile(source, "form.tsx");
         assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
         let code = &out.code;
@@ -824,7 +931,8 @@ return <div title=\"na\u{00ef}ve \u{1F4A1}\">Hola caf\u{00e9} \u{1F600}</div>;\n
     #[test]
     fn directive_namespace_form_binds_input_and_auto_imports() {
         // `use:tooltip={msg}` binds the directive's `tooltip` input and auto-imports `Tooltip`.
-        let source = "export default function Btn() {\n\
+        let source = "import { Tooltip } from './tooltip';\n\
+export default function Btn() {\n\
   const msg = 'hi';\n\
   return <button use:tooltip={msg}>x</button>;\n\
 }\n";
@@ -845,8 +953,9 @@ return <div title=\"na\u{00ef}ve \u{1F4A1}\">Hola caf\u{00e9} \u{1F600}</div>;\n
 
     #[test]
     fn directive_capitalized_attribute_applies_and_auto_imports() {
-        // `<input Autofocus />` applies the `Autofocus` directive.
-        let source = "export default function Form() {\n  return <input Autofocus />;\n}\n";
+        // `<input Autofocus />` applies the `Autofocus` directive (the class is in scope by import).
+        let source = "import { Autofocus } from './autofocus';\n\
+export default function Form() {\n  return <input Autofocus />;\n}\n";
         let out = compile(source, "form.tsx");
         assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
         let code = &out.code;
@@ -916,6 +1025,168 @@ export default function Btn() {\n  return <span>x</span>;\n}\n";
         );
     }
 
+    /// Assert that `name` is referenced in the emitted `dependencies: […]` array AND is actually
+    /// defined at MODULE scope in `code` (a top-level `import`/`function`/`class`/`const`, NOT buried
+    /// inside the synthesized `function {Class}() { … }` wrapper where the module-scope
+    /// `<Class>.ɵcmp = ɵɵdefineComponent({ dependencies: [name] })` could not see it). This is the
+    /// guarantee that closes the dangling-`use:` bug: every `dependencies` entry resolves at boot.
+    fn assert_dependency_defined_at_module_scope(code: &str, name: &str) {
+        assert!(
+            code.contains(&format!("dependencies: [{name}]"))
+                || code.contains(&format!("dependencies:[{name}]"))
+                || code.contains(&format!("[{name}]"))
+                && code.contains("dependencies"),
+            "`{name}` is not referenced in dependencies; got: {code}"
+        );
+        // The wrapper is `function {Class}() { … }`, ending just before the `.ɵfac` static. The
+        // referenced symbol must be defined OUTSIDE that wrapper (module scope): either an import or a
+        // top-level declaration appearing before the wrapper opens. Re-parse and check the top level.
+        let allocator = Allocator::default();
+        let module_type = SourceType::default().with_module(true);
+        let parsed = JsParser::new(&allocator, code, module_type).parse();
+        assert!(
+            parsed.errors.is_empty(),
+            "emitted module did not re-parse: {:?}\n--- code ---\n{code}",
+            parsed.errors
+        );
+        let defined_at_top = parsed.program.body.iter().any(|stmt| match stmt {
+            Statement::ImportDeclaration(import) => import
+                .specifiers
+                .as_ref()
+                .map(|specs| {
+                    specs.iter().any(|s| {
+                        use oxc_ast::ast::ImportDeclarationSpecifier::*;
+                        match s {
+                            ImportSpecifier(s) => s.local.name == name,
+                            ImportDefaultSpecifier(s) => s.local.name == name,
+                            ImportNamespaceSpecifier(s) => s.local.name == name,
+                        }
+                    })
+                })
+                .unwrap_or(false),
+            Statement::FunctionDeclaration(func) => {
+                func.id.as_ref().map(|id| id.name == name).unwrap_or(false)
+            }
+            Statement::ClassDeclaration(class) => {
+                class.id.as_ref().map(|id| id.name == name).unwrap_or(false)
+            }
+            Statement::VariableDeclaration(var) => var
+                .declarations
+                .iter()
+                .any(|d| d.id.get_identifier_name().as_deref() == Some(name)),
+            _ => false,
+        });
+        assert!(
+            defined_at_top,
+            "dependency `{name}` is referenced but NOT defined at module scope (it would dangle / \
+             `{name} is not defined` at boot); got: {code}"
+        );
+    }
+
+    #[test]
+    fn local_use_directive_is_defined_at_module_scope_and_referenced() {
+        // The real `counter.tsx` shape: a sibling `export function highlight()` directive applied via
+        // `use:highlight`. The `use:` name lowers to the class `Highlight`, but the author declared
+        // the directive as the lowercase `highlight` — so the dependency must reference the REAL
+        // identifier `highlight`, and that declaration must survive at MODULE scope (hoisted out of
+        // the component wrapper) so `dependencies: [highlight]` resolves at boot rather than dangling.
+        let source = "import { signal } from '@angular/core';\n\
+export function highlight() {}\n\
+export default function counter() {\n\
+  const count = signal(0);\n\
+  return <section use:highlight>{count()}</section>;\n\
+}\n";
+        let out = compile(source, "counter.tsx");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+        assert_well_formed_module(code);
+        // The directive resolved to the author's real lowercase identifier — NOT a fabricated
+        // `Highlight` — and it is defined at module scope (hoisted beside the component class).
+        assert!(
+            !code.contains("dependencies: [Highlight]") && !code.contains("dependencies:[Highlight]"),
+            "fabricated PascalCase `Highlight` leaked into dependencies; got: {code}"
+        );
+        assert_dependency_defined_at_module_scope(code, "highlight");
+        // The hoisted directive is NOT inside the component wrapper anymore: the wrapper's returned
+        // bindings object must not list `highlight` (it is module-scope, not component state).
+        let wrapper_start = code.find("function Counter() {").expect("no wrapper");
+        let fac = code.find("\u{0275}fac").expect("no fac");
+        let wrapper = &code[wrapper_start..fac];
+        assert!(
+            !wrapper.contains("function highlight"),
+            "directive left inside the component wrapper (would dangle at module scope); got: {wrapper}"
+        );
+    }
+
+    #[test]
+    fn imported_use_directive_is_hoisted_and_referenced() {
+        // An IMPORTED `use:` directive: `use:tooltip={msg}` matches the imported `Tooltip`. The import
+        // must be hoisted to module scope (above the wrapper) and `dependencies: [Tooltip]` references
+        // it — the import is the in-scope symbol, so the dependency resolves at boot.
+        let source = "import { Tooltip } from './tooltip';\n\
+export default function Btn() {\n\
+  const msg = 'hi';\n\
+  return <button use:tooltip={msg}>x</button>;\n\
+}\n";
+        let out = compile(source, "btn.tsx");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+        assert_well_formed_module(code);
+        assert_dependency_defined_at_module_scope(code, "Tooltip");
+        // The import sits above the component wrapper (module scope), not inside it.
+        let import_idx = code
+            .find("import { Tooltip } from './tooltip';")
+            .expect("tooltip import missing");
+        let wrapper_idx = code.find("function Btn() {").expect("no wrapper");
+        assert!(import_idx < wrapper_idx, "import not hoisted above wrapper; got: {code}");
+    }
+
+    #[test]
+    fn value_less_unresolved_use_directive_drops_dependency_without_error() {
+        // The real `greeting-card.tjsx` shape: `use:autofocus` with NO `autofocus`/`Autofocus` symbol
+        // in scope. It must NOT emit a dangling `dependencies: [Autofocus]` (which would throw
+        // `Autofocus is not defined` at boot); instead it degrades to a bare native `autofocus` host
+        // attribute, contributing no dependency and no diagnostic.
+        let source = "import { signal } from '@angular/core';\n\
+export default function greetingCard() {\n\
+  const name = signal('Grace');\n\
+  return <input use:autofocus value={name()} />;\n\
+}\n";
+        let out = compile(source, "greeting-card.tjsx");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+        assert_well_formed_module(code);
+        assert!(
+            !code.contains("Autofocus"),
+            "fabricated/dangling `Autofocus` leaked into the emit; got: {code}"
+        );
+        // The native `autofocus` attribute still reached the template (the directive degraded to it).
+        assert!(code.contains("autofocus"), "native autofocus attribute lost; got: {code}");
+    }
+
+    #[test]
+    fn value_binding_unresolved_use_directive_is_reported() {
+        // A value-BINDING `use:tooltip={x}` with no `Tooltip` in scope binds an `@Input` that cannot
+        // exist — a genuine dangling-directive mistake. The dependency is dropped (no boot-time
+        // `Tooltip is not defined`) AND a diagnostic is surfaced so the gap is explicit.
+        let source = "export default function Btn() {\n\
+  const msg = 'hi';\n\
+  return <button use:tooltip={msg}>x</button>;\n\
+}\n";
+        let out = compile(source, "btn.tsx");
+        assert!(
+            out.errors.iter().any(|e| e.contains("Tooltip") && e.contains("not imported")),
+            "expected an unresolved-directive diagnostic; got: {:?}",
+            out.errors
+        );
+        assert!(
+            !out.code.contains("dependencies: [Tooltip]")
+                && !out.code.contains("dependencies:[Tooltip]"),
+            "dangling Tooltip dependency emitted; got: {}",
+            out.code
+        );
+    }
+
     #[test]
     fn realistic_counter_tsx_compiles_all_features_to_ivy() {
         // Headline end-to-end acceptance: a realistic Counter component that exercises, in one source,
@@ -926,8 +1197,9 @@ export default function Btn() {\n  return <span>x</span>;\n}\n";
         //   * a `{count}` text interpolation that auto-calls the signal,
         //   * an `items.map(...)` lowered to an `@for` list,
         //   * a `{cond && <JSX/>}` lowered to an `@if`,
-        //   * a `use:` directive (selectorless auto-import).
-        let source = "export default function Counter() {\n\
+        //   * a `use:` directive (selectorless auto-import; the class is in scope by import).
+        let source = "import { Autofocus } from './autofocus';\n\
+export default function Counter() {\n\
   let count = 0;\n\
   let items = [1, 2, 3];\n\
   const inc = () => { count++; };\n\

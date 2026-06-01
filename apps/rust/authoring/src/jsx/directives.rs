@@ -39,11 +39,17 @@
 use std::cell::RefCell;
 
 thread_local! {
-    /// The candidate set + collected directive class references for the in-flight lowering pass.
+    /// The candidate set + collected directive references + unresolved diagnostics for the in-flight
+    /// lowering pass.
     ///
-    /// `candidates` is the set of imported class names (set once, before lowering) used to resolve
-    /// the bare-lowercase Angular-attribute form. `referenced` accumulates the directive classes the
-    /// lowering actually applied, in first-seen order, so the front-end can auto-import them.
+    /// `candidates` is the set of IN-SCOPE symbol names — every imported binding AND every top-level
+    /// local declaration (function / const / class) in the authoring module. It is used both to
+    /// resolve the bare-lowercase Angular-attribute form and, critically, to RESOLVE every applied
+    /// directive's class reference back to the real emitted identifier (so the `dependencies: […]`
+    /// array never names a symbol that is not actually in scope). `referenced` accumulates the
+    /// RESOLVED directive identifiers the lowering applied, in first-seen order, so the front-end can
+    /// auto-import them. `unresolved` collects `use:`-style names that matched no in-scope symbol, so
+    /// the front-end can surface a diagnostic instead of emitting a dangling reference.
     static STATE: RefCell<DirectiveState> = RefCell::new(DirectiveState::default());
 }
 
@@ -51,33 +57,89 @@ thread_local! {
 struct DirectiveState {
     candidates: Vec<String>,
     referenced: Vec<String>,
+    unresolved: Vec<String>,
 }
 
-/// Seed the lowering pass with the imported class-name candidate set and clear any prior
-/// references. Call once before lowering a component's JSX.
+/// Seed the lowering pass with the in-scope symbol candidate set (imports + local top-level
+/// declarations) and clear any prior references / diagnostics. Call once before lowering a
+/// component's JSX.
 pub fn begin_pass(candidate_names: &[String]) {
     STATE.with(|s| {
         let mut s = s.borrow_mut();
         s.candidates = candidate_names.to_vec();
         s.referenced.clear();
+        s.unresolved.clear();
     });
 }
 
-/// Record that the directive class `name` was applied in the template (deduplicated, first-seen
-/// order). The JSX front-end drains these via [`take_directive_references`] after lowering to feed
-/// the selectorless auto-import.
-pub fn register_directive_reference(name: &str) {
+/// Resolve a directive class reference `class_name` (the PascalCase form produced by
+/// [`classify_attribute`]) to the ACTUAL in-scope identifier that will be emitted, if any.
+///
+/// A `use:highlight` lowers `class_name` to `Highlight`, but the author may have declared/imported
+/// the directive under a different casing (`highlight`, `HighlightDirective`, …). The dependency
+/// MUST name a symbol that is actually defined in the module, so resolve against the candidate set:
+///   1. an exact match (`Highlight` == imported `Highlight`) wins, preserving the author's casing;
+///   2. otherwise a PascalCase-fold match (`highlight` folds to `Highlight`) resolves to the
+///      author's real identifier (`highlight`) — never the fabricated `Highlight`.
+/// Returns `None` when no in-scope symbol matches (a `use:` name the author never imported/declared).
+fn resolve_directive_symbol(class_name: &str) -> Option<String> {
     STATE.with(|s| {
+        let s = s.borrow();
+        if let Some(exact) = s.candidates.iter().find(|c| c.as_str() == class_name) {
+            return Some(exact.clone());
+        }
+        s.candidates
+            .iter()
+            .find(|c| pascal_case(c) == class_name)
+            .cloned()
+    })
+}
+
+/// Record that the directive `app` was applied in the template, RESOLVED to the real in-scope
+/// identifier (deduplicated, first-seen order). When the directive class matches no imported binding
+/// or local declaration, nothing is recorded as a dependency — so no dangling `dependencies: [<Name>]`
+/// reference (and thus no `<Name> is not defined` ReferenceError at boot) is emitted. The unresolved
+/// name is then triaged:
+///   * a VALUE-LESS application (`use:autofocus`, `<input Autofocus/>`) lowers to a bare host
+///     attribute (`autofocus=""`), which is a perfectly valid native DOM attribute, so the dropped
+///     dependency is benign — nothing is reported;
+///   * a VALUE-BINDING or STRUCTURAL application (`use:tooltip={x}`, `structural:foo={x}`) only makes
+///     sense as a real directive (it binds an `@Input` / wraps the host), so an unresolved one is a
+///     genuine authoring mistake and is collected as a diagnostic via [`take_unresolved_directives`].
+/// The JSX front-end drains the resolved references via [`take_directive_references`].
+pub fn register_directive_reference(app: &DirectiveApplication) {
+    STATE.with(|s| {
+        let resolved = resolve_directive_symbol(&app.class_name);
         let mut s = s.borrow_mut();
-        if !s.referenced.iter().any(|n| n == name) {
-            s.referenced.push(name.to_string());
+        match resolved {
+            Some(symbol) => {
+                if !s.referenced.iter().any(|n| n == &symbol) {
+                    s.referenced.push(symbol);
+                }
+            }
+            None => {
+                // Only a value-binding / structural application that resolves to nothing is a real
+                // dangling-directive mistake; a value-less application degrades to a native host
+                // attribute and is silently dropped.
+                let reports = app.input_name.is_some() || app.structural;
+                if reports && !s.unresolved.iter().any(|n| n == &app.class_name) {
+                    s.unresolved.push(app.class_name.clone());
+                }
+            }
         }
     });
 }
 
-/// Drain the directive class references collected during the lowering pass (first-seen order).
+/// Drain the resolved directive identifiers collected during the lowering pass (first-seen order).
 pub fn take_directive_references() -> Vec<String> {
     STATE.with(|s| std::mem::take(&mut s.borrow_mut().referenced))
+}
+
+/// Drain the `use:`-style directive names that matched no in-scope symbol during the lowering pass
+/// (first-seen order). The front-end surfaces these as diagnostics rather than emitting a dangling
+/// `dependencies: […]` reference to an undefined class.
+pub fn take_unresolved_directives() -> Vec<String> {
+    STATE.with(|s| std::mem::take(&mut s.borrow_mut().unresolved))
 }
 
 /// Whether `name` (a bare lowercase attribute) PascalCase-folds to a known imported directive class.
@@ -280,6 +342,7 @@ mod tests {
         let out = body();
         // Drain so a later test in the same thread starts clean.
         let _ = take_directive_references();
+        let _ = take_unresolved_directives();
         out
     }
 
@@ -408,14 +471,71 @@ mod tests {
         });
     }
 
+    /// A value-less directive application (no input binding, not structural) for the given class.
+    fn value_less(class_name: &str) -> DirectiveApplication {
+        DirectiveApplication {
+            class_name: class_name.to_string(),
+            input_name: None,
+            structural: false,
+        }
+    }
+
+    /// A value-binding directive application (binds its primary input) for the given class.
+    fn value_binding(class_name: &str, input: &str) -> DirectiveApplication {
+        DirectiveApplication {
+            class_name: class_name.to_string(),
+            input_name: Some(input.to_string()),
+            structural: false,
+        }
+    }
+
     #[test]
-    fn collects_references_in_first_seen_order() {
-        with_candidates(&["Highlight"], || {
-            register_directive_reference("Autofocus");
-            register_directive_reference("Tooltip");
-            register_directive_reference("Autofocus"); // duplicate ignored
+    fn collects_resolved_references_in_first_seen_order() {
+        // The candidates are the in-scope symbols. `Autofocus`/`Tooltip` resolve by exact match; the
+        // resolved (real) identifier is recorded, deduplicated, in first-seen order.
+        with_candidates(&["Autofocus", "Tooltip"], || {
+            register_directive_reference(&value_less("Autofocus"));
+            register_directive_reference(&value_binding("Tooltip", "tooltip"));
+            register_directive_reference(&value_less("Autofocus")); // duplicate ignored
             let refs = take_directive_references();
             assert_eq!(refs, vec!["Autofocus".to_string(), "Tooltip".to_string()]);
+            assert!(take_unresolved_directives().is_empty());
+        });
+    }
+
+    #[test]
+    fn reference_resolves_to_author_casing_not_fabricated_pascal() {
+        // A `use:highlight` lowers to class `Highlight`, but the author declared the directive as the
+        // lowercase `highlight`. Resolution must record the REAL identifier `highlight`, never the
+        // fabricated `Highlight`, so the emitted `dependencies` names a symbol that actually exists.
+        with_candidates(&["highlight"], || {
+            register_directive_reference(&value_less("Highlight"));
+            assert_eq!(take_directive_references(), vec!["highlight".to_string()]);
+            assert!(take_unresolved_directives().is_empty());
+        });
+    }
+
+    #[test]
+    fn value_less_unresolved_directive_is_dropped_silently() {
+        // `use:autofocus` with no `autofocus`/`Autofocus` symbol in scope is NOT a dangling directive
+        // mistake: it lowers to a bare native `autofocus` host attribute. So it contributes no
+        // dependency AND no diagnostic.
+        with_candidates(&[], || {
+            register_directive_reference(&value_less("Autofocus"));
+            assert!(take_directive_references().is_empty());
+            assert!(take_unresolved_directives().is_empty());
+        });
+    }
+
+    #[test]
+    fn value_binding_unresolved_directive_is_a_diagnostic() {
+        // `use:tooltip={x}` binds an `@Input`, which only makes sense for a real directive; with no
+        // `Tooltip` in scope it is a genuine dangling-directive mistake — dropped from dependencies
+        // AND reported.
+        with_candidates(&[], || {
+            register_directive_reference(&value_binding("Tooltip", "tooltip"));
+            assert!(take_directive_references().is_empty());
+            assert_eq!(take_unresolved_directives(), vec!["Tooltip".to_string()]);
         });
     }
 }

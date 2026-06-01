@@ -51,10 +51,11 @@ pub fn lower_element(element: &JSXElement, source: &str) -> String {
                 super::directives::classify_attribute(&raw_name, a.value.is_some())
             {
                 if app.structural {
-                    super::directives::register_directive_reference(&app.class_name);
+                    super::directives::register_directive_reference(&app);
                     structurals.push(StructuralDirective {
                         input: app
                             .input_name
+                            .clone()
                             .unwrap_or_else(|| super::directives::primary_input_name_of(&app.class_name)),
                         value: structural_value_text(a, source),
                     });
@@ -459,7 +460,7 @@ fn lower_directive(
     attr: &oxc_ast::ast::JSXAttribute,
     source: &str,
 ) {
-    super::directives::register_directive_reference(&app.class_name);
+    super::directives::register_directive_reference(app);
 
     let input = app
         .input_name
@@ -837,6 +838,8 @@ mod tests {
         super::super::directives::begin_pass(&owned);
         let html = lower(expr_src);
         let refs = super::super::directives::take_directive_references();
+        // Drain diagnostics too so a later test in the same thread starts clean.
+        let _ = super::super::directives::take_unresolved_directives();
         (html, refs)
     }
 
@@ -845,7 +848,7 @@ mod tests {
         // PREFERRED form: `use:autofocus` applies the `Autofocus` directive (value-less). The host
         // carries the bare input attribute so a `[autofocus]` selector matches, and `Autofocus` is
         // collected for auto-import.
-        let (html, refs) = lower_with(&[], "<input use:autofocus />");
+        let (html, refs) = lower_with(&["Autofocus"], "<input use:autofocus />");
         assert_eq!(html, "<input autofocus=\"\" />");
         assert_eq!(refs, vec!["Autofocus".to_string()]);
     }
@@ -853,7 +856,7 @@ mod tests {
     #[test]
     fn namespace_directive_with_value_binds_input() {
         // PREFERRED form: `use:tooltip={msg}` applies `Tooltip` and binds its `tooltip` input.
-        let (html, refs) = lower_with(&[], "<button use:tooltip={msg}>hi</button>");
+        let (html, refs) = lower_with(&["Tooltip"], "<button use:tooltip={msg}>hi</button>");
         assert_eq!(html, "<button [tooltip]=\"msg\">hi</button>");
         assert_eq!(refs, vec!["Tooltip".to_string()]);
     }
@@ -861,7 +864,7 @@ mod tests {
     #[test]
     fn capitalized_directive_no_value_applies() {
         // `<input Autofocus/>` applies the `Autofocus` directive.
-        let (html, refs) = lower_with(&[], "<input Autofocus />");
+        let (html, refs) = lower_with(&["Autofocus"], "<input Autofocus />");
         assert_eq!(html, "<input autofocus=\"\" />");
         assert_eq!(refs, vec!["Autofocus".to_string()]);
     }
@@ -869,7 +872,7 @@ mod tests {
     #[test]
     fn capitalized_directive_string_value_binds_primary_input() {
         // `<button Tooltip="hi">` binds the lower-camel primary input `tooltip` with the literal.
-        let (html, refs) = lower_with(&[], "<button Tooltip=\"hi\">x</button>");
+        let (html, refs) = lower_with(&["Tooltip"], "<button Tooltip=\"hi\">x</button>");
         assert_eq!(html, "<button tooltip=\"hi\">x</button>");
         assert_eq!(refs, vec!["Tooltip".to_string()]);
     }
@@ -877,7 +880,7 @@ mod tests {
     #[test]
     fn capitalized_directive_expression_value_binds_primary_input() {
         // `Tooltip={expr}` binds `[tooltip]="expr"`.
-        let (html, refs) = lower_with(&[], "<button Tooltip={msg}>x</button>");
+        let (html, refs) = lower_with(&["Tooltip"], "<button Tooltip={msg}>x</button>");
         assert_eq!(html, "<button [tooltip]=\"msg\">x</button>");
         assert_eq!(refs, vec!["Tooltip".to_string()]);
     }
@@ -926,7 +929,7 @@ mod tests {
     fn directive_coexists_with_dom_attributes_and_events() {
         // A directive application sits alongside ordinary attributes/events on the same element.
         let (html, refs) = lower_with(
-            &[],
+            &["Tooltip"],
             "<button class=\"b\" use:tooltip={msg} onClick={go}>x</button>",
         );
         assert!(html.contains("class=\"b\""), "no class; got {html}");
