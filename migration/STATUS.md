@@ -18,9 +18,9 @@ a `DecoratorCompiler` registry that mirrors the authoring-plugin design.
 
 Where things stand:
 
-- **treaty_ivy compiler** — DONE & green: 4 crates, **447 `#[test]`** total. Emits
+- **treaty_ivy compiler** — DONE & green: 4 crates, **470 `#[test]`** total. Emits
   complete ES-module Ivy output (component/directive/injectable/pipe). Golden
-  parity vs Angular's own corpus: **165 / 185 runnable = 89.2%** (live-scored),
+  parity vs Angular's own corpus: **170 / 185 runnable = 91.9%** (live-scored),
   climbing toward full parity as the ranked DIFFs are closed.
 - **Angular Linker** — IN PROGRESS (not yet committed): partial `ɵɵngDeclare*`
   → AOT `ɵɵdefine*`, planned to land in the facade crate. Lets Treaty apps
@@ -54,7 +54,7 @@ core  <-  template  <-  decorators  <-  facade
 | `treaty_ivy_template` | template parse + bind, control flow, host/styling | 138 |
 | `treaty_ivy_decorators` | `@Component/@Directive/@Injectable/@Pipe` lowering, queries, DI | 39 |
 | `treaty_ivy_facade` | public entry, NAPI ports, compliance + parity harness | 55 |
-| **Total** | | **447** |
+| **Total** | | **470** |
 
 A **`DecoratorCompiler` registry** sits in the decorators crate so decorator
 handlers compose the same way authoring plugins do.
@@ -84,19 +84,17 @@ Harness moved into the facade crate:
 | --- | --- |
 | Total cases | 642 |
 | Compiled (runnable) | 185 |
-| **matchGolden PASS** | **165** |
-| matchGolden DIFF | 20 |
+| **matchGolden PASS** | **170** |
+| matchGolden DIFF | 15 |
 | Skipped (no runnable golden) | 457 |
 | compile-without-error (of 619-entry dump) | 594 |
-| **Pass-rate (runnable subset)** | **89.2%** |
+| **Pass-rate (runnable subset)** | **91.9%** |
 
 > ~435 of the skips are partial / `ngDeclare`-only fixtures (no full golden); the
 > **Angular Linker** work below brings that whole class into scope.
 >
 > Corpus dump env var renamed `RENDER3_CORPUS_DUMP` → **`TREATY_IVY_CORPUS_DUMP`**.
-> The committed `COMPLIANCE-REPORT.md` artifact still shows the pre-fix 142/185; it
-> regenerates to 165/185 the next time `treaty_ivy` is free (a cargo recompute can't
-> run while the linker workflow is editing the crate).
+> The committed `COMPLIANCE-REPORT.md` is regenerated to 170/185 (`--report`).
 
 ### Ranked DIFF gaps (20 remaining — the work toward full parity)
 

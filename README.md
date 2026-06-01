@@ -12,7 +12,7 @@ JSX-flavored Angular — signals by default.
 
 | Area | What | Status |
 | --- | --- | --- |
-| Compiler | `treaty_ivy` — direct-to-Ivy in Rust (4-crate carve: core/template/decorators/facade), `DecoratorCompiler` registry | ✅ 165/185 runnable Angular golden parity (89.2%, climbing) |
+| Compiler | `treaty_ivy` — direct-to-Ivy in Rust (4-crate carve: core/template/decorators/facade), `DecoratorCompiler` registry | ✅ 170/185 runnable Angular golden parity (91.9%, climbing) |
 | Authoring → Ivy | `.treaty` SFC + JSX-flavored Angular authoring plugins → `treaty_ivy` | ✅ |
 | Decorators / DI | `@Component/@Directive/@Injectable/@Pipe`, constructor DI (`ɵɵinject`/`ɵɵdirectiveInject` + `InjectFlags`), queries, `@Input({alias,transform})`, host bindings/styling, `signals: true` | ✅ |
 | Consuming Angular libs | Built-in **Angular Linker**: partial `ɵɵngDeclare*` → AOT `ɵɵdefine*`, no JIT, dev + prod | 🏗️ in progress (bundler wiring next) |
