@@ -1,18 +1,19 @@
 //! Pillar 2 — the **conformance gate**.
 //!
 //! This module is a deterministic (NO-AI) wrapper around the two EXISTING JS harnesses that live
-//! under `libs/render3` and which are the source of truth for "is the Rust/oxc port still 1:1 with
-//! Angular":
+//! under `libs/treaty-ivy/facade` and which are the source of truth for "is the Rust/oxc port still
+//! 1:1 with Angular":
 //!
-//!   * `libs/render3/compliance/run-compliance.mjs` — runs Treaty's compiler against Angular's own
-//!     `compiler-cli` compliance corpus and prints headline `PASS`/`DIFF`/`SKIPPED` counts plus, in
-//!     `--verbose` mode, a `DIFF <id>` line per diverging case.
-//!   * `libs/render3/parity/parity.mjs` — the *oracle* diff: lowers a fixed fixture corpus through
-//!     both `@angular/compiler` and the Rust addon and prints a per-fixture `RESULT: PASS|DIFF`.
+//!   * `libs/treaty-ivy/facade/compliance/run-compliance.mjs` — runs Treaty's compiler against
+//!     Angular's own `compiler-cli` compliance corpus and prints headline `PASS`/`DIFF`/`SKIPPED`
+//!     counts plus, in `--verbose` mode, a `DIFF <id>` line per diverging case.
+//!   * `libs/treaty-ivy/facade/parity/parity.mjs` — the *oracle* diff: lowers a fixed fixture
+//!     corpus through both `@angular/compiler` and the Rust addon and prints a per-fixture
+//!     `RESULT: PASS|DIFF`.
 //!
 //! The wrapper:
 //!   1. invokes each harness as a `node` child process (READ-ONLY — it never runs `cargo` for
-//!      render3 and never edits `libs/render3`),
+//!      the port and never edits `libs/treaty-ivy`),
 //!   2. parses their stdout into a structured [`ConformanceReport`] (compliance pass/total, oracle
 //!      pass/diff, plus the per-case PASS/DIFF identifiers each harness exposes),
 //!   3. and via [`compare_to_baseline`] computes the **drift surface**: the set of cases that pass
@@ -32,9 +33,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Harness {
-    /// `libs/render3/compliance/run-compliance.mjs`.
+    /// `libs/treaty-ivy/facade/compliance/run-compliance.mjs`.
     Compliance,
-    /// `libs/render3/parity/parity.mjs`.
+    /// `libs/treaty-ivy/facade/parity/parity.mjs`.
     Oracle,
 }
 
@@ -512,9 +513,10 @@ fn push_unique(v: &mut Vec<String>, id: String) {
 // Child-process invocation. Thin shell around the parsers; never runs cargo, never edits render3.
 // ---------------------------------------------------------------------------
 
-/// Where the harnesses live, relative to the Treaty repo root.
-const COMPLIANCE_SCRIPT: &str = "libs/render3/compliance/run-compliance.mjs";
-const PARITY_SCRIPT: &str = "libs/render3/parity/parity.mjs";
+/// Where the harnesses live, relative to the Treaty repo root. They moved with the port from
+/// `libs/render3/{compliance,parity}` to `libs/treaty-ivy/facade/{compliance,parity}`.
+const COMPLIANCE_SCRIPT: &str = "libs/treaty-ivy/facade/compliance/run-compliance.mjs";
+const PARITY_SCRIPT: &str = "libs/treaty-ivy/facade/parity/parity.mjs";
 
 /// Errors invoking a harness child process.
 #[derive(Debug)]
@@ -546,7 +548,7 @@ impl std::error::Error for RunError {}
 /// stdout. `--verbose` is passed so the per-case `DIFF <id>` lines are emitted for drift detection.
 ///
 /// READ-ONLY: this only runs `node` on the existing JS harness; it never invokes `cargo` for
-/// render3 and never writes into `libs/render3`.
+/// the port and never writes into `libs/treaty-ivy`.
 pub fn run_compliance(repo_root: &Path) -> Result<ComplianceResult, RunError> {
     let script = repo_root.join(COMPLIANCE_SCRIPT);
     if !script.exists() {

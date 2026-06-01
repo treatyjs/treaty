@@ -1,5 +1,5 @@
 //! Pillar 1 + pillar 3 **glue against the live tree**: the deterministic logic the CLI wires to
-//! the real `tools/angular-ref` reference sources and the committed `libs/render3/src` Rust port.
+//! the real `tools/angular-ref` reference sources and the committed `libs/treaty-ivy/*` Rust port.
 //!
 //! Three operations, all NO-AI and reproducible:
 //!   * [`record_baseline`] — fingerprint every symbol-map reference TS file at the current
@@ -20,22 +20,23 @@ use serde::{Deserialize, Serialize};
 
 use crate::drift::fingerprint_exports;
 use crate::report::{ChangeKind, ChangedFile, ChangedSymbol, DriftReport, PortTask, TaskAction};
-use crate::symbol_map::{self, PortKind, ANGULAR_COMPILER_SRC_ROOT, MODULE_MAP, RENDER3_SRC_ROOT};
+use crate::symbol_map::{self, PortKind, ANGULAR_COMPILER_SRC_ROOT, MODULE_MAP, TREATY_IVY_SRC_ROOT};
 use crate::ts2rust::{diff_against, emit_rust};
 
 /// A read-only source provider. `ts(rel)` reads a vendored Angular source RELATIVE to
 /// [`ANGULAR_COMPILER_SRC_ROOT`]; `rust(rel)` reads a committed Rust port RELATIVE to
-/// [`RENDER3_SRC_ROOT`]. A missing file is `Ok(None)` (NOT an error) — a deleted reference is a
+/// [`TREATY_IVY_SRC_ROOT`]. A missing file is `Ok(None)` (NOT an error) — a deleted reference is a
 /// legitimate, reportable drift, not a harness failure.
 pub trait SourceReader {
     /// Read a TS reference file relative to [`ANGULAR_COMPILER_SRC_ROOT`].
     fn ts(&self, rel: &str) -> std::io::Result<Option<String>>;
-    /// Read a committed Rust port file relative to [`RENDER3_SRC_ROOT`].
+    /// Read a committed Rust port file relative to [`TREATY_IVY_SRC_ROOT`].
     fn rust(&self, rel: &str) -> std::io::Result<Option<String>>;
 }
 
 /// A read-only [`SourceReader`] over the real filesystem, rooted at the Treaty repo. Resolves
-/// `<root>/tools/angular-ref/packages/compiler/src/<rel>` and `<root>/libs/render3/src/<rel>`.
+/// `<root>/tools/angular-ref/packages/compiler/src/<rel>` and `<root>/libs/treaty-ivy/<rel>`
+/// (each `rel` already carries its crate's `src/` prefix, e.g. `core/src/identifiers.rs`).
 pub struct FsReader {
     root: std::path::PathBuf,
 }
@@ -61,7 +62,7 @@ impl SourceReader for FsReader {
         Self::read_opt(&path)
     }
     fn rust(&self, rel: &str) -> std::io::Result<Option<String>> {
-        let path = self.root.join(RENDER3_SRC_ROOT).join(rel);
+        let path = self.root.join(TREATY_IVY_SRC_ROOT).join(rel);
         Self::read_opt(&path)
     }
 }
@@ -349,7 +350,7 @@ pub enum VerifyStatus {
 pub struct VerifyEntry {
     /// TS reference file, relative to [`ANGULAR_COMPILER_SRC_ROOT`].
     pub ts_file: String,
-    /// Committed Rust port file, relative to [`RENDER3_SRC_ROOT`].
+    /// Committed Rust port file, relative to [`TREATY_IVY_SRC_ROOT`].
     pub rust_file: String,
     /// The outcome.
     pub status: VerifyStatus,
@@ -535,7 +536,7 @@ fn declaration_block(emitted: &str, header: &str) -> String {
 /// declaration line itself (`pub enum X {` or `pub const X: … = &[`) and capture to its closer, so
 /// surrounding prose does not defeat the match. Comparison reuses [`diff_against`], which is line-
 /// based and trims a trailing newline, so leading indentation differences DO register (the emitted
-/// items are column-0, and so are the committed table items in `libs/render3`).
+/// items are column-0, and so are the committed table items in `libs/treaty-ivy`).
 fn extract_item(committed: &str, header: &str) -> Option<String> {
     if header.is_empty() {
         return None;
@@ -667,7 +668,7 @@ mod tests {
         // It maps to the identifiers.rs Mechanical table -> a single Codegen task with its spec.
         assert_eq!(report.tasks.len(), 1);
         let task = &report.tasks[0];
-        assert_eq!(task.rust_file, "identifiers.rs");
+        assert_eq!(task.rust_file, "core/src/identifiers.rs");
         assert_eq!(task.action, TaskAction::Codegen);
         assert_eq!(task.spec.as_deref(), Some("migration/render3-specs/14-identifiers.md"));
     }
@@ -696,7 +697,7 @@ mod tests {
 
         let reader = MemReader::default()
             .with_ts("render3/r3_identifiers.ts", IDENTIFIERS_TS)
-            .with_rust("identifiers.rs", &committed_file);
+            .with_rust("core/src/identifiers.rs", &committed_file);
 
         let report = verify_codegen(&reader).unwrap();
         let entry = report
@@ -717,7 +718,7 @@ mod tests {
 
         let reader = MemReader::default()
             .with_ts("render3/r3_identifiers.ts", IDENTIFIERS_TS)
-            .with_rust("identifiers.rs", &committed_file);
+            .with_rust("core/src/identifiers.rs", &committed_file);
 
         let report = verify_codegen(&reader).unwrap();
         assert!(!report.is_all_in_sync(), "drift must be detected");

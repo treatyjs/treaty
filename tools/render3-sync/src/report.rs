@@ -29,7 +29,7 @@ pub struct ChangedSymbol {
     pub ts_file: String,
     /// How the symbol changed.
     pub change: ChangeKind,
-    /// Rust port file(s), relative to `libs/render3/src/`, resolved via the symbol->module map.
+    /// Rust port file(s), relative to `libs/treaty-ivy/`, resolved via the symbol->module map.
     /// Empty when the harness cannot attribute the symbol to any ported module (itself a
     /// reportable condition — an unmapped Angular export).
     pub rust_files: Vec<String>,
@@ -90,7 +90,7 @@ pub enum TaskAction {
 /// artifact a human (or a gated codegen step) consumes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortTask {
-    /// Rust port file to touch, relative to `libs/render3/src/` (empty for `UpdateMap` tasks).
+    /// Rust port file to touch, relative to `libs/treaty-ivy/` (empty for `UpdateMap` tasks).
     pub rust_file: String,
     /// Originating TS source file(s), relative to `tools/angular-ref/packages/compiler/src/`.
     pub ts_files: Vec<String>,

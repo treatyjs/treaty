@@ -11,11 +11,11 @@
 //!     the live references and diff against the recorded baseline, printing the [`DriftReport`]
 //!     (Added/Removed/Modified exports + derived PortTasks) as JSON. Exits 1 on drift.
 //!   * `codegen-verify [--repo-root <dir>] [--out <file>]` — for each Mechanical symbol-map row,
-//!     emit Rust from the vendored TS and diff it against the committed Rust in `libs/render3/src`,
-//!     printing a [`VerifyReport`]. Exits 1 if any row is out of sync.
+//!     emit Rust from the vendored TS and diff it against the committed Rust under
+//!     `libs/treaty-ivy/*`, printing a [`VerifyReport`]. Exits 1 if any row is out of sync.
 //!
 //! These commands read the LIVE filesystem read-only via [`render3_sync::FsReader`]; they never
-//! modify `libs/render3`. See `migration/RENDER3-SYNC-PLAN.md`.
+//! modify the `libs/treaty-ivy/*` ports. See `migration/RENDER3-SYNC-PLAN.md`.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -120,14 +120,14 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
 }
 
 /// Resolve the repo root: the explicit `--repo-root`, else the nearest ancestor of CWD that
-/// contains both `tools/angular-ref` and `libs/render3`.
+/// contains both `tools/angular-ref` and `libs/treaty-ivy` (the relocated render3 port).
 fn resolve_repo_root(explicit: Option<PathBuf>) -> Option<PathBuf> {
     if let Some(r) = explicit {
         return Some(r);
     }
     let mut dir = std::env::current_dir().ok()?;
     loop {
-        if dir.join("tools/angular-ref").is_dir() && dir.join("libs/render3").is_dir() {
+        if dir.join("tools/angular-ref").is_dir() && dir.join("libs/treaty-ivy").is_dir() {
             return Some(dir);
         }
         if !dir.pop() {

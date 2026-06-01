@@ -1,9 +1,9 @@
 //! `conformance` — pillar 2 CLI.
 //!
-//! Runs the existing `libs/render3` compliance + oracle JS harnesses as child processes (READ-ONLY:
-//! it never runs `cargo` for render3 and never edits `libs/render3`), parses their output into a
-//! [`ConformanceReport`], and either emits it as JSON or diffs it against a previously captured
-//! baseline JSON to print the **newly-failing drift surface**.
+//! Runs the existing `libs/treaty-ivy/facade` compliance + oracle JS harnesses as child processes
+//! (READ-ONLY: it never runs `cargo` for the port and never edits `libs/treaty-ivy`), parses their
+//! output into a [`ConformanceReport`], and either emits it as JSON or diffs it against a previously
+//! captured baseline JSON to print the **newly-failing drift surface**.
 //!
 //! Usage:
 //!   conformance run [--repo-root <dir>] [--out <file.json>]
@@ -12,7 +12,7 @@
 //!       Diff two captured reports; print the newly-failing cases (the drift surface). Exits 1 if
 //!       anything newly failed.
 //!
-//! `--repo-root` defaults to the current directory's nearest ancestor containing `libs/render3`.
+//! `--repo-root` defaults to the current directory's nearest ancestor containing `libs/treaty-ivy`.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -70,7 +70,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
     let root = match repo_root.or_else(find_repo_root) {
         Some(r) => r,
         None => {
-            eprintln!("conformance: could not locate repo root (no ancestor contains libs/render3); pass --repo-root");
+            eprintln!("conformance: could not locate repo root (no ancestor contains libs/treaty-ivy); pass --repo-root");
             return ExitCode::FAILURE;
         }
     };
@@ -160,11 +160,12 @@ fn print_comparison(cmp: &BaselineComparison) {
     println!("{}", if cmp.is_clean() { "CLEAN: still 1:1" } else { "DRIFT: re-port the newly-failing cases" });
 }
 
-/// Walk up from the current directory to find the nearest ancestor containing `libs/render3`.
+/// Walk up from the current directory to find the nearest ancestor containing `libs/treaty-ivy`
+/// (the relocated render3 port).
 fn find_repo_root() -> Option<PathBuf> {
     let mut dir = std::env::current_dir().ok()?;
     loop {
-        if dir.join("libs").join("render3").is_dir() {
+        if dir.join("libs").join("treaty-ivy").is_dir() {
             return Some(dir);
         }
         if !dir.pop() {

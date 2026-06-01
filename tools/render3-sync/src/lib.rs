@@ -1,5 +1,6 @@
-//! `render3-sync` — a deterministic (NO-AI) harness that keeps Treaty's Rust/oxc `render3`
-//! port 1:1 with Angular's `packages/compiler`.
+//! `render3-sync` — a deterministic (NO-AI) harness that keeps Treaty's Rust/oxc Ivy port (the
+//! crates under `libs/treaty-ivy/*`, formerly the single `libs/render3`) 1:1 with Angular's
+//! `packages/compiler`.
 //!
 //! See `migration/RENDER3-SYNC-PLAN.md` for the three pillars. This crate is the scaffold:
 //!   * [`symbol_map`] — the maintained TS-file/export -> Rust-module table (pillar 1 input).
@@ -8,12 +9,12 @@
 //!     (the deterministic primitive every pillar builds on).
 //!   * [`drift`] — pillar 1's drift differ: diff two TS snapshots' exports (name + body hash) and
 //!     map each change to its Rust owner, producing a [`DriftReport`] with derived [`PortTask`]s.
-//!   * [`conformance`] — pillar 2's conformance gate: run the existing `libs/render3` compliance +
-//!     oracle JS harnesses as child processes, parse their output into a
+//!   * [`conformance`] — pillar 2's conformance gate: run the existing `libs/treaty-ivy/facade`
+//!     compliance + parity (oracle) JS harnesses as child processes, parse their output into a
 //!     [`conformance::ConformanceReport`], and compute the newly-failing drift surface via
 //!     [`conformance::compare_to_baseline`].
 //!
-//! The harness produces REPORTS + staged codegen; it never modifies `libs/render3/src`.
+//! The harness produces REPORTS + staged codegen; it never modifies the `libs/treaty-ivy/*` ports.
 
 pub mod conformance;
 pub mod drift;
@@ -33,7 +34,7 @@ pub use report::{
     ChangeKind, ChangedFile, ChangedSymbol, DriftReport, PortTask, TaskAction,
 };
 pub use symbol_map::{
-    ModuleMapping, PortKind, ANGULAR_COMPILER_SRC_ROOT, MODULE_MAP, RENDER3_SRC_ROOT,
+    ModuleMapping, PortKind, ANGULAR_COMPILER_SRC_ROOT, MODULE_MAP, TREATY_IVY_SRC_ROOT,
 };
 pub use sync::{
     diff_baseline, record_baseline, reference_ts_files, verify_codegen, Baseline, FileBaseline,

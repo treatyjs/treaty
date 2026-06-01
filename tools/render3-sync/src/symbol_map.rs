@@ -1,15 +1,20 @@
 //! The SYMBOL -> MODULE map: the maintained, static table mapping Angular
 //! `packages/compiler` TypeScript source files (and their exported symbols) to the Rust
-//! modules in `libs/render3/src` that port them.
+//! modules under `libs/treaty-ivy/*` that port them.
 //!
 //! This is pillar 1 of the harness (see `migration/RENDER3-SYNC-PLAN.md`): when Angular
 //! drifts, a changed TS file/symbol is resolved through this table to the precise Rust file a
 //! human must touch. It is intentionally a hand-maintained, deterministic constant — NO AI is
 //! involved in producing or consulting it.
 //!
+//! The former single-crate `libs/render3` port was carved into four workspace crates under
+//! `libs/treaty-ivy/{core,template,decorators,facade}`; each `rust_file` below is therefore a path
+//! relative to [`TREATY_IVY_SRC_ROOT`] that includes its owning crate's `src/` prefix
+//! (e.g. `core/src/identifiers.rs`).
+//!
 //! Paths are kept relative to their respective roots:
 //!   * `ts_file`  is relative to `tools/angular-ref/packages/compiler/src/`
-//!   * `rust_file` is relative to `libs/render3/src/`
+//!   * `rust_file` is relative to `libs/treaty-ivy/`
 //!
 //! The attributions below were verified against the `//! Source:` / `PORT TARGET:` headers in
 //! each ported Rust module.
@@ -18,8 +23,14 @@
 /// diffs against.
 pub const ANGULAR_COMPILER_SRC_ROOT: &str = "tools/angular-ref/packages/compiler/src";
 
-/// Root, relative to the Treaty repo, of the Rust port the harness keeps 1:1.
-pub const RENDER3_SRC_ROOT: &str = "libs/render3/src";
+/// Root, relative to the Treaty repo, of the Rust port the harness keeps 1:1. The port now spans
+/// four crates under `libs/treaty-ivy`, so each `rust_file` carries its crate's `src/` prefix.
+pub const TREATY_IVY_SRC_ROOT: &str = "libs/treaty-ivy";
+
+/// Back-compat alias for the pre-rename `libs/render3/src` root constant. Retained as a re-export
+/// so any out-of-crate consumer keeps compiling; new code should use [`TREATY_IVY_SRC_ROOT`].
+#[deprecated(note = "the render3 port was carved into libs/treaty-ivy/*; use TREATY_IVY_SRC_ROOT")]
+pub const RENDER3_SRC_ROOT: &str = TREATY_IVY_SRC_ROOT;
 
 /// Confidence that the Rust module is a *mechanical* (value/name table) port of the TS, and
 /// therefore a candidate for pillar-3 oxc codegen, versus hand-ported logic that drift only
@@ -43,7 +54,8 @@ pub enum PortKind {
 pub struct ModuleMapping {
     /// TS source path, relative to [`ANGULAR_COMPILER_SRC_ROOT`].
     pub ts_file: &'static str,
-    /// Rust port path, relative to [`RENDER3_SRC_ROOT`].
+    /// Rust port path, relative to [`TREATY_IVY_SRC_ROOT`] (includes the owning crate's `src/`
+    /// prefix, e.g. `core/src/identifiers.rs`).
     pub rust_file: &'static str,
     /// Whether this is a mechanical table (codegen candidate) or hand-ported logic.
     pub kind: PortKind,
@@ -60,21 +72,21 @@ pub const MODULE_MAP: &[ModuleMapping] = &[
     // ---- L0 foundation -----------------------------------------------------------------
     ModuleMapping {
         ts_file: "render3/r3_identifiers.ts",
-        rust_file: "identifiers.rs",
+        rust_file: "core/src/identifiers.rs",
         kind: PortKind::Mechanical,
         spec: Some("migration/render3-specs/14-identifiers.md"),
         anchor_symbols: &["Identifiers"],
     },
     ModuleMapping {
         ts_file: "output/output_ast.ts",
-        rust_file: "output_ast.rs",
+        rust_file: "core/src/output_ast.rs",
         kind: PortKind::Logic,
         spec: Some("migration/render3-specs/01-output_ast.md"),
         anchor_symbols: &["Expression", "Statement", "Type", "BuiltinType", "BinaryOperator"],
     },
     ModuleMapping {
         ts_file: "render3/util.ts",
-        rust_file: "util.rs",
+        rust_file: "core/src/util.rs",
         kind: PortKind::Logic,
         spec: None,
         anchor_symbols: &["R3Reference", "DefinitionMap"],
@@ -82,21 +94,21 @@ pub const MODULE_MAP: &[ModuleMapping] = &[
     // ---- expression parser -------------------------------------------------------------
     ModuleMapping {
         ts_file: "expression_parser/lexer.ts",
-        rust_file: "expression/lexer.rs",
+        rust_file: "core/src/expression/lexer.rs",
         kind: PortKind::Logic,
         spec: None,
         anchor_symbols: &["Lexer", "Token", "TokenType"],
     },
     ModuleMapping {
         ts_file: "expression_parser/ast.ts",
-        rust_file: "expression/ast.rs",
+        rust_file: "core/src/expression/ast.rs",
         kind: PortKind::Logic,
         spec: None,
         anchor_symbols: &["AST", "ASTWithSource", "Binary", "PropertyRead"],
     },
     ModuleMapping {
         ts_file: "expression_parser/parser.ts",
-        rust_file: "expression/parser.rs",
+        rust_file: "core/src/expression/parser.rs",
         kind: PortKind::Logic,
         spec: None,
         anchor_symbols: &["Parser", "ParseSpan"],
@@ -106,14 +118,14 @@ pub const MODULE_MAP: &[ModuleMapping] = &[
     // is fed by both abstract_emitter.ts and abstract_js_emitter.ts.
     ModuleMapping {
         ts_file: "output/abstract_emitter.ts",
-        rust_file: "output/emitter.rs",
+        rust_file: "core/src/output/emitter.rs",
         kind: PortKind::Logic,
         spec: None,
         anchor_symbols: &["AbstractEmitterVisitor", "EmitterVisitorContext"],
     },
     ModuleMapping {
         ts_file: "output/abstract_js_emitter.ts",
-        rust_file: "output/emitter.rs",
+        rust_file: "core/src/output/emitter.rs",
         kind: PortKind::Logic,
         spec: None,
         anchor_symbols: &["AbstractJsEmitterVisitor"],
@@ -121,35 +133,35 @@ pub const MODULE_MAP: &[ModuleMapping] = &[
     // ---- r3 template AST + transform ---------------------------------------------------
     ModuleMapping {
         ts_file: "render3/r3_ast.ts",
-        rust_file: "template/r3_ast.rs",
+        rust_file: "template/src/template/r3_ast.rs",
         kind: PortKind::Logic,
         spec: None,
         anchor_symbols: &["Element", "Template", "BoundText", "Node"],
     },
     ModuleMapping {
         ts_file: "render3/r3_template_transform.ts",
-        rust_file: "template/template_transform.rs",
+        rust_file: "template/src/template/template_transform.rs",
         kind: PortKind::Logic,
         spec: None,
         anchor_symbols: &["HtmlAstToIvyAst", "htmlAstToRender3Ast"],
     },
     ModuleMapping {
         ts_file: "render3/r3_control_flow.ts",
-        rust_file: "template/control_flow.rs",
+        rust_file: "template/src/template/control_flow.rs",
         kind: PortKind::Logic,
         spec: None,
         anchor_symbols: &["createIfBlock", "createForLoop", "createSwitchBlock"],
     },
     ModuleMapping {
         ts_file: "render3/r3_deferred_blocks.ts",
-        rust_file: "template/deferred.rs",
+        rust_file: "template/src/template/deferred.rs",
         kind: PortKind::Logic,
         spec: None,
         anchor_symbols: &["createDeferredBlock"],
     },
     ModuleMapping {
         ts_file: "render3/r3_deferred_triggers.ts",
-        rust_file: "template/deferred.rs",
+        rust_file: "template/src/template/deferred.rs",
         kind: PortKind::Logic,
         spec: None,
         anchor_symbols: &["parseDeferredTime", "parseWhenTrigger", "parseOnTrigger"],
@@ -157,35 +169,35 @@ pub const MODULE_MAP: &[ModuleMapping] = &[
     // ---- view (compiler / template instructions / queries / binder / config) -----------
     ModuleMapping {
         ts_file: "render3/view/compiler.ts",
-        rust_file: "view/compiler.rs",
+        rust_file: "decorators/src/compiler.rs",
         kind: PortKind::Logic,
         spec: Some("migration/render3-specs/11-view_compiler.md"),
         anchor_symbols: &["compileComponentFromMetadata", "compileDirectiveFromMetadata"],
     },
     ModuleMapping {
         ts_file: "render3/view/template.ts",
-        rust_file: "view/template.rs",
+        rust_file: "template/src/view/template.rs",
         kind: PortKind::Logic,
         spec: None,
         anchor_symbols: &["TemplateDefinitionBuilder"],
     },
     ModuleMapping {
         ts_file: "render3/view/query_generation.ts",
-        rust_file: "view/queries.rs",
+        rust_file: "template/src/view/queries.rs",
         kind: PortKind::Logic,
         spec: None,
         anchor_symbols: &["createViewQueriesFunction", "createContentQueriesFunction"],
     },
     ModuleMapping {
         ts_file: "render3/view/t2_binder.ts",
-        rust_file: "binder.rs",
+        rust_file: "template/src/binder.rs",
         kind: PortKind::Logic,
         spec: Some("migration/render3-specs/10-t2_binder.md"),
         anchor_symbols: &["R3TargetBinder", "BoundTarget"],
     },
     ModuleMapping {
         ts_file: "render3/view/t2_api.ts",
-        rust_file: "binder.rs",
+        rust_file: "template/src/binder.rs",
         kind: PortKind::Logic,
         spec: Some("migration/render3-specs/10-t2_binder.md"),
         anchor_symbols: &["Target", "BoundTarget", "DirectiveMeta"],
@@ -193,28 +205,28 @@ pub const MODULE_MAP: &[ModuleMapping] = &[
     // ---- factory / pipe / module / injector codegen ------------------------------------
     ModuleMapping {
         ts_file: "render3/r3_factory.ts",
-        rust_file: "factory.rs",
+        rust_file: "core/src/factory.rs",
         kind: PortKind::Logic,
         spec: Some("migration/render3-specs/15-factory.md"),
         anchor_symbols: &["compileFactoryFunction", "R3FactoryMetadata", "FactoryTarget"],
     },
     ModuleMapping {
         ts_file: "render3/r3_pipe_compiler.ts",
-        rust_file: "pipe_module_injector.rs",
+        rust_file: "decorators/src/pipe_module_injector.rs",
         kind: PortKind::Logic,
         spec: Some("migration/render3-specs/16-pipe_module_injector.md"),
         anchor_symbols: &["compilePipeFromMetadata", "createPipeType"],
     },
     ModuleMapping {
         ts_file: "render3/r3_module_compiler.ts",
-        rust_file: "pipe_module_injector.rs",
+        rust_file: "decorators/src/pipe_module_injector.rs",
         kind: PortKind::Logic,
         spec: Some("migration/render3-specs/16-pipe_module_injector.md"),
         anchor_symbols: &["compileNgModule", "createNgModuleType"],
     },
     ModuleMapping {
         ts_file: "render3/r3_injector_compiler.ts",
-        rust_file: "pipe_module_injector.rs",
+        rust_file: "decorators/src/pipe_module_injector.rs",
         kind: PortKind::Logic,
         spec: Some("migration/render3-specs/16-pipe_module_injector.md"),
         anchor_symbols: &["compileInjector", "R3InjectorMetadata"],
@@ -229,14 +241,14 @@ pub const MODULE_MAP: &[ModuleMapping] = &[
     // vendored pipeline files that actually exist — not the removed `compiler_util` path.
     ModuleMapping {
         ts_file: "template/pipeline/src/ingest.ts",
-        rust_file: "expression_converter.rs",
+        rust_file: "core/src/expression_converter.rs",
         kind: PortKind::Logic,
         spec: None,
         anchor_symbols: &["ingestComponent", "ingestHostBinding"],
     },
     ModuleMapping {
         ts_file: "template/pipeline/src/conversion.ts",
-        rust_file: "expression_converter.rs",
+        rust_file: "core/src/expression_converter.rs",
         kind: PortKind::Logic,
         spec: None,
         anchor_symbols: &["BINARY_OPERATORS", "literalOrArrayLiteral"],
@@ -244,49 +256,49 @@ pub const MODULE_MAP: &[ModuleMapping] = &[
     // ---- ml_parser (HTML front-end) ----------------------------------------------------
     ModuleMapping {
         ts_file: "ml_parser/lexer.ts",
-        rust_file: "ml_parser.rs",
+        rust_file: "template/src/ml_parser.rs",
         kind: PortKind::Logic,
         spec: None,
         anchor_symbols: &["Lexer", "tokenize"],
     },
     ModuleMapping {
         ts_file: "ml_parser/parser.ts",
-        rust_file: "ml_parser.rs",
+        rust_file: "template/src/ml_parser.rs",
         kind: PortKind::Logic,
         spec: None,
         anchor_symbols: &["Parser", "ParseTreeResult"],
     },
     ModuleMapping {
         ts_file: "ml_parser/ast.ts",
-        rust_file: "ml_parser.rs",
+        rust_file: "template/src/ml_parser.rs",
         kind: PortKind::Logic,
         spec: None,
         anchor_symbols: &["Element", "Attribute", "Text", "Node"],
     },
     ModuleMapping {
         ts_file: "ml_parser/html_parser.ts",
-        rust_file: "ml_parser.rs",
+        rust_file: "template/src/ml_parser.rs",
         kind: PortKind::Logic,
         spec: None,
         anchor_symbols: &["HtmlParser"],
     },
     ModuleMapping {
         ts_file: "ml_parser/tags.ts",
-        rust_file: "ml_parser.rs",
+        rust_file: "template/src/ml_parser.rs",
         kind: PortKind::Logic,
         spec: None,
         anchor_symbols: &["TagContentType", "getNsPrefix"],
     },
     ModuleMapping {
         ts_file: "ml_parser/html_tags.ts",
-        rust_file: "ml_parser.rs",
+        rust_file: "template/src/ml_parser.rs",
         kind: PortKind::Mechanical,
         spec: None,
         anchor_symbols: &["HtmlTagDefinition", "getHtmlTagDefinition"],
     },
     ModuleMapping {
         ts_file: "ml_parser/tokens.ts",
-        rust_file: "ml_parser.rs",
+        rust_file: "template/src/ml_parser.rs",
         kind: PortKind::Logic,
         spec: None,
         anchor_symbols: &["TokenType", "Token"],
@@ -294,14 +306,14 @@ pub const MODULE_MAP: &[ModuleMapping] = &[
     // ---- i18n core ---------------------------------------------------------------------
     ModuleMapping {
         ts_file: "i18n/digest.ts",
-        rust_file: "i18n.rs",
+        rust_file: "core/src/digest.rs",
         kind: PortKind::Logic,
         spec: None,
         anchor_symbols: &["computeMsgId", "fingerprint", "decimalDigest"],
     },
     ModuleMapping {
         ts_file: "i18n/i18n_ast.ts",
-        rust_file: "i18n.rs",
+        rust_file: "template/src/i18n.rs",
         kind: PortKind::Logic,
         spec: None,
         anchor_symbols: &["Message", "Node", "Container", "Icu", "Placeholder"],
@@ -311,21 +323,21 @@ pub const MODULE_MAP: &[ModuleMapping] = &[
     // are driven by the view compiler + a oxc-based @Component/@Directive source front-end.
     ModuleMapping {
         ts_file: "render3/view/api.ts",
-        rust_file: "compile.rs",
+        rust_file: "facade/src/compile.rs",
         kind: PortKind::Logic,
         spec: None,
         anchor_symbols: &["R3ComponentMetadata", "R3DirectiveMetadata"],
     },
     ModuleMapping {
         ts_file: "render3/view/config.ts",
-        rust_file: "view/compiler.rs",
+        rust_file: "decorators/src/compiler.rs",
         kind: PortKind::Mechanical,
         spec: None,
         anchor_symbols: &["toOptimizableTemplate"],
     },
     ModuleMapping {
         ts_file: "jit_compiler_facade.ts",
-        rust_file: "source_compile.rs",
+        rust_file: "facade/src/source_compile.rs",
         kind: PortKind::Logic,
         spec: None,
         anchor_symbols: &["CompilerFacadeImpl"],
@@ -337,7 +349,7 @@ pub const MODULE_MAP: &[ModuleMapping] = &[
     // here is the highest-value, safest auto-codegen.
     ModuleMapping {
         ts_file: "core.ts",
-        rust_file: "output_ast.rs",
+        rust_file: "core/src/output_ast.rs",
         kind: PortKind::Mechanical,
         spec: None,
         anchor_symbols: &[
@@ -377,7 +389,7 @@ mod tests {
     fn maps_identifiers_table() {
         let hits = rust_modules_for_ts("render3/r3_identifiers.ts");
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].rust_file, "identifiers.rs");
+        assert_eq!(hits[0].rust_file, "core/src/identifiers.rs");
         assert_eq!(hits[0].kind, PortKind::Mechanical);
     }
 
@@ -385,14 +397,14 @@ mod tests {
     fn maps_view_template() {
         let hits = rust_modules_for_ts("render3/view/template.ts");
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].rust_file, "view/template.rs");
+        assert_eq!(hits[0].rust_file, "template/src/view/template.rs");
     }
 
     #[test]
     fn output_ast_maps_to_output_ast_rs() {
         let hits = rust_modules_for_ts("output/output_ast.ts");
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].rust_file, "output_ast.rs");
+        assert_eq!(hits[0].rust_file, "core/src/output_ast.rs");
     }
 
     #[test]
@@ -400,7 +412,7 @@ mod tests {
         // Several TS files all port into ml_parser.rs.
         let count = MODULE_MAP
             .iter()
-            .filter(|m| m.rust_file == "ml_parser.rs")
+            .filter(|m| m.rust_file == "template/src/ml_parser.rs")
             .count();
         assert!(count >= 7, "expected ml_parser.rs to be fed by >=7 TS files, got {count}");
     }
@@ -408,7 +420,7 @@ mod tests {
     #[test]
     fn symbol_resolves_to_module() {
         let hits = rust_modules_for_symbol("AttributeMarker");
-        assert!(hits.iter().any(|m| m.rust_file == "output_ast.rs"));
+        assert!(hits.iter().any(|m| m.rust_file == "core/src/output_ast.rs"));
     }
 
     /// Locate the Treaty repo root from this crate's directory, so the test resolves vendored
@@ -443,12 +455,38 @@ mod tests {
     }
 
     #[test]
+    fn every_rust_file_resolves_to_an_existing_port_module() {
+        // The render3 port was carved into libs/treaty-ivy/{core,template,decorators,facade}; a
+        // stale row pointing at a moved/renamed Rust module must fail here rather than letting the
+        // codegen-verify path silently read an absent committed file (and report false "Missing").
+        let root = repo_root();
+        let mut missing: Vec<String> = Vec::new();
+        for m in MODULE_MAP {
+            let path = root.join(TREATY_IVY_SRC_ROOT).join(m.rust_file);
+            if !path.is_file() {
+                missing.push(format!("{} (resolved: {})", m.rust_file, path.display()));
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "every symbol_map rust_file must exist under {TREATY_IVY_SRC_ROOT}; missing:\n  {}",
+            missing.join("\n  ")
+        );
+    }
+
+    #[test]
     fn paths_are_normalized_relative() {
         for m in MODULE_MAP {
             assert!(!m.ts_file.starts_with('/'), "ts_file must be relative: {}", m.ts_file);
             assert!(!m.ts_file.contains('\\'), "ts_file must use '/': {}", m.ts_file);
             assert!(m.ts_file.ends_with(".ts"), "ts_file must be a .ts file: {}", m.ts_file);
             assert!(m.rust_file.ends_with(".rs"), "rust_file must be a .rs file: {}", m.rust_file);
+            // Every rust_file is rooted at its owning treaty-ivy crate's src/ dir.
+            assert!(
+                m.rust_file.contains("/src/"),
+                "rust_file must include its crate's src/ prefix: {}",
+                m.rust_file
+            );
         }
     }
 }

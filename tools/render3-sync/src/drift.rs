@@ -457,9 +457,9 @@ mod tests {
         assert!(!by_name.contains_key("SHARED"), "unchanged const must not be reported");
         assert!(!by_name.contains_key("Helper"), "reflow-only class must not be reported");
 
-        // Both map (file-level) to identifiers.rs — a Mechanical table.
+        // Both map (file-level) to core/src/identifiers.rs — a Mechanical table.
         for s in [modified, added] {
-            assert_eq!(s.rust_files, vec!["identifiers.rs".to_string()]);
+            assert_eq!(s.rust_files, vec!["core/src/identifiers.rs".to_string()]);
             assert_eq!(s.kind, Some(PortKind::Mechanical));
         }
     }
@@ -489,7 +489,7 @@ mod tests {
         // the table's spec attached.
         assert_eq!(report.tasks.len(), 1, "tasks: {:?}", report.tasks);
         let task = &report.tasks[0];
-        assert_eq!(task.rust_file, "identifiers.rs");
+        assert_eq!(task.rust_file, "core/src/identifiers.rs");
         assert_eq!(task.action, TaskAction::Codegen);
         assert_eq!(
             task.symbols,
@@ -514,7 +514,7 @@ mod tests {
 
     #[test]
     fn logic_module_change_is_a_manual_port_task() {
-        // view/template.ts -> view/template.rs is hand-ported LOGIC.
+        // render3/view/template.ts -> template/src/view/template.rs is hand-ported LOGIC.
         let report = build_report(
             "a",
             "b",
@@ -526,7 +526,7 @@ mod tests {
         );
         assert_eq!(report.tasks.len(), 1);
         assert_eq!(report.tasks[0].action, TaskAction::ManualPort);
-        assert_eq!(report.tasks[0].rust_file, "view/template.rs");
+        assert_eq!(report.tasks[0].rust_file, "template/src/view/template.rs");
     }
 
     #[test]
@@ -579,7 +579,7 @@ mod tests {
         let s = &cf.symbols[0];
         assert_eq!(s.symbol, "AttributeMarker");
         assert_eq!(s.change, ChangeKind::Modified);
-        assert!(s.rust_files.contains(&"output_ast.rs".to_string()));
+        assert!(s.rust_files.contains(&"core/src/output_ast.rs".to_string()));
         assert_eq!(s.kind, Some(PortKind::Mechanical));
     }
 }
