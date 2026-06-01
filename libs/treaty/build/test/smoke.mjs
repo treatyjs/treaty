@@ -7,15 +7,27 @@
  *      builder symbol) and an on-disk schema.
  *   2. The application build schema validates a minimal config and applies the
  *      documented defaults via the architect CoreSchemaRegistry.
+ *   3. Both builders actually RUN over a tiny project through the real architect
+ *      engine (Architect + TestingArchitectHost): architect validates the target
+ *      options against the builder schema, invokes the builder, and the builder
+ *      assembles its Treaty Rspack config and reaches the `@rspack/core` peer.
+ *      That peer is intentionally not installed here, so the builder returns a
+ *      handled `{ success: false }` BuilderOutput carrying the documented
+ *      actionable error — proving the builder runs end-to-end through architect
+ *      and fails cleanly (rather than crashing the run) when the peer is absent.
  *
- * Does NOT run a full ng workspace build (no @rspack/core peer installed).
+ * Does NOT run a full Rspack compilation (that needs the @rspack/core peer).
  */
 
 import { readFile } from 'node:fs/promises'
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import path from 'node:path'
 import assert from 'node:assert/strict'
 import { schema } from '@angular-devkit/core'
+import { Architect } from '@angular-devkit/architect'
+import { TestingArchitectHost } from '@angular-devkit/architect/testing/index.js'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const pkgRoot = path.resolve(here, '..')
@@ -96,4 +108,57 @@ if (badResult.success) {
 }
 console.log('ok: application schema rejects an invalid config')
 
-console.log('\nSMOKE PASS: @treaty/build builders resolve and schemas validate')
+// --- 5. both builders RUN over a tiny project through the real architect engine ---
+// Build a throwaway workspace with a single src/main.ts, register this package's
+// builders with a TestingArchitectHost, and schedule each target exactly as
+// `ng build` / `ng serve` would. Architect validates the options against the
+// builder schema and invokes the builder; the builder assembles its Treaty Rspack
+// config and reaches the (intentionally-absent) @rspack/core peer, so it must
+// return a handled failing BuilderOutput with the documented actionable message
+// instead of throwing. A throw here would crash the architect run — exactly the
+// regression this case guards against.
+const ws = mkdtempSync(path.join(tmpdir(), 'treaty-build-smoke-'))
+try {
+	mkdirSync(path.join(ws, 'src'), { recursive: true })
+	writeFileSync(path.join(ws, 'src', 'main.ts'), 'export const main = 1\n')
+
+	const runRegistry = new schema.CoreSchemaRegistry()
+	runRegistry.addPostTransform(schema.transforms.addUndefinedDefaults)
+	const architectHost = new TestingArchitectHost(ws, ws)
+	const architect = new Architect(architectHost, runRegistry)
+	await architectHost.addBuilderFromPackage(pkgRoot)
+
+	const PEER_HINT = /@rspack\/(core|dev-server)/
+
+	const appRun = await architect.scheduleBuilder('@treaty/build:application', {
+		entry: 'src/main.ts',
+		outputPath: 'dist/app',
+	})
+	const appOut = await appRun.result
+	await appRun.stop()
+	if (appOut.success) {
+		fail('application builder unexpectedly succeeded without the @rspack/core peer')
+	}
+	if (!PEER_HINT.test(String(appOut.error))) {
+		fail(`application builder error should name the missing peer, got: ${appOut.error}`)
+	}
+	console.log('ok: @treaty/build:application runs through architect and fails cleanly without @rspack/core')
+
+	const serveRun = await architect.scheduleBuilder('@treaty/build:dev-server', {
+		entry: 'src/main.ts',
+		port: 4200,
+	})
+	const serveOut = await serveRun.result
+	await serveRun.stop()
+	if (serveOut.success) {
+		fail('dev-server builder unexpectedly succeeded without the @rspack/core peer')
+	}
+	if (!PEER_HINT.test(String(serveOut.error))) {
+		fail(`dev-server builder error should name the missing peer, got: ${serveOut.error}`)
+	}
+	console.log('ok: @treaty/build:dev-server runs through architect and fails cleanly without @rspack/core')
+} finally {
+	rmSync(ws, { recursive: true, force: true })
+}
+
+console.log('\nSMOKE PASS: @treaty/build builders resolve, schemas validate, and run through architect')

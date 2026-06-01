@@ -116,17 +116,21 @@ export async function runDevServer(
 		}),
 	})
 
-	const rspack = loadRspack()
-	const RspackDevServer = loadRspackDevServer()
-
-	const compiler = rspack(config)
-	const server = new RspackDevServer({ port: options.port, host, hot: true }, compiler)
-
-	context.addTeardown(async () => {
-		await server.stop()
-	})
-
+	// Loading the peers, constructing the compiler/server, and starting it can all
+	// throw (a peer missing, the config rejected, or the port in use). Wrap the
+	// whole sequence so a failure surfaces as a clean failing BuilderOutput and
+	// `ng serve` reports a handled failure rather than crashing the architect run.
 	try {
+		const rspack = loadRspack()
+		const RspackDevServer = loadRspackDevServer()
+
+		const compiler = rspack(config)
+		const server = new RspackDevServer({ port: options.port, host, hot: true }, compiler)
+
+		context.addTeardown(async () => {
+			await server.stop()
+		})
+
 		await server.start()
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error)

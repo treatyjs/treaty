@@ -92,8 +92,18 @@ export async function runApplicationBuild(
 
 	context.reportStatus(`Building Treaty app${name ? ` "${name}"` : ''} with Rspack + auto Module Federation`)
 
-	const rspack = loadRspack()
-	const compiler = rspack(config)
+	// Loading the peer and constructing the compiler can throw (peer missing or
+	// the config is rejected). Surface that as a clean failing BuilderOutput so
+	// `ng build` reports a handled failure rather than crashing the architect run.
+	let compiler: RspackCompiler
+	try {
+		const rspack = loadRspack()
+		compiler = rspack(config)
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error)
+		context.logger.error(message)
+		return { success: false, error: message }
+	}
 
 	return await new Promise<BuilderOutput>((resolve) => {
 		compiler.run((runError, stats) => {
