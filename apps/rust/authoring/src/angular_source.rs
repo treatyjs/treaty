@@ -336,8 +336,13 @@ fn compile_plain_ts_server_module(
     // `redact_server_bodies_in_map`. Without this, a bundler that re-embeds the authoring `.ts` as the
     // map's `sourcesContent` would leak the server bodies (and any secret in them) through the map even
     // though the client CODE no longer contains them.
-    let server_bodies: Vec<String> =
+    let mut server_bodies: Vec<String> =
         extraction.server_fns.iter().map(|f| f.source.clone()).collect();
+    // Also redact every stripped NON-fn server-only top-level statement (e.g. a `const DB_API_KEY = …`
+    // beside the fns in a file-level `'use server'` module). These never reach the client CODE, but the
+    // map's embedded `sourcesContent` is the ORIGINAL source, so without redacting them too the secret
+    // would survive in the map even though the code is clean.
+    server_bodies.extend(extraction.server_only_sources.iter().cloned());
     let map = crate::source_map::client_map_with_redacted_source(
         original_source,
         SOURCE_NAME,
@@ -982,6 +987,60 @@ export async function loadPage$$(page: number) {\n\
             "no client binding for loadPage$$; got:\n{}",
             out.code
         );
+    }
+
+    #[test]
+    fn file_level_use_server_strips_top_level_secret_const_from_client() {
+        // PHASE 3 regression: a file-level `'use server'` module is server-only IN FULL, so a TOP-LEVEL
+        // secret declared BESIDE the server fns (not inside a fn body) must ALSO be stripped from the
+        // client. Previously only the fn bodies were lifted, so a `const SECRET = …` survived into the
+        // client bundle. The whole-module strip removes every top-level runtime statement, keeping only
+        // imports + type declarations + the emitted client bindings.
+        const SECRET: &str = "sk_live_TREATY_SERVER_ONLY_9f3a1c";
+        let source = format!(
+            "'use server'\n\
+import {{ z }} from 'zod'\n\
+export interface Todo {{ readonly id: number }}\n\
+const DB_API_KEY = '{SECRET}'\n\
+const store: Todo[] = [{{ id: 1 }}]\n\
+export async function listTodos(): Promise<Todo[]> {{\n\
+  if (DB_API_KEY.length === 0) throw new Error('no key');\n\
+  return store.slice();\n\
+}}\n"
+        );
+
+        let out = compile_angular_source(&source, "todos.server.ts");
+
+        // The server module retains the secret + store (it runs server-side).
+        let server_module = out.server_module.expect("file-level server must yield a server module");
+        assert!(server_module.contains("listTodos"), "fn missing from server module");
+
+        // SECURITY: the secret + the server-only data must be ABSENT from the client code.
+        assert_client_parses(&out.code);
+        assert!(
+            !out.code.contains(SECRET),
+            "SECURITY: top-level secret leaked into client code; got:\n{}",
+            out.code
+        );
+        assert!(
+            !out.code.contains("store.slice") && !out.code.contains("store: Todo[]"),
+            "SECURITY: server-only store leaked into client code; got:\n{}",
+            out.code
+        );
+        // The import and the exported type survive (no runtime value), and the binding is emitted.
+        assert!(out.code.contains("import { z }"), "import lost; got:\n{}", out.code);
+        assert!(out.code.contains("export interface Todo"), "type lost; got:\n{}", out.code);
+        assert!(out.code.contains("export const listTodos ="), "binding missing; got:\n{}", out.code);
+
+        // SECURITY: the secret must not appear in the client map's sourcesContent either.
+        let map = out.map.expect("server module must carry a redacted client map");
+        let value: serde_json::Value = serde_json::from_str(&map).expect("client map is valid JSON");
+        for c in value["sourcesContent"].as_array().expect("sourcesContent present") {
+            assert!(
+                !c.as_str().unwrap_or("").contains(SECRET),
+                "SECURITY: secret leaked into client map sourcesContent"
+            );
+        }
     }
 
     #[test]

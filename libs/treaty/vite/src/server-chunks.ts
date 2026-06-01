@@ -119,8 +119,33 @@ export function clientStubModule(exportName: string): string {
  */
 export function injectClientBindings(code: string, chunks: readonly ServerFnChunk[]): string {
 	if (chunks.length === 0) return code
-	const bindings = chunks.map((c) => c.clientBinding).join('\n')
+	// A PURE server MODULE (a file-level `'use server'` file) is lowered by the
+	// compiler to client code that ALREADY exports a binding for each server fn
+	// (e.g. `export const listTodos = (() => edenHttpResource(...))`). Injecting the
+	// chunk's `import { listTodos } …; export { listTodos };` binding on top would
+	// re-export the same name and produce a duplicate-export error. So only inject a
+	// chunk's binding when the client code does NOT already export that name; the
+	// chunk is still emitted as the server-body artifact regardless. For a component
+	// whose INLINE server fns were lifted, the client code has no such export, so the
+	// binding is injected as before.
+	const needed = chunks.filter((c) => !clientAlreadyExports(code, c.exportName))
+	if (needed.length === 0) return code
+	const bindings = needed.map((c) => c.clientBinding).join('\n')
 	return `${bindings}\n${code}`
+}
+
+/**
+ * Whether `code` already declares a top-level export named `name` — an
+ * `export const|let|var|function|class <name>` or an `export { … name … }` list.
+ * Used to avoid double-exporting a server fn whose binding the compiler already
+ * emitted (the pure-server-module case).
+ */
+function clientAlreadyExports(code: string, name: string): boolean {
+	const esc = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+	const decl = new RegExp(`(?:^|[\\n;])\\s*export\\s+(?:const|let|var|function|class)\\s+${esc}\\b`)
+	if (decl.test(code)) return true
+	const list = new RegExp(`export\\s*\\{[^}]*\\b${esc}\\b[^}]*\\}`)
+	return list.test(code)
 }
 
 /**

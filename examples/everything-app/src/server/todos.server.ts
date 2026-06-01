@@ -17,6 +17,12 @@ export interface Todo {
 	readonly done: boolean
 }
 
+// A SERVER-ONLY SECRET. In a real app this is a DB connection string / API key /
+// session signing key. It lives only on the server: the body below is extracted to
+// the backend artifact, so this token must NEVER appear in the client bundle or its
+// source map. The dev-backend e2e asserts exactly that (and that the fn still RUNS).
+const DB_API_KEY = 'sk_live_TREATY_SERVER_ONLY_9f3a1c'
+
 // In a real app this is your DB / service layer; it lives only on the server.
 const store: Todo[] = [
 	{ id: 1, title: 'Author a .treaty component', done: true },
@@ -24,8 +30,11 @@ const store: Todo[] = [
 	{ id: 3, title: 'Wire three server-fn transports', done: false },
 ]
 
-/** GET-shaped server fn: list all todos. */
+/** GET-shaped server fn: list all todos. The secret is used server-side only. */
 export async function listTodos(): Promise<Todo[]> {
+	// Touch the secret server-side (a real handler would authenticate the DB call
+	// with it). It is never returned to the client, only proven to run server-side.
+	if (DB_API_KEY.length === 0) throw new Error('missing DB key')
 	return store.slice()
 }
 

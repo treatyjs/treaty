@@ -71,10 +71,18 @@ await check('factory returns a well-formed Vite plugin', () => {
 // rewritten) req.url for a given incoming request URL. Captures the single
 // middleware the plugin registers and runs it against a minimal connect-style req.
 function runDevMiddleware(p, url) {
-	let middleware
-	const server = { middlewares: { use(fn) { middleware = fn } } }
+	// configureServer registers TWO middlewares: the MIME `?import` injector (first)
+	// and the dev-backend `/__server/<name>` router (second). This helper exercises
+	// the FIRST (the import-query injector); the dev backend is covered separately.
+	const middlewares = []
+	const server = {
+		middlewares: { use(fn) { middlewares.push(fn) } },
+		ssrLoadModule: async () => ({}),
+		ssrFixStacktrace() {},
+	}
 	p.configureServer.call({}, server)
-	assert.equal(typeof middleware, 'function', 'configureServer registers a middleware')
+	const middleware = middlewares[0]
+	assert.equal(typeof middleware, 'function', 'configureServer registers the import-query middleware first')
 	const req = { url }
 	let nexted = false
 	middleware(req, {}, () => { nexted = true })
@@ -390,6 +398,9 @@ await check('function chunking emits per-fn chunks + manifest, body never in cli
 	}
 
 	const p = authoringPluginOf(treaty({ compilerFactory: () => stubCompiler }))
+	// The server-body asset is emitted only for a one-shot build (in dev Vite's
+	// emitFile only warns), so mark this a build before transforming.
+	p.configResolved.call({}, { command: 'build', mode: 'production' })
 
 	// Build PluginContext capturing emitted chunks/assets.
 	const emitted = []
@@ -403,9 +414,13 @@ await check('function chunking emits per-fn chunks + manifest, body never in cli
 	const out = await p.transform.call(ctx, 'source-ignored', FILE)
 	assert.ok(out, 'transform returns a result for the server-fn file')
 
-	// Two server fns -> two emitted CHUNKS, one per fn, with stable file names.
-	const chunkFiles = emitted.filter((f) => f.type === 'chunk')
-	assert.equal(chunkFiles.length, 2, `expected 2 emitted chunks, got ${chunkFiles.length}`)
+	// Two server fns -> two emitted server-body ASSETS, one per fn, with stable file
+	// names. The body is emitted as an ASSET (not a `chunk`) so Rollup never PARSES
+	// it as client JS — the default axum backend body is Rust, and the client never
+	// imports it (the binding is redirected to the RPC stub by resolveId). It is
+	// written verbatim to `<id>.server.js` for a server runtime to consume.
+	const chunkFiles = emitted.filter((f) => f.type === 'asset' && /\.server\.js$/.test(f.fileName))
+	assert.equal(chunkFiles.length, 2, `expected 2 emitted server-body assets, got ${chunkFiles.length}`)
 	const chunkNames = chunkFiles.map((f) => f.fileName).sort()
 	for (const c of serverChunks) {
 		assert.ok(
@@ -499,6 +514,188 @@ await check('functionChunking:false leaves server fns as a single blob', async (
 	assert.equal(emitted.length, 0, 'no chunks emitted when chunking is off')
 	p.generateBundle.call(ctx, {}, {})
 	assert.equal(emitted.length, 0, 'no manifest emitted when chunking is off')
+})
+
+// 12. DEV BACKEND: parse/decode helpers behave per the client-stub contract.
+await check('dev-backend parseServerFnRoute + decodeArgs', async () => {
+	const { parseServerFnRoute, decodeArgs } = await import('../dist/index.js')
+	assert.equal(parseServerFnRoute('/__server/listTodos'), 'listTodos', 'plain route parses')
+	assert.equal(parseServerFnRoute('/__server/streamLogs?t=1'), 'streamLogs', 'query stripped')
+	assert.equal(parseServerFnRoute('/src/x.ts'), null, 'non-server path is null')
+	assert.equal(parseServerFnRoute('/__server/a/b'), null, 'nested path rejected')
+	assert.equal(parseServerFnRoute('/__server/'), null, 'empty name rejected')
+	// decodeArgs: empty -> [], a bare value -> single arg, an array -> spread.
+	assert.deepEqual(decodeArgs(''), [], 'empty body -> no args')
+	assert.deepEqual(decodeArgs('5'), [5], 'bare value -> one positional arg')
+	assert.deepEqual(decodeArgs('"x"'), ['x'], 'bare string -> one positional arg')
+	assert.deepEqual(decodeArgs('[1,2]'), [1, 2], 'array -> spread positional args')
+})
+
+// helper: drive the dev-backend `/__server/<name>` middleware (the SECOND
+// middleware configureServer registers) with a mock SSR loader, returning the
+// captured response (status, content-type, collected body).
+async function runServerFnRequest({ url, method = 'POST', body = '', ssrLoadModule }) {
+	const middlewares = []
+	const server = {
+		middlewares: { use(fn) { middlewares.push(fn) } },
+		ssrLoadModule,
+		ssrFixStacktrace() {},
+	}
+	const p = authoringPluginOf(treaty())
+	// Register the fn the way the plugin does during transform: load the server
+	// module so its chunks register into the dev backend registry.
+	p.configureServer.call({}, server)
+	const backend = middlewares[middlewares.length - 1]
+	assert.equal(typeof backend, 'function', 'dev backend middleware registered')
+
+	// Mock connect req: emit the body then end.
+	const handlers = {}
+	const req = {
+		url,
+		method,
+		on(event, cb) {
+			handlers[event] = cb
+			return req
+		},
+	}
+	let status = 0
+	let contentType = ''
+	let out = ''
+	let ended = false
+	const res = {
+		statusCode: 200,
+		setHeader(name, value) {
+			if (name.toLowerCase() === 'content-type') contentType = value
+		},
+		write(chunk) {
+			out += chunk
+			return true
+		},
+		end(b) {
+			status = this.statusCode
+			if (b !== undefined) out += b
+			ended = true
+		},
+	}
+	let nexted = false
+	backend(req, res, () => { nexted = true })
+	// Feed the body asynchronously, like a real stream.
+	if (handlers.data && body) handlers.data(Buffer.from(body, 'utf8'))
+	if (handlers.end) handlers.end()
+	// The handler is async; spin the event loop until it responds or calls next.
+	for (let i = 0; i < 50 && !ended && !nexted; i++) await new Promise((r) => setTimeout(r, 5))
+	return { plugin: p, status, contentType, body: out, ended, nexted, server }
+}
+
+// 13. DEV BACKEND: a registered server fn RUNS server-side and returns JSON.
+await check('dev-backend runs a registered API server fn and returns JSON', async () => {
+	const p = authoringPluginOf(treaty())
+	// Register `addThing` by transforming a pure server module (file-level use server).
+	const SECRET = 'SUPER_SECRET_DB_TOKEN_42'
+	const serverSrc = "'use server'\nexport async function addThing(n) {\n  const token = '" + SECRET + "'\n  return { doubled: n * 2, len: token.length }\n}\n"
+	// The transform registers the fn into the plugin's dev registry.
+	const client = await p.transform.call({ emitFile: () => 'ref' }, serverSrc, '/src/srv/thing.server.ts')
+	assert.ok(client, 'pure server module is owned + transformed')
+	assert.ok(!client.code.includes(SECRET), 'the secret never appears in client code')
+
+	// Now drive the configured backend, with an SSR loader returning the real fn.
+	const middlewares = []
+	const server = {
+		middlewares: { use(fn) { middlewares.push(fn) } },
+		async ssrLoadModule(id) {
+			assert.equal(id, '/src/srv/thing.server.ts', 'backend loads the original module SSR-side')
+			return { addThing: async (n) => ({ doubled: n * 2, len: SECRET.length }) }
+		},
+		ssrFixStacktrace() {},
+	}
+	p.configureServer.call({}, server)
+	const backend = middlewares[middlewares.length - 1]
+
+	const handlers = {}
+	const req = { url: '/__server/addThing', method: 'POST', on(e, cb) { handlers[e] = cb } }
+	let body = ''
+	let status = 0
+	let ct = ''
+	let ended = false
+	const res = {
+		statusCode: 200,
+		setHeader(n, v) { if (n.toLowerCase() === 'content-type') ct = v },
+		write() { return true },
+		end(b) { status = this.statusCode; if (b !== undefined) body += b; ended = true },
+	}
+	backend(req, res, () => {})
+	handlers.data(Buffer.from('21', 'utf8'))
+	handlers.end()
+	for (let i = 0; i < 50 && !ended; i++) await new Promise((r) => setTimeout(r, 5))
+	assert.ok(ended, 'backend responded')
+	assert.equal(status, 200, 'API fn returns 200')
+	assert.ok(/application\/json/.test(ct), 'API fn returns JSON content-type')
+	const parsed = JSON.parse(body)
+	assert.equal(parsed.doubled, 42, 'real server body ran (21*2)')
+	assert.equal(parsed.len, SECRET.length, 'server-side secret length computed server-side')
+	assert.ok(!body.includes(SECRET), 'the secret value never crosses the wire')
+})
+
+// 14. DEV BACKEND: an async-generator (stream) server fn yields SSE chunks.
+await check('dev-backend streams an async-generator server fn as SSE', async () => {
+	const p = authoringPluginOf(treaty())
+	const serverSrc = "'use server'\nexport async function* ticks(count) {\n  for (let i = 1; i <= count; i++) yield { seq: i }\n}\n"
+	await p.transform.call({ emitFile: () => 'ref' }, serverSrc, '/src/srv/ticks.server.ts')
+
+	const middlewares = []
+	const server = {
+		middlewares: { use(fn) { middlewares.push(fn) } },
+		async ssrLoadModule() {
+			return {
+				ticks: async function* (count) {
+					for (let i = 1; i <= count; i++) yield { seq: i }
+				},
+			}
+		},
+		ssrFixStacktrace() {},
+	}
+	p.configureServer.call({}, server)
+	const backend = middlewares[middlewares.length - 1]
+
+	const handlers = {}
+	const req = { url: '/__server/ticks', method: 'POST', on(e, cb) { handlers[e] = cb } }
+	let out = ''
+	let ct = ''
+	let ended = false
+	const res = {
+		statusCode: 200,
+		setHeader(n, v) { if (n.toLowerCase() === 'content-type') ct = v },
+		write(c) { out += c; return true },
+		end(b) { if (b !== undefined) out += b; ended = true },
+	}
+	backend(req, res, () => {})
+	handlers.data(Buffer.from('3', 'utf8'))
+	handlers.end()
+	for (let i = 0; i < 50 && !ended; i++) await new Promise((r) => setTimeout(r, 5))
+	assert.ok(ended, 'stream responded')
+	assert.ok(/text\/event-stream/.test(ct), 'stream fn uses an SSE content-type')
+	const dataFrames = out.split('\n\n').filter((f) => f.startsWith('data: ')).map((f) => f.slice('data: '.length))
+	// Three yielded chunks + one terminating `{}` end frame.
+	assert.ok(dataFrames.length >= 3, `expected >=3 SSE data frames, got ${dataFrames.length}`)
+	assert.deepEqual(JSON.parse(dataFrames[0]), { seq: 1 }, 'first SSE frame is the first yield')
+	assert.deepEqual(JSON.parse(dataFrames[2]), { seq: 3 }, 'third SSE frame is the third yield')
+})
+
+// 15. DEV BACKEND: an unknown fn 404s; a non-server path falls through to next().
+await check('dev-backend 404s an unknown fn and ignores non-server paths', async () => {
+	const r1 = await runServerFnRequest({
+		url: '/__server/doesNotExist',
+		ssrLoadModule: async () => ({}),
+	})
+	assert.equal(r1.status, 404, 'unknown fn -> 404')
+	assert.ok(!r1.nexted, 'a /__server/* path is claimed, not passed through')
+
+	const r2 = await runServerFnRequest({
+		url: '/src/app/main.ts',
+		ssrLoadModule: async () => ({}),
+	})
+	assert.ok(r2.nexted, 'a non-/__server path falls through to next()')
+	assert.ok(!r2.ended, 'a non-server request is left for the next middleware')
 })
 
 for (const line of results) console.log(line)

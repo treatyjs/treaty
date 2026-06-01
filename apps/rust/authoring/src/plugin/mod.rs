@@ -102,6 +102,12 @@ const DEFAULT_LANG: &str = "rust";
 pub struct ServerExtraction {
     pub client_source: String,
     pub server_fns: Vec<ServerFn>,
+    /// Verbatim source text of every NON-fn top-level statement that was stripped from the client
+    /// because the module is file-level `'use server'` (a top-level `const`/helper/etc. that may hold
+    /// a secret). These are server-only and must be redacted from the client source map as well, so
+    /// the map's `sourcesContent` never embeds the secret even though the client CODE no longer
+    /// carries it. Empty for non-file-level extractions and for modules with no such statements.
+    pub server_only_sources: Vec<String>,
 }
 
 /// What a [`BackendPlugin`] produces from a set of [`ServerFn`]s.
@@ -216,11 +222,11 @@ pub fn extract_server_block(source: &str) -> ServerExtraction {
 
     // 2. Lift the remaining top-level marker forms (`'use server'` directive, `name$$` suffix) from
     //    whatever client source survived step 1, removing their declarations as we go.
-    let (rewritten, marker_fns) = extract_marker_fns(&client_source);
+    let (rewritten, marker_fns, server_only_sources) = extract_marker_fns(&client_source);
     client_source = rewritten;
     server_fns.extend(marker_fns);
 
-    ServerExtraction { client_source, server_fns }
+    ServerExtraction { client_source, server_fns, server_only_sources }
 }
 
 /// Scan top-level declarations of `source` for the marker conventions that do not use an explicit
@@ -242,9 +248,9 @@ pub fn extract_server_block(source: &str) -> ServerExtraction {
 ///
 /// The scan parses `source` once with OXC and removes the matched declarations by byte span (highest
 /// span first so earlier offsets stay valid). Only program-top-level declarations are considered.
-fn extract_marker_fns(source: &str) -> (String, Vec<ServerFn>) {
+fn extract_marker_fns(source: &str) -> (String, Vec<ServerFn>, Vec<String>) {
     if source.trim().is_empty() {
-        return (source.to_string(), Vec::new());
+        return (source.to_string(), Vec::new(), Vec::new());
     }
 
     let allocator = Allocator::default();
@@ -262,6 +268,9 @@ fn extract_marker_fns(source: &str) -> (String, Vec<ServerFn>) {
     let mut fns = Vec::new();
     // Byte spans of the top-level declarations we remove from the client source.
     let mut removals: Vec<(usize, usize)> = Vec::new();
+    // Verbatim source of stripped NON-fn server-only top-level statements (file-level modules only),
+    // so the client source map can redact them too.
+    let mut server_only_sources: Vec<String> = Vec::new();
 
     // When the module is file-level `'use server'`, strip the directive statement itself from the
     // client source so the lifted module marker does not survive into the client bundle.
@@ -277,11 +286,65 @@ fn extract_marker_fns(source: &str) -> (String, Vec<ServerFn>) {
         if let Some((server_fn, span)) = server_fn_from_top_level(source, stmt, !file_level_server) {
             removals.push(span);
             fns.push(server_fn);
+            continue;
+        }
+
+        // A file-level `'use server'` module is server-only IN FULL: every top-level RUNTIME
+        // statement that is not a server fn — a `const`/`let`/`var` (which may hold a secret such as
+        // a DB key, like `const DB_API_KEY = …`), a non-exported helper `function`/`class`, or a bare
+        // expression statement — is also stripped from the client source. Without this, a top-level
+        // secret declared beside the server fns would survive into the client bundle even though the
+        // fn BODIES were lifted. Imports and pure TYPE declarations (`interface`/`type`, which carry
+        // no runtime value and are erased by the bundler) are kept so a consumer can still import the
+        // module's types.
+        if file_level_server && is_server_only_runtime_statement(stmt) {
+            let (start, end) = (stmt.span().start as usize, stmt.span().end as usize);
+            removals.push((start, end));
+            server_only_sources.push(source[start..end].to_string());
         }
     }
 
     let client_source = strip_spans(source, &mut removals);
-    (client_source, fns)
+    (client_source, fns, server_only_sources)
+}
+
+/// Whether a top-level statement of a file-level `'use server'` module is RUNTIME code that must be
+/// stripped from the client source (it is server-only). True for variable declarations, function and
+/// class declarations, bare expression statements, and `export`s wrapping any of those. False for
+/// `import` declarations and pure TYPE declarations (`interface` / `type` alias, and `export`s of
+/// them), which carry no runtime value and are kept so the module's types stay importable.
+fn is_server_only_runtime_statement(stmt: &Statement) -> bool {
+    use oxc_ast::ast::{Declaration, ExportDefaultDeclarationKind};
+    match stmt {
+        // Imports and type-only declarations are not runtime-bearing: keep them.
+        Statement::ImportDeclaration(_)
+        | Statement::TSInterfaceDeclaration(_)
+        | Statement::TSTypeAliasDeclaration(_)
+        | Statement::TSEnumDeclaration(_)
+        | Statement::TSModuleDeclaration(_)
+        | Statement::TSImportEqualsDeclaration(_) => false,
+        // Runtime declarations are server-only.
+        Statement::VariableDeclaration(_)
+        | Statement::FunctionDeclaration(_)
+        | Statement::ClassDeclaration(_)
+        | Statement::ExpressionStatement(_) => true,
+        // An `export …` wrapping a runtime declaration is server-only; an `export interface`/
+        // `export type` is a pure type re-export and is kept. (A `TSTypeAliasDeclaration`/
+        // `TSInterfaceDeclaration` inside an `ExportNamedDeclaration` is type-only.)
+        Statement::ExportNamedDeclaration(export) => match export.declaration.as_ref() {
+            None => false, // `export { … }` / `export … from …`: a re-export, keep it.
+            Some(Declaration::TSInterfaceDeclaration(_))
+            | Some(Declaration::TSTypeAliasDeclaration(_))
+            | Some(Declaration::TSEnumDeclaration(_))
+            | Some(Declaration::TSModuleDeclaration(_)) => false,
+            Some(_) => true,
+        },
+        Statement::ExportDefaultDeclaration(export) => !matches!(
+            &export.declaration,
+            ExportDefaultDeclarationKind::TSInterfaceDeclaration(_)
+        ),
+        _ => false,
+    }
 }
 
 /// Remove each `(start, end)` byte span from `source`. Also swallows one trailing newline after each

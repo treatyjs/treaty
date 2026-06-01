@@ -47,6 +47,11 @@ import {
 	serverChunkFileName,
 	type TrackedServerFn,
 } from './server-chunks.js'
+import {
+	createServerFnMiddleware,
+	type DevBackendServer,
+	type DevServerFn,
+} from './dev-backend.js'
 
 /** Public options for {@link treaty}. */
 export interface PluginOptions extends TreatyCompilerOptions {
@@ -362,6 +367,33 @@ function isCandidate(id: string): boolean {
 	return classify(cleanId(id)) !== null
 }
 
+/**
+ * The Angular decorators that mean a module must be LOWERED to Ivy (even in SSR).
+ * Mirrors the compiler-core screen; used only to tell a pure server module apart
+ * from a component that happens to colocate a `server { … }` block.
+ */
+const ANGULAR_DECORATOR_RE = /@(?:Component|Directive|Pipe|Injectable|NgModule)\s*\(/
+
+/**
+ * The server-fn markers the Rust front-end extracts: a `'use server'`/
+ * `'use websocket'` directive, a `server[:lang] { … }` block, or a `$$`-suffixed
+ * declaration. Mirrors `hasServerMarker` in `@treaty/compiler`.
+ */
+const SERVER_MARKER_RE =
+	/(?:^|[\n;{])\s*['"]use (?:server|websocket)['"]|(?:^|[\n;{}])\s*server(?::[A-Za-z_$][\w$]*)?\s*\{|\b[A-Za-z_$][\w$]*\$\$\s*(?:=|\()/m
+
+/**
+ * Whether `code` is a PURE server module — it declares server functions but no
+ * Angular component/directive/etc. to lower. Such a module has nothing to render
+ * client- or SSR-side beyond its server fns, so the dev backend's SSR pass passes
+ * it through unchanged (letting Vite transpile the raw TS and run the real
+ * bodies). A component that colocates a `server { … }` block is NOT pure: it must
+ * still be lowered to Ivy, so it is excluded here.
+ */
+function isPureServerModule(code: string): boolean {
+	return SERVER_MARKER_RE.test(code) && !ANGULAR_DECORATOR_RE.test(code)
+}
+
 /** The plugin name surfaced in Vite logs for the file-routes virtual module. */
 const ROUTES_PLUGIN_NAME = 'treaty:vite:file-routes'
 
@@ -465,6 +497,13 @@ export default function treaty(options: PluginOptions = {}): Plugin[] {
 	const clientStubs = new Map<string, string>()
 	const tracked = new Map<string, TrackedServerFn>()
 
+	// Dev backend registry: export name -> the original module id whose SSR-loaded
+	// export is the REAL server-fn body. Populated during `transform` as server fns
+	// are discovered; read by the dev `/__server/<name>` middleware to run the body
+	// server-side (the client only ever sees the RPC stub). Keyed by export name —
+	// the route segment the client stub fetches.
+	const devServerFns = new Map<string, DevServerFn>()
+
 	/**
 	 * Register one extracted server fn as its own code-split chunk: stash the
 	 * body under its server-virtual id and emit it as a Rollup chunk with a
@@ -474,13 +513,23 @@ export default function treaty(options: PluginOptions = {}): Plugin[] {
 	 */
 	function registerServerChunk(
 		ctx: { emitFile?: (file: EmittedFile) => string },
-		chunk: ServerFnChunk
+		chunk: ServerFnChunk,
+		sourceId: string
 	): void {
 		const fileName = serverChunkFileName(chunk)
 		serverBodies.set(`${SERVER_VIRTUAL_PREFIX}${chunk.id}`, chunk.code)
 		clientStubs.set(`${CLIENT_VIRTUAL_PREFIX}${chunk.id}`, clientStubModule(chunk.exportName))
 		tracked.set(chunk.id, { chunk, fileName })
-		if (typeof ctx.emitFile === 'function') {
+		// Dev backend: route `/__server/<exportName>` to the ORIGINAL module so its
+		// SSR-loaded export runs the real body server-side (never shipped to the
+		// client). `sourceId` is the authoring file the fn was extracted from.
+		devServerFns.set(chunk.exportName, { exportName: chunk.exportName, moduleId: sourceId })
+		// Emit the server-body asset ONLY for a one-shot `build`. In dev (serve) Vite's
+		// plugin context exposes an `emitFile` that merely WARNS ("not supported in serve
+		// mode") — and the asset is not needed there, since the dev backend runs the real
+		// server body by SSR-loading the original module. So we skip emit in dev and rely
+		// on the registered virtuals + the dev backend; the build path still emits the asset.
+		if (isColdBuild && typeof ctx.emitFile === 'function') {
 			// Emit the server body as a Rollup ASSET (verbatim `source`), NOT a
 			// `chunk`. A server-fn body is a BACKEND module -- the default axum
 			// backend emits a Rust/axum service. Emitting it as `type: 'chunk'`
@@ -596,7 +645,7 @@ export default function treaty(options: PluginOptions = {}): Plugin[] {
 		 * the existing transform/idempotency/linker/source-map behaviour is preserved
 		 * and only the response LABEL for these two extensions changes.
 		 */
-		configureServer(server: { middlewares: { use(fn: DevMiddleware): void } }) {
+		configureServer(server: { middlewares: { use(fn: DevMiddleware): void } } & DevBackendServer) {
 			server.middlewares.use((req, _res, next) => {
 				const url = req.url
 				if (typeof url === 'string' && isOwnedAuthoringUrl(url) && !IMPORT_QUERY_RE.test(url)) {
@@ -604,6 +653,14 @@ export default function treaty(options: PluginOptions = {}): Plugin[] {
 				}
 				next()
 			})
+
+			// DEV BACKEND. Serve `/__server/<name>` by loading the original server
+			// module SSR-side and invoking the real body, so the client RPC stub's
+			// `fetch('/__server/<name>')` gets a genuine response in dev instead of a
+			// 404. The fn registry is populated lazily as authoring files are
+			// transformed, so the middleware reads it at request time (a fn the app
+			// has not yet compiled simply 404s until its module is first transformed).
+			server.middlewares.use(createServerFnMiddleware(server, devServerFns))
 		},
 
 		/**
@@ -679,7 +736,7 @@ export default function treaty(options: PluginOptions = {}): Plugin[] {
 		 * Vite's `{ code, map }` shape. Files the core does not own (it returns
 		 * `null`) fall through to Vite's normal pipeline untouched.
 		 */
-		async transform(code, id) {
+		async transform(code, id, transformOptions) {
 			if (!isCandidate(id)) return null
 			// Idempotency guard: a module whose extension this plugin owns may re-enter
 			// the pre-transform already carrying the FIRST pass's lowered Ivy output
@@ -688,6 +745,18 @@ export default function treaty(options: PluginOptions = {}): Plugin[] {
 			// emitter's signature and pass the already-lowered JS through untouched —
 			// guaranteeing each authoring module is compiled exactly once.
 			if (isLoweredIvy(code)) return null
+
+			// DEV BACKEND SSR PASS. The dev `/__server/<name>` middleware loads the
+			// ORIGINAL server module via `ssrLoadModule` to RUN the real body. In that
+			// SSR pass we must NOT lift the server fns out (that would replace the body
+			// with the RPC stub and recurse). A pure server module — server markers but
+			// no Angular component to lower — is therefore passed through untouched in
+			// SSR so Vite's own TS pipeline transpiles and executes the genuine bodies.
+			// (A `.treaty`/JSX component still lowers normally, even in SSR.)
+			if (transformOptions?.ssr === true && isPureServerModule(code)) {
+				return null
+			}
+
 			const result = compiler.transform(cleanId(id), code)
 			if (result === null) return null
 
@@ -697,7 +766,7 @@ export default function treaty(options: PluginOptions = {}): Plugin[] {
 			let out = result.code
 			if (functionChunking && result.serverChunks && result.serverChunks.length > 0) {
 				for (const chunk of result.serverChunks) {
-					registerServerChunk(this, chunk)
+					registerServerChunk(this, chunk, cleanId(id))
 				}
 				out = injectClientBindings(out, result.serverChunks)
 			}
@@ -864,6 +933,14 @@ export function treatyWithFederation(
 	return plugins
 }
 
+export {
+	createServerFnMiddleware,
+	parseServerFnRoute,
+	decodeArgs,
+	SERVER_ROUTE_PREFIX,
+	type DevServerFn,
+	type DevBackendServer,
+} from './dev-backend.js'
 export { toViteFederation, generateMfConfig } from '@treaty/module-federation'
 export type { MfOptions, NormalizedMfConfig } from '@treaty/module-federation'
 export { createTreatyCompiler } from '@treaty/compiler'

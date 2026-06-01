@@ -92,6 +92,42 @@ function isAngularDecoratorSource(code: string): boolean {
 }
 
 /**
+ * A plain `.ts` (or `.tsx`/`.tjsx`) module that carries NO Angular decorator is
+ * still Treaty's to compile when it declares a SERVER FUNCTION, because the Rust
+ * front-end must lift those bodies out of the client bundle (and the backend dev
+ * runtime needs the extracted server module). Without this screen a file-level
+ * `'use server'` module — e.g. `todos.server.ts` exporting `listTodos` — would
+ * short-circuit to `null` here and be served by the bundler's plain-TS pipeline,
+ * shipping the full body (and any secret in it) to the browser: the exact
+ * client-leak the Rust extraction was hardened to prevent (it never runs if the
+ * TS gate returns early).
+ *
+ * The markers mirror the Rust extractor (`extract_server_block`):
+ *   * a file-level / function-level `'use server'` or `'use websocket'` string
+ *     directive,
+ *   * a top-level `server { … }` / `server:lang { … }` block, or
+ *   * a `$$`-suffixed declaration name (the inline server-fn marker).
+ *
+ * This is a deliberately cheap pre-screen; a false positive merely routes the
+ * module to the Rust front-end, which AST-detects the real markers and passes a
+ * non-server module through unchanged (returning no `serverModule`).
+ */
+const SERVER_MARKER_RE =
+	/(?:^|[\n;{])\s*['"]use (?:server|websocket)['"]|(?:^|[\n;{}])\s*server(?::[A-Za-z_$][\w$]*)?\s*\{|\b[A-Za-z_$][\w$]*\$\$\s*(?:=|\()/m
+function hasServerMarker(code: string): boolean {
+	return SERVER_MARKER_RE.test(code)
+}
+
+/**
+ * Whether a `'component'`-kind `.ts`/`.tsx`/`.tjsx` module should be routed to
+ * the Rust front-end: it carries an Angular decorator OR a server-fn marker.
+ * A module with neither is an ordinary TypeScript module the bundler handles.
+ */
+function isTreatyComponentSource(code: string): boolean {
+	return isAngularDecoratorSource(code) || hasServerMarker(code)
+}
+
+/**
  * The unified JSX front-end (used for `.tsx`/`.tjsx`) requires the module to
  * declare a JSX component (a default-export or named function/arrow returning
  * JSX). A `.tsx` that instead carries a classic `@Component` class with a string
@@ -130,7 +166,7 @@ export class TreatyCompiler {
 		if (kind === null) return false
 		if (kind === 'component') {
 			// Without source we can't be sure; assume yes and let transform decide.
-			return code === undefined ? true : isAngularDecoratorSource(code)
+			return code === undefined ? true : isTreatyComponentSource(code)
 		}
 		return true
 	}
@@ -145,7 +181,7 @@ export class TreatyCompiler {
 	transform(id: string, code: string): TransformResult | null {
 		const kind = classify(id)
 		if (kind === null) return null
-		if (kind === 'component' && !isAngularDecoratorSource(code)) return null
+		if (kind === 'component' && !isTreatyComponentSource(code)) return null
 
 		const hash = contentHash(code)
 		if (this.cacheEnabled) {
@@ -191,7 +227,7 @@ export class TreatyCompiler {
 			const { id, code } = files[i]!
 			const kind = classify(id)
 			if (kind === null) continue
-			if (kind === 'component' && !isAngularDecoratorSource(code)) continue
+			if (kind === 'component' && !isTreatyComponentSource(code)) continue
 
 			const hash = contentHash(code)
 			// Cache hit: serve and skip the batch, exactly like transform().
