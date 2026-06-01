@@ -30,7 +30,7 @@ use oxc_parser::Parser as JsParser;
 use oxc_span::SourceType;
 
 use crate::plugin::{
-    client_runtime_prelude_for_code, extract_server_block_jsx, rewrite_call_sites, PluginRegistry,
+    client_runtime_imports_for_code, extract_server_block_jsx, rewrite_call_sites, PluginRegistry,
 };
 use crate::sfc::compile_from_parts_with_directives_and_map;
 use crate::source_map::redact_server_bodies_in_map;
@@ -293,10 +293,9 @@ pub fn compile(source: &str, file_name: &str) -> CompiledAuthoring {
     //    typesafe resource HTTP client) — the SAME default backend the `.ts`/`.treaty` paths use, not
     //    a hardcoded Elysia path — and rewrite the client call sites to the plugin's per-fn binding.
     //    The lifted server-fn body texts are kept so they can be redacted out of the client map's
-    //    `sourcesContent` below. The emitted bindings reference resource-client runtime symbols
-    //    (`edenHttpResource`/`edenStreamResource`/`edenWebSocket`/…); a self-contained prelude
-    //    defining exactly the referenced symbols is prepended so the client module resolves every
-    //    reference at boot instead of throwing `<symbol> is not defined`.
+    //    `sourcesContent` below. The emitted bindings reference the real `@treaty/httpclient` resource
+    //    helper (`edenPromiseResource`); a real `import` of it is prepended so the client module
+    //    resolves the binding at boot instead of throwing `<symbol> is not defined`.
     let (javascript, server_module, server_bodies) = if extraction.server_fns.is_empty() {
         (javascript, None, Vec::new())
     } else {
@@ -354,16 +353,16 @@ pub fn compile(source: &str, file_name: &str) -> CompiledAuthoring {
     }
     all_errors.extend(compiled.errors);
 
-    // The rewritten call sites in the emitted module reference the resource-client runtime symbols
-    // the server-fn bindings expand to. Prepend a self-contained MODULE-SCOPE definition for exactly
-    // the symbols the emitted code names (not inside the component wrapper, where the signals pass
-    // would mistake them for component state), so the module resolves every reference at boot rather
-    // than throwing `<symbol> is not defined`. Empty when no binding symbol is referenced.
-    let prelude = client_runtime_prelude_for_code(&compiled.code);
-    let code = if prelude.is_empty() {
+    // The rewritten call sites in the emitted module reference the real `@treaty/httpclient` resource
+    // helper the server-fn bindings wrap. Prepend a real MODULE-SCOPE `import` of it (a top-level
+    // import statement, not inside the component wrapper where the signals pass would mistake it for
+    // component state), so the module resolves the binding at boot rather than throwing `<symbol> is
+    // not defined`. Empty when no binding symbol is referenced.
+    let imports = client_runtime_imports_for_code(&compiled.code);
+    let code = if imports.is_empty() {
         compiled.code
     } else {
-        format!("{prelude}\n{}", compiled.code)
+        format!("{imports}\n{}", compiled.code)
     };
 
     CompiledAuthoring {
@@ -854,18 +853,19 @@ export default function counter() {\n  return <section>hi</section>;\n}\n";
             "no save route in axum server module; got: {server_module}"
         );
         // The free call to `save` in the component body is rewritten to the axum resource-client
-        // binding (`edenHttpResource` POSTing to `/__server/save`), and the server body never leaks
-        // into the client JS.
+        // binding (`edenPromiseResource` POSTing to `/__server/save` via fetch), and the server body
+        // never leaks into the client JS.
         assert!(
-            out.code.contains("edenHttpResource") && out.code.contains("'/__server/save'"),
+            out.code.contains("edenPromiseResource") && out.code.contains("'/__server/save'"),
             "call site not rewritten to axum resource client; got: {}",
             out.code
         );
-        // The resource-client runtime symbol the binding references is defined in the module, so the
-        // client resolves it at boot rather than throwing `edenHttpResource is not defined`.
+        // The resource-client runtime symbol the binding references is IMPORTED from the real
+        // `@treaty/httpclient` runtime, so the client resolves it at boot rather than throwing
+        // `edenPromiseResource is not defined` — and it is NOT a self-defined stub.
         assert!(
-            out.code.contains("const edenHttpResource ="),
-            "no resource-client runtime prelude for the referenced binding; got: {}",
+            out.code.contains("import { edenPromiseResource } from '@treaty/httpclient/resources'"),
+            "no real resource-client import for the referenced binding; got: {}",
             out.code
         );
         assert!(
@@ -1713,10 +1713,12 @@ export default function greetingCard() {\n\
             "the `$$` server fn declaration leaked into the client; got: {code}"
         );
         // The call site routes through the axum resource-client binding, whose runtime symbol is
-        // defined in the module so it resolves at boot.
+        // IMPORTED from the real `@treaty/httpclient` runtime (not a self-defined stub) so it resolves
+        // at boot.
         assert!(
-            code.contains("edenHttpResource") && code.contains("const edenHttpResource ="),
-            "call site not rewritten to a defined resource-client binding; got: {code}"
+            code.contains("edenPromiseResource")
+                && code.contains("import { edenPromiseResource } from '@treaty/httpclient/resources'"),
+            "call site not rewritten to an imported resource-client binding; got: {code}"
         );
         assert!(code.contains("export default GreetingCard;"), "no class default export; got: {code}");
     }
@@ -1792,10 +1794,12 @@ export default function greetingCard() {\n\
             "SECURITY: `$$` server body leaked into the client; got:\n{}",
             out.code
         );
-        // A binding is present and its runtime symbol is defined so the client resolves it at boot.
+        // A binding is present and its runtime symbol is IMPORTED from the real runtime (not a stub)
+        // so the client resolves it at boot.
         assert!(
-            out.code.contains("edenHttpResource") && out.code.contains("const edenHttpResource ="),
-            "no defined resource-client binding for the lifted fn; got:\n{}",
+            out.code.contains("edenPromiseResource")
+                && out.code.contains("import { edenPromiseResource } from '@treaty/httpclient/resources'"),
+            "no imported resource-client binding for the lifted fn; got:\n{}",
             out.code
         );
     }

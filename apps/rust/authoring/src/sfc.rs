@@ -1054,6 +1054,16 @@ pub fn compile_treaty_authoring_with(
     let (compiled, map) =
         compile_treaty_file_with_map(&client_source, file_name, file_name, source);
 
+    // The rewritten call sites reference the real `@treaty/httpclient` resource helper the bindings
+    // wrap. Prepend a real `import` of it so the compiled `.treaty` client module resolves the binding
+    // at boot rather than throwing `<symbol> is not defined`. Empty when no binding symbol is named.
+    let imports = crate::plugin::client_runtime_imports_for_code(&compiled.code);
+    let code = if imports.is_empty() {
+        compiled.code
+    } else {
+        format!("{imports}\n{}", compiled.code)
+    };
+
     // CLIENT PRIVACY: the map embeds the original authoring source as `sourcesContent`, which still
     // carries the verbatim `server { … }` block. Redact each lifted server-fn body out of the map's
     // content (blanked to position-preserving whitespace) so the server source never reaches the
@@ -1063,7 +1073,7 @@ pub fn compile_treaty_authoring_with(
     let map = map.map(|m| redact_server_bodies_in_map(&m, &server_bodies));
 
     CompiledAuthoring {
-        code: compiled.code,
+        code,
         server_module: Some(emit.server_module),
         errors: compiled.errors,
         map,
@@ -1527,10 +1537,17 @@ function onClick(user) { return save(user); }\n\
             "default path should not emit an Elysia app; got: {server_module}"
         );
 
-        // The compiled client routes the call through the axum typesafe resource client binding.
+        // The compiled client routes the call through the axum typesafe resource client binding,
+        // wrapping the REAL `edenPromiseResource` export.
         assert!(
-            out.code.contains("edenHttpResource") && out.code.contains("'/__server/save'"),
+            out.code.contains("edenPromiseResource") && out.code.contains("'/__server/save'"),
             "call not rewritten to axum resource client; got: {}",
+            out.code
+        );
+        // The resource helper is IMPORTED from the published runtime so the `.treaty` client boots.
+        assert!(
+            out.code.contains("import { edenPromiseResource } from '@treaty/httpclient/resources'"),
+            "no real resource-client import in the compiled .treaty client; got: {}",
             out.code
         );
         assert!(

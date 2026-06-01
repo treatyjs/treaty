@@ -211,13 +211,13 @@ pub fn compile_angular_component_with(
         }
     }
 
-    // The rewritten call sites now reference the resource-client runtime symbols the bindings use;
-    // prepend a self-contained definition for the symbols the emitted code actually names so the
-    // module resolves every reference at boot rather than throwing `<symbol> is not defined`. Keying
-    // off the emitted code keeps a non-axum backend's distinct binding shape free of an unused prelude.
-    let prelude = crate::plugin::client_runtime_prelude_for_code(&code);
-    if !prelude.is_empty() {
-        code = format!("{prelude}\n{code}");
+    // The rewritten call sites now reference the real `@treaty/httpclient` resource helper the
+    // bindings wrap; prepend a real `import` of it so the module resolves the binding at boot rather
+    // than throwing `<symbol> is not defined`. Keying off the emitted code keeps a non-axum backend's
+    // distinct binding shape free of an unused import.
+    let imports = crate::plugin::client_runtime_imports_for_code(&code);
+    if !imports.is_empty() {
+        code = format!("{imports}\n{code}");
     }
 
     CompiledAuthoring {
@@ -339,14 +339,13 @@ fn compile_plain_ts_server_module(
         }
     }
 
-    // The emitted bindings reference resource-client runtime symbols (`edenHttpResource` /
-    // `edenStreamResource` / `edenWebSocket` / `httpClient` / `wsUrl`). Prepend a self-contained
-    // definition for exactly the symbols the emitted code names, so the client module resolves every
-    // reference the moment it is imported (closing the `edenStreamResource is not defined` boot
-    // crash). The prelude is empty when no binding symbol is referenced.
-    let prelude = crate::plugin::client_runtime_prelude_for_code(&code);
-    if !prelude.is_empty() {
-        code = format!("{prelude}\n{code}");
+    // The emitted bindings reference the real `@treaty/httpclient` resource helper
+    // (`edenPromiseResource`). Prepend a real `import` of it so the client module resolves the binding
+    // the moment it is imported (closing the `<symbol> is not defined` boot crash). The import is empty
+    // when no binding symbol is referenced.
+    let imports = crate::plugin::client_runtime_imports_for_code(&code);
+    if !imports.is_empty() {
+        code = format!("{imports}\n{code}");
     }
 
     // CLIENT PRIVACY: emit a v3 client map whose embedded `sourcesContent` is the ORIGINAL authoring
@@ -412,10 +411,16 @@ export class AppComponent {}\n";
         );
 
         // The compiled client routes the call through the axum typesafe resource client binding
-        // (`edenHttpResource` POSTing to `/__server/save`), not the original fn and not an eden path.
+        // (`edenPromiseResource` POSTing to `/__server/save`), not the original fn and not an eden path.
         assert!(
-            out.code.contains("edenHttpResource") && out.code.contains("'/__server/save'"),
+            out.code.contains("edenPromiseResource") && out.code.contains("'/__server/save'"),
             "call not rewritten to axum resource client; got: {}",
+            out.code
+        );
+        // The resource helper is imported from the REAL `@treaty/httpclient` runtime (not a stub def).
+        assert!(
+            out.code.contains("import { edenPromiseResource } from '@treaty/httpclient/resources'"),
+            "no real resource-client import; got: {}",
             out.code
         );
         assert!(
@@ -800,6 +805,88 @@ export class AppModule {}\n";
         );
     }
 
+    /// Parse `code` and assert `name` is bound at MODULE SCOPE by a real top-level `import` (an
+    /// `ImportSpecifier`/`ImportDefaultSpecifier`/`ImportNamespaceSpecifier` local), reading the bound
+    /// name off the PARSED AST — never a regex. A reference to a symbol that is imported is NOT a free
+    /// (undefined) reference, so the module resolves it at boot. This is how PHASE 2 proves the boot
+    /// `ReferenceError` is closed: the binding's runtime symbol comes from a real import, not a stub.
+    fn assert_imported_at_module_scope(code: &str, name: &str) {
+        use oxc_ast::ast::ImportDeclarationSpecifier;
+        let allocator = Allocator::default();
+        let source_type = SourceType::default().with_typescript(true);
+        let ret = Parser::new(&allocator, code, source_type).parse();
+        assert!(ret.errors.is_empty(), "client code did not parse: {code}");
+        let imported = ret.program.body.iter().any(|stmt| {
+            let Statement::ImportDeclaration(import) = stmt else { return false };
+            let Some(specs) = &import.specifiers else { return false };
+            specs.iter().any(|spec| {
+                let local = match spec {
+                    ImportDeclarationSpecifier::ImportSpecifier(s) => &s.local.name,
+                    ImportDeclarationSpecifier::ImportDefaultSpecifier(s) => &s.local.name,
+                    ImportDeclarationSpecifier::ImportNamespaceSpecifier(s) => &s.local.name,
+                };
+                local.as_str() == name
+            })
+        });
+        assert!(
+            imported,
+            "`{name}` is referenced by an emitted binding but is NOT imported at module scope \
+             (it would be a free/undefined reference -> `{name} is not defined` at boot); got:\n{code}"
+        );
+    }
+
+    #[test]
+    fn stream_consumer_client_emit_imports_resource_helper_no_free_reference() {
+        // PHASE 2 (the log-viewer boot crash): a `logs.stream.ts`-shaped FILE-LEVEL `'use server'`
+        // module with an `async function*` is lowered so the client keeps only the typed stream
+        // binding. That binding wraps `edenPromiseResource`; PARSE the emitted client and assert the
+        // symbol is bound by a real top-level `import` from the published `@treaty/httpclient` runtime
+        // (NOT a self-defined stub), so the module has no free/undefined reference to it and boots
+        // without `edenPromiseResource is not defined` (the original log-viewer ReferenceError).
+        let source = "'use server'\n\
+\n\
+export interface LogLine { readonly seq: number }\n\
+export async function* streamLogs(count: number): AsyncGenerator<LogLine> {\n\
+  const levels = ['info', 'warn', 'error'];\n\
+  for (let seq = 1; seq <= count; seq++) {\n\
+    await Promise.resolve();\n\
+    yield { seq, level: levels[seq % levels.length] };\n\
+  }\n\
+}\n";
+        let out = compile_angular_source(source, "logs.stream.ts");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+
+        // The emitted client parses and the binding references the resource helper.
+        assert_client_parses(&out.code);
+        assert!(
+            out.code.contains("export const streamLogs =") && out.code.contains("edenPromiseResource"),
+            "no stream client binding wrapping the resource helper; got:\n{}",
+            out.code
+        );
+        // The reference is NOT free: the symbol is bound by a real top-level import from the runtime.
+        assert_imported_at_module_scope(&out.code, "edenPromiseResource");
+        assert!(
+            out.code.contains("import { edenPromiseResource } from '@treaty/httpclient/resources'"),
+            "resource helper not imported from the real runtime module; got:\n{}",
+            out.code
+        );
+        // No INVENTED stub symbol survives (the forbidden self-defining prelude path).
+        assert!(
+            !out.code.contains("const edenPromiseResource =")
+                && !out.code.contains("edenStreamResource")
+                && !out.code.contains("edenWebSocket")
+                && !out.code.contains("httpClient"),
+            "an invented resource-client stub leaked into the client; got:\n{}",
+            out.code
+        );
+        // The stream body and its data never reach the client.
+        assert!(
+            !out.code.contains("await Promise.resolve()") && !out.code.contains("['info', 'warn', 'error']"),
+            "SECURITY: stream body leaked into the client; got:\n{}",
+            out.code
+        );
+    }
+
     #[test]
     fn file_level_use_server_module_extracts_streaming_and_req_resp_fns() {
         // The headline security fix, on a `logs.stream.ts`-shaped module: a FILE-LEVEL `'use server'`
@@ -895,8 +982,22 @@ export async function loadUser(id: number) {\n\
             out.code
         );
         assert!(
-            out.code.contains("httpClient.post") && out.code.contains("'/__server/loadUser'"),
-            "req/resp binding does not POST to the route; got:\n{}",
+            out.code.contains("fetch('/__server/loadUser'") && out.code.contains("method: 'POST'"),
+            "req/resp binding does not POST to the route via fetch; got:\n{}",
+            out.code
+        );
+        // Every binding wraps the REAL resource helper, imported from the published runtime.
+        assert!(
+            out.code.contains("import { edenPromiseResource } from '@treaty/httpclient/resources'"),
+            "no real resource-client import for the lifted server module; got:\n{}",
+            out.code
+        );
+        // No invented client shim survives.
+        assert!(
+            !out.code.contains("httpClient")
+                && !out.code.contains("edenStreamResource")
+                && !out.code.contains("edenWebSocket"),
+            "an invented resource-client shim leaked into the client; got:\n{}",
             out.code
         );
     }
@@ -1106,16 +1207,25 @@ export function wsPresence(userId: string, onEvent: (e: PresenceEvent) => void) 
             !names.contains(&"wsPresence".to_string()),
             "wsPresence survived as a fn/arrow declaration (body present); got: {names:?}"
         );
-        // A typed WebSocket client binding is exported, and the `edenWebSocket` runtime symbol it
-        // references is defined in the module (no `edenWebSocket is not defined` at boot).
+        // A typed WebSocket client binding is exported. It opens a `WebSocket` (browser global) and
+        // wraps it in the REAL `edenPromiseResource` export — no invented `edenWebSocket`/`wsUrl` shim.
         assert!(
-            out.code.contains("export const wsPresence =") && out.code.contains("edenWebSocket"),
+            out.code.contains("export const wsPresence =")
+                && out.code.contains("WebSocket")
+                && out.code.contains("edenPromiseResource"),
             "no ws client binding for wsPresence; got:\n{}",
             out.code
         );
+        // The resource helper is IMPORTED from the published runtime (not a self-defined stub), so the
+        // binding resolves at boot (no `edenPromiseResource is not defined`).
         assert!(
-            out.code.contains("const edenWebSocket ="),
-            "ws binding runtime symbol not defined (would dangle at boot); got:\n{}",
+            out.code.contains("import { edenPromiseResource } from '@treaty/httpclient/resources'"),
+            "ws binding runtime symbol not imported from the real runtime (would dangle at boot); got:\n{}",
+            out.code
+        );
+        assert!(
+            !out.code.contains("edenWebSocket") && !out.code.contains("wsUrl("),
+            "an invented ws shim leaked into the client; got:\n{}",
             out.code
         );
         // The exported interface (a pure type) survives for consumers.

@@ -15,11 +15,16 @@
 //!   verbatim (passthrough); `ts` (and any non-rust) bodies are transpiled via
 //!   [`super::ts_to_rust::transpile_body`], whose graceful `Default::default()` fallbacks keep the
 //!   generated Rust compiling.
-//! * **client bindings** — a typesafe resource HTTP-client binding map (`name` -> TS expression
-//!   string). Each fn becomes a typed signal-resource call that `POST`s to `/__server/<name>` with
-//!   the typed args and is typed to the response, built on the `@treaty/httpclient` resources layer
-//!   (`edenHttpResource` / `httpResource` style). This is the typesafe-http-client binding, distinct
-//!   from the Eden binding emitted by [`super::ElysiaEdenPlugin`].
+//! * **client bindings** — a typesafe resource-client binding map (`name` -> TS expression string).
+//!   Each fn becomes a typed signal-resource call typed to the response, built ONLY on symbols the
+//!   real `@treaty/httpclient` resources layer actually exports (`edenPromiseResource`) plus browser
+//!   globals (`fetch` / `EventSource` / `WebSocket`) — never an invented `httpClient`/`edenStreamResource`/
+//!   `edenWebSocket` shim. The Api binding `POST`s to `/__server/<name>` via `fetch` and wraps it in
+//!   `edenPromiseResource`; the Stream/WebSocket bindings open an `EventSource`/`WebSocket` and wrap
+//!   the connection in the same real `edenPromiseResource` (the runtime exposes no dedicated
+//!   streaming/duplex resource helper today — see the module note on `stream_client_binding`). This is
+//!   the typesafe resource-client binding, distinct from the Eden binding emitted by
+//!   [`super::ElysiaEdenPlugin`].
 
 use std::collections::HashMap;
 
@@ -265,9 +270,14 @@ fn indent_block(body: &str) -> String {
 
 /// The client-side binding for a fn: a typed signal-resource call that POSTs to `/__server/<name>`.
 ///
-/// Built on the `@treaty/httpclient` resources layer, it returns a factory taking the fn's typed args
-/// and yielding an `edenHttpResource` typed to the fn's response. The request body is the named-param
-/// payload object; a single-param fn forwards the bare arg, a no-param fn POSTs an empty body.
+/// Built ONLY on symbols the real `@treaty/httpclient` resources layer exports (`edenPromiseResource`)
+/// plus the `fetch` browser global — no invented `httpClient` shim. It returns a factory taking the
+/// fn's typed args and yielding an `edenPromiseResource` typed to the fn's response: each invocation
+/// POSTs the named-param payload to the route via `fetch` and resolves the JSON response. A
+/// single-param fn forwards the bare arg, a no-param fn POSTs an empty body. The
+/// [`client_runtime_imports_for_code`](super::client_runtime_imports_for_code) emitter prepends the
+/// real `import { edenPromiseResource } from '@treaty/httpclient/resources'` so the binding resolves
+/// at boot.
 fn client_binding(f: &ServerFn) -> String {
     let route = format!("{SERVER_ROUTE_PREFIX}/{}", f.name);
 
@@ -299,10 +309,14 @@ fn client_binding(f: &ServerFn) -> String {
         }
     };
 
-    // A typed signal resource over the typesafe HTTP client: each invocation POSTs the typed args to
-    // the route and is typed to the route's response via `edenHttpResource`.
+    // A typed promise signal resource: each invocation POSTs the typed args to the route via the
+    // `fetch` browser global and resolves the JSON response, wrapped in the REAL
+    // `edenPromiseResource` export (no invented `httpClient`). The resource is typed to the route's
+    // response.
     format!(
-        "(({arg_list}) => edenHttpResource(() => httpClient.post('{route}', {body_expr})))",
+        "(({arg_list}) => edenPromiseResource(() => \
+         fetch('{route}', {{ method: 'POST', headers: {{ 'content-type': 'application/json' }}, \
+         body: JSON.stringify({body_expr}) }}).then((res) => res.json())))",
     )
 }
 
@@ -353,20 +367,51 @@ fn emit_ws_handler(f: &ServerFn) -> String {
 }
 
 /// The client-side binding for a [`TransportKind::Stream`] fn: a factory that opens an `EventSource`
-/// to the fn's `/__server/<name>` GET route, exposing a streaming subscription typed to the fn's
-/// response.
+/// (a browser global) to the fn's `/__server/<name>` GET route and resolves the first streamed
+/// message, wrapped in the REAL `edenPromiseResource` export.
+///
+/// RUNTIME GAP (reported, not stubbed): `@treaty/httpclient` exports no DEDICATED streaming resource
+/// (`edenResource`/`edenHttpResource`/`edenPromiseResource` are all one-shot). Rather than invent an
+/// `edenStreamResource` shim, the binding routes the `EventSource` through the existing
+/// `edenPromiseResource`, which resolves the first server-sent message (the connection's first value).
+/// This boots without a ReferenceError and uses only real exports; a multi-value streaming resource
+/// awaits a dedicated `edenStreamResource` helper in `@treaty/httpclient` (out of this change's scope —
+/// the runtime package is not edited here).
 fn stream_client_binding(f: &ServerFn) -> String {
     let route = format!("{SERVER_ROUTE_PREFIX}/{}", f.name);
     let arg_list = binding_arg_list(f);
-    format!("(({arg_list}) => edenStreamResource(() => new EventSource('{route}')))")
+    format!(
+        "(({arg_list}) => edenPromiseResource(() => new Promise((resolve, reject) => {{ \
+         const source = new EventSource('{route}'); \
+         source.onmessage = (event) => {{ resolve(JSON.parse(event.data)); source.close(); }}; \
+         source.onerror = (event) => {{ reject(event); source.close(); }}; \
+         }})))"
+    )
 }
 
 /// The client-side binding for a [`TransportKind::WebSocket`] fn: a factory that opens a `WebSocket`
-/// to the fn's `/__server/<name>` route, exposing the bidirectional socket.
+/// (a browser global) to the fn's `/__server/<name>` route and resolves once the socket is open,
+/// yielding the live socket, wrapped in the REAL `edenPromiseResource` export. The ws URL is derived
+/// inline from `location` (no invented `wsUrl` helper).
+///
+/// RUNTIME GAP (reported, not stubbed): `@treaty/httpclient` exports no DEDICATED duplex/WebSocket
+/// resource. Rather than invent an `edenWebSocket`/`wsUrl` shim, the binding builds the ws URL inline
+/// and routes the live `WebSocket` through the existing `edenPromiseResource`, which resolves once the
+/// socket opens. This boots without a ReferenceError and uses only real exports; a first-class duplex
+/// resource awaits a dedicated `edenWebSocket` helper in `@treaty/httpclient` (out of this change's
+/// scope — the runtime package is not edited here).
 fn ws_client_binding(f: &ServerFn) -> String {
     let route = format!("{SERVER_ROUTE_PREFIX}/{}", f.name);
     let arg_list = binding_arg_list(f);
-    format!("(({arg_list}) => edenWebSocket(() => new WebSocket(wsUrl('{route}'))))")
+    format!(
+        "(({arg_list}) => edenPromiseResource(() => new Promise((resolve, reject) => {{ \
+         const scheme = (typeof location !== 'undefined' && location.protocol === 'https:') ? 'wss://' : 'ws://'; \
+         const host = (typeof location !== 'undefined') ? location.host : ''; \
+         const socket = new WebSocket(scheme + host + '{route}'); \
+         socket.onopen = () => resolve(socket); \
+         socket.onerror = (event) => reject(event); \
+         }})))"
+    )
 }
 
 /// The typed arrow parameter list for a binding factory, shared by the stream/ws bindings.
@@ -490,18 +535,23 @@ mod tests {
         let emit = AxumBackendPlugin.emit(&extraction.server_fns);
 
         let binding = emit.client_bindings.get("add").expect("binding for add");
-        // A typed signal-resource call that POSTs to /__server/add.
+        // A typed signal-resource call wrapping the REAL `edenPromiseResource` export.
         assert!(
-            binding.contains("edenHttpResource"),
+            binding.contains("edenPromiseResource"),
             "binding is not a signal resource; got: {binding}"
         );
         assert!(
             binding.contains("'/__server/add'"),
             "binding does not POST to the server route; got: {binding}"
         );
+        // POSTs via the `fetch` browser global — no invented `httpClient` shim.
         assert!(
-            binding.contains("httpClient.post"),
-            "binding does not use the http client; got: {binding}"
+            binding.contains("fetch('/__server/add'") && binding.contains("method: 'POST'"),
+            "binding does not POST via fetch; got: {binding}"
+        );
+        assert!(
+            !binding.contains("httpClient"),
+            "binding references an invented httpClient shim; got: {binding}"
         );
     }
 
@@ -533,11 +583,16 @@ mod tests {
             "no streaming route registration; got:\n{}",
             emit.server_module
         );
-        // The client binding opens an EventSource stream.
+        // The client binding opens an EventSource stream wrapped in the REAL `edenPromiseResource`
+        // export (no invented `edenStreamResource` shim).
         let binding = emit.client_bindings.get("ticks").expect("binding for ticks");
         assert!(
             binding.contains("EventSource") && binding.contains("'/__server/ticks'"),
             "binding is not a stream subscription; got: {binding}"
+        );
+        assert!(
+            binding.contains("edenPromiseResource") && !binding.contains("edenStreamResource"),
+            "stream binding must wrap the real edenPromiseResource, not an invented edenStreamResource; got: {binding}"
         );
         assert_no_marker_words(&emit.server_module);
     }
@@ -575,11 +630,18 @@ mod tests {
             "no ws route registration; got:\n{}",
             emit.server_module
         );
-        // The client binding opens a WebSocket.
+        // The client binding opens a WebSocket wrapped in the REAL `edenPromiseResource` export, with
+        // the ws URL derived inline (no invented `edenWebSocket`/`wsUrl` shim).
         let binding = emit.client_bindings.get("chat").expect("binding for chat");
         assert!(
             binding.contains("WebSocket") && binding.contains("'/__server/chat'"),
             "binding is not a websocket; got: {binding}"
+        );
+        assert!(
+            binding.contains("edenPromiseResource")
+                && !binding.contains("edenWebSocket")
+                && !binding.contains("wsUrl("),
+            "ws binding must wrap the real edenPromiseResource, not an invented edenWebSocket/wsUrl; got: {binding}"
         );
         assert_no_marker_words(&emit.server_module);
     }

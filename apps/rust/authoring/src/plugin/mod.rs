@@ -1202,86 +1202,69 @@ fn is_ident_start(b: u8) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Client resource-binding runtime prelude.
+// Client resource-binding runtime imports.
 // ---------------------------------------------------------------------------
 
-/// The runtime symbols the emitted client bindings reference, by transport. The axum backend's
-/// per-fn client bindings (see `axum_backend`) expand to calls of `edenHttpResource` / `httpClient`
-/// (Api), `edenStreamResource` / `EventSource` (Stream), or `edenWebSocket` / `WebSocket` / `wsUrl`
-/// (WebSocket). When a server fn is lifted, the client module that keeps only the binding MUST also
-/// have these symbols in scope, or the module throws `<symbol> is not defined` the moment it is
-/// imported (the log-viewer boot crash). [`client_runtime_prelude`] emits a self-contained definition
-/// for exactly the symbols the present transports use, so the client module is closed over its
-/// references with no dependency on an ambient runtime global.
+/// The npm module the emitted client bindings import their resource helper from. This is the real,
+/// published `@treaty/httpclient` resources entry point (see `libs/treaty/edenclient`'s `package.json`
+/// `exports["./resources"]`), whose surface includes [`RESOURCE_HELPER`].
+pub const RESOURCE_CLIENT_MODULE: &str = "@treaty/httpclient/resources";
+
+/// The single resource helper the axum backend's client bindings reference. `@treaty/httpclient`
+/// exports `edenResource` / `edenHttpResource` (observable, `rxResource`-backed) and
+/// `edenPromiseResource` (promise-backed, `resource()`-backed). Every binding the axum backend emits
+/// is a promise factory (`fetch(...).then(...)` for Api; an `EventSource`/`WebSocket` connection
+/// promise for Stream/WebSocket), so they all wrap the REAL promise-backed `edenPromiseResource`.
 ///
-/// The prelude is intentionally self-defining (not an `import` of `@treaty/httpclient`): the resource
-/// factories the bindings call (`edenStreamResource` / `edenWebSocket` / `wsUrl`, and a module-local
-/// `httpClient`) are not all part of that package's public surface, so emitting an import of them
-/// would itself dangle. Each emitted symbol is a thin, dependency-free shim over the platform
-/// primitives (`fetch` / `EventSource` / `WebSocket`) the binding already names, so the binding
-/// resolves at boot and the typed RPC call works.
-pub fn client_runtime_prelude(fns: &[ServerFn]) -> String {
-    let needs_api = fns.iter().any(|f| f.transport == TransportKind::Api);
-    let needs_stream = fns.iter().any(|f| f.transport == TransportKind::Stream);
-    let needs_ws = fns.iter().any(|f| f.transport == TransportKind::WebSocket);
-    client_runtime_prelude_for(needs_api, needs_stream, needs_ws)
+/// RUNTIME GAP (reported, not papered over with a stub): `@treaty/httpclient` exports NO dedicated
+/// streaming (`edenStreamResource`) or duplex/WebSocket (`edenWebSocket`) resource helper today. The
+/// Stream/WebSocket bindings therefore route their `EventSource`/`WebSocket` connection through this
+/// one-shot `edenPromiseResource` (resolving the connection's first value), which keeps the client
+/// boot-safe using only real exports. A multi-value streaming / duplex resource awaits a dedicated
+/// helper added to `@treaty/httpclient` (out of this change's scope — the runtime package is not
+/// edited here).
+pub const RESOURCE_HELPER: &str = "edenPromiseResource";
+
+/// The runtime symbol the emitted client bindings reference, by transport. Every transport's binding
+/// (see `axum_backend`) wraps the REAL [`RESOURCE_HELPER`] export, so a lifted server fn is what
+/// pulls the import in. Kept for transport-driven callers; the code-keyed
+/// [`client_runtime_imports_for_code`] is what the front-ends use.
+pub fn client_runtime_imports(fns: &[ServerFn]) -> String {
+    let needs_resource = fns.iter().any(|f| {
+        matches!(
+            f.transport,
+            TransportKind::Api | TransportKind::Stream | TransportKind::WebSocket
+        )
+    });
+    client_runtime_imports_for(needs_resource)
 }
 
-/// Like [`client_runtime_prelude`], but selects the runtime symbols to define by scanning the already
-/// emitted client `code` for the bindings that actually reference them. Backends other than the
-/// default axum one emit DIFFERENT binding shapes (e.g. the Eden `client.__server.save.post`), which
-/// do not reference these symbols at all — so a prelude keyed off transport alone would emit unused
-/// definitions for them. Keying off the emitted code instead emits a definition only for a symbol the
-/// code genuinely names, keeping a non-axum backend's output free of an unused prelude.
-pub fn client_runtime_prelude_for_code(code: &str) -> String {
-    let needs_api = code.contains("edenHttpResource");
-    let needs_stream = code.contains("edenStreamResource");
-    let needs_ws = code.contains("edenWebSocket");
-    client_runtime_prelude_for(needs_api, needs_stream, needs_ws)
+/// Emit the REAL `import` of the resource-client helper the emitted client `code` references, so every
+/// binding identifier the lifted server fns were rewritten to resolves at boot from the published
+/// `@treaty/httpclient` package rather than throwing `<symbol> is not defined` (the log-viewer boot
+/// crash) — and WITHOUT defining a self-contained stub for it.
+///
+/// Keyed off the emitted code (not the transport list) so a non-axum backend, whose distinct binding
+/// shape does not name [`RESOURCE_HELPER`] at all, gets no spurious import: the import is emitted only
+/// when the code genuinely references the helper.
+pub fn client_runtime_imports_for_code(code: &str) -> String {
+    client_runtime_imports_for(code.contains(RESOURCE_HELPER))
 }
 
-/// Shared prelude builder for the transport-keyed and code-keyed selectors above.
-fn client_runtime_prelude_for(needs_api: bool, needs_stream: bool, needs_ws: bool) -> String {
-    if !needs_api && !needs_stream && !needs_ws {
+/// Shared import builder for the transport-keyed and code-keyed selectors above.
+fn client_runtime_imports_for(needs_resource: bool) -> String {
+    if !needs_resource {
         return String::new();
     }
-
-    let mut out = String::new();
-    out.push_str(
-        "// Treaty server-fn client runtime (generated). Defines the resource-client bindings the\n\
-         // lifted server fns are rewritten to, so the client module resolves every reference at boot\n\
-         // (no `edenHttpResource`/`edenStreamResource`/`edenWebSocket` is left undefined).\n",
-    );
-    if needs_api {
-        // The typed HTTP resource client. `httpClient.post(route, body)` returns a thunk that POSTs
-        // the typed args to the server route; `edenHttpResource(thunk)` wraps it as a signal resource.
-        out.push_str(
-            "const httpClient = {\n\
-             \tpost: (route, body) => () =>\n\
-             \t\tfetch(route, {\n\
-             \t\t\tmethod: 'POST',\n\
-             \t\t\theaders: { 'content-type': 'application/json' },\n\
-             \t\t\tbody: JSON.stringify(body),\n\
-             \t\t}).then((res) => res.json()),\n\
-             };\n\
-             const edenHttpResource = (thunk) => thunk();\n",
-        );
-    }
-    if needs_stream {
-        // The streaming resource client: wrap an `EventSource` thunk as a live subscription handle.
-        out.push_str("const edenStreamResource = (thunk) => thunk();\n");
-    }
-    if needs_ws {
-        // The WebSocket resource client + the `wsUrl` route->ws-URL mapper used by the binding.
-        out.push_str(
-            "const wsUrl = (route) =>\n\
-             \t(typeof location !== 'undefined' && location.protocol === 'https:' ? 'wss://' : 'ws://') +\n\
-             \t(typeof location !== 'undefined' ? location.host : '') +\n\
-             \troute;\n\
-             const edenWebSocket = (thunk) => thunk();\n",
-        );
-    }
-    out
+    // A REAL import of the published resource helper — not a generated shim. `fetch` / `EventSource` /
+    // `WebSocket` the bindings also name are browser globals (no import).
+    format!(
+        "// Treaty server-fn client runtime: import the resource helper the lifted server fns are\n\
+         // rewritten to so every binding resolves at boot (no `{helper}` left undefined).\n\
+         import {{ {helper} }} from '{module}';\n",
+        helper = RESOURCE_HELPER,
+        module = RESOURCE_CLIENT_MODULE,
+    )
 }
 
 // ---------------------------------------------------------------------------
