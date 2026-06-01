@@ -6,7 +6,8 @@
   "description": "Showcase of every Treaty authoring capability: .treaty SFCs, JSX components, selectorless Angular @Component, server functions across api/websocket/stream transports, and lazy feature routes that auto-become Module Federation remotes.",
   "scripts": {
     "typecheck": "tsgo --noEmit -p tsconfig.json",
-    "lint": "oxlint src *.config.ts federation",
+    "lint": "oxlint src *.config.ts federation e2e.mjs",
+    "e2e": "node e2e.mjs",
     "build:vite": "vite build",
     "dev:vite": "vite",
     "build:rspack": "rspack build -c rspack.config.ts",

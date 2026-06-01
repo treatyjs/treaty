@@ -156,12 +156,58 @@ node_modules/.bin/oxlint examples/everything-app/src examples/everything-app/*.c
 
 # Compile every source through the real Treaty Rust addon:
 bun examples/everything-app/verify.mjs
+
+# Angular linker end-to-end (the "no JIT / no @angular/compiler" guarantee):
+node examples/everything-app/e2e.mjs
 ```
 
 The build configs themselves are part of the type-check above (the
 `tsconfig.json` `include` covers `*.config.ts` and `federation/`), so
 `tsgo` proves every bundler config is wired to the Treaty plugins correctly
 without needing the bundlers installed.
+
+## The Angular linker end-to-end harness (`e2e.mjs`)
+
+`node examples/everything-app/e2e.mjs` proves the fix for the bug where
+`@treaty/vite` (`import treaty from "@treaty/vite"`) served published
+**partial-compiled** Angular libraries un-linked, so the app threw
+*"_PlatformLocation needs JIT / `@angular/compiler` is not available"* at runtime.
+`@treaty/vite` now reuses the **same Rust-backed** Angular partial-declaration
+linker plugins `@treaty/ts-vite` owns (one source of truth:
+`createLinkPartialPlugins()`), so partial `@angular/*` (`ɵɵngDeclare*`) is linked
+to AOT `ɵɵdefine*` at build/dev time with **no `@angular/compiler` and no JIT**.
+
+It runs entirely against the **built `@treaty/vite` dist** and the **real
+partial `@angular` libraries**, in seven steps:
+
+1. `treaty()` returns the linker plugins alongside the authoring plugin (the
+   wiring that was missing).
+2. The wired linker de-partials a real `@angular/common` module to **zero
+   residual** `ɵɵngDeclare`, with no `@angular/compiler` / `@angular/compiler-cli`
+   / `@babel/core` (the Rust linker only).
+3. The dev-serve `index.html` transform injects no `@angular/compiler` script.
+4. (negative form of 3) any injected `@angular/compiler` script is stripped.
+5. **PROD** — a real `vite build` over a fixture that imports the partial
+   `@angular/common` (the `_PlatformLocation` source) and
+   `@angular/platform-browser`. The emitted bundle has **zero** residual
+   `ɵɵngDeclare`, imports **no** `@angular/compiler`, and carries AOT Ivy defs
+   (`ɵɵdefine*` incl. `ɵɵdefineInjectable`).
+6. **DEV** — a real `vite dev` server; the served `@angular/common` and
+   `@angular/platform-browser` dep modules have **no** residual `ɵɵngDeclare`,
+   and the served `index.html` injects **no** `@angular/compiler` script.
+7. **BOOT** — the linked `_PlatformLocation` module is evaluated against a
+   faithful `@angular/core` stub whose `ɵɵngDeclare*` / `getCompilerFacade`
+   primitives throw Angular's real *"needs to be compiled using the JIT
+   compiler, but '@angular/compiler' is not available"* error. A correctly-linked
+   AOT module calls only `ɵɵdefine*` and so evaluates **without** that crash —
+   i.e. the everything-app's reported boot failure no longer happens. (An
+   un-linked module would still call `ɵɵngDeclare*` and throw, so this is a real
+   test, not a tautology.)
+
+Exit code `0` on success, `1` on any failed assertion. The harness wires a local
+`node_modules` symlink farm and writes a scratch Vite fixture under
+`.e2e-vite-fixture/` (gitignored, removed on a clean run); it never installs or
+links `@angular/compiler`.
 
 ## A note on the REPL plugin-output viewer
 

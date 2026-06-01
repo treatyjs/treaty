@@ -1,0 +1,4 @@
+# Scratch fixtures written by the Angular linker e2e harness (e2e.mjs).
+# Both are removed on a clean run; ignored so a crashed run never leaks artifacts.
+.e2e-vite-fixture/
+.e2e-neg/
