@@ -35,22 +35,21 @@
 //   4. BOOT the built bundle headlessly (jsdom) and assert it bootstraps with NO "needs JIT /
 //      @angular/compiler" error and a component renders (the AppRoot shell + router-outlet + the
 //      router-resolved "" route paint into the DOM). The eager JSX surfaces are loaded so the boot
-//      also exercises the lowered JSX components in the running app — see `BOOT_BLOCKED` below.
+//      also exercises the lowered JSX components in the running app — the boot is a HARD requirement
+//      (see `BOOT_BLOCKED` below).
 //
-// REPORTED OUT-OF-SCOPE RUST-COMPILER GAP (blocks the everything-app BOOT, not the build):
-//   The JSX authoring lowering emits a `use:<name>` template directive (e.g. `use:autofocus` in
-//   greeting-card.tjsx, `use:highlight`/`use:class` in counter.tsx) into the Ivy component's
-//   `dependencies: […]` array as a CAPITALIZED class reference (`Autofocus`, `Highlight`) but emits
-//   NO import or definition for that directive class. `@treaty/compiler.compileUnifiedSource` returns
-//   zero diagnostics, so the build succeeds, yet the emitted module references an UNDEFINED binding —
-//   so booting the bundle throws `Autofocus is not defined` (ReferenceError) before AppRoot paints.
-//   Repro (compiler core, no bundler): compile examples/everything-app/src/features/greeter/
-//   greeting-card.tjsx with `compileUnifiedSource` → output contains `dependencies: [Autofocus]`
-//   with no `class/const/import Autofocus`. Owning workflow: the Rust compiler (libs/treaty-ivy /
-//   libs/authoring/node). Until the lowering either imports/synthesizes the `use:` directive class or
-//   drops unresolved `use:` names from `dependencies`, the everything-app cannot BOOT, so this harness
-//   asserts the full BUILD + JSX-lowered-once guarantees (all green) and the boot step is gated off
-//   behind `BOOT_BLOCKED` so the committed script stays green and the gap stays explicit.
+// CLOSED RUST-COMPILER GAP (previously blocked the everything-app BOOT):
+//   The JSX authoring lowering USED to emit a `use:<name>` template directive (e.g. `use:autofocus`
+//   in greeting-card.tjsx, `use:highlight` in counter.tsx) into the Ivy component's
+//   `dependencies: […]` array as a CAPITALIZED class reference (`Autofocus`, `Highlight`) with NO
+//   import or definition for that class, so booting the bundle threw `Autofocus is not defined`
+//   (ReferenceError) before AppRoot painted. The Rust JSX lowering now RESOLVES every applied
+//   directive to a real in-scope symbol: `use:highlight` resolves to the author's hoisted local
+//   `highlight` (the declaration is lifted to module scope beside the component class so the
+//   dependency reference is defined), and a value-less `use:autofocus` with no directive class in
+//   scope degrades to a native `autofocus` host attribute (no fabricated `Autofocus`). The bundle no
+//   longer references any undefined binding, so this harness asserts the whole-app headless BOOT +
+//   render as a hard requirement (`BOOT_BLOCKED = false`).
 //
 // Usage:  node examples/everything-app/full-build.e2e.mjs
 // Exit code 0 on success, 1 on any failed assertion.
@@ -82,12 +81,12 @@ function check(label, condition, detail) {
 	return ok
 }
 
-// The headless BOOT of the everything-app is BLOCKED by the reported out-of-scope Rust-compiler gap
-// documented in the file header: the JSX `use:<name>` directive lowering emits an undefined
-// `dependencies: [Autofocus]`/`[Highlight]` reference, so the built bundle throws `Autofocus is not
-// defined` at bootstrap. The BUILD + JSX-lowered-once proofs are unaffected and remain green. Flip
-// this to `false` once the Rust compiler imports/synthesizes the `use:` directive class (or drops
-// unresolved `use:` names) and the boot will be asserted as a hard requirement.
+// The headless BOOT of the everything-app is a HARD requirement: the JSX `use:<name>` directive
+// lowering now resolves every applied directive to a real in-scope symbol (see the CLOSED gap in the
+// file header), so the built bundle no longer references an undefined `dependencies: [Autofocus]` /
+// `[Highlight]` and boots cleanly. `BOOT_BLOCKED` is kept (defaulting to `false`) as an explicit
+// regression switch + the blocked-probe machinery below: if the `use:` gap ever returns, set it back
+// to `true` to record the exact reason rather than failing opaquely.
 const BOOT_BLOCKED = false
 
 // ---------------------------------------------------------------------------

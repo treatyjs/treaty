@@ -207,12 +207,18 @@ async function main() {
 		)
 	}
 
-	// Record the one documented out-of-scope gap so the gate is explicit about it (recorded, not failed).
+	// The `use:`-directive Rust gap that previously blocked the in-browser boot is CLOSED: the JSX
+	// `use:<name>` lowering now resolves each directive to a real in-scope symbol (counter.tsx
+	// `use:highlight` → the hoisted local `highlight`; greeting-card.tjsx `use:autofocus` → a native
+	// host attribute, no fabricated `Autofocus`), so the bundle no longer emits an undefined
+	// `dependencies:[Autofocus|Highlight]`. full-build.e2e.mjs asserts the whole-app headless
+	// boot+render as a HARD requirement (BOOT_BLOCKED=false). If that gate ever re-blocks the boot,
+	// surface it here so the regression is explicit rather than silently green.
 	const bootBlocked = /boot\+render is BLOCKED by the reported Rust `use:`-directive gap/.test(build.out)
-	console.log(
-		bootBlocked
-			? 'NOTE  headless BOOT+render of the full app is gated on the documented out-of-scope Rust `use:`-directive gap (greeting-card.tjsx/counter.tsx emit an undefined `dependencies:[Autofocus|Highlight]`). DEV serve + BUILD of every surface are green; only the in-browser boot of the whole app is blocked, owned by the Rust compiler workflow (libs/treaty-ivy / libs/authoring/node).'
-			: 'NOTE  headless BOOT+render appears unblocked — full-build.e2e.mjs should flip BOOT_BLOCKED to false.',
+	check(
+		'headless BOOT+render of the full app is NOT blocked by a `use:`-directive gap (boot is a hard requirement of full-build.e2e.mjs)',
+		!bootBlocked,
+		bootBlocked ? 'full-build.e2e.mjs reported the boot is BLOCKED — the `use:` directive gap regressed' : '',
 	)
 
 	console.log('')
@@ -224,7 +230,7 @@ async function main() {
 		'UNIFIED DEV+BUILD GATE PASSED: every Treaty authoring surface (.treaty / .tsx / .tjsx / @Component .ts) is green on BOTH paths — ' +
 			'DEV serve (real vite dev server: no unresolved imports, each surface lowered to Ivy, JSX is Angular-Ivy+signals not React, no JIT/@angular/compiler) ' +
 			'AND full vite BUILD (exit 0, each surface lowered to Ivy once, zero residual ɵɵngDeclare, no @angular/compiler / Babel finisher). ' +
-			'Only the whole-app headless boot is gated on the documented out-of-scope Rust `use:`-directive gap.',
+			'The whole-app headless boot+render is green too: the JSX `use:`-directive lowering resolves every directive to a real in-scope symbol, so the app boots with no `X is not defined` ReferenceError and a route renders.',
 	)
 }
 
