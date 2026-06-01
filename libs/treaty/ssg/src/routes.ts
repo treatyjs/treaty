@@ -13,10 +13,18 @@
  *     values at build time. A parameterized route with no supplied params is
  *     skipped (it cannot be statically materialized).
  *
- * The walk recurses into `children`, accumulating the URL prefix, so a child
- * route is enumerated at its full path. Wildcard (`**`) and pure-redirect routes
- * are never prerenderable and are dropped.
+ * The deterministic walk — recursing into `children` with the URL prefix
+ * accumulated, dropping wildcard (`**`) and pure-redirect routes, fanning
+ * parameterized routes out and percent-encoding param values — runs in the Rust
+ * core (`treaty_ssg::discovery`, via the `@treaty/ssg-node` addon). This module
+ * is the thin host glue: it lowers the `RouteLike` config (which carries
+ * function-valued loaders that cannot cross the JSON boundary) to the structural
+ * `RouteSpec` the core needs, resolves any `getStaticPaths` callback (a host
+ * function) into concrete param sets, calls the core, and re-attaches each route
+ * node to the returned {@link DiscoveredRoute}s.
  */
+
+import { loadNative } from './native.js'
 
 /**
  * The minimal structural shape of an Angular route this package needs. It is a
@@ -124,6 +132,31 @@ export interface DiscoverRoutesAsyncOptions extends DiscoverRoutesOptions {
 	readonly getStaticPaths?: StaticPathsProvider
 }
 
+/** Error raised when a route cannot be enumerated into concrete URLs. */
+export class RouteDiscoveryError extends Error {
+	constructor(message: string) {
+		super(message)
+		this.name = 'RouteDiscoveryError'
+	}
+}
+
+/** The structural `RouteSpec` the Rust core's discovery walk consumes. */
+interface RouteSpec {
+	readonly path: string
+	readonly has_component: boolean
+	readonly has_load_component: boolean
+	readonly redirect_to?: string
+	readonly children: RouteSpec[]
+}
+
+/** The `DiscoveredRoute` shape the Rust core returns (no `route` node). */
+interface NativeDiscoveredRoute {
+	readonly url: string
+	readonly routePath: string
+	readonly parameterized: boolean
+	readonly params: RouteParams
+}
+
 /** Join a parent URL prefix with a child segment, normalizing slashes. */
 function joinPath(parent: string, segment: string | undefined): string {
 	const child = (segment ?? '').replace(/^\/+|\/+$/g, '')
@@ -137,11 +170,6 @@ function hasComponent(route: RouteLike): boolean {
 	return route.component !== undefined || route.loadComponent !== undefined
 }
 
-/** A wildcard catch-all (`**`) is never a concrete prerenderable URL. */
-function isWildcard(path: string | undefined): boolean {
-	return (path ?? '').replace(/^\/+|\/+$/g, '') === '**'
-}
-
 /** The `:param` names declared in a route path (`'blog/:slug'` -> `['slug']`). */
 function paramNames(routePath: string): string[] {
 	return routePath
@@ -150,139 +178,83 @@ function paramNames(routePath: string): string[] {
 		.map((seg) => seg.slice(1))
 }
 
-/** Substitute `:param` segments in `routePath` using `params`; throws if missing. */
-function substitute(routePath: string, params: RouteParams): string {
-	const url = routePath
-		.split('/')
-		.map((seg) => {
-			if (!seg.startsWith(':')) return seg
-			const name = seg.slice(1)
+/**
+ * Lower a `RouteLike` tree to the structural {@link RouteSpec} tree the Rust
+ * core needs (function-valued loaders reduced to the booleans the walk branches
+ * on), while recording each accumulated declared path → route node so the node
+ * can be re-attached to the core's component-free {@link DiscoveredRoute}s.
+ */
+function lowerRoutes(
+	routes: readonly RouteLike[],
+	prefix: string,
+	nodeByPath: Map<string, RouteLike>
+): RouteSpec[] {
+	return routes.map((route) => {
+		const here = joinPath(prefix, route.path)
+		nodeByPath.set(here, route)
+		const spec: RouteSpec = {
+			path: route.path ?? '',
+			has_component: route.component !== undefined,
+			has_load_component: route.loadComponent !== undefined,
+			redirect_to: route.redirectTo,
+			children:
+				route.children && route.children.length > 0
+					? lowerRoutes(route.children, here, nodeByPath)
+					: [],
+		}
+		return spec
+	})
+}
+
+/**
+ * Validate that every supplied param set binds all of a route's declared
+ * `:param`s, throwing {@link RouteDiscoveryError} for a missing/empty binding.
+ * Mirrors the historical TS `substitute` error so a malformed param set is a
+ * loud failure rather than a silently-dropped route (the Rust walk would skip
+ * it); the actual URL substitution + percent-encoding is the core's job.
+ */
+function validateParamSets(routePath: string, names: readonly string[], sets: readonly RouteParams[]): void {
+	for (const params of sets) {
+		for (const name of names) {
 			const value = params[name]
 			if (value === undefined || value === '') {
 				throw new RouteDiscoveryError(
 					`route '${routePath}' is missing a value for parameter ':${name}'`
 				)
 			}
-			return encodeURIComponent(value)
-		})
-		.join('/')
-	return url
-}
-
-/** Error raised when a route cannot be enumerated into concrete URLs. */
-export class RouteDiscoveryError extends Error {
-	constructor(message: string) {
-		super(message)
-		this.name = 'RouteDiscoveryError'
+		}
 	}
 }
 
-/** Normalize a discovered URL to a single leading slash (index -> `'/'`). */
-function toUrl(rawPath: string): string {
-	const clean = rawPath.replace(/^\/+|\/+$/g, '')
-	return clean === '' ? '/' : `/${clean}`
+/** Merge static + computed param sets into a single map keyed by declared path. */
+function mergeParams(
+	base: RouteParamsMap | undefined,
+	extra: Record<string, RouteParams[]>
+): Record<string, RouteParams[]> {
+	const merged: Record<string, RouteParams[]> = {}
+	for (const [key, value] of Object.entries(base ?? {})) merged[key] = [...value]
+	for (const [key, value] of Object.entries(extra)) {
+		merged[key] = [...(merged[key] ?? []), ...value]
+	}
+	return merged
 }
 
-/** Whether `route` is a concrete prerenderable node (not a wildcard/redirect). */
-function isRenderable(route: RouteLike, includeComponentless: boolean): boolean {
-	const wildcard = isWildcard(route.path)
-	const pureRedirect = route.redirectTo !== undefined && !hasComponent(route)
-	return (hasComponent(route) || includeComponentless) && !wildcard && !pureRedirect
-}
-
-/** Emit the single {@link DiscoveredRoute} for a static (non-parameterized) node. */
-function staticRoute(route: RouteLike, here: string): DiscoveredRoute {
-	return { url: toUrl(here), routePath: here, parameterized: false, params: {}, route }
-}
-
-/** Emit one {@link DiscoveredRoute} per param set for a parameterized node. */
-function parameterizedRoutes(
-	route: RouteLike,
-	here: string,
-	sets: readonly RouteParams[]
+/**
+ * Re-attach the route node to each core-returned {@link DiscoveredRoute} by its
+ * declared `routePath`, producing the public shape. A path with no recorded node
+ * (should not happen for a core-discovered route) falls back to an empty node.
+ */
+function attachNodes(
+	native: readonly NativeDiscoveredRoute[],
+	nodeByPath: Map<string, RouteLike>
 ): DiscoveredRoute[] {
-	return sets.map((params) => ({
-		url: toUrl(substitute(here, params)),
-		routePath: here,
-		parameterized: true,
-		params,
-		route,
+	return native.map((route) => ({
+		url: route.url,
+		routePath: route.routePath,
+		parameterized: route.parameterized,
+		params: route.params,
+		route: nodeByPath.get(route.routePath) ?? {},
 	}))
-}
-
-/** The static param sets declared for a route in {@link DiscoverRoutesOptions.params}. */
-function staticParamSets(
-	options: DiscoverRoutesOptions,
-	route: RouteLike,
-	here: string
-): readonly RouteParams[] {
-	return options.params?.[route.path ?? here] ?? options.params?.[here] ?? []
-}
-
-/**
- * Walk `routes`, accumulating the URL prefix, and collect every concrete
- * prerenderable route. Parameterized routes fan out into one entry per supplied
- * param set; static routes yield exactly one. Wildcards and pure redirects are
- * dropped. Children are always recursed so a renderable child of a layout route
- * is still discovered at its full path.
- */
-function walk(
-	routes: readonly RouteLike[],
-	prefix: string,
-	options: DiscoverRoutesOptions,
-	out: DiscoveredRoute[]
-): void {
-	for (const route of routes) {
-		const here = joinPath(prefix, route.path)
-
-		if (isRenderable(route, options.includeComponentless === true)) {
-			const names = paramNames(here)
-			if (names.length === 0) {
-				out.push(staticRoute(route, here))
-			} else {
-				out.push(...parameterizedRoutes(route, here, staticParamSets(options, route, here)))
-			}
-		}
-
-		if (route.children && route.children.length > 0) {
-			walk(route.children, here, options, out)
-		}
-	}
-}
-
-/**
- * Async sibling of {@link walk} that resolves each parameterized route's param
- * sets through a {@link StaticPathsProvider} (in addition to any static
- * `params`). Static nodes and recursion are identical to {@link walk}; only the
- * parameterized branch differs, awaiting the provider per route.
- */
-async function walkAsync(
-	routes: readonly RouteLike[],
-	prefix: string,
-	options: DiscoverRoutesAsyncOptions,
-	out: DiscoveredRoute[]
-): Promise<void> {
-	for (const route of routes) {
-		const here = joinPath(prefix, route.path)
-
-		if (isRenderable(route, options.includeComponentless === true)) {
-			const names = paramNames(here)
-			if (names.length === 0) {
-				out.push(staticRoute(route, here))
-			} else {
-				const sets = [...staticParamSets(options, route, here)]
-				if (options.getStaticPaths) {
-					const provided = await options.getStaticPaths({ routePath: here, params: names, route })
-					if (provided) sets.push(...provided)
-				}
-				out.push(...parameterizedRoutes(route, here, sets))
-			}
-		}
-
-		if (route.children && route.children.length > 0) {
-			await walkAsync(route.children, here, options, out)
-		}
-	}
 }
 
 /**
@@ -294,14 +266,35 @@ async function walkAsync(
  * cannot invent the param values). Wildcard (`**`) and pure-redirect routes are
  * excluded. Children are walked recursively, so the result is the full flat list
  * of URLs the prerender pipeline will materialize.
+ *
+ * The deterministic walk runs in the Rust SSG core; this function only lowers
+ * the config, validates supplied param sets, and re-attaches the route nodes.
  */
 export function discoverRoutes(
 	routes: readonly RouteLike[] | undefined,
 	options: DiscoverRoutesOptions = {}
 ): DiscoveredRoute[] {
-	const out: DiscoveredRoute[] = []
-	if (routes && routes.length > 0) walk(routes, '', options, out)
-	return out
+	if (!routes || routes.length === 0) return []
+
+	const nodeByPath = new Map<string, RouteLike>()
+	const specs = lowerRoutes(routes, '', nodeByPath)
+
+	// Validate the supplied static param sets for completeness (the loud-failure
+	// contract) before the core fans them out.
+	for (const [declaredPath, sets] of Object.entries(options.params ?? {})) {
+		validateParamSets(declaredPath, paramNames(declaredPath), sets)
+	}
+
+	const native = loadNative()
+	const json = native.discoverRoutes(
+		JSON.stringify({
+			routes: specs,
+			params: options.params ?? {},
+			includeComponentless: options.includeComponentless === true,
+		})
+	)
+	const discovered = JSON.parse(json) as NativeDiscoveredRoute[]
+	return attachNodes(discovered, nodeByPath)
 }
 
 /**
@@ -312,12 +305,76 @@ export function discoverRoutes(
  * this is the entry the site generator uses so a route can compute its `:slug`
  * universe (from content, a CMS, a macro) at build time rather than only from a
  * hard-coded {@link RouteParamsMap}.
+ *
+ * The `getStaticPaths` callback (a host function) is run here, in TS, per
+ * parameterized route; its results are folded into the param map and the
+ * deterministic fan-out is then delegated to the Rust core in one call.
  */
 export async function discoverRoutesAsync(
 	routes: readonly RouteLike[] | undefined,
 	options: DiscoverRoutesAsyncOptions = {}
 ): Promise<DiscoveredRoute[]> {
-	const out: DiscoveredRoute[] = []
-	if (routes && routes.length > 0) await walkAsync(routes, '', options, out)
-	return out
+	if (!routes || routes.length === 0) return []
+
+	const nodeByPath = new Map<string, RouteLike>()
+	const specs = lowerRoutes(routes, '', nodeByPath)
+
+	// Resolve the getStaticPaths provider per parameterized route (the host
+	// function seam Rust cannot run), accumulating computed sets keyed by path.
+	const computed: Record<string, RouteParams[]> = {}
+	if (options.getStaticPaths) {
+		await resolveStaticPaths(routes, '', options, computed)
+	}
+
+	const params = mergeParams(options.params, computed)
+
+	// Validate completeness (static + computed) before the core fans out.
+	for (const [declaredPath, sets] of Object.entries(params)) {
+		validateParamSets(declaredPath, paramNames(declaredPath), sets)
+	}
+
+	const native = loadNative()
+	const json = native.discoverRoutes(
+		JSON.stringify({
+			routes: specs,
+			params,
+			includeComponentless: options.includeComponentless === true,
+		})
+	)
+	const discovered = JSON.parse(json) as NativeDiscoveredRoute[]
+	return attachNodes(discovered, nodeByPath)
+}
+
+/**
+ * Walk the `RouteLike` tree (TS-side, since it carries the route nodes the
+ * provider reads) and invoke `getStaticPaths` for each renderable parameterized
+ * route, accumulating the computed param sets keyed by the route's full declared
+ * path. Mirrors the core's renderability rule so the provider is asked about
+ * exactly the routes the core will fan out.
+ */
+async function resolveStaticPaths(
+	routes: readonly RouteLike[],
+	prefix: string,
+	options: DiscoverRoutesAsyncOptions,
+	out: Record<string, RouteParams[]>
+): Promise<void> {
+	for (const route of routes) {
+		const here = joinPath(prefix, route.path)
+		const renderable =
+			(hasComponent(route) || options.includeComponentless === true) &&
+			(route.path ?? '').replace(/^\/+|\/+$/g, '') !== '**' &&
+			!(route.redirectTo !== undefined && !hasComponent(route))
+		if (renderable) {
+			const names = paramNames(here)
+			if (names.length > 0 && options.getStaticPaths) {
+				const provided = await options.getStaticPaths({ routePath: here, params: names, route })
+				if (provided && provided.length > 0) {
+					out[here] = [...(out[here] ?? []), ...provided]
+				}
+			}
+		}
+		if (route.children && route.children.length > 0) {
+			await resolveStaticPaths(route.children, here, options, out)
+		}
+	}
 }

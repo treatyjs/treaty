@@ -4,12 +4,21 @@
  * **`sitemap.xml` + `robots.txt` emit** for `@treaty/ssg`. Once the prerender
  * pipeline knows the concrete URLs it materialized, it can emit the two static
  * discovery artifacts every static site wants: a sitemap enumerating those URLs
- * for crawlers and a robots policy that points at it. Both are pure
- * string-builders (no I/O) so the site generator owns when/where to write them.
+ * for crawlers and a robots policy that points at it.
+ *
+ * The builders themselves live in the Rust SSG core (`treaty_ssg::manifest`, via
+ * the `@treaty/ssg-node` addon) — per [[rust-core-ts-shim-layering]] these are
+ * deterministic string builders that belong in Rust. This module is the thin
+ * marshalling wrapper exposing them under the package's public API; the
+ * whole-site generator emits these artifacts directly through the core's
+ * `generateSiteFull`, so these standalone helpers are for callers that want a
+ * sitemap/robots string in isolation.
  *
  * Treaty is a compiler, not a host: these are static files the generator emits;
  * serving them is the platform's job.
  */
+
+import { loadNative } from './native.js'
 
 /** A single URL entry for the sitemap. */
 export interface SitemapEntry {
@@ -23,54 +32,24 @@ export interface SitemapEntry {
 	readonly priority?: number
 }
 
-/** Escape text for safe embedding inside XML element bodies / attributes. */
-function escapeXml(value: string): string {
-	return value
-		.replace(/&/g, '&amp;')
-		.replace(/</g, '&lt;')
-		.replace(/>/g, '&gt;')
-		.replace(/"/g, '&quot;')
-		.replace(/'/g, '&apos;')
-}
-
 /**
  * Join a site origin (`https://example.com`, possibly with a trailing slash)
  * with a root-relative URL path (`'/about'`) into one absolute, deduplicated-slash
  * location. A path that is already absolute (`http(s)://…`) is returned verbatim.
+ * Pure pass-through to the Rust core's `absolute_url`.
  */
 export function absoluteUrl(origin: string, urlPath: string): string {
-	if (/^https?:\/\//i.test(urlPath)) return urlPath
-	const base = origin.replace(/\/+$/, '')
-	const path = urlPath.startsWith('/') ? urlPath : `/${urlPath}`
-	return `${base}${path}`
+	return loadNative().absoluteUrl(origin, urlPath)
 }
 
 /**
  * Render a sitemap XML document for `entries`, resolving each entry's `url`
  * against `origin` into an absolute `<loc>`. Output is deterministic (entries in
  * the order given) and minimal — only the optional fields actually supplied are
- * emitted — so it is reproducible across builds.
+ * emitted — so it is reproducible across builds. The Rust core builds the XML.
  */
 export function buildSitemap(origin: string, entries: readonly SitemapEntry[]): string {
-	const lines = ['<?xml version="1.0" encoding="UTF-8"?>', '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">']
-	for (const entry of entries) {
-		lines.push('  <url>')
-		lines.push(`    <loc>${escapeXml(absoluteUrl(origin, entry.url))}</loc>`)
-		if (entry.lastmod !== undefined) lines.push(`    <lastmod>${escapeXml(entry.lastmod)}</lastmod>`)
-		if (entry.changefreq !== undefined) lines.push(`    <changefreq>${entry.changefreq}</changefreq>`)
-		if (entry.priority !== undefined) {
-			lines.push(`    <priority>${clampPriority(entry.priority).toFixed(1)}</priority>`)
-		}
-		lines.push('  </url>')
-	}
-	lines.push('</urlset>')
-	return `${lines.join('\n')}\n`
-}
-
-/** Clamp a sitemap priority into the valid `[0,1]` range. */
-function clampPriority(priority: number): number {
-	if (!Number.isFinite(priority)) return 0.5
-	return Math.min(1, Math.max(0, priority))
+	return loadNative().buildSitemap(JSON.stringify({ origin, entries }))
 }
 
 /** Options for {@link buildRobots}. */
@@ -90,19 +69,10 @@ export interface RobotsOptions {
 /**
  * Render a `robots.txt` body: a single `User-agent: *` group that allows
  * crawling (with any supplied `disallow` prefixes), optionally followed by a
- * `Sitemap:` line. Deterministic and dependency-free.
+ * `Sitemap:` line. Deterministic; the Rust core builds the body.
  */
 export function buildRobots(options: RobotsOptions = {}): string {
-	const lines = ['User-agent: *']
-	const disallow = options.disallow ?? []
-	if (disallow.length === 0) {
-		lines.push('Allow: /')
-	} else {
-		for (const prefix of disallow) lines.push(`Disallow: ${prefix.startsWith('/') ? prefix : `/${prefix}`}`)
-	}
-	if (options.sitemapUrl !== undefined) {
-		lines.push('')
-		lines.push(`Sitemap: ${options.sitemapUrl}`)
-	}
-	return `${lines.join('\n')}\n`
+	return loadNative().buildRobots(
+		JSON.stringify({ sitemapUrl: options.sitemapUrl, disallow: options.disallow ?? [] })
+	)
 }

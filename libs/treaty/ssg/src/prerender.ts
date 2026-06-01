@@ -10,10 +10,16 @@
  *      (the Rust authoring compiler behind the NAPI addon),
  *   3. executes the component's top-of-file render-time macro / RSC data through
  *      the {@link RenderRuntime} (Nova-backed in production, stubbed otherwise),
- *   4. statically interprets the emitted Ivy template against that data to a
- *      static HTML fragment ({@link ./render}),
- *   5. wraps it in a full HTML document with a **hydration marker** + serialized
- *      render state, and writes it to the output directory.
+ *   4. hands the emitted Ivy + resolved render data to the Rust SSG core (the
+ *      `@treaty/ssg-node` addon), which statically interprets the template to an
+ *      HTML fragment, detects the route's hydration islands, resolves the
+ *      head/SEO, and wraps the result in a full hydration-ready document,
+ *   5. writes the returned document to the output directory.
+ *
+ * Steps 2–3 are the boundaries Rust cannot own (the compiler and the Nova
+ * runtime); every deterministic SSG byte in step 4 — the Ivy → HTML
+ * interpretation, head/SEO emit, document wrapping, island detection — is
+ * produced by the Rust core (`treaty_ssg`). See [[rust-core-ts-shim-layering]].
  *
  * Treaty is a compiler, not a host: the pipeline only EMITS the static files and
  * a manifest. Serving them (and bootstrapping client hydration via Angular's
@@ -22,9 +28,10 @@
  */
 
 import { TreatyCompiler, type TransformResult } from '@treaty/compiler'
-import { renderIvyToHtml } from './render.js'
+import { loadNative } from './native.js'
 import {
 	StubRenderRuntime,
+	type JsonValue,
 	type RenderData,
 	type RenderMacro,
 	type RenderRuntime,
@@ -210,104 +217,207 @@ export class PrerenderError extends Error {
 /** Default output directory for emitted static documents. */
 export const DEFAULT_OUT_DIR = 'dist/ssg'
 
-/** Map a concrete URL to its `index.html` output path under `outDir`. */
-function outputPathFor(outDir: string, url: string): string {
-	const clean = url.replace(/^\/+|\/+$/g, '')
-	const dir = clean === '' ? outDir : `${outDir}/${clean}`
-	return `${dir}/index.html`
+/** The full result of prerendering one route: the document plus its metadata. */
+export interface PrerenderRouteResult {
+	/** The complete hydration-ready HTML document. */
+	readonly document: string
+	/** The render data the template was bound against (also embedded for hydration). */
+	readonly data: RenderData
+	/** The hydration islands detected in the rendered markup. */
+	readonly islands: readonly HydrationIsland[]
 }
 
-/** Escape text for embedding inside an HTML element body. */
-function escapeHtml(value: string): string {
-	return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+/** A fully-resolved page the Rust core's `generateSiteFull` emits. */
+interface NativePageInput {
+	readonly url: string
+	readonly routePath: string
+	readonly parameterized: boolean
+	readonly ivyCode: string
+	readonly componentId: string
+	readonly data: RenderData
+	readonly title?: string
+	readonly head?: HeadMeta
 }
 
-/** Escape an HTML attribute value for safe double-quoted output. */
-function escapeAttr(value: string): string {
-	return value.replace(/&/g, '&amp;').replace(/"/g, '&quot;')
+/** A page in the `GeneratedSite` JSON the Rust core returns. */
+interface NativePage {
+	readonly url: string
+	readonly output: string
+	readonly routePath: string
+	readonly parameterized: boolean
+	readonly document: string
+	readonly bytes: number
+	readonly data: RenderData
+	readonly islands: HydrationIsland[]
 }
 
-/** Whether a meta key uses the Open Graph `property=` convention. */
-function isPropertyMeta(name: string): boolean {
-	return name.startsWith('og:') || name.startsWith('article:') || name.startsWith('fb:')
+/** The `GeneratedSite` JSON shape the Rust core returns. */
+interface NativeGeneratedSite {
+	readonly outDir: string
+	readonly pages: NativePage[]
+	readonly artifacts: { kind: string; output: string; contents: string; bytes: number }[]
+	readonly hydration: { version: number; routes: RouteHydration[] }
 }
 
-/** Render the `<head>` SEO/meta tags for a document from {@link HeadMeta}. */
-function renderHead(head: HeadMeta, title: string): string {
-	const lines = [
-		'<meta charset="utf-8">',
-		'<meta name="viewport" content="width=device-width, initial-scale=1">',
-		`<title>${escapeHtml(title)}</title>`,
-	]
-	if (head.description !== undefined) {
-		lines.push(`<meta name="description" content="${escapeAttr(head.description)}">`)
-	}
-	if (head.canonical !== undefined) {
-		lines.push(`<link rel="canonical" href="${escapeAttr(head.canonical)}">`)
-	}
-	for (const [name, content] of Object.entries(head.meta ?? {})) {
-		const attr = isPropertyMeta(name) ? 'property' : 'name'
-		lines.push(`<meta ${attr}="${escapeAttr(name)}" content="${escapeAttr(content)}">`)
-	}
-	for (const [rel, href] of Object.entries(head.links ?? {})) {
-		lines.push(`<link rel="${escapeAttr(rel)}" href="${escapeAttr(href)}">`)
-	}
-	return lines.map((l) => `${l}\n`).join('')
+/** Drop `undefined`-valued fields so the JSON omits absent overrides cleanly. */
+function compactHead(head: HeadMeta | undefined): HeadMeta | undefined {
+	if (head === undefined) return undefined
+	const out: Record<string, unknown> = {}
+	if (head.title !== undefined) out['title'] = head.title
+	if (head.description !== undefined) out['description'] = head.description
+	if (head.canonical !== undefined) out['canonical'] = head.canonical
+	if (head.lang !== undefined) out['lang'] = head.lang
+	if (head.meta !== undefined) out['meta'] = head.meta
+	if (head.links !== undefined) out['links'] = head.links
+	return out as HeadMeta
+}
+
+/** The resolved render of one route: its emitted Ivy, render data, and file id. */
+export interface ResolvedRouteRender {
+	/** Emitted Ivy JS for the route's compiled component. */
+	readonly ivyCode: string
+	/** The route's resolved render data (macro output, route params, or `{}`). */
+	readonly data: RenderData
+	/** The file id used for the source (and the hydration islands' component id). */
+	readonly fileId: string
 }
 
 /**
- * Derive the effective {@link HeadMeta} for a route: caller-supplied `head`
- * fields win, falling back to conventional keys in the render `data`
- * (`description`, `canonical`) and the resolved document `title`. This is what
- * lets a render-time macro drive SEO simply by returning those keys.
+ * Compile a route's component and run its macro through the runtime, returning
+ * the emitted Ivy + the resolved render data + the file id. Returns `null` when
+ * the compiler does not own / produce a result for the source (a pass-through
+ * module). The compile boundary (the authoring compiler) and the macro boundary
+ * (the Nova runtime) are the two host seams Rust cannot run; everything after is
+ * the Rust core's job. Shared by {@link prerenderRouteResult} and the whole-site
+ * generator so the resolution semantics (param merge, error wrapping) are single-
+ * sourced.
  */
-function resolveHead(head: HeadMeta | undefined, data: RenderData, title: string, lang: string): HeadMeta {
-	const fromData = (key: string): string | undefined => {
-		const value = data[key]
-		return typeof value === 'string' ? value : undefined
+export function resolveRouteRender(
+	route: DiscoveredRoute,
+	input: RoutePrerenderInput,
+	runtime: RenderRuntime,
+	compiler: TreatyCompiler
+): ResolvedRouteRender | null {
+	const fileId = input.fileId ?? `${route.routePath || 'index'}.tsx`
+
+	let compiled: TransformResult | null
+	try {
+		compiled = compiler.transform(fileId, input.source)
+	} catch (cause) {
+		throw new PrerenderError(route.url, cause instanceof Error ? cause.message : String(cause))
 	}
-	return {
-		title: head?.title ?? title,
-		lang: head?.lang ?? lang,
-		description: head?.description ?? fromData('description'),
-		canonical: head?.canonical ?? fromData('canonical'),
-		meta: head?.meta,
-		links: head?.links,
+	if (compiled === null) return null
+
+	// Execute render-time data: macro params are merged over the route's own
+	// params so a macro can read `input.slug` for a `:slug` route by default.
+	let data: RenderData = {}
+	if (input.macro) {
+		const macro: RenderMacro = {
+			source: input.macro.source,
+			input: { ...(route.params as Record<string, JsonValue>), ...(input.macro.input ?? {}) },
+		}
+		try {
+			data = runtime.runMacro(macro)
+		} catch (cause) {
+			throw new PrerenderError(route.url, cause instanceof Error ? cause.message : String(cause))
+		}
+	} else if (Object.keys(route.params).length > 0) {
+		// No macro: still expose route params to the template as render data.
+		data = { ...(route.params as Record<string, JsonValue>) }
 	}
+
+	return { ivyCode: compiled.code, data, fileId }
 }
 
 /**
- * Wrap a rendered HTML fragment in a full, hydration-ready HTML document. The
- * root mount carries {@link HYDRATION_MARKER_ATTR} (so the client runtime knows
- * the markup is a prerender to hydrate rather than replace) and the serialized
- * render state is embedded as JSON in a non-executable script under
- * {@link HYDRATION_STATE_ID} for the client to reuse without a refetch. The
- * `<head>` is built from the resolved {@link HeadMeta} (title + SEO meta).
+ * Drive the Rust core's `generateSiteFull` over a list of pre-resolved pages and
+ * return the parsed {@link NativeGeneratedSite}. Every deterministic SSG byte —
+ * the Ivy → HTML interpretation, island detection, head/SEO emit, document
+ * wrapping, sitemap/robots/hydration-manifest emit — is produced by the Rust
+ * core; this only marshals JSON in and out.
  */
-function wrapDocument(fragment: string, data: RenderData, head: HeadMeta): string {
-	const state = escapeHtml(JSON.stringify(data)).replace(/<\/script/gi, '<\\/script')
-	const lang = head.lang ?? 'en'
-	const title = head.title ?? ''
-	return (
-		'<!doctype html>\n' +
-		`<html lang="${escapeAttr(lang)}">\n` +
-		'<head>\n' +
-		renderHead(head, title) +
-		'</head>\n' +
-		'<body>\n' +
-		`<app-root ${HYDRATION_MARKER_ATTR}="1">${fragment}</app-root>\n` +
-		`<script type="application/json" id="${HYDRATION_STATE_ID}">${state}</script>\n` +
-		'</body>\n' +
-		'</html>\n'
+function generateSiteNative(
+	pages: readonly NativePageInput[],
+	config: { outDir: string; lang: string; origin?: string; disallow?: readonly string[]; sitemap?: boolean; robots?: boolean; hydrationManifest?: boolean }
+): NativeGeneratedSite {
+	const native = loadNative()
+	const json = native.generateSiteFull(
+		JSON.stringify({
+			config: {
+				out_dir: config.outDir,
+				lang: config.lang,
+				origin: config.origin ?? '',
+				disallow: config.disallow ?? [],
+				sitemap: config.sitemap ?? true,
+				robots: config.robots ?? true,
+				hydration_manifest: config.hydrationManifest ?? true,
+			},
+			pages,
+		})
 	)
+	return JSON.parse(json) as NativeGeneratedSite
 }
 
-/** Default file writer: write `contents` to `path`, creating parent dirs. */
-async function defaultWriteFile(path: string, contents: string): Promise<void> {
-	const { mkdir, writeFile } = await import('node:fs/promises')
-	const slash = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'))
-	if (slash > 0) await mkdir(path.slice(0, slash), { recursive: true })
-	await writeFile(path, contents, 'utf8')
+/**
+ * Prerender a single discovered route to a complete HTML document string. Pure
+ * (no disk I/O) so it is independently testable: compiles the component, runs
+ * its macro through the runtime, then has the Rust core statically render the
+ * Ivy template and wrap it in a hydration-ready document. Returns `null` when the
+ * route has no component to render. The optional `head` supplies SEO metadata for
+ * the document (else it is derived from the render data + title).
+ */
+export function prerenderRoute(
+	route: DiscoveredRoute,
+	input: RoutePrerenderInput,
+	runtime: RenderRuntime,
+	compiler: TreatyCompiler,
+	title: string,
+	lang: string,
+	head?: HeadMeta
+): string | null {
+	const result = prerenderRouteResult(route, input, runtime, compiler, title, lang, head)
+	return result === null ? null : result.document
+}
+
+/**
+ * Prerender a single discovered route to its full {@link PrerenderRouteResult}
+ * (document + render data + hydration islands). Like {@link prerenderRoute} but
+ * surfaces the render data and detected islands the site generator folds into
+ * its hydration manifest. Returns `null` when the route has no component to
+ * render.
+ */
+export function prerenderRouteResult(
+	route: DiscoveredRoute,
+	input: RoutePrerenderInput,
+	runtime: RenderRuntime,
+	compiler: TreatyCompiler,
+	title: string,
+	lang: string,
+	head?: HeadMeta
+): PrerenderRouteResult | null {
+	const rendered = resolveRouteRender(route, input, runtime, compiler)
+	if (rendered === null) return null
+
+	// Single-page emit through the Rust core: the artifacts are not needed here
+	// (this is the per-route entry), only the page's document + data + islands.
+	const site = generateSiteNative(
+		[
+			{
+				url: route.url,
+				routePath: route.routePath,
+				parameterized: route.parameterized,
+				ivyCode: rendered.ivyCode,
+				componentId: rendered.fileId,
+				data: rendered.data,
+				title,
+				head: compactHead(head),
+			},
+		],
+		{ outDir: DEFAULT_OUT_DIR, lang, sitemap: false, robots: false, hydrationManifest: false }
+	)
+	const page = site.pages[0]
+	if (page === undefined) return null
+	return { document: page.document, data: page.data, islands: page.islands }
 }
 
 /** Resolve the document title for a route from the config. */
@@ -329,118 +439,12 @@ function resolveHeadConfig(
 	return h
 }
 
-/** The full result of prerendering one route: the document plus its metadata. */
-export interface PrerenderRouteResult {
-	/** The complete hydration-ready HTML document. */
-	readonly document: string
-	/** The render data the template was bound against (also embedded for hydration). */
-	readonly data: RenderData
-	/** The hydration islands detected in the rendered markup. */
-	readonly islands: readonly HydrationIsland[]
-}
-
-/** Count the static interpolation islands the renderer filled in `code`. */
-function detectIslands(componentId: string, code: string): HydrationIsland[] {
-	const islands: HydrationIsland[] = [{ kind: 'component', id: componentId }]
-	const interpRe = /ɵɵtextInterpolate\d*\s*\(/g
-	let count = 0
-	while (interpRe.exec(code) !== null) count++
-	for (let i = 0; i < count; i++) {
-		islands.push({ kind: 'interpolation', id: `${componentId}#${i}` })
-	}
-	return islands
-}
-
-/**
- * Compile a route's component, run its macro through the runtime, and statically
- * render the Ivy template to render data + an HTML fragment + detected hydration
- * islands. Returns `null` when the route has no compiler-owned component or
- * template. Shared by {@link prerenderRoute} and the site pipeline so document
- * assembly is the only thing that differs between them.
- */
-function renderRouteFragment(
-	route: DiscoveredRoute,
-	input: RoutePrerenderInput,
-	runtime: RenderRuntime,
-	compiler: TreatyCompiler
-): { fragment: string; data: RenderData; islands: HydrationIsland[] } | null {
-	const fileId = input.fileId ?? `${route.routePath || 'index'}.tsx`
-
-	let compiled: TransformResult | null
-	try {
-		compiled = compiler.transform(fileId, input.source)
-	} catch (cause) {
-		throw new PrerenderError(route.url, cause instanceof Error ? cause.message : String(cause))
-	}
-	if (compiled === null) return null
-
-	// Execute render-time data: macro params are merged over the route's own
-	// params so a macro can read `input.slug` for a `:slug` route by default.
-	let data: RenderData = {}
-	if (input.macro) {
-		const macro: RenderMacro = {
-			source: input.macro.source,
-			input: { ...route.params, ...(input.macro.input ?? {}) },
-		}
-		try {
-			data = runtime.runMacro(macro)
-		} catch (cause) {
-			throw new PrerenderError(route.url, cause instanceof Error ? cause.message : String(cause))
-		}
-	} else if (Object.keys(route.params).length > 0) {
-		// No macro: still expose route params to the template as render data.
-		data = { ...route.params }
-	}
-
-	const fragment = renderIvyToHtml(compiled.code, data)
-	const islands = detectIslands(fileId, compiled.code)
-	return { fragment, data, islands }
-}
-
-/**
- * Prerender a single discovered route to a complete HTML document string. Pure
- * (no disk I/O) so it is independently testable: compiles the component, runs
- * its macro through the runtime, statically renders the Ivy template, and wraps
- * the result in a hydration-ready document. Returns `null` when the route has no
- * component to render. The optional `head` supplies SEO metadata for the
- * document (else it is derived from the render data + title).
- */
-export function prerenderRoute(
-	route: DiscoveredRoute,
-	input: RoutePrerenderInput,
-	runtime: RenderRuntime,
-	compiler: TreatyCompiler,
-	title: string,
-	lang: string,
-	head?: HeadMeta
-): string | null {
-	const rendered = renderRouteFragment(route, input, runtime, compiler)
-	if (rendered === null) return null
-	const resolved = resolveHead(head, rendered.data, title, lang)
-	return wrapDocument(rendered.fragment, rendered.data, resolved)
-}
-
-/**
- * Prerender a single discovered route to its full {@link PrerenderRouteResult}
- * (document + render data + hydration islands). Like {@link prerenderRoute} but
- * surfaces the render data and detected islands the site generator folds into
- * its hydration manifest. Returns `null` when the route has no component to
- * render.
- */
-export function prerenderRouteResult(
-	route: DiscoveredRoute,
-	input: RoutePrerenderInput,
-	runtime: RenderRuntime,
-	compiler: TreatyCompiler,
-	title: string,
-	lang: string,
-	head?: HeadMeta
-): PrerenderRouteResult | null {
-	const rendered = renderRouteFragment(route, input, runtime, compiler)
-	if (rendered === null) return null
-	const resolved = resolveHead(head, rendered.data, title, lang)
-	const document = wrapDocument(rendered.fragment, rendered.data, resolved)
-	return { document, data: rendered.data, islands: rendered.islands }
+/** Default file writer: write `contents` to `path`, creating parent dirs. */
+async function defaultWriteFile(path: string, contents: string): Promise<void> {
+	const { mkdir, writeFile } = await import('node:fs/promises')
+	const slash = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'))
+	if (slash > 0) await mkdir(path.slice(0, slash), { recursive: true })
+	await writeFile(path, contents, 'utf8')
 }
 
 /**
@@ -451,7 +455,8 @@ export function prerenderRouteResult(
  * Static routes yield one document; parameterized routes yield one per supplied
  * param set ({@link PrerenderConfig.params}). Routes the resolver maps to `null`,
  * and components the compiler does not own / that have no template, are skipped
- * (they contribute no manifest entry). All documents are written through
+ * (they contribute no manifest entry). The deterministic render + document
+ * assembly happens in the Rust core; all documents are written through
  * {@link PrerenderConfig.writeFile} (disk by default).
  *
  * @throws {PrerenderError} if a route's component fails to compile or its macro
@@ -465,28 +470,45 @@ export async function prerenderAll(config: PrerenderConfig): Promise<PrerenderMa
 	const write = config.writeFile ?? defaultWriteFile
 
 	const discovered = discoverRoutes(config.routes, { params: config.params })
-	const routes: PrerenderedRoute[] = []
 
+	// Resolve every route's render data (compile + macro) in TS, then emit all
+	// pages through the Rust core in one call.
+	const pages: NativePageInput[] = []
 	for (const route of discovered) {
 		const input = config.resolve(route)
 		if (input === null) continue
-
-		const rendered = renderRouteFragment(route, input, runtime, compiler)
+		const rendered = resolveRouteRender(route, input, runtime, compiler)
 		if (rendered === null) continue
-
-		const title = resolveTitle(config, route)
-		const head = resolveHead(resolveHeadConfig(config, route, rendered.data), rendered.data, title, lang)
-		const document = wrapDocument(rendered.fragment, rendered.data, head)
-
-		const output = outputPathFor(outDir, route.url)
-		await write(output, document)
-		routes.push({
+		pages.push({
 			url: route.url,
-			output,
 			routePath: route.routePath,
 			parameterized: route.parameterized,
-			bytes: Buffer.byteLength(document, 'utf8'),
-			islands: rendered.islands,
+			ivyCode: rendered.ivyCode,
+			componentId: rendered.fileId,
+			data: rendered.data,
+			title: resolveTitle(config, route),
+			head: compactHead(resolveHeadConfig(config, route, rendered.data)),
+		})
+	}
+
+	const site = generateSiteNative(pages, {
+		outDir,
+		lang,
+		sitemap: false,
+		robots: false,
+		hydrationManifest: false,
+	})
+
+	const routes: PrerenderedRoute[] = []
+	for (const page of site.pages) {
+		await write(page.output, page.document)
+		routes.push({
+			url: page.url,
+			output: page.output,
+			routePath: page.routePath,
+			parameterized: page.parameterized,
+			bytes: page.bytes,
+			islands: page.islands,
 		})
 	}
 
