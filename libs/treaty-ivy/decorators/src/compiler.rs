@@ -1206,6 +1206,30 @@ impl HostBindingsBuilder for DefaultHostBindingsBuilder {
                 continue;
             }
 
+            // Legacy animation (`@`-prefixed) listener: `(@myAnim.start)` → `ɵɵsyntheticHostListener`
+            // with the event name kept verbatim (`@myAnim.start`) and a handler named
+            // `${name}_animation_${anim}_${phase}_HostBindingHandler` (Angular
+            // `prepareSyntheticListenerFunctionName(anim, phase)` ⇒ `animation_${anim}_${phase}`).
+            // The `@<anim>.<phase>` key splits on the FIRST `.` into the animation name and phase.
+            if let Some(rest) = event.strip_prefix('@') {
+                let (anim, phase) = match rest.split_once('.') {
+                    Some((a, p)) => (a, p),
+                    None => (rest, ""),
+                };
+                let handler_anim = if phase.is_empty() {
+                    format!("animation_{anim}")
+                } else {
+                    format!("animation_{anim}_{phase}")
+                };
+                let handler_name = format!("{name}_{handler_anim}_HostBindingHandler");
+                let handler_fn = o::fn_(params, body, None, Some(handler_name));
+                create_stmts.push(host_instruction(
+                    R3::SyntheticHostListener,
+                    vec![o::literal(LiteralValue::String(event.clone()), None), handler_fn],
+                ));
+                continue;
+            }
+
             // `naming.ts`: `${name}_${event}_HostBindingHandler`.
             let handler_name = format!("{name}_{}_HostBindingHandler", event.replace('.', "_"));
             let handler_fn = o::fn_(params, body, None, Some(handler_name));
@@ -1275,10 +1299,14 @@ impl HostBindingsBuilder for DefaultHostBindingsBuilder {
                     R3::Attribute,
                     vec![o::literal(LiteralValue::String(attr.to_string()), None), value],
                 )
-            } else if let Some(synthetic) = prop.strip_prefix('@') {
+            } else if prop.starts_with('@') {
+                // Legacy synthetic (animation) host property. The bound name keeps the `@` prefix
+                // verbatim — `ɵɵsyntheticHostProperty("@myAnim", …)` — matching Angular's
+                // `prepareSyntheticPropertyName` (the runtime keys the animation player off the
+                // `@`-prefixed name).
                 host_instruction(
                     R3::SyntheticHostProperty,
-                    vec![o::literal(LiteralValue::String(synthetic.to_string()), None), value],
+                    vec![o::literal(LiteralValue::String(prop.clone()), None), value],
                 )
             } else {
                 host_instruction(
@@ -3195,6 +3223,53 @@ mod tests {
         let style_at = js.find("ɵɵstyleProp").expect("styleProp");
         let class_at = js.find("ɵɵclassProp").expect("classProp");
         assert!(style_at < class_at, "styleProp must precede classProp in the flush: {js}");
+    }
+
+    #[test]
+    fn host_legacy_synthetic_animation_bindings() {
+        // `host: { '[@myAnim]': 'myAnimState', '(@myAnim.start)': 'onStart()',
+        //          '(@myAnim.done)': 'onDone()' }` — legacy (`@`-prefixed) animation host bindings.
+        // Listeners route to `ɵɵsyntheticHostListener` (NOT `ɵɵlistener`) keeping the `@evt.phase`
+        // name; the handler is named `${name}_animation_${anim}_${phase}_HostBindingHandler`
+        // (`prepareSyntheticListenerFunctionName`). The property routes to
+        // `ɵɵsyntheticHostProperty` keeping the `@` prefix (`prepareSyntheticPropertyName`). Mirrors
+        // r3_view_compiler_styling/component_animations/animation_host_bindings.
+        let mut meta = directive_meta("MyAnimDir", "[my-anim-dir]");
+        meta.host.properties.insert("@myAnim".to_string(), "myAnimState".to_string());
+        meta.host.listeners.insert("@myAnim.start".to_string(), "onStart()".to_string());
+        meta.host.listeners.insert("@myAnim.done".to_string(), "onDone()".to_string());
+        let mut hb = DefaultHostBindingsBuilder;
+        let compiled = compile_directive_from_metadata(&meta, &mut hb);
+        let js = emit_expression(&compiled.expression);
+
+        // Listeners → ɵɵsyntheticHostListener with the `@evt.phase` name kept verbatim.
+        assert!(js.contains("ɵɵsyntheticHostListener"), "missing ɵɵsyntheticHostListener: {js}");
+        assert!(!js.contains("ɵɵlistener("), "synthetic listener must not use ɵɵlistener: {js}");
+        assert!(
+            js.contains("\"@myAnim.start\"") && js.contains("\"@myAnim.done\""),
+            "synthetic listener event names must keep the @ prefix and phase: {js}"
+        );
+        // Handler name uses the `animation_${anim}_${phase}` infix.
+        assert!(
+            js.contains("MyAnimDir_animation_myAnim_start_HostBindingHandler")
+                && js.contains("MyAnimDir_animation_myAnim_done_HostBindingHandler"),
+            "synthetic listener handler names wrong: {js}"
+        );
+        // Property → ɵɵsyntheticHostProperty keeping the @ prefix.
+        assert!(
+            js.contains("ɵɵsyntheticHostProperty(\"@myAnim\", ctx.myAnimState)"),
+            "synthetic property must keep @ prefix: {js}"
+        );
+        // Neither handler reads $event ⇒ empty parameter lists.
+        assert!(
+            !js.contains("HostBindingHandler($event)"),
+            "synthetic listener handlers should take no params: {js}"
+        );
+        // One property binding ⇒ hostVars 1.
+        assert!(
+            js.contains("hostVars: 1") || js.contains("hostVars:1"),
+            "expected hostVars: 1: {js}"
+        );
     }
 
     #[test]
