@@ -24,8 +24,8 @@
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    Argument, CallExpression, Expression, ObjectExpression, ObjectPropertyKind, PropertyKey,
-    Statement,
+    ArrayExpressionElement, Argument, CallExpression, Expression, ObjectExpression,
+    ObjectPropertyKind, PropertyKey, Statement,
 };
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType};
@@ -37,7 +37,9 @@ use crate::factory::{
 };
 use crate::compile::RealTemplateBuilder;
 use crate::output::emitter::{emit_expression, emit_statements};
-use crate::output_ast::{self as o, Expr, LiteralValue, ParseSourceSpan};
+use crate::output_ast::{
+    self as o, Expr, ExprKind, LiteralMapEntry, LiteralValue, ParseSourceSpan,
+};
 use crate::pipe_module_injector::{
     compile_injector, compile_ng_module, compile_pipe_from_metadata, R3InjectorMetadata,
     R3NgModuleCommon, R3NgModuleMetadata, R3NgModuleMetadataGlobal, R3PipeMetadata,
@@ -190,22 +192,48 @@ fn convert_expr(expr: &Expression) -> Option<Expr> {
         Expression::ArrayExpression(arr) => {
             let mut elems = Vec::with_capacity(arr.elements.len());
             for el in &arr.elements {
-                let inner = el.as_expression()?;
-                elems.push(convert_expr(inner)?);
+                match el {
+                    // `[...providers]` — a spread element carries its argument through as
+                    // `...expr` (opaque providers/imports arrays are passed verbatim).
+                    ArrayExpressionElement::SpreadElement(s) => {
+                        elems.push(o::spread(convert_expr(&s.argument)?));
+                    }
+                    // Holes (`[, x]`) are not part of any partial declaration we link.
+                    ArrayExpressionElement::Elision(_) => return None,
+                    other => {
+                        let inner = other.as_expression()?;
+                        elems.push(convert_expr(inner)?);
+                    }
+                }
             }
             Some(o::literal_arr(elems, None))
         }
         Expression::ObjectExpression(obj) => {
             let mut entries = Vec::with_capacity(obj.properties.len());
             for p in &obj.properties {
-                let ObjectPropertyKind::ObjectProperty(op) = p else {
-                    return None;
-                };
-                let key = key_name(&op.key)?;
-                let quoted = !is_safe_object_key(key);
-                entries.push((key.to_string(), quoted, convert_expr(&op.value)?));
+                match p {
+                    ObjectPropertyKind::ObjectProperty(op) => {
+                        let key = key_name(&op.key)?;
+                        let quoted = !is_safe_object_key(key);
+                        entries.push(LiteralMapEntry::Property {
+                            key: key.to_string(),
+                            value: convert_expr(&op.value)?,
+                            quoted,
+                        });
+                    }
+                    // `{...defaults}` — an object spread carries its argument through as
+                    // `...expr`.
+                    ObjectPropertyKind::SpreadProperty(sp) => {
+                        entries.push(LiteralMapEntry::Spread {
+                            expression: convert_expr(&sp.argument)?,
+                        });
+                    }
+                }
             }
-            Some(o::literal_map(entries, None))
+            Some(Expr::bare(ExprKind::LiteralMap {
+                entries,
+                value_type: None,
+            }))
         }
         Expression::StaticMemberExpression(m) => {
             let object = convert_expr(&m.object)?;
@@ -642,12 +670,28 @@ fn link_injector(obj: &ObjectExpression) -> Result<String, String> {
         Some(Expression::ArrayExpression(arr)) => {
             let mut out = Vec::with_capacity(arr.elements.len());
             for el in &arr.elements {
-                let inner = el
-                    .as_expression()
-                    .ok_or_else(|| "unsupported injector `imports` element".to_string())?;
-                out.push(convert_expr(inner).ok_or_else(|| {
-                    "unsupported injector `imports` element expression".to_string()
-                })?);
+                // Injector `imports` are opaque (carried verbatim), so a spread element
+                // (`imports: [...A_IMPORTS]`) passes through as `...expr` rather than
+                // being rejected.
+                match el {
+                    ArrayExpressionElement::SpreadElement(s) => {
+                        let arg = convert_expr(&s.argument).ok_or_else(|| {
+                            "unsupported injector `imports` spread expression".to_string()
+                        })?;
+                        out.push(o::spread(arg));
+                    }
+                    ArrayExpressionElement::Elision(_) => {
+                        return Err("unsupported injector `imports` element".to_string());
+                    }
+                    other => {
+                        let inner = other
+                            .as_expression()
+                            .ok_or_else(|| "unsupported injector `imports` element".to_string())?;
+                        out.push(convert_expr(inner).ok_or_else(|| {
+                            "unsupported injector `imports` element expression".to_string()
+                        })?);
+                    }
+                }
             }
             out
         }
@@ -1820,6 +1864,130 @@ mod tests {
         );
         assert_no_declare(&out.code);
         assert_reparses(&out.code);
+    }
+
+    #[test]
+    fn links_injector_with_spread_providers() {
+        // Real shape from @angular/platform-browser's BrowserModule injector:
+        // `providers: [...BROWSER_MODULE_PROVIDERS, ...TESTABILITY_PROVIDERS]`.
+        let src = r#"BrowserModule.ɵinj = i0.ɵɵngDeclareInjector({ minVersion: "12.0.0", version: "21.2.15", ngImport: i0, type: BrowserModule, providers: [...BROWSER_MODULE_PROVIDERS, ...TESTABILITY_PROVIDERS] });"#;
+        let out = link_partial(src, "platform-browser.mjs");
+        assert!(out.errors.is_empty(), "errors: {:?}", out.errors);
+        assert!(
+            out.code.contains("\u{0275}\u{0275}defineInjector"),
+            "got: {}",
+            out.code
+        );
+        // Both spreads pass through verbatim as `...expr` array entries.
+        assert!(
+            canonical(&out.code)
+                .contains("providers: [...BROWSER_MODULE_PROVIDERS, ...TESTABILITY_PROVIDERS]"),
+            "got: {}",
+            out.code
+        );
+        assert_no_declare(&out.code);
+        assert_reparses(&out.code);
+    }
+
+    #[test]
+    fn links_injector_with_mixed_spread_and_plain_providers() {
+        let src = r#"Mod.ɵinj = i0.ɵɵngDeclareInjector({ version: "21.2.15", ngImport: i0, type: Mod, providers: [SomeService, ...EXTRA, { provide: TOKEN, useValue: 1 }] });"#;
+        let out = link_partial(src, "x.mjs");
+        assert!(out.errors.is_empty(), "errors: {:?}", out.errors);
+        assert!(
+            canonical(&out.code)
+                .contains("providers: [SomeService, ...EXTRA, {provide: TOKEN, useValue: 1}]"),
+            "got: {}",
+            out.code
+        );
+        assert_reparses(&out.code);
+    }
+
+    #[test]
+    fn links_injector_with_spread_imports() {
+        // Injector `imports` are opaque, so a spread element passes through verbatim.
+        let src = r#"Mod.ɵinj = i0.ɵɵngDeclareInjector({ version: "21.2.15", ngImport: i0, type: Mod, imports: [CommonModule, ...SHARED_IMPORTS] });"#;
+        let out = link_partial(src, "x.mjs");
+        assert!(out.errors.is_empty(), "errors: {:?}", out.errors);
+        assert!(
+            canonical(&out.code).contains("imports: [CommonModule, ...SHARED_IMPORTS]"),
+            "got: {}",
+            out.code
+        );
+        assert_reparses(&out.code);
+    }
+
+    /// Parse a single expression, run `convert_expr`, and emit the result back to text.
+    /// The allocator is local, so parse + convert + emit all happen before it is dropped.
+    fn convert_and_emit(expr_src: &str) -> String {
+        let wrapped = format!("const __x = ({expr_src});");
+        let allocator = Allocator::default();
+        let source_type = SourceType::default().with_typescript(true).with_module(true);
+        let ret = Parser::new(&allocator, &wrapped, source_type).parse();
+        assert!(
+            ret.errors.is_empty(),
+            "test expression did not parse: {:?}",
+            ret.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+        let mut found: Option<String> = None;
+        for stmt in &ret.program.body {
+            if let Statement::VariableDeclaration(decl) = stmt {
+                if let Some(d) = decl.declarations.first() {
+                    if let Some(init) = &d.init {
+                        let converted =
+                            convert_expr(init).expect("expression should convert via convert_expr");
+                        found = Some(emit_def_text(&converted));
+                    }
+                }
+            }
+        }
+        found.expect("no variable initializer found in test source")
+    }
+
+    /// Collapse the emitter's pretty-printing (newlines/tabs/trailing `;`) to a single-space
+    /// canonical form so structural assertions are insensitive to layout.
+    fn canonical(s: &str) -> String {
+        let trimmed = s.trim().trim_end_matches(';');
+        let mut out = String::with_capacity(trimmed.len());
+        let mut prev_space = false;
+        for ch in trimmed.chars() {
+            if ch.is_whitespace() {
+                if !prev_space {
+                    out.push(' ');
+                    prev_space = true;
+                }
+            } else {
+                out.push(ch);
+                prev_space = false;
+            }
+        }
+        // Normalize spacing just inside brackets/braces so `[ ...a` == `[...a`.
+        out.replace("[ ", "[")
+            .replace(" ]", "]")
+            .replace("{ ", "{")
+            .replace(" }", "}")
+            .replace(" ,", ",")
+    }
+
+    #[test]
+    fn convert_expr_array_spread() {
+        assert_eq!(canonical(&convert_and_emit("[...a, b, ...c]")), "[...a, b, ...c]");
+    }
+
+    #[test]
+    fn convert_expr_object_spread() {
+        assert_eq!(
+            canonical(&convert_and_emit("{ ...x, k: v, ...y }")),
+            "({...x, k: v, ...y})"
+        );
+    }
+
+    #[test]
+    fn convert_expr_nested_spread() {
+        assert_eq!(
+            canonical(&convert_and_emit("{ providers: [...A, { useValue: [...B] }] }")),
+            "({providers: [...A, {useValue: [...B]}]})"
+        );
     }
 
     #[test]

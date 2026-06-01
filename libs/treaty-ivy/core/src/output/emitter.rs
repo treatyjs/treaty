@@ -697,8 +697,15 @@ impl<'a> Lowerer<'a> {
             ExprKind::LiteralArray(entries) => {
                 let mut elements = self.ast.vec_with_capacity(entries.len());
                 for e in entries {
-                    let el = self.lower_expr(e);
-                    elements.push(ArrayExpressionElement::from(el));
+                    // A `Spread` entry becomes a real `...x` array element; everything
+                    // else is a plain expression element.
+                    if let ExprKind::Spread(inner) = &e.kind {
+                        let el = self.lower_expr(inner);
+                        elements.push(self.ast.array_expression_element_spread_element(SPAN, el));
+                    } else {
+                        let el = self.lower_expr(e);
+                        elements.push(ArrayExpressionElement::from(el));
+                    }
                 }
                 self.ast.expression_array(SPAN, elements)
             }

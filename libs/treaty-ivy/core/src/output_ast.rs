@@ -1301,6 +1301,12 @@ pub fn literal_arr(values: Vec<Expr>, ty: Option<Type>) -> Expr {
     Expr::with_type(ExprKind::LiteralArray(values), ty)
 }
 
+/// `spread(expr)` → `SpreadElementExpr` (`...expr`), used as an entry of a `LiteralArrayExpr`
+/// or as a call argument. Object-property spreads use [`LiteralMapEntry::Spread`] instead.
+pub fn spread(expr: Expr) -> Expr {
+    Expr::bare(ExprKind::Spread(Box::new(expr)))
+}
+
 /// `literalMap(values, type=null)` → `LiteralMapExpr` of property assignments.
 pub fn literal_map(values: Vec<(String, bool, Expr)>, value_type: Option<Type>) -> Expr {
     let entries = values
