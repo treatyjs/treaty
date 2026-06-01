@@ -13,17 +13,20 @@ JSX-flavored Angular — signals by default.
 | Area | What | Status |
 | --- | --- | --- |
 | Compiler | `treaty_ivy` — direct-to-Ivy in Rust (4-crate carve: core/template/decorators/facade), `DecoratorCompiler` registry | ✅ 170/185 runnable Angular golden parity (91.9%, climbing) |
-| Authoring → Ivy | `.treaty` SFC + JSX-flavored Angular authoring plugins → `treaty_ivy` | ✅ |
-| Decorators / DI | `@Component/@Directive/@Injectable/@Pipe`, constructor DI (`ɵɵinject`/`ɵɵdirectiveInject` + `InjectFlags`), queries, `@Input({alias,transform})`, host bindings/styling, `signals: true` | ✅ |
-| Consuming Angular libs | Built-in **Angular Linker**: partial `ɵɵngDeclare*` → AOT `ɵɵdefine*`, no JIT, dev + prod | 🏗️ in progress (bundler wiring next) |
+| All decorators → Ivy AOT | `@Component/@Directive/@Pipe/@Injectable/@NgModule` lower to Ivy `ɵɵdefine*` (no JIT) on every entry, including the unified `compile()` path | ✅ |
+| Authoring → Ivy | `.treaty` SFC + JSX-flavored Angular authoring plugins → `treaty_ivy`; selector + class name derived from the file name (kebab selector, no `<ng-component>`) | ✅ |
+| Decorators / DI | constructor DI (`ɵɵinject`/`ɵɵdirectiveInject` + `InjectFlags`), queries, `@Input({alias,transform})`, host bindings/styling, `signals: true` | ✅ |
+| Consuming Angular libs (linker) | Built-in **Angular Linker**: partial `ɵɵngDeclare*` → AOT `ɵɵdefine*` in Rust. Links real `@angular/*` + CDK/Material to ZERO residual `ɵɵngDeclare` (no `@angular/compiler`); wired into vite/rspack/rsbuild/rslib + the `@treaty/vite` plugin, dev + prod | ✅ link path (production backend **hosting** of server fns is the remaining piece) |
+| Nav / RouterLink | `RouterLink` + attribute-selector directives auto-imported into `dependencies[]` so navigation works | ✅ |
+| Component style encapsulation | Emulated encapsulation via a ported `ShadowCss` (`_ngcontent-%COMP%` scoping) | ✅ |
+| File-based routing | `treaty_file_routing` crate + CLI; build-time `virtual:treaty-routes` module (no prebuilt `routes.ts`) across vite/rspack/rsbuild | ✅ (`examples/file-routed-app`) |
+| Server functions | Inline by default (`server{}` / file-level `'use server'` / `$$` / `use websocket`); bodies extracted to the backend and stripped from client code **and** the source map; run in dev over `/__server/*`. Backend-agnostic (axum default, Elysia opt-in) | ✅ extracted + run in dev (production hosting + real SSE/WS fan-out queued) |
 | Runtime | Node-compatible Nova runtime, module-granular `node:` builtins, real `node:tls`/`node:https` over rustls (ring), offline-clean | ✅ 483 tests; conformance 51/0 + corpus 68/0 |
 | SSR / SSG | Server render + static generation cores (Rust-first deterministic logic) | 🏗️ |
-| File-based routing | `treaty_file_routing` crate + CLI; real-engine route generation | ✅ (`examples/file-routed-app`) |
-| Server functions | Inline by default (`server{}` / `'use server'` / `$`), backend-agnostic (axum default, Elysia opt-in); bodies excluded from client source maps | ✅ |
-| Source maps | v3 maps (Ivy JS ↔ authoring source) threaded through addon + bundler plugins | ✅ |
-| Bundler / NAPI | `compileComponent`, `compileComponentSource`, `compileTreatyFile`, `compile`, `compileMany`, `runMacro` (`linkPartial` lands with the linker) | ✅ |
+| Source maps | v3 maps (Ivy JS ↔ authoring source) threaded through addon + bundler plugins; server-fn bodies excluded | ✅ |
+| Bundler / NAPI | `compileComponent`, `compileComponentSource`, `compileTreatyFile`, `compile`, `compileMany`, `runMacro`, `linkPartial` | ✅ |
 | Tooling | Typecheck **tsgo**, lint **oxlint**, no `tsc` | ✅ |
-| Build → boot e2e | Real vite build + boot of `everything-app` / `file-routed-app` | ⏳ queued (blocked on linker) |
+| Build → boot e2e | Real vite build + boot of `everything-app` / `file-routed-app`; a source-validate gate parses every authoring source | ✅ (e2e-gated) |
 
 Legend: ✅ done · 🏗️ in progress · ⏳ queued.
 

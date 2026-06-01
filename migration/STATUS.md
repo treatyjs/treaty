@@ -19,19 +19,25 @@ a `DecoratorCompiler` registry that mirrors the authoring-plugin design.
 Where things stand:
 
 - **treaty_ivy compiler** — DONE & green: 4 crates, **470 `#[test]`** total. Emits
-  complete ES-module Ivy output (component/directive/injectable/pipe). Golden
-  parity vs Angular's own corpus: **170 / 185 runnable = 91.9%** (live-scored),
-  climbing toward full parity as the ranked DIFFs are closed.
-- **Angular Linker** — IN PROGRESS (not yet committed): partial `ɵɵngDeclare*`
-  → AOT `ɵɵdefine*`, planned to land in the facade crate. Lets Treaty apps
-  consume real published Angular libraries with **no JIT** in dev *and* prod.
-  Bundler wiring is the following step.
+  complete ES-module Ivy output. **Every Angular decorator**
+  (`@Component/@Directive/@Pipe/@Injectable/@NgModule`) lowers to Ivy AOT (no JIT)
+  on every entry point, including the unified `compile()` path. Golden parity vs
+  Angular's own corpus: **170 / 185 runnable = 91.9%** (live-scored), climbing
+  toward full parity as the ranked DIFFs are closed.
+- **Angular Linker** — DONE for the LINK path: partial `ɵɵngDeclare*` → AOT
+  `ɵɵdefine*` in Rust (`libs/treaty-ivy/facade/src/linker.rs` + NAPI `linkPartial`).
+  Links real `@angular/*` + CDK/Material to **ZERO residual `ɵɵngDeclare`** (no
+  `@angular/compiler`, no JIT), and is wired into vite/rspack/rsbuild/rslib plus
+  the `@treaty/vite` plugin, **dev and prod**. Remaining: production backend
+  *hosting* of server fns (the dev backend already runs them).
 - **Node-compatible runtime** — DONE & green: 483 in-crate tests, module-granular
   `node:` builtins, real `node:tls` + `node:https` over rustls/ring, offline-clean.
-- **File-based routing** — DONE: `treaty_file_routing` Rust crate + CLI, wired into
-  `examples/file-routed-app`.
-- **Example apps + addon** — DONE (sources); real vite build + boot e2e is
-  **queued**, blocked on the linker so partial Angular libs link.
+- **File-based routing** — DONE: `treaty_file_routing` Rust crate + CLI, exposed as
+  a build-time `virtual:treaty-routes` module (no prebuilt `routes.ts`) across
+  vite/rspack/rsbuild; wired into `examples/file-routed-app`.
+- **Example apps + addon** — DONE: both `everything-app` and `file-routed-app`
+  **build and boot** under a repeatable e2e gate; a source-validate e2e parses
+  every authoring source through the production compiler seam.
 
 ---
 
@@ -61,6 +67,9 @@ handlers compose the same way authoring plugins do.
 
 ### What emits correctly (DONE)
 
+- **All decorator kinds → Ivy AOT, no JIT:** `@Component` (`ɵcmp`),
+  `@Directive` (`ɵdir`), `@Pipe` (`ɵpipe`), `@Injectable` (`ɵprov`),
+  `@NgModule` (`ɵmod` + `ɵinj`) — including through the unified `compile()` entry.
 - Complete ES-module emit: `export class` + imports + `ɵfac` + `ɵcmp`/`ɵdir`.
 - Constructor DI: `ɵɵdirectiveInject` / `ɵɵinject` + `InjectFlags`, with
   `@Inject` / `@Optional` / `@Self` / `@SkipSelf` / `@Host` / `@Attribute`.
@@ -96,7 +105,12 @@ Harness moved into the facade crate:
 > Corpus dump env var renamed `RENDER3_CORPUS_DUMP` → **`TREATY_IVY_CORPUS_DUMP`**.
 > The committed `COMPLIANCE-REPORT.md` is regenerated to 170/185 (`--report`).
 
-### Ranked DIFF gaps (20 remaining — the work toward full parity)
+### Ranked DIFF gaps (the work toward full parity)
+
+The live harness reports **15 matchGolden DIFFs** of the 185 runnable cases. The
+categories below enumerate the outstanding gap shapes (genuine compiler features
+plus harness/golden-authoring limits); a few categories collapse to one DIFF case
+each, so the per-category tallies are upper bounds, not the headline DIFF count.
 
 Genuine features (large / bespoke):
 - control / `field` bindings (2) — need `ɵɵcontrolCreate` (create) + `ɵɵcontrol` (update), breaking the element-create chain (`R3DirectiveMetadata.control_create` scaffolding exists, unpopulated).
@@ -114,22 +128,29 @@ Harness / golden-authoring limits (not compiler defects):
 
 ## (2) Angular Linker — partial → AOT
 
-**Status: IN PROGRESS (being implemented now — `libs/treaty-ivy/facade/src/linker.rs`
-+ NAPI `linkPartial`).**
+**Status: DONE for the link path (`libs/treaty-ivy/facade/src/linker.rs` + NAPI
+`linkPartial`). Production backend HOSTING of server fns is the remaining piece.**
 
 Published Angular libraries ship **partial-compilation** output
 (`ɵɵngDeclareComponent` / `ɵɵngDeclareDirective` / … the `ɵɵngDeclare*` family).
 Without a linker, consuming them forces the JIT fallback and triggers the
 `_PlatformLocation needs JIT / @angular/compiler not available` runtime error.
 
-The linker will re-emit the fully-AOT `ɵɵdefineComponent` / `ɵɵdefine*` calls so
-Treaty apps depend on real Angular libraries with **no JIT** — and it must run in
-**both dev and production** builds.
+The linker re-emits the fully-AOT `ɵɵdefineComponent` / `ɵɵdefine*` calls so
+Treaty apps depend on real Angular libraries with **no JIT**, in **both dev and
+production** builds.
 
-- REMAINING: implement the Rust linker pass (`ɵɵngDeclare*` → `ɵɵdefine*`);
-  bundler wiring (run the linker over `node_modules` partial libs during
-  vite/build); NAPI surfacing of `linkPartial` in the addon. This is the blocker
-  for the real build + boot e2e (workstream 5).
+- DONE: the Rust linker pass (`ɵɵngDeclare*` → `ɵɵdefine*`) as a surgical span
+  rewrite over the EXISTING render3 emit. `link_real_packages.rs` links real
+  `@angular/{platform-browser, core, common(+http), forms, router, animations}`
+  plus CDK and Material to **ZERO residual `ɵɵngDeclare`** call sites; the linked
+  output re-parses as a valid ES module and never imports `@angular/compiler`.
+- DONE: bundler wiring — the linker runs over `node_modules` partial libs across
+  `@treaty/{vite,rspack,rsbuild,rslib}` (dev + prod) and NAPI surfaces
+  `linkPartial` in the addon.
+- REMAINING: production (non-dev) backend **hosting** of server fns — real SSE/WS
+  transport fan-out (the in-dev `/__server/*` backend already runs them; the
+  production axum handlers are skeletons).
 
 Why it matters: it is the gate to using the existing Angular ecosystem
 unmodified, AOT, without bundling `@angular/compiler` into the app.
@@ -155,22 +176,32 @@ Node-compatible Nova runtime (pure-Rust JS engine).
 **Status: DONE.**
 
 - `treaty_file_routing` Rust crate (deterministic route generation, Rust-first).
-- `treaty-file-routing` CLI.
-- `examples/file-routed-app` generates its routes via the real engine; the JS
-  routing e2e is green.
+- `treaty-file-routing` CLI; `generateRoutes` NAPI binding.
+- Exposed as a build-time **`virtual:treaty-routes`** module (no prebuilt
+  `routes.ts`) across vite/rspack/rsbuild.
+- `examples/file-routed-app` consumes the virtual module via the real engine; the
+  JS routing e2e is green.
 
 ---
 
-## (5) Example apps + addon + queued build e2e
+## (5) Example apps + addon + build → boot e2e
 
-**Status: sources DONE; real build e2e QUEUED (blocked on linker).**
+**Status: DONE — both apps build and boot under e2e gates.**
 
-- `examples/everything-app` — broad feature coverage.
-- `examples/file-routed-app` — file-routing engine demo.
-- `AppRoot` complete-module export fixed.
+- `examples/everything-app` — broad feature coverage. Builds and boots; covered by
+  a full `vite build` + headless boot e2e, plus dev-serve, nav/MIME/styles,
+  server-fn-dev, and source-validate gates.
+- `examples/file-routed-app` — file-routing engine demo; full vite build + headless
+  boot e2e of FS routing.
+- A **source-validate** e2e parses every authoring source under `src/` through the
+  production `@treaty/compiler` seam and asserts each lowers to the correct
+  `ɵɵdefine*` with no surviving Angular decorator and no server-fn body leaking
+  into client code or the source map.
+- Whole-app boot now succeeds: filename→component name + kebab selector (no
+  `<ng-component>`), `@for` track index-first (NG0955 fixed), `use:`-directive deps
+  resolved, RouterLink/attr-selector directives auto-imported, emulated-encapsulation
+  styles, `.treaty`/`.tjsx` served as JS in dev (MIME fixed).
 - Addon (`libs/authoring/node`) rebuilt.
-- REMAINING: real **vite build + boot e2e**, queued — blocked on the Angular
-  linker (workstream 2) so partial Angular libs link AOT.
 
 ---
 
@@ -180,16 +211,23 @@ Node-compatible Nova runtime (pure-Rust JS engine).
 
 - **NAPI surface** (`libs/authoring/node`, `index.d.ts`): `compileComponent`,
   `compileComponentSource`, `compileTreatyFile`, `compile`, `compileMany`,
-  `runMacro`. `linkPartial` to be added with the linker (workstream 2).
+  `runMacro`, **`linkPartial`** (the Angular linker, workstream 2), and
+  `generateRoutes` (file routing, workstream 4).
 - **Authoring plugins** are pluggable; `.treaty` SFC + JSX-flavored Angular are
   both plugins (signals-by-default, lowercase class, `@control-flow`, JS loops →
   `@for`).
 - **Source maps**: compiler emits v3 maps (Ivy JS ↔ authoring source), threaded
   render path → addon → bundler plugins; code string unchanged.
-- **Server functions**: declared inline by default (`server{}` / `'use server'`
-  / `$`); extracted bodies must **not** appear in client source maps — the client
-  map references only the replaced API call. Backend-agnostic (axum default,
-  Elysia opt-in).
+- **Server functions**: declared inline by default — `server{}`, file-level
+  `'use server'`, `$$`, and `use websocket` markers are extracted to the backend
+  with the body **stripped from the client code AND the source map** (the client
+  map references only the replaced RPC stub; a parsed privacy guard enforces this).
+  In dev they **run** over a `/__server/*` connect middleware that SSR-loads the
+  original module so the real body executes without shipping to the client.
+  Backend-agnostic (axum default, Elysia opt-in).
+- REMAINING: server-fn extraction UNIFICATION across all marker forms (in
+  progress); production (non-dev) backend hosting + real SSE/WS transport fan-out
+  (the dev backend runs; the production axum handlers are skeletons).
 
 ---
 
@@ -222,23 +260,26 @@ These are tracked separately but share the compiler:
 
 ## Prioritized "remaining to do everything with the Treaty compiler"
 
-1. **Close the 43 compliance DIFFs**, by category (biggest first):
-   - `ɵɵelement` shape (12) — the single largest cluster.
-   - misc instruction-shape mismatches (9).
-   - `ɵɵclassProp` (3), `ɵɵelementStart` (3).
-   - `ɵɵadvance` (2), `ɵɵdomProperty` (2), `ɵɵpureFunction1` (2),
-     `ɵɵviewQuery` (2), `ɵɵcontentQuery` (2).
-   - tail: `ɵɵqueryAdvance`, `ɵɵsyntheticHostListener`, `ɵɵstyleProp`,
-     nested-fn-shape, `ɵɵdefer`, `ɵɵattribute` (1 each).
-2. **Finish the Angular Linker**: bundler wiring (link partial `node_modules`
-   libs during build) + NAPI `linkPartial`; verify AOT in dev *and* prod.
-3. **Unblock + run the real build → boot e2e** for `everything-app` and
-   `file-routed-app` (depends on #2).
-4. **Reduce the 457 compliance skips**: bring host / animations / deferred /
+Done this session (moved OUT of the remaining list): all decorators → Ivy AOT
+on every entry incl. `compile()`; the Angular linker link path + bundler wiring +
+NAPI `linkPartial` (real `@angular/*` + CDK/Material to zero residual); the real
+build → boot e2e for both example apps; the source-validate gate; the file-level
+`'use server'` client leak CLOSED and server fns running in dev.
+
+1. **Close the remaining 15 compliance DIFFs** (toward 185) — see the ranked DIFF
+   gaps above (control/`field` bindings, inline-arrow host/transform conversion,
+   host-binding literal → `ɵɵpureFunctionN`, `@Pipe`+`@Injectable`, deep i18n in
+   `@switch`/`@defer`/`@let`, plus the harness-limited goldens).
+2. **Server-fn extraction UNIFICATION** across all marker forms (in progress), then
+   production (non-dev) backend **hosting** + real SSE/WS transport fan-out (the
+   dev `/__server/*` backend runs them; the production axum handlers are skeletons).
+3. **SSR / SSG Rust core** (in progress).
+4. **Angular-CLI builders / schematics / CLI** (in progress).
+5. **JSX / `.treaty` directive authoring**; macro-data inlining; multi-casing
+   selectors.
+6. **Reduce the 457 compliance skips**: bring host / animations / deferred /
    `ngDeclare`-only fixtures into the runnable set.
-5. **Build-to-deploy**: Module Federation per lazy route + lib (versioned
-   remotes, partial deploy/rollback), Angular CLI wrap (builders + schematics).
-6. **Source-map verification** end-to-end (server-fn bodies excluded from client
-   maps).
-7. **Promote sibling tooling** (treaty-packagr, ngx-maintenance, dep-updater) on
+7. **Build-to-deploy**: Module Federation per lazy route + lib (versioned
+   remotes, partial deploy/rollback).
+8. **Promote sibling tooling** (treaty-packagr, ngx-maintenance, dep-updater) on
    the green compiler.

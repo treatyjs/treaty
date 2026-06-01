@@ -6,10 +6,16 @@ with dead-code elimination + file deletion), bundler plugins for **Vite / Rspack
 **100% compliance at the core**.
 
 ## Where we are (committed this program)
-- render3 engine: direct-to-Ivy, 361 tests; oracle 27/27; **compliance 90/98 of the runnable subset
-  (91.8%) and climbing** (last round flipped the 3 content-projection cases, `5953975`). NOTE: this is
-  the runnable subset (98 cases), NOT the full 642-case corpus (the rest are partial/ngDeclare-only,
-  multi-file, or metadata shapes the source front-end does not yet model). Do not claim 100%.
+- Ivy engine (now `treaty_ivy`, carved into 4 workspace crates under `libs/treaty-ivy/`): direct-to-Ivy,
+  470 tests; oracle 27/27; **compliance 170/185 of the runnable subset (91.9%) and climbing**. NOTE:
+  this is the runnable subset (185 cases), NOT the full 642-case corpus (the rest are
+  partial/ngDeclare-only, multi-file, or metadata shapes the source front-end does not yet model). Do
+  not claim 100%. **All decorator kinds** (`@Component/@Directive/@Pipe/@Injectable/@NgModule`) now
+  lower to Ivy AOT (no JIT) on every entry, including the unified `compile()` path.
+- **Angular Linker (link path) DONE**: partial `ɵɵngDeclare*` → AOT `ɵɵdefine*` in Rust
+  (`libs/treaty-ivy/facade/src/linker.rs` + NAPI `linkPartial`); links real `@angular/*` + CDK/Material
+  to ZERO residual `ɵɵngDeclare` (no `@angular/compiler`); wired into vite/rspack/rsbuild/rslib + the
+  `@treaty/vite` plugin, dev + prod. Both example apps build AND boot under e2e gates.
 - Authoring plugin layer: `.treaty` + JSX are peer authoring plugins → render3, with **full
   TS-expression support in JSX lowering** (`d68ce81`).
 - **v3 source maps end-to-end for every authoring format** — the base `@Component` `.ts` path plus
@@ -40,10 +46,11 @@ with dead-code elimination + file deletion), bundler plugins for **Vite / Rspack
 | SSR | ✅ | — |
 | SSG | ✅ DONE — `treaty_ssg` Rust core (getStaticPaths, head/SEO, hydration manifest, sitemap/robots) | G |
 | File routing (base + flexible) | ✅ DONE — `treaty_file_routing` Rust crate (`routes/` + `api/`) | — |
-| Authoring to Ivy (direct) | ✅ (render3, ~90/98 runnable / 91.8%) | A |
+| Authoring to Ivy (direct) | ✅ (`treaty_ivy`, 170/185 runnable / 91.9%; all decorators → AOT) | A |
+| Consuming Angular libs (linker) | ✅ link path — partial `ɵɵngDeclare*` → AOT, real `@angular/*` + CDK/Material to zero residual, wired into all bundlers dev+prod (prod server-fn hosting remaining) | C |
 | JSX authoring (selectorless, full TS expressions) | ✅ DONE | — |
 | Source maps (all formats, server-body privacy) | ✅ DONE — v3 maps for .treaty/.tsx/.tjsx/.ts | — |
-| Server-side function in component | ✅ DONE | done |
+| Server-side function in component | ✅ extracted + run in dev — `server{}`/file-level `'use server'`/`$$`/`use websocket` lifted to the backend, body stripped from client code AND source map, executed in dev over `/__server/*`; marker UNIFICATION + production hosting/real SSE-WS fan-out remaining | B/C |
 | function chunking | ✅ DONE — per-fn chunks + manifest across all 4 bundlers | B/C |
 | First-class Module Federation | ✅ DONE — auto zero-config + toggle + standalone eject | D |
 | VS Code extension + LSP | ✅ DONE — extension + grammars + Angular-file support | — |
@@ -59,10 +66,10 @@ bindings, providers, inputs/outputs), AND the file-by-file pipeline where that's
 compile. Beyond raising the runnable pass-rate, **EXPAND the runnable set** toward the full 642 (handle
 the currently-skipped cases where a comparable golden exists). The bar: **we KNOW we can compile ANY
 app.** Iterative rounds (analyze→fan-out by disjoint file→verify), oracle stays 27.
-**Status: 🏗️ underway — now 90/98 runnable (91.8%, `5953975`)**, up from 3 over ~13 rounds; not yet
-100% and the headline number is the runnable subset, not the full 642 corpus. Keep going. NOTE:
-compliance EDITS render3, so it cannot run concurrently with the Rust-crate wave (K/M build render3) —
-interleave them.
+**Status: 🏗️ underway — now 170/185 runnable (91.9%)**; not yet 100% and the headline number is the
+runnable subset, not the full 642 corpus. 15 matchGolden DIFFs remain (see `migration/STATUS.md` for
+the ranked gaps). Keep going. NOTE: compliance EDITS the Ivy crates, so it cannot run concurrently with
+the Rust-crate wave (K/M build them) — interleave them.
 
 **B. File-by-file compilation core** — a TS package `@treaty/compiler` wrapping the NAPI addon
 (`compileTreatyFile`/`compileComponentSource`) with: a `transform(id, code)→IvyJS` per-file API,
@@ -75,7 +82,10 @@ applies to `.treaty`, JSX (`.tsx`/`.tjsx`), AND **standard Angular `.ts`** — s
 Angular still benefits from Treaty's fast direct-to-Ivy file-by-file compile + dead-code/file-deletion.
 It must handle **every Angular decorator kind** found in a `.ts` (`@Component`, `@Directive`, `@Pipe`,
 `@Injectable`, `@NgModule`), compiling each to Ivy, and **pass through non-Angular TS unchanged**
-(return null so the bundler's normal TS handling applies).
+(return null so the bundler's normal TS handling applies). **Status: all-decorators → Ivy AOT is DONE**
+— every decorator kind lowers to `ɵɵdefine*` (no JIT) on every entry, including the unified `compile()`
+path; verified by the everything-app source-validate e2e (parses each emit and asserts no surviving
+Angular decorator node).
 
 **Expose render3 directly via NAPI (user 2026-05-30):** the current addon (`libs/authoring/node`) wraps
 `apps/rust/authoring`'s three entry points and uses `render3` only transitively. Add a **render3 NAPI
@@ -89,6 +99,11 @@ reimplementation). Sequenced with H (touches NAPI + render3 + core; after Wave 1
 **C. Bundler plugins** — each a new package consuming B:
 `@treaty/vite`, `@treaty/rspack`, `@treaty/rsbuild`, `@treaty/rslib`. Per-file transform + HMR/watch +
 handle file deletion + production build (build-to-deploy output). Territory: `libs/treaty/{vite,rspack,rsbuild,rslib}` (new, disjoint per package).
+**Status: ✅ core DONE across all four plugins** — per-file transform; the Angular **linker** runs over
+partial `node_modules` libs (dev + prod, zero residual `ɵɵngDeclare`); file routing surfaces as a
+build-time `virtual:treaty-routes` module; `.treaty`/`.tjsx` are served as JS in dev (MIME fixed); and a
+dev backend runs server fns over `/__server/*` (SSR-loaded body, no client leak). Both example apps
+build + boot under e2e gates. REMAINING: production (non-dev) backend hosting + real SSE/WS fan-out.
 
 **D. Module Federation (latest, AUTOMATIC + zero-config — user 2026-05-30) — 🏗️ underway (toggle +
 standalone eject landed `93d64d8`):** `@module-federation/enhanced` integrated out-of-the-box across the bundler plugins (Rspack native MF;
