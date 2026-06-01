@@ -32,6 +32,41 @@ export declare function compileComponent(template: string, selector: string, cla
  */
 export declare function compileComponentSource(source: string): CompiledComponent
 /**
+ * One component class's host-resolved external `templateUrl`/`styleUrls` content, passed into
+ * [`compile_component_source_resolved`].
+ *
+ * RUST-CORE / TS-SHIM BOUNDARY: the compiler does NOT read files. A bundler plugin resolves the
+ * `templateUrl` / `styleUrls` / `styleUrl` paths against the importing module, reads the files, and
+ * supplies their contents here keyed by the component's `class_name` (so a multi-class file
+ * resolves each component independently).
+ */
+export interface ResolvedComponent {
+  /** The component class identifier the resolved content belongs to (e.g. `"AppComponent"`). */
+  className: string
+  /**
+   * The resolved template HTML for a `templateUrl` component. `undefined`/absent leaves a
+   * `templateUrl` component erroring (never a silent empty template).
+   */
+  template?: string
+  /**
+   * The resolved style strings for `styleUrls`/`styleUrl`, in declaration order. Appended after
+   * any inline `styles:[...]`, matching ngtsc's ordering.
+   */
+  styles: Array<string>
+}
+/**
+ * Compile an Angular `@Component`/`@Directive` class from TypeScript SOURCE, supplying the
+ * host-resolved external `templateUrl`/`styleUrls` content per component class.
+ *
+ * Identical to [`compile_component_source`] except the caller passes `resolved` — one
+ * [`ResolvedComponent`] per component class whose external `templateUrl`/`styleUrls` it read from
+ * disk. A `templateUrl` component WITHOUT a supplied resolved template still errors (no silent
+ * empty template); a `styleUrls` component compiles to the SAME `ɵɵdefineComponent` as the inline
+ * `styles:[...]` equivalent. This entry runs no source-map pipeline (it mirrors the resolution-free
+ * `compile_component_source` shape).
+ */
+export declare function compileComponentSourceResolved(source: string, resolved: Array<ResolvedComponent>): CompiledComponent
+/**
  * Link an Angular **partial-declaration** module directly to its full AOT form.
  *
  * Published Angular libraries ship *partial*-compiled: classes emit `ɵɵngDeclare*({...})` calls

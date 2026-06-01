@@ -8,6 +8,10 @@ use treaty_file_routing::{
 use treaty_ivy::compile::compile_component as r3_compile_component;
 use treaty_ivy::linker::link_partial as r3_link_partial;
 use treaty_ivy::source_compile::compile_component_source_with_map as r3_compile_component_source_with_map;
+use treaty_ivy::source_compile::{
+    compile_component_source_with_resolved as r3_compile_component_source_with_resolved,
+    ResolvedComponentContent, ResolvedContentMap,
+};
 
 /// Normalize render3's empty-string "no map" sentinel into `None` (it never emits `{}`).
 fn map_or_none(map: String) -> Option<String> {
@@ -62,6 +66,57 @@ pub fn compile_component_source(source: String) -> CompiledComponent {
         code: result.code,
         errors: result.errors,
         map: map_or_none(result.map),
+    }
+}
+
+/// One component class's host-resolved external `templateUrl`/`styleUrls` content, passed into
+/// [`compile_component_source_resolved`].
+///
+/// RUST-CORE / TS-SHIM BOUNDARY: the compiler does NOT read files. A bundler plugin resolves the
+/// `templateUrl` / `styleUrls` / `styleUrl` paths against the importing module, reads the files, and
+/// supplies their contents here keyed by the component's `class_name` (so a multi-class file
+/// resolves each component independently).
+#[napi(object)]
+pub struct ResolvedComponent {
+    /// The component class identifier the resolved content belongs to (e.g. `"AppComponent"`).
+    pub class_name: String,
+    /// The resolved template HTML for a `templateUrl` component. `undefined`/absent leaves a
+    /// `templateUrl` component erroring (never a silent empty template).
+    pub template: Option<String>,
+    /// The resolved style strings for `styleUrls`/`styleUrl`, in declaration order. Appended after
+    /// any inline `styles:[...]`, matching ngtsc's ordering.
+    pub styles: Vec<String>,
+}
+
+/// Compile an Angular `@Component`/`@Directive` class from TypeScript SOURCE, supplying the
+/// host-resolved external `templateUrl`/`styleUrls` content per component class.
+///
+/// Identical to [`compile_component_source`] except the caller passes `resolved` — one
+/// [`ResolvedComponent`] per component class whose external `templateUrl`/`styleUrls` it read from
+/// disk. A `templateUrl` component WITHOUT a supplied resolved template still errors (no silent
+/// empty template); a `styleUrls` component compiles to the SAME `ɵɵdefineComponent` as the inline
+/// `styles:[...]` equivalent. This entry runs no source-map pipeline (it mirrors the resolution-free
+/// `compile_component_source` shape).
+#[napi]
+pub fn compile_component_source_resolved(
+    source: String,
+    resolved: Vec<ResolvedComponent>,
+) -> CompiledComponent {
+    let mut map: ResolvedContentMap = ResolvedContentMap::with_capacity(resolved.len());
+    for entry in resolved {
+        map.insert(
+            entry.class_name,
+            ResolvedComponentContent {
+                template: entry.template,
+                styles: entry.styles,
+            },
+        );
+    }
+    let result = r3_compile_component_source_with_resolved(&source, &map);
+    CompiledComponent {
+        code: result.code,
+        errors: result.errors,
+        map: None,
     }
 }
 

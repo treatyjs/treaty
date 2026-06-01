@@ -45,13 +45,32 @@ pub struct ClassMeta<'a> {
     pub class_name_span: ParseSourceSpan,
 }
 
+/// Host-resolved external content for ONE `@Component` class: the template string its `templateUrl`
+/// resolves to and the style strings its `styleUrls`/`styleUrl` resolve to. File I/O and path
+/// resolution are HOST/bundler concerns; the compiler consumes the already-read contents. See
+/// `source_compile`'s `ResolvedComponentContent` (the facade re-export of this type).
+#[derive(Debug, Clone, Default)]
+pub struct ResolvedComponentContent {
+    /// The resolved template HTML for a `templateUrl` component (`None` leaves it erroring).
+    pub template: Option<String>,
+    /// The resolved style strings for `styleUrls`/`styleUrl`, in declaration order.
+    pub styles: Vec<String>,
+}
+
+/// Per-file map from a `@Component` class name to its host-resolved external content. Keyed by class
+/// name so multi-class files resolve each component independently.
+pub type ResolvedContentMap = std::collections::HashMap<String, ResolvedComponentContent>;
+
 /// Cross-class context shared by every class in a file, needed to resolve template dependencies in
 /// a multi-class module. `auto_import_candidates` is the union of the file's imported names and the
 /// sibling class names (for selectorless auto-import); `sibling_directives` is every sibling
 /// `@Directive`/`@Component` carrying a non-empty `selector` (for cross-class CSS-selector matching).
+/// `resolved_content` carries, per component class name, the host-resolved `templateUrl`/`styleUrls`
+/// contents (`None` when the caller supplied no resolution channel — inline-only compilation).
 pub struct CompileCtx<'a> {
     pub auto_import_candidates: &'a [String],
     pub sibling_directives: &'a [crate::binder::SelectorDirective],
+    pub resolved_content: Option<&'a ResolvedContentMap>,
 }
 
 /// The Ivy emit of ONE decorated class, decomposed so the original module can be re-assembled

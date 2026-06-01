@@ -7,10 +7,16 @@
 //! [`crate::view::compiler::compile_component_from_metadata`] emitter (via the same
 //! [`crate::compile::RealTemplateBuilder`] glue used by [`crate::compile::compile_component`]).
 //!
-//! Metadata kinds that are NOT yet extractable (`providers`, `viewProviders`, `@ViewChild`/query
-//! decorators, `host` bindings, `hostDirectives`, multi-class files, external `templateUrl`)
-//! cause this function to return a [`CompiledComponent`] with a clear `errors` entry rather than
-//! silently mis-compiling — the harness can then skip/relog those cases.
+//! Metadata kinds that are NOT yet extractable cause this function to return a
+//! [`CompiledComponent`] with a clear `errors` entry rather than silently mis-compiling — the
+//! harness can then skip/relog those cases.
+//!
+//! External `templateUrl` / `styleUrls` / `styleUrl` are supported through a HOST-resolved content
+//! channel ([`ResolvedContentMap`] / [`compile_component_source_with_resolved`]): the compiler does
+//! not read files (path resolution + file I/O are bundler concerns — the rust-core / ts-shim
+//! boundary), so the caller resolves the paths, reads the files, and supplies their contents keyed
+//! by class name. A `templateUrl` component WITHOUT a supplied resolved template is a clear error,
+//! never a silent empty template.
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
@@ -53,6 +59,19 @@ fn err(msg: impl Into<String>) -> CompiledComponent {
         errors: vec![msg.into()],
     }
 }
+
+/// The host-resolved external content for ONE `@Component` class — the template string the
+/// component's `templateUrl` resolves to and the style strings its `styleUrls`/`styleUrl` resolve
+/// to.
+///
+/// The compiler intentionally does NOT read files: path resolution and file I/O are HOST/bundler
+/// concerns (the rust-core / ts-shim boundary — see this module's docs). A bundler plugin resolves
+/// the `templateUrl`/`styleUrls` paths, reads the files, and supplies their contents here keyed by
+/// the component's class name (so a multi-class file resolves each class independently). The
+/// compiler then treats `template` exactly as it would an inline `template:` and `styles` exactly as
+/// it would an inline `styles:[...]` entry. Defined in the `decorators` crate (it rides on
+/// [`CompileCtx`]) and re-exported here as the public surface.
+pub use crate::decorators::registry::{ResolvedComponentContent, ResolvedContentMap};
 
 /// Build the class self-reference (`value`/`ty`), stamping the original-source `span` of
 /// the class name onto the `value` read. The `value` read is the one cloned into the
@@ -1335,7 +1354,31 @@ pub fn compile_component_source(ts_source: &str) -> CompiledComponent {
         return err(format!("parse error: {}", msgs.join("; ")));
     }
 
-    compile_program_with_source(&ret.program, Some(ts_source), None)
+    compile_program_with_source(&ret.program, Some(ts_source), None, None)
+}
+
+/// Compile a TypeScript source string, supplying host-resolved external `templateUrl`/`styleUrls`
+/// content per component class.
+///
+/// Identical to [`compile_component_source`] except that `resolved` carries the template/style
+/// strings a bundler plugin read from the files referenced by each component's `templateUrl` /
+/// `styleUrls` / `styleUrl`. A `templateUrl` component WITHOUT a resolved template still errors (no
+/// silent empty template); a `styleUrls` component without resolved styles compiles with only its
+/// inline `styles:[...]` (the missing files simply contribute nothing).
+pub fn compile_component_source_with_resolved(
+    ts_source: &str,
+    resolved: &ResolvedContentMap,
+) -> CompiledComponent {
+    let allocator = Allocator::default();
+    let source_type = SourceType::default().with_typescript(true);
+    let ret = Parser::new(&allocator, ts_source, source_type).parse();
+
+    if !ret.errors.is_empty() {
+        let msgs: Vec<String> = ret.errors.iter().map(|e| e.to_string()).collect();
+        return err(format!("parse error: {}", msgs.join("; ")));
+    }
+
+    compile_program_with_source(&ret.program, Some(ts_source), None, Some(resolved))
 }
 
 /// Context for additive source-map emission: the original authoring source text plus the
@@ -1394,8 +1437,12 @@ pub fn compile_component_source_with_map(
         source_content: ts_source,
     };
     let mut map_out = String::new();
-    let compiled =
-        compile_program_with_source(&ret.program, Some(ts_source), Some((&ctx, &mut map_out)));
+    let compiled = compile_program_with_source(
+        &ret.program,
+        Some(ts_source),
+        Some((&ctx, &mut map_out)),
+        None,
+    );
     CompiledComponentWithMap {
         code: compiled.code,
         map: map_out,
@@ -1785,6 +1832,7 @@ fn compile_program_with_source(
     program: &Program,
     source: Option<&str>,
     map: Option<(&MapContext, &mut String)>,
+    resolved: Option<&ResolvedContentMap>,
 ) -> CompiledComponent {
     let imported_names = collect_imported_names(program);
 
@@ -1841,6 +1889,7 @@ fn compile_program_with_source(
             dec,
             &auto_import_candidates,
             &sibling_directives,
+            resolved,
         ) {
             Ok(emit) => {
                 errors.extend(emit.errors.clone());
@@ -2016,6 +2065,7 @@ impl DecoratorCompiler for ComponentCompiler {
             c.class_name_span.clone(),
             ctx.auto_import_candidates,
             ctx.sibling_directives,
+            ctx.resolved_content,
         )
     }
 }
@@ -2037,6 +2087,7 @@ impl DecoratorCompiler for DirectiveCompiler {
             c.class_name_span.clone(),
             ctx.auto_import_candidates,
             ctx.sibling_directives,
+            ctx.resolved_content,
         )
     }
 }
@@ -2293,6 +2344,7 @@ fn compile_decorated_class(
     dec: &Decorator,
     auto_import_candidates: &[String],
     sibling_directives: &[crate::binder::SelectorDirective],
+    resolved_content: Option<&ResolvedContentMap>,
 ) -> Result<ClassEmit, String> {
     let (class_name, class_name_span) = match &class.id {
         Some(id) => (
@@ -2312,6 +2364,7 @@ fn compile_decorated_class(
     let ctx = CompileCtx {
         auto_import_candidates,
         sibling_directives,
+        resolved_content,
     };
 
     // MULTI-DECORATOR dispatch: ngtsc compiles EVERY recognized trait on a class, not only the
@@ -2398,16 +2451,18 @@ fn compile_component_or_directive(
     class_name_span: ParseSourceSpan,
     auto_import_candidates: &[String],
     sibling_directives: &[crate::binder::SelectorDirective],
+    resolved_content: Option<&ResolvedContentMap>,
 ) -> Result<ClassEmit, String> {
+    // The host-resolved external content for THIS class (keyed by class name), if the caller wired
+    // the resolution channel and supplied an entry. Used to back `templateUrl`/`styleUrls`.
+    let resolved = resolved_content.and_then(|m| m.get(&class_name));
+
     // Reject decorator-level metadata we cannot yet model.
     if let Some(obj) = obj {
         for k in UNSUPPORTED_DECORATOR_KEYS {
             if find_prop(obj, k).is_some() {
                 return Err(format!("unsupported @{:?} metadata key: {k}", kind));
             }
-        }
-        if find_prop(obj, "templateUrl").is_some() {
-            return Err("external templateUrl unsupported (inline `template` only)".to_string());
         }
     }
 
@@ -2417,12 +2472,37 @@ fn compile_component_or_directive(
         .and_then(string_value);
 
     // template (components only). Directives have no template.
-    let template_html = obj
+    //
+    // Resolution order matches ngtsc's "template OR templateUrl" (a component declares one):
+    //   * an inline `template:` string is used directly;
+    //   * otherwise a `templateUrl:` is satisfied by the HOST-RESOLVED template the caller supplied
+    //     for this class — file reading is the bundler's job (rust-core / ts-shim boundary). When a
+    //     `templateUrl` is declared but no resolved template was supplied, this is a clear error (NOT
+    //     a silent empty template).
+    let has_template_url = obj
+        .and_then(|o| find_prop(o, "templateUrl"))
+        .is_some();
+    let inline_template = obj
         .and_then(|o| find_prop(o, "template"))
         .and_then(string_value);
+    let template_html = match inline_template {
+        Some(t) => Some(t),
+        None if has_template_url => match resolved.and_then(|r| r.template.clone()) {
+            Some(t) => Some(t),
+            None => {
+                return Err(
+                    "external templateUrl has no resolved template (the host must supply the \
+                     resolved template content for this component)"
+                        .to_string(),
+                )
+            }
+        },
+        None => None,
+    };
 
     if kind == TopLevel::Component && template_html.is_none() {
-        // A component with a non-string `template` (or none) — bail rather than mis-compile.
+        // A component with neither an inline string `template` nor a (resolved) `templateUrl` — bail
+        // rather than mis-compile.
         return Err("component has no inline string `template`".to_string());
     }
 
@@ -2449,11 +2529,20 @@ fn compile_component_or_directive(
         .unwrap_or(ChangeDetectionStrategy::Default);
 
     // styles: ['...', ...] — inline component styles. Threaded into the definition `styles:[...]`
-    // array (and, for emulated encapsulation, scoped) by the emitter.
-    let styles = obj
+    // array (and, for emulated encapsulation, scoped) by the emitter. The HOST-RESOLVED `styleUrls`/
+    // `styleUrl` file contents (supplied by the caller for this class) are appended AFTER the inline
+    // styles, matching ngtsc's ordering (inline `styles` first, then `styleUrls` file contents) — a
+    // `styleUrls` component thus emits the same `styles:[...]` as the inline-equivalent. When no
+    // resolved styles were supplied (the caller wired no channel, or the files were empty), the
+    // component compiles with only its inline styles — a missing style file simply contributes
+    // nothing (it has no DI / correctness impact, unlike a missing template).
+    let mut styles = obj
         .and_then(|o| find_prop(o, "styles"))
         .and_then(string_array_value)
         .unwrap_or_default();
+    if let Some(resolved) = resolved {
+        styles.extend(resolved.styles.iter().cloned());
+    }
 
     // encapsulation: ViewEncapsulation.X — defaults to Emulated (Angular's `null → Emulated`).
     let encapsulation = obj
@@ -3576,6 +3665,124 @@ mod tests {
             out.errors.iter().any(|e| e.contains("templateUrl")),
             "expected templateUrl error; got {:?}",
             out.errors
+        );
+    }
+
+    #[test]
+    fn template_url_with_resolved_matches_inline() {
+        // A `templateUrl` component compiled WITH the host-resolved template content must emit the
+        // SAME `ɵɵdefineComponent` as the inline-`template` equivalent (the resolution channel only
+        // supplies the string the file would have held; the emit path is identical thereafter).
+        let html = "<h1>{{title}}</h1><p>hi</p>";
+        let inline = format!(
+            r#"@Component({{selector:"a",template:"{html}"}}) export class C {{ title = 'x'; }}"#
+        );
+        let inline_out = compile_component_source(&inline);
+        assert!(
+            inline_out.errors.is_empty(),
+            "inline errors: {:?}",
+            inline_out.errors
+        );
+
+        let external = r#"@Component({selector:"a",templateUrl:"./c.html"}) export class C { title = 'x'; }"#;
+        let mut resolved = ResolvedContentMap::new();
+        resolved.insert(
+            "C".to_string(),
+            ResolvedComponentContent {
+                template: Some(html.to_string()),
+                styles: Vec::new(),
+            },
+        );
+        let ext_out = compile_component_source_with_resolved(external, &resolved);
+        assert!(ext_out.errors.is_empty(), "ext errors: {:?}", ext_out.errors);
+        assert_eq!(
+            normalize_ws(&ext_out.code),
+            normalize_ws(&inline_out.code),
+            "templateUrl+resolved must match inline template emit"
+        );
+    }
+
+    #[test]
+    fn template_url_without_resolved_entry_errors() {
+        // A resolution map that is present but carries NO entry for this class (e.g. resolution
+        // failed) must still error — never a silent empty template.
+        let external = r#"@Component({selector:"a",templateUrl:"./c.html"}) export class C {}"#;
+        let resolved = ResolvedContentMap::new();
+        let out = compile_component_source_with_resolved(external, &resolved);
+        assert!(out.code.is_empty(), "expected no code; got: {}", out.code);
+        assert!(
+            out.errors.iter().any(|e| e.contains("resolved template")),
+            "expected resolved-template error; got {:?}",
+            out.errors
+        );
+    }
+
+    #[test]
+    fn style_urls_resolved_match_inline_styles() {
+        // `styleUrls` with host-resolved style contents must emit the SAME `styles:[...]` as the
+        // inline-`styles` equivalent (resolved styles appended after inline styles, ngtsc order).
+        let style_a = "div.cool { color: blue; }";
+        let style_b = ":host.nice p { color: gold; }";
+        let inline = format!(
+            r#"@Component({{selector:"my-component",styles:['{style_a}','{style_b}'],template:'...',standalone:false}}) export class MyComponent {{}}"#
+        );
+        let inline_out = compile_component_source(&inline);
+        assert!(
+            inline_out.errors.is_empty(),
+            "inline errors: {:?}",
+            inline_out.errors
+        );
+
+        let external = r#"@Component({selector:"my-component",styleUrls:['./a.css','./b.css'],template:'...',standalone:false}) export class MyComponent {}"#;
+        let mut resolved = ResolvedContentMap::new();
+        resolved.insert(
+            "MyComponent".to_string(),
+            ResolvedComponentContent {
+                template: None,
+                styles: vec![style_a.to_string(), style_b.to_string()],
+            },
+        );
+        let ext_out = compile_component_source_with_resolved(external, &resolved);
+        assert!(ext_out.errors.is_empty(), "ext errors: {:?}", ext_out.errors);
+        assert_eq!(
+            normalize_ws(&ext_out.code),
+            normalize_ws(&inline_out.code),
+            "styleUrls+resolved must match inline styles emit"
+        );
+    }
+
+    #[test]
+    fn inline_styles_then_resolved_style_urls_concat() {
+        // A component declaring BOTH inline `styles` AND `styleUrl` (singular): the inline style
+        // comes first, then the resolved style-file content — matching ngtsc's inline-then-file
+        // ordering.
+        let inline_style = "a{color:red}";
+        let file_style = "b{color:green}";
+        let inline_equiv = format!(
+            r#"@Component({{selector:"c",styles:['{inline_style}','{file_style}'],template:'x'}}) export class C {{}}"#
+        );
+        let inline_out = compile_component_source(&inline_equiv);
+        assert!(
+            inline_out.errors.is_empty(),
+            "inline errors: {:?}",
+            inline_out.errors
+        );
+
+        let external = r#"@Component({selector:"c",styles:['a{color:red}'],styleUrl:'./c.css',template:'x'}) export class C {}"#;
+        let mut resolved = ResolvedContentMap::new();
+        resolved.insert(
+            "C".to_string(),
+            ResolvedComponentContent {
+                template: None,
+                styles: vec![file_style.to_string()],
+            },
+        );
+        let ext_out = compile_component_source_with_resolved(external, &resolved);
+        assert!(ext_out.errors.is_empty(), "ext errors: {:?}", ext_out.errors);
+        assert_eq!(
+            normalize_ws(&ext_out.code),
+            normalize_ws(&inline_out.code),
+            "inline styles + resolved styleUrl must concat in order"
         );
     }
 
