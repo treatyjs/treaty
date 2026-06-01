@@ -16,7 +16,14 @@
     "lint": "turbo run lint",
     "test": "turbo run test"
   },
+  "devDependencies": {
+    "@typescript/native-preview": "^7.0.0-dev.20260527.2",
+    "oxlint": "^1.67.0",
+    "turbo": "^2.9.16",
+    "typescript": "^5.9.0"
+  },
   "engines": {
     "node": ">=20"
-  }
+  },
+  "packageManager": "bun@1.4.0"
 }
