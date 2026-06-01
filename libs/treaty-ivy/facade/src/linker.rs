@@ -220,6 +220,67 @@ fn convert_expr(expr: &Expression) -> Option<Expr> {
             Some(callee.instantiate(args))
         }
         Expression::ParenthesizedExpression(p) => convert_expr(&p.expression),
+        // Arrow functions appear as `useFactory: () => new X(inject(Dep))`. Only
+        // expression-bodied (or single-`return`) arrows are faithfully convertible
+        // to the output IR; multi-statement bodies are left unconverted (→ `None`,
+        // surfaced as an explicit link error rather than wrong code).
+        Expression::ArrowFunctionExpression(arrow) => {
+            let params = convert_params(&arrow.params)?;
+            let body = convert_arrow_body(arrow)?;
+            Some(o::arrow_fn(params, body, None))
+        }
+        // `function (…) { return …; }` factory functions convert to a FunctionExpr.
+        Expression::FunctionExpression(func) => {
+            let params = convert_params(&func.params)?;
+            let body_block = func.body.as_ref()?;
+            let body = convert_return_only_block(&body_block.statements)?;
+            Some(o::fn_(params, body, None, None))
+        }
+        _ => None,
+    }
+}
+
+/// Convert a parameter list to [`o::FnParam`]s. Only plain identifier bindings are
+/// supported (no destructuring / defaults / rest); anything else → `None`.
+fn convert_params(params: &oxc_ast::ast::FormalParameters) -> Option<Vec<o::FnParam>> {
+    if params.rest.is_some() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(params.items.len());
+    for item in &params.items {
+        let id = item.pattern.get_binding_identifier()?;
+        out.push(o::FnParam::new(id.name.to_string(), None));
+    }
+    Some(out)
+}
+
+/// Convert an arrow's body: an expression body (`() => expr`) maps to
+/// [`ArrowBody::Expr`]; a single-`return` block (`() => { return expr; }`) is
+/// folded to the same expression form (matching how the emitter would print it).
+/// Any other block shape → `None`.
+fn convert_arrow_body(arrow: &oxc_ast::ast::ArrowFunctionExpression) -> Option<o::ArrowBody> {
+    if arrow.expression {
+        if let Some(Statement::ExpressionStatement(stmt)) = arrow.body.statements.first() {
+            return Some(o::ArrowBody::Expr(Box::new(convert_expr(&stmt.expression)?)));
+        }
+        return None;
+    }
+    let expr = single_return_expr(&arrow.body.statements)?;
+    Some(o::ArrowBody::Expr(Box::new(expr)))
+}
+
+/// Convert a `function` body that is exactly `{ return <expr>; }` to a one-statement
+/// `[return <converted expr>;]` block. Any other shape → `None`.
+fn convert_return_only_block(statements: &[Statement]) -> Option<Vec<o::Stmt>> {
+    let expr = single_return_expr(statements)?;
+    Some(vec![o::Stmt::bare(o::StmtKind::Return(expr))])
+}
+
+/// The single returned expression of a one-statement `{ return <expr>; }` body, or
+/// `None` if the body is not exactly one `return` of a convertible expression.
+fn single_return_expr(statements: &[Statement]) -> Option<Expr> {
+    match statements {
+        [Statement::ReturnStatement(ret)] => convert_expr(ret.argument.as_ref()?),
         _ => None,
     }
 }
@@ -1226,5 +1287,194 @@ i0.ɵɵngDeclareClassMetadata({ minVersion: "12.0.0", version: "21.2.15", ngImpo
             );
         }
         assert_reparses(&out.code);
+    }
+
+    // ---------------------------------------------------------------------
+    // Real published-library integration (Phase 3). These exercise
+    // `link_partial` against the actual `@angular/common` fesm2022 chunks that
+    // ship in `node_modules`, proving the linker de-partials real libraries —
+    // most importantly the `_location` chunk whose partial `ɵɵngDeclare*` calls
+    // are the ones that previously forced a JIT fallback (and the JIT error).
+    // Every test degrades gracefully (returns / skips) when the package is not
+    // installed, so the suite stays hermetic in minimal checkouts.
+    // ---------------------------------------------------------------------
+
+    /// The `ɵɵngDeclare` partial marker (`ɵɵ` + `ngDeclare`), built at runtime so
+    /// this file's own assertions never contain the literal substring being
+    /// searched for in linked output.
+    fn declare_marker() -> String {
+        format!("{}{}ngDeclare", '\u{0275}', '\u{0275}')
+    }
+
+    /// Resolve a `node_modules` directory relative to this crate, canonicalized
+    /// so the embedded `..` segments resolve reliably on Windows.
+    fn node_modules_dir(rel: &str) -> std::path::PathBuf {
+        let raw = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../node_modules")
+            .join(rel);
+        std::fs::canonicalize(&raw).unwrap_or(raw)
+    }
+
+    /// Assert linked output is fully de-partialed: no `ɵɵngDeclare` marker
+    /// survives, it never pulls in `@angular/compiler` (i.e. no JIT), and it
+    /// still parses as a valid ES module (after folding the barred-o to ASCII to
+    /// sidestep oxc 0.133's `ɵ`-in-member-expression parser gap — see
+    /// [`assert_reparses`]).
+    fn assert_fully_linked(linked: &str, name: &str) {
+        assert!(
+            !linked.contains(&declare_marker()),
+            "{name}: a partial-declaration marker survived linking"
+        );
+        assert!(
+            !linked.contains("@angular/compiler"),
+            "{name}: linked output still references @angular/compiler (JIT not eliminated)"
+        );
+        assert_reparses(linked);
+    }
+
+    /// Link the real `_location` chunk of `@angular/common` — the exact path
+    /// that raised the reported JIT error (it carries Factory, Injectable,
+    /// Injector and NgModule partial declarations). It must link to a fully
+    /// de-partialed, JIT-free, re-parseable module with the expected
+    /// `ɵɵdefine*`/`ɵfac` outputs. The chunk filename can carry a build hash, so
+    /// it is discovered dynamically.
+    #[test]
+    fn links_real_common_location_di_chunk() {
+        let dir = node_modules_dir("@angular/common/fesm2022");
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            eprintln!("skipping links_real_common_location_di_chunk: {} absent", dir.display());
+            return;
+        };
+        let marker = declare_marker();
+        let mut linked_location = false;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            if !name.contains("location")
+                || path.extension().and_then(|e| e.to_str()) != Some("mjs")
+            {
+                continue;
+            }
+            let Ok(code) = std::fs::read_to_string(&path) else { continue };
+            if !code.contains(&marker) {
+                continue;
+            }
+            let out = link_partial(&code, &name);
+            assert!(out.errors.is_empty(), "{name}: link errors: {:?}", out.errors);
+            assert_fully_linked(&out.code, &name);
+            assert!(
+                out.code.contains(&format!("{}{}defineInjectable", '\u{0275}', '\u{0275}')),
+                "{name}: expected a linked defineInjectable"
+            );
+            // Factory declarations become a factory function assigned to `ɵfac`.
+            assert!(out.code.contains('\u{0275}'), "{name}: expected linked ɵ-prefixed members");
+            linked_location = true;
+        }
+        assert!(
+            linked_location,
+            "no @angular/common *location* chunk with partial DI declarations was found in {}",
+            dir.display()
+        );
+    }
+
+    /// Sweep every fesm2022 chunk of `@angular/common`: each chunk that carries
+    /// DI/pipe partial declarations (i.e. is NOT component/directive-only) must
+    /// link without error to a JIT-free, re-parseable module with no surviving
+    /// DI/pipe markers. At least one such chunk must exist, proving the linker
+    /// runs over the real published library — not just hand-written fixtures.
+    #[test]
+    fn links_every_di_pipe_chunk_in_angular_common() {
+        let dir = node_modules_dir("@angular/common/fesm2022");
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            eprintln!("skipping links_every_di_pipe_chunk_in_angular_common: {} absent", dir.display());
+            return;
+        };
+        let prefix = format!("{}{}", '\u{0275}', '\u{0275}');
+        // The DI + pipe kinds this front-end owns and must fully eliminate.
+        let di_pipe_kinds = [
+            format!("{prefix}ngDeclareFactory"),
+            format!("{prefix}ngDeclareInjectable"),
+            format!("{prefix}ngDeclareInjector"),
+            format!("{prefix}ngDeclareNgModule"),
+            format!("{prefix}ngDeclarePipe"),
+            format!("{prefix}ngDeclareClassMetadata"),
+        ];
+        let mut linked_chunks = 0usize;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("mjs") {
+                continue;
+            }
+            let Ok(code) = std::fs::read_to_string(&path) else { continue };
+            let has_di_pipe = di_pipe_kinds.iter().any(|k| code.contains(k));
+            if !has_di_pipe {
+                continue;
+            }
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            let out = link_partial(&code, &name);
+            assert!(out.errors.is_empty(), "{name}: link errors: {:?}", out.errors);
+            assert!(
+                !out.code.contains("@angular/compiler"),
+                "{name}: linked output references @angular/compiler"
+            );
+            for kind in &di_pipe_kinds {
+                assert!(
+                    !out.code.contains(kind.as_str()),
+                    "{name}: {kind} survived linking"
+                );
+            }
+            assert_reparses(&out.code);
+            linked_chunks += 1;
+        }
+        assert!(
+            linked_chunks > 0,
+            "no @angular/common chunk carried DI/pipe partial declarations in {}",
+            dir.display()
+        );
+    }
+
+    /// At least one real chunk must carry a partial `ɵɵngDeclarePipe` and link
+    /// it to a `ɵɵdefinePipe` (the pipe kind is owned by this DI+pipe
+    /// front-end). `common.mjs` bundles `AsyncPipe`, `DatePipe`, … which fit.
+    #[test]
+    fn links_real_common_pipe_to_define_pipe() {
+        let dir = node_modules_dir("@angular/common/fesm2022");
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            eprintln!("skipping links_real_common_pipe_to_define_pipe: {} absent", dir.display());
+            return;
+        };
+        let declare_pipe = format!("{}{}ngDeclarePipe", '\u{0275}', '\u{0275}');
+        let define_pipe = format!("{}{}definePipe", '\u{0275}', '\u{0275}');
+        let mut found = false;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("mjs") {
+                continue;
+            }
+            let Ok(code) = std::fs::read_to_string(&path) else { continue };
+            if !code.contains(&declare_pipe) {
+                continue;
+            }
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            let out = link_partial(&code, &name);
+            assert!(out.errors.is_empty(), "{name}: link errors: {:?}", out.errors);
+            assert!(
+                !out.code.contains(&declare_pipe),
+                "{name}: ngDeclarePipe survived linking"
+            );
+            assert!(
+                out.code.contains(&define_pipe),
+                "{name}: expected a linked definePipe"
+            );
+            assert!(
+                !out.code.contains("@angular/compiler"),
+                "{name}: linked pipe chunk references @angular/compiler"
+            );
+            assert_reparses(&out.code);
+            found = true;
+        }
+        if !found {
+            eprintln!("skipping: no @angular/common chunk carried a partial pipe declaration");
+        }
     }
 }
