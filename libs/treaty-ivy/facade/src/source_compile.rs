@@ -2700,8 +2700,8 @@ fn compile_ng_module_class(
     class_name: &str,
 ) -> Result<ClassEmit, String> {
     use crate::pipe_module_injector::{
-        compile_ng_module, R3NgModuleCommon, R3NgModuleMetadata, R3NgModuleMetadataGlobal,
-        R3SelectorScopeMode,
+        compile_injector, compile_ng_module, R3InjectorMetadata, R3NgModuleCommon,
+        R3NgModuleMetadata, R3NgModuleMetadataGlobal, R3SelectorScopeMode,
     };
 
     // Each scope array (`declarations`/`imports`/`exports`/`bootstrap`) is a list of bare class
@@ -2723,6 +2723,19 @@ fn compile_ng_module_class(
         .and_then(string_value)
         .map(|s| o::literal(LiteralValue::String(s), None));
 
+    // `schemas: [CUSTOM_ELEMENTS_SCHEMA | NO_ERRORS_SCHEMA, …]` is read for parity, but — exactly
+    // like ngtsc — it is NOT emitted onto the runtime `ɵɵdefineNgModule({...})` block. ngtsc's
+    // NgModule handler always forwards `schemas: []` to `R3NgModuleMetadata` (see
+    // `compiler-cli/.../ng_module/src/handler.ts`, marked `TODO: FW-1004`); the source `schemas`
+    // are consumed only for template type-checking diagnostics, never for emit. So we validate the
+    // entries (bare schema identifier refs) but keep the module def's `schemas` field `None`,
+    // matching the full/local goldens (`basic_full.js`, `all_options.js`), which carry NO `schemas`
+    // on the define block even when the source declares them.
+    let _schemas: Vec<DirRef> = obj
+        .and_then(|o| find_prop(o, "schemas"))
+        .map(identifier_refs)
+        .unwrap_or_default();
+
     let meta = R3NgModuleMetadata::Global(R3NgModuleMetadataGlobal {
         common: R3NgModuleCommon {
             r#type: directive_ref(class_name),
@@ -2740,13 +2753,68 @@ fn compile_ng_module_class(
     });
     let compiled = compile_ng_module(&meta);
 
+    // ── Injector (`ɵinj = ɵɵdefineInjector({ [providers], [imports] })`) ──────────────────────
+    // ngtsc emits an `ɵinj` static alongside every `ɵmod`. The source front-end has no cross-class
+    // type information, so it mirrors Angular's *local-compilation* injector path
+    // (`allowUnresolvedReferences` in the ngtsc NgModule handler): `providers` is carried through
+    // opaquely, and the injector's `imports` are the NgModule decorator's `imports` PLUS `exports`
+    // arrays expanded entry-by-entry (no directive/pipe filtering, which would require type info).
+    // `compile_injector` elides `providers`/`imports` when absent/empty, so a bare `@NgModule({})`
+    // still yields `ɵɵdefineInjector({})`.
+    let providers = match obj.and_then(|o| find_prop(o, "providers")) {
+        None => None,
+        Some(e) => match convert_expr(e) {
+            Some(expr) => Some(expr),
+            None => return Err("unsupported NgModule `providers` expression form".to_string()),
+        },
+    };
+    let mut injector_imports: Vec<Expr> = Vec::new();
+    for key in ["imports", "exports"] {
+        match obj.and_then(|o| find_prop(o, key)) {
+            None => {}
+            Some(Expression::ArrayExpression(arr)) => {
+                for el in &arr.elements {
+                    let Some(inner) = el.as_expression() else { continue };
+                    match convert_expr(inner) {
+                        Some(expr) => injector_imports.push(expr),
+                        None => {
+                            return Err(format!(
+                                "unsupported NgModule `{key}` entry expression form"
+                            ))
+                        }
+                    }
+                }
+            }
+            // A non-array `imports`/`exports` value is added as-is (ngtsc local-mode behaviour).
+            Some(other) => match convert_expr(other) {
+                Some(expr) => injector_imports.push(expr),
+                None => return Err(format!("unsupported NgModule `{key}` expression form")),
+            },
+        }
+    }
+    let injector = compile_injector(&R3InjectorMetadata {
+        name: class_name.to_string(),
+        r#type: directive_ref(class_name),
+        providers,
+        imports: injector_imports,
+    });
+    // `X.ɵinj = i0.ɵɵdefineInjector({...});` lands immediately AFTER `X.ɵmod` and BEFORE the
+    // `ɵɵsetNgModuleScope` / `ɵɵregisterNgModuleType` side effects (matching ngtsc's emit order).
+    let injector_stmt = o::variable(class_name, None)
+        .prop("\u{0275}inj")
+        .set(injector.expression)
+        .to_stmt();
+    let mut extra_statements = Vec::with_capacity(compiled.statements.len() + 1);
+    extra_statements.push(injector_stmt);
+    extra_statements.extend(compiled.statements);
+
     Ok(ClassEmit {
         class_name: class_name.to_string(),
         static_member: "\u{0275}mod",
         def_expression: compiled.expression,
-        // `compile_ng_module` emits the `ɵɵsetNgModuleScope` / `ɵɵregisterNgModuleType` side-effect
-        // statements; they belong AFTER the class's `ɵmod` assignment.
-        extra_statements: compiled.statements,
+        // `ɵinj` assignment then `compile_ng_module`'s `ɵɵsetNgModuleScope` / `ɵɵregisterNgModuleType`
+        // side-effect statements; all belong AFTER the class's `ɵmod` assignment.
+        extra_statements,
         extra_after_def: true,
         factory: Some(class_factory(class, class_name, FactoryTarget::NgModule)),
         errors: Vec::new(),
@@ -3990,6 +4058,123 @@ mod tests {
         assert!(f.contains("declarations:[CompA,CompB]"), "declarations wrong; got: {}", out.code);
         assert!(f.contains("imports:[CommonModule]"), "imports wrong; got: {}", out.code);
         assert!(f.contains("exports:[CompA]"), "exports wrong; got: {}", out.code);
+    }
+
+    #[test]
+    fn ng_module_always_emits_injector_alongside_module() {
+        // Every `@NgModule` emits both `ɵmod` and `ɵinj`; a bare module with no providers/imports
+        // still yields an empty `ɵɵdefineInjector({})` (ngtsc emits `ɵinj` unconditionally).
+        let src = r#"
+            @NgModule({})
+            export class EmptyModule {}
+        "#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let f = flat(&out.code);
+        assert!(
+            out.code.contains("\u{0275}\u{0275}defineNgModule"),
+            "no defineNgModule; got: {}",
+            out.code
+        );
+        assert!(
+            f.contains("EmptyModule.\u{0275}inj=") && f.contains("\u{0275}\u{0275}defineInjector({})"),
+            "expected empty ɵinj=defineInjector({{}}); got: {}",
+            out.code
+        );
+        // `ɵmod` must precede `ɵinj` (ngtsc emit order).
+        let mod_at = f.find("\u{0275}mod=").expect("no ɵmod assignment");
+        let inj_at = f.find("\u{0275}inj=").expect("no ɵinj assignment");
+        assert!(mod_at < inj_at, "ɵinj must follow ɵmod; got: {}", out.code);
+    }
+
+    #[test]
+    fn ng_module_injector_carries_providers_and_imports() {
+        // A module declaring `providers` + `imports` builds `ɵɵdefineInjector({ providers, imports })`:
+        // `providers` is carried through verbatim, and the injector's `imports` are the decorator's
+        // `imports` PLUS `exports` arrays expanded entry-by-entry (ngtsc local-compilation shape).
+        let src = r#"
+            @NgModule({
+                imports: [CommonModule, RouterModule],
+                exports: [SharedModule],
+                providers: [MyService, { provide: TOKEN, useClass: Impl }],
+            })
+            export class FeatureModule {}
+        "#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let f = flat(&out.code);
+        // The injector block holds providers (verbatim) and imports = imports ⧺ exports.
+        let inj = extract_args(&out.code, "\u{0275}\u{0275}defineInjector");
+        let inj_flat: String = inj.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            inj_flat.contains("providers:[MyService,{provide:TOKEN,useClass:Impl}]"),
+            "injector providers wrong; got: {}",
+            out.code
+        );
+        assert!(
+            inj_flat.contains("imports:[CommonModule,RouterModule,SharedModule]"),
+            "injector imports must be imports⧺exports entry-by-entry; got: {}",
+            out.code
+        );
+        // The module def still drives the selector-scope side effect for `imports`/`exports`.
+        assert!(
+            f.contains("\u{0275}\u{0275}setNgModuleScope"),
+            "no setNgModuleScope; got: {}",
+            out.code
+        );
+    }
+
+    #[test]
+    fn ng_module_schemas_are_read_but_not_emitted_on_def() {
+        // A module declaring `schemas` compiles cleanly, and — faithful to ngtsc — the schema
+        // identifiers are NOT emitted onto the `ɵɵdefineNgModule({...})` block (ngtsc forwards
+        // `schemas: []` to the module def; schemas drive template diagnostics only). The full/local
+        // goldens (basic_full.js, all_options.js) confirm: their source declares `schemas` but the
+        // define block carries none.
+        let src = r#"
+            @NgModule({
+                declarations: [CompA],
+                schemas: [CUSTOM_ELEMENTS_SCHEMA, NO_ERRORS_SCHEMA],
+            })
+            export class SchemaModule {}
+        "#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let mod_def = extract_args(&out.code, "\u{0275}\u{0275}defineNgModule");
+        assert!(
+            !mod_def.contains("schemas"),
+            "schemas must NOT appear on the define block (ngtsc parity); got: {}",
+            out.code
+        );
+        // The module still emits its `ɵmod` + `ɵinj` + declarations scope side effect.
+        let f = flat(&out.code);
+        assert!(f.contains("\u{0275}inj="), "no ɵinj; got: {}", out.code);
+        assert!(
+            f.contains("declarations:[CompA]"),
+            "declarations scope missing; got: {}",
+            out.code
+        );
+    }
+
+    /// Extract the balanced `({ ... })` argument slice of the FIRST `marker(...)` call in `code`.
+    fn extract_args(code: &str, marker: &str) -> String {
+        let at = code.find(marker).unwrap_or_else(|| panic!("no {marker} in: {code}"));
+        let bytes = code.as_bytes();
+        let open = code[at..].find('(').map(|o| at + o).expect("no '(' after marker");
+        let mut depth = 0i32;
+        for i in open..bytes.len() {
+            match bytes[i] {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return code[open..=i].to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+        code[open..].to_string()
     }
 
     #[test]
