@@ -37,6 +37,9 @@ import {
 	exportFederationConfig,
 	writeFederationConfig,
 	renderFederationConfigFile,
+	federatedModules,
+	toFederatedModuleInputs,
+	federatedModuleInputs,
 	DEFAULT_HOST_NAME,
 	DEFAULT_FILENAME,
 } from '../dist/index.js'
@@ -540,6 +543,85 @@ check('writeFederationConfig ejects a standalone config to disk', async () => {
 	} finally {
 		await rm(dir, { recursive: true, force: true })
 	}
+})
+
+// 31. federatedModules: route graph -> deployable module descriptors (the D2 pass)
+check('federatedModules derives host + lazy-route + lib modules from the route graph', () => {
+	const modules = federatedModules({
+		name: 'shell',
+		routes: [
+			{ path: 'dashboard', loadComponent: () => ({}) },
+			{ path: 'reports', loadChildren: () => ({}) },
+			{ path: 'home', component: {} }, // eager: not a module
+			{ path: 'admin', component: {}, children: [{ path: 'users', loadComponent: () => ({}) }] },
+		],
+		libs: ['./libs/data-access'],
+	})
+	const byId = Object.fromEntries(modules.map((m) => [m.moduleId, m]))
+	assert.equal(byId['shell'].kind, 'host', 'host container is a module')
+	assert.equal(byId['shell'].path, DEFAULT_FILENAME, 'host backed by its remote entry filename')
+	assert.equal(byId['./routes/dashboard'].kind, 'route', 'lazy route is a route module')
+	assert.equal(byId['./routes/dashboard'].path, './src/app/dashboard', 'route backed by its exposed source path')
+	assert.equal(byId['./routes/reports'].kind, 'route', 'lazy children is a route module')
+	assert.equal(byId['./routes/admin/users'].kind, 'route', 'nested lazy route is a module at full path')
+	assert.equal(byId['./libs/data-access'].kind, 'lib', 'lib is a lib module')
+	assert.equal(byId['./routes/home'], undefined, 'eager route is NOT a module')
+	assert.deepEqual(modules.map((m) => m.moduleId), [
+		'./libs/data-access',
+		'./routes/admin/users',
+		'./routes/dashboard',
+		'./routes/reports',
+		'shell',
+	], 'exactly the host + lazy routes + libs, sorted')
+})
+
+// 32. includeHost:false + a disabled config yields only/no host
+check('federatedModules: includeHost toggle + disabled config', () => {
+	const noHost = federatedModules({ name: 'shell', routes: [{ path: 'd', loadComponent: () => ({}) }] }, { includeHost: false })
+	assert.deepEqual(noHost.map((m) => m.moduleId), ['./routes/d'], 'includeHost:false omits the host')
+
+	const disabled = federatedModules({ enabled: false, name: 'shell', routes: [{ path: 'd', loadComponent: () => ({}) }] })
+	assert.deepEqual(disabled.map((m) => m.moduleId), ['shell'], 'disabled config exposes nothing (host only)')
+	assert.deepEqual(
+		federatedModules({ enabled: false, name: 'shell', libs: ['./libs/x'] }, { includeHost: false }),
+		[],
+		'disabled + no host => empty'
+	)
+})
+
+// 33. manual exposes participate as modules (manual wins over derived)
+check('federatedModules includes manual exposes (classified by prefix)', () => {
+	const modules = federatedModules({
+		name: 'shell',
+		exposes: { './widgets/clock': './src/app/clock.ts', './libs/manual': './libs/manual/index.ts' },
+	})
+	const byId = Object.fromEntries(modules.map((m) => [m.moduleId, m]))
+	assert.equal(byId['./widgets/clock'].kind, 'route', 'non-lib manual expose classified as a route module')
+	assert.equal(byId['./widgets/clock'].path, './src/app/clock.ts', 'manual expose path carried')
+	assert.equal(byId['./libs/manual'].kind, 'lib', 'manual expose under ./libs classified as a lib module')
+})
+
+// 34. toFederatedModuleInputs / federatedModuleInputs -> buildManifest-ready seed
+check('federatedModuleInputs builds a manifest-ready module seed from the route graph', () => {
+	const inputs = federatedModuleInputs(
+		{ name: 'shell', routes: [{ path: 'dashboard', loadComponent: () => ({}) }], libs: ['./libs/ui'] },
+		{ version: '1.2.3', urlFor: (m, v) => `https://cdn/${m.moduleId}/${v}/remoteEntry.js` }
+	)
+	const byId = Object.fromEntries(inputs.map((i) => [i.moduleId, i]))
+	// host + route + lib, each stamped with the version + derived url + kind (the
+	// exact FederatedModuleInput shape @treaty/federation-deploy.buildManifest consumes).
+	assert.deepEqual(byId['shell'], { moduleId: 'shell', version: '1.2.3', url: 'https://cdn/shell/1.2.3/remoteEntry.js', kind: 'host' })
+	assert.deepEqual(byId['./routes/dashboard'], {
+		moduleId: './routes/dashboard', version: '1.2.3', url: 'https://cdn/./routes/dashboard/1.2.3/remoteEntry.js', kind: 'route',
+	})
+	assert.equal(byId['./libs/ui'].kind, 'lib', 'lib kind carried into the input')
+
+	// defaults: placeholder version + relative versioned path.
+	const def = toFederatedModuleInputs(federatedModules({ name: 'app' }))
+	const host = def.find((i) => i.moduleId === 'app')
+	assert.equal(host.version, '0.0.0', 'default placeholder version')
+	assert.equal(host.url, 'app/0.0.0/remoteEntry.js', 'default relative versioned path')
+	assert.equal(host.kind, 'host', 'default host kind')
 })
 
 await Promise.all(pending)

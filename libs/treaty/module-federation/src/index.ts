@@ -67,6 +67,19 @@ export type {
 	DeriveLibsOptions,
 } from './routes.js'
 
+export {
+	federatedModules,
+	toFederatedModuleInputs,
+	federatedModuleInputs,
+} from './modules.js'
+export type {
+	FederatedModule,
+	FederatedModuleKind,
+	FederatedModuleInput,
+	FederatedModulesOptions,
+	ToFederatedModuleInputsOptions,
+} from './modules.js'
+
 export { toRspackModuleFederation } from './rspack.js'
 export type {
 	RspackModuleFederationOptions,
