@@ -1,5 +1,11 @@
 import { createBabelLinker } from './babelLinker';
-import { composeLinkers, PARTIAL_MARKER, type PartialLinker } from './linkPartial';
+import {
+  composeLinkers,
+  getLinkBackend,
+  resetLinkBackendForTesting,
+  PARTIAL_MARKER,
+  type PartialLinker,
+} from './linkPartial';
 
 describe('createBabelLinker', () => {
   const linker = createBabelLinker();
@@ -58,7 +64,11 @@ describe('composeLinkers', () => {
     };
   }
 
-  it('returns the addon result unchanged when no partial marker remains', () => {
+  beforeEach(() => {
+    resetLinkBackendForTesting();
+  });
+
+  it('returns the addon result unchanged when no partial marker remains (Rust primary, records "rust")', () => {
     const addonCalls = { n: 0 };
     const babelCalls = { n: 0 };
     const composed = composeLinkers(
@@ -66,52 +76,87 @@ describe('composeLinkers', () => {
       fakeAddon('SHOULD-NOT-RUN', babelCalls),
     );
 
-    const out = composed.linkPartial('whatever', 'x.mjs');
+    const out = composed.linkPartial('whatever', 'rust-only.mjs');
 
     expect(out.code).toBe('ɵɵdefineInjectable(...)');
     expect(addonCalls.n).toBe(1);
     expect(babelCalls.n).toBe(0); // Babel not consulted - addon fully linked.
+    expect(getLinkBackend('rust-only.mjs')).toBe('rust');
   });
 
-  it('runs the Babel backend over the addon output when partial declarations remain', () => {
+  it('hands the ORIGINAL source to Babel (records "babel") when the addon leaves residual declarations', () => {
     const addonCalls = { n: 0 };
     const babelCalls = { n: 0 };
+    let babelSawSource = '';
+    // Addon leaves a residual ɵɵngDeclareDirective (it does not yet cover directives).
     const composed = composeLinkers(fakeAddon(RESIDUAL, addonCalls), {
       linkPartial(code) {
         babelCalls.n += 1;
-        // Simulate the complete linker finishing the residual directive.
+        babelSawSource = code;
         return { code: code.replace(/ɵɵngDeclare/g, 'ɵɵdefine'), errors: [] };
       },
     });
 
-    const out = composed.linkPartial('partial source', 'x.mjs');
+    const ORIGINAL = `i0.${PARTIAL_MARKER}Directive({}); i0.${PARTIAL_MARKER}Factory({});`;
+    const out = composed.linkPartial(ORIGINAL, 'residual.mjs');
 
     expect(addonCalls.n).toBe(1);
     expect(babelCalls.n).toBe(1);
+    // Babel re-links the ORIGINAL module source (not the addon's partial output) so the whole module
+    // is linked once, self-consistently.
+    expect(babelSawSource).toBe(ORIGINAL);
     expect(out.code).not.toContain(PARTIAL_MARKER);
     expect(out.code).toContain('ɵɵdefineDirective');
+    expect(getLinkBackend('residual.mjs')).toBe('babel');
   });
 
-  it('short-circuits (does not call Babel) when the addon reports errors', () => {
+  it('falls back to Babel over the ORIGINAL source (records "babel") when the addon errors', () => {
     const babelCalls = { n: 0 };
+    let babelSawSource = '';
     const composed = composeLinkers(
-      { linkPartial: () => ({ code: RESIDUAL, errors: ['addon boom'] }) },
+      // Addon cannot yet handle this declaration kind and reports an error.
+      { linkPartial: () => ({ code: RESIDUAL, errors: ['unsupported injector `providers`'] }) },
       {
         linkPartial(code) {
           babelCalls.n += 1;
-          return { code, errors: [] };
+          babelSawSource = code;
+          // The complete reference linker handles the whole family.
+          return { code: code.replace(/ɵɵngDeclare/g, 'ɵɵdefine'), errors: [] };
         },
       },
     );
 
-    const out = composed.linkPartial('partial source', 'x.mjs');
+    const ORIGINAL = `i0.${PARTIAL_MARKER}Injector({ providers: [] });`;
+    const out = composed.linkPartial(ORIGINAL, 'errfallback.mjs');
 
-    expect(out.errors).toEqual(['addon boom']);
-    expect(babelCalls.n).toBe(0);
+    // Babel ran over the ORIGINAL source, not the addon's (partial) output.
+    expect(babelCalls.n).toBe(1);
+    expect(babelSawSource).toBe(ORIGINAL);
+    expect(out.errors).toEqual([]);
+    expect(out.code).not.toContain(PARTIAL_MARKER);
+    expect(getLinkBackend('errfallback.mjs')).toBe('babel');
   });
 
-  it('returns the addon directly when there is no Babel backend', () => {
-    const addon: PartialLinker = { linkPartial: () => ({ code: RESIDUAL, errors: [] }) };
-    expect(composeLinkers(addon, null)).toBe(addon);
+  it('surfaces an error (records no backend) when BOTH the addon AND Babel fail', () => {
+    const composed = composeLinkers(
+      { linkPartial: () => ({ code: RESIDUAL, errors: ['addon boom'] }) },
+      { linkPartial: code => ({ code, errors: ['babel boom too'] }) },
+    );
+
+    const out = composed.linkPartial('partial source', 'bothfail.mjs');
+
+    expect(out.errors).toEqual(['babel boom too']);
+    expect(getLinkBackend('bothfail.mjs')).toBeUndefined();
+  });
+
+  it('runs the Rust addon alone (records "rust") when there is no Babel backend', () => {
+    const addonCalls = { n: 0 };
+    const composed = composeLinkers(fakeAddon('ɵɵdefineInjectable(...)', addonCalls), null);
+
+    const out = composed.linkPartial('whatever', 'no-babel.mjs');
+
+    expect(out.code).toBe('ɵɵdefineInjectable(...)');
+    expect(addonCalls.n).toBe(1);
+    expect(getLinkBackend('no-babel.mjs')).toBe('rust');
   });
 });

@@ -5,6 +5,9 @@ export {
   composeLinkers,
   linkPartialCode,
   resetLinkerForTesting,
+  getLinkBackend,
+  resetLinkBackendForTesting,
+  type LinkBackend,
   type LinkPartialResult,
   type PartialLinker,
 };
@@ -47,6 +50,22 @@ interface PartialLinker {
 }
 
 /**
+ * Which backend handled a given module, for observability (the e2e asserts the Rust addon is the
+ * primary backend that owns every module it can fully link, and that Babel handles only the modules
+ * the Rust linker cannot yet fully link):
+ *
+ *   * `'rust'`  - the Rust/NAPI addon (the PRIMARY backend) linked the module completely (no residual
+ *                 `ɵɵngDeclare*`, no error); Babel did NOT run. As the Rust linker grows to cover
+ *                 every declaration kind, more modules become `'rust'` and `@angular/compiler-cli`
+ *                 drops off the hot path entirely.
+ *   * `'babel'` - the Rust addon was tried first but could not fully link this module (it left a
+ *                 residual `ɵɵngDeclare*` it does not yet cover, reported an error, or its
+ *                 `linkPartial` export was unavailable), so the complete Babel linker linked the
+ *                 module's original source.
+ */
+type LinkBackend = 'rust' | 'babel';
+
+/**
  * Cheap detector for a partial-compiled module that must be linked.
  *
  * A module needs linking only when it both lives under `node_modules` (published, already
@@ -64,28 +83,75 @@ function isPartialModule(id: string, code: string): boolean {
 let cachedLinker: PartialLinker | null | undefined;
 
 /**
- * Compose the (fast, partial-coverage) Rust addon linker with the (complete) Babel linker so the
- * output is guaranteed free of residual `ɵɵngDeclare*` calls regardless of which backend is present.
+ * Per-module record of which backend handled the most recent link of each file, keyed by module id.
+ * Populated by {@link composeLinkers}/{@link loadLinker} and read via {@link getLinkBackend}. This is
+ * the observability seam the e2e uses to assert "Rust primary, Babel only for residual".
+ */
+const backendByModule = new Map<string, LinkBackend>();
+
+/** Report which backend last linked `id`, or `undefined` if it was never linked. */
+function getLinkBackend(id: string): LinkBackend | undefined {
+  return backendByModule.get(id);
+}
+
+/** Test seam: clear the recorded per-module backends. */
+function resetLinkBackendForTesting(): void {
+  backendByModule.clear();
+}
+
+/**
+ * Compose the (fast) Rust addon linker as the PRIMARY backend with the (complete) Babel linker as a
+ * residual-only finisher, so the output is guaranteed free of residual `ɵɵngDeclare*` calls
+ * regardless of which declaration kinds the Rust linker covers today.
  *
- * The Rust addon currently links only the DI + pipe family and leaves
- * `ɵɵngDeclareComponent`/`Directive` untouched; any residual `ɵɵngDeclare*` would still trigger the
- * runtime JIT fallback. So when the addon output still contains the marker AND a Babel backend is
- * available, we run the Babel linker over the addon's output to finish the component/directive
- * declarations. (The Babel linker is a no-op for already-linked `ɵɵdefine*` calls.)
+ * The Rust addon is always run FIRST and OWNS every module it can fully link. The Babel linker
+ * (`@angular/compiler-cli`) is consulted ONLY to finish what the Rust linker cannot yet complete:
+ *
+ *   * Rust fully links the module (no residual `ɵɵngDeclare*`, no error) ⇒ ship the Rust output as-is
+ *     ⇒ `'rust'`. Babel is NOT invoked.
+ *   * Rust leaves a residual `ɵɵngDeclare*` (today: `ɵɵngDeclareComponent`/`Directive`, which it does
+ *     not yet cover) or reports an error (a declaration kind it has not learned yet, e.g. an injector
+ *     with `providers`). In either case the module is not fully Rust-linkable today, so the COMPLETE
+ *     reference Babel linker links the ORIGINAL source for that module ⇒ `'babel'`.
+ *
+ * Why Babel re-links the ORIGINAL source rather than Rust's partial output: the Ivy definitions of a
+ * single class are interdependent (the `ɵfac` factory shape is coupled to its `ɵcmp`/`ɵdir`/`ɵprov`).
+ * Rust rewriting a class's factory while Babel rewrites that same class's directive over Rust's output
+ * yields an inconsistent definition (it manifests at runtime as "constructor was not compatible with
+ * Dependency Injection"). Handing Babel the original source produces one self-consistent linked module.
+ * A module Rust links in FULL is internally consistent and ships untouched - so as the Rust linker
+ * grows to cover components/directives, more modules become `'rust'` and `@angular/compiler-cli`
+ * leaves the hot path entirely. The chosen backend is recorded per module for the e2e to assert.
  */
 function composeLinkers(addon: PartialLinker, babel: PartialLinker | null): PartialLinker {
   if (babel === null) {
-    return addon;
+    return {
+      linkPartial(code: string, filename: string): LinkPartialResult {
+        const result = addon.linkPartial(code, filename);
+        if (result.errors.length === 0) {
+          backendByModule.set(filename, 'rust');
+        }
+        return result;
+      },
+    };
   }
   return {
     linkPartial(code: string, filename: string): LinkPartialResult {
+      // Rust addon is the primary backend - always first.
       const first = addon.linkPartial(code, filename);
-      if (first.errors.length > 0 || !first.code.includes(PARTIAL_MARKER)) {
+      if (first.errors.length === 0 && !first.code.includes(PARTIAL_MARKER)) {
+        // Rust fully linked the module on its own (no residual, no error) - ship it, no Babel.
+        backendByModule.set(filename, 'rust');
         return first;
       }
-      // Residual partial declarations remain (components/directives the addon does not yet link):
-      // finish them with the complete Babel linker.
-      return babel.linkPartial(first.code, filename);
+      // Rust could not fully link this module (residual `ɵɵngDeclare*` it does not yet cover, or an
+      // error on a declaration kind it has not learned). Hand the ORIGINAL source to the complete
+      // Babel linker so the whole module is linked once, self-consistently.
+      const finished = babel.linkPartial(code, filename);
+      if (finished.errors.length === 0) {
+        backendByModule.set(filename, 'babel');
+      }
+      return finished;
     },
   };
 }
@@ -119,6 +185,8 @@ function loadLinker(): PartialLinker | null {
   try {
     const addon = require('@treaty/authoring-node') as Partial<PartialLinker>;
     if (typeof addon.linkPartial === 'function') {
+      // Rust addon present: it is the PRIMARY backend, composed with Babel only to finish residual
+      // declarations it does not yet cover (see {@link composeLinkers}).
       cachedLinker = composeLinkers(
         { linkPartial: addon.linkPartial.bind(addon) },
         babel,
@@ -129,7 +197,20 @@ function loadLinker(): PartialLinker | null {
     // Fall through to the Babel-only backend.
   }
 
-  cachedLinker = babel;
+  // No Rust addon `linkPartial` export: degrade to the Babel-only backend (records `'babel'`).
+  if (babel === null) {
+    cachedLinker = null;
+    return cachedLinker;
+  }
+  cachedLinker = {
+    linkPartial(code: string, filename: string): LinkPartialResult {
+      const result = babel.linkPartial(code, filename);
+      if (result.errors.length === 0) {
+        backendByModule.set(filename, 'babel');
+      }
+      return result;
+    },
+  };
   return cachedLinker;
 }
 
