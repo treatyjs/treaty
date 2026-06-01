@@ -34,3 +34,13 @@ tasks:
     inputs:
     - src/**/*
     - $workspaceRoot/.oxlintrc.json
+  test:
+    command: node
+    args:
+    - $projectRoot/test/mf.smoke.mjs
+    deps:
+    - ~:build
+    inputs:
+    - src/**/*
+    - test/**/*
+    - dist/**/*

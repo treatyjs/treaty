@@ -19,6 +19,19 @@ tasks:
     - treaty-deploy:build
     inputs:
     - src/everything-demo/**/*
+  # `test` runs the everything-demo headless boot/build smoke (same suite as the
+  # everything-demo task), so a single `moon run repl:test` gates the full D2 stack.
+  test:
+    command: node
+    args:
+    - $projectRoot/src/everything-demo/everything-demo.smoke.mjs
+    deps:
+    - treaty-compiler:build
+    - treaty-module-federation:build
+    - treaty-federation-deploy:build
+    - treaty-deploy:build
+    inputs:
+    - src/everything-demo/**/*
   # Type-check the everything-demo Node ESM module + smoke (checkJs, via tsgo).
   typecheck-demo:
     command: tsgo

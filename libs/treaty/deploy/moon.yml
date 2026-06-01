@@ -34,6 +34,9 @@ tasks:
     inputs:
     - src/**/*
     - $workspaceRoot/.oxlintrc.json
+  # Runs the package's own smoke suites (deploy + http-target + remote, via the
+  # all.smoke.mjs aggregator). Depends on the cross-package d2-flow suite so a
+  # single `moon run treaty-deploy:test` exercises every suite in this package.
   test:
     command: node
     args:
@@ -41,6 +44,22 @@ tasks:
     deps:
     - ~:build
     - treaty-federation-deploy:build
+    - ~:test-d2-flow
+    inputs:
+    - src/**/*
+    - test/**/*
+    - dist/**/*
+  # The end-to-end D2 chain across all three packages
+  # (@treaty/module-federation -> @treaty/federation-deploy -> @treaty/deploy),
+  # so it depends on every package's built dist.
+  test-d2-flow:
+    command: node
+    args:
+    - $projectRoot/test/d2-flow.smoke.mjs
+    deps:
+    - ~:build
+    - treaty-federation-deploy:build
+    - treaty-module-federation:build
     inputs:
     - src/**/*
     - test/**/*

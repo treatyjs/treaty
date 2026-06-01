@@ -34,3 +34,27 @@ tasks:
     inputs:
     - src/**/*
     - $workspaceRoot/.oxlintrc.json
+  # The package's public-surface smoke suite. Depends on the deployment-manifest
+  # suite so a single `moon run treaty-federation-deploy:test` runs BOTH suites.
+  test:
+    command: node
+    args:
+    - $projectRoot/test/federation-deploy.smoke.mjs
+    deps:
+    - ~:build
+    - ~:test-deployment-manifest
+    inputs:
+    - src/**/*
+    - test/**/*
+    - dist/**/*
+  # The versioned deployment-manifest (D2) smoke suite.
+  test-deployment-manifest:
+    command: node
+    args:
+    - $projectRoot/test/deployment-manifest.smoke.mjs
+    deps:
+    - ~:build
+    inputs:
+    - src/**/*
+    - test/**/*
+    - dist/**/*
