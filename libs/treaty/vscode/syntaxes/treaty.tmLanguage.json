@@ -120,8 +120,23 @@
         { "include": "#propertyBinding" },
         { "include": "#eventBinding" },
         { "include": "#templateBinding" },
+        { "include": "#useDirective" },
         { "include": "#interpolation" },
         { "include": "#plainAttribute" }
+      ]
+    },
+    "useDirective": {
+      "comment": "`use:<name>` directive application on a template element: the `use` namespace, the `:` separator, and the directive name, with an optional bound value.",
+      "begin": "(?<![-_$[:alnum:]])(use)(:)([_$[:alpha:]][-_$[:alnum:]]*)",
+      "beginCaptures": {
+        "1": { "name": "keyword.control.directive.use.treaty entity.other.attribute-name.html" },
+        "2": { "name": "punctuation.separator.directive.use.treaty" },
+        "3": { "name": "entity.name.function.directive.treaty entity.other.ng-binding-name.property.html" }
+      },
+      "end": "(?=\\s|/?>)",
+      "name": "meta.directive.use.treaty",
+      "patterns": [
+        { "include": "#attributeValue" }
       ]
     },
     "propertyBinding": {
@@ -626,6 +641,41 @@
           "name": "comment.line.double-slash.ts",
           "end": "(?=$)"
         }
+      ]
+    },
+    "hostBindingKey": {
+      "comment": "A host{} spec binding/listener key: a quoted Angular host microsyntax string used as an object key, e.g. '[style.color]', '(click)', '[(ngModel)]', 'class.active', 'attr.role'. A directive authored as a function returns `{ host: { … } }`; this paints those keys as binding names so they read like template bindings, not plain strings.",
+      "begin": "(['\"])(?=\\s*(?:\\[[^'\"]*\\]|\\([^'\"]*\\)|\\[\\([^'\"]*\\)\\]|(?:class|style|attr|animate)\\.[^'\"]*)\\1\\s*:)",
+      "beginCaptures": {
+        "1": { "name": "string.quoted.ng-binding.treaty punctuation.definition.string.begin.ts" }
+      },
+      "end": "\\1",
+      "endCaptures": {
+        "0": { "name": "string.quoted.ng-binding.treaty punctuation.definition.string.end.ts" }
+      },
+      "name": "meta.host-binding.key.treaty",
+      "patterns": [
+        {
+          "match": "(\\[\\(?|\\(|\\)?\\])",
+          "name": "punctuation.definition.ng-binding-name.treaty"
+        },
+        {
+          "match": "(class|style|attr|animate)(?=\\.)",
+          "name": "entity.other.ng-binding-name.special.html"
+        },
+        { "match": "\\.", "name": "punctuation.accessor.html" },
+        {
+          "match": "[-_$[:alnum:]]+",
+          "name": "entity.other.ng-binding-name.property.html"
+        }
+      ]
+    }
+  },
+  "injections": {
+    "L:meta.objectliteral.ts": {
+      "comment": "Inside a TypeScript object literal (where a directive function's host{} spec lives), paint Angular host-binding microsyntax keys as binding names.",
+      "patterns": [
+        { "include": "source.treaty#hostBindingKey" }
       ]
     }
   }

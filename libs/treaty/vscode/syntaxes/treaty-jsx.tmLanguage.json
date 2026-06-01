@@ -15,6 +15,33 @@
         { "include": "#block" }
       ]
     },
+    "hostBindingKey": {
+      "comment": "A host{} spec binding/listener key: a quoted Angular host microsyntax string used as an object key, e.g. '[style.color]', '(click)', '[(ngModel)]', 'class.active', 'attr.role'. The directive-authoring function returns `{ host: { … } }`; this paints those keys as binding names so they read like template bindings, not plain strings.",
+      "begin": "(['\"])(?=\\s*(?:\\[[^'\"]*\\]|\\([^'\"]*\\)|\\[\\([^'\"]*\\)\\]|(?:class|style|attr|animate)\\.[^'\"]*)\\1\\s*:)",
+      "beginCaptures": {
+        "1": { "name": "string.quoted.ng-binding.tjsx punctuation.definition.string.begin.ts" }
+      },
+      "end": "\\1",
+      "endCaptures": {
+        "0": { "name": "string.quoted.ng-binding.tjsx punctuation.definition.string.end.ts" }
+      },
+      "name": "meta.host-binding.key.tjsx",
+      "patterns": [
+        {
+          "match": "(\\[\\(?|\\(|\\)?\\])",
+          "name": "punctuation.definition.ng-binding-name.tjsx"
+        },
+        {
+          "match": "(class|style|attr|animate)(?=\\.)",
+          "name": "entity.other.ng-binding-name.special.html"
+        },
+        { "match": "\\.", "name": "punctuation.accessor.html" },
+        {
+          "match": "[-_$[:alnum:]]+",
+          "name": "entity.other.ng-binding-name.property.html"
+        }
+      ]
+    },
     "block": {
       "begin": "(?<![$._[:alnum:]])(@)(if|else if|else|defer|placeholder|loading|error|switch|for|empty)\\b\\s*",
       "beginCaptures": {
@@ -145,7 +172,21 @@
           "captures": {
             "1": { "name": "entity.other.attribute-name.class.tjsx entity.other.ng-binding-name.property.html" }
           }
+        },
+        {
+          "comment": "`use:<name>` directive application: the `use` namespace, the `:` separator, and the directive name.",
+          "match": "(?<![-_$[:alnum:]])(use)(:)([_$[:alpha:]][-_$[:alnum:]]*)",
+          "captures": {
+            "1": { "name": "keyword.control.directive.use.tjsx entity.other.attribute-name.tjsx" },
+            "2": { "name": "punctuation.separator.directive.use.tjsx" },
+            "3": { "name": "entity.name.function.directive.tjsx entity.other.ng-binding-name.property.html" }
+          }
         }
+      ]
+    },
+    "L:meta.objectliteral.ts": {
+      "patterns": [
+        { "include": "source.tjsx#hostBindingKey" }
       ]
     }
   }
