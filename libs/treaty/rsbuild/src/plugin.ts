@@ -37,6 +37,7 @@ import {
 	type TreatyPluginOptions,
 } from './options.js'
 import { ServerChunkCollector } from './server-chunks.js'
+import { registerLinkPartialTransform } from './link-partial.js'
 
 /**
  * The `processAssets` pipeline stage to emit server-fn chunks at. `'additional'`
@@ -114,6 +115,14 @@ export function pluginTreaty(options: TreatyPluginOptions = {}): RsbuildPlugin {
 				const resolve = config.resolve ?? (config.resolve = {})
 				resolve.extensions = mergeExtensions(resolve.extensions, extensions)
 			})
+
+			// Link published partial-compiled Angular libraries (node_modules `ɵɵngDeclare*`) to AOT
+			// via the SHARED Rust linker, so the build needs NO JIT and NO `@angular/compiler`. This
+			// is independent of how first-party authoring files are routed below; it only touches
+			// partial `node_modules` modules and runs whenever the host exposes `api.transform`.
+			if (typeof api.transform === 'function') {
+				registerLinkPartialTransform(api)
+			}
 
 			// Strategy 1: the first-class transform hook.
 			if (typeof api.transform === 'function') {
