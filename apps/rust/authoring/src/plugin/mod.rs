@@ -428,26 +428,77 @@ fn is_ident_byte(b: u8) -> bool {
 /// may legally begin?
 ///
 /// Because blocks are matched at any brace depth (so in-component blocks lift like top-level ones),
-/// this guards against two non-block uses that `matches_keyword` alone would accept:
-///   * a member access `x.server { … }` (preceding non-space byte is `.`), and
-///   * an object-literal property `{ server: … }` (preceding non-space byte is `,` after another
-///     property — still rejected because the *following* `:`-then-`{` shape is handled by the caller,
-///     but a defensive leading-token check keeps intent clear).
+/// this guards against the non-block uses that `matches_keyword` alone would accept:
+///   * a member access `x.server { … }` (the preceding code token is `.`), and
+///   * an object-literal property `{ server: … }` (the `:`-then-value shape, also rejected by the
+///     caller, which requires a `{` directly after the optional `:LANG` tag).
 ///
-/// A `server` block legitimately follows the start of input, a statement terminator (`;`), a block
-/// boundary (`{` / `}`), or another statement — all of which leave the preceding non-whitespace byte
-/// as one of `{`, `}`, `;`, or none. Anything else (an identifier byte, `.`, `=`, `(`, etc.) means
-/// `server` is being used as a value, not a block keyword.
+/// A `server` block legitimately begins at the start of input, after a statement terminator (`;`), or
+/// after a block boundary (`{` / `}`). It may ALSO begin after a *preceding statement that omitted its
+/// semicolon* (the TS-by-default authoring style the `.treaty` spec encourages) — in that case
+/// JavaScript's automatic-semicolon-insertion (ASI) treats the line break before `server` as the
+/// statement boundary. So a token that can legally *end* a statement (an identifier/keyword char, a
+/// string/template close quote, a numeric literal, or a `)` / `]`) followed by a newline before
+/// `server` is also statement position.
+///
+/// The scan is comment- and string-aware: it walks the source from the start up to `i`, skipping
+/// strings/templates/comments wholesale (via [`TextScanner`]), so a `//`-comment ending in `.` or an
+/// import string ending in `'…'` on the line above `server {` no longer fools the guard. It records
+/// the last meaningful code byte before `i` and whether a newline separated that byte from `server`.
 fn server_in_statement_position(source: &str, i: usize) -> bool {
     let bytes = source.as_bytes();
-    let mut k = i;
-    while k > 0 && bytes[k - 1].is_ascii_whitespace() {
-        k -= 1;
+
+    // The last ordinary-code byte seen before `i`, and whether a line break has occurred since it.
+    let mut last_code: Option<u8> = None;
+    let mut newline_since_last_code = false;
+
+    let scanner = TextScanner::new(source);
+    let mut p = 0usize;
+    while p < i {
+        // Skip a string/template/comment wholesale. A comment counts as "whitespace" for ASI: any
+        // newline inside or after it still separates the preceding code token from `server`.
+        if let Some(next) = scanner.skip_noncode(p) {
+            // Clamp to `i` so we never read past the keyword we are classifying.
+            let end = next.min(i);
+            if source.as_bytes()[p..end].contains(&b'\n') {
+                newline_since_last_code = true;
+            }
+            p = next;
+            continue;
+        }
+
+        let b = bytes[p];
+        if b.is_ascii_whitespace() {
+            if b == b'\n' {
+                newline_since_last_code = true;
+            }
+        } else {
+            last_code = Some(b);
+            newline_since_last_code = false;
+        }
+        p += 1;
     }
-    if k == 0 {
-        return true;
+
+    match last_code {
+        // Start of input, or the previous token explicitly ended a statement/opened a block.
+        None => true,
+        Some(b'{') | Some(b'}') | Some(b';') => true,
+        // ASI: a token that can end a statement, followed by a line break, opens a new statement.
+        Some(b) if newline_since_last_code && can_end_statement(b) => true,
+        _ => false,
     }
-    matches!(bytes[k - 1], b'{' | b'}' | b';')
+}
+
+/// Can the byte `b` be the final character of a JavaScript expression/statement, such that a line
+/// break after it triggers automatic-semicolon insertion?
+///
+/// True for identifier/keyword characters (e.g. the `e` of `types` or a bare `null`), a closing
+/// string/template quote (`'` `"` `` ` ``), and the closing `)` / `]` of a call/index/group. These
+/// are exactly the token-enders that precede a no-semicolon `server { … }` block in TS-by-default
+/// authoring. A `,`, `.`, `=`, `(`, `[`, `:` etc. cannot end a statement, so `server` after one of
+/// those (even across a newline) is a value, not a block.
+fn can_end_statement(b: u8) -> bool {
+    is_ident_byte(b) || matches!(b, b'\'' | b'"' | b'`' | b')' | b']')
 }
 
 /// Tracks lexical context (strings, template literals, comments) while scanning JS/TS text, so the
@@ -1328,5 +1379,74 @@ server:php {\n\
         );
         assert!(!extraction.client_source.contains("function a"));
         assert!(!extraction.client_source.contains("function b"));
+    }
+
+    #[test]
+    fn server_block_lifts_when_preceding_import_omits_semicolon() {
+        // TS-by-default authoring (`.treaty` spec): the import above `server {` has NO trailing
+        // semicolon, so its last code byte is the closing `'` of the module path. ASI treats the
+        // newline before `server` as the statement boundary, so the block must still lift.
+        let source = "import { type Greeting } from './greeting.types'\n\
+server {\n\
+  async function greet(who: string) { return who; }\n\
+}\n\
+const x = 1\n";
+        let extraction = extract_server_block(source);
+
+        assert_eq!(extraction.server_fns.len(), 1, "no-semicolon import blocked server lift");
+        assert_eq!(extraction.server_fns[0].name, "greet");
+        assert!(
+            !extraction.client_source.contains("server {"),
+            "server block not removed; got: {}",
+            extraction.client_source
+        );
+        assert!(
+            extraction.client_source.contains("import { type Greeting } from './greeting.types'"),
+            "import lost; got: {}",
+            extraction.client_source
+        );
+    }
+
+    #[test]
+    fn server_block_lifts_when_preceded_by_line_comment() {
+        // A `//` comment line (ending in `.`) sits directly above `server {`. The guard must skip
+        // the comment and see the no-semicolon import below it as the statement boundary.
+        let source = "import { type Greeting } from './greeting.types'\n\
+// Every function inside this block is server-only and extracted to a sibling module.\n\
+server {\n\
+  async function greet(who: string) { return who; }\n\
+}\n";
+        let extraction = extract_server_block(source);
+
+        assert_eq!(extraction.server_fns.len(), 1, "comment above server blocked lift");
+        assert_eq!(extraction.server_fns[0].name, "greet");
+        assert!(
+            !extraction.client_source.contains("server {"),
+            "server block not removed; got: {}",
+            extraction.client_source
+        );
+    }
+
+    #[test]
+    fn server_block_lifts_after_block_comment() {
+        // A `/* … */` block comment (which may contain newlines and stray punctuation) before
+        // `server {` must not defeat the guard.
+        let source = "const a = 1 /* note: the . here must not fool the guard */\n\
+server {\n\
+  function f() { return 1; }\n\
+}\n";
+        let extraction = extract_server_block(source);
+        assert_eq!(extraction.server_fns.len(), 1, "block comment above server blocked lift");
+        assert_eq!(extraction.server_fns[0].name, "f");
+    }
+
+    #[test]
+    fn server_member_access_with_newline_is_not_a_block() {
+        // `obj\n  .server { … }` is a member access split across lines: the last code byte before
+        // `server` is `.`, which cannot end a statement, so this is NOT a block even with a newline.
+        let source = "const obj = makeThing()\nconst x = obj\n  .server\n";
+        let extraction = extract_server_block(source);
+        assert!(extraction.server_fns.is_empty(), "member access misread as server block");
+        assert_eq!(extraction.client_source, source);
     }
 }

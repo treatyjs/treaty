@@ -1377,6 +1377,110 @@ function onClick(user) { return save(user); }\n\
     }
 
     #[test]
+    fn greeter_shaped_sfc_lowers_to_valid_client_module_and_server_module() {
+        // The greeter.treaty shape that previously emitted malformed output: a `.treaty` SFC with
+        // module imports WITHOUT trailing semicolons (TS-by-default), a `//`-comment directly above
+        // a `server { … }` block, reactive bindings, and a handler that calls the server fn. The
+        // result must be a VALID ES module — imports hoisted to module scope (never inside the fn
+        // wrapper), no raw `server {` text in the client, bindings collected into the returned
+        // object — plus a populated server module carrying the `greet` body.
+        let source = "import { signal, computed } from '@angular/core'\n\
+import { type Greeting } from './greeting.types'\n\
+\n\
+const name = signal('Ada')\n\
+const greeting = signal<Greeting | null>(null)\n\
+const headline = computed(() => greeting()?.text ?? `Say hello to ${name()}`)\n\
+\n\
+// Every function inside this block is server-only: extracted to a sibling module.\n\
+server {\n\
+\tasync function greet(who: string): Promise<Greeting> {\n\
+\t\tconst text = `Hello, ${who}!`\n\
+\t\treturn { text, at: Date.now() }\n\
+\t}\n\
+}\n\
+\n\
+async function sayHello(): Promise<void> {\n\
+\tgreeting.set(await greet(name().trim() || 'world'))\n\
+}\n\
+\n\
+<section class=\"greeter\">\n\
+  <h2>{{ headline() }}</h2>\n\
+  <button (click)=\"sayHello()\">Greet</button>\n\
+</section>\n";
+
+        let out = compile_treaty_authoring(source, "greeter.treaty");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+
+        // (b) The raw `server {` block text must NOT survive into the client module.
+        assert!(
+            !code.contains("server {"),
+            "raw server block leaked into client; got: {code}"
+        );
+        // The server fn body must NOT reach the client bundle.
+        assert!(
+            !code.contains("Date.now()") && !code.contains("Hello, ${who}"),
+            "server body leaked into client; got: {code}"
+        );
+
+        // The whole client module RE-PARSES as a valid ES module via oxc. The emitted body keeps
+        // the author's TypeScript (e.g. `signal<Greeting | null>(...)`), so parse as a TS module.
+        let allocator = Allocator::default();
+        let module_type = SourceType::default().with_module(true).with_typescript(true);
+        let parsed = JsParser::new(&allocator, code, module_type).parse();
+        assert!(
+            parsed.errors.is_empty(),
+            "client module did not parse as valid TS module: {:?}\n--- code ---\n{code}",
+            parsed.errors
+        );
+
+        // (a) Imports are HOISTED to module scope, above the function wrapper — never inside it.
+        let fn_idx = code.find("function Greeter() {").expect("no fn wrapper");
+        let core_import_idx = code
+            .find("import { signal, computed } from '@angular/core'")
+            .expect("user core import missing");
+        let types_import_idx = code
+            .find("import { type Greeting } from './greeting.types'")
+            .expect("types import missing");
+        assert!(
+            core_import_idx < fn_idx && types_import_idx < fn_idx,
+            "an import is not above the function wrapper; got: {code}"
+        );
+        // No `import` statement appears anywhere inside the function body.
+        let body_start = fn_idx;
+        let body = &code[body_start..];
+        let body = &body[..body.find("\nreturn {").unwrap_or(body.len())];
+        assert!(
+            !body.contains("import "),
+            "import leaked into the function body; got body: {body}"
+        );
+
+        // (c) The reactive bindings are collected into the returned object (non-empty return).
+        for binding in ["name", "greeting", "headline", "sayHello"] {
+            assert!(
+                code.contains(&format!("return {{ ")) && code.contains(binding),
+                "binding `{binding}` not collected into the returned object; got: {code}"
+            );
+        }
+        // The return object is not empty.
+        assert!(
+            !code.contains("return {  };") && !code.contains("return { };"),
+            "bindings return is empty; got: {code}"
+        );
+
+        // A server module IS produced and carries the `greet` route + body.
+        let server_module = out.server_module.expect("expected a server module for greet");
+        assert!(
+            server_module.contains("\"/__server/greet\""),
+            "no greet route in server module; got: {server_module}"
+        );
+
+        // The component definition is otherwise intact.
+        assert!(code.contains(DEFINE), "no defineComponent; got: {code}");
+        assert!(code.contains("ctx.headline"), "template did not bind headline; got: {code}");
+    }
+
+    #[test]
     fn treaty_without_server_block_has_no_server_module() {
         let source = "const name = 'World';\n<div>{{ name }}</div>";
         let out = compile_treaty_authoring(source, "greeting.treaty");
