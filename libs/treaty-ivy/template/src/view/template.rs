@@ -5831,10 +5831,43 @@ impl TemplateDefinitionBuilder {
         // Trigger instructions (regular `on` triggers only; prefetch/hydrate are a separate
         // subsystem). Default to `ɵɵdeferOnIdle()` when no concrete trigger is given.
         self.emit_defer_triggers(&deferred.triggers);
+
+        // A `when <cond>` trigger is an UPDATE op (`ɵɵdeferWhen(<cond>)`), not a create-block `on`
+        // trigger: the binding cursor advances to the defer op's slot, then `ɵɵdeferWhen` re-evaluates
+        // the condition each change-detection pass (`reify.ts` `DeferWhen`). Emitted in source order
+        // for the (rare) multi-`when` case.
+        self.emit_defer_when_triggers(deferred, defer_slot);
+    }
+
+    /// Emit the UPDATE-block `ɵɵdeferWhen(<cond>)` op for each `when <cond>` trigger on a defer block,
+    /// advancing the binding cursor to the defer op's slot first. No-op when the block has no `when`
+    /// trigger (the common `on`-trigger / triggerless case).
+    fn emit_defer_when_triggers(&mut self, deferred: &DeferredBlock, defer_slot: usize) {
+        let when_values: Vec<AstNode> = deferred
+            .triggers
+            .defined_in_order()
+            .iter()
+            .filter_map(|t| match &t.kind {
+                DeferredTriggerKind::When { value } => Some(value.clone()),
+                _ => None,
+            })
+            .collect();
+        if when_values.is_empty() {
+            return;
+        }
+        self.allocate_binding_slots(when_values.len());
+        self.advance_to(defer_slot);
+        self.current_target_slot = defer_slot;
+        for value in &when_values {
+            let cond = self.lower_expr(value);
+            self.update_code.push(instruction(R3::DeferWhen, vec![cond]));
+        }
     }
 
     /// Emit the create-block trigger instructions for a defer block's regular trigger set, defaulting
-    /// to `ɵɵdeferOnIdle()` when none is present (`ingestDeferBlock` / `reify.ts` `DeferOn`).
+    /// to `ɵɵdeferOnIdle()` ONLY when no concrete trigger is present (`ingest.ts`: the idle fallback
+    /// is suppressed when any concrete `on` OR `when` trigger exists, since `when` is a real trigger
+    /// even though it reifies as a separate `ɵɵdeferWhen` UPDATE op).
     fn emit_defer_triggers(&mut self, triggers: &DeferredBlockTriggers) {
         let mut emitted_concrete = false;
         for trigger in triggers.defined_in_order() {
@@ -5848,8 +5881,13 @@ impl TemplateDefinitionBuilder {
                 DeferredTriggerKind::Hover { .. } => (R3::DeferOnHover, vec![]),
                 DeferredTriggerKind::Interaction { .. } => (R3::DeferOnInteraction, vec![]),
                 DeferredTriggerKind::Viewport { .. } => (R3::DeferOnViewport, vec![]),
-                // `when` is a `ɵɵdeferWhen` update op; `never` is hydrate-only — skip here.
-                DeferredTriggerKind::When { .. } | DeferredTriggerKind::Never => continue,
+                // `when` reifies as a `ɵɵdeferWhen` UPDATE op (emitted separately), but it IS a
+                // concrete trigger, so it suppresses the idle fallback. `never` is hydrate-only.
+                DeferredTriggerKind::When { .. } => {
+                    emitted_concrete = true;
+                    continue;
+                }
+                DeferredTriggerKind::Never => continue,
             };
             emitted_concrete = true;
             self.creation_code.push(instruction(reference, args));
@@ -8774,6 +8812,87 @@ mod tests {
         assert!(
             between.contains("\u{0275}\u{0275}advance("),
             "an ɵɵadvance must separate storeLet from i18nExp, got: {out}"
+        );
+    }
+
+    #[test]
+    fn defer_when_trigger_emits_update_op_and_suppresses_idle_default() {
+        use crate::expression::ast::ExprKind as EK;
+        use crate::template::r3_ast::{
+            BlockSpans, DeferredBlock, DeferredBlockTriggers, DeferredTrigger, DeferredTriggerKind,
+            TriggerKey, TriggerSpans,
+        };
+        let ab = AbsoluteSourceSpan::new(0, 0);
+        let sp = ParseSpan::new(0, 0);
+        // `isLoaded`
+        let cond = AstNode::new(
+            sp,
+            ab,
+            EK::PropertyRead {
+                name_span: ab,
+                receiver: Box::new(AstNode::new(sp, ab, EK::ImplicitReceiver)),
+                name: "isLoaded".to_string(),
+            },
+        );
+        let mut triggers = DeferredBlockTriggers::default();
+        triggers.when = Some(DeferredTrigger {
+            kind: DeferredTriggerKind::When { value: cond },
+            spans: TriggerSpans {
+                name_span: None,
+                source_span: t_span(),
+                prefetch_span: None,
+                when_or_on_source_span: None,
+                hydrate_span: None,
+            },
+        });
+        triggers.push_order(TriggerKey::When);
+        // `@defer (when isLoaded) { <span></span> }`
+        let span_el = Node::Element(Element {
+            name: "span".to_string(),
+            attributes: vec![],
+            inputs: vec![],
+            outputs: vec![],
+            directives: vec![],
+            children: vec![],
+            references: vec![],
+            is_self_closing: false,
+            source_span: t_span(),
+            start_source_span: t_span(),
+            end_source_span: None,
+            is_void: false,
+            i18n: None,
+        });
+        let defer = Node::DeferredBlock(DeferredBlock {
+            children: vec![span_el],
+            triggers,
+            prefetch_triggers: DeferredBlockTriggers::default(),
+            hydrate_triggers: DeferredBlockTriggers::default(),
+            placeholder: None,
+            loading: None,
+            error: None,
+            main_block_span: t_span(),
+            spans: BlockSpans {
+                name_span: t_span(),
+                source_span: t_span(),
+                start_source_span: t_span(),
+                end_source_span: None,
+            },
+            i18n: None,
+        });
+        let input = TemplateCompilationInput::new("MyApp_Template", vec![defer]);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let out = emit_with_hoisted(&builder, &func);
+
+        // A `when` trigger reifies as an UPDATE op reading the bound condition off `ctx`.
+        assert!(
+            out.contains("\u{0275}\u{0275}deferWhen(ctx.isLoaded)"),
+            "expected ɵɵdeferWhen(ctx.isLoaded), got: {out}"
+        );
+        // The idle fallback is suppressed when a concrete `when` trigger is present.
+        assert!(
+            !out.contains("\u{0275}\u{0275}deferOnIdle("),
+            "ɵɵdeferOnIdle must not be emitted when a when-trigger exists, got: {out}"
         );
     }
 
