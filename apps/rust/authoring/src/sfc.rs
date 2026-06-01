@@ -164,7 +164,11 @@ fn component_stem(file_name: &str) -> &str {
 /// Used as the selector ONLY when the author gives none; it replaces Angular's `ng-component`
 /// no-selector default so a bootstrapped Treaty component has a real host tag instead of
 /// `<ng-component>`.
-fn to_kebab_case(file_name: &str) -> String {
+///
+/// Public within the crate so the base-Angular `.ts` front-end ([`crate::angular_source`]) can pass
+/// the same filename-derived selector to a SELECTORLESS `@Component`, keeping the JSX / `.treaty` /
+/// `.ts` authoring formats aligned on one convention.
+pub fn to_kebab_case(file_name: &str) -> String {
     let stem = component_stem(file_name);
 
     let mut out = String::new();

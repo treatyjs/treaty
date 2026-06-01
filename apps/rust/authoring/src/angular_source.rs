@@ -9,9 +9,10 @@ use oxc_allocator::Allocator;
 use oxc_ast::ast::{Class, Decorator, Expression, Statement};
 use oxc_parser::Parser;
 use oxc_span::SourceType;
-use treaty_ivy::source_compile::compile_component_source_with_map;
+use treaty_ivy::source_compile::compile_component_source_with_map_and_selector;
 
 use crate::plugin::{extract_server_block, rewrite_call_sites, PluginRegistry};
+use crate::sfc::to_kebab_case;
 use crate::source_map::redact_server_bodies_in_map;
 use crate::CompiledAuthoring;
 
@@ -138,12 +139,12 @@ fn detect_angular_decorators(source: &str) -> Vec<AngularDecoratorKind> {
 ///
 /// When no `server { … }` block is present the source compiles unchanged and `server_module` is
 /// `None`.
-pub fn compile_angular_component(source: &str) -> CompiledAuthoring {
+pub fn compile_angular_component(source: &str, file_name: &str) -> CompiledAuthoring {
     let registry = PluginRegistry::with_defaults();
     let plugin = registry
         .default_plugin()
         .expect("registry seeded with a default backend plugin");
-    compile_angular_component_with(source, |fns| plugin.emit(fns))
+    compile_angular_component_with(source, file_name, |fns| plugin.emit(fns))
 }
 
 /// Like [`compile_angular_component`], but emits server functions through `emit` (the caller's chosen
@@ -151,16 +152,25 @@ pub fn compile_angular_component(source: &str) -> CompiledAuthoring {
 /// `elysia-eden` (`PluginRegistry::get("elysia-eden")`).
 pub fn compile_angular_component_with(
     source: &str,
+    file_name: &str,
     emit: impl FnOnce(&[crate::plugin::ServerFn]) -> crate::plugin::BackendEmit,
 ) -> CompiledAuthoring {
     let extraction = extract_server_block(source);
 
+    // A SELECTORLESS `@Component` (no `selector` in its decorator) adopts the filename-derived
+    // kebab selector — the same Treaty convention the `.treaty`/`.tsx`/`.tjsx` front-ends apply —
+    // so a bootstrapped selectorless `.ts` component renders a real host tag instead of Angular's
+    // `ng-component` default. A component that DECLARES a selector keeps it (the facade only
+    // substitutes when the decorator omits one), so explicit-selector `.ts` files are untouched.
+    let default_selector = to_kebab_case(file_name);
+
     if extraction.server_fns.is_empty() {
         // No server block: compile with the additive v3 map and pass it through UNCHANGED.
-        let compiled = compile_component_source_with_map(
+        let compiled = compile_component_source_with_map_and_selector(
             &extraction.client_source,
             GENERATED_NAME,
             SOURCE_NAME,
+            Some(&default_selector),
         );
         return CompiledAuthoring {
             code: compiled.code,
@@ -171,8 +181,12 @@ pub fn compile_angular_component_with(
     }
 
     let emit = emit(&extraction.server_fns);
-    let compiled =
-        compile_component_source_with_map(&extraction.client_source, GENERATED_NAME, SOURCE_NAME);
+    let compiled = compile_component_source_with_map_and_selector(
+        &extraction.client_source,
+        GENERATED_NAME,
+        SOURCE_NAME,
+        Some(&default_selector),
+    );
 
     // CLIENT PRIVACY: the map embeds the authoring source as `sourcesContent`. Even though the
     // `server { … }` block was already lifted out of `client_source` before compilation, redact each
@@ -218,10 +232,11 @@ pub fn compile_angular_component_with(
 ///     place to route them through.
 ///   * no Angular decorator at all — a plain `.ts` module — passes through **unchanged**.
 ///
-/// The `file_name` is accepted for parity with the other authoring plugins (and future diagnostics);
-/// the base-Angular path does not derive a class name from it (the `@Component` class names itself).
+/// The `file_name` derives the fallback element selector a SELECTORLESS `@Component` adopts (its
+/// kebab-case stem, the same Treaty convention the JSX / `.treaty` front-ends use); a `@Component`
+/// that declares its own `selector` keeps it. The base-Angular path does not derive a class name
+/// from `file_name` (the `@Component` class names itself).
 pub fn compile_angular_source(source: &str, file_name: &str) -> CompiledAuthoring {
-    let _ = file_name;
     // Detect decorators on the SERVER-STRIPPED source: a `server { … }` block is not valid TS, so a
     // `@Component` that colocates one would otherwise fail to parse here and be misrouted to the
     // pass-through path. Lifting the block first lets detection see the real `@Component` and route
@@ -234,7 +249,7 @@ pub fn compile_angular_source(source: &str, file_name: &str) -> CompiledAuthorin
     // component still drives compilation — `compile_component_source` already rejects multi-class
     // files, so the component path will report that faithfully.)
     if kinds.contains(&AngularDecoratorKind::Component) {
-        return compile_angular_component(source);
+        return compile_angular_component(source, file_name);
     }
 
     // Either no Angular decorator (plain `.ts`) or only decorator kinds without a source extractor
@@ -264,7 +279,7 @@ server {\n\
 @Component({ template: '<button (click)=\"save(user)\">go</button>' })\n\
 export class AppComponent {}\n";
 
-        let out = compile_angular_component(source);
+        let out = compile_angular_component(source, "app.component.ts");
 
         // A server module was generated as a Rust/axum service with the POST route for `save`.
         let server_module = out.server_module.expect("expected a server module");
@@ -315,7 +330,7 @@ export class AppComponent {}\n";
 
         let registry = PluginRegistry::with_defaults();
         let elysia = registry.get("elysia-eden").expect("elysia-eden registered");
-        let out = compile_angular_component_with(source, |fns| elysia.emit(fns));
+        let out = compile_angular_component_with(source, "app.component.ts", |fns| elysia.emit(fns));
 
         let server_module = out.server_module.expect("expected a server module");
         assert!(
@@ -345,7 +360,7 @@ export class AppComponent {}\n";
         let source = "import { Component } from '@angular/core';\n\
 @Component({ selector: 'app-x', template: '<div>{{x}}</div>' })\n\
 export class XComponent { x = 1; }\n";
-        let out = compile_angular_component(source);
+        let out = compile_angular_component(source, "x.component.ts");
         assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
 
         let map = out.map.expect("expected a source map");
@@ -366,7 +381,7 @@ server {\n\
 @Component({ template: '<button (click)=\"save(user)\">go</button>' })\n\
 export class AppComponent {}\n";
 
-        let out = compile_angular_component(source);
+        let out = compile_angular_component(source, "app.component.ts");
         let map = out.map.expect("expected a source map for a server-block component");
         let value: serde_json::Value =
             serde_json::from_str(&map).expect("map should be valid JSON");
@@ -391,8 +406,53 @@ export class AppComponent {}\n";
         let source = "import { Component } from '@angular/core';\n\
 @Component({ template: '<div></div>' })\n\
 export class AppComponent {}\n";
-        let out = compile_angular_component(source);
+        let out = compile_angular_component(source, "app.component.ts");
         assert!(out.server_module.is_none(), "unexpected server module");
+    }
+
+    #[test]
+    fn selectorless_component_adopts_filename_kebab_selector() {
+        // The reported defect for a SELECTORLESS `@Component` `.ts`: with no `selector` in the
+        // decorator, the emit used Angular's `ng-component` no-selector default, so a bootstrapped
+        // component rendered a bare `<ng-component>` host. The filename now drives a kebab selector
+        // (`log-viewer.component.ts` -> `log-viewer`), removing the `ng-component` host.
+        let source = "import { Component } from '@angular/core';\n\
+@Component({ template: '<div>{{x}}</div>' })\n\
+export class LogViewer { x = 1; }\n";
+        let out = compile_angular_source(source, "log-viewer.component.ts");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        assert!(
+            out.code.contains("selectors: [[\"log-viewer\"]]"),
+            "expected filename-derived `log-viewer` selector; got: {}",
+            out.code
+        );
+        assert!(
+            !out.code.contains("ng-component"),
+            "ng-component default must not survive for a selectorless component; got: {}",
+            out.code
+        );
+    }
+
+    #[test]
+    fn explicit_selector_component_is_not_overridden_by_file_name() {
+        // A `@Component` that DECLARES its own selector keeps it verbatim — the filename fallback only
+        // fills in a MISSING selector, so explicit-selector `.ts` files (the golden-corpus shape) are
+        // never rewritten.
+        let source = "import { Component } from '@angular/core';\n\
+@Component({ selector: 'my-explicit-thing', template: '<div></div>' })\n\
+export class Whatever {}\n";
+        let out = compile_angular_source(source, "some-other-name.component.ts");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        assert!(
+            out.code.contains("selectors: [[\"my-explicit-thing\"]]"),
+            "explicit selector must be preserved; got: {}",
+            out.code
+        );
+        assert!(
+            !out.code.contains("some-other-name"),
+            "filename must NOT override an explicit selector; got: {}",
+            out.code
+        );
     }
 
     const DEFINE: &str = "\u{0275}\u{0275}defineComponent";

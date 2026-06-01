@@ -550,6 +550,17 @@ async function bootHeadless() {
 	const rendered =
 		/Treaty everything-app|Server logs|dashboard|metrics|waiting for stream/i.test(rootText) ||
 		routerOutletPresent
+	// The user-reported defect: a SELECTORLESS component used to render a bare `<ng-component>` host
+	// (Angular's no-selector default) because the compiler never derived a selector. The filename now
+	// drives a kebab-case selector for every selectorless authoring format (.treaty / .tsx / .tjsx /
+	// selectorless `.ts` @Component), so the BOOTED DOM must carry NO `<ng-component>` host — the
+	// rendered host tag is the derived selector instead. Probe the whole document (the AppRoot shell
+	// AND the router-resolved route paint here).
+	const ngComponentHosts = window.document.querySelectorAll('ng-component').length
+	// The eager "" route is the selectorless `@Component` LogViewer (`log-viewer.component.ts`): its
+	// host element is now the derived `<log-viewer>` tag, the concrete proof the selector is real and
+	// the `<ng-component>` host is gone.
+	const logViewerHostPresent = Boolean(window.document.querySelector('log-viewer'))
 
 	// The no-JIT guarantee holds regardless of the `use:`-directive gap: the partial @angular deps were
 	// de-partialled to AOT by the Rust linker, so the boot must never throw a JIT / @angular/compiler
@@ -599,6 +610,20 @@ async function bootHeadless() {
 		'a component rendered (AppRoot shell + router-outlet + the "" route through the router)',
 		rendered,
 		rootText ? rootText.replace(/\s+/g, ' ').trim().slice(0, 120) : 'no app-root content',
+	)
+	// The headline user requirement: the booted DOM has NO bare `<ng-component>` host — every
+	// selectorless component now renders under its filename-derived selector.
+	check(
+		'booted DOM has NO bare <ng-component> host (filename-derived selectors removed it)',
+		ngComponentHosts === 0,
+		`ng-component hosts=${ngComponentHosts}`,
+	)
+	// Concrete proof for the selectorless `.ts` @Component: the eager "" route paints under its
+	// derived `<log-viewer>` host tag.
+	check(
+		'the selectorless LogViewer route renders under its derived <log-viewer> host (not <ng-component>)',
+		logViewerHostPresent,
+		logViewerHostPresent ? '' : 'no <log-viewer> host found',
 	)
 
 	// NG0955 regression guard (runtime): booting LogViewer drained `streamLogs(10)` into `lines()` and

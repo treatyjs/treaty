@@ -1354,7 +1354,7 @@ pub fn compile_component_source(ts_source: &str) -> CompiledComponent {
         return err(format!("parse error: {}", msgs.join("; ")));
     }
 
-    compile_program_with_source(&ret.program, Some(ts_source), None, None)
+    compile_program_with_source(&ret.program, Some(ts_source), None, None, None)
 }
 
 /// Compile a TypeScript source string, supplying host-resolved external `templateUrl`/`styleUrls`
@@ -1378,7 +1378,7 @@ pub fn compile_component_source_with_resolved(
         return err(format!("parse error: {}", msgs.join("; ")));
     }
 
-    compile_program_with_source(&ret.program, Some(ts_source), None, Some(resolved))
+    compile_program_with_source(&ret.program, Some(ts_source), None, Some(resolved), None)
 }
 
 /// Context for additive source-map emission: the original authoring source text plus the
@@ -1417,6 +1417,25 @@ pub fn compile_component_source_with_map(
     file_name: &str,
     source_name: &str,
 ) -> CompiledComponentWithMap {
+    compile_component_source_with_map_and_selector(ts_source, file_name, source_name, None)
+}
+
+/// Like [`compile_component_source_with_map`], but a SELECTORLESS `@Component` (one whose decorator
+/// declares no `selector`) adopts `default_selector` as its element selector.
+///
+/// `default_selector` is the Treaty convention's filename-derived kebab tag (e.g.
+/// `log-viewer.component.ts` → `"log-viewer"`), supplied by the authoring front-end so a
+/// bootstrapped selectorless `.ts` component renders a real host element instead of Angular's
+/// `ng-component` no-selector default. A `@Component` that DECLARES a selector keeps it verbatim, a
+/// `@Directive` is never given one (directives are legitimately class-only), and passing `None`
+/// reproduces [`compile_component_source_with_map`] exactly (byte-identical emit) — so the
+/// golden-corpus / inline paths are unaffected.
+pub fn compile_component_source_with_map_and_selector(
+    ts_source: &str,
+    file_name: &str,
+    source_name: &str,
+    default_selector: Option<&str>,
+) -> CompiledComponentWithMap {
     let allocator = Allocator::default();
     let source_type = SourceType::default().with_typescript(true);
     let ret = Parser::new(&allocator, ts_source, source_type).parse();
@@ -1442,6 +1461,7 @@ pub fn compile_component_source_with_map(
         Some(ts_source),
         Some((&ctx, &mut map_out)),
         None,
+        default_selector,
     );
     CompiledComponentWithMap {
         code: compiled.code,
@@ -1833,6 +1853,7 @@ fn compile_program_with_source(
     source: Option<&str>,
     map: Option<(&MapContext, &mut String)>,
     resolved: Option<&ResolvedContentMap>,
+    default_selector: Option<&str>,
 ) -> CompiledComponent {
     let imported_names = collect_imported_names(program);
 
@@ -1890,6 +1911,7 @@ fn compile_program_with_source(
             &auto_import_candidates,
             &sibling_directives,
             resolved,
+            default_selector,
         ) {
             Ok(emit) => {
                 errors.extend(emit.errors.clone());
@@ -2066,6 +2088,8 @@ impl DecoratorCompiler for ComponentCompiler {
             ctx.auto_import_candidates,
             ctx.sibling_directives,
             ctx.resolved_content,
+            // A selectorless `@Component` adopts the caller's filename-derived default selector.
+            ctx.default_selector,
         )
     }
 }
@@ -2088,6 +2112,8 @@ impl DecoratorCompiler for DirectiveCompiler {
             ctx.auto_import_candidates,
             ctx.sibling_directives,
             ctx.resolved_content,
+            // A `@Directive` is legitimately selectorless (class-only); never substitute a selector.
+            None,
         )
     }
 }
@@ -2345,6 +2371,7 @@ fn compile_decorated_class(
     auto_import_candidates: &[String],
     sibling_directives: &[crate::binder::SelectorDirective],
     resolved_content: Option<&ResolvedContentMap>,
+    default_selector: Option<&str>,
 ) -> Result<ClassEmit, String> {
     let (class_name, class_name_span) = match &class.id {
         Some(id) => (
@@ -2365,6 +2392,7 @@ fn compile_decorated_class(
         auto_import_candidates,
         sibling_directives,
         resolved_content,
+        default_selector,
     };
 
     // MULTI-DECORATOR dispatch: ngtsc compiles EVERY recognized trait on a class, not only the
@@ -2452,6 +2480,7 @@ fn compile_component_or_directive(
     auto_import_candidates: &[String],
     sibling_directives: &[crate::binder::SelectorDirective],
     resolved_content: Option<&ResolvedContentMap>,
+    default_selector: Option<&str>,
 ) -> Result<ClassEmit, String> {
     // The host-resolved external content for THIS class (keyed by class name), if the caller wired
     // the resolution channel and supplied an entry. Used to back `templateUrl`/`styleUrls`.
@@ -2467,9 +2496,21 @@ fn compile_component_or_directive(
     }
 
     // selector.
+    //
+    // A `@Component` that declares its own `selector` keeps it verbatim. A SELECTORLESS `@Component`
+    // (no `selector` key) adopts `default_selector` when the caller supplied one — the Treaty
+    // convention's filename-derived kebab tag — so a bootstrapped selectorless `.ts` component
+    // renders a real host element instead of Angular's `ng-component` no-selector default. The
+    // fallback applies ONLY to a component (`default_selector` is threaded as `None` for the
+    // `@Directive` path, and for the golden-corpus / inline compile entries), so a selectorless
+    // directive and the golden corpus emit byte-identically (`selector: None`).
     let selector = obj
         .and_then(|o| find_prop(o, "selector"))
-        .and_then(string_value);
+        .and_then(string_value)
+        .or_else(|| match kind {
+            TopLevel::Component => default_selector.map(str::to_string),
+            _ => None,
+        });
 
     // template (components only). Directives have no template.
     //

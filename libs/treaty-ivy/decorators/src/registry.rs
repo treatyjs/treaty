@@ -67,10 +67,17 @@ pub type ResolvedContentMap = std::collections::HashMap<String, ResolvedComponen
 /// `@Directive`/`@Component` carrying a non-empty `selector` (for cross-class CSS-selector matching).
 /// `resolved_content` carries, per component class name, the host-resolved `templateUrl`/`styleUrls`
 /// contents (`None` when the caller supplied no resolution channel — inline-only compilation).
+/// `default_selector` is the fallback element selector a SELECTORLESS `@Component` adopts when its
+/// decorator declares no `selector` (the Treaty convention: a filename-derived kebab tag), so a
+/// bootstrapped selectorless `.ts` component renders a real host tag instead of Angular's
+/// `ng-component` no-selector default. It is `None` for the golden-corpus / inline compile paths,
+/// which leaves a selectorless component's `selector` exactly `None` (byte-identical emit), and it
+/// is NEVER applied to a `@Directive` (directives are legitimately selectorless / class-only).
 pub struct CompileCtx<'a> {
     pub auto_import_candidates: &'a [String],
     pub sibling_directives: &'a [crate::binder::SelectorDirective],
     pub resolved_content: Option<&'a ResolvedContentMap>,
+    pub default_selector: Option<&'a str>,
 }
 
 /// The Ivy emit of ONE decorated class, decomposed so the original module can be re-assembled
