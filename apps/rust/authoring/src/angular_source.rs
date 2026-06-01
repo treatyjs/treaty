@@ -193,8 +193,11 @@ pub fn compile_angular_component_with(
     // lifted server-fn body from the map's `sourcesContent` as a defense-in-depth guarantee, blanking
     // the body bytes to spaces so the map's line/column positions stay valid. The server source text
     // never reaches the client map.
-    let server_bodies: Vec<String> =
+    let mut server_bodies: Vec<String> =
         extraction.server_fns.iter().map(|f| f.source.clone()).collect();
+    // Also redact the verbatim original declaration text (directive included), which is what the map's
+    // `sourcesContent` embeds, so a `'use server'` marker fn beside the `@Component` is fully blanked.
+    server_bodies.extend(extraction.server_fns.iter().map(|f| f.verbatim_source.clone()));
     let map = map_or_none(redact_server_bodies_in_map(&compiled.map, &server_bodies));
 
     // render3 emits only the `defineComponent`, and lowers every template reference to a component
@@ -210,6 +213,15 @@ pub fn compile_angular_component_with(
             code = code.replace(&format!("ctx.{}(", f.name), &format!("{binding}("));
         }
     }
+
+    // A lifted server fn that is a SIBLING module export (a top-level `$$` / `'use server'` fn declared
+    // beside the `@Component`, not invoked from the component itself) was removed by the lift, so a
+    // consumer that `import { loadUser$$ } from './app.component'` would now receive `undefined`.
+    // Re-export each such fn as its client binding so the consumer transparently gets the RPC stub —
+    // the SAME wiring the plain-`.ts` and JSX paths apply, via the shared
+    // [`crate::plugin::export_server_fn_bindings`]. A fn already rewritten in-place (a free / `ctx.<fn>`
+    // call) is skipped, so there is no double-binding.
+    code = crate::plugin::export_server_fn_bindings(&code, &extraction.server_fns, &emit.client_bindings);
 
     // The rewritten call sites now reference the real `@treaty/httpclient` resource helper the
     // bindings wrap; prepend a real `import` of it so the module resolves the binding at boot rather
@@ -328,16 +340,13 @@ fn compile_plain_ts_server_module(
     // Start from the client source with every server-fn declaration already removed, then rewrite any
     // remaining FREE references to a lifted fn to its client binding (so an in-module caller routes
     // through the backend rather than dangling on the now-absent declaration).
-    let mut code = rewrite_call_sites(&extraction.client_source, &emit.client_bindings);
+    let code = rewrite_call_sites(&extraction.client_source, &emit.client_bindings);
 
     // Re-export each lifted server fn as its typed client binding so module consumers keep importing
     // the same name and transparently get the RPC stub. The binding is the plugin-provided client
-    // expression (a fetch/EventSource resource factory) — the body never appears here.
-    for f in &extraction.server_fns {
-        if let Some(binding) = emit.client_bindings.get(&f.name) {
-            code.push_str(&format!("\nexport const {} = {};\n", f.name, binding));
-        }
-    }
+    // expression (a fetch/EventSource resource factory) — the body never appears here. Shared with
+    // every other front-end via [`crate::plugin::export_server_fn_bindings`].
+    let mut code = crate::plugin::export_server_fn_bindings(&code, &extraction.server_fns, &emit.client_bindings);
 
     // The emitted bindings reference the real `@treaty/httpclient` resource helper
     // (`edenPromiseResource`). Prepend a real `import` of it so the client module resolves the binding
@@ -356,6 +365,10 @@ fn compile_plain_ts_server_module(
     // though the client CODE no longer contains them.
     let mut server_bodies: Vec<String> =
         extraction.server_fns.iter().map(|f| f.source.clone()).collect();
+    // Also redact the VERBATIM original declaration text (directive included) — what the map's
+    // `sourcesContent` actually embeds — so a `'use server'` marker fn (whose stripped `source` would
+    // not match the original) is still fully blanked.
+    server_bodies.extend(extraction.server_fns.iter().map(|f| f.verbatim_source.clone()));
     // Also redact every stripped NON-fn server-only top-level statement (e.g. a `const DB_API_KEY = …`
     // beside the fns in a file-level `'use server'` module). These never reach the client CODE, but the
     // map's embedded `sourcesContent` is the ORIGINAL source, so without redacting them too the secret
@@ -379,6 +392,97 @@ fn compile_plain_ts_server_module(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Parse `code` (TypeScript) and assert it has no parse errors — proving the emitted client module
+    /// is syntactically valid by building the AST, never a regex.
+    fn assert_unified_client_parses(code: &str) {
+        let allocator = Allocator::default();
+        let source_type = SourceType::default().with_typescript(true);
+        let ret = Parser::new(&allocator, code, source_type).parse();
+        assert!(
+            ret.errors.is_empty(),
+            "emitted client did not parse: {:?}\n--- code ---\n{code}",
+            ret.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn unified_component_with_dollar_suffix_fn_extracts_binds_and_imports() {
+        // MATRIX (@Component + $$): a SIBLING `$$`-suffixed server fn declared beside a `@Component`
+        // must be extracted to the server module, its body ABSENT from the client, and a client binding
+        // re-exported + the resource helper imported — the SAME unified wiring every front-end applies.
+        let source = "import { Component } from '@angular/core';\n\
+export async function loadUser$$(id: number) { return db.users.find(id); }\n\
+@Component({ template: '<div>{{ x }}</div>' })\n\
+export class AppComponent { x = 1; }\n";
+        let out = compile_angular_component(source, "app.component.ts");
+
+        let server_module = out.server_module.expect("$$ fn must yield a server module");
+        assert!(server_module.contains("db.users.find"), "body not in server module; got:\n{server_module}");
+
+        assert_unified_client_parses(&out.code);
+        assert!(!out.code.contains("db.users.find"), "SECURITY: body leaked into client; got:\n{}", out.code);
+        assert!(
+            out.code.contains("export const loadUser$$ ="),
+            "no re-exported client binding for the lifted $$ fn; got:\n{}",
+            out.code
+        );
+        assert!(
+            out.code.contains("import { edenPromiseResource } from '@treaty/httpclient/resources'"),
+            "no real resource-client import; got:\n{}",
+            out.code
+        );
+        assert_imported_at_module_scope(&out.code, "edenPromiseResource");
+    }
+
+    #[test]
+    fn unified_component_with_use_server_fn_extracts_binds_and_imports() {
+        // MATRIX (@Component + 'use server'): a SIBLING fn carrying a `'use server'` body directive
+        // declared beside a `@Component` must be extracted, body ABSENT from the client, a binding
+        // re-exported, and the helper imported.
+        let source = "import { Component } from '@angular/core';\n\
+export async function loadUser(id: number) { 'use server'; return db.users.find(id); }\n\
+@Component({ template: '<div>{{ x }}</div>' })\n\
+export class AppComponent { x = 1; }\n";
+        let out = compile_angular_component(source, "app.component.ts");
+
+        let server_module = out.server_module.expect("use-server fn must yield a server module");
+        assert!(server_module.contains("db.users.find"), "body not in server module; got:\n{server_module}");
+
+        assert_unified_client_parses(&out.code);
+        assert!(!out.code.contains("db.users.find"), "SECURITY: body leaked into client; got:\n{}", out.code);
+        assert!(
+            out.code.contains("export const loadUser ="),
+            "no re-exported client binding for the lifted use-server fn; got:\n{}",
+            out.code
+        );
+        assert_imported_at_module_scope(&out.code, "edenPromiseResource");
+    }
+
+    #[test]
+    fn unified_component_with_server_block_binds_and_imports() {
+        // MATRIX (.ts + server{}): a `@Component` with an inline `server { … }` block whose fn IS called
+        // from the template keeps the in-place call-site rewrite (and so is NOT double-re-exported), and
+        // imports the helper.
+        let source = "import { Component } from '@angular/core';\n\
+server {\n\
+  async function save(user: User) { return db.insert(user); }\n\
+}\n\
+@Component({ template: '<button (click)=\"save(user)\">go</button>' })\n\
+export class AppComponent {}\n";
+        let out = compile_angular_component(source, "app.component.ts");
+        assert!(out.server_module.is_some(), "server block must yield a server module");
+        assert_unified_client_parses(&out.code);
+        assert!(!out.code.contains("db.insert"), "SECURITY: body leaked; got:\n{}", out.code);
+        // The fn is invoked in the template, so its call site was rewritten in place (it does not also
+        // get a re-export — that would double-bind).
+        assert!(
+            !out.code.contains("export const save ="),
+            "an in-place-rewritten fn was wrongly also re-exported; got:\n{}",
+            out.code
+        );
+        assert_imported_at_module_scope(&out.code, "edenPromiseResource");
+    }
 
     #[test]
     fn angular_server_block_extracts_route_and_rewrites_call_through_default_axum() {

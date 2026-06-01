@@ -296,19 +296,25 @@ pub fn compile(source: &str, file_name: &str) -> CompiledAuthoring {
     //    `sourcesContent` below. The emitted bindings reference the real `@treaty/httpclient` resource
     //    helper (`edenPromiseResource`); a real `import` of it is prepended so the client module
     //    resolves the binding at boot instead of throwing `<symbol> is not defined`.
-    let (javascript, server_module, server_bodies) = if extraction.server_fns.is_empty() {
-        (javascript, None, Vec::new())
-    } else {
-        let registry = PluginRegistry::with_defaults();
-        let plugin = registry
-            .default_plugin()
-            .expect("registry seeded with a default backend plugin");
-        let emit = plugin.emit(&extraction.server_fns);
-        let rewritten = rewrite_call_sites(&javascript, &emit.client_bindings);
-        let bodies: Vec<String> =
-            extraction.server_fns.iter().map(|f| f.source.clone()).collect();
-        (rewritten, Some(emit.server_module), bodies)
-    };
+    let (javascript, server_module, server_bodies, server_bindings) =
+        if extraction.server_fns.is_empty() {
+            (javascript, None, Vec::new(), std::collections::HashMap::new())
+        } else {
+            let registry = PluginRegistry::with_defaults();
+            let plugin = registry
+                .default_plugin()
+                .expect("registry seeded with a default backend plugin");
+            let emit = plugin.emit(&extraction.server_fns);
+            let rewritten = rewrite_call_sites(&javascript, &emit.client_bindings);
+            // Redact BOTH the stripped lifted `source` and the `verbatim_source` (the exact original
+            // text, directive included) from the client map — the verbatim form is what the map's
+            // `sourcesContent` embeds, so a `'use server'` marker fn (whose `source` had the directive
+            // stripped) is still fully redacted.
+            let mut bodies: Vec<String> =
+                extraction.server_fns.iter().map(|f| f.source.clone()).collect();
+            bodies.extend(extraction.server_fns.iter().map(|f| f.verbatim_source.clone()));
+            (rewritten, Some(emit.server_module), bodies, emit.client_bindings)
+        };
 
     // 5. Signals-by-default: every component variable is a signal. Wrap simple-value declarations in
     //    `signal(...)`, rewrite writes to `.set(...)` / `.update(...)`, and inject the `signal`
@@ -358,11 +364,21 @@ pub fn compile(source: &str, file_name: &str) -> CompiledAuthoring {
     // import statement, not inside the component wrapper where the signals pass would mistake it for
     // component state), so the module resolves the binding at boot rather than throwing `<symbol> is
     // not defined`. Empty when no binding symbol is referenced.
-    let imports = client_runtime_imports_for_code(&compiled.code);
+    // A lifted server fn that is a SIBLING module export (a top-level `$$` / `'use server'` /
+    // `'use websocket'` fn declared beside the component, not invoked from the component body) was
+    // removed by the lift, so an external `import { loadGreeting$$ } from './card'` would now receive
+    // `undefined`. Re-export each such fn as its client binding at module scope so the consumer
+    // transparently gets the RPC stub — the SAME wiring the `@Component` `.ts` and plain-`.ts` paths
+    // apply, via the shared [`crate::plugin::export_server_fn_bindings`]. A fn already rewritten in the
+    // component body (a free call) is skipped, so there is no double-binding.
+    let with_bindings =
+        crate::plugin::export_server_fn_bindings(&compiled.code, &extraction.server_fns, &server_bindings);
+
+    let imports = client_runtime_imports_for_code(&with_bindings);
     let code = if imports.is_empty() {
-        compiled.code
+        with_bindings
     } else {
-        format!("{imports}\n{}", compiled.code)
+        format!("{imports}\n{with_bindings}")
     };
 
     CompiledAuthoring {
@@ -829,6 +845,88 @@ export default function counter() {\n  return <section>hi</section>;\n}\n";
         assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
         assert!(out.code.contains(DEFINE), "no defineComponent; got: {}", out.code);
         assert!(out.code.contains("App_Template"), "no template fn; got: {}", out.code);
+    }
+
+    /// Parse `code` as an ES module (TypeScript) and assert it has no parse errors — by building the
+    /// AST, never a regex — proving the emitted JSX client module is syntactically valid.
+    fn assert_jsx_client_parses(code: &str) {
+        let allocator = Allocator::default();
+        let module_type = SourceType::default().with_module(true).with_typescript(true);
+        let ret = JsParser::new(&allocator, code, module_type).parse();
+        assert!(
+            ret.errors.is_empty(),
+            "emitted JSX client did not parse: {:?}\n--- code ---\n{code}",
+            ret.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Parse `code` and assert `name` is bound at MODULE SCOPE by a top-level `import` specifier local,
+    /// read off the PARSED AST (never a regex).
+    fn assert_jsx_imported_at_module_scope(code: &str, name: &str) {
+        use oxc_ast::ast::ImportDeclarationSpecifier;
+        let allocator = Allocator::default();
+        let module_type = SourceType::default().with_module(true).with_typescript(true);
+        let ret = JsParser::new(&allocator, code, module_type).parse();
+        assert!(ret.errors.is_empty(), "client code did not parse: {code}");
+        let imported = ret.program.body.iter().any(|stmt| {
+            let Statement::ImportDeclaration(import) = stmt else { return false };
+            let Some(specs) = &import.specifiers else { return false };
+            specs.iter().any(|spec| {
+                let local = match spec {
+                    ImportDeclarationSpecifier::ImportSpecifier(s) => &s.local.name,
+                    ImportDeclarationSpecifier::ImportDefaultSpecifier(s) => &s.local.name,
+                    ImportDeclarationSpecifier::ImportNamespaceSpecifier(s) => &s.local.name,
+                };
+                local.as_str() == name
+            })
+        });
+        assert!(imported, "`{name}` is not imported at module scope; got:\n{code}");
+    }
+
+    #[test]
+    fn unified_jsx_with_dollar_suffix_fn_extracts_binds_and_imports() {
+        // MATRIX (JSX + $$): a top-level `$$`-suffixed server fn in a `.tsx` module (whose component
+        // body is JSX, so a plain-TS parse would choke and miss the marker) must be extracted via the
+        // JSX-aware pre-pass, body ABSENT from the client, a client binding re-exported at module
+        // scope, and the resource helper imported — the SAME unified wiring every front-end applies.
+        let source = "import { signal } from '@angular/core'\n\
+export async function loadGreeting$$(name: string) {\n\
+  const greetings = ['Hello', 'Welcome'];\n\
+  return { text: greetings[name.length] };\n\
+}\n\
+export default function greetingCard() {\n\
+  const name = signal('Grace');\n\
+  return <section>{name()}</section>;\n\
+}\n";
+        let out = compile(source, "greeting-card.tsx");
+
+        let server_module = out
+            .server_module
+            .expect("JSX-file $$ fn must yield a server module");
+        assert!(
+            server_module.contains("greetings[name.length") || server_module.contains("'Hello'"),
+            "body not carried into server module; got:\n{server_module}"
+        );
+
+        // VERIFY EMITTED CLIENT BY PARSING; body must be absent.
+        assert_jsx_client_parses(&out.code);
+        assert!(
+            !out.code.contains("greetings[name.length"),
+            "SECURITY: server body leaked into JSX client; got:\n{}",
+            out.code
+        );
+        // The lifted fn is re-exported as its client binding at module scope.
+        assert!(
+            out.code.contains("export const loadGreeting$$ ="),
+            "no re-exported client binding for the lifted $$ fn; got:\n{}",
+            out.code
+        );
+        assert!(
+            out.code.contains("import { edenPromiseResource } from '@treaty/httpclient/resources'"),
+            "no real resource-client import; got:\n{}",
+            out.code
+        );
+        assert_jsx_imported_at_module_scope(&out.code, "edenPromiseResource");
     }
 
     #[test]

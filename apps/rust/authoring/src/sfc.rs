@@ -47,7 +47,9 @@ use treaty_ivy::view::compiler::{
     ViewEncapsulation,
 };
 
-use crate::plugin::{extract_server_block, rewrite_call_sites, BackendEmit, PluginRegistry, ServerFn};
+use crate::plugin::{
+    extract_server_block_treaty, rewrite_call_sites, BackendEmit, PluginRegistry, ServerFn,
+};
 use crate::source_map::redact_server_bodies_in_map;
 use crate::treaty::ast::AstNode;
 use crate::treaty::lexer::Lexer;
@@ -102,6 +104,46 @@ fn split_chunks(source: &str) -> TreatyChunks {
         }
     }
     chunks
+}
+
+/// Build a byte-offset-identical "detection view" of a `.treaty` source in which every NON-JavaScript
+/// region (HTML, `<style>`, the top-of-file macro fence, control-flow markers) is blanked to
+/// length-preserving whitespace, leaving the JavaScript regions intact in place.
+///
+/// A `.treaty` SFC interleaves TypeScript with markup that is not valid TypeScript, so a whole-file TS
+/// parse — which the parse-based server-fn MARKER lift (`'use server'` / `$$` / `'use websocket'`)
+/// needs — fails and the marker in the JS region is never seen. Masking the non-JS regions to
+/// whitespace (every non-newline byte → a space, newlines preserved so line/column spans stay aligned)
+/// yields a view that parses as TS and whose every byte sits at the same index as in the real source,
+/// so the marker spans map 1:1 back. The lexer's [`Token::start`]/`end` byte offsets drive the mask, so
+/// it is exact (never a regex). Bytes the lexer does not cover (whitespace/gaps between tokens) stay as
+/// they are — they are already insignificant whitespace.
+fn mask_non_js_regions(source: &str) -> String {
+    use crate::treaty::token::TokenKind;
+    let bytes = source.as_bytes();
+    // Start from a copy; blank only the spans of non-JavaScript tokens.
+    let mut out: Vec<u8> = bytes.to_vec();
+
+    let mut lexer = Lexer::new(source);
+    while let Some(token) = lexer.next_token() {
+        if matches!(token.kind, TokenKind::JavaScript(_)) {
+            continue;
+        }
+        // Blank this non-JS region to whitespace, preserving byte length AND newlines (so span line
+        // numbers in the detection parse line up with the real source).
+        let start = token.start.min(out.len());
+        let end = token.end.min(out.len());
+        for b in &mut out[start..end] {
+            if *b != b'\n' && *b != b'\r' {
+                *b = b' ';
+            }
+        }
+    }
+
+    // `out` is a byte-for-byte length-preserving transform of valid UTF-8 (only non-newline bytes in
+    // masked regions were set to ASCII space, never splitting a multibyte char because a masked region
+    // is replaced wholesale on its own token boundaries), so it is valid UTF-8.
+    String::from_utf8(out).unwrap_or_else(|_| source.to_string())
 }
 
 /// PascalCase the *stem* of a file name (path separators, extension, and a trailing `.component`
@@ -563,8 +605,10 @@ fn compile_treaty_file_inner(
     // `import` declarations leak verbatim INTO the component function — illegal, and esbuild rejects
     // it with `Unexpected "{"`). Stripping the block here keeps every `.treaty` entry point emitting
     // valid client JS; the server MODULE itself is still emitted only by the server-aware
-    // `compile_treaty_authoring` path.
-    let client_source = extract_server_block(source).client_source;
+    // `compile_treaty_authoring` path. The marker forms (`'use server'` / `$$` / `'use websocket'`) are
+    // lifted too via the masked detection view (see [`mask_non_js_regions`]), so a marker server fn in
+    // a `.treaty` JS chunk is stripped from the client even on this server-UNAWARE entry.
+    let client_source = extract_server_block_treaty(source, &mask_non_js_regions(source)).client_source;
     let chunks = split_chunks(&client_source);
     let class_name = to_pascal_case(file_name);
 
@@ -1027,7 +1071,11 @@ pub fn compile_treaty_authoring_with(
     file_name: &str,
     emit: impl FnOnce(&[ServerFn]) -> BackendEmit,
 ) -> CompiledAuthoring {
-    let extraction = extract_server_block(source);
+    // Lift `server { … }` blocks AND marker server fns (`'use server'` / `$$` / `'use websocket'`) out
+    // of the `.treaty` SFC. The masked detection view (see [`mask_non_js_regions`]) lets the
+    // parse-based marker lift see the JS regions despite the interleaved markup, so a marker server fn
+    // in a `.treaty` JS chunk is extracted exactly like the `.ts`/`.tsx` paths.
+    let extraction = extract_server_block_treaty(source, &mask_non_js_regions(source));
 
     // The map embeds the ORIGINAL authoring file text as `sourcesContent`, named by `file_name`,
     // mirroring the base `@Component` `.ts` path. The original `source` (pre-server-strip) is used
@@ -1054,22 +1102,39 @@ pub fn compile_treaty_authoring_with(
     let (compiled, map) =
         compile_treaty_file_with_map(&client_source, file_name, file_name, source);
 
+    // A lifted server fn that is a SIBLING export (a top-level `$$` / `'use server'` fn declared in the
+    // `.treaty` JS chunk, not bound from the template) was removed by the lift, so an external
+    // `import { name }` of it would now receive `undefined`. Re-export each such fn as its client
+    // binding at module scope so the consumer transparently gets the RPC stub — the SAME wiring the
+    // `@Component` `.ts` / plain-`.ts` / JSX paths apply, via the shared
+    // [`crate::plugin::export_server_fn_bindings`]. A fn already rewritten in place is skipped.
+    let with_bindings = crate::plugin::export_server_fn_bindings(
+        &compiled.code,
+        &extraction.server_fns,
+        &emit.client_bindings,
+    );
+
     // The rewritten call sites reference the real `@treaty/httpclient` resource helper the bindings
     // wrap. Prepend a real `import` of it so the compiled `.treaty` client module resolves the binding
     // at boot rather than throwing `<symbol> is not defined`. Empty when no binding symbol is named.
-    let imports = crate::plugin::client_runtime_imports_for_code(&compiled.code);
+    let imports = crate::plugin::client_runtime_imports_for_code(&with_bindings);
     let code = if imports.is_empty() {
-        compiled.code
+        with_bindings
     } else {
-        format!("{imports}\n{}", compiled.code)
+        format!("{imports}\n{with_bindings}")
     };
 
     // CLIENT PRIVACY: the map embeds the original authoring source as `sourcesContent`, which still
-    // carries the verbatim `server { … }` block. Redact each lifted server-fn body out of the map's
-    // content (blanked to position-preserving whitespace) so the server source never reaches the
-    // client map — the same guarantee the base `@Component` `.ts` path provides.
-    let server_bodies: Vec<String> =
+    // carries the verbatim `server { … }` block AND any marker server fn (`'use server'` / `$$`).
+    // Redact each lifted fn out of the map's content (blanked to position-preserving whitespace) so the
+    // server source never reaches the client map — the same guarantee the base `@Component` `.ts` path
+    // provides. Both the stripped lifted `source` AND the `verbatim_source` (the EXACT original text,
+    // directive included) are blanked: the verbatim form is what the map's `sourcesContent` embeds, so
+    // a `'use server'` fn (whose `source` had the directive removed and so would not match the original)
+    // is still fully redacted.
+    let mut server_bodies: Vec<String> =
         extraction.server_fns.iter().map(|f| f.source.clone()).collect();
+    server_bodies.extend(extraction.server_fns.iter().map(|f| f.verbatim_source.clone()));
     let map = map.map(|m| redact_server_bodies_in_map(&m, &server_bodies));
 
     CompiledAuthoring {
@@ -1561,6 +1626,79 @@ function onClick(user) { return save(user); }\n\
             "server body leaked into client; got: {}",
             out.code
         );
+    }
+
+    /// Parse `code` as an ES module and assert it has no parse errors — by building the AST, never a
+    /// regex — proving the emitted `.treaty` client module is syntactically valid.
+    fn assert_treaty_client_parses(code: &str) {
+        let allocator = Allocator::default();
+        let module_type = SourceType::default().with_module(true).with_typescript(true);
+        let ret = JsParser::new(&allocator, code, module_type).parse();
+        assert!(
+            ret.errors.is_empty(),
+            "emitted .treaty client did not parse: {:?}\n--- code ---\n{code}",
+            ret.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Parse `code` and assert `name` is bound at MODULE SCOPE by a top-level `import` specifier local,
+    /// read off the PARSED AST (never a regex).
+    fn assert_treaty_imported_at_module_scope(code: &str, name: &str) {
+        use oxc_ast::ast::ImportDeclarationSpecifier;
+        let allocator = Allocator::default();
+        let module_type = SourceType::default().with_module(true).with_typescript(true);
+        let ret = JsParser::new(&allocator, code, module_type).parse();
+        assert!(ret.errors.is_empty(), "client code did not parse: {code}");
+        let imported = ret.program.body.iter().any(|stmt| {
+            let oxc_ast::ast::Statement::ImportDeclaration(import) = stmt else { return false };
+            let Some(specs) = &import.specifiers else { return false };
+            specs.iter().any(|spec| {
+                let local = match spec {
+                    ImportDeclarationSpecifier::ImportSpecifier(s) => &s.local.name,
+                    ImportDeclarationSpecifier::ImportDefaultSpecifier(s) => &s.local.name,
+                    ImportDeclarationSpecifier::ImportNamespaceSpecifier(s) => &s.local.name,
+                };
+                local.as_str() == name
+            })
+        });
+        assert!(imported, "`{name}` is not imported at module scope; got:\n{code}");
+    }
+
+    #[test]
+    fn unified_treaty_with_use_server_fn_extracts_binds_and_imports() {
+        // MATRIX (.treaty + 'use server'): a SIBLING fn carrying a `'use server'` body directive in the
+        // `.treaty` JS chunk must be extracted to the server module, body ABSENT from the client, a
+        // client binding re-exported, and the resource helper imported — the SAME unified wiring every
+        // front-end applies.
+        let source = "export async function loadUser(id: number) { 'use server'; return db.users.find(id); }\n\
+const title = 'Form';\n\
+<div>{{ title }}</div>\n";
+        let out = compile_treaty_authoring(source, "form.treaty");
+
+        let server_module = out.server_module.expect("use-server fn must yield a server module");
+        assert!(
+            server_module.contains("db.users.find"),
+            "body not in server module; got:\n{server_module}"
+        );
+
+        // VERIFY EMITTED CLIENT BY PARSING.
+        assert_treaty_client_parses(&out.code);
+        assert!(
+            !out.code.contains("db.users.find"),
+            "SECURITY: body leaked into .treaty client; got:\n{}",
+            out.code
+        );
+        assert!(
+            out.code.contains("export const loadUser ="),
+            "no re-exported client binding for the lifted use-server fn; got:\n{}",
+            out.code
+        );
+        assert!(
+            out.code.contains("import { edenPromiseResource } from '@treaty/httpclient/resources'"),
+            "no real resource-client import; got:\n{}",
+            out.code
+        );
+        assert_treaty_imported_at_module_scope(&out.code, "edenPromiseResource");
     }
 
     #[test]

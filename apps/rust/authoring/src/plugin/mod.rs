@@ -90,6 +90,22 @@ pub struct ServerFn {
     /// The transport kind for this fn (see [`TransportKind`]), detected during extraction. Defaults
     /// to [`TransportKind::Api`].
     pub transport: TransportKind,
+    /// Whether the fn was declared with an `export` at module scope (an `export function f$$()`, an
+    /// `export const g = …`, an `export default function h()`, or any top-level fn in a file-level
+    /// `'use server'` / `'use websocket'` module). Such a fn is part of the module's PUBLIC surface: a
+    /// consumer `import { f } from './x'`s it, so after lifting its body the client must RE-EXPORT the
+    /// name as its client binding (an RPC stub) or the import resolves to `undefined`. A non-exported
+    /// fn (an in-component `server { … }` block fn, a bare top-level marker fn that is only called
+    /// in-module) is NOT re-exported — its call sites are rewritten in place instead. Defaults to
+    /// `false` (the conservative, non-re-exported case).
+    pub exported: bool,
+    /// The VERBATIM declaration text exactly as it appears in the original source — including any
+    /// leading `'use server'` / `'use websocket'` directive that [`ServerFn::source`] strips. This is
+    /// the precise byte sequence the client source map's `sourcesContent` embeds (the map carries the
+    /// original authoring file), so the privacy redaction must blank THIS text, not the stripped
+    /// [`ServerFn::source`] (whose directive removal would otherwise leave the body unmatched and so
+    /// unredacted in the map). Empty only for synthetic test fns; every extracted fn carries it.
+    pub verbatim_source: String,
 }
 
 /// The default target language when no `server:IDENT` tag is given.
@@ -211,12 +227,48 @@ pub fn extract_server_block_jsx(source: &str) -> ServerExtraction {
     extract_server_block_with_type(source, SourceType::tsx())
 }
 
+/// Like [`extract_server_block`], but for a `.treaty` SFC, whose interleaved HTML/CSS regions are not
+/// valid TypeScript. The explicit `server[:LANG] { … }` block lift (a comment/string-aware text scan)
+/// already works on the raw SFC; the parse-based MARKER lift (`'use server'` / `$$` / `'use websocket'`)
+/// would otherwise fail because the whole-file TS parse chokes on the markup. So this masks every
+/// non-JavaScript region of the SFC to length-preserving whitespace, runs the marker parse over that
+/// masked view (which now parses as TS and whose spans map 1:1 back into the real source), and slices /
+/// strips against the real source — so a `'use server'` / `$$` server fn declared in a `.treaty` JS
+/// chunk is extracted exactly like the `.ts` path, carrying its REAL body.
+pub fn extract_server_block_treaty(source: &str, js_masked: &str) -> ServerExtraction {
+    extract_server_block_impl(
+        source,
+        SourceType::default().with_typescript(true),
+        Some(js_masked),
+    )
+}
+
 /// Shared implementation of [`extract_server_block`] / [`extract_server_block_jsx`], parameterized on
 /// the [`SourceType`] used by the marker pre-pass so a JSX source parses with JSX enabled.
 fn extract_server_block_with_type(source: &str, source_type: SourceType) -> ServerExtraction {
+    extract_server_block_impl(source, source_type, None)
+}
+
+/// Shared implementation behind [`extract_server_block_with_type`] and [`extract_server_block_treaty`].
+///
+/// `marker_detect` is an optional byte-offset-identical detection view for the parse-based marker lift
+/// (see [`extract_marker_fns_detect`]); when `None`, the post-block client source is its own detection
+/// source (the `.ts`/`.tsx` paths). The `.treaty` path supplies a masked view so the marker parse sees
+/// only the JS regions. The masked view describes the WHOLE source; the marker step is run over the
+/// slice of it corresponding to the post-block client source.
+fn extract_server_block_impl(
+    source: &str,
+    source_type: SourceType,
+    marker_detect: Option<&str>,
+) -> ServerExtraction {
     // 1. Lift every explicit `server[:LANG] { … }` block first. Multiple blocks are supported; each
     //    keeps its own language tag (bare `server { … }` defaults to `rust`).
+    //
+    //    When `marker_detect` is supplied (the `.treaty` masked view), the SAME block spans are removed
+    //    from it in lockstep with the real source so the two stay byte-offset-identical for the
+    //    parse-based marker step below.
     let mut client_source = String::with_capacity(source.len());
+    let mut client_detect = marker_detect.map(|_| String::with_capacity(source.len()));
     let mut server_fns: Vec<ServerFn> = Vec::new();
     let mut cursor = 0usize;
     while let Some(block) = find_server_block(&source[cursor..]) {
@@ -234,24 +286,32 @@ fn extract_server_block_with_type(source: &str, source_type: SourceType) -> Serv
 
         // Carry forward the text that precedes this block; resume scanning after it.
         client_source.push_str(&source[cursor..block_start]);
+        if let (Some(detect), Some(mask)) = (client_detect.as_mut(), marker_detect) {
+            detect.push_str(&mask[cursor..block_start]);
+        }
         cursor = block_end;
     }
     // Whatever remains after the last block (or the whole source if there were no blocks).
     client_source.push_str(&source[cursor..]);
+    if let (Some(detect), Some(mask)) = (client_detect.as_mut(), marker_detect) {
+        detect.push_str(&mask[cursor..]);
+    }
 
     // 2. Lift the remaining top-level marker forms (`'use server'` directive, `name$$` suffix,
     //    module-level `'use websocket'`) from whatever client source survived step 1, removing their
-    //    declarations as we go.
+    //    declarations as we go. The detection view is the masked client source for `.treaty`, else the
+    //    client source itself.
+    let detect = client_detect.as_deref().unwrap_or(&client_source);
     let (rewritten, marker_fns, server_only_sources) =
-        extract_marker_fns_with_type(&client_source, source_type);
+        extract_marker_fns_detect(&client_source, detect, source_type);
     client_source = rewritten;
     server_fns.extend(marker_fns);
 
     ServerExtraction { client_source, server_fns, server_only_sources }
 }
 
-/// Scan top-level declarations of `source` for the marker conventions that do not use an explicit
-/// `server { … }` wrapper, lift them out, and return the source with their declarations removed.
+/// Scan top-level declarations for the marker conventions that do not use an explicit `server { … }`
+/// wrapper, lift them out, and return the source with their declarations removed.
 ///
 /// A top-level declaration is a server fn when any of the following hold:
 ///   * a `function` / `const NAME = (…) => …` whose body's first statement is the bare
@@ -267,27 +327,47 @@ fn extract_server_block_with_type(source: &str, source_type: SourceType) -> Serv
 /// `export default function h(){…}`, and `export async function* s(){…}` are all considered, so a
 /// file-level `'use server'` module exporting its server fns is fully extracted.
 ///
-/// The scan parses `source` once with OXC and removes the matched declarations by byte span (highest
-/// span first so earlier offsets stay valid). Only program-top-level declarations are considered.
-/// Parses with the caller-supplied [`SourceType`] so a JSX (`.tsx`/`.tjsx`) source — whose component
-/// body is not valid plain TypeScript — is parsed with JSX enabled and its top-level markers are seen
-/// (the `.ts`/`.treaty` callers pass a plain-TypeScript [`SourceType`]).
+/// The scan parses `detect_source` once with OXC and removes the matched declarations by byte span
+/// (highest span first so earlier offsets stay valid). Only program-top-level declarations are
+/// considered. Parses with the caller-supplied [`SourceType`] so a JSX (`.tsx`/`.tjsx`) source — whose
+/// component body is not valid plain TypeScript — is parsed with JSX enabled and its top-level markers
+/// are seen (the `.ts`/`.treaty` callers pass a plain-TypeScript [`SourceType`]).
 ///
-/// Adds module-level `'use websocket'` support alongside the file-level `'use server'` lift: a
-/// top-of-program `'use websocket'` string directive turns the WHOLE module into a server module
-/// whose exported fns are lifted as [`TransportKind::WebSocket`] server fns (the duplex analogue of a
+/// Module-level `'use websocket'` is supported alongside the file-level `'use server'` lift: a
+/// top-of-program `'use websocket'` string directive turns the WHOLE module into a server module whose
+/// exported fns are lifted as [`TransportKind::WebSocket`] server fns (the duplex analogue of a
 /// file-level `'use server'` module), the directive statement is stripped from the client, and each
 /// lifted fn is rewritten to its WebSocket client binding by the active backend.
-fn extract_marker_fns_with_type(
-    source: &str,
+///
+/// `detect_source` is parsed to FIND the markers; each lifted fn's body text is sliced from — and the
+/// matched spans stripped out of — `text_source`. `detect_source` MUST be byte-offset-identical to
+/// `text_source` (same length, every byte at the same index), differing only in which bytes are
+/// blanked: a `.treaty` SFC's interleaved HTML/CSS regions are not valid TypeScript, so the whole-file
+/// parse fails and a `'use server'` / `$$` marker in the JS region is missed. The `.treaty` front-end
+/// passes a `detect_source` with every non-JS region replaced by length-preserving whitespace (so the
+/// parse sees only the JS, succeeds, and every span maps 1:1 back into the real `text_source`), while
+/// `text_source` is the real client source whose JS bodies (and HTML) are intact — so the lifted fn
+/// carries its REAL body and the strip lands on the real declaration. The `.ts`/`.tsx` callers pass the
+/// same string for both (no masking needed).
+fn extract_marker_fns_detect(
+    text_source: &str,
+    detect_source: &str,
     source_type: SourceType,
 ) -> (String, Vec<ServerFn>, Vec<String>) {
-    if source.trim().is_empty() {
-        return (source.to_string(), Vec::new(), Vec::new());
+    debug_assert_eq!(
+        text_source.len(),
+        detect_source.len(),
+        "detect_source must be byte-offset-identical to text_source"
+    );
+    if detect_source.trim().is_empty() {
+        return (text_source.to_string(), Vec::new(), Vec::new());
     }
+    // Slice fn bodies and strip spans from the REAL text source; parse the (possibly masked) detect
+    // source so spans are found even when the real source interleaves non-TS regions.
+    let source = text_source;
 
     let allocator = Allocator::default();
-    let ret = JsParser::new(&allocator, source, source_type).parse();
+    let ret = JsParser::new(&allocator, detect_source, source_type).parse();
 
     // A file-level `'use server'` directive turns the WHOLE module into a server module: every
     // top-level function/arrow-const declaration is server-only, regardless of per-fn marker. A
@@ -334,6 +414,12 @@ fn extract_marker_fns_with_type(
             // transport (the duplex-channel analogue of a file-level `'use server'` module).
             if file_level_websocket {
                 server_fn.transport = TransportKind::WebSocket;
+            }
+            // A file-level `'use server'` / `'use websocket'` module is wholly a server module: every
+            // lifted fn (even a bare, non-`export` declaration) is the module's public surface a
+            // consumer imports, so it must be re-exported as its client binding.
+            if file_level {
+                server_fn.exported = true;
             }
             removals.push(span);
             fns.push(server_fn);
@@ -788,7 +874,7 @@ fn server_fn_from_top_level(
     // Top-level marker forms always target `rust` (the default backend language).
     match stmt {
         Statement::ExportNamedDeclaration(export) => {
-            let (server_fn, _inner_span) = match export.declaration.as_ref()? {
+            let (mut server_fn, _inner_span) = match export.declaration.as_ref()? {
                 Declaration::FunctionDeclaration(func) => {
                     build_from_function(source, func, require_marker, DEFAULT_LANG)
                 }
@@ -797,6 +883,9 @@ fn server_fn_from_top_level(
                 }
                 _ => None,
             }?;
+            // An `export`ed declaration is part of the module's public surface, so a consumer imports
+            // it by name — the client must re-export its binding (see [`ServerFn::exported`]).
+            server_fn.exported = true;
             // Remove the whole `export …` statement (so no dangling `export` remains); the function
             // source the backend re-emits never includes the `export` keyword.
             Some((server_fn, (export.span.start as usize, export.span.end as usize)))
@@ -805,8 +894,9 @@ fn server_fn_from_top_level(
             let ExportDefaultDeclarationKind::FunctionDeclaration(func) = &export.declaration else {
                 return None;
             };
-            let (server_fn, _inner_span) =
+            let (mut server_fn, _inner_span) =
                 build_from_function(source, func, require_marker, DEFAULT_LANG)?;
+            server_fn.exported = true;
             Some((server_fn, (export.span.start as usize, export.span.end as usize)))
         }
         _ => build_server_fn(source, stmt, require_marker, DEFAULT_LANG),
@@ -872,6 +962,9 @@ fn build_from_function(
     let transport = detect_transport(&name, func.generator, has_ws_directive, &body_src);
 
     let span = (func.span.start as usize, func.span.end as usize);
+    // The verbatim declaration text as it appears in the original source (directive included) — what
+    // the client map's `sourcesContent` embeds, so the privacy redaction can blank it exactly.
+    let verbatim_source = source[span.0..span.1].to_string();
     // Strip the `'use server'` directive (by span) then the `'use websocket'` directive (by
     // content) from the lifted source, so neither marker survives into the emitted body.
     let src = strip_directive(source, span, directive);
@@ -892,6 +985,10 @@ fn build_from_function(
             is_async: func.r#async,
             lang: lang.to_string(),
             transport,
+            // Set by the caller that knows the declaration's export context (the `export`-wrapped path
+            // in `server_fn_from_top_level`, or a file-level module). Defaults to non-exported here.
+            exported: false,
+            verbatim_source,
         },
         span,
     ))
@@ -928,6 +1025,9 @@ fn build_from_var_decl(
     let transport = detect_transport(&name, false, has_ws_directive, &body_src);
 
     let span = (decl.span.start as usize, decl.span.end as usize);
+    // Verbatim declaration text (directive included) — what the client map embeds; see
+    // [`ServerFn::verbatim_source`].
+    let verbatim_source = source[span.0..span.1].to_string();
     let src = strip_directive(source, span, directive);
     let src = strip_leading_directive_text(&src, USE_WEBSOCKET_DIRECTIVE);
 
@@ -946,6 +1046,9 @@ fn build_from_var_decl(
             is_async: arrow.r#async,
             lang: lang.to_string(),
             transport,
+            // Set by the caller that knows the declaration's export context. Defaults to non-exported.
+            exported: false,
+            verbatim_source,
         },
         span,
     ))
@@ -1190,11 +1293,32 @@ pub fn rewrite_call_sites(client_source: &str, bindings: &HashMap<String, String
             continue;
         }
 
-        out.push(bytes[i] as char);
-        i += 1;
+        // An ordinary byte that is neither noncode nor an identifier start. It may be the LEAD byte of
+        // a multibyte UTF-8 char (e.g. `ɵ`, which is what the lowered Ivy emit on the `@Component`
+        // server path is full of). Copy the WHOLE char — slicing through `client_source` to the next
+        // char boundary — rather than `bytes[i] as char`, which would split the char into its raw bytes
+        // and corrupt it (the `ɵɵdefineComponent` mojibake bug).
+        let char_len = utf8_char_len(bytes[i]);
+        let end = (i + char_len).min(bytes.len());
+        out.push_str(&client_source[i..end]);
+        i = end;
     }
 
     out
+}
+
+/// The byte length of the UTF-8 char whose lead byte is `b` (1 for ASCII / a continuation byte, up to
+/// 4 for a 4-byte sequence). Used to copy a whole multibyte char in one step.
+fn utf8_char_len(b: u8) -> usize {
+    if b < 0x80 || (0x80..0xC0).contains(&b) {
+        1
+    } else if b < 0xE0 {
+        2
+    } else if b < 0xF0 {
+        3
+    } else {
+        4
+    }
 }
 
 fn is_ident_start(b: u8) -> bool {
@@ -1265,12 +1389,118 @@ fn client_runtime_imports_for(needs_resource: bool) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Shared server-fn binding re-export.
+// ---------------------------------------------------------------------------
+
+/// Re-export every lifted server fn as its client binding at module scope, for any lifted fn whose
+/// NAME does not already appear as a free reference rewritten in `code`.
+///
+/// A lifted server fn reaches the client in one of two shapes:
+///   * it was CALLED somewhere in the client (a template handler / free reference): [`rewrite_call_sites`]
+///     (and, on the `@Component` path, the `ctx.<fn>(` swap) already replaced the call with the binding
+///     expression, so nothing more is needed; OR
+///   * it was a SIBLING module export the author imports elsewhere (`import { loadUser$$ } from './x'`):
+///     the lift removed its declaration, so a consumer would now import `undefined`. For these the
+///     binding must be re-exported under the same name so the consumer transparently receives the RPC
+///     stub instead of the (lifted) body.
+///
+/// This appends `export const <name> = <binding>;` for every fn marked [`ServerFn::exported`] — a fn
+/// that was an `export` declaration (or any fn in a file-level `'use server'`/`'use websocket'` module),
+/// i.e. part of the module's PUBLIC surface a consumer imports. A NON-exported fn (an in-component
+/// `server { … }` block fn, a bare top-level marker fn called only in-module) is NOT re-exported: its
+/// call sites were already rewritten in place, and re-exporting it would emit a duplicate binding under
+/// a name no external consumer imports. The binding is the active backend's per-fn client expression (a
+/// `fetch`/`EventSource`/`WebSocket` factory) — the body never appears. Front-ends call this so EVERY
+/// authoring form (`@Component` `.ts`, plain `.ts`, `.treaty`, JSX) emits the client binding for a
+/// lifted exported server fn, not just the in-component call-site rewrite.
+pub fn export_server_fn_bindings(
+    code: &str,
+    fns: &[ServerFn],
+    bindings: &HashMap<String, String>,
+) -> String {
+    let mut out = code.to_string();
+    for f in fns {
+        if !f.exported {
+            continue;
+        }
+        let Some(binding) = bindings.get(&f.name) else {
+            continue;
+        };
+        out.push_str(&format!("\nexport const {} = {};\n", f.name, binding));
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Tests.
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a minimal [`ServerFn`] for the re-export unit tests, parameterized on `exported`.
+    fn test_fn(name: &str, exported: bool) -> ServerFn {
+        ServerFn {
+            name: name.to_string(),
+            source: String::new(),
+            params: Vec::new(),
+            return_type: None,
+            is_async: true,
+            lang: "rust".to_string(),
+            transport: TransportKind::Api,
+            exported,
+            verbatim_source: String::new(),
+        }
+    }
+
+    #[test]
+    fn rewrite_call_sites_preserves_multibyte_chars() {
+        // REGRESSION: a multibyte UTF-8 char (the Ivy `ɵ`, U+0275 = bytes 0xC9 0xB5) in the client
+        // source must survive `rewrite_call_sites` intact. The byte-at-a-time `bytes[i] as char` path
+        // split it into two Latin-1 chars (the `ɵɵdefineComponent` mojibake) — copying the whole char
+        // fixes it. This matters because the `@Component` server path rewrites call sites over the
+        // ALREADY-LOWERED Ivy emit, which is full of `ɵ`.
+        let mut bindings = HashMap::new();
+        bindings.insert("save".to_string(), "client.save".to_string());
+        let client = "i0.\u{0275}\u{0275}defineComponent({ x: save() });\n";
+        let out = rewrite_call_sites(client, &bindings);
+        assert!(
+            out.contains("\u{0275}\u{0275}defineComponent"),
+            "multibyte ɵ corrupted by rewrite; got bytes: {:?}",
+            out.chars().map(|c| c as u32).collect::<Vec<_>>()
+        );
+        assert!(out.contains("client.save()"), "call not rewritten; got: {out}");
+        // The output must be valid UTF-8 round-tripping the original ɵ codepoints (no 0xC9/0xB5 split).
+        assert!(!out.chars().any(|c| c as u32 == 0x00C9), "ɵ was split into Latin-1 bytes; got: {out}");
+    }
+
+    #[test]
+    fn export_server_fn_bindings_reexports_exported_fn() {
+        let mut bindings = HashMap::new();
+        bindings.insert("loadUser$$".to_string(), "((id) => fetchThing(id))".to_string());
+        let fns = vec![test_fn("loadUser$$", true)];
+        // An EXPORTED lifted fn is part of the module surface, so it is re-exported under its name.
+        let out = export_server_fn_bindings("const x = 1;", &fns, &bindings);
+        assert!(
+            out.contains("export const loadUser$$ = ((id) => fetchThing(id));"),
+            "no re-export for an exported lifted fn; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn export_server_fn_bindings_skips_non_exported_fn() {
+        let mut bindings = HashMap::new();
+        bindings.insert("save".to_string(), "client.save".to_string());
+        let fns = vec![test_fn("save", false)];
+        // A NON-exported fn (an in-component `server { … }` block fn whose call site was rewritten in
+        // place) is NOT re-exported — no consumer imports it, and a re-export would duplicate-bind it.
+        let out = export_server_fn_bindings("const r = save();", &fns, &bindings);
+        assert!(
+            !out.contains("export const save ="),
+            "re-exported a non-exported (in-component) fn; got:\n{out}"
+        );
+    }
 
     #[test]
     fn extract_server_block_lifts_async_fn_and_removes_block() {

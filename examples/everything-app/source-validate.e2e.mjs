@@ -296,15 +296,171 @@ async function validateFile(abs) {
 }
 
 // ---------------------------------------------------------------------------
+// CROSS-CUTTING server-fn matrix (synthetic, in-file). The user requirement (2026-06-01) is that
+// server-fn extraction is a CROSS-CUTTING capability — it must hold for normal Angular `@Component`
+// `.ts` and `.treaty`, not just JSX. The everything-app `src/**` corpus exercises the file-level
+// `'use server'` / `.ws` / `.stream` server modules and a `.treaty`/JSX `server { }` block, but NOT a
+// `@Component` (or `.treaty`) that ALSO declares a SIBLING marker server fn (`'use server'` body
+// directive / `$$` suffix) beside the component — the precise leak the unified pre-pass closes. These
+// synthetic rows drive that matrix through the SAME production `@treaty/compiler` seam and assert, by
+// PARSING the emitted client (esbuild loader + @babel/parser — never a regex over the emit):
+//   - the server-fn body token is ABSENT from the client code AND the client map's sourcesContent,
+//   - a server artifact (serverModule/chunks) is produced,
+//   - the lifted fn is re-exported as a client binding AND the resource helper is imported at module
+//     scope (so a consumer import resolves at boot, not `undefined`),
+//   - and (for a component) the expected `ɵɵdefineComponent` still emits with no surviving decorator.
+// Each is a distinct authoring FORM so the matrix proves the capability is uniform per front-end.
+const CROSS_CUTTING_MATRIX = [
+	{
+		file: 'matrix/component-use-server.component.ts',
+		source:
+			"import { Component } from '@angular/core'\n" +
+			"export async function loadUser(id: number) { 'use server'; return db.users.findSecret(id) }\n" +
+			"@Component({ template: '<div>{{ x }}</div>' })\n" +
+			'export class MatrixUseServerComponent { x = 1 }\n',
+		bodyToken: 'db.users.findSecret',
+		binding: 'export const loadUser =',
+		expectedDefine: 'ɵɵdefineComponent',
+	},
+	{
+		file: 'matrix/component-dollar.component.ts',
+		source:
+			"import { Component } from '@angular/core'\n" +
+			'export async function loadOrder$$(id: number) { return db.orders.findSecret(id) }\n' +
+			"@Component({ template: '<div>{{ x }}</div>' })\n" +
+			'export class MatrixDollarComponent { x = 1 }\n',
+		bodyToken: 'db.orders.findSecret',
+		binding: 'export const loadOrder$$ =',
+		expectedDefine: 'ɵɵdefineComponent',
+	},
+	{
+		file: 'matrix/sfc-use-server.treaty',
+		source:
+			"export async function loadRow(id: number) { 'use server'; return db.rows.findSecret(id) }\n" +
+			"const title = 'Matrix'\n" +
+			'<div>{{ title }}</div>\n',
+		bodyToken: 'db.rows.findSecret',
+		binding: 'export const loadRow =',
+		expectedDefine: 'ɵɵdefineComponent',
+	},
+	{
+		file: 'matrix/jsx-dollar.tjsx',
+		source:
+			"import { signal } from '@angular/core'\n" +
+			'export async function loadCard$$(name: string) { return db.cards.findSecret(name) }\n' +
+			'export default function matrixCard() {\n' +
+			"  const name = signal('Grace')\n" +
+			'  return <section>{name()}</section>\n' +
+			'}\n',
+		bodyToken: 'db.cards.findSecret',
+		binding: 'export const loadCard$$ =',
+		expectedDefine: 'ɵɵdefineComponent',
+	},
+]
+
+/**
+ * Parse the (TS-stripped) emitted client JS and assert `name` is imported at MODULE scope — read off
+ * the @babel AST, never a regex. An imported symbol is not a free/undefined reference, so the binding
+ * resolves at boot.
+ */
+function importedAtModuleScope(js, name) {
+	const ast = parser.parse(js, { sourceType: 'module', plugins: ['jsx'] })
+	let found = false
+	traverse(ast, {
+		ImportDeclaration(path) {
+			for (const spec of path.node.specifiers) {
+				if (spec.local && spec.local.name === name) found = true
+			}
+		},
+	})
+	return found
+}
+
+async function validateCrossCuttingMatrix() {
+	for (const c of CROSS_CUTTING_MATRIX) {
+		const abs = join(here, 'src', c.file)
+		const row = { file: `synthetic:${c.file}`, ok: true, reasons: [] }
+
+		let result = null
+		let threw = null
+		try {
+			result = compiler.transform(abs, c.source)
+		} catch (err) {
+			threw = err?.message ?? String(err)
+		}
+		if (!expect(row, 'compiles without diagnostics', threw === null && result && typeof result.code === 'string' && result.code.length > 0, threw ?? 'no code emitted')) {
+			row.ok = false
+			rows.push(row)
+			continue
+		}
+
+		const clientCode = result.code
+
+		// A server artifact is produced.
+		const hasServerArtifact = Boolean(result.serverModule) || (Array.isArray(result.serverChunks) && result.serverChunks.length > 0)
+		expect(row, 'sibling marker server fn produces a server artifact', hasServerArtifact, 'no serverModule or serverChunks')
+
+		// The server-fn body token is ABSENT from the client code (exact substring; not the leak vector).
+		expect(row, `server body token absent from CLIENT code: "${c.bodyToken}"`, !clientCode.includes(c.bodyToken), 'token leaked into client code')
+
+		// The lifted fn is re-exported as its client binding (so a consumer import resolves to the stub).
+		expect(row, `lifted fn re-exported as client binding: "${c.binding}"`, clientCode.includes(c.binding), 'no re-exported client binding')
+
+		// Verify well-formedness + Ivy def + module-scope helper import by PARSING the emit.
+		let inspected = null
+		try {
+			inspected = await inspectEmittedClientCode(clientCode, abs)
+		} catch (err) {
+			const e = err?.errors?.[0]?.text ?? err?.message ?? String(err)
+			expect(row, 'emitted client module is well-formed (esbuild loader accepts it)', false, e)
+		}
+		if (inspected) {
+			expect(row, `emits ${c.expectedDefine}`, inspected.defineCalls.has(c.expectedDefine), `saw [${[...inspected.defineCalls].join(', ') || 'none'}]`)
+			expect(row, 'NO raw Angular decorator node survives (AOT, no JIT)', inspected.survivingDecorators === 0, `${inspected.survivingDecorators} decorator node(s) remain`)
+
+			// The resource helper the binding wraps is imported at module scope (parsed off the AST).
+			const isTreaty = abs.endsWith('.treaty')
+			const stripped = await esbuild.transform(clientCode, { loader: isTreaty ? 'ts' : 'tsx', format: 'esm', jsx: 'preserve', logLevel: 'silent' })
+			expect(row, "resource helper 'edenPromiseResource' imported at module scope (no free reference at boot)", importedAtModuleScope(stripped.code, 'edenPromiseResource'), 'helper not imported at module scope')
+		}
+
+		// The body token must not survive in the client map's sourcesContent either (parsed structurally).
+		let mapContent = ''
+		if (typeof result.map === 'string' && result.map.length > 0) {
+			let mapParsed = null
+			try {
+				mapParsed = JSON.parse(result.map)
+			} catch {
+				mapParsed = null
+			}
+			expect(row, 'client source map is valid v3 JSON', mapParsed && mapParsed.version === 3, 'map not parseable v3')
+			mapContent = mapParsed && Array.isArray(mapParsed.sourcesContent) ? mapParsed.sourcesContent.join('\n') : ''
+		}
+		expect(row, `server body token absent from client MAP sourcesContent: "${c.bodyToken}"`, !mapContent.includes(c.bodyToken), 'token leaked into client map')
+
+		// Production privacy guard over the threaded chunks/map.
+		const audit = assertNoServerBodyInMap(result)
+		expect(row, 'assertNoServerBodyInMap passes', audit.ok, audit.leak ? `${audit.leak.token} in ${audit.leak.where}` : '')
+
+		row.ok = row.reasons.length === 0
+		rows.push(row)
+	}
+}
+
+// ---------------------------------------------------------------------------
 async function main() {
 	const srcDir = join(here, 'src')
 	const files = enumerateSources(srcDir).sort()
-	console.log(`== source-validate: ${files.length} authoring source(s) under src/ ==\n`)
+	console.log(`== source-validate: ${files.length} authoring source(s) under src/ + ${CROSS_CUTTING_MATRIX.length} synthetic cross-cutting server-fn case(s) ==\n`)
 
 	for (const abs of files) {
 		// eslint-disable-next-line no-await-in-loop
 		await validateFile(abs)
 	}
+
+	// Cross-cutting server-fn matrix (synthetic): @Component+'use server', @Component+$$,
+	// .treaty+'use server', JSX+$$ — proving server-fn extraction is uniform across front-ends.
+	await validateCrossCuttingMatrix()
 
 	// PER-FILE PASS/FAIL MATRIX. Each row also emits a grep-stable canonical status line
 	// (`[source-validate] PASS <file>` / `[source-validate] FAIL <file>`) so the unified dev.e2e
