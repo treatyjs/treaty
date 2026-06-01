@@ -286,3 +286,201 @@ fn whole_bootstrap_packages_link_to_zero_residual() {
         "no bootstrap @angular package was installed; cannot verify zero-residual linking"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Wider-ecosystem sweep (Angular CDK / Material and any sibling community packages).
+//
+// CDK + Material are the canonical partial-compiled libraries that exercise declaration shapes the
+// first-party bootstrap packages never do — input transform functions written as guarded ternaries
+// (`value => value == null ? undefined : numberAttribute(value)`), multi-statement `useFactory`
+// bodies (`{ const parent = inject(...); return parent || new X(); }`), `forwardRef` inside provider
+// `deps`, rich host bindings and content/view queries. Every such chunk must de-partial to ZERO
+// residual in Rust (no @angular/compiler, no JIT fallback).
+//
+// These packages are not pinned in this repo's package.json, so they may be absent from
+// `node_modules`. The sweep locates each package's `fesm2022` dir in `node_modules/@angular/<pkg>`
+// and, additionally, under an optional `TREATY_IVY_ECOSYSTEM_DIR` (a directory of extracted package
+// roots, e.g. `npm pack` output) so CI/dev can point at a vendored extraction. When neither is
+// present the package is skipped gracefully (logged); the combined gate asserts that AT LEAST ONE
+// ecosystem package was present so the sweep is never silently vacuous when run in an environment
+// that does provide them — but a bare checkout without CDK/Material installed skips cleanly.
+// ---------------------------------------------------------------------------
+
+/// The wider-ecosystem packages whose partial chunks the linker must de-partial to zero. Each is an
+/// `@angular`-scoped package directory name; the sweep also tolerates a sibling community package by
+/// the same convention if one is dropped into the ecosystem dir.
+const ECOSYSTEM_PACKAGES: &[&str] = &["cdk", "material"];
+
+/// Candidate `fesm2022` directories for an ecosystem package: the repo `node_modules/@angular/<pkg>`
+/// install location, plus (when `TREATY_IVY_ECOSYSTEM_DIR` is set) every `*/<pkg>/.../fesm2022`
+/// inside that extraction dir. Returns each existing candidate directory.
+fn ecosystem_fesm_dirs(pkg: &str) -> Vec<std::path::PathBuf> {
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+
+    // 1. Real install location (an app that depends on CDK/Material has it here).
+    let installed = ng_dir(&format!("{pkg}/fesm2022"));
+    if installed.is_dir() {
+        dirs.push(installed);
+    }
+
+    // 2. Optional extraction dir (`npm pack` tarballs unpacked): walk it for any
+    //    `…/<pkg…>/…/fesm2022` directory whose parent path mentions the package name.
+    if let Ok(root) = std::env::var("TREATY_IVY_ECOSYSTEM_DIR") {
+        let mut stack = vec![std::path::PathBuf::from(root)];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            for e in entries.flatten() {
+                let p = e.path();
+                if !p.is_dir() {
+                    continue;
+                }
+                if p.file_name().and_then(|n| n.to_str()) == Some("fesm2022")
+                    && p.to_string_lossy().to_lowercase().contains(pkg)
+                {
+                    if !dirs.iter().any(|d| d == &p) {
+                        dirs.push(p);
+                    }
+                } else {
+                    stack.push(p);
+                }
+            }
+        }
+    }
+    dirs
+}
+
+/// Recursively link every partial `.mjs` chunk in a directory tree (CDK/Material keep their chunks
+/// flat in `fesm2022`, but a nested layout is handled too). Asserts per chunk: no link errors, ZERO
+/// residual `ɵɵngDeclare` call site, the output re-parses as a valid ES module, and no
+/// `@angular/compiler` import is introduced. Returns `(before, after, linked_chunk_count)`.
+fn link_tree_recursive(label: &str, root: &std::path::Path) -> (usize, usize, usize) {
+    let marker = ng_declare();
+    let mut before = 0usize;
+    let mut after = 0usize;
+    let mut chunks = 0usize;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("mjs") {
+                continue;
+            }
+            let Ok(code) = std::fs::read_to_string(&path) else { continue };
+            if !code.contains(&marker) {
+                continue;
+            }
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            let chunk_before = residual(&code);
+            if chunk_before == 0 {
+                continue;
+            }
+            let compiler_before = imports_angular_compiler(&code);
+
+            let out = link_partial(&code, &name);
+            assert!(out.errors.is_empty(), "{label}/{name}: link errors: {:?}", out.errors);
+
+            let chunk_after = residual(&out.code);
+            assert_eq!(
+                chunk_after, 0,
+                "{label}/{name}: {chunk_after} ɵɵngDeclare call site(s) survived full linking (was {chunk_before})"
+            );
+            assert!(
+                compiler_before || !imports_angular_compiler(&out.code),
+                "{label}/{name}: linking INTRODUCED a @angular/compiler import (JIT fallback not eliminated)"
+            );
+            assert_parses_as_module(&out.code, &format!("{label}/{name}"));
+
+            before += chunk_before;
+            after += chunk_after;
+            chunks += 1;
+        }
+    }
+    (before, after, chunks)
+}
+
+/// Sweep ONE wider-ecosystem package across every candidate `fesm2022` dir. Returns
+/// `(before, after, chunks)` summed across all candidates, or `None` when the package is absent.
+fn sweep_ecosystem_package(pkg: &str) -> Option<(usize, usize, usize)> {
+    let dirs = ecosystem_fesm_dirs(pkg);
+    if dirs.is_empty() {
+        return None;
+    }
+    let (mut before, mut after, mut chunks) = (0usize, 0usize, 0usize);
+    for dir in &dirs {
+        let (b, a, c) = link_tree_recursive(pkg, dir);
+        before += b;
+        after += a;
+        chunks += c;
+    }
+    Some((before, after, chunks))
+}
+
+/// Angular CDK — every partial chunk present must de-partial to zero residual. Skips when CDK is not
+/// installed (neither in `node_modules` nor the ecosystem extraction dir).
+#[test]
+fn angular_cdk_links_to_zero_residual() {
+    match sweep_ecosystem_package("cdk") {
+        None => eprintln!("skipping @angular/cdk: not installed"),
+        Some((_, _, 0)) => eprintln!("skipping @angular/cdk: no partial chunks present"),
+        Some((before, after, chunks)) => {
+            assert_eq!(after, 0, "@angular/cdk: {after} residual ɵɵngDeclare after linking");
+            eprintln!("@angular/cdk: linked {chunks} chunk(s) — residual ɵɵngDeclare {before} -> {after}");
+        }
+    }
+}
+
+/// Angular Material — every partial chunk present must de-partial to zero residual. Skips when
+/// Material is not installed.
+#[test]
+fn angular_material_links_to_zero_residual() {
+    match sweep_ecosystem_package("material") {
+        None => eprintln!("skipping @angular/material: not installed"),
+        Some((_, _, 0)) => eprintln!("skipping @angular/material: no partial chunks present"),
+        Some((before, after, chunks)) => {
+            assert_eq!(after, 0, "@angular/material: {after} residual ɵɵngDeclare after linking");
+            eprintln!("@angular/material: linked {chunks} chunk(s) — residual ɵɵngDeclare {before} -> {after}");
+        }
+    }
+}
+
+/// The full wider-ecosystem zero-residual gate: every PRESENT ecosystem package must carry partial
+/// chunks that de-partial to ZERO residual. When at least one package is present the gate is
+/// non-vacuous (it asserts a positive chunk count was actually linked); when NONE is present (a bare
+/// checkout without CDK/Material) it skips cleanly — these packages are not pinned in this repo, so
+/// their absence is not a failure, only their non-zero residual is.
+#[test]
+fn wider_ecosystem_packages_link_to_zero_residual() {
+    let mut present = 0usize;
+    let mut total_chunks = 0usize;
+    for pkg in ECOSYSTEM_PACKAGES {
+        match sweep_ecosystem_package(pkg) {
+            None | Some((_, _, 0)) => continue,
+            Some((before, after, chunks)) => {
+                present += 1;
+                total_chunks += chunks;
+                assert_eq!(after, 0, "@angular/{pkg}: {after} residual ɵɵngDeclare after linking");
+                eprintln!(
+                    "@angular/{pkg}: residual ɵɵngDeclare {before} -> {after} across {chunks} chunk(s)"
+                );
+            }
+        }
+    }
+    if present == 0 {
+        eprintln!(
+            "skipping wider-ecosystem gate: no ecosystem package (cdk/material) installed; \
+             set TREATY_IVY_ECOSYSTEM_DIR or install @angular/cdk + @angular/material to exercise it"
+        );
+        return;
+    }
+    // Non-vacuous when present: at least one real partial chunk must have been linked.
+    assert!(
+        total_chunks > 0,
+        "wider-ecosystem packages were present but carried no linkable partial chunks"
+    );
+    eprintln!("wider ecosystem: {present} package(s), {total_chunks} partial chunk(s) → zero residual");
+}

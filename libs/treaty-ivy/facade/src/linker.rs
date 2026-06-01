@@ -38,7 +38,8 @@ use crate::factory::{
 use crate::compile::RealTemplateBuilder;
 use crate::output::emitter::{emit_expression, emit_statements};
 use crate::output_ast::{
-    self as o, Expr, ExprKind, LiteralMapEntry, LiteralValue, ParseSourceSpan,
+    self as o, BinaryOperator, Expr, ExprKind, LiteralMapEntry, LiteralValue, ParseSourceSpan,
+    UnaryOperator,
 };
 use crate::pipe_module_injector::{
     compile_injector, compile_ng_module, compile_pipe_from_metadata, R3InjectorMetadata,
@@ -258,7 +259,58 @@ fn convert_expr(expr: &Expression) -> Option<Expr> {
             // `new callee(...args)` via the `Expr::instantiate` builder.
             Some(callee.instantiate(args))
         }
-        Expression::ParenthesizedExpression(p) => convert_expr(&p.expression),
+        Expression::ParenthesizedExpression(p) => {
+            // Preserve the explicit grouping so emitted precedence matches the source
+            // (`(a || b) && c`); the inner expression carries through.
+            convert_expr(&p.expression).map(|inner| Expr::bare(ExprKind::Parenthesized(Box::new(inner))))
+        }
+        // `cond ? a : b` — input transform functions are routinely written as a guarded
+        // ternary (`value => value == null ? undefined : numberAttribute(value)`), so the
+        // declaration's opaque `transformFunction` must carry the conditional through verbatim.
+        Expression::ConditionalExpression(cond) => {
+            let condition = convert_expr(&cond.test)?;
+            let true_case = convert_expr(&cond.consequent)?;
+            let false_case = convert_expr(&cond.alternate)?;
+            Some(condition.conditional(true_case, Some(false_case)))
+        }
+        // `a && b`, `a || b`, `a ?? b` — logical operators inside transform/factory bodies.
+        Expression::LogicalExpression(logical) => {
+            let op = match logical.operator {
+                oxc_ast::ast::LogicalOperator::And => BinaryOperator::And,
+                oxc_ast::ast::LogicalOperator::Or => BinaryOperator::Or,
+                oxc_ast::ast::LogicalOperator::Coalesce => BinaryOperator::NullishCoalesce,
+            };
+            let lhs = convert_expr(&logical.left)?;
+            let rhs = convert_expr(&logical.right)?;
+            Some(binary_expr(op, lhs, rhs))
+        }
+        // Comparison / arithmetic binary operators (`value == null`, `x + 1`, …). Operators with
+        // no IR equivalent (bitwise shift / XOR) fall through to `None` → an explicit link error
+        // rather than a silent mis-emit.
+        Expression::BinaryExpression(bin) => {
+            let op = map_binary_operator(bin.operator)?;
+            let lhs = convert_expr(&bin.left)?;
+            let rhs = convert_expr(&bin.right)?;
+            Some(binary_expr(op, lhs, rhs))
+        }
+        // `!x`, `+x`, `-x`, `typeof x`, `void x`. `delete`/`~` have no IR form → `None`.
+        Expression::UnaryExpression(un) => {
+            let inner = convert_expr(&un.argument)?;
+            match un.operator {
+                oxc_ast::ast::UnaryOperator::LogicalNot => Some(o::not(inner)),
+                oxc_ast::ast::UnaryOperator::UnaryPlus => {
+                    Some(o::unary(UnaryOperator::Plus, inner, None))
+                }
+                oxc_ast::ast::UnaryOperator::UnaryNegation => {
+                    Some(o::unary(UnaryOperator::Minus, inner, None))
+                }
+                oxc_ast::ast::UnaryOperator::Typeof => Some(o::typeof_expr(inner)),
+                oxc_ast::ast::UnaryOperator::Void => {
+                    Some(Expr::bare(ExprKind::Void(Box::new(inner))))
+                }
+                _ => None,
+            }
+        }
         // Arrow functions appear as `useFactory: () => new X(inject(Dep))`. Only
         // expression-bodied (or single-`return`) arrows are faithfully convertible
         // to the output IR; multi-statement bodies are left unconverted (→ `None`,
@@ -268,15 +320,95 @@ fn convert_expr(expr: &Expression) -> Option<Expr> {
             let body = convert_arrow_body(arrow)?;
             Some(o::arrow_fn(params, body, None))
         }
-        // `function (…) { return …; }` factory functions convert to a FunctionExpr.
+        // `function (…) { … }` factory functions convert to a FunctionExpr. The body is converted
+        // statement-by-statement (const/let, expression, `if`, `return`) so multi-statement
+        // factories (`useFactory: function(){ const p = inject(...); return p || new X(); }`) carry
+        // through verbatim, not just the single-`return` shape.
         Expression::FunctionExpression(func) => {
             let params = convert_params(&func.params)?;
             let body_block = func.body.as_ref()?;
-            let body = convert_return_only_block(&body_block.statements)?;
+            let body = convert_statements(&body_block.statements)?;
             Some(o::fn_(params, body, None, None))
         }
         _ => None,
     }
+}
+
+/// Build a [`BinaryOperator`] IR node from an lhs/rhs through the public per-operator builders
+/// (the generic `binary` constructor is private). Every operator the linker maps has a builder.
+fn binary_expr(op: BinaryOperator, lhs: Expr, rhs: Expr) -> Expr {
+    match op {
+        BinaryOperator::Equals => lhs.equals(rhs),
+        BinaryOperator::NotEquals => lhs.not_equals(rhs),
+        BinaryOperator::Identical => lhs.identical(rhs),
+        BinaryOperator::NotIdentical => lhs.not_identical(rhs),
+        BinaryOperator::Minus => lhs.minus(rhs),
+        BinaryOperator::Plus => lhs.plus(rhs),
+        BinaryOperator::Divide => lhs.divide(rhs),
+        BinaryOperator::Multiply => lhs.multiply(rhs),
+        BinaryOperator::Modulo => lhs.modulo(rhs),
+        BinaryOperator::Exponentiation => lhs.power(rhs),
+        BinaryOperator::And => lhs.and(rhs),
+        BinaryOperator::Or => lhs.or(rhs),
+        BinaryOperator::BitwiseOr => lhs.bitwise_or(rhs),
+        BinaryOperator::BitwiseAnd => lhs.bitwise_and(rhs),
+        BinaryOperator::Lower => lhs.lower(rhs),
+        BinaryOperator::LowerEquals => lhs.lower_equals(rhs),
+        BinaryOperator::Bigger => lhs.bigger(rhs),
+        BinaryOperator::BiggerEquals => lhs.bigger_equals(rhs),
+        BinaryOperator::NullishCoalesce => lhs.nullish_coalesce(rhs),
+        // The remaining IR operators (assignment + compound-assignment, plus `In`/`InstanceOf`,
+        // which the IR `BinaryOperator` does not even define) are never produced here:
+        // `map_binary_operator` returns `None` for `in`/`instanceof` and never yields an assignment
+        // op, and the `LogicalExpression` arm only feeds `And`/`Or`/`NullishCoalesce`. This arm is
+        // unreachable for any converted declaration.
+        BinaryOperator::Assign
+        | BinaryOperator::AdditionAssignment
+        | BinaryOperator::SubtractionAssignment
+        | BinaryOperator::MultiplicationAssignment
+        | BinaryOperator::DivisionAssignment
+        | BinaryOperator::RemainderAssignment
+        | BinaryOperator::ExponentiationAssignment
+        | BinaryOperator::AndAssignment
+        | BinaryOperator::OrAssignment
+        | BinaryOperator::NullishCoalesceAssignment
+        | BinaryOperator::In
+        | BinaryOperator::InstanceOf => {
+            unreachable!("binary_expr: operator {op:?} is never produced by the linker's converters")
+        }
+    }
+}
+
+/// Map an oxc [`oxc_syntax::operator::BinaryOperator`] to the IR [`BinaryOperator`], or `None` for
+/// operators with no IR representation (bitwise shifts / XOR / `in` / `instanceof`) — an
+/// unconvertible operator surfaces as a link error rather than emitting wrong code.
+fn map_binary_operator(op: oxc_ast::ast::BinaryOperator) -> Option<BinaryOperator> {
+    use oxc_ast::ast::BinaryOperator as Ox;
+    Some(match op {
+        Ox::Equality => BinaryOperator::Equals,
+        Ox::Inequality => BinaryOperator::NotEquals,
+        Ox::StrictEquality => BinaryOperator::Identical,
+        Ox::StrictInequality => BinaryOperator::NotIdentical,
+        Ox::LessThan => BinaryOperator::Lower,
+        Ox::LessEqualThan => BinaryOperator::LowerEquals,
+        Ox::GreaterThan => BinaryOperator::Bigger,
+        Ox::GreaterEqualThan => BinaryOperator::BiggerEquals,
+        Ox::Addition => BinaryOperator::Plus,
+        Ox::Subtraction => BinaryOperator::Minus,
+        Ox::Multiplication => BinaryOperator::Multiply,
+        Ox::Division => BinaryOperator::Divide,
+        Ox::Remainder => BinaryOperator::Modulo,
+        Ox::Exponential => BinaryOperator::Exponentiation,
+        Ox::BitwiseOR => BinaryOperator::BitwiseOr,
+        Ox::BitwiseAnd => BinaryOperator::BitwiseAnd,
+        // No IR equivalent: `<<` `>>` `>>>` `^` `in` `instanceof`.
+        Ox::ShiftLeft
+        | Ox::ShiftRight
+        | Ox::ShiftRightZeroFill
+        | Ox::BitwiseXOR
+        | Ox::In
+        | Ox::Instanceof => return None,
+    })
 }
 
 /// Convert a parameter list to [`o::FnParam`]s. Only plain identifier bindings are
@@ -293,10 +425,10 @@ fn convert_params(params: &oxc_ast::ast::FormalParameters) -> Option<Vec<o::FnPa
     Some(out)
 }
 
-/// Convert an arrow's body: an expression body (`() => expr`) maps to
-/// [`ArrowBody::Expr`]; a single-`return` block (`() => { return expr; }`) is
-/// folded to the same expression form (matching how the emitter would print it).
-/// Any other block shape → `None`.
+/// Convert an arrow's body. An expression body (`() => expr`) maps to [`ArrowBody::Expr`]; a
+/// single-`return` block (`() => { return expr; }`) folds to the same expression form (matching how
+/// the emitter would print it); any richer block (`() => { const x = …; return …; }`) maps to a
+/// full [`ArrowBody::Block`] via [`convert_statements`]. An unconvertible body → `None`.
 fn convert_arrow_body(arrow: &oxc_ast::ast::ArrowFunctionExpression) -> Option<o::ArrowBody> {
     if arrow.expression {
         if let Some(Statement::ExpressionStatement(stmt)) = arrow.body.statements.first() {
@@ -304,23 +436,87 @@ fn convert_arrow_body(arrow: &oxc_ast::ast::ArrowFunctionExpression) -> Option<o
         }
         return None;
     }
-    let expr = single_return_expr(&arrow.body.statements)?;
-    Some(o::ArrowBody::Expr(Box::new(expr)))
+    // A single-`return` block collapses to the expression form (the emitter prints it identically).
+    if let [Statement::ReturnStatement(ret)] = arrow.body.statements.as_slice() {
+        let expr = convert_expr(ret.argument.as_ref()?)?;
+        return Some(o::ArrowBody::Expr(Box::new(expr)));
+    }
+    Some(o::ArrowBody::Block(convert_statements(&arrow.body.statements)?))
 }
 
-/// Convert a `function` body that is exactly `{ return <expr>; }` to a one-statement
-/// `[return <converted expr>;]` block. Any other shape → `None`.
-fn convert_return_only_block(statements: &[Statement]) -> Option<Vec<o::Stmt>> {
-    let expr = single_return_expr(statements)?;
-    Some(vec![o::Stmt::bare(o::StmtKind::Return(expr))])
+/// Convert a block body's statements to IR [`o::Stmt`]s. Supports the statement forms that appear
+/// in a partial-declaration factory/transform body: `const`/`let`/`var` declarations (single plain
+/// binding with an initializer), expression statements, `if`/`else`, and `return`. Any other
+/// statement (loops, try/catch, destructuring binding, …) → `None`, surfaced as an explicit link
+/// error rather than a silent mis-emit.
+fn convert_statements(statements: &[Statement]) -> Option<Vec<o::Stmt>> {
+    let mut out = Vec::with_capacity(statements.len());
+    for stmt in statements {
+        out.push(convert_statement(stmt)?);
+    }
+    Some(out)
 }
 
-/// The single returned expression of a one-statement `{ return <expr>; }` body, or
-/// `None` if the body is not exactly one `return` of a convertible expression.
-fn single_return_expr(statements: &[Statement]) -> Option<Expr> {
-    match statements {
-        [Statement::ReturnStatement(ret)] => convert_expr(ret.argument.as_ref()?),
+/// Convert one block statement to an IR [`o::Stmt`].
+fn convert_statement(stmt: &Statement) -> Option<o::Stmt> {
+    match stmt {
+        Statement::VariableDeclaration(decl) => {
+            // Only a single plain-identifier declarator with an initializer is modelled (the
+            // factory-body shape `const parent = inject(...)`). `const` → FINAL modifier (the
+            // emitter prints `const`), `let`/`var` → no modifier (prints `let`).
+            let [declarator] = decl.declarations.as_slice() else {
+                return None;
+            };
+            let name = declarator.id.get_binding_identifier()?.name.to_string();
+            let value = match &declarator.init {
+                Some(e) => Some(convert_expr(e)?),
+                None => None,
+            };
+            let is_const = matches!(decl.kind, oxc_ast::ast::VariableDeclarationKind::Const);
+            let modifiers = if is_const {
+                o::StmtModifier::FINAL
+            } else {
+                o::StmtModifier::NONE
+            };
+            Some(o::Stmt::with_modifiers(
+                o::StmtKind::DeclareVar {
+                    name,
+                    value,
+                    ty: None,
+                },
+                modifiers,
+            ))
+        }
+        Statement::ExpressionStatement(es) => {
+            Some(o::Stmt::bare(o::StmtKind::Expression(convert_expr(&es.expression)?)))
+        }
+        Statement::ReturnStatement(ret) => {
+            let expr = convert_expr(ret.argument.as_ref()?)?;
+            Some(o::Stmt::bare(o::StmtKind::Return(expr)))
+        }
+        Statement::IfStatement(if_stmt) => {
+            let condition = convert_expr(&if_stmt.test)?;
+            let true_case = convert_branch(&if_stmt.consequent)?;
+            let false_case = match &if_stmt.alternate {
+                Some(alt) => convert_branch(alt)?,
+                None => Vec::new(),
+            };
+            Some(o::Stmt::bare(o::StmtKind::If {
+                condition,
+                true_case,
+                false_case,
+            }))
+        }
         _ => None,
+    }
+}
+
+/// Convert an `if`/`else` branch — either a `{ … }` block (its statements) or a single bare
+/// statement (wrapped in a one-element block).
+fn convert_branch(stmt: &Statement) -> Option<Vec<o::Stmt>> {
+    match stmt {
+        Statement::BlockStatement(block) => convert_statements(&block.body),
+        other => Some(vec![convert_statement(other)?]),
     }
 }
 
