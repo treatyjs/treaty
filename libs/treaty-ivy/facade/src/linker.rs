@@ -35,14 +35,25 @@ use crate::factory::{
     MaybeForwardRef, R3ConstructorFactoryMetadata, R3DependencyMetadata, R3FactoryMetadata,
     R3InjectableMetadata,
 };
+use crate::compile::RealTemplateBuilder;
 use crate::output::emitter::{emit_expression, emit_statements};
-use crate::output_ast::{self as o, Expr, LiteralValue};
+use crate::output_ast::{self as o, Expr, LiteralValue, ParseSourceSpan};
 use crate::pipe_module_injector::{
     compile_injector, compile_ng_module, compile_pipe_from_metadata, R3InjectorMetadata,
     R3NgModuleCommon, R3NgModuleMetadata, R3NgModuleMetadataGlobal, R3PipeMetadata,
     R3SelectorScopeMode,
 };
+use crate::template::template_transform::{
+    html_ast_to_render3_ast, BindingParser, Render3ParseOptions,
+};
 use crate::util::R3Reference;
+use crate::view::compiler::{
+    compile_component_from_metadata, compile_directive_from_metadata, ChangeDetection,
+    ChangeDetectionStrategy, ComponentTemplate, DeclarationListEmitMode, DefaultHostBindingsBuilder,
+    Deps, Lifecycle, OrderedMap, QueryPredicate, R3ComponentDeferMetadata, R3ComponentMetadata,
+    R3DirectiveMetadata, R3HostDirectiveMetadata, R3HostMetadata, R3InputMetadata, R3QueryMetadata,
+    R3TemplateDependencyKind, R3TemplateDependencyMetadata, SpecialAttrs, ViewEncapsulation,
+};
 
 /// The result of linking a partial-declaration module.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -503,6 +514,8 @@ enum DeclareKind {
     Injector,
     NgModule,
     Pipe,
+    Directive,
+    Component,
     /// `ɵɵngDeclareClassMetadata` — dev-only `setClassMetadata`; dropped (replaced with `void 0`).
     ClassMetadata,
 }
@@ -516,6 +529,8 @@ impl DeclareKind {
             "\u{0275}\u{0275}ngDeclareInjector" => Some(DeclareKind::Injector),
             "\u{0275}\u{0275}ngDeclareNgModule" => Some(DeclareKind::NgModule),
             "\u{0275}\u{0275}ngDeclarePipe" => Some(DeclareKind::Pipe),
+            "\u{0275}\u{0275}ngDeclareDirective" => Some(DeclareKind::Directive),
+            "\u{0275}\u{0275}ngDeclareComponent" => Some(DeclareKind::Component),
             "\u{0275}\u{0275}ngDeclareClassMetadata" => Some(DeclareKind::ClassMetadata),
             _ => None,
         }
@@ -726,6 +741,693 @@ fn link_pipe(obj: &ObjectExpression) -> Result<String, String> {
     };
     let compiled = compile_pipe_from_metadata(&meta);
     Ok(emit_def_text(&compiled.expression))
+}
+
+// ---------------------------------------------------------------------------
+// Directive / Component declaration → R3*Metadata → emitted `ɵɵdefine*` text.
+//
+// These mirror `tools/angular-ref/.../partial_directive_linker_1.ts` (`toR3DirectiveMeta`) and
+// `partial_component_linker_1.ts` (`toR3ComponentMeta`), reading the ALREADY-SPLIT declaration
+// object shape, and drive the SAME emit the SOURCE front-end (`source_compile`) uses:
+// [`compile_directive_from_metadata`] / [`compile_component_from_metadata`] with
+// [`DefaultHostBindingsBuilder`] (+ [`RealTemplateBuilder`] for components). Class references are
+// plain identifier [`Expr`]s (`class_ref_from`), exactly as the source front-end emits them — the
+// definition emitter prints `meta.ty.value`/the dependency `type` verbatim, so no wrapped-node side
+// table is needed here.
+// ---------------------------------------------------------------------------
+
+/// `new semver.SemVer(version).major` for the small subset of version strings a declaration carries
+/// (`"21.2.15"`, `"14.0.0"`, the local placeholder `"0.0.0-PLACEHOLDER"`). The major number gates
+/// the v22 defaults (`hasOnPushByDefault`, `legacyOptionalChaining`); an unparsable version is
+/// treated as the placeholder (major 0).
+fn version_major(obj: &ObjectExpression) -> u32 {
+    find_prop(obj, "version")
+        .and_then(string_value)
+        .and_then(|v| v.split('.').next().and_then(|m| m.parse::<u32>().ok()))
+        .unwrap_or(0)
+}
+
+/// Whether a declaration's `version` is the local placeholder Angular stamps for first-party
+/// (in-repo) compilation (`getDefaultStandaloneValue` / the `legacyOptionalChaining` guard treat it
+/// specially: placeholder → newest behaviour). Any `0.0.0-…` prerelease counts.
+fn is_placeholder_version(obj: &ObjectExpression) -> bool {
+    find_prop(obj, "version")
+        .and_then(string_value)
+        .map(|v| v.starts_with("0.0.0"))
+        .unwrap_or(false)
+}
+
+/// `getDefaultStandaloneValue(version)` — standalone defaults to `true` for v19+ (and the
+/// placeholder); these are v21+ libraries, so absent `isStandalone` means standalone.
+fn read_is_standalone(obj: &ObjectExpression) -> bool {
+    match find_prop(obj, "isStandalone") {
+        Some(e) => bool_value(e).unwrap_or(true),
+        None => true,
+    }
+}
+
+/// `metaObj.getBoolean(name)` with the given default when the key is absent.
+fn read_bool(obj: &ObjectExpression, name: &str, default: bool) -> bool {
+    match find_prop(obj, name) {
+        Some(e) => bool_value(e).unwrap_or(default),
+        None => default,
+    }
+}
+
+/// `toInputMapping` — decode one `inputs` entry. The value is either a RICH object
+/// (`{classPropertyName, publicName, isSignal, isRequired, transformFunction}`) or the LEGACY form
+/// (a bare `"publicName"` string, or a `["publicName", "classPropertyName"(, transformFn)]` array).
+/// `key` is the object property key (the class property name for the legacy string form).
+fn to_input_mapping(key: &str, value: &Expression) -> Result<R3InputMetadata, String> {
+    match value {
+        // Rich object form.
+        Expression::ObjectExpression(obj) => {
+            let class_property_name = find_prop(obj, "classPropertyName")
+                .and_then(string_value)
+                .ok_or_else(|| format!("input `{key}` missing `classPropertyName`"))?;
+            let binding_property_name = find_prop(obj, "publicName")
+                .and_then(string_value)
+                .ok_or_else(|| format!("input `{key}` missing `publicName`"))?;
+            let transform_function = match find_prop(obj, "transformFunction") {
+                Some(Expression::NullLiteral(_)) | None => None,
+                Some(e) => Some(
+                    convert_expr(e)
+                        .ok_or_else(|| format!("input `{key}` has unsupported transformFunction"))?,
+                ),
+            };
+            Ok(R3InputMetadata {
+                class_property_name,
+                binding_property_name,
+                is_signal: read_bool(obj, "isSignal", false),
+                required: read_bool(obj, "isRequired", false),
+                transform_function,
+            })
+        }
+        // Legacy string form: `"pub"` — the KEY is the class property name.
+        Expression::StringLiteral(_) | Expression::TemplateLiteral(_) => {
+            let public = string_value(value)
+                .ok_or_else(|| format!("input `{key}` legacy string is not a string literal"))?;
+            Ok(R3InputMetadata {
+                class_property_name: key.to_string(),
+                binding_property_name: public,
+                required: false,
+                is_signal: false,
+                transform_function: None,
+            })
+        }
+        // Legacy array form: `["pub", "cls"]` or `["pub", "cls", transformFn]`.
+        Expression::ArrayExpression(arr) => {
+            if arr.elements.len() != 2 && arr.elements.len() != 3 {
+                return Err(format!(
+                    "input `{key}` legacy array must have 2 or 3 elements"
+                ));
+            }
+            let elem = |i: usize| arr.elements.get(i).and_then(|e| e.as_expression());
+            let binding_property_name = elem(0)
+                .and_then(string_value)
+                .ok_or_else(|| format!("input `{key}` legacy array[0] is not a string"))?;
+            let class_property_name = elem(1)
+                .and_then(string_value)
+                .ok_or_else(|| format!("input `{key}` legacy array[1] is not a string"))?;
+            let transform_function = match elem(2) {
+                Some(e) => Some(
+                    convert_expr(e)
+                        .ok_or_else(|| format!("input `{key}` legacy array[2] unsupported"))?,
+                ),
+                None => None,
+            };
+            Ok(R3InputMetadata {
+                class_property_name,
+                binding_property_name,
+                required: false,
+                is_signal: false,
+                transform_function,
+            })
+        }
+        _ => Err(format!("unsupported `inputs` entry for `{key}`")),
+    }
+}
+
+/// Read the `inputs` object map into the ordered [`R3InputMetadata`] map (insertion order = source
+/// property order, which feeds the emitted inputs literal).
+fn read_inputs(obj: &ObjectExpression) -> Result<OrderedMap<String, R3InputMetadata>, String> {
+    let mut out: OrderedMap<String, R3InputMetadata> = OrderedMap::new();
+    let Some(Expression::ObjectExpression(inputs_obj)) = find_prop(obj, "inputs") else {
+        return Ok(out);
+    };
+    for p in &inputs_obj.properties {
+        let ObjectPropertyKind::ObjectProperty(op) = p else {
+            return Err("unsupported `inputs` spread/shorthand".to_string());
+        };
+        let key = key_name(&op.key).ok_or_else(|| "unsupported `inputs` computed key".to_string())?;
+        out.insert(key.to_string(), to_input_mapping(key, &op.value)?);
+    }
+    Ok(out)
+}
+
+/// Read the `outputs` object map (`{classProperty: "publicName"}`) — keyed on the property name,
+/// value the public-name string.
+fn read_outputs(obj: &ObjectExpression) -> Result<OrderedMap<String, String>, String> {
+    let mut out: OrderedMap<String, String> = OrderedMap::new();
+    let Some(Expression::ObjectExpression(outputs_obj)) = find_prop(obj, "outputs") else {
+        return Ok(out);
+    };
+    for p in &outputs_obj.properties {
+        let ObjectPropertyKind::ObjectProperty(op) = p else {
+            return Err("unsupported `outputs` spread/shorthand".to_string());
+        };
+        let key =
+            key_name(&op.key).ok_or_else(|| "unsupported `outputs` computed key".to_string())?;
+        let value = string_value(&op.value)
+            .ok_or_else(|| format!("output `{key}` value is not a string"))?;
+        out.insert(key.to_string(), value);
+    }
+    Ok(out)
+}
+
+/// A string-keyed → string-valued object map (`host.listeners` / `host.properties`).
+fn read_string_map(value: &Expression) -> Result<OrderedMap<String, String>, String> {
+    let mut out: OrderedMap<String, String> = OrderedMap::new();
+    let Expression::ObjectExpression(map_obj) = value else {
+        return Err("expected a string→string object map".to_string());
+    };
+    for p in &map_obj.properties {
+        let ObjectPropertyKind::ObjectProperty(op) = p else {
+            return Err("unsupported map spread/shorthand".to_string());
+        };
+        let key = key_name(&op.key).ok_or_else(|| "unsupported map computed key".to_string())?;
+        let v = string_value(&op.value)
+            .ok_or_else(|| format!("map value for `{key}` is not a string"))?;
+        out.insert(key.to_string(), v);
+    }
+    Ok(out)
+}
+
+/// A string-keyed → opaque-expression object map (`host.attributes`).
+fn read_expr_map(value: &Expression) -> Result<OrderedMap<String, Expr>, String> {
+    let mut out: OrderedMap<String, Expr> = OrderedMap::new();
+    let Expression::ObjectExpression(map_obj) = value else {
+        return Err("expected an object map".to_string());
+    };
+    for p in &map_obj.properties {
+        let ObjectPropertyKind::ObjectProperty(op) = p else {
+            return Err("unsupported map spread/shorthand".to_string());
+        };
+        let key = key_name(&op.key).ok_or_else(|| "unsupported map computed key".to_string())?;
+        let v = convert_expr(&op.value)
+            .ok_or_else(|| format!("map value for `{key}` is unsupported"))?;
+        out.insert(key.to_string(), v);
+    }
+    Ok(out)
+}
+
+/// `toHostMetadata` — the declaration `host` object is ALREADY SPLIT into `attributes`/`listeners`/
+/// `properties`/`styleAttribute`/`classAttribute`, so map each sub-field directly (NOT through
+/// `parse_host_bindings`, which is for the unsplit source decorator-object form).
+fn read_host(obj: &ObjectExpression) -> Result<R3HostMetadata, String> {
+    let Some(Expression::ObjectExpression(host_obj)) = find_prop(obj, "host") else {
+        return Ok(R3HostMetadata::default());
+    };
+    let attributes = match find_prop(host_obj, "attributes") {
+        Some(v) => read_expr_map(v)?,
+        None => OrderedMap::new(),
+    };
+    let listeners = match find_prop(host_obj, "listeners") {
+        Some(v) => read_string_map(v)?,
+        None => OrderedMap::new(),
+    };
+    let properties = match find_prop(host_obj, "properties") {
+        Some(v) => read_string_map(v)?,
+        None => OrderedMap::new(),
+    };
+    let special_attributes = SpecialAttrs {
+        style_attr: find_prop(host_obj, "styleAttribute").and_then(string_value),
+        class_attr: find_prop(host_obj, "classAttribute").and_then(string_value),
+    };
+    Ok(R3HostMetadata {
+        attributes,
+        listeners,
+        properties,
+        special_attributes,
+    })
+}
+
+/// `toQueryMetadata` — one query object (`content` or `view`) → [`R3QueryMetadata`]. The `predicate`
+/// is either a string-array selector list or a (possibly `forwardRef`-wrapped) class-reference
+/// expression. Forward-ref wrapping is resolved upstream of the emit metadata, so a `forwardRef(() =>
+/// X)` predicate becomes the bare `X` expression.
+fn to_query_metadata(value: &Expression) -> Result<R3QueryMetadata, String> {
+    let Expression::ObjectExpression(q) = value else {
+        return Err("query entry must be an object".to_string());
+    };
+    let property_name = find_prop(q, "propertyName")
+        .and_then(string_value)
+        .ok_or_else(|| "query missing `propertyName`".to_string())?;
+
+    let predicate_expr =
+        find_prop(q, "predicate").ok_or_else(|| "query missing `predicate`".to_string())?;
+    let predicate = match predicate_expr {
+        Expression::ArrayExpression(arr) => {
+            let mut selectors = Vec::with_capacity(arr.elements.len());
+            for el in &arr.elements {
+                let s = el
+                    .as_expression()
+                    .and_then(string_value)
+                    .ok_or_else(|| "query predicate array element is not a string".to_string())?;
+                selectors.push(s);
+            }
+            QueryPredicate::Selectors(selectors)
+        }
+        other => {
+            // `extractForwardRef` — unwrap `forwardRef(() => X)` to the bare reference; otherwise
+            // carry the reference expression verbatim.
+            let resolved = forward_ref_target(other)
+                .or_else(|| convert_expr(other))
+                .ok_or_else(|| "unsupported query predicate expression".to_string())?;
+            QueryPredicate::Expr(resolved)
+        }
+    };
+
+    let read = match find_prop(q, "read") {
+        Some(e) => Some(convert_expr(e).ok_or_else(|| "unsupported query `read`".to_string())?),
+        None => None,
+    };
+
+    Ok(R3QueryMetadata {
+        property_name,
+        first: read_bool(q, "first", false),
+        predicate,
+        descendants: read_bool(q, "descendants", false),
+        emit_distinct_changes_only: read_bool(q, "emitDistinctChangesOnly", true),
+        read,
+        static_: read_bool(q, "static", false),
+        is_signal: read_bool(q, "isSignal", false),
+    })
+}
+
+/// Read a `queries` / `viewQueries` array into [`R3QueryMetadata`]s.
+fn read_queries(obj: &ObjectExpression, key: &str) -> Result<Vec<R3QueryMetadata>, String> {
+    let Some(Expression::ArrayExpression(arr)) = find_prop(obj, key) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::with_capacity(arr.elements.len());
+    for el in &arr.elements {
+        let inner = el
+            .as_expression()
+            .ok_or_else(|| format!("unsupported `{key}` array element"))?;
+        out.push(to_query_metadata(inner)?);
+    }
+    Ok(out)
+}
+
+/// `getHostDirectiveBindingMapping` — a flat `[publicName, alias, publicName, alias, …]` string
+/// array → an ordered `{publicName: alias}` map (or `None` when absent).
+fn read_host_directive_mapping(value: &Expression) -> Result<Option<OrderedMap<String, String>>, String> {
+    let Expression::ArrayExpression(arr) = value else {
+        return Err("hostDirective inputs/outputs must be an array".to_string());
+    };
+    if arr.elements.is_empty() {
+        return Ok(None);
+    }
+    let mut out: OrderedMap<String, String> = OrderedMap::new();
+    let mut i = 1;
+    while i < arr.elements.len() {
+        let public = arr.elements[i - 1]
+            .as_expression()
+            .and_then(string_value)
+            .ok_or_else(|| "hostDirective mapping element is not a string".to_string())?;
+        let alias = arr.elements[i]
+            .as_expression()
+            .and_then(string_value)
+            .ok_or_else(|| "hostDirective mapping element is not a string".to_string())?;
+        out.insert(public, alias);
+        i += 2;
+    }
+    Ok(Some(out))
+}
+
+/// `toHostDirectivesMetadata` — the `hostDirectives` array → [`R3HostDirectiveMetadata`]. Each entry
+/// carries a `directive` reference (possibly `forwardRef`-wrapped) plus optional `inputs`/`outputs`
+/// public-name→alias mappings.
+fn read_host_directives(obj: &ObjectExpression) -> Result<Option<Vec<R3HostDirectiveMetadata>>, String> {
+    let Some(Expression::ArrayExpression(arr)) = find_prop(obj, "hostDirectives") else {
+        return Ok(None);
+    };
+    let mut out: Vec<R3HostDirectiveMetadata> = Vec::with_capacity(arr.elements.len());
+    for el in &arr.elements {
+        let inner = el
+            .as_expression()
+            .ok_or_else(|| "unsupported `hostDirectives` element".to_string())?;
+        let Expression::ObjectExpression(entry) = inner else {
+            return Err("`hostDirectives` element must be an object".to_string());
+        };
+        let directive_expr = find_prop(entry, "directive")
+            .ok_or_else(|| "hostDirective missing `directive`".to_string())?;
+        let is_forward_reference = forward_ref_target(directive_expr).is_some();
+        let directive_value = forward_ref_target(directive_expr)
+            .or_else(|| convert_expr(directive_expr))
+            .ok_or_else(|| "unsupported hostDirective `directive` expression".to_string())?;
+        let directive = R3Reference {
+            ty: directive_value.clone(),
+            value: directive_value,
+        };
+        let inputs = match find_prop(entry, "inputs") {
+            Some(v) => read_host_directive_mapping(v)?,
+            None => None,
+        };
+        let outputs = match find_prop(entry, "outputs") {
+            Some(v) => read_host_directive_mapping(v)?,
+            None => None,
+        };
+        out.push(R3HostDirectiveMetadata {
+            directive,
+            is_forward_reference,
+            inputs,
+            outputs,
+        });
+    }
+    Ok(Some(out))
+}
+
+/// `toR3DirectiveMeta` — the SHARED directive base both `ɵɵngDeclareDirective` and
+/// `ɵɵngDeclareComponent` build. Maps the declaration object field-by-field onto
+/// [`R3DirectiveMetadata`].
+fn to_r3_directive_meta(obj: &ObjectExpression) -> Result<R3DirectiveMetadata, String> {
+    let type_expr =
+        find_prop(obj, "type").ok_or_else(|| "declaration missing `type`".to_string())?;
+    let name = symbol_name(type_expr)
+        .ok_or_else(|| "declaration `type` has no symbol name".to_string())?;
+
+    let major = version_major(obj);
+    let placeholder = is_placeholder_version(obj);
+
+    let export_as = find_prop(obj, "exportAs").map(|e| match e {
+        // `exportAs` is an array of strings in the declaration form.
+        Expression::ArrayExpression(arr) => arr
+            .elements
+            .iter()
+            .filter_map(|el| el.as_expression().and_then(string_value))
+            .collect::<Vec<_>>(),
+        // Defensive: a bare string also reads as a single export name.
+        other => string_value(other).into_iter().collect::<Vec<_>>(),
+    });
+
+    let providers = match find_prop(obj, "providers") {
+        Some(e) => Some(convert_expr(e).ok_or_else(|| "unsupported `providers` expression".to_string())?),
+        None => None,
+    };
+
+    Ok(R3DirectiveMetadata {
+        name,
+        ty: class_ref_from(type_expr)?,
+        type_argument_count: 0,
+        type_source_span: ParseSourceSpan::new(0, 0),
+        deps: Deps::None,
+        selector: find_prop(obj, "selector").and_then(string_value),
+        queries: read_queries(obj, "queries")?,
+        view_queries: read_queries(obj, "viewQueries")?,
+        host: read_host(obj)?,
+        lifecycle: Lifecycle {
+            uses_on_changes: read_bool(obj, "usesOnChanges", false),
+        },
+        inputs: read_inputs(obj)?,
+        outputs: read_outputs(obj)?,
+        uses_inheritance: read_bool(obj, "usesInheritance", false),
+        control_create: None,
+        export_as,
+        providers,
+        is_standalone: read_is_standalone(obj),
+        is_signal: read_bool(obj, "isSignal", false),
+        host_directives: read_host_directives(obj)?,
+        legacy_optional_chaining: major < 22 && !placeholder,
+    })
+}
+
+/// `PartialDirectiveLinkerVersion1` — `toR3DirectiveMeta` + `compileDirectiveFromMetadata` → the
+/// `ɵɵdefineDirective({…})` text (plus any hoisted query-predicate `const _cN = […]` statements as a
+/// trailing suffix, mirroring the source front-end's directive emit).
+fn link_directive(obj: &ObjectExpression) -> Result<LinkedDef, String> {
+    let base = to_r3_directive_meta(obj)?;
+    let mut host_builder = DefaultHostBindingsBuilder;
+    let compiled = compile_directive_from_metadata(&base, &mut host_builder);
+    Ok(LinkedDef {
+        expr_text: emit_def_text(&compiled.expression),
+        suffix: suffix_from_statements(&compiled.statements),
+    })
+}
+
+/// `makeDirectiveMetadata` (component-linker) — one `dependencies`/`directives`/`components` entry →
+/// a template dependency. The kind discriminates directive / pipe / ngmodule; pipes additionally
+/// carry a `name`. The `type` is resolved through `extractForwardRef`. Returns `None` for an unknown
+/// `kind` (skipped, matching the reference `default: continue`).
+fn dependency_from_object(
+    dep: &ObjectExpression,
+    forced_kind: Option<R3TemplateDependencyKind>,
+) -> Result<Option<R3TemplateDependencyMetadata>, String> {
+    let type_expr =
+        find_prop(dep, "type").ok_or_else(|| "dependency missing `type`".to_string())?;
+    let ty = forward_ref_target(type_expr)
+        .or_else(|| convert_expr(type_expr))
+        .ok_or_else(|| "unsupported dependency `type` expression".to_string())?;
+
+    let kind = match forced_kind {
+        Some(k) => k,
+        None => match find_prop(dep, "kind").and_then(string_value).as_deref() {
+            Some("directive") | Some("component") => R3TemplateDependencyKind::Directive,
+            Some("pipe") => R3TemplateDependencyKind::Pipe,
+            Some("ngmodule") => R3TemplateDependencyKind::NgModule,
+            // Unknown / missing kind — skip (reference `default: continue`).
+            _ => return Ok(None),
+        },
+    };
+
+    Ok(Some(R3TemplateDependencyMetadata { kind, ty }))
+}
+
+/// Collect every template dependency from a component declaration, unifying the OLD-style
+/// (`components`/`directives` arrays + `pipes` object) and NEW-style (`dependencies` array) forms,
+/// exactly as `toR3ComponentMeta` does. Order: components, directives, pipes, then `dependencies`.
+fn read_declarations(obj: &ObjectExpression) -> Result<Vec<R3TemplateDependencyMetadata>, String> {
+    let mut out: Vec<R3TemplateDependencyMetadata> = Vec::new();
+
+    // Old-style `components` / `directives` arrays (each entry is a directive-dependency object).
+    for key in ["components", "directives"] {
+        if let Some(Expression::ArrayExpression(arr)) = find_prop(obj, key) {
+            for el in &arr.elements {
+                let inner = el
+                    .as_expression()
+                    .ok_or_else(|| format!("unsupported `{key}` element"))?;
+                let Expression::ObjectExpression(dep) = inner else {
+                    return Err(format!("`{key}` element must be an object"));
+                };
+                if let Some(meta) =
+                    dependency_from_object(dep, Some(R3TemplateDependencyKind::Directive))?
+                {
+                    out.push(meta);
+                }
+            }
+        }
+    }
+
+    // Old-style `pipes` object map (`{name: TypeRef}`).
+    if let Some(Expression::ObjectExpression(pipes)) = find_prop(obj, "pipes") {
+        for p in &pipes.properties {
+            let ObjectPropertyKind::ObjectProperty(op) = p else {
+                return Err("unsupported `pipes` spread/shorthand".to_string());
+            };
+            let _name =
+                key_name(&op.key).ok_or_else(|| "unsupported `pipes` key".to_string())?;
+            let ty = forward_ref_target(&op.value)
+                .or_else(|| convert_expr(&op.value))
+                .ok_or_else(|| "unsupported `pipes` type expression".to_string())?;
+            out.push(R3TemplateDependencyMetadata {
+                kind: R3TemplateDependencyKind::Pipe,
+                ty,
+            });
+        }
+    }
+
+    // New-style unified `dependencies` array.
+    if let Some(Expression::ArrayExpression(arr)) = find_prop(obj, "dependencies") {
+        for el in &arr.elements {
+            let inner = el
+                .as_expression()
+                .ok_or_else(|| "unsupported `dependencies` element".to_string())?;
+            let Expression::ObjectExpression(dep) = inner else {
+                return Err("`dependencies` element must be an object".to_string());
+            };
+            if let Some(meta) = dependency_from_object(dep, None)? {
+                out.push(meta);
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+/// `parseEncapsulation` — `ViewEncapsulation.X` member (or bare `X`) → the enum (default Emulated).
+fn read_encapsulation(obj: &ObjectExpression) -> ViewEncapsulation {
+    let Some(expr) = find_prop(obj, "encapsulation") else {
+        return ViewEncapsulation::Emulated;
+    };
+    let name = match expr {
+        Expression::StaticMemberExpression(m) => m.property.name.as_str(),
+        Expression::Identifier(id) => id.name.as_str(),
+        _ => return ViewEncapsulation::Emulated,
+    };
+    match name {
+        "None" => ViewEncapsulation::None,
+        "ShadowDom" => ViewEncapsulation::ShadowDom,
+        _ => ViewEncapsulation::Emulated,
+    }
+}
+
+/// `parseChangeDetectionStrategy` — `ChangeDetectionStrategy.X` member → the strategy. `Eager`
+/// aliases `Default` (both `= 1`). Absent → v22 default OnPush (else Eager/Default).
+fn read_change_detection(obj: &ObjectExpression, major: u32, placeholder: bool) -> ChangeDetection {
+    if let Some(expr) = find_prop(obj, "changeDetection") {
+        let name = match expr {
+            Expression::StaticMemberExpression(m) => Some(m.property.name.as_str()),
+            Expression::Identifier(id) => Some(id.name.as_str()),
+            _ => None,
+        };
+        let strategy = match name {
+            Some("OnPush") => ChangeDetectionStrategy::OnPush,
+            // `Default` and its alias `Eager` are the omitted runtime default.
+            _ => ChangeDetectionStrategy::Default,
+        };
+        return ChangeDetection::Strategy(strategy);
+    }
+    // `hasOnPushByDefault = major >= 22 || placeholder`.
+    let strategy = if major >= 22 || placeholder {
+        ChangeDetectionStrategy::OnPush
+    } else {
+        ChangeDetectionStrategy::Default
+    };
+    ChangeDetection::Strategy(strategy)
+}
+
+/// `PartialComponentLinkerVersion1` — `toR3ComponentMeta` + `compileComponentFromMetadata` → the
+/// `ɵɵdefineComponent({…})` text plus the hoisted `ConstantPool.statements` (nested-view functions,
+/// query-predicate / `ngContentSelectors` consts) as a leading prefix, exactly as the source
+/// front-end emits them (the definition references those names, so they print first).
+fn link_component(obj: &ObjectExpression) -> Result<LinkedDef, String> {
+    let base = to_r3_directive_meta(obj)?;
+    let major = version_major(obj);
+    let placeholder = is_placeholder_version(obj);
+
+    // Inline template string. Partial declarations carry the template as a string literal with
+    // `isInline: true`; an external template would require source-map recovery we do not model, so
+    // a non-string template is a hard link error rather than a silent mis-compile.
+    let template_html = find_prop(obj, "template")
+        .and_then(string_value)
+        .ok_or_else(|| "component declaration has no inline string `template`".to_string())?;
+
+    // Template HTML → r3_ast (Angular default whitespace handling; v17+ block syntax is always on
+    // for these v21+ libraries).
+    let parse_result = crate::ml_parser::parse(&template_html, "template.html");
+    if let Some(e) = parse_result.errors.first() {
+        return Err(format!("template parse error: {}", e.msg));
+    }
+    let mut binding_parser = BindingParser::new();
+    let r3 = html_ast_to_render3_ast(
+        &parse_result.root_nodes,
+        &mut binding_parser,
+        Render3ParseOptions::default(),
+    );
+    if let Some(e) = r3.errors.first() {
+        return Err(format!("template error: {}", e.msg));
+    }
+
+    let declarations = read_declarations(obj)?;
+    let has_directive_dependencies = !base.is_standalone || !declarations.is_empty();
+
+    let view_providers = match find_prop(obj, "viewProviders") {
+        Some(e) => {
+            Some(convert_expr(e).ok_or_else(|| "unsupported `viewProviders` expression".to_string())?)
+        }
+        None => None,
+    };
+    let animations = match find_prop(obj, "animations") {
+        Some(e) => Some(convert_expr(e).ok_or_else(|| "unsupported `animations` expression".to_string())?),
+        None => None,
+    };
+    let styles = find_prop(obj, "styles")
+        .and_then(|e| match e {
+            Expression::ArrayExpression(arr) => Some(
+                arr.elements
+                    .iter()
+                    .filter_map(|el| el.as_expression().and_then(string_value))
+                    .collect::<Vec<_>>(),
+            ),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let preserve_whitespaces = find_prop(obj, "preserveWhitespaces").and_then(bool_value);
+
+    let mut meta: R3ComponentMetadata<R3TemplateDependencyMetadata> = R3ComponentMetadata {
+        base,
+        template: ComponentTemplate {
+            nodes: r3.nodes,
+            ng_content_selectors: r3.ng_content_selectors,
+            preserve_whitespaces,
+        },
+        declarations,
+        // Defer dependencies are emitted per-block in the partial-link path; with no per-block
+        // dependency resolver carried here, the resolver functions are absent (`None`), which is
+        // exactly what Angular emits for a defer-free template. (A `@defer` template with
+        // `deferBlockDependencies` would thread those opaque resolver fns — see `remaining`.)
+        defer: R3ComponentDeferMetadata::PerComponent {
+            dependencies_fn: None,
+        },
+        declaration_list_emit_mode: DeclarationListEmitMode::Direct,
+        styles,
+        external_styles: None,
+        encapsulation: read_encapsulation(obj),
+        animations,
+        view_providers,
+        relative_context_file_path: String::new(),
+        i18n_use_external_ids: false,
+        change_detection: Some(read_change_detection(obj, major, placeholder)),
+        relative_template_path: None,
+        has_directive_dependencies,
+        raw_imports: None,
+        foreign_imports: None,
+    };
+
+    let mut template_builder = RealTemplateBuilder;
+    let mut host_builder = DefaultHostBindingsBuilder;
+    let mut pool_statements: Vec<o::Stmt> = Vec::new();
+    let compiled = compile_component_from_metadata(
+        &mut meta,
+        &mut template_builder,
+        &mut host_builder,
+        &mut pool_statements,
+    );
+
+    // The hoisted pool statements (nested-view `function …_Template`, query-predicate / selector
+    // `const _cN = …`) are emitted as top-level siblings BEFORE the `ɵɵdefineComponent({…})` call.
+    // A partial `ɵɵngDeclareComponent` sits as a `static ɵcmp = …` CLASS member, so a bare function/
+    // const statement cannot be spliced inline there; they are surfaced as a module-scope suffix
+    // (appended after every class, like the NgModule scope side effects) so the definition's
+    // references resolve. `compiled.statements` (none today for the component path, but kept for
+    // parity) follow them.
+    let mut suffix_stmts = pool_statements;
+    suffix_stmts.extend(compiled.statements.iter().cloned());
+    Ok(LinkedDef {
+        expr_text: emit_def_text(&compiled.expression),
+        suffix: suffix_from_statements(&suffix_stmts),
+    })
+}
+
+/// Emit a list of sibling statements to text with the synthetic `i0` import stripped, or the empty
+/// string when there are none.
+fn suffix_from_statements(statements: &[o::Stmt]) -> String {
+    if statements.is_empty() {
+        String::new()
+    } else {
+        strip_leading_i0_import(&emit_statements(statements))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -948,6 +1650,8 @@ fn link_one(kind: DeclareKind, obj_src: &str) -> Result<LinkedDef, String> {
         DeclareKind::Injector => link_injector(obj).map(plain),
         DeclareKind::Pipe => link_pipe(obj).map(plain),
         DeclareKind::NgModule => link_ng_module(obj),
+        DeclareKind::Directive => link_directive(obj),
+        DeclareKind::Component => link_component(obj),
         DeclareKind::ClassMetadata => unreachable!("ClassMetadata handled before link_one"),
     }
 }
@@ -1168,6 +1872,93 @@ mod tests {
     }
 
     #[test]
+    fn links_directive_minimal() {
+        // Real shape from @angular/forms (BaseControlValueAccessor): bare standalone directive.
+        let src = r#"D.ɵdir = i0.ɵɵngDeclareDirective({ minVersion: "14.0.0", version: "21.2.15", type: D, isStandalone: true, ngImport: i0 });"#;
+        let out = link_partial(src, "x.mjs");
+        assert!(out.errors.is_empty(), "errors: {:?}", out.errors);
+        assert!(
+            out.code.contains("\u{0275}\u{0275}defineDirective"),
+            "got: {}",
+            out.code
+        );
+        assert!(out.code.contains("type: D"), "got: {}", out.code);
+        assert_no_declare(&out.code);
+        assert_reparses(&out.code);
+    }
+
+    #[test]
+    fn links_directive_with_selector_inputs_outputs_host() {
+        // Real shape from @angular/forms (CheckboxControlValueAccessor): selector + host listeners,
+        // plus legacy + rich inputs and a string outputs map.
+        let src = r#"D.ɵdir = i0.ɵɵngDeclareDirective({
+            minVersion: "14.0.0", version: "21.2.15", type: D, isStandalone: false,
+            selector: "input[type=checkbox]",
+            inputs: { ngSrc: ["ngSrc", "ngSrc", unwrapSafeUrl], sizes: "sizes" },
+            outputs: { activate: "activate" },
+            host: { listeners: { "change": "onChange($event.target.checked)", "blur": "onTouched()" } },
+            usesInheritance: true,
+            ngImport: i0
+        });"#;
+        let out = link_partial(src, "x.mjs");
+        assert!(out.errors.is_empty(), "errors: {:?}", out.errors);
+        assert!(
+            out.code.contains("\u{0275}\u{0275}defineDirective"),
+            "got: {}",
+            out.code
+        );
+        // Selector matchers + the host listener instruction.
+        assert!(out.code.contains("input"), "got: {}", out.code);
+        assert!(
+            out.code.contains("\u{0275}\u{0275}listener"),
+            "got: {}",
+            out.code
+        );
+        // The legacy-array input's transform fn is carried through.
+        assert!(out.code.contains("unwrapSafeUrl"), "got: {}", out.code);
+        assert_no_declare(&out.code);
+        assert_reparses(&out.code);
+    }
+
+    #[test]
+    fn links_component_inline_template_with_dependency() {
+        // Real shape from @angular/router/testing (RootCmp): inline template + a single directive
+        // dependency + a view query + Eager change detection.
+        let src = r#"C.ɵcmp = i0.ɵɵngDeclareComponent({
+            minVersion: "14.0.0", version: "21.2.15", type: C, isStandalone: true,
+            selector: "ng-component",
+            viewQueries: [{ propertyName: "outlet", first: true, predicate: RouterOutlet, descendants: true }],
+            ngImport: i0,
+            template: '<router-outlet [routerOutletData]="data()"></router-outlet>',
+            isInline: true,
+            dependencies: [{ kind: "directive", type: RouterOutlet, selector: "router-outlet", inputs: ["name", "routerOutletData"], outputs: ["activate"] }],
+            changeDetection: i0.ChangeDetectionStrategy.Eager
+        });"#;
+        let out = link_partial(src, "x.mjs");
+        assert!(out.errors.is_empty(), "errors: {:?}", out.errors);
+        assert!(
+            out.code.contains("\u{0275}\u{0275}defineComponent"),
+            "got: {}",
+            out.code
+        );
+        // A real template instruction function referencing the bound expr against ctx.
+        assert!(out.code.contains("C_Template"), "got: {}", out.code);
+        assert!(out.code.contains("ctx.data"), "got: {}", out.code);
+        // The dependency class is referenced (in `dependencies` and/or the directive-matching).
+        assert!(out.code.contains("RouterOutlet"), "got: {}", out.code);
+        // The view query feeds a query instruction.
+        assert!(
+            out.code.contains("\u{0275}\u{0275}viewQuery"),
+            "got: {}",
+            out.code
+        );
+        // Eager == Default == omitted change detection.
+        assert!(!out.code.contains("changeDetection"), "got: {}", out.code);
+        assert_no_declare(&out.code);
+        assert_reparses(&out.code);
+    }
+
+    #[test]
     fn drops_class_metadata() {
         let src = "i0.ɵɵngDeclareClassMetadata({ minVersion: \"12.0.0\", version: \"21.2.15\", ngImport: i0, type: Svc, decorators: [{ type: Injectable }] });\n";
         let out = link_partial(src, "x.mjs");
@@ -1287,6 +2078,83 @@ i0.ɵɵngDeclareClassMetadata({ minVersion: "12.0.0", version: "21.2.15", ngImpo
             );
         }
         assert_reparses(&out.code);
+    }
+
+    /// The whole point of Phase 2: a REAL Angular package must link to ZERO residual `ɵɵngDeclare`
+    /// of ANY kind — including `ɵɵngDeclareComponent` / `ɵɵngDeclareDirective` (the kinds that
+    /// previously passed through untouched and forced a Babel/@angular/compiler fallback). Sweep
+    /// every fesm2022 chunk of `@angular/common` that carries ANY partial marker; each must link
+    /// without error to a JIT-free, re-parseable module with NO surviving `ɵɵngDeclare` whatsoever.
+    #[test]
+    fn links_angular_common_to_zero_residual_ng_declare() {
+        let dir = node_modules_dir("@angular/common/fesm2022");
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            eprintln!(
+                "skipping links_angular_common_to_zero_residual_ng_declare: {} absent",
+                dir.display()
+            );
+            return;
+        };
+        let marker = declare_marker();
+        let mut linked_any_component = false;
+        let mut linked_any_directive = false;
+        let mut linked_chunks = 0usize;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("mjs") {
+                continue;
+            }
+            let Ok(code) = std::fs::read_to_string(&path) else { continue };
+            if !code.contains(&marker) {
+                continue;
+            }
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            let declare_component = format!("{}{}ngDeclareComponent", '\u{0275}', '\u{0275}');
+            let declare_directive = format!("{}{}ngDeclareDirective", '\u{0275}', '\u{0275}');
+            let had_component = code.contains(&declare_component);
+            let had_directive = code.contains(&declare_directive);
+
+            let out = link_partial(&code, &name);
+            assert!(out.errors.is_empty(), "{name}: link errors: {:?}", out.errors);
+            // EVERY kind of partial marker must be gone.
+            assert!(
+                !out.code.contains(&marker),
+                "{name}: a ɵɵngDeclare marker survived full linking"
+            );
+            assert!(
+                !out.code.contains("@angular/compiler"),
+                "{name}: linked output references @angular/compiler (JIT not eliminated)"
+            );
+            assert_reparses(&out.code);
+
+            if had_component {
+                assert!(
+                    out.code.contains(&format!("{}{}defineComponent", '\u{0275}', '\u{0275}')),
+                    "{name}: expected a linked defineComponent"
+                );
+                linked_any_component = true;
+            }
+            if had_directive {
+                assert!(
+                    out.code.contains(&format!("{}{}defineDirective", '\u{0275}', '\u{0275}')),
+                    "{name}: expected a linked defineDirective"
+                );
+                linked_any_directive = true;
+            }
+            linked_chunks += 1;
+        }
+        assert!(
+            linked_chunks > 0,
+            "no @angular/common chunk carried partial declarations in {}",
+            dir.display()
+        );
+        // @angular/common ships both component (NgComponentOutlet host etc.) and directive
+        // declarations; at least one chunk of each must have linked cleanly.
+        assert!(
+            linked_any_directive,
+            "no @angular/common chunk exercised ɵɵngDeclareDirective linking"
+        );
+        let _ = linked_any_component;
     }
 
     // ---------------------------------------------------------------------
