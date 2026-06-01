@@ -2,6 +2,7 @@ export {
   PARTIAL_MARKER,
   isPartialModule,
   loadLinker,
+  composeLinkers,
   linkPartialCode,
   resetLinkerForTesting,
   type LinkPartialResult,
@@ -21,6 +22,8 @@ export {
  * The whole `ɵɵngDeclare*` family shares this exact prefix, so a substring test against the
  * module source is a sufficient (and cheap) detector.
  */
+import { createBabelLinker } from './babelLinker';
+
 const PARTIAL_MARKER = 'ɵɵngDeclare';
 
 /**
@@ -61,31 +64,72 @@ function isPartialModule(id: string, code: string): boolean {
 let cachedLinker: PartialLinker | null | undefined;
 
 /**
- * Lazily resolve the Rust/NAPI addon's `linkPartial` entry, memoising the result (including a
- * `null` "unavailable" outcome, so a missing/older addon is probed at most once).
+ * Compose the (fast, partial-coverage) Rust addon linker with the (complete) Babel linker so the
+ * output is guaranteed free of residual `ɵɵngDeclare*` calls regardless of which backend is present.
  *
- * The addon is the published `@treaty/authoring-node` package (`libs/authoring/node`). We resolve
- * it by package name so this works both inside the monorepo and when `@treaty/ts-vite` is consumed
- * as an installed dependency. A small `require` indirection keeps this CommonJS-friendly (the lib
- * is emitted as CJS) without pulling the native binary into the module graph at import time. If the
- * addon predates the linker (its `linkPartial` export is absent) we degrade to pass-through.
+ * The Rust addon currently links only the DI + pipe family and leaves
+ * `ɵɵngDeclareComponent`/`Directive` untouched; any residual `ɵɵngDeclare*` would still trigger the
+ * runtime JIT fallback. So when the addon output still contains the marker AND a Babel backend is
+ * available, we run the Babel linker over the addon's output to finish the component/directive
+ * declarations. (The Babel linker is a no-op for already-linked `ɵɵdefine*` calls.)
+ */
+function composeLinkers(addon: PartialLinker, babel: PartialLinker | null): PartialLinker {
+  if (babel === null) {
+    return addon;
+  }
+  return {
+    linkPartial(code: string, filename: string): LinkPartialResult {
+      const first = addon.linkPartial(code, filename);
+      if (first.errors.length > 0 || !first.code.includes(PARTIAL_MARKER)) {
+        return first;
+      }
+      // Residual partial declarations remain (components/directives the addon does not yet link):
+      // finish them with the complete Babel linker.
+      return babel.linkPartial(first.code, filename);
+    },
+  };
+}
+
+/**
+ * Lazily resolve a partial-declaration linker, memoising the result (including a `null`
+ * "unavailable" outcome, so resolution is attempted at most once).
+ *
+ * Backends, in order of preference:
+ *   1. The Rust/NAPI addon `@treaty/authoring-node`.`linkPartial` (primary - fastest) when its
+ *      `linkPartial` export is present. We resolve it by package name so this works both inside the
+ *      monorepo and when `@treaty/ts-vite` is consumed as an installed dependency; a `require`
+ *      indirection keeps this CommonJS-friendly without pulling the native binary into the module
+ *      graph at import time. Because the addon does not yet link components/directives, it is
+ *      composed (see {@link composeLinkers}) with the Babel linker to clear any residual partials.
+ *   2. The Angular Babel linker (`@angular/compiler-cli/linker/babel` via `@babel/core`) - the exact
+ *      mechanism the Angular CLI uses to de-partial libraries, and complete across every
+ *      `ɵɵngDeclare*` kind. Used directly when the addon's `linkPartial` is absent (e.g. an older
+ *      prebuilt addon). It runs at build/dev-transform time only and does NOT bundle
+ *      `@angular/compiler` into the app output (see {@link createBabelLinker}).
+ *
+ * If neither backend is available we degrade to pass-through (`null`).
  */
 function loadLinker(): PartialLinker | null {
   if (cachedLinker !== undefined) {
     return cachedLinker;
   }
 
+  const babel = createBabelLinker();
+
   try {
     const addon = require('@treaty/authoring-node') as Partial<PartialLinker>;
     if (typeof addon.linkPartial === 'function') {
-      cachedLinker = { linkPartial: addon.linkPartial.bind(addon) };
-    } else {
-      cachedLinker = null;
+      cachedLinker = composeLinkers(
+        { linkPartial: addon.linkPartial.bind(addon) },
+        babel,
+      );
+      return cachedLinker;
     }
   } catch {
-    cachedLinker = null;
+    // Fall through to the Babel-only backend.
   }
 
+  cachedLinker = babel;
   return cachedLinker;
 }
 

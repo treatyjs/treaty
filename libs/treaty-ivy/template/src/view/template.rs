@@ -609,6 +609,32 @@ fn is_legacy_animation_name(name: &str) -> bool {
     name.starts_with('@')
 }
 
+/// Whether a bound attribute is an *eligible control property* — the template analogue of Angular's
+/// `specializeControlProperties` phase (`phases/control_directives.ts`). A property/attribute/two-way
+/// binding whose name matches one of the reactive-forms control directives, with the binding kind in
+/// that directive's eligible-op set, gains a paired `ɵɵcontrolCreate()` (after the element's create
+/// op) and `ɵɵcontrol()` (after the binding's update op). The name→eligible-kind map is byte-for-byte
+/// Angular's `ELIGIBLE_CONTROL_PROPERTIES`:
+///   - `formField`        → Property
+///   - `formControl`      → Property
+///   - `formControlName`  → Property | Attribute
+///   - `ngModel`          → Attribute | Property | TwoWayProperty
+fn is_control_binding(input: &BoundAttribute) -> bool {
+    use crate::expression::ast::BindingType;
+    // A `[name]` property binding is `Property`; a `[(name)]` two-way is `TwoWay`; an `[attr.name]`
+    // binding carries `BindingType::Attribute` with the bare attribute name (without the `attr.`
+    // prefix) — Angular keys the control map on that bare name for the Attribute case.
+    match input.name.as_str() {
+        "formField" | "formControl" => matches!(input.kind, BindingType::Property),
+        "formControlName" => matches!(input.kind, BindingType::Property | BindingType::Attribute),
+        "ngModel" => matches!(
+            input.kind,
+            BindingType::Property | BindingType::Attribute | BindingType::TwoWay
+        ),
+        _ => false,
+    }
+}
+
 /// Whether a binding expression is "empty" — the parser's representation of `[@baz]` with no
 /// `="…"` value: an empty-string literal primitive or an empty/`EmptyExpr` AST. Such a binding
 /// emits the `undefined` value.
@@ -3600,6 +3626,18 @@ impl TemplateDefinitionBuilder {
             self.build_property(slot, input);
         }
 
+        // CONTROL bindings (`specializeControlProperties`, `phases/control_directives.ts`): a
+        // reactive-forms control property (`formField`/`formControl`/`formControlName`/`ngModel`)
+        // gains a paired `ɵɵcontrol()` in the UPDATE block — inserted right after the binding's
+        // property op — and a `ɵɵcontrolCreate()` in the CREATE block (emitted after the element's
+        // create op, below). `ɵɵcontrol` is not a chainable instruction, so it stands alone after the
+        // (possibly chained) property run for this element. Count the eligible bindings so the create
+        // block emits a matching `ɵɵcontrolCreate()` per control op.
+        let control_bindings = element.inputs.iter().filter(|i| is_control_binding(i)).count();
+        for _ in 0..control_bindings {
+            self.update_code.push(instruction(R3::Control, vec![]));
+        }
+
         // Valueless `@`-prefixed static attributes (`<div @bar>`) → `ɵɵproperty("@bar", undefined)`.
         // These synthetic legacy-animation properties carry no expression, so they reserve one var
         // slot each (like any property binding) and advance to the host slot before emitting.
@@ -3639,6 +3677,14 @@ impl TemplateDefinitionBuilder {
                 R3::ElementEnd
             };
             self.creation_code.push(instruction(end_ref, vec![]));
+        }
+
+        // `ɵɵcontrolCreate()` for each control-eligible binding on this element, emitted after the
+        // element's LAST create op (`ɵɵelement`, or `ɵɵelementEnd` when the element opened a
+        // start/end pair). Angular's `addControlInstruction` does `insertAfter(controlCreateOp,
+        // targetCreateOp)` where `targetCreateOp` is the last Element/ElementEnd op for the xref.
+        for _ in 0..control_bindings {
+            self.creation_code.push(instruction(R3::ControlCreate, vec![]));
         }
     }
 
@@ -6756,6 +6802,41 @@ mod tests {
 
         assert!(out.contains("\u{0275}\u{0275}property(\"id\""), "got: {out}");
         assert!(!out.contains("\u{0275}\u{0275}domProperty"), "got: {out}");
+    }
+
+    #[test]
+    fn control_property_binding_emits_control_create_and_control() {
+        // `<input [formField]="x">` — `formField` is an eligible CONTROL property
+        // (`specializeControlProperties`). The create block gains a `ɵɵcontrolCreate()` right after
+        // the element op; the update block gains a `ɵɵcontrol()` right after the `ɵɵproperty` op.
+        let nodes = element_with_input("input", "formField", BindingType::Property, prop_read("x"));
+        let input = TemplateCompilationInput::new("Test_Template", nodes).with_dom_only(false);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let out = emit_expression(&builder.build_template_function(&input));
+
+        assert!(out.contains("\u{0275}\u{0275}controlCreate()"), "got: {out}");
+        assert!(out.contains("\u{0275}\u{0275}control()"), "got: {out}");
+        // The control-create op follows the element create op (ɵɵelement(0,...) then controlCreate).
+        let el_idx = out.find("\u{0275}\u{0275}element(0").expect("element op");
+        let cc_idx = out.find("\u{0275}\u{0275}controlCreate(").expect("controlCreate op");
+        assert!(cc_idx > el_idx, "controlCreate must follow element: {out}");
+        // The control op follows the property op in the update block.
+        let prop_idx = out.find("\u{0275}\u{0275}property(\"formField\"").expect("property op");
+        let ctrl_idx = out.find("\u{0275}\u{0275}control(").expect("control op");
+        assert!(ctrl_idx > prop_idx, "control must follow property: {out}");
+    }
+
+    #[test]
+    fn attr_formfield_binding_is_not_a_control() {
+        // `[attr.formField]` is an Attribute binding; `formField` is only control-eligible as a
+        // Property (Angular `ELIGIBLE_CONTROL_PROPERTIES`). So NO control instructions are emitted.
+        let nodes = element_with_input("div", "formField", BindingType::Attribute, prop_read("x"));
+        let input = TemplateCompilationInput::new("Test_Template", nodes).with_dom_only(false);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let out = emit_expression(&builder.build_template_function(&input));
+
+        assert!(!out.contains("\u{0275}\u{0275}controlCreate"), "got: {out}");
+        assert!(!out.contains("\u{0275}\u{0275}control("), "got: {out}");
     }
 
     #[test]
