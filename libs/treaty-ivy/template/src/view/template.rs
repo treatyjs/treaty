@@ -5948,84 +5948,10 @@ impl Visitor for TemplateDefinitionBuilder {
 /// lowering). The walk recurses through every sub-expression so nested uses (`g(h($event))`,
 /// `cond ? $event : 0`, chains, …) are all detected.
 fn handler_references_dollar_event(node: &AstNode) -> bool {
-    use AstExprKind as EK;
-
-    // A bare implicit/this read named `$event` is the reference we look for.
-    if let EK::PropertyRead { receiver, name, .. } | EK::SafePropertyRead { receiver, name, .. } =
-        &node.kind
-    {
-        if name == EVENT_NAME
-            && matches!(
-                receiver.kind,
-                EK::ImplicitReceiver | EK::ThisReceiver
-            )
-        {
-            return true;
-        }
-    }
-
-    // Otherwise recurse into every child expression.
-    match &node.kind {
-        EK::EmptyExpr
-        | EK::ImplicitReceiver
-        | EK::ThisReceiver
-        | EK::LiteralPrimitive { .. }
-        | EK::TemplateLiteralElement { .. }
-        | EK::RegularExpressionLiteral { .. } => false,
-        EK::Chain { expressions }
-        | EK::LiteralArray { expressions }
-        | EK::Interpolation { expressions, .. } => {
-            expressions.iter().any(handler_references_dollar_event)
-        }
-        EK::Conditional {
-            condition,
-            true_exp,
-            false_exp,
-        } => {
-            handler_references_dollar_event(condition)
-                || handler_references_dollar_event(true_exp)
-                || handler_references_dollar_event(false_exp)
-        }
-        EK::PropertyRead { receiver, .. } | EK::SafePropertyRead { receiver, .. } => {
-            handler_references_dollar_event(receiver)
-        }
-        EK::KeyedRead { receiver, key } | EK::SafeKeyedRead { receiver, key } => {
-            handler_references_dollar_event(receiver) || handler_references_dollar_event(key)
-        }
-        EK::BindingPipe { exp, args, .. } => {
-            handler_references_dollar_event(exp)
-                || args.iter().any(handler_references_dollar_event)
-        }
-        EK::SpreadElement { expression }
-        | EK::PrefixNot { expression }
-        | EK::TypeofExpression { expression }
-        | EK::VoidExpression { expression }
-        | EK::NonNullAssert { expression }
-        | EK::ParenthesizedExpression { expression } => {
-            handler_references_dollar_event(expression)
-        }
-        EK::LiteralMap { values, .. } => values.iter().any(handler_references_dollar_event),
-        EK::Binary { left, right, .. } => {
-            handler_references_dollar_event(left) || handler_references_dollar_event(right)
-        }
-        EK::Unary { expr, .. } => handler_references_dollar_event(expr),
-        EK::Call {
-            receiver, args, ..
-        }
-        | EK::SafeCall {
-            receiver, args, ..
-        } => {
-            handler_references_dollar_event(receiver)
-                || args.iter().any(handler_references_dollar_event)
-        }
-        EK::TaggedTemplateLiteral { tag, template } => {
-            handler_references_dollar_event(tag) || handler_references_dollar_event(template)
-        }
-        EK::TemplateLiteral { expressions, .. } => {
-            expressions.iter().any(handler_references_dollar_event)
-        }
-        EK::ArrowFunction { body, .. } => handler_references_dollar_event(body),
-    }
+    // Single source of truth: the canonical `$event`-reachability walk lives on the core
+    // expression AST so the template listener builder and the host-binding listener builder
+    // (decorators crate) agree byte-for-byte on when to declare the `$event` parameter.
+    node.references_dollar_event()
 }
 
 /// If `node` is a bare property read off the implicit receiver (`x`, `$index`), return its name.

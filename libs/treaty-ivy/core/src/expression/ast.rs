@@ -496,6 +496,86 @@ impl AstNode {
         )
     }
 
+    /// Whether this handler expression reads the implicit `$event` parameter anywhere in its
+    /// tree — a bare `$event` (or `this.$event`) read. Angular's view compiler omits the
+    /// `$event` parameter from a generated listener handler function when the handler does not
+    /// reference it (`BoundEvent` → `getEventHandlerVars`/`resolveDollarEvent`); mirroring that
+    /// keeps the generated handler signature byte-identical (`fn()` vs `fn($event)`). Used by both
+    /// the template-side listener builder and the host-binding listener builder.
+    pub fn references_dollar_event(&self) -> bool {
+        const EVENT_NAME: &str = "$event";
+        use ExprKind as EK;
+
+        // A bare implicit/this read named `$event` is the reference we look for.
+        if let EK::PropertyRead { receiver, name, .. } | EK::SafePropertyRead { receiver, name, .. } =
+            &self.kind
+        {
+            if name == EVENT_NAME
+                && matches!(receiver.kind, EK::ImplicitReceiver | EK::ThisReceiver)
+            {
+                return true;
+            }
+        }
+
+        // Otherwise recurse into every child expression.
+        match &self.kind {
+            EK::EmptyExpr
+            | EK::ImplicitReceiver
+            | EK::ThisReceiver
+            | EK::LiteralPrimitive { .. }
+            | EK::TemplateLiteralElement { .. }
+            | EK::RegularExpressionLiteral { .. } => false,
+            EK::Chain { expressions }
+            | EK::LiteralArray { expressions }
+            | EK::Interpolation { expressions, .. } => {
+                expressions.iter().any(AstNode::references_dollar_event)
+            }
+            EK::Conditional {
+                condition,
+                true_exp,
+                false_exp,
+            } => {
+                condition.references_dollar_event()
+                    || true_exp.references_dollar_event()
+                    || false_exp.references_dollar_event()
+            }
+            EK::PropertyRead { receiver, .. } | EK::SafePropertyRead { receiver, .. } => {
+                receiver.references_dollar_event()
+            }
+            EK::KeyedRead { receiver, key } | EK::SafeKeyedRead { receiver, key } => {
+                receiver.references_dollar_event() || key.references_dollar_event()
+            }
+            EK::BindingPipe { exp, args, .. } => {
+                exp.references_dollar_event()
+                    || args.iter().any(AstNode::references_dollar_event)
+            }
+            EK::SpreadElement { expression }
+            | EK::PrefixNot { expression }
+            | EK::TypeofExpression { expression }
+            | EK::VoidExpression { expression }
+            | EK::NonNullAssert { expression }
+            | EK::ParenthesizedExpression { expression } => expression.references_dollar_event(),
+            EK::LiteralMap { values, .. } => {
+                values.iter().any(AstNode::references_dollar_event)
+            }
+            EK::Binary { left, right, .. } => {
+                left.references_dollar_event() || right.references_dollar_event()
+            }
+            EK::Unary { expr, .. } => expr.references_dollar_event(),
+            EK::Call { receiver, args, .. } | EK::SafeCall { receiver, args, .. } => {
+                receiver.references_dollar_event()
+                    || args.iter().any(AstNode::references_dollar_event)
+            }
+            EK::TaggedTemplateLiteral { tag, template } => {
+                tag.references_dollar_event() || template.references_dollar_event()
+            }
+            EK::TemplateLiteral { expressions, .. } => {
+                expressions.iter().any(AstNode::references_dollar_event)
+            }
+            EK::ArrowFunction { body, .. } => body.references_dollar_event(),
+        }
+    }
+
     /// Builds the synthetic `LiteralPrimitive(0)` used by the unary desugaring
     /// (`-x` => `0 - x`, `+x` => `x - 0`). Mirrors `new LiteralPrimitive(span, sourceSpan, 0)`.
     /// Retained for the parser/lowering step that materializes the desugared binary form.

@@ -918,12 +918,20 @@ struct HostPureFunctions {
 
 #[derive(Default)]
 struct HostPureState {
-    /// Running var-offset cursor for the next pure function (seeded at `regular_bindings`).
+    /// Running var-offset cursor for the next pure function / hoisted arrow (seeded at
+    /// `regular_bindings`). A pure function reserves `1 + num_args` slots; a hoisted arrow reserves
+    /// a single slot (`varsUsedByOp` ⇒ `1` for an `ArrowFunction`). Both draw from this one cursor so
+    /// the offsets are numbered after every regular binding, in op order, exactly as Angular's
+    /// deferred var-counting pass does.
     var_cursor: usize,
-    /// Hoisted factories, de-duped structurally: `(factory_body, minted_name)`.
+    /// Hoisted factories, de-duped structurally: `(factory_body, minted_name)`. Holds both
+    /// pure-literal factories (`$cN$`) and arrow factories (`$arrowFnN$`).
     interned: Vec<(Expr, String)>,
-    /// Counter seeding the minted `$cN$` reference names.
+    /// Counter seeding the minted `$cN$` pure-literal factory reference names.
     next_const: usize,
+    /// Counter seeding the minted `$arrowFnN$` arrow factory reference names (a separate Angular
+    /// namespace — `getSharedFunctionReference` vs `getSharedConstant`).
+    next_arrow: usize,
 }
 
 impl HostPureFunctions {
@@ -983,14 +991,31 @@ impl crate::expression_converter::PipeSlotAllocator for HostPureFunctions {
         Some(offset)
     }
 
-    fn intern_pure_function_factory(&self, factory: &Expr, _is_arrow: bool) -> Option<String> {
+    fn allocate_arrow_slot(&self) -> Option<usize> {
+        // A hoisted host arrow consumes a single binding (var) slot, numbered after every regular
+        // binding alongside the pure functions (Angular `varsUsedByOp` ⇒ `1` for `ArrowFunction`).
+        let mut state = self.state.borrow_mut();
+        let offset = state.var_cursor;
+        state.var_cursor = offset + 1;
+        Some(offset)
+    }
+
+    fn intern_pure_function_factory(&self, factory: &Expr, is_arrow: bool) -> Option<String> {
         let mut state = self.state.borrow_mut();
         if let Some((_, name)) = state.interned.iter().find(|(f, _)| f.is_equivalent(factory)) {
             return Some(name.clone());
         }
-        let n = state.next_const;
-        state.next_const = n + 1;
-        let name = format!("$c{n}$");
+        // Arrow factories and pure-literal factories live in independent reference namespaces
+        // (`getSharedFunctionReference` → `$arrowFnN$`, `getSharedConstant` → `$cN$`).
+        let name = if is_arrow {
+            let n = state.next_arrow;
+            state.next_arrow = n + 1;
+            format!("$arrowFn{n}$")
+        } else {
+            let n = state.next_const;
+            state.next_const = n + 1;
+            format!("$c{n}$")
+        };
         state.interned.push((factory.clone(), name.clone()));
         Some(name)
     }
@@ -1074,14 +1099,23 @@ impl crate::expression_converter::LocalResolver for HostListenerResolver {
 
 /// Parse + lower a host *listener* handler (an action) rooted at `ctx`, keeping `$event` a bare
 /// parameter read (Angular `resolveDollarEvent`) rather than a `ctx.$event` property access.
-fn lower_host_listener_value(value: &str) -> crate::expression_converter::ConvertedBinding {
+/// Returns the lowered binding alongside whether the handler references `$event`, so the caller
+/// can omit the `$event` parameter from the generated handler when it is unused (Angular's
+/// `getEventHandlerVars`/`resolveDollarEvent`: a handler that never reads `$event` is emitted as
+/// `fn()` rather than `fn($event)`).
+fn lower_host_listener_value(
+    value: &str,
+) -> (crate::expression_converter::ConvertedBinding, bool) {
     let parser = crate::expression::parser::Parser::default();
     let parsed = parser.parse_action(
         value,
         crate::expression::ast::ParseSourceSpan { start: 0, end: 0 },
         0,
     );
-    crate::expression_converter::convert_action_binding_with(&parsed.ast, &HostListenerResolver)
+    let references_event = parsed.ast.references_dollar_event();
+    let converted =
+        crate::expression_converter::convert_action_binding_with(&parsed.ast, &HostListenerResolver);
+    (converted, references_event)
 }
 
 impl HostBindingsBuilder for DefaultHostBindingsBuilder {
@@ -1146,19 +1180,23 @@ impl HostBindingsBuilder for DefaultHostBindingsBuilder {
         // event-name argument), with the handler named on the SANITIZED event (`.` dropped, so
         // `animate.enter` → `animateenter`) — faithful to Angular's `reify.ts` + `naming.ts`.
         for (event, handler_src) in host.listeners.iter() {
-            let converted = lower_host_listener_value(handler_src);
+            let (converted, references_event) = lower_host_listener_value(handler_src);
             let mut body = converted.stmts;
             body.push(Stmt::bare(StmtKind::Return(converted.expr)));
+
+            // Angular omits the `$event` parameter from the generated handler when the handler
+            // body never reads it (`getEventHandlerVars`/`resolveDollarEvent`), so the signature
+            // is `fn()` rather than `fn($event)`.
+            let params = if references_event {
+                vec![FnParam::new(HOST_EVENT_NAME, None)]
+            } else {
+                Vec::new()
+            };
 
             if event == "animate.enter" || event == "animate.leave" {
                 let handler_name =
                     format!("{name}_{}_HostBindingHandler", event.replace('.', ""));
-                let handler_fn = o::fn_(
-                    vec![FnParam::new(HOST_EVENT_NAME, None)],
-                    body,
-                    None,
-                    Some(handler_name),
-                );
+                let handler_fn = o::fn_(params, body, None, Some(handler_name));
                 let reference = if event == "animate.leave" {
                     R3::AnimationLeaveListener
                 } else {
@@ -1170,12 +1208,7 @@ impl HostBindingsBuilder for DefaultHostBindingsBuilder {
 
             // `naming.ts`: `${name}_${event}_HostBindingHandler`.
             let handler_name = format!("{name}_{}_HostBindingHandler", event.replace('.', "_"));
-            let handler_fn = o::fn_(
-                vec![FnParam::new(HOST_EVENT_NAME, None)],
-                body,
-                None,
-                Some(handler_name),
-            );
+            let handler_fn = o::fn_(params, body, None, Some(handler_name));
             create_stmts.push(host_instruction(
                 R3::Listener,
                 vec![o::literal(LiteralValue::String(event.clone()), None), handler_fn],
@@ -2964,6 +2997,88 @@ mod tests {
         let stmts = crate::output::emitter::emit_statements(&compiled.statements);
         assert!(stmts.contains("$c0$"), "factory const not hoisted: {stmts}");
         assert!(stmts.contains("[\"red\", a0]"), "factory body wrong: {stmts}");
+    }
+
+    #[test]
+    fn host_arrow_binding_hoists_arrow_function_factory() {
+        // `host: { '[attr.no-context]': '((a, b) => a / b)(5, 10)',
+        //          '[attr.with-context]': '((a, b) => a / b + componentProp)(6, 12)' }`
+        // — a user arrow written directly in a host binding runs Angular's host-bindings
+        // `generateArrowFunctions`: each arrow is hoisted into a `(ctx, view) => <userArrow>`
+        // factory const and the binding becomes `ɵɵarrowFunction(varOffset, $arrowFnN$, ctx)(args)`.
+        // Var offsets are numbered after the two regular bindings (slots 2 and 3 ⇒ hostVars 4), and
+        // the arrow references are minted in the `$arrowFnN$` namespace (mirrors
+        // r3_view_compiler_arrow_functions/arrow_function_host_binding).
+        let mut meta = directive_meta("TestDir", "[d]");
+        meta.host
+            .properties
+            .insert("attr.no-context".to_string(), "((a, b) => a / b)(5, 10)".to_string());
+        meta.host.properties.insert(
+            "attr.with-context".to_string(),
+            "((a, b) => a / b + componentProp)(6, 12)".to_string(),
+        );
+        let mut hb = DefaultHostBindingsBuilder;
+        let compiled = compile_directive_from_metadata(&meta, &mut hb);
+        let js = emit_expression(&compiled.expression);
+
+        // Each arrow is hoisted and referenced by name; the call applies the original arguments.
+        assert!(
+            js.contains("ɵɵarrowFunction(2, $arrowFn0$, ctx)(5, 10)"),
+            "no-context arrow not hoisted to slot 2: {js}"
+        );
+        assert!(
+            js.contains("ɵɵarrowFunction(3, $arrowFn1$, ctx)(6, 12)"),
+            "with-context arrow not hoisted to slot 3: {js}"
+        );
+        // The inline arrow must NOT survive in the binding position.
+        assert!(!js.contains("=> a / b)(5, 10)"), "arrow left inline: {js}");
+        // Two regular bindings + two single-slot arrows ⇒ hostVars 4.
+        assert!(
+            js.contains("hostVars: 4") || js.contains("hostVars:4"),
+            "expected hostVars: 4: {js}"
+        );
+        // Both factories are hoisted as sibling consts; the with-context body roots its read at ctx.
+        let stmts = crate::output::emitter::emit_statements(&compiled.statements);
+        assert!(stmts.contains("$arrowFn0$"), "arrow factory 0 not hoisted: {stmts}");
+        assert!(stmts.contains("$arrowFn1$"), "arrow factory 1 not hoisted: {stmts}");
+        assert!(
+            stmts.contains("(ctx, view) => (a, b) => a / b + ctx.componentProp"),
+            "factory body wrong: {stmts}"
+        );
+    }
+
+    #[test]
+    fn host_listener_omits_event_param_when_unreferenced() {
+        // A host listener whose handler never reads `$event` is emitted as `fn()` — not `fn($event)`
+        // (Angular `getEventHandlerVars`/`resolveDollarEvent`). `mousedown` reads it, so it keeps the
+        // parameter (mirrors r3_view_compiler_arrow_functions/arrow_function_host_listener and the
+        // $event-omission half of component_animations).
+        let mut meta = directive_meta("TestDir", "[d]");
+        meta.host
+            .listeners
+            .insert("click".to_string(), "someSignal.update(prev => prev + 1)".to_string());
+        meta.host
+            .listeners
+            .insert("keyup".to_string(), "onKey($event)".to_string());
+        let mut hb = DefaultHostBindingsBuilder;
+        let compiled = compile_directive_from_metadata(&meta, &mut hb);
+        let js = emit_expression(&compiled.expression);
+
+        // `click` never reads $event ⇒ empty parameter list.
+        assert!(
+            js.contains("function TestDir_click_HostBindingHandler()"),
+            "click handler should take no params: {js}"
+        );
+        // `keyup` reads $event ⇒ keeps the parameter.
+        assert!(
+            js.contains("function TestDir_keyup_HostBindingHandler($event)"),
+            "keyup handler should keep the $event param: {js}"
+        );
+        // The inner update arrow is left inline (not hoisted — it is not a host *binding* arrow).
+        assert!(
+            js.contains("ctx.someSignal.update(prev => prev + 1)"),
+            "inner action arrow should stay inline: {js}"
+        );
     }
 
     #[test]

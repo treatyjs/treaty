@@ -494,10 +494,12 @@ pub fn convert_property_binding_with_pipes<R: LocalResolver, P: PipeSlotAllocato
 /// analogue of [`convert_property_binding_with_pipes`]. A HOST property binding runs Angular's full
 /// host-bindings pipeline, which includes `generatePureLiteralStructures` — so `host: {'[id]':
 /// '["red", id]'}` lowers to `ɵɵdomProperty("id", ɵɵpureFunction1(slot, $ff$, ctx.id))` with the
-/// factory hoisted to a module-level const. Unlike the template pipe path this does NOT enable
-/// `hoist_arrows` (no host fixture rewrites a user arrow), keeping the existing host-arrow behaviour
-/// unchanged. The supplied `pipes` allocator owns the pure-function var-offset assignment and factory
-/// hoisting; without one a literal stays a verbatim array/map.
+/// factory hoisted to a module-level const. The host pipeline ALSO runs `generateArrowFunctions`, so
+/// a user arrow written directly in a host binding (`host: {'[attr.x]': '((a, b) => a / b)(5, 10)'}`)
+/// is hoisted into a `(ctx, view) => <userArrow>` factory and emitted as
+/// `ɵɵarrowFunction(varOffset, $arrowFnN$, ctx)(5, 10)` — exactly as the template binding path does.
+/// The supplied `pipes` allocator owns the pure-function/arrow var-offset assignment and factory
+/// hoisting; without one a literal stays a verbatim array/map and an arrow stays inline.
 pub fn convert_host_property_binding_with_pure<R: LocalResolver, P: PipeSlotAllocator>(
     expr: &AstNode,
     resolver: &R,
@@ -505,6 +507,7 @@ pub fn convert_host_property_binding_with_pure<R: LocalResolver, P: PipeSlotAllo
 ) -> ConvertedBinding {
     let mut cx = Converter::new(resolver).with_pipes(pipes);
     cx.extract_pure = true;
+    cx.hoist_arrows = true;
     let expr = cx.convert(expr);
     cx.finish(expr)
 }
