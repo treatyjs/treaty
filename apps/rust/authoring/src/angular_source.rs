@@ -211,6 +211,15 @@ pub fn compile_angular_component_with(
         }
     }
 
+    // The rewritten call sites now reference the resource-client runtime symbols the bindings use;
+    // prepend a self-contained definition for the symbols the emitted code actually names so the
+    // module resolves every reference at boot rather than throwing `<symbol> is not defined`. Keying
+    // off the emitted code keeps a non-axum backend's distinct binding shape free of an unused prelude.
+    let prelude = crate::plugin::client_runtime_prelude_for_code(&code);
+    if !prelude.is_empty() {
+        code = format!("{prelude}\n{code}");
+    }
+
     CompiledAuthoring {
         code,
         server_module: Some(emit.server_module),
@@ -328,6 +337,16 @@ fn compile_plain_ts_server_module(
         if let Some(binding) = emit.client_bindings.get(&f.name) {
             code.push_str(&format!("\nexport const {} = {};\n", f.name, binding));
         }
+    }
+
+    // The emitted bindings reference resource-client runtime symbols (`edenHttpResource` /
+    // `edenStreamResource` / `edenWebSocket` / `httpClient` / `wsUrl`). Prepend a self-contained
+    // definition for exactly the symbols the emitted code names, so the client module resolves every
+    // reference the moment it is imported (closing the `edenStreamResource is not defined` boot
+    // crash). The prelude is empty when no binding symbol is referenced.
+    let prelude = crate::plugin::client_runtime_prelude_for_code(&code);
+    if !prelude.is_empty() {
+        code = format!("{prelude}\n{code}");
     }
 
     // CLIENT PRIVACY: emit a v3 client map whose embedded `sourcesContent` is the ORIGINAL authoring
@@ -1041,6 +1060,70 @@ export async function listTodos(): Promise<Todo[]> {{\n\
                 "SECURITY: secret leaked into client map sourcesContent"
             );
         }
+    }
+
+    #[test]
+    fn file_level_use_websocket_module_extracts_ws_fns_with_defined_binding() {
+        // PHASE 1: a MODULE-LEVEL `'use websocket'` directive (the duplex analogue of file-level
+        // `'use server'`) must lift every exported fn as a WebSocket-transport server fn through the
+        // axum default backend: the body goes to the server module, the client keeps only the typed
+        // binding (whose runtime symbol is defined so it resolves at boot), and the body is ABSENT
+        // from the client — verified by PARSING the emitted client module, not a regex.
+        let source = "'use websocket'\n\
+\n\
+export interface PresenceEvent { readonly userId: string }\n\
+\n\
+export function wsPresence(userId: string, onEvent: (e: PresenceEvent) => void) {\n\
+  const broadcast = (status) => { onEvent({ userId, status, at: Date.now() }); };\n\
+  broadcast('online');\n\
+  return { close: () => broadcast('offline') };\n\
+}\n";
+        let out = compile_angular_source(source, "presence.ws.ts");
+
+        // A server module is produced and carries the body + a ws upgrade route/handler.
+        let server_module = out
+            .server_module
+            .expect("file-level 'use websocket' must yield a server module");
+        assert!(
+            server_module.contains("WebSocketUpgrade") && server_module.contains("__server_wsPresence"),
+            "no ws upgrade handler for the lifted fn; got:\n{server_module}"
+        );
+        assert!(
+            server_module.contains("onEvent({ userId") || server_module.contains("broadcast"),
+            "ws body not carried into the server module; got:\n{server_module}"
+        );
+
+        // VERIFY EMITTED CLIENT CODE BY PARSING: the client must parse and the body must be absent.
+        assert_client_parses(&out.code);
+        assert!(
+            !out.code.contains("onEvent({ userId") && !out.code.contains("broadcast("),
+            "SECURITY: ws body leaked into the client; got:\n{}",
+            out.code
+        );
+        // The fn is no longer a function/arrow declaration in the client AST (only a binding const).
+        let names = declared_fn_names(&out.code);
+        assert!(
+            !names.contains(&"wsPresence".to_string()),
+            "wsPresence survived as a fn/arrow declaration (body present); got: {names:?}"
+        );
+        // A typed WebSocket client binding is exported, and the `edenWebSocket` runtime symbol it
+        // references is defined in the module (no `edenWebSocket is not defined` at boot).
+        assert!(
+            out.code.contains("export const wsPresence =") && out.code.contains("edenWebSocket"),
+            "no ws client binding for wsPresence; got:\n{}",
+            out.code
+        );
+        assert!(
+            out.code.contains("const edenWebSocket ="),
+            "ws binding runtime symbol not defined (would dangle at boot); got:\n{}",
+            out.code
+        );
+        // The exported interface (a pure type) survives for consumers.
+        assert!(
+            out.code.contains("export interface PresenceEvent"),
+            "exported type lost; got:\n{}",
+            out.code
+        );
     }
 
     #[test]

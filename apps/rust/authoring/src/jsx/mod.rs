@@ -29,7 +29,9 @@ use oxc_ast::ast::{
 use oxc_parser::Parser as JsParser;
 use oxc_span::SourceType;
 
-use crate::plugin::{extract_server_block, rewrite_call_sites, BackendPlugin, ElysiaEdenPlugin};
+use crate::plugin::{
+    client_runtime_prelude_for_code, extract_server_block_jsx, rewrite_call_sites, PluginRegistry,
+};
 use crate::sfc::compile_from_parts_with_directives_and_map;
 use crate::source_map::redact_server_bodies_in_map;
 use crate::CompiledAuthoring;
@@ -211,8 +213,12 @@ struct LoweredComponent {
 /// standalone and selectorless, exactly like the `.treaty` path. A `server { … }` block is lifted
 /// and routed through the reference Elysia/Eden backend, mirroring `sfc::compile_treaty_authoring`.
 pub fn compile(source: &str, file_name: &str) -> CompiledAuthoring {
-    // 1. Lift any server block first, so server-only code never reaches JSX parsing/lowering.
-    let extraction = extract_server_block(source);
+    // 1. Lift any server block / marker server fn first, so server-only code never reaches JSX
+    //    parsing/lowering. The JSX-aware extraction parses the marker pre-pass with JSX enabled so a
+    //    top-level `$$`-suffixed (or `'use server'` / `'use websocket'`) server fn in a `.tjsx`/`.tsx`
+    //    file is seen and lifted exactly like the `.ts` path — a plain-TS parse would choke on the
+    //    component's JSX body and miss the marker, leaking the server body to the client.
+    let extraction = extract_server_block_jsx(source);
 
     // 1b. Lower Angular control-flow blocks written directly inside JSX (`@if`/`@for`/`@switch`)
     //     out of the source *before* OXC parses it: their `{ … }` bodies are not parseable JSX
@@ -282,13 +288,23 @@ pub fn compile(source: &str, file_name: &str) -> CompiledAuthoring {
     //     so block-body interpolations are auto-called consistently with the rest of the template.
     let template_html = angular_blocks::restore(&template_html, &cf_blocks);
 
-    // 4. When a server block was present, emit it and rewrite client call sites — same contract as
-    //    the `.treaty` path. The lifted server-fn body texts are kept so they can be redacted out of
-    //    the client map's `sourcesContent` below.
+    // 4. When a server fn was lifted (a `server { … }` block, OR a top-level `$$` / `'use server'` /
+    //    `'use websocket'` marker), emit it through the backend [`PluginRegistry`] default (axum +
+    //    typesafe resource HTTP client) — the SAME default backend the `.ts`/`.treaty` paths use, not
+    //    a hardcoded Elysia path — and rewrite the client call sites to the plugin's per-fn binding.
+    //    The lifted server-fn body texts are kept so they can be redacted out of the client map's
+    //    `sourcesContent` below. The emitted bindings reference resource-client runtime symbols
+    //    (`edenHttpResource`/`edenStreamResource`/`edenWebSocket`/…); a self-contained prelude
+    //    defining exactly the referenced symbols is prepended so the client module resolves every
+    //    reference at boot instead of throwing `<symbol> is not defined`.
     let (javascript, server_module, server_bodies) = if extraction.server_fns.is_empty() {
         (javascript, None, Vec::new())
     } else {
-        let emit = ElysiaEdenPlugin.emit(&extraction.server_fns);
+        let registry = PluginRegistry::with_defaults();
+        let plugin = registry
+            .default_plugin()
+            .expect("registry seeded with a default backend plugin");
+        let emit = plugin.emit(&extraction.server_fns);
         let rewritten = rewrite_call_sites(&javascript, &emit.client_bindings);
         let bodies: Vec<String> =
             extraction.server_fns.iter().map(|f| f.source.clone()).collect();
@@ -338,8 +354,20 @@ pub fn compile(source: &str, file_name: &str) -> CompiledAuthoring {
     }
     all_errors.extend(compiled.errors);
 
+    // The rewritten call sites in the emitted module reference the resource-client runtime symbols
+    // the server-fn bindings expand to. Prepend a self-contained MODULE-SCOPE definition for exactly
+    // the symbols the emitted code names (not inside the component wrapper, where the signals pass
+    // would mistake them for component state), so the module resolves every reference at boot rather
+    // than throwing `<symbol> is not defined`. Empty when no binding symbol is referenced.
+    let prelude = client_runtime_prelude_for_code(&compiled.code);
+    let code = if prelude.is_empty() {
+        compiled.code
+    } else {
+        format!("{prelude}\n{}", compiled.code)
+    };
+
     CompiledAuthoring {
-        code: compiled.code,
+        code,
         server_module,
         map,
         errors: all_errors,
@@ -818,17 +846,26 @@ export default function counter() {\n  return <section>hi</section>;\n}\n";
 }\n";
         let out = compile(source, "app.tsx");
 
-        // The in-component server fn is extracted and emitted (Elysia/Eden reference backend).
+        // The in-component server fn is extracted and emitted through the DEFAULT backend (axum +
+        // typesafe resource HTTP client) — the same default the `.ts`/`.treaty` paths use.
         let server_module = out.server_module.expect("expected a server module for in-component block");
         assert!(
-            server_module.contains(".post('/__server/save'"),
-            "no save route in server module; got: {server_module}"
+            server_module.contains("\"/__server/save\"") && server_module.contains("post(__server_save)"),
+            "no save route in axum server module; got: {server_module}"
         );
-        // The free call to `save` in the component body is rewritten to the Eden client binding,
-        // and the server body never leaks into the client JS.
+        // The free call to `save` in the component body is rewritten to the axum resource-client
+        // binding (`edenHttpResource` POSTing to `/__server/save`), and the server body never leaks
+        // into the client JS.
         assert!(
-            out.code.contains("client.__server.save.post"),
-            "call site not rewritten to client binding; got: {}",
+            out.code.contains("edenHttpResource") && out.code.contains("'/__server/save'"),
+            "call site not rewritten to axum resource client; got: {}",
+            out.code
+        );
+        // The resource-client runtime symbol the binding references is defined in the module, so the
+        // client resolves it at boot rather than throwing `edenHttpResource is not defined`.
+        assert!(
+            out.code.contains("const edenHttpResource ="),
+            "no resource-client runtime prelude for the referenced binding; got: {}",
             out.code
         );
         assert!(
@@ -1633,16 +1670,17 @@ export default function counter() {\n\
     }
 
     #[test]
-    fn sibling_async_export_fn_is_stripped_not_nested() {
+    fn sibling_dollar_marked_export_fn_is_extracted_as_server_fn() {
         // The real `greeting-card.tjsx` shape: a sibling `export async function loadGreeting$$()`
-        // alongside the default-export component, referenced from the component body. The `export `
-        // keyword must be stripped so the async helper is a plain body local, not a nested export.
-        // (Helper signature is left untyped: the well-formed-module assertion re-parses as pure JS;
-        // TS annotations in the body are handled by the downstream TS pass and are verified through
-        // the esbuild `loader: 'ts'` JS harness, not here.)
+        // alongside the default-export component, referenced from the component body. The `$$` suffix
+        // is the inline server-fn marker, so this helper is SERVER-ONLY: the JSX front-end must
+        // extract its body to a server module (axum default) and rewrite the component's call site to
+        // the typed client binding — the body must NOT survive as a client-side body local (that was
+        // the security leak this closes).
         let source = "import { signal } from '@angular/core';\n\
 export async function loadGreeting$$(name) {\n\
-  return { text: name };\n\
+  const greetings = ['Hello', 'Welcome'];\n\
+  return { text: greetings[name.length % greetings.length] };\n\
 }\n\
 export default function greetingCard() {\n\
   const name = signal('Grace');\n\
@@ -1654,16 +1692,112 @@ export default function greetingCard() {\n\
         let code = &out.code;
 
         assert_well_formed_module(code);
-        // The async helper survives as a plain body declaration (no `export` prefix).
+        // A server module carries the lifted body (axum default backend).
+        let server_module = out
+            .server_module
+            .expect("the `$$`-marked sibling fn must be lifted to a server module");
         assert!(
-            code.contains("async function loadGreeting$$"),
-            "async helper lost; got: {code}"
+            server_module.contains("\"/__server/loadGreeting$$\"")
+                || server_module.contains("__server_loadGreeting"),
+            "no server route for the lifted `$$` fn; got: {server_module}"
         );
+        // SECURITY: the server-fn body (the `greetings` data + indexing) is ABSENT from the client.
         assert!(
-            !code.contains("export async function loadGreeting$$"),
-            "sibling async export not stripped (nested export bug); got: {code}"
+            !code.contains("['Hello', 'Welcome']") && !code.contains("greetings[name.length"),
+            "SECURITY: `$$` server body leaked into the client; got: {code}"
+        );
+        // The declaration is gone (neither exported nor a surviving body declaration with the body).
+        assert!(
+            !code.contains("async function loadGreeting$$")
+                && !code.contains("export async function loadGreeting$$"),
+            "the `$$` server fn declaration leaked into the client; got: {code}"
+        );
+        // The call site routes through the axum resource-client binding, whose runtime symbol is
+        // defined in the module so it resolves at boot.
+        assert!(
+            code.contains("edenHttpResource") && code.contains("const edenHttpResource ="),
+            "call site not rewritten to a defined resource-client binding; got: {code}"
         );
         assert!(code.contains("export default GreetingCard;"), "no class default export; got: {code}");
+    }
+
+    /// Collect every top-level (and `export`-wrapped) function/arrow-const NAME declared in `code` by
+    /// walking the PARSED tsx AST (not a regex). Used to assert a lifted `$$` server fn's DECLARATION
+    /// is absent from the emitted client module — a surviving declaration is a real AST node.
+    fn jsx_client_declared_fn_names(code: &str) -> Vec<String> {
+        let allocator = Allocator::default();
+        let ret = JsParser::new(&allocator, code, SourceType::tsx()).parse();
+        assert!(
+            ret.errors.is_empty(),
+            "emitted client module did not parse as tsx: {:?}\n--- code ---\n{code}",
+            ret.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+        let mut names = Vec::new();
+        for stmt in &ret.program.body {
+            match stmt {
+                Statement::FunctionDeclaration(f) => {
+                    if let Some(id) = &f.id {
+                        names.push(id.name.to_string());
+                    }
+                }
+                Statement::VariableDeclaration(d) => {
+                    for decl in &d.declarations {
+                        if let (Some(name), Some(Expression::ArrowFunctionExpression(_))) =
+                            (decl.id.get_identifier_name(), &decl.init)
+                        {
+                            names.push(name.to_string());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        names
+    }
+
+    #[test]
+    fn jsx_dollar_marked_server_fn_body_absent_from_parsed_client() {
+        // PHASE 1: a `$$`-marked server fn in a JSX (`.tjsx`) file must be extracted exactly like the
+        // `.ts` path. Verified by PARSING the emitted client (tsx): the body statements are ABSENT,
+        // the fn is not a surviving declaration, a binding is present, and a server module is produced.
+        let source = "import { signal } from '@angular/core';\n\
+export async function loadGreeting$$(name: string) {\n\
+  const greetings = ['Hello', 'Welcome', 'Greetings', 'Salutations'];\n\
+  return { text: greetings[name.length % greetings.length] };\n\
+}\n\
+export default function greetingCard() {\n\
+  const name = signal('Grace');\n\
+  const greet = async () => { await loadGreeting$$(name()); };\n\
+  return <button onClick={greet}>{name()}</button>;\n\
+}\n";
+        let out = compile(source, "greeting-card.tjsx");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+
+        // serverModule is populated (the lifted body lives there, not on the client).
+        let server_module = out.server_module.expect("expected a server module for the `$$` JSX fn");
+        assert!(
+            server_module.contains("greetings") || server_module.contains("__server_loadGreeting"),
+            "server module did not carry the lifted fn; got:\n{server_module}"
+        );
+
+        // PARSE the client: the body data is absent and the fn is not a surviving declaration.
+        let names = jsx_client_declared_fn_names(&out.code);
+        assert!(
+            !names.contains(&"loadGreeting$$".to_string()),
+            "the `$$` server fn survived as a client declaration; got names: {names:?}"
+        );
+        assert!(
+            !out.code.contains("['Hello', 'Welcome', 'Greetings', 'Salutations']")
+                && !out.code.contains("greetings[name.length"),
+            "SECURITY: `$$` server body leaked into the client; got:\n{}",
+            out.code
+        );
+        // A binding is present and its runtime symbol is defined so the client resolves it at boot.
+        assert!(
+            out.code.contains("edenHttpResource") && out.code.contains("const edenHttpResource ="),
+            "no defined resource-client binding for the lifted fn; got:\n{}",
+            out.code
+        );
     }
 
     #[test]

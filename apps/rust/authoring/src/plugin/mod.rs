@@ -195,6 +195,25 @@ impl Default for PluginRegistry {
 /// When no top-level `server { … }` block is present the source is returned unchanged with an empty
 /// `server_fns` list.
 pub fn extract_server_block(source: &str) -> ServerExtraction {
+    extract_server_block_with_type(source, SourceType::default().with_typescript(true))
+}
+
+/// Like [`extract_server_block`], but parses the marker pre-pass with a JSX-capable [`SourceType`].
+///
+/// The marker pre-pass ([`extract_marker_fns_with_type`]) parses the module with OXC to find `'use server'` /
+/// `'use websocket'` directives and `$$`-suffixed declarations. A `.tjsx` / `.tsx` source whose
+/// component body is JSX FAILS to parse as plain TypeScript, so a top-level `$$`/`'use server'`/`'use
+/// websocket'` marker in a JSX file would never be seen (the parse yields no usable body) and its
+/// body would leak to the client. Routing the JSX front-ends through this entry with
+/// [`SourceType::tsx`] lets the marker pre-pass see the real declarations, so the `$$` JSX server fn
+/// is extracted exactly like the `.ts` path.
+pub fn extract_server_block_jsx(source: &str) -> ServerExtraction {
+    extract_server_block_with_type(source, SourceType::tsx())
+}
+
+/// Shared implementation of [`extract_server_block`] / [`extract_server_block_jsx`], parameterized on
+/// the [`SourceType`] used by the marker pre-pass so a JSX source parses with JSX enabled.
+fn extract_server_block_with_type(source: &str, source_type: SourceType) -> ServerExtraction {
     // 1. Lift every explicit `server[:LANG] { … }` block first. Multiple blocks are supported; each
     //    keeps its own language tag (bare `server { … }` defaults to `rust`).
     let mut client_source = String::with_capacity(source.len());
@@ -220,9 +239,11 @@ pub fn extract_server_block(source: &str) -> ServerExtraction {
     // Whatever remains after the last block (or the whole source if there were no blocks).
     client_source.push_str(&source[cursor..]);
 
-    // 2. Lift the remaining top-level marker forms (`'use server'` directive, `name$$` suffix) from
-    //    whatever client source survived step 1, removing their declarations as we go.
-    let (rewritten, marker_fns, server_only_sources) = extract_marker_fns(&client_source);
+    // 2. Lift the remaining top-level marker forms (`'use server'` directive, `name$$` suffix,
+    //    module-level `'use websocket'`) from whatever client source survived step 1, removing their
+    //    declarations as we go.
+    let (rewritten, marker_fns, server_only_sources) =
+        extract_marker_fns_with_type(&client_source, source_type);
     client_source = rewritten;
     server_fns.extend(marker_fns);
 
@@ -248,22 +269,42 @@ pub fn extract_server_block(source: &str) -> ServerExtraction {
 ///
 /// The scan parses `source` once with OXC and removes the matched declarations by byte span (highest
 /// span first so earlier offsets stay valid). Only program-top-level declarations are considered.
-fn extract_marker_fns(source: &str) -> (String, Vec<ServerFn>, Vec<String>) {
+/// Parses with the caller-supplied [`SourceType`] so a JSX (`.tsx`/`.tjsx`) source — whose component
+/// body is not valid plain TypeScript — is parsed with JSX enabled and its top-level markers are seen
+/// (the `.ts`/`.treaty` callers pass a plain-TypeScript [`SourceType`]).
+///
+/// Adds module-level `'use websocket'` support alongside the file-level `'use server'` lift: a
+/// top-of-program `'use websocket'` string directive turns the WHOLE module into a server module
+/// whose exported fns are lifted as [`TransportKind::WebSocket`] server fns (the duplex analogue of a
+/// file-level `'use server'` module), the directive statement is stripped from the client, and each
+/// lifted fn is rewritten to its WebSocket client binding by the active backend.
+fn extract_marker_fns_with_type(
+    source: &str,
+    source_type: SourceType,
+) -> (String, Vec<ServerFn>, Vec<String>) {
     if source.trim().is_empty() {
         return (source.to_string(), Vec::new(), Vec::new());
     }
 
     let allocator = Allocator::default();
-    let source_type = SourceType::default().with_typescript(true);
     let ret = JsParser::new(&allocator, source, source_type).parse();
 
     // A file-level `'use server'` directive turns the WHOLE module into a server module: every
-    // top-level function/arrow-const declaration is server-only, regardless of per-fn marker.
+    // top-level function/arrow-const declaration is server-only, regardless of per-fn marker. A
+    // file-level `'use websocket'` directive does the same, but classifies every lifted fn as a
+    // WebSocket-transport server fn (the duplex-channel analogue). Either directive triggers the
+    // whole-module lift; the websocket flavour additionally forces `TransportKind::WebSocket`.
     let file_level_server = ret
         .program
         .directives
         .iter()
         .any(|d| d.expression.value.as_str() == USE_SERVER_DIRECTIVE);
+    let file_level_websocket = ret
+        .program
+        .directives
+        .iter()
+        .any(|d| d.expression.value.as_str() == USE_WEBSOCKET_DIRECTIVE);
+    let file_level = file_level_server || file_level_websocket;
 
     let mut fns = Vec::new();
     // Byte spans of the top-level declarations we remove from the client source.
@@ -272,18 +313,28 @@ fn extract_marker_fns(source: &str) -> (String, Vec<ServerFn>, Vec<String>) {
     // so the client source map can redact them too.
     let mut server_only_sources: Vec<String> = Vec::new();
 
-    // When the module is file-level `'use server'`, strip the directive statement itself from the
-    // client source so the lifted module marker does not survive into the client bundle.
-    if file_level_server {
-        if let Some(d) = ret.program.directives.first() {
-            removals.push((d.span.start as usize, d.span.end as usize));
+    // When the module is file-level `'use server'` / `'use websocket'`, strip every leading string
+    // directive statement (e.g. `'use server'` / `'use websocket'`) from the client source so the
+    // lifted module marker does not survive into the client bundle.
+    if file_level {
+        for d in &ret.program.directives {
+            let v = d.expression.value.as_str();
+            if v == USE_SERVER_DIRECTIVE || v == USE_WEBSOCKET_DIRECTIVE {
+                removals.push((d.span.start as usize, d.span.end as usize));
+            }
         }
     }
 
     for stmt in &ret.program.body {
-        // Inside a file-level `'use server'` module no per-fn marker is required; otherwise the
-        // declaration must carry its own marker (`'use server'` body directive or `$$` suffix).
-        if let Some((server_fn, span)) = server_fn_from_top_level(source, stmt, !file_level_server) {
+        // Inside a file-level `'use server'`/`'use websocket'` module no per-fn marker is required;
+        // otherwise the declaration must carry its own marker (`'use server'` body directive or `$$`
+        // suffix).
+        if let Some((mut server_fn, span)) = server_fn_from_top_level(source, stmt, !file_level) {
+            // A file-level `'use websocket'` module forces every lifted fn onto the WebSocket
+            // transport (the duplex-channel analogue of a file-level `'use server'` module).
+            if file_level_websocket {
+                server_fn.transport = TransportKind::WebSocket;
+            }
             removals.push(span);
             fns.push(server_fn);
             continue;
@@ -297,7 +348,7 @@ fn extract_marker_fns(source: &str) -> (String, Vec<ServerFn>, Vec<String>) {
         // fn BODIES were lifted. Imports and pure TYPE declarations (`interface`/`type`, which carry
         // no runtime value and are erased by the bundler) are kept so a consumer can still import the
         // module's types.
-        if file_level_server && is_server_only_runtime_statement(stmt) {
+        if file_level && is_server_only_runtime_statement(stmt) {
             let (start, end) = (stmt.span().start as usize, stmt.span().end as usize);
             removals.push((start, end));
             server_only_sources.push(source[start..end].to_string());
@@ -1151,6 +1202,89 @@ fn is_ident_start(b: u8) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Client resource-binding runtime prelude.
+// ---------------------------------------------------------------------------
+
+/// The runtime symbols the emitted client bindings reference, by transport. The axum backend's
+/// per-fn client bindings (see `axum_backend`) expand to calls of `edenHttpResource` / `httpClient`
+/// (Api), `edenStreamResource` / `EventSource` (Stream), or `edenWebSocket` / `WebSocket` / `wsUrl`
+/// (WebSocket). When a server fn is lifted, the client module that keeps only the binding MUST also
+/// have these symbols in scope, or the module throws `<symbol> is not defined` the moment it is
+/// imported (the log-viewer boot crash). [`client_runtime_prelude`] emits a self-contained definition
+/// for exactly the symbols the present transports use, so the client module is closed over its
+/// references with no dependency on an ambient runtime global.
+///
+/// The prelude is intentionally self-defining (not an `import` of `@treaty/httpclient`): the resource
+/// factories the bindings call (`edenStreamResource` / `edenWebSocket` / `wsUrl`, and a module-local
+/// `httpClient`) are not all part of that package's public surface, so emitting an import of them
+/// would itself dangle. Each emitted symbol is a thin, dependency-free shim over the platform
+/// primitives (`fetch` / `EventSource` / `WebSocket`) the binding already names, so the binding
+/// resolves at boot and the typed RPC call works.
+pub fn client_runtime_prelude(fns: &[ServerFn]) -> String {
+    let needs_api = fns.iter().any(|f| f.transport == TransportKind::Api);
+    let needs_stream = fns.iter().any(|f| f.transport == TransportKind::Stream);
+    let needs_ws = fns.iter().any(|f| f.transport == TransportKind::WebSocket);
+    client_runtime_prelude_for(needs_api, needs_stream, needs_ws)
+}
+
+/// Like [`client_runtime_prelude`], but selects the runtime symbols to define by scanning the already
+/// emitted client `code` for the bindings that actually reference them. Backends other than the
+/// default axum one emit DIFFERENT binding shapes (e.g. the Eden `client.__server.save.post`), which
+/// do not reference these symbols at all — so a prelude keyed off transport alone would emit unused
+/// definitions for them. Keying off the emitted code instead emits a definition only for a symbol the
+/// code genuinely names, keeping a non-axum backend's output free of an unused prelude.
+pub fn client_runtime_prelude_for_code(code: &str) -> String {
+    let needs_api = code.contains("edenHttpResource");
+    let needs_stream = code.contains("edenStreamResource");
+    let needs_ws = code.contains("edenWebSocket");
+    client_runtime_prelude_for(needs_api, needs_stream, needs_ws)
+}
+
+/// Shared prelude builder for the transport-keyed and code-keyed selectors above.
+fn client_runtime_prelude_for(needs_api: bool, needs_stream: bool, needs_ws: bool) -> String {
+    if !needs_api && !needs_stream && !needs_ws {
+        return String::new();
+    }
+
+    let mut out = String::new();
+    out.push_str(
+        "// Treaty server-fn client runtime (generated). Defines the resource-client bindings the\n\
+         // lifted server fns are rewritten to, so the client module resolves every reference at boot\n\
+         // (no `edenHttpResource`/`edenStreamResource`/`edenWebSocket` is left undefined).\n",
+    );
+    if needs_api {
+        // The typed HTTP resource client. `httpClient.post(route, body)` returns a thunk that POSTs
+        // the typed args to the server route; `edenHttpResource(thunk)` wraps it as a signal resource.
+        out.push_str(
+            "const httpClient = {\n\
+             \tpost: (route, body) => () =>\n\
+             \t\tfetch(route, {\n\
+             \t\t\tmethod: 'POST',\n\
+             \t\t\theaders: { 'content-type': 'application/json' },\n\
+             \t\t\tbody: JSON.stringify(body),\n\
+             \t\t}).then((res) => res.json()),\n\
+             };\n\
+             const edenHttpResource = (thunk) => thunk();\n",
+        );
+    }
+    if needs_stream {
+        // The streaming resource client: wrap an `EventSource` thunk as a live subscription handle.
+        out.push_str("const edenStreamResource = (thunk) => thunk();\n");
+    }
+    if needs_ws {
+        // The WebSocket resource client + the `wsUrl` route->ws-URL mapper used by the binding.
+        out.push_str(
+            "const wsUrl = (route) =>\n\
+             \t(typeof location !== 'undefined' && location.protocol === 'https:' ? 'wss://' : 'ws://') +\n\
+             \t(typeof location !== 'undefined' ? location.host : '') +\n\
+             \troute;\n\
+             const edenWebSocket = (thunk) => thunk();\n",
+        );
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Tests.
 // ---------------------------------------------------------------------------
 
@@ -1681,6 +1815,75 @@ export async function loadUser(id: number) {\n\
             extraction.client_source
         );
         assert!(extraction.client_source.contains("const keep = 2;"));
+    }
+
+    #[test]
+    fn file_level_use_websocket_lifts_every_exported_fn_as_websocket() {
+        // A MODULE-LEVEL `'use websocket'` directive turns the whole module into a server module whose
+        // exported fns are lifted as WebSocket-transport server fns (the duplex analogue of file-level
+        // `'use server'`). The directive is stripped, the bodies leave the client, and a pure type
+        // export survives.
+        let source = "'use websocket'\n\
+export interface PresenceEvent { readonly userId: string }\n\
+export function wsPresence(userId: string, onEvent: (e: PresenceEvent) => void) {\n\
+  const broadcast = (status) => { onEvent({ userId, status }); };\n\
+  return { close: () => broadcast('offline') };\n\
+}\n";
+        let extraction = extract_server_block(source);
+
+        assert_eq!(extraction.server_fns.len(), 1, "the exported fn should lift");
+        let f = &extraction.server_fns[0];
+        assert_eq!(f.name, "wsPresence");
+        assert_eq!(
+            f.transport,
+            TransportKind::WebSocket,
+            "file-level 'use websocket' must classify the lifted fn as WebSocket"
+        );
+        assert!(
+            !extraction.client_source.contains("onEvent({ userId"),
+            "ws body leaked into client; got: {}",
+            extraction.client_source
+        );
+        assert!(
+            !extraction.client_source.trim_start().starts_with("'use websocket'"),
+            "file-level 'use websocket' directive not stripped; got: {}",
+            extraction.client_source
+        );
+        assert!(
+            extraction.client_source.contains("export interface PresenceEvent"),
+            "exported type lost; got: {}",
+            extraction.client_source
+        );
+    }
+
+    #[test]
+    fn jsx_extraction_lifts_dollar_marker_in_jsx_module() {
+        // PHASE 1 core fix: a `$$`-marked server fn in a JSX module (whose component body is JSX, not
+        // valid plain TS) is only seen when the marker pre-pass parses with JSX enabled. The plain-TS
+        // [`extract_server_block`] misses it (the JSX body fails to parse); [`extract_server_block_jsx`]
+        // lifts it.
+        let source = "import { signal } from '@angular/core'\n\
+export async function loadGreeting$$(name: string) {\n\
+  const greetings = ['Hello', 'Welcome'];\n\
+  return { text: greetings[name.length] };\n\
+}\n\
+export default function greetingCard() {\n\
+  const name = signal('Grace');\n\
+  return <section>{name()}</section>;\n\
+}\n";
+        // Plain-TS extraction cannot see the marker (the JSX body breaks the parse).
+        let plain = extract_server_block(source);
+        assert_eq!(plain.server_fns.len(), 0, "plain-TS parse should miss the JSX-file marker");
+
+        // JSX-aware extraction lifts it and removes the body from the client.
+        let jsx = extract_server_block_jsx(source);
+        assert_eq!(jsx.server_fns.len(), 1, "JSX-aware extraction should lift the `$$` fn");
+        assert_eq!(jsx.server_fns[0].name, "loadGreeting$$");
+        assert!(
+            !jsx.client_source.contains("greetings[name.length"),
+            "server body leaked into client after JSX extraction; got: {}",
+            jsx.client_source
+        );
     }
 
     #[test]
