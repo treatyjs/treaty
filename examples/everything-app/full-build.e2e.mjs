@@ -342,6 +342,30 @@ function assertBundle() {
 		defineInjectable + defineDirective > 0,
 		`injectable=${defineInjectable} directive=${defineDirective} pipe=${definePipe} injector=${defineInjector}`,
 	)
+
+	// NG0955 regression guard (bundle-level): the LogViewer `@for (line of lines(); track line.seq)`
+	// track closure MUST be emitted INDEX-first with Angular's exact param names — `($index, $item) =>
+	// $item.seq` — and must NOT be the old item-first form `(line, $index) => line.seq` that fed the
+	// index number into the item param (collapsing every key to "" -> NG0955). Scan all chunks for the
+	// LogViewer repeater's track arrow.
+	let trackIndexFirst = false
+	let trackItemFirstBug = false
+	for (const file of files) {
+		const code = readFileSync(file, 'utf-8')
+		if (/\(\s*\$index\s*,\s*\$item\s*\)\s*=>\s*\$item\.seq/.test(code)) trackIndexFirst = true
+		// The exact buggy emission: the author-written item name first, `$index` second.
+		if (/\(\s*line\s*,\s*\$index\s*\)\s*=>\s*line\.seq/.test(code)) trackItemFirstBug = true
+	}
+	check(
+		'LogViewer @for/track closure is emitted INDEX-first (($index, $item) => $item.seq)',
+		trackIndexFirst,
+		trackIndexFirst ? 'found ($index, $item) => $item.seq' : 'index-first track arrow not found',
+	)
+	check(
+		'LogViewer @for/track closure is NOT the old item-first NG0955 form ((line, $index) => line.seq)',
+		!trackItemFirstBug,
+		trackItemFirstBug ? 'found buggy (line, $index) => line.seq' : '',
+	)
 }
 
 // ---------------------------------------------------------------------------
@@ -456,11 +480,24 @@ async function bootHeadless() {
 	await new Promise((r) => setTimeout(r, 600))
 	console.error = origError
 
+	// The LogViewer "" route streams `streamLogs(10)` (its async-generator body is inlined client-side
+	// in this example bundle), pushing 10 lines into the signal over microtasks. Give the generator a
+	// little extra time to fully drain so all 10 `<li>` rows are reconciled before we assert. If the
+	// track key were broken (item-first closure), the repeater reconciliation of equal/"" keys would
+	// have thrown NG0955 during one of these flushes.
+	for (let i = 0; i < 10; i++) {
+		await new Promise((r) => setTimeout(r, 60))
+	}
+
 	const combined = `${importError ? String(importError.stack ?? importError) : ''}\n${consoleError}`
 	const jitError =
 		/needs to be compiled using the JIT compiler|@angular\/compiler|JIT compilation failed|Runtime compiler is not loaded|Component .* is not resolved/i.test(
 			combined,
 		)
+	// NG0955 surfaces either as the explicit Angular error code or its message
+	// ("provided values ... are not unique" / duplicate keys) on the console OR as a thrown import error.
+	const ng0955 =
+		/NG0955|provided values?\b[^\n]*not\b[^\n]*unique|duplicate keys?|values? .* are not unique/i.test(combined)
 
 	const root = window.document.querySelector('app-root')
 	const rootText = root ? (root.textContent ?? '') : ''
@@ -520,6 +557,40 @@ async function bootHeadless() {
 		'a component rendered (AppRoot shell + router-outlet + the "" route through the router)',
 		rendered,
 		rootText ? rootText.replace(/\s+/g, ' ').trim().slice(0, 120) : 'no app-root content',
+	)
+
+	// NG0955 regression guard (runtime): booting LogViewer drained `streamLogs(10)` into `lines()` and
+	// reconciled the `@for (line of lines(); track line.seq)` repeater — the exact path that threw
+	// NG0955 when the track closure was emitted item-first (`line` got the index number, `line.seq` was
+	// undefined, every key collapsed to "" -> duplicate keys). Assert the error never fired.
+	check(
+		'boot did NOT throw / log NG0955 (duplicate / non-unique @for track keys)',
+		!ng0955,
+		ng0955 ? combined.trim().split('\n').slice(0, 4).join(' | ') : '',
+	)
+
+	// The 10 streamed log lines must each render as a `<li>` with a DISTINCT track key. The template
+	// surfaces each line's level on `data-level` and its message ("log line <seq>") in the row text;
+	// the `seq` (the actual track key, 1..10) is unique per row, so a correctly-tracked list shows 10
+	// rows whose "log line N" messages are all distinct. A broken track key would have either thrown
+	// NG0955 (above) or collapsed/duplicated rows.
+	const lis = Array.from(window.document.querySelectorAll('li'))
+	const seqsFromText = lis
+		.map((li) => {
+			const m = /log line\s+(\d+)/i.exec(li.textContent ?? '')
+			return m ? Number(m[1]) : null
+		})
+		.filter((n) => n !== null)
+	const distinctSeqs = new Set(seqsFromText)
+	check(
+		'LogViewer rendered 10 <li> rows for the 10 streamed lines',
+		lis.length === 10,
+		`li count = ${lis.length}`,
+	)
+	check(
+		'the 10 <li> rows have DISTINCT track keys (seq 1..10, no duplicates)',
+		seqsFromText.length === 10 && distinctSeqs.size === 10,
+		`parsed seqs = [${seqsFromText.join(', ')}] (distinct ${distinctSeqs.size})`,
 	)
 }
 
