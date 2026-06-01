@@ -16,8 +16,10 @@
 //! ```
 //!
 //! Component derivation:
-//!   * class name: PascalCase of `file_name` (stem only, extension stripped)
-//!   * selector:   `None` (SELECTORLESS / class-name based resolution)
+//!   * class name: PascalCase of `file_name` (stem only, extension + trailing `.component` stripped)
+//!   * selector:   kebab-case of `file_name` (the Treaty convention when the author gives none),
+//!                 replacing Angular's `ng-component` no-selector default; sibling components still
+//!                 resolve by class name through the selectorless binder
 //!   * standalone: `true`
 //!   * template:   the joined HTML chunks
 //!   * styles:     the CSS chunks (newlines/tabs stripped, as the TS pipeline does)
@@ -102,16 +104,14 @@ fn split_chunks(source: &str) -> TreatyChunks {
     chunks
 }
 
-/// PascalCase the *stem* of a file name (extension and path separators dropped).
+/// PascalCase the *stem* of a file name (path separators, extension, and a trailing `.component`
+/// segment dropped).
 ///
-/// `"hello-world.treaty"` -> `"HelloWorld"`, `"my_widget.treaty"` -> `"MyWidget"`.
+/// `"hello-world.treaty"` -> `"HelloWorld"`, `"my_widget.treaty"` -> `"MyWidget"`,
+/// `"log-viewer.component.ts"` -> `"LogViewer"`.
 fn to_pascal_case(file_name: &str) -> String {
-    // Drop directory components and the extension.
-    let base = file_name
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(file_name);
-    let stem = base.split('.').next().unwrap_or(base);
+    // Drop directory components, the extension, and a trailing `.component` segment.
+    let stem = component_stem(file_name);
 
     let mut out = String::new();
     let mut new_word = true;
@@ -133,6 +133,75 @@ fn to_pascal_case(file_name: &str) -> String {
         "TreatyComponent".to_string()
     } else {
         out
+    }
+}
+
+/// The bare file-name stem used for both name and selector derivation: directory components and the
+/// authoring extension are dropped, and a trailing `.component` segment (the Angular `foo.component`
+/// convention) is stripped so `log-viewer.component.ts` and `gauge.treaty` both reduce to their
+/// logical component name (`log-viewer`, `gauge`). The remaining stem keeps its author-written word
+/// separators (`-`/`_`/space) so it can be PascalCased or kebab-cased downstream.
+fn component_stem(file_name: &str) -> &str {
+    let base = file_name.rsplit(['/', '\\']).next().unwrap_or(file_name);
+    // Drop the authoring extension (the final `.ext`); a name with no dot keeps its whole self.
+    let no_ext = base.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(base);
+    // Strip a trailing `.component` segment (`foo.component` -> `foo`), the Angular file convention.
+    no_ext
+        .strip_suffix(".component")
+        .unwrap_or(no_ext)
+}
+
+/// Derive a kebab-case element selector from a file name, the Treaty convention for a component that
+/// declares no explicit selector. The authoring extension and a trailing `.component` segment are
+/// dropped, then the stem is lowercased with every run of non-alphanumeric characters collapsed to a
+/// single `-` and a digit-letter / letter-digit / case boundary treated as a word break:
+///
+/// `"counter.tsx"` -> `"counter"`, `"greeting-card.tjsx"` -> `"greeting-card"`,
+/// `"log-viewer.component.ts"` -> `"log-viewer"`, `"MyWidget.treaty"` -> `"my-widget"`. Digits stay
+/// attached to their adjacent run (`"chart2d"` -> `"chart2d"`); only separators and case transitions
+/// introduce a word break.
+///
+/// Used as the selector ONLY when the author gives none; it replaces Angular's `ng-component`
+/// no-selector default so a bootstrapped Treaty component has a real host tag instead of
+/// `<ng-component>`.
+fn to_kebab_case(file_name: &str) -> String {
+    let stem = component_stem(file_name);
+
+    let mut out = String::new();
+    let mut prev_was_alnum = false;
+    let mut prev_lower_or_digit = false;
+    let chars: Vec<char> = stem.chars().collect();
+    for (i, &ch) in chars.iter().enumerate() {
+        if ch.is_ascii_alphanumeric() {
+            // Insert a boundary `-` at a camelCase transition (`MyWidget` -> `my-widget`,
+            // `HTTPClient` -> `http-client`) when the previous char was alphanumeric. Digits attach
+            // to their neighboring run, so `chart2d` stays one word.
+            let is_upper = ch.is_ascii_uppercase();
+            let next_is_lower = chars.get(i + 1).is_some_and(|c| c.is_ascii_lowercase());
+            let case_boundary = prev_was_alnum
+                && ((is_upper && prev_lower_or_digit)
+                    || (is_upper && next_is_lower && !out.is_empty()));
+            if case_boundary && !out.ends_with('-') {
+                out.push('-');
+            }
+            out.extend(ch.to_lowercase());
+            prev_was_alnum = true;
+            prev_lower_or_digit = !is_upper;
+        } else {
+            // Any separator collapses to a single `-` (no leading/trailing/duplicate dashes).
+            if !out.is_empty() && !out.ends_with('-') {
+                out.push('-');
+            }
+            prev_was_alnum = false;
+            prev_lower_or_digit = false;
+        }
+    }
+
+    let trimmed = out.trim_matches('-');
+    if trimmed.is_empty() {
+        "treaty-component".to_string()
+    } else {
+        trimmed.to_string()
     }
 }
 
@@ -798,15 +867,23 @@ fn compile_from_parts_inner(
         .filter(|name| !candidates.iter().any(|c| c == name))
         .collect();
 
-    // 3. Standalone, selectorless component metadata.
+    // 3. Standalone component metadata.
+    //
+    // SELECTOR: the author declares none, so derive a kebab-case element selector from the file name
+    // (the Treaty convention: `counter.tsx` → `counter`, `greeting-card.tjsx` → `greeting-card`,
+    // `log-viewer.component.ts` → `log-viewer`). This is the source of truth that gives a bootstrapped
+    // component a real host tag instead of Angular's `ng-component` no-selector default — while
+    // sibling components still resolve selectorlessly by class name through the binder, so the
+    // derived selector never has to be referenced explicitly in a template.
+    let derived_selector = to_kebab_case(file_name);
     let base = R3DirectiveMetadata {
         name: class_name.to_string(),
         ty: class_ref(class_name),
         type_argument_count: 0,
         type_source_span: ParseSourceSpan::new(0, 0),
         deps: Deps::None,
-        // SELECTORLESS: no selector → resolution is class-name based.
-        selector: None,
+        // Filename-derived element selector (kebab-case) when the author gives none.
+        selector: Some(derived_selector),
         queries: Vec::new(),
         view_queries: Vec::new(),
         host: R3HostMetadata::default(),
@@ -993,6 +1070,78 @@ mod tests {
         assert_eq!(to_pascal_case("my_widget.treaty"), "MyWidget");
         assert_eq!(to_pascal_case("src/foo/Bar.treaty"), "Bar");
         assert_eq!(to_pascal_case("name"), "Name");
+        // A trailing `.component` segment is stripped (the Angular file convention).
+        assert_eq!(to_pascal_case("log-viewer.component.ts"), "LogViewer");
+        assert_eq!(to_pascal_case("counter.tsx"), "Counter");
+        assert_eq!(to_pascal_case("features/greeter/greeting-card.tjsx"), "GreetingCard");
+    }
+
+    #[test]
+    fn kebab_case_selector_from_file_name() {
+        // The user-required Treaty convention: bare kebab basename, no `app-` prefix.
+        assert_eq!(to_kebab_case("counter.tsx"), "counter");
+        assert_eq!(to_kebab_case("greeting-card.tjsx"), "greeting-card");
+        assert_eq!(to_kebab_case("gauge.treaty"), "gauge");
+        // A trailing `.component` segment is dropped before kebab-casing.
+        assert_eq!(to_kebab_case("log-viewer.component.ts"), "log-viewer");
+        // Path components are dropped.
+        assert_eq!(to_kebab_case("src/features/metrics/gauge.treaty"), "gauge");
+        // PascalCase / camelCase / underscores collapse to kebab word breaks.
+        assert_eq!(to_kebab_case("MyWidget.treaty"), "my-widget");
+        assert_eq!(to_kebab_case("my_widget.treaty"), "my-widget");
+        // A caps-run followed by a lowercase word breaks before that final cap
+        // (`HTTPClient` -> `http-client`).
+        assert_eq!(to_kebab_case("HTTPClient.tsx"), "http-client");
+        // Digits attach to the adjacent lowercase run (no spurious break): `chart2d` -> `chart2d`.
+        assert_eq!(to_kebab_case("chart2d.tsx"), "chart2d");
+        // An all-separator / empty stem falls back to a stable default.
+        assert_eq!(to_kebab_case("---.treaty"), "treaty-component");
+    }
+
+    #[test]
+    fn treaty_component_derives_kebab_selector_from_file_name() {
+        // No explicit selector in a `.treaty` source → the filename drives a kebab-case selector,
+        // replacing Angular's `ng-component` no-selector default so the host tag is real.
+        let source = "const name = 'World';\n<div>{{ name }}</div>";
+        let out = compile_treaty_file(source, "log-viewer.component.treaty");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        assert!(
+            out.code.contains("selectors: [[\"log-viewer\"]]"),
+            "expected derived `log-viewer` selector; got: {}",
+            out.code
+        );
+        assert!(
+            !out.code.contains("ng-component"),
+            "ng-component default must not survive; got: {}",
+            out.code
+        );
+    }
+
+    #[test]
+    fn compile_from_parts_derives_selector_for_each_format_stem() {
+        // The shared backend funnel derives the selector from `file_name` for any selectorless
+        // authoring format (the `.tsx`/`.tjsx` paths reach the same `compile_from_parts`).
+        let cases = [
+            ("counter.tsx", "counter"),
+            ("greeting-card.tjsx", "greeting-card"),
+            ("gauge.treaty", "gauge"),
+        ];
+        for (file_name, selector) in cases {
+            let compiled = compile_from_parts(
+                "Counter",
+                "const x = 1;",
+                "<div>{{ x }}</div>",
+                "",
+                file_name,
+            );
+            assert!(
+                compiled
+                    .code
+                    .contains(&format!("selectors: [[\"{selector}\"]]")),
+                "{file_name}: expected selector `{selector}`; got: {}",
+                compiled.code
+            );
+        }
     }
 
     #[test]

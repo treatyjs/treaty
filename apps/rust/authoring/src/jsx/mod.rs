@@ -35,10 +35,14 @@ use crate::source_map::redact_server_bodies_in_map;
 use crate::CompiledAuthoring;
 
 /// PascalCase the stem of a file name, reused as the component class name. Mirrors the `.treaty`
-/// derivation so JSX and `.treaty` components name themselves the same way.
+/// derivation (path separators, the authoring extension, and a trailing `.component` segment are all
+/// dropped) so JSX and `.treaty` components name themselves the same way — and so the class name and
+/// the kebab-case selector (derived from the same stem by `crate::sfc`) stay aligned.
 fn to_pascal_case(file_name: &str) -> String {
     let base = file_name.rsplit(['/', '\\']).next().unwrap_or(file_name);
-    let stem = base.split('.').next().unwrap_or(base);
+    // Drop the authoring extension (the final `.ext`), then a trailing `.component` segment.
+    let no_ext = base.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(base);
+    let stem = no_ext.strip_suffix(".component").unwrap_or(no_ext);
 
     let mut out = String::new();
     let mut new_word = true;
@@ -670,6 +674,60 @@ mod tests {
     fn pascal_case_from_tsx_name() {
         assert_eq!(to_pascal_case("hello-world.tsx"), "HelloWorld");
         assert_eq!(to_pascal_case("my_widget.tjsx"), "MyWidget");
+        // A trailing `.component` segment is stripped, matching the `.treaty`/selector stem.
+        assert_eq!(to_pascal_case("log-viewer.component.tsx"), "LogViewer");
+        assert_eq!(to_pascal_case("src/foo/Bar.tsx"), "Bar");
+    }
+
+    #[test]
+    fn class_name_and_selector_derive_from_file_name_not_body_symbols() {
+        // Reproduces the reported defect: a lowercase default-export function (`counter`) alongside a
+        // sibling helper/directive (`highlight`) must NOT name the emitted class after a body symbol.
+        // The FILENAME is the source of truth → class `Counter`, selector `counter`.
+        let source = "export function highlight() {}\n\
+export default function counter() {\n  return <section>hi</section>;\n}\n";
+        let out = compile(source, "counter.tsx");
+
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        assert!(
+            out.code.contains("class Counter") || out.code.contains("function Counter("),
+            "class must be filename-derived `Counter`, not a body symbol; got: {}",
+            out.code
+        );
+        assert!(
+            !out.code.contains("function highlight()") || out.code.contains("Counter"),
+            "the sibling `highlight` must not become the component class; got: {}",
+            out.code
+        );
+        // The selector is the kebab filename, not Angular's `ng-component` default.
+        assert!(
+            out.code.contains("selectors: [[\"counter\"]]"),
+            "expected derived `counter` selector; got: {}",
+            out.code
+        );
+        assert!(
+            !out.code.contains("ng-component"),
+            "ng-component default must not survive; got: {}",
+            out.code
+        );
+    }
+
+    #[test]
+    fn tjsx_multiword_file_name_derives_kebab_selector() {
+        let source = "export default function greetingCard() {\n  return <section>hi</section>;\n}\n";
+        let out = compile(source, "features/greeter/greeting-card.tjsx");
+
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        assert!(
+            out.code.contains("GreetingCard"),
+            "class must be filename-derived `GreetingCard`; got: {}",
+            out.code
+        );
+        assert!(
+            out.code.contains("selectors: [[\"greeting-card\"]]"),
+            "expected derived `greeting-card` selector; got: {}",
+            out.code
+        );
     }
 
     /// Parse `code` as an ES module and assert it is well-formed: no parse errors, exactly one
