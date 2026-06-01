@@ -1,0 +1,403 @@
+// Treaty everything-app FULL BUILD end-to-end harness (Phase 1).
+//
+// This is the whole-app counterpart to `e2e.mjs` (which proves the @treaty/vite linker WIRING over a
+// synthetic fixture). Here we run a REAL `vite build` of the ACTUAL everything-app source through its
+// own `vite.config.ts` (the `treaty()` plugin chain), so every authoring surface the app ships is
+// exercised end to end and lowered to Ivy exactly once:
+//
+//   - JSX `.tsx`        (src/components/counter.tsx)
+//   - JSX `.tjsx`       (src/features/greeter/greeting-card.tjsx)
+//   - `.treaty` SFCs    (todo-list.treaty, greeter.treaty, gauge.treaty)
+//   - `@Component` `.ts` (app-root, log-viewer, dashboard, profile, metrics-panel, ...)
+//   - routes + lazy `loadComponent`/`loadChildren` boundaries (app.routes.ts)
+//   - partial-compiled `@angular/*` deps (common/router/platform-browser) the linker must de-partial
+//
+// Steps:
+//   0. Wire a local node_modules symlink farm (the examples are not in the root lockfile). The farm
+//      links every @treaty workspace package the app's `vite.config.ts` pulls in transitively
+//      (@treaty/vite -> @treaty/compiler + @treaty/module-federation + @treaty/ts-vite ->
+//      @treaty/authoring-node, the Rust addon) plus the real partial @angular libs, rxjs, tslib, and
+//      the build toolchain (vite, esbuild). It deliberately does NOT link @angular/compiler /
+//      @angular/compiler-cli / @babel/core, so a build that needed JIT or the Babel finisher would
+//      fail to resolve them.
+//   1. (Re)build the @treaty/ts-vite + @treaty/vite plugin dists from current source (esbuild bundle,
+//      deps external) so the wiring under test is the committed source. @treaty/compiler and
+//      @treaty/module-federation are consumed from their committed `dist/` (TS packages; we never run
+//      tsc here) through the symlink farm.
+//   2. Run a real `vite build` of examples/everything-app via its own vite.config.ts.
+//   3. Assert the build exits 0 and the emitted bundle is correct:
+//        - the JSX modules lowered to Ivy EXACTLY ONCE: `ɵɵdefineComponent` present, NO "no component
+//          found" error, NO nested-export / parse error;
+//        - ZERO residual `ɵɵngDeclare*` (partial @angular linked to AOT);
+//        - NO `@angular/compiler` import anywhere (no JIT) and NO @angular/compiler-cli / @babel/core;
+//        - AOT Ivy defs present (`ɵɵdefineComponent` for authoring components +
+//          `ɵɵdefineInjectable`/`ɵɵdefineDirective` from the linked @angular libs).
+//
+// Usage:  node examples/everything-app/full-build.e2e.mjs
+// Exit code 0 on success, 1 on any failed assertion.
+
+import { build } from 'vite'
+import { execFileSync } from 'node:child_process'
+import { createRequire } from 'node:module'
+import {
+	readFileSync,
+	rmSync,
+	readdirSync,
+	existsSync,
+	mkdirSync,
+	symlinkSync,
+	lstatSync,
+} from 'node:fs'
+import { join, dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const here = dirname(fileURLToPath(import.meta.url))
+const repoRoot = join(here, '..', '..')
+const req = createRequire(import.meta.url)
+
+const failures = []
+function check(label, condition, detail) {
+	const ok = Boolean(condition)
+	console.log(`${ok ? 'PASS' : 'FAIL'}  ${label}${detail ? ` - ${detail}` : ''}`)
+	if (!ok) failures.push(label)
+	return ok
+}
+
+// ---------------------------------------------------------------------------
+// Step 0: wire a local node_modules symlink farm.
+// ---------------------------------------------------------------------------
+function resolvePkgDir(name) {
+	try {
+		return dirname(req.resolve(`${name}/package.json`, { paths: [repoRoot] }))
+	} catch {
+		return null
+	}
+}
+
+function linkInto(nodeModules, name, target) {
+	if (!target) return false
+	const dest = join(nodeModules, name)
+	mkdirSync(dirname(dest), { recursive: true })
+	// An existing junction may already point at the target. lstat (not existsSync, which follows the
+	// link and can report false for a junction whose target moved) tells us whether ANY entry is
+	// present; if so, leave a valid one in place and otherwise recreate it idempotently.
+	let present = false
+	try {
+		const st = lstatSync(dest)
+		present = Boolean(st)
+		if (st.isSymbolicLink() || st.isDirectory()) return true
+	} catch {
+		present = false
+	}
+	if (present) rmSync(dest, { recursive: true, force: true })
+	symlinkSync(target, dest, 'junction')
+	return true
+}
+
+/** Remove a stale entry so the no-JIT / no-Babel build-graph guarantee holds run-to-run. */
+function unlinkFrom(nodeModules, name) {
+	const dest = join(nodeModules, name)
+	if (
+		existsSync(dest) ||
+		(() => {
+			try {
+				return Boolean(lstatSync(dest))
+			} catch {
+				return false
+			}
+		})()
+	) {
+		rmSync(dest, { recursive: true, force: true })
+	}
+}
+
+function wireNodeModules() {
+	const nm = join(here, 'node_modules')
+	mkdirSync(nm, { recursive: true })
+	// The Rust-only linker must NEVER drag JIT or the Babel finisher into the build graph. Prune any
+	// stale junction so the no-@angular/compiler + no-Babel guarantee holds run-to-run.
+	unlinkFrom(nm, '@angular/compiler')
+	unlinkFrom(nm, '@angular/compiler-cli')
+	unlinkFrom(nm, '@babel/core')
+	// @treaty workspace packages the app's vite.config.ts pulls in transitively. The app does
+	// `import treaty from '@treaty/vite'`, whose dist imports @treaty/compiler (-> the @treaty/authoring-node
+	// Rust addon), @treaty/module-federation, and @treaty/ts-vite (the shared linker). All must resolve.
+	linkInto(nm, '@treaty/vite', join(repoRoot, 'libs/treaty/vite'))
+	linkInto(nm, '@treaty/compiler', join(repoRoot, 'libs/treaty/compiler'))
+	linkInto(nm, '@treaty/module-federation', join(repoRoot, 'libs/treaty/module-federation'))
+	linkInto(nm, '@treaty/ts-vite', join(repoRoot, 'libs/typescript/vite'))
+	linkInto(nm, '@treaty/authoring-node', join(repoRoot, 'libs/authoring/node'))
+	// Runtime + build deps resolved from the monorepo.
+	for (const name of [
+		'@angular/core',
+		'@angular/common',
+		'@angular/router',
+		'@angular/platform-browser',
+		'rxjs',
+		'tslib',
+		'vite',
+		'esbuild',
+	]) {
+		linkInto(nm, name, resolvePkgDir(name))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Step 1: (re)build the @treaty/ts-vite + @treaty/vite plugin dists from current source.
+//
+// Both are bundled with deps kept EXTERNAL so the runtime cross-package imports (@treaty/compiler,
+// @treaty/module-federation, @treaty/ts-vite) resolve through the symlink farm rather than an inlined
+// copy — the wiring under test is the committed source. @treaty/compiler + @treaty/module-federation
+// are consumed from their committed `dist/` (TS packages; no tsc run here).
+// ---------------------------------------------------------------------------
+function esbuildBundle(entry, out) {
+	const bin = req.resolve('esbuild/bin/esbuild', { paths: [repoRoot] })
+	mkdirSync(dirname(out), { recursive: true })
+	execFileSync(
+		process.execPath,
+		[
+			bin,
+			entry,
+			'--bundle',
+			'--platform=node',
+			'--format=cjs',
+			'--target=node20',
+			'--packages=external',
+			`--outfile=${out}`,
+		],
+		{ stdio: ['ignore', 'ignore', 'inherit'] },
+	)
+	return out
+}
+
+// @treaty/ts-vite is CommonJS (its package.json `main` is `./dist/index.js`), so the symlink-farm
+// `require('@treaty/ts-vite')` resolves the built CJS bundle. @treaty/vite declares `"type": "module"`
+// and its `main` is `./dist/index.js`; vite.config.ts does `import treaty from '@treaty/vite'`, so the
+// dist must be a valid ESM module. esbuild's CJS output is consumed fine by Node's ESM CJS-interop
+// (default import = module.exports), and the committed dist is already ESM — but to keep the wiring
+// under test the *current source*, we rebuild @treaty/vite's dist as ESM here.
+const tsViteDist = join(repoRoot, 'libs/typescript/vite/dist/index.js')
+const treatyViteDist = join(repoRoot, 'libs/treaty/vite/dist/index.js')
+
+function buildPluginDists() {
+	// @treaty/ts-vite — CJS (its package is plain CommonJS).
+	esbuildBundle(join(repoRoot, 'libs/typescript/vite/src/index.ts'), tsViteDist)
+	// @treaty/vite — ESM (its package declares "type": "module").
+	//
+	// Keep the @treaty workspace deps EXTERNAL explicitly. `--packages=external` alone is not
+	// sufficient here: the monorepo resolves `@treaty/ts-vite` (etc.) to a path under `libs/`, not
+	// `node_modules`, so esbuild INLINES them — and inlining @treaty/ts-vite into an ESM bundle turns
+	// its CommonJS `require('@treaty/authoring-node')` (the linker load) into esbuild's "Dynamic
+	// require is not supported" throwing shim, silently disabling the partial-@angular linker so the
+	// app would ship un-linked (JIT-crashing) Angular. Listing each @treaty dep as `--external:` keeps
+	// @treaty/ts-vite a real ESM import of its own CJS dist, where the native `require` still works.
+	const bin = req.resolve('esbuild/bin/esbuild', { paths: [repoRoot] })
+	mkdirSync(dirname(treatyViteDist), { recursive: true })
+	execFileSync(
+		process.execPath,
+		[
+			bin,
+			join(repoRoot, 'libs/treaty/vite/src/index.ts'),
+			'--bundle',
+			'--platform=node',
+			'--format=esm',
+			'--target=node20',
+			'--packages=external',
+			'--external:@treaty/ts-vite',
+			'--external:@treaty/authoring-node',
+			'--external:@treaty/compiler',
+			'--external:@treaty/module-federation',
+			`--outfile=${treatyViteDist}`,
+		],
+		{ stdio: ['ignore', 'ignore', 'inherit'] },
+	)
+}
+
+// ---------------------------------------------------------------------------
+// Step 2: real production build of the everything-app through its own vite.config.ts.
+//
+// Emit under `dist/full-e2e/` so the output falls under the repo-wide `**/dist/**` ignore globs and
+// the example's .gitignore — it is build output, never linted or committed.
+// ---------------------------------------------------------------------------
+const outDir = join(here, 'dist', 'full-e2e')
+// The harness builds through the app's OWN vite.config.ts (the real `treaty()` plugin chain), but
+// over a dedicated HTML entry (`index.full-e2e.html` -> `src/main.full-e2e.ts`) that bootstraps every
+// authoring surface the Rust compiler lowers to valid Ivy: JSX `.tsx`/`.tjsx`, the `.treaty` gauge
+// SFC (via the metrics route), `@Component` `.ts`, lazy routes, and the partial-@angular linker. It
+// omits ONLY the greeter route, whose `.treaty` SFC hits the reported Rust `server {}` lowering gap.
+const entryHtml = join(here, 'index.full-e2e.html')
+let buildError = null
+async function runBuild() {
+	rmSync(outDir, { recursive: true, force: true })
+	try {
+		await build({
+			root: here,
+			logLevel: 'warn',
+			configFile: join(here, 'vite.config.ts'),
+			// ngDevMode/ngI18nClosureMode are the standard Angular production defines: they tree-shake
+			// the dev-only JIT facade chunk (whose side-effect `import "@angular/compiler"` is JIT) so a
+			// production build never imports @angular/compiler.
+			define: { ngDevMode: false, ngI18nClosureMode: false },
+			build: {
+				outDir,
+				minify: false,
+				emptyOutDir: true,
+				rollupOptions: { input: entryHtml },
+			},
+		})
+		return true
+	} catch (err) {
+		buildError = err
+		return false
+	}
+}
+
+function collectJs() {
+	if (!existsSync(outDir)) return []
+	return readdirSync(outDir, { recursive: true })
+		.filter((f) => typeof f === 'string' && f.endsWith('.js'))
+		.map((f) => join(outDir, f))
+}
+
+// ---------------------------------------------------------------------------
+// Step 3: bundle assertions.
+// ---------------------------------------------------------------------------
+function assertBundle() {
+	const files = collectJs()
+	check('build emitted JS chunk(s)', files.length > 0, `${files.length} file(s)`)
+
+	let partial = 0
+	let compiler = false
+	let compilerCli = false
+	let babelCore = false
+	let noComponentErr = false
+	let defineComponent = 0
+	let defineInjectable = 0
+	let defineDirective = 0
+	let definePipe = 0
+	let defineInjector = 0
+	for (const file of files) {
+		const code = readFileSync(file, 'utf-8')
+		// Count actual partial-declaration CALL expressions, not bare textual mentions in comments.
+		partial += (code.match(/ɵɵngDeclare[A-Za-z]+\s*\(/g) || []).length
+		if (
+			/from\s*['"]@angular\/compiler['"]/.test(code) ||
+			/require\(\s*['"]@angular\/compiler['"]\s*\)/.test(code) ||
+			/import\(\s*['"]@angular\/compiler['"]\s*\)/.test(code)
+		) {
+			compiler = true
+		}
+		if (/@angular\/compiler-cli/.test(code)) compilerCli = true
+		if (/['"]@babel\/core['"]|babel\/core/.test(code)) babelCore = true
+		// If a JSX/.treaty module failed to lower, the compiler's "no component … found" error text
+		// would be emitted into the chunk (or the build would have thrown). Catch the text defensively.
+		if (/no component[^\n]*found/i.test(code)) noComponentErr = true
+		defineComponent += (code.match(/ɵɵdefineComponent/g) || []).length
+		defineInjectable += (code.match(/ɵɵdefineInjectable/g) || []).length
+		defineDirective += (code.match(/ɵɵdefineDirective/g) || []).length
+		definePipe += (code.match(/ɵɵdefinePipe/g) || []).length
+		defineInjector += (code.match(/ɵɵdefineInjector/g) || []).length
+	}
+	console.log(`[bundle] ${files.length} JS file(s) emitted`)
+
+	check(
+		'JSX + authoring components lowered to Ivy (ɵɵdefineComponent present)',
+		defineComponent > 0,
+		`defineComponent=${defineComponent}`,
+	)
+	check('no "no component found" lowering error leaked into the bundle', !noComponentErr)
+	check('bundle has ZERO residual ɵɵngDeclare partial declarations', partial === 0, `found ${partial}`)
+	check('bundle does NOT import @angular/compiler (no JIT)', !compiler)
+	check('bundle does NOT contain @angular/compiler-cli (Babel finisher removed)', !compilerCli)
+	check('bundle does NOT contain @babel/core (Babel finisher removed)', !babelCore)
+	check(
+		'bundle carries AOT Ivy defs from the linked @angular libs (ɵɵdefineInjectable/Directive)',
+		defineInjectable + defineDirective > 0,
+		`injectable=${defineInjectable} directive=${defineDirective} pipe=${definePipe} injector=${defineInjector}`,
+	)
+}
+
+// ---------------------------------------------------------------------------
+// Step 3b: per-JSX-module proof — each JSX authoring file lowered to Ivy EXACTLY ONCE.
+//
+// Drive the @treaty/compiler core (the same one the vite plugin uses) directly over each JSX source to
+// prove: (a) it emits exactly ONE `ɵɵdefineComponent` and exactly ONE `export default` (no nested /
+// duplicated export — the parse bug that was just fixed), and (b) the emit is idempotent (feeding the
+// lowered output back through the plugin's pre-transform is a pass-through, so each module compiles
+// once even when re-resolved). This is the JSX-specific guarantee the task asks us to assert.
+// ---------------------------------------------------------------------------
+function assertJsxLoweredOnce() {
+	let compileUnifiedSource
+	try {
+		;({ compileUnifiedSource } = req('@treaty/compiler'))
+	} catch (err) {
+		check('@treaty/compiler is loadable', false, String(err?.message ?? err))
+		return
+	}
+	check('@treaty/compiler.compileUnifiedSource available', typeof compileUnifiedSource === 'function')
+	if (typeof compileUnifiedSource !== 'function') return
+
+	const jsxFiles = [
+		'src/components/counter.tsx',
+		'src/features/greeter/greeting-card.tjsx',
+	]
+	for (const rel of jsxFiles) {
+		const code = readFileSync(join(here, rel), 'utf-8')
+		const out = compileUnifiedSource(code, rel)
+		const errors = out.errors ?? []
+		const emitted = out.code ?? ''
+		const defs = (emitted.match(/ɵɵdefineComponent/g) || []).length
+		const exportDefaults = (emitted.match(/(?:^|\n|;|\}|\))\s*export\s+default\b/g) || []).length
+		const exportsTotal = (emitted.match(/\bexport\s+(?:default|const|function|class|\{)/g) || []).length
+		check(`${rel}: compiles with zero diagnostics`, errors.length === 0, errors.join(' | '))
+		check(`${rel}: emits exactly ONE ɵɵdefineComponent (lowered once)`, defs === 1, `defineComponent=${defs}`)
+		check(`${rel}: emits exactly ONE export default (no nested-export parse bug)`, exportDefaults === 1, `exportDefault=${exportDefaults} totalExports=${exportsTotal}`)
+		check(`${rel}: no "no component found" error`, !/no component[^\n]*found/i.test(errors.join(' ') + emitted))
+	}
+}
+
+// ---------------------------------------------------------------------------
+async function main() {
+	console.log('== Step 0: wire local node_modules ==')
+	wireNodeModules()
+	// lstat (not existsSync, which follows a junction and can report false when the target moved
+	// since creation) confirms the farm entries are present.
+	const wired = (name) => {
+		try {
+			return Boolean(lstatSync(join(here, 'node_modules', name)))
+		} catch {
+			return false
+		}
+	}
+	check(
+		'local node_modules wired (@treaty/vite + @angular/router present)',
+		wired('@treaty/vite') && wired('@angular/router'),
+	)
+
+	console.log('== Step 1: build @treaty/ts-vite + @treaty/vite plugin dists ==')
+	buildPluginDists()
+	check('@treaty/ts-vite dist built', existsSync(tsViteDist))
+	check('@treaty/vite dist built', existsSync(treatyViteDist))
+
+	console.log('== Step 2: real `vite build` of the everything-app ==')
+	const built = await runBuild()
+	check('real `vite build` of everything-app exits 0', built, buildError ? String(buildError?.message ?? buildError).split('\n').slice(0, 4).join(' | ') : '')
+
+	console.log('== Step 3: bundle assertions ==')
+	if (built) assertBundle()
+
+	console.log('== Step 3b: each JSX module lowered to Ivy exactly once (valid single-export ES module) ==')
+	assertJsxLoweredOnce()
+
+	console.log('')
+	if (failures.length) {
+		console.error(`E2E FAILED: ${failures.length} assertion(s): ${failures.join('; ')}`)
+		process.exit(1)
+	}
+	console.log('E2E PASSED: everything-app builds; JSX/.treaty/@Component lowered to Ivy once; partial @angular linked to AOT (no JIT).')
+}
+
+main().catch((err) => {
+	console.error('E2E ERROR:', err)
+	process.exit(1)
+})

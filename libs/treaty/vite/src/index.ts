@@ -160,6 +160,67 @@ function cleanId(id: string): string {
 }
 
 /**
+ * The minimal esbuild surface this plugin uses to strip TypeScript syntax from
+ * lowered authoring output. Declared structurally so the plugin typechecks
+ * without a direct `esbuild` dependency — esbuild always rides along with Vite,
+ * and we load it lazily by specifier ({@link loadEsbuildTransform}).
+ */
+interface EsbuildLike {
+	transform(
+		input: string,
+		options: {
+			loader?: 'ts' | 'tsx' | 'js' | 'jsx'
+			format?: 'esm'
+			target?: string
+			sourcefile?: string
+			sourcemap?: boolean | 'external'
+			tsconfigRaw?: string
+		}
+	): Promise<{ code: string; map: string }>
+}
+
+/**
+ * Lazily-loaded esbuild `transform` (memoized). The Treaty compiler emits the
+ * authoring body verbatim as TypeScript (`.treaty`/JSX bodies are "TS-by-default";
+ * the lowered Ivy keeps `signal<T[]>(…)` generics and `: T` annotations), so the
+ * output must be type-stripped before it is valid ECMAScript. Vite's built-in
+ * esbuild pass strips `.ts`/`.tsx` ids itself, but it never sees Treaty's own
+ * `.treaty`/`.tjsx` extensions — so for those this plugin strips types here, using
+ * the same esbuild Vite ships. Returns `null` if esbuild cannot be loaded (then
+ * the output is returned unstripped, preserving the prior behaviour).
+ */
+let esbuildPromise: Promise<EsbuildLike | null> | undefined
+function loadEsbuildTransform(): Promise<EsbuildLike | null> {
+	if (esbuildPromise === undefined) {
+		esbuildPromise = import('esbuild')
+			.then((m) => (m as unknown as { default?: EsbuildLike } & EsbuildLike).default ?? (m as unknown as EsbuildLike))
+			.catch(() => null)
+	}
+	return esbuildPromise
+}
+
+/**
+ * The owned extensions whose lowered output Vite's own esbuild transform will NOT
+ * type-strip, because Vite does not recognise them as TypeScript ids. `.ts`/`.tsx`
+ * are stripped by Vite natively; `.treaty` and `.tjsx` are Treaty-only extensions,
+ * so this plugin strips their lowered TS itself. `.tjsx` lowers JSX-flavoured
+ * source so it needs the `tsx` loader; `.treaty` lowers to plain TS (`ts`).
+ */
+const STRIP_LOADER_BY_EXT: Readonly<Record<string, 'ts' | 'tsx'>> = {
+	'.treaty': 'ts',
+	'.tjsx': 'tsx',
+}
+
+/** Pick the esbuild type-strip loader for `id`, or `null` if Vite already strips it. */
+function stripLoaderFor(id: string): 'ts' | 'tsx' | null {
+	const clean = cleanId(id).toLowerCase()
+	for (const ext of Object.keys(STRIP_LOADER_BY_EXT)) {
+		if (clean.endsWith(ext)) return STRIP_LOADER_BY_EXT[ext]
+	}
+	return null
+}
+
+/**
  * The signature of Ivy JS this plugin's compiler emits: the `import * as i0 from
  * "@angular/core"` namespace import the emitter always prepends, paired with one
  * of the Ivy definition members it writes (`i0.ɵɵdefine*`, a `.ɵfac =` factory,
@@ -429,7 +490,7 @@ export default function treaty(options: PluginOptions = {}): Plugin[] {
 		 * Vite's `{ code, map }` shape. Files the core does not own (it returns
 		 * `null`) fall through to Vite's normal pipeline untouched.
 		 */
-		transform(code, id) {
+		async transform(code, id) {
 			if (!isCandidate(id)) return null
 			// Idempotency guard: a module whose extension this plugin owns may re-enter
 			// the pre-transform already carrying the FIRST pass's lowered Ivy output
@@ -452,10 +513,38 @@ export default function treaty(options: PluginOptions = {}): Plugin[] {
 				out = injectClientBindings(out, result.serverChunks)
 			}
 
-			return {
-				code: out,
-				map: emitSourceMap && result.map !== undefined ? result.map : null,
+			const map = emitSourceMap && result.map !== undefined ? result.map : null
+
+			// Type-strip the lowered output for Treaty-only extensions (`.treaty`/`.tjsx`)
+			// that Vite's built-in esbuild pass never sees. The Treaty compiler emits the
+			// authoring body verbatim as TypeScript ("TS-by-default"), so without this the
+			// lowered module still carries `signal<T[]>(…)` generics / `: T` annotations and
+			// fails Rollup's JS parse. `.ts`/`.tsx` are left for Vite's own esbuild pass.
+			//
+			// The strip is a pure type-erasure pass: it removes type tokens but keeps the
+			// runtime statements on their original lines, so the compiler's authoring-source
+			// map is retained as-is (rather than replaced by esbuild's lowered-relative map,
+			// which would break the authoring → emitted chain). We therefore request no map
+			// from esbuild and keep `result.map`.
+			const stripLoader = stripLoaderFor(id)
+			if (stripLoader !== null) {
+				const esbuild = await loadEsbuildTransform()
+				if (esbuild !== null) {
+					const stripped = await esbuild.transform(out, {
+						loader: stripLoader,
+						format: 'esm',
+						target: 'es2022',
+						sourcefile: cleanId(id),
+						sourcemap: false,
+						// Skip any tsconfig the project may carry (we only strip types; we do not
+						// apply project compiler options).
+						tsconfigRaw: '{}',
+					})
+					out = stripped.code
+				}
 			}
+
+			return { code: out, map }
 		},
 
 		/**
