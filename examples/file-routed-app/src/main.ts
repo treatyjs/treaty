@@ -5,10 +5,12 @@
  * to Vite untouched — only the route authoring files it pulls in transitively
  * (`.treaty` / `.tjsx`) are lowered to Ivy. It wires the standalone application:
  *
- *   - `provideRouter(routes)` consumes the GENERATED route graph
- *     (`src/generated/routes.ts`), which the build-time route generator lowers
- *     from the `routes/` directory tree using the `treaty_file_routing`
- *     convention. The route components are all lazy `loadComponent` boundaries.
+ *   - `provideRouter(routes)` consumes the route graph produced DURING the build
+ *     as the `virtual:treaty-routes` virtual module: `@treaty/vite`'s `fileRoutes`
+ *     option lowers the on-disk `routes/` directory tree to an Angular route graph
+ *     via the `treaty_file_routing` Rust core on every load — there is no
+ *     checked-in / prebuilt `routes.ts`. The route components are all lazy
+ *     `loadComponent` boundaries.
  *   - `provideZonelessChangeDetection()` because the route components are
  *     signal-by-default and OnPush throughout (no zone.js).
  *
@@ -21,7 +23,7 @@ import { bootstrapApplication } from '@angular/platform-browser'
 import { provideRouter } from '@angular/router'
 
 import { RoutedRoot } from './app/routed-root.component'
-import { routes } from './generated/routes'
+import { routes } from 'virtual:treaty-routes'
 
 void bootstrapApplication(RoutedRoot, {
 	providers: [provideZonelessChangeDetection(), provideRouter(routes)],

@@ -1,47 +1,66 @@
 /**
  * Vite build for the file-routed-app, wired to the Treaty compiler and the
- * file-system route generator.
+ * file-system route generator — produced DURING the build as a VIRTUAL MODULE.
  *
- * Treaty is a compiler, not a host: this config does not start anything. Two
- * contributions:
+ * Treaty is a compiler, not a host: this config does not start anything. The one
+ * `treaty(...)` plugin (`@treaty/vite`) contributes both halves of the
+ * file-routing story, with the routing logic living ONCE in Rust:
  *
- *   - `treaty(...)` — the `@treaty/vite` plugin. Lowers every route authoring
- *     file (`.treaty` / `.tjsx`) the generated route graph lazily imports to Ivy
- *     JS via `@treaty/compiler` -> the Rust addon.
- *   - `fileRoutesPlugin()` — a tiny local plugin that runs the route generator
- *     (`scripts/generate-routes.mjs`) on `buildStart`, so `src/generated/routes.ts`
- *     is always regenerated from the on-disk `routes/` tree before the bundle is
- *     built. This is the JS surface for the `treaty_file_routing` convention: the
- *     same `routes/` -> Angular-routes + Module-Federation-remotes lowering the
- *     crate performs, wired into the build.
+ *   - it lowers every route authoring file (`.treaty` / `.tjsx`) the route graph
+ *     lazily imports to Ivy JS via `@treaty/compiler` -> the Rust addon; and
+ *   - via `fileRoutes`, it serves `import { routes } from 'virtual:treaty-routes'`
+ *     by driving the Rust file-routing core (`@treaty/authoring-node`.
+ *     `generateRoutes`, the shim over `treaty_file_routing`) over the on-disk
+ *     `routes/` + `api/` tree on every load. There is NO checked-in / prebuilt
+ *     `routes.ts` and NO prebuild step — the route graph is generated from the
+ *     filesystem at build time, and editing/adding/removing a route file
+ *     regenerates the virtual module in dev (the referenced route files are
+ *     registered as Vite watch dependencies).
  *
- * The route generator and the Treaty plugin are decoupled: the generator only
- * emits a plain `.ts` route module (lazy `import('…/foo.treaty')` loaders); the
- * Treaty plugin then owns lowering each `.treaty` / `.tjsx` target as Vite pulls
- * it into the graph.
+ * `routesRoot` is this app's directory (it contains `routes/` and `api/`).
+ * `dynamicSegmentStyle: 'colon'` makes dynamic segments Angular-router-native
+ * (`[slug]` -> `:slug`), so the generated graph is directly consumable by
+ * `provideRouter`. `importBase` is the absolute app root: because the virtual
+ * module has no on-disk location, the emitted lazy `import('<root>/routes/…')`
+ * loaders use an absolute base so Vite can resolve each real route file (and the
+ * Treaty plugin then lowers it).
  */
-import { execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
-import { dirname, join } from 'node:path'
+import { dirname } from 'node:path'
 
-import { defineConfig, type Plugin } from 'vite'
+import { defineConfig, transformWithEsbuild, type Plugin } from 'vite'
 import treaty from '@treaty/vite'
+import { isTreatyRoutesId } from '@treaty/ts-vite'
 
-const here = dirname(fileURLToPath(import.meta.url))
-const generator = join(here, 'scripts', 'generate-routes.mjs')
+const appRoot = dirname(fileURLToPath(import.meta.url))
+// Vite resolves module ids with POSIX separators, so the absolute import base the
+// emitted lazy loaders use must be forward-slashed even on Windows.
+const importBase = appRoot.replace(/\\/g, '/')
 
 /**
- * Regenerate `src/generated/routes.ts` from the `routes/` tree before each
- * build/dev start. Running the generator as a child process keeps the file-route
- * lowering in one place (`scripts/generate-routes.mjs`, also runnable by hand)
- * and guarantees the generated module is current with the directory tree.
+ * Transpile the `virtual:treaty-routes` module from the file-routing core's
+ * TypeScript emit (`export const routes: Routes`, `import type { Routes }`) down
+ * to plain JS so the bundler can parse it. The route module is served as a
+ * virtual module (the resolved id is NUL-prefixed), which opts it out of Vite's
+ * built-in esbuild TS transform — so a thin companion `transform` hook runs
+ * esbuild over just that module. This only strips the TypeScript-only syntax; the
+ * route graph itself is unchanged, and the routing logic still lives entirely in
+ * the Rust core that produced the module.
  */
-function fileRoutesPlugin(): Plugin {
+function transpileRoutesVirtualModule(): Plugin {
 	return {
-		name: 'treaty:file-routes',
-		enforce: 'pre',
-		buildStart() {
-			execFileSync(process.execPath, [generator], { cwd: here, stdio: 'inherit' })
+		name: 'file-routed-app:transpile-routes-vmod',
+		async transform(code, id) {
+			if (!isTreatyRoutesId(id)) return null
+			// Use a synthetic .ts filename: the resolved id is NUL-prefixed, which
+			// esbuild rejects as a source name, and the explicit `ts` loader is what
+			// selects the transform anyway.
+			const out = await transformWithEsbuild(code, 'virtual-treaty-routes.ts', {
+				loader: 'ts',
+				format: 'esm',
+				sourcemap: false,
+			})
+			return { code: out.code, map: null }
 		},
 	}
 }
@@ -52,9 +71,17 @@ export default defineConfig({
 		outDir: 'dist',
 	},
 	plugins: [
-		fileRoutesPlugin(),
 		treaty({
 			sourceMap: true,
+			// File routing as a build-time virtual module (no prebuilt routes.ts).
+			fileRoutes: {
+				routesRoot: appRoot,
+				// Angular-router-native dynamic segments (:slug) for provideRouter.
+				dynamicSegmentStyle: 'colon',
+				// The virtual module has no on-disk path, so the lazy loaders need an
+				// absolute base to resolve the real route files.
+				importBase,
+			},
 			// Cold-build prewarm: batch-compile the route authoring files up front in
 			// one parallel round trip through the Rust addon so the per-module
 			// transforms during the build are served from the incremental cache.
@@ -72,5 +99,6 @@ export default defineConfig({
 				'routes/docs/[category]/[page]/index.tjsx',
 			],
 		}),
+		transpileRoutesVirtualModule(),
 	],
 })

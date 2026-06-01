@@ -10,30 +10,41 @@ Module Federation remotes, and a server-endpoint manifest.
 
 ## Running file-based routing
 
-`src/generated/routes.ts` is **generated** from the on-disk `routes/` + `api/`
-tree by the real `treaty_file_routing` engine — it is never hand-written. One
-command produces it:
+The route graph is produced **DURING the build, as a virtual module** — there is
+**no checked-in / prebuilt `routes.ts`** and **no prebuild step**. The app simply
+imports it:
 
-```sh
-# From this directory (examples/file-routed-app):
-npm run generate-routes        # alias: npm run routes
+```ts
+// src/main.ts
+import { routes } from 'virtual:treaty-routes'
 ```
 
-That runs `scripts/generate-routes.mjs`, which:
+`vite.config.ts` enables this by passing `fileRoutes` to the `@treaty/vite`
+plugin:
 
-1. `cargo build`s the detached crate's CLI
-   (`cargo build --manifest-path libs/file-routing/Cargo.toml`, a no-op once
-   compiled),
-2. runs the binary over **this app's own project root** twice —
-   `treaty-file-routing . --style colon --emit ts` for the Angular `Routes`
-   array + `federationRemotes`, and `--emit json` to lift the api/ endpoint
-   manifest — and
-3. writes the combined module to `src/generated/routes.ts` (`routes`,
-   `federationRemotes`, and `apiEndpoints` exports).
+```ts
+treaty({
+  fileRoutes: {
+    routesRoot: appRoot,              // dir containing routes/ + api/
+    dynamicSegmentStyle: 'colon',     // Angular-native :slug for provideRouter
+    importBase: appRoot,              // absolute base for the lazy loaders
+  },
+})
+```
 
-`vite.config.ts` re-runs the same script on `buildStart`, so the generated
-routes are always current with the directory tree. To invoke the engine
-directly instead of through the npm script (run from the repo root):
+On every `load` of `virtual:treaty-routes`, the plugin drives the **Rust
+file-routing core** (`@treaty/authoring-node`.`generateRoutes`, the bundler shim
+over the `treaty_file_routing` crate) against the on-disk `routes/` + `api/`
+tree and serves the emitted Angular `Routes` array + `federationRemotes`. The
+referenced route files are registered as Vite watch dependencies, so
+editing/adding/removing a route regenerates the module in dev — no restart, no
+regen command. The routing logic lives **once**, in Rust; the bundler plugin is a
+thin shim (resolve options → call Rust → register watch files), exactly mirroring
+the Angular partial-declaration linker. The same shared helper backs
+`@treaty/rspack` and `@treaty/rsbuild`, so the route output is identical across
+bundlers.
+
+To inspect the engine output directly without a build (run from the repo root):
 
 ```sh
 # Full GeneratedRouting (routes + remotes + endpoints) as JSON:
@@ -48,8 +59,10 @@ cargo run --manifest-path libs/file-routing/Cargo.toml --bin treaty-file-routing
 ### How `routes/` + `api/` map to the output
 
 Each entry below is asserted by the end-to-end test
-(`npm run test:e2e`, `test/routing.e2e.mjs`), which regenerates the module and
-checks the result against the tree — proving the generation is real and correct:
+(`npm run test:e2e`, `test/routing.e2e.mjs`), which drives the real `@treaty/vite`
+plugin (its `resolveId`/`load` for `virtual:treaty-routes`) over this tree at
+build time and checks the result against the tree — proving the generation is
+real, build-time, and correct, with no prebuilt file on disk:
 
 | On disk | Generated route `path` |
 | --- | --- |
@@ -71,10 +84,10 @@ checks the result against the tree — proving the generation is real and correc
 | `api/posts/index.ts` | `/posts` |
 | `api/posts/[id]/index.ts` | `/posts/:id` (param `id`) |
 
-The generator uses `--style colon`, so dynamic segments are the Angular-router
-native `:param` form and `provideRouter(routes)` consumes the module as-is. The
-tables in **Expected output** below are the **verified** colon-style output the
-E2E test asserts against. The pretty inspector example
+The plugin generates with `dynamicSegmentStyle: 'colon'`, so dynamic segments are
+the Angular-router native `:param` form and `provideRouter(routes)` consumes the
+module as-is. The tables in **Expected output** below are the **verified**
+colon-style output the E2E test asserts against. The pretty inspector example
 (`cargo run --example real_dir_tree -- examples/file-routed-app`) prints the same
 data as an indented summary.
 

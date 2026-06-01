@@ -3,14 +3,12 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "File-system routed Treaty app: a routes/ + api/ tree lowered to Angular lazy routes + Module Federation remotes by the treaty_file_routing convention, wired into a real Vite build via a route-generation step.",
+  "description": "File-system routed Treaty app: a routes/ + api/ tree lowered to Angular lazy routes + Module Federation remotes by the treaty_file_routing convention, produced DURING the build as the virtual:treaty-routes virtual module (no checked-in / prebuilt routes.ts and no prebuild step).",
   "scripts": {
-    "routes": "node scripts/generate-routes.mjs",
-    "generate-routes": "node scripts/generate-routes.mjs",
     "verify": "node verify.mjs",
     "test:e2e": "node test/routing.e2e.mjs",
     "typecheck": "tsgo --noEmit -p tsconfig.json",
-    "lint": "oxlint src scripts test *.config.ts",
+    "lint": "oxlint src test *.config.ts",
     "build:vite": "vite build",
     "dev:vite": "vite"
   },

@@ -32,13 +32,25 @@ export declare function compileComponent(template: string, selector: string, cla
  */
 export declare function compileComponentSource(source: string): CompiledComponent
 /**
+ * Link an Angular **partial-declaration** module directly to its full AOT form.
+ *
+ * Published Angular libraries ship *partial*-compiled: classes emit `ɵɵngDeclare*({...})` calls
+ * instead of the full `ɵɵdefine*({...})`. This is the Rust Angular Linker: it rewrites every
+ * linkable `ɵɵngDeclare*` call (the DI + pipe family — `ɵɵngDeclareFactory`/`Injectable`/
+ * `Injector`/`NgModule`/`Pipe`, plus dropping the dev-only `ɵɵngDeclareClassMetadata`) into the
+ * corresponding `ɵɵdefine*` call by driving the SAME render3 emit fed from the declaration object.
+ *
+ * `code` is the module source (typically a `.mjs` fesm chunk); `file_name` selects the parse mode.
+ * The returned `code` is byte-identical to the input outside the rewritten call spans; `errors`
+ * carries diagnostics for any declaration that could not be linked (its call is left untouched).
+ */
+export declare function linkPartial(code: string, fileName: string): CompiledComponent
+/**
  * Compile a `.treaty` single-file component directly from its source.
  *
  * `source` is the full `.treaty` file contents and `file_name` its path/name (used for
- * diagnostics and as the map's source name). Returns the emitted `ɵɵdefineComponent({...})`
- * definition plus the additive Source Map v3 JSON (`map`, embedding the original `.treaty` source
- * as `sourcesContent`), or a `CompiledComponent` carrying descriptive errors. This entry is
- * server-block-unaware; the server-block-aware path (with body redaction) is reached via `compile`.
+ * diagnostics). Returns the emitted `ɵɵdefineComponent({...})` definition, or a
+ * `CompiledComponent` carrying descriptive errors.
  */
 export declare function compileTreatyFile(source: string, fileName: string): CompiledComponent
 /** Result of the unified per-file authoring compile ([`compile`]). */
@@ -108,7 +120,7 @@ export interface CompiledAuthoringEntry {
   /**
    * The additive Source Map v3 JSON mapping `code` back to the original authoring source, or
    * `undefined` when the routed front-end produced no map. Server-fn bodies are redacted from the
-   * map's `sourcesContent` (client privacy), exactly as for the single-file `compile` entry.
+   * map's `sourcesContent` (client privacy), exactly as for the single-file [`compile`] entry.
    */
   map?: string
 }
@@ -128,76 +140,72 @@ export interface CompiledAuthoringEntry {
  */
 export declare function compileMany(files: Array<AuthoringFile>): Array<CompiledAuthoringEntry>
 /**
- * Execute a Treaty macro through the Nova-backed `treaty_runtime` and return its produced value
- * as a JSON string.
+ * The generated file-routing **virtual module** plus its watch dependency set.
  *
- * `tsSource` is the TypeScript body of a macro (the top-of-file fenced block in a `.treaty` file).
- * `inputJson` is a JSON string injected as the macro's `input` / `__args` globals (pass `"null"`
- * for no input). The returned string is the JSON encoding of the macro's produced value (its
- * default export, explicit `return`, or trailing expression); values with no JSON form encode as
- * `null`.
- *
- * Throws if `inputJson` is not valid JSON, the source cannot be transpiled, or the macro throws.
- */
-export declare function runMacro(tsSource: string, inputJson: string): string
-/**
- * Execute a Treaty server function through the Nova-backed `treaty_runtime` and return its result
- * as a JSON string.
- *
- * `tsSource` is the TypeScript body of a server function; `argsJson` is a JSON string (typically an
- * array of positional arguments) injected as the function's `args` / `__args` globals. The returned
- * string is the JSON encoding of the value the function returns (or its trailing expression).
- *
- * Throws if `argsJson` is not valid JSON, the source cannot be transpiled, or the function throws.
- */
-export declare function runServerFn(tsSource: string, argsJson: string): string
-/**
- * Link a partial-compiled Angular module to full AOT Ivy via the Rust `treaty_ivy` linker.
- *
- * `code` is the source of a published Angular library module that may contain partial-declaration
- * calls (the `ɵɵngDeclareFactory` / `ɵɵngDeclareInjectable` / `ɵɵngDeclareInjector` /
- * `ɵɵngDeclareNgModule` / `ɵɵngDeclareComponent` / `ɵɵngDeclareDirective` / `ɵɵngDeclarePipe` /
- * `ɵɵngDeclareClassMetadata` family); `fileName` is its path (for diagnostics). Each declaration is
- * rewritten in place to the corresponding full AOT `ɵɵdefine*` call so the library runs with NO JIT
- * and NO `@angular/compiler` at runtime, in dev and production. Non-partial code passes through
- * byte-identical; `errors` is empty on success.
- */
-export declare function linkPartial(code: string, fileName: string): CompiledComponent
-/**
- * The generated file-routing virtual module plus its watch dependency set.
- *
- * Produced by `generateRoutes` for a bundler plugin to serve as an in-memory module during a build
- * (no checked-in / prebuilt `routes.ts`). `code` is the emitted TypeScript routes module —
- * byte-identical to the `treaty-file-routing` CLI `--emit ts` output because both call the SAME
- * pure-core emitter. `files` are the tree-relative route entry files the module's lazy `import(...)`
- * loaders reference, for the bundler to register as watch dependencies so editing a route re-runs
- * the virtual module.
+ * Produced by [`generate_routes`] for a bundler plugin to serve as an in-memory
+ * module during a build (no checked-in / prebuilt `routes.ts`). `code` is the
+ * emitted TypeScript routes module — byte-identical to the `treaty-file-routing`
+ * CLI `--emit ts` output because both call the SAME pure-core emitter
+ * ([`treaty_file_routing::emit_ts`]). `files` are the tree-relative route entry
+ * files the module's lazy `import(...)` loaders reference, for the bundler to
+ * register as watch dependencies so editing a route re-runs the virtual module.
  */
 export interface GeneratedRoutes {
   /**
-   * The emitted TypeScript routes module (`export const routes`, `export default routes`,
-   * `export const federationRemotes`).
+   * The emitted TypeScript routes module (`export const routes`, `export default
+   * routes`, `export const federationRemotes`).
    */
   code: string
   /**
-   * Tree-relative route entry files the emitted module references (watch deps), in route
-   * depth-first then federation order, de-duplicated.
+   * Tree-relative route entry files the emitted module references (watch deps),
+   * in route depth-first then federation order, de-duplicated.
    */
   files: Array<string>
 }
 /**
- * Generate the file-routing module for `rootDir` DURING a build, as a virtual module — the
- * bundler-plugin shim over the pure `treaty_file_routing` core.
+ * Generate the file-routing module for `root_dir` DURING a build, as a virtual
+ * module — the bundler-plugin shim over the pure [`treaty_file_routing`] core.
  *
- * `rootDir` is the project root that CONTAINS the configured `routes/` and `api/` directories.
- * `configJson` is a JSON object of file-routing knobs (`routesDir`, `apiDir`, `dynamicSegmentStyle`
- * `"bracket"`/`"colon"`, `federation`, `importBase`, …); pass `""` or `"{}"` for the defaults.
+ * `root_dir` is the project root that CONTAINS the configured `routes/` and
+ * `api/` directories. `config_json` is a JSON object of the
+ * [`GenerateRoutesOptions`] knobs (`routesDir`, `apiDir`, `dynamicSegmentStyle`
+ * `"bracket"`/`"colon"`, `federation`, `importBase`, …); pass `""` or `"{}"` for
+ * the defaults.
  *
- * Drives the SAME pipeline as the CLI: a real-filesystem `DirTree` over `rootDir` → `generateRouting`
- * → `emitTs`, so the returned `code` matches `treaty-file-routing --emit ts` byte-for-byte for the
- * same tree + base. The returned `files` are the route entry files the module references, for the
+ * Drives the SAME pipeline as the CLI: a [`RealFsDirTree`] over `root_dir` →
+ * [`generate_routing`] → [`emit_ts`], so the returned `code` matches
+ * `treaty-file-routing --emit ts` byte-for-byte for the same tree + base. The
+ * returned `files` are the route entry files the module references, for the
  * plugin to register as watch dependencies.
  *
- * Throws if `configJson` is non-empty and not valid JSON.
+ * [`generate_routing`]: treaty_file_routing::generate_routing
+ * [`emit_ts`]: treaty_file_routing::emit_ts
  */
 export declare function generateRoutes(rootDir: string, configJson: string): GeneratedRoutes
+/**
+ * Execute a Treaty macro through the Nova-backed [`treaty_runtime`] and return its produced value
+ * as a JSON string.
+ *
+ * `ts_source` is the TypeScript body of a macro (the top-of-file fenced block in a `.treaty` file).
+ * `input_json` is a JSON string injected as the macro's `input` / `__args` globals (pass `"null"`
+ * for no input). The returned string is the JSON encoding of the macro's produced value (its
+ * default export, explicit `return`, or trailing expression); values with no JSON form encode as
+ * `null`.
+ *
+ * Errors (an invalid `input_json`, a transpile/parse failure, or a thrown macro) surface as a
+ * rejected JS error carrying the underlying message.
+ */
+export declare function runMacro(tsSource: string, inputJson: string): string
+/**
+ * Execute a Treaty server function through the Nova-backed [`treaty_runtime`] and return its result
+ * as a JSON string.
+ *
+ * `ts_source` is the TypeScript body of a server function; `args_json` is a JSON string (typically
+ * an array of positional arguments) injected as the function's `args` / `__args` globals. The
+ * returned string is the JSON encoding of the value the function `return`s (or its trailing
+ * expression).
+ *
+ * Errors (an invalid `args_json`, a transpile/parse failure, or a thrown function) surface as a
+ * rejected JS error carrying the underlying message.
+ */
+export declare function runServerFn(tsSource: string, argsJson: string): string

@@ -17,4 +17,26 @@
  * Treaty is a compiler, not a host: nothing here runs; these declarations only
  * keep the authoring-time route graph type-clean.
  */
-export {}
+
+/**
+ * The build-time file-routing virtual module served by `@treaty/vite`'s
+ * `fileRoutes` option. There is no on-disk `routes.ts`: `@treaty/vite` generates
+ * this module from the `routes/` + `api/` tree via the Rust file-routing core on
+ * every load. This ambient declaration types the import so the app bootstrap
+ * typechecks without the module existing on disk; the emitted shape matches the
+ * `treaty_file_routing` TS emitter (`routes` / default export plus the
+ * `federationRemotes` descriptor list).
+ */
+declare module 'virtual:treaty-routes' {
+	/** The Angular route graph generated from the `routes/` directory tree. */
+	export const routes: import('@angular/router').Routes
+	export default routes
+
+	/** Module-Federation remotes derived from the lazy route + layout boundaries. */
+	export const federationRemotes: ReadonlyArray<{
+		readonly name: string
+		readonly exposedModule: string
+		readonly entryFile: string
+		readonly routePath: string
+	}>
+}
