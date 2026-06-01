@@ -3933,7 +3933,16 @@ impl TemplateDefinitionBuilder {
             .collect();
         if !root_exprs.is_empty() {
             self.allocate_binding_slots(root_exprs.len());
-            self.advance_to(slot);
+            // The `ɵɵi18nExp` bindings apply at the END of the i18n block's slot range, not at the
+            // anchor: when the block reserved data slots beyond the `ɵɵi18nStart` anchor (a bracketed
+            // child like an external `@let`'s `ɵɵdeclareLet` or an `<ng-template>`), the binding
+            // cursor must reach the last of those slots before the `ɵɵi18nExp`/`ɵɵi18nApply` run
+            // (TDB `_currentIndex` after the block's create ops). `data_index` points just past the
+            // last slot allocated within this block (siblings are not yet processed), so the advance
+            // target is `data_index - 1`, never below the anchor. For a self-contained block (no
+            // bracketed slots) this equals the anchor `slot`, leaving the simple case unchanged.
+            let advance_target = (self.data_index.saturating_sub(1)).max(slot);
+            self.advance_to(advance_target);
             self.current_target_slot = slot;
             for ie in &root_exprs {
                 let lowered = self.lower_expr(&ie.expr);
@@ -8651,6 +8660,121 @@ mod tests {
             is_void: false,
             i18n: Some(I18nMeta),
         })]
+    }
+
+    /// `<div i18n>@let result = value; <ng-template>{{result}}</ng-template></div>` — a CROSS-VIEW
+    /// `@let` declared inside an i18n block and read from a child `<ng-template>`. Because the let is
+    /// read externally it reserves a `ɵɵdeclareLet` data slot (slot 2) and emits `ɵɵstoreLet` in the
+    /// host update block; the `<ng-template>` takes the next slot (3). The root `ɵɵi18nExp`/`ɵɵi18nApply`
+    /// bind at the END of the block's slot range, so an `ɵɵadvance()` must step from the let slot to
+    /// the last block slot BETWEEN `ɵɵstoreLet` and `ɵɵi18nExp` (Angular
+    /// let_in_i18n_and_child_view golden).
+    fn i18n_external_let_with_child_view() -> Vec<Node> {
+        use crate::expression::ast::ExprKind as EK;
+        use crate::template::r3_ast::{I18nMeta, LetDeclaration, Template};
+        let ab = || AbsoluteSourceSpan::new(0, 0);
+        let sp = || ParseSpan::new(0, 0);
+        let read = |name: &str| {
+            AstNode::new(
+                sp(),
+                ab(),
+                EK::PropertyRead {
+                    name_span: ab(),
+                    receiver: Box::new(AstNode::new(sp(), ab(), EK::ImplicitReceiver)),
+                    name: name.to_string(),
+                },
+            )
+        };
+        // `@let result = value;`
+        let let_decl = Node::LetDeclaration(LetDeclaration {
+            name: "result".to_string(),
+            value: read("value"),
+            source_span: t_span(),
+            name_span: t_span(),
+            value_span: t_span(),
+        });
+        // Root `{{result}}` (folded into the message; its operand drives the ROOT ɵɵi18nExp).
+        let root_interp = AstNode::new(
+            sp(),
+            ab(),
+            EK::Interpolation {
+                strings: vec!["".to_string(), "".to_string()],
+                expressions: vec![read("result")],
+            },
+        );
+        let root_bound = Node::BoundText(BoundText {
+            value: root_interp,
+            source_span: t_span(),
+            i18n: None,
+        });
+        // `{{result}}` inside the child view — this read makes the let cross-view (external).
+        let child_interp = AstNode::new(
+            sp(),
+            ab(),
+            EK::Interpolation {
+                strings: vec!["".to_string(), "".to_string()],
+                expressions: vec![read("result")],
+            },
+        );
+        let ng_template = Node::Template(Template {
+            tag_name: Some("ng-template".to_string()),
+            attributes: vec![],
+            inputs: vec![],
+            outputs: vec![],
+            directives: vec![],
+            template_attrs: vec![],
+            children: vec![Node::BoundText(BoundText {
+                value: child_interp,
+                source_span: t_span(),
+                i18n: None,
+            })],
+            references: vec![],
+            variables: vec![],
+            is_self_closing: false,
+            source_span: t_span(),
+            start_source_span: t_span(),
+            end_source_span: None,
+            i18n: None,
+        });
+        vec![Node::Element(Element {
+            name: "div".to_string(),
+            attributes: vec![],
+            inputs: vec![],
+            outputs: vec![],
+            directives: vec![],
+            children: vec![let_decl, root_bound, ng_template],
+            references: vec![],
+            is_self_closing: false,
+            source_span: t_span(),
+            start_source_span: t_span(),
+            end_source_span: None,
+            is_void: false,
+            i18n: Some(I18nMeta),
+        })]
+    }
+
+    #[test]
+    fn i18n_external_let_advances_between_store_let_and_i18n_exp() {
+        let input =
+            TemplateCompilationInput::new("MyApp_Template", i18n_external_let_with_child_view());
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let out = emit_expression(&func);
+
+        // The external let stores into its slot, then the binding cursor advances to the last block
+        // slot before the i18n expression runs: `ɵɵstoreLet(...); ɵɵadvance(); ɵɵi18nExp(...)`.
+        let store = out
+            .find("\u{0275}\u{0275}storeLet(")
+            .unwrap_or_else(|| panic!("missing ɵɵstoreLet, got: {out}"));
+        let exp = out
+            .find("\u{0275}\u{0275}i18nExp(")
+            .unwrap_or_else(|| panic!("missing ɵɵi18nExp, got: {out}"));
+        assert!(store < exp, "storeLet must precede i18nExp, got: {out}");
+        let between = &out[store..exp];
+        assert!(
+            between.contains("\u{0275}\u{0275}advance("),
+            "an ɵɵadvance must separate storeLet from i18nExp, got: {out}"
+        );
     }
 
     #[test]
