@@ -298,7 +298,31 @@ bun run e2e:dev-serve    # == node examples/everything-app/dev-serve.e2e.mjs
 
 # Nav / MIME / styles gate (real HTTP dev server module-load + real Router render):
 bun run e2e:nav          # == node examples/everything-app/nav.e2e.mjs
+
+# Source-validating build gate (compile EVERY src/ authoring file through the
+# production @treaty/compiler seam and PARSE-verify correct Ivy + no server leak):
+bun run e2e:source-validate  # == node examples/everything-app/source-validate.e2e.mjs
 ```
+
+The source-validate gate enumerates every authoring source under `src/`
+(`.treaty` / `.tsx` / `.tjsx` / `@Component` `.ts` / the `*.server.ts` /
+`*.ws.ts` / `*.stream.ts` server modules), lowers each through the same
+`TreatyCompiler.transform` seam the bundler plugins use, and asserts — BY
+PARSING the emitted client output (esbuild's real loader for well-formedness,
+then `@babel/parser` for AST facts; never regex over the emit) — that every
+component lowers to `ɵɵdefineComponent`, every directive to `ɵɵdefineDirective`,
+every pipe to `ɵɵdefinePipe` with NO surviving Angular decorator node (no JIT),
+and that every server module extracts its body with NO server-fn body or secret
+token leaking into the client code or the parsed source-map `sourcesContent`. It
+prints a per-file PASS/FAIL matrix and exits non-zero on any failure. It does not
+fabricate passes: a real source that violates the contract is reported with the
+precise leaked token / missing def. Today it surfaces two reported Rust
+server-extraction gaps as FAIL — `presence.ws.ts` (`'use websocket'`) and the
+inline `$$` server fn in `greeting-card.tjsx` ship their body to the client
+because the Rust front-end lifts only file-level `'use server'` and `.treaty`
+`server { … }` blocks. The unified `dev:e2e` gate runs this as a child: the 19
+cleanly-lowering sources are hard PASS cells, and those two are recorded against
+the reported Rust gap so closing it is noticed rather than silently green.
 
 Exit code `0` on success, `1` if any child harness fails or any matrix cell is
 not green.

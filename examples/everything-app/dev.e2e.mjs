@@ -174,6 +174,10 @@ async function main() {
 		navE2e.status === 0,
 	)
 
+	// --- SOURCE-VALIDATING child: compile EVERY real authoring source through the production
+	//     @treaty/compiler seam and assert (by PARSING the emit) correct Ivy + no server-fn leak. ---
+	const srcValidate = runChild('source-validate.e2e.mjs')
+
 	// --- JSX-is-Treaty/Angular-not-React semantic proof (compiler core) ---
 	console.log('\n========== JSX semantic proof (Angular Ivy + signals, not React) ==========')
 	assertJsxIsAngularNotReact()
@@ -276,6 +280,67 @@ async function main() {
 		bootBlocked ? 'full-build.e2e.mjs reported the boot is BLOCKED — the `use:` directive gap regressed' : '',
 	)
 
+	// -----------------------------------------------------------------------
+	// SOURCE-VALIDATE MATRIX: every real authoring source compiled through the production @treaty/compiler
+	// seam and PARSE-verified (correct Ivy `define*`, no surviving Angular decorator, no server-fn body or
+	// secret leaking into the client code/map). Read each file's canonical `[source-validate] PASS/FAIL
+	// <file>` status line. Each cleanly-lowering surface is a HARD PASS; the two server-extraction rows are
+	// recorded against the reported Rust gap (file-level `'use server'` + `.treaty` `server { }` extract,
+	// but `'use websocket'` and inline `$$` do not yet) so closing the gap is NOTICED, not silently green.
+	// -----------------------------------------------------------------------
+	console.log('\n========== SOURCE-VALIDATE MATRIX: every authoring source compiled + PARSE-verified ==========')
+
+	/** A `[source-validate] PASS <file>` line exists for `file` and there is no FAIL line for it. */
+	function sourceValidatePassed(file) {
+		const lines = srcValidate.out.split('\n')
+		const passRe = new RegExp(`^\\[source-validate\\] PASS ${file.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`)
+		const failRe = new RegExp(`^\\[source-validate\\] FAIL ${file.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`)
+		let sawPass = false
+		for (const line of lines) {
+			if (failRe.test(line)) return false
+			if (passRe.test(line)) sawPass = true
+		}
+		return sawPass
+	}
+
+	const SOURCE_VALIDATE_HARD_PASS = [
+		'src/app/app-root.component.ts',
+		'src/components/counter.tsx',
+		'src/components/highlight.directive.ts',
+		'src/components/log-viewer.component.ts',
+		'src/components/todo-list.treaty',
+		'src/features/dashboard/dashboard.component.ts',
+		'src/features/greeter/greeter-page.component.ts',
+		'src/features/greeter/greeter.treaty',
+		'src/features/greeter/greeting.types.ts',
+		'src/features/metrics/gauge.treaty',
+		'src/features/metrics/highlight-delta.directive.ts',
+		'src/features/metrics/metrics-panel.component.ts',
+		'src/features/metrics/percent.pipe.ts',
+		'src/features/profile/profile-settings.component.ts',
+		'src/features/profile/profile.component.ts',
+		'src/features/profile/profile.routes.ts',
+		'src/routes/app.routes.ts',
+		'src/server/logs.stream.ts',
+		'src/server/todos.server.ts',
+	]
+	for (const file of SOURCE_VALIDATE_HARD_PASS) {
+		check(`[source-validate] ${file} compiles to correct Ivy + leak-free (PARSE-verified)`, sourceValidatePassed(file), 'see source-validate.e2e.mjs matrix')
+	}
+
+	// The two reported Rust server-extraction gaps: their server-fn body is NOT yet extracted, so
+	// source-validate.e2e.mjs reports them FAIL with the leaked token named. Record that here so the gap is
+	// surfaced explicitly; if either source starts PASSING (gap closed) this flips and the row below fails,
+	// prompting promotion into SOURCE_VALIDATE_HARD_PASS.
+	for (const file of ['src/server/presence.ws.ts', 'src/features/greeter/greeting-card.tjsx']) {
+		const stillBlocked = !sourceValidatePassed(file)
+		check(
+			`[source-validate] ${file} server-fn extraction is recorded as the reported Rust gap ('use websocket' / inline $$ bodies not yet lifted)`,
+			stillBlocked,
+			stillBlocked ? '' : `${file} now PASSES source-validate — the Rust extraction gap closed; promote it into SOURCE_VALIDATE_HARD_PASS`,
+		)
+	}
+
 	console.log('')
 	if (failures.length) {
 		console.error(`UNIFIED DEV+BUILD GATE FAILED: ${failures.length} assertion(s): ${failures.join('; ')}`)
@@ -287,7 +352,8 @@ async function main() {
 			'AND full vite BUILD (exit 0, each surface lowered to Ivy once, zero residual ɵɵngDeclare, no @angular/compiler / Babel finisher) ' +
 			'AND NAV (real HTTP dev server: every route module loads as JS — the reported .treaty/.tjsx NS_ERROR/disallowed-MIME bug is gone — and the real Angular Router renders the logs/dashboard/profile routes with the global + component-scoped styles applied). ' +
 			'The whole-app headless boot+render is green too: the JSX `use:`-directive lowering resolves every directive to a real in-scope symbol, so the app boots with no `X is not defined` ReferenceError and a route renders. ' +
-			'Two route RENDERS are recorded as reported out-of-scope Rust-compiler gaps (modules LOAD + MIME proven): greeter (greeter.treaty inline `server {}` emitted verbatim) and metrics (consumed standalone @Pipe/@Directive have no Ivy ɵpipe/ɵdir def).',
+			'SOURCE-VALIDATE proves it from the source side: every real authoring file under src/ compiles through the production @treaty/compiler seam and is PARSE-verified — every @Component/.treaty/JSX → ɵɵdefineComponent, @Directive → ɵɵdefineDirective, @Pipe → ɵɵdefinePipe with NO surviving Angular decorator node, and the file-level `use server` + `.treaty` `server {}` modules extract their bodies with NO secret/body leaking into the client code or map. ' +
+			'Two route RENDERS are recorded as reported out-of-scope Rust-compiler gaps (modules LOAD + MIME proven): greeter (greeter.treaty inline `server {}` emitted verbatim) and metrics (consumed standalone @Pipe/@Directive have no Ivy ɵpipe/ɵdir def); and two server-extraction surfaces are recorded as reported Rust gaps (source-validate names the leaked token): presence.ws.ts (`use websocket`) and greeting-card.tjsx (inline `$$`) do not yet lift their server-fn body.',
 	)
 }
 
