@@ -19,7 +19,8 @@
   "sideEffects": false,
   "dependencies": {
     "@treaty/compiler": "*",
-    "@treaty/module-federation": "*"
+    "@treaty/module-federation": "*",
+    "@treaty/ts-vite": "*"
   },
   "peerDependencies": {
     "vite": "^5.0.0 || ^6.0.0 || ^7.0.0",

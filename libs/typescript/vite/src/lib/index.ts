@@ -1,6 +1,7 @@
 export {
   angular,
   linkAngularPartials,
+  createLinkPartialPlugins,
   getLinkBackend,
   isPartialModule,
   linkPartialCode,
@@ -13,6 +14,7 @@ import { ConfigPlugin } from './configPlugin';
 import { DevelopmentPlugin } from './devPlugin';
 import { DevServePlugin } from './devServePlugin';
 import { LinkPartialPlugin } from './linkPartialPlugin';
+import { createLinkPartialPlugins } from './linkPartialPlugins';
 import { TsLoaderPlugin } from './tsLoaderPlugin';
 import {
   getLinkBackend,

@@ -27,6 +27,7 @@ import {
 	type MfOptions,
 	type ViteFederationOptions,
 } from '@treaty/module-federation'
+import { createLinkPartialPlugins } from '@treaty/ts-vite'
 import type { Plugin } from 'vite'
 import type { EmittedFile } from 'rollup'
 import {
@@ -142,10 +143,25 @@ function isCandidate(id: string): boolean {
 }
 
 /**
- * Create the Treaty Vite plugin. Returns a single {@link Plugin} object that
- * delegates all lowering to the shared {@link TreatyCompiler} core.
+ * Create the Treaty Vite plugins. Returns an array: the Treaty authoring plugin
+ * (which delegates all lowering to the shared {@link TreatyCompiler} core) plus
+ * the shared Angular partial-declaration linker plugins from `@treaty/ts-vite`
+ * ({@link createLinkPartialPlugins}).
+ *
+ * The linker plugins are why a Treaty app that consumes published *partial*-compiled
+ * Angular libraries (`@angular/{common,forms,router,platform-browser,core}`, whose
+ * decorated classes ship as `ɵɵngDeclare*` calls) boots with NO JIT and NO
+ * `@angular/compiler`: they de-partial those libraries to AOT `ɵɵdefine*` at
+ * prebundle/transform time (dev-serve and build alike) via the Rust linker
+ * (`@treaty/authoring-node`.`linkPartial`) and exclude `@angular/compiler` from the
+ * dependency prebundle. Without them `@treaty/vite` served partial Angular libs
+ * un-linked, which threw "needs JIT / `@angular/compiler` not available" at runtime.
+ *
+ * The linker logic itself is shared (one source of truth in `@treaty/ts-vite`,
+ * backed by Rust); `@treaty/vite` only spreads the plugins here. Vite flattens
+ * nested plugin arrays, so `plugins: [treaty(...)]` works unchanged.
  */
-export default function treaty(options: PluginOptions = {}): Plugin {
+export default function treaty(options: PluginOptions = {}): Plugin[] {
 	const emitSourceMap = options.sourceMap ?? true
 	const esbuildLoaders = options.esbuildLoaders ?? DEFAULT_ESBUILD_LOADERS
 	const prewarmFiles = options.prewarm ?? []
@@ -189,7 +205,7 @@ export default function treaty(options: PluginOptions = {}): Plugin {
 		}
 	}
 
-	return {
+	const treatyPlugin: Plugin = {
 		name: PLUGIN_NAME,
 		// Run before Vite's core TS/esbuild handling so authoring files reach the
 		// Treaty compiler as their original source rather than esbuild output.
@@ -370,6 +386,12 @@ export default function treaty(options: PluginOptions = {}): Plugin {
 			})
 		},
 	}
+
+	// The shared Rust-backed Angular partial-declaration linker plugins run alongside the
+	// authoring plugin: they own published `node_modules` partial Angular libraries (de-partialling
+	// `ɵɵngDeclare*` → AOT `ɵɵdefine*`) and exclude `@angular/compiler`, while `treatyPlugin` owns
+	// first-party authoring files. The two ownerships are disjoint, so ordering between them is safe.
+	return [treatyPlugin, ...createLinkPartialPlugins()]
 }
 
 /**
@@ -424,7 +446,7 @@ export function treatyWithFederation(
 	options: PluginOptions = {}
 ): Array<Plugin | Promise<Plugin>> {
 	const mf = resolveMfOptions(options.moduleFederation ?? true)
-	const plugins: Array<Plugin | Promise<Plugin>> = [treaty(options)]
+	const plugins: Array<Plugin | Promise<Plugin>> = [...treaty(options)]
 	if (mf !== null) plugins.push(createFederationPlugin(mf))
 	return plugins
 }
