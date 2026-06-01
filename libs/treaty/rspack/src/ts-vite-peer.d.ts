@@ -22,4 +22,33 @@ declare module '@treaty/ts-vite' {
 	 * caller serves the source unchanged); throws when the linker reports diagnostics.
 	 */
 	export function linkPartialCode(code: string, id: string): string | null
+
+	// File routing as a virtual module, generated DURING the build by the SHARED Rust-backed helper
+	// in `@treaty/ts-vite` (the shim over `treaty_file_routing` via `@treaty/authoring-node`).
+	// `@treaty/rspack` reuses this one helper and only adds the alias + loader-rule wiring.
+
+	/** The bare virtual module specifier (`virtual:treaty-routes`) a Treaty app imports for its routes. */
+	export const TREATY_ROUTES_ID: string
+	/** Knobs forwarded to the Rust file-routing core; only `routesRoot` is required. */
+	export interface RoutesVirtualModuleOptions {
+		readonly routesRoot: string
+		readonly cwd?: string
+		readonly routesDir?: string
+		readonly apiDir?: string
+		readonly dynamicSegmentStyle?: 'bracket' | 'colon'
+		readonly federation?: boolean
+		readonly importBase?: string
+	}
+	/** The emitted routes module plus the route entry files it references (watch deps). */
+	export interface GeneratedRoutesModule {
+		code: string
+		files: string[]
+		watchFiles: string[]
+	}
+	/**
+	 * Generate the Treaty file-routing virtual module DURING a build: resolve the routes root, drive
+	 * the Rust `generateRoutes` core, and return the emitted TypeScript module plus its route-file
+	 * watch dependencies. Throws when the `@treaty/authoring-node` addon is unavailable.
+	 */
+	export function generateRoutesModule(options: RoutesVirtualModuleOptions): GeneratedRoutesModule
 }

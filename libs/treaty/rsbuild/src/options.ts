@@ -8,6 +8,7 @@
  */
 
 import type { TreatyCompilerOptions } from '@treaty/compiler'
+import type { RoutesVirtualModuleOptions } from '@treaty/ts-vite'
 
 /** The authoring file extensions Treaty owns and lowers to Ivy JS. */
 export const TREATY_EXTENSIONS = ['.treaty', '.tsx', '.tjsx'] as const
@@ -47,6 +48,19 @@ export interface TreatyPluginOptions extends TreatyCompilerOptions {
 	 * that hands the plugin the full owned-file set, so this batch path is opt-in.
 	 */
 	readonly prewarm?: readonly string[]
+	/**
+	 * File-system routing as a VIRTUAL MODULE, generated DURING the build (no
+	 * checked-in / prebuilt `routes.ts`). When set, the plugin aliases
+	 * `import routes from 'virtual:treaty-routes'` to an in-package sentinel and runs
+	 * the routes loader over it, which drives the Rust file-routing core
+	 * (`@treaty/authoring-node`.`generateRoutes`) over the configured `routesRoot` so
+	 * the route graph always reflects the on-disk `routes/` tree. Omitted ⇒ the
+	 * virtual module is not wired (apps that do not use file routing are unaffected).
+	 *
+	 * The routing logic lives ONCE in Rust; the plugin is the thin Rsbuild shim
+	 * (alias + Rspack loader rule), mirroring the partial-declaration linker.
+	 */
+	readonly fileRoutes?: RoutesVirtualModuleOptions
 }
 
 /** Split plugin options into the compiler core options it forwards. */

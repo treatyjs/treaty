@@ -8,6 +8,7 @@
 
 import type { TreatyCompilerOptions } from '@treaty/compiler'
 import type { MfOptions } from '@treaty/module-federation'
+import type { RoutesVirtualModuleOptions } from '@treaty/ts-vite'
 
 /**
  * Options understood by both the Treaty Rspack loader and plugin. These are the
@@ -42,6 +43,19 @@ export interface TreatyPluginOptions extends TreatyCompilerOptions {
 	 *     unaffected — fully backward compatible).
 	 */
 	readonly moduleFederation?: MfOptions | boolean
+	/**
+	 * File-system routing as a VIRTUAL MODULE, generated DURING the build (no
+	 * checked-in / prebuilt `routes.ts`). When set, the plugin aliases
+	 * `import routes from 'virtual:treaty-routes'` to an in-package sentinel and runs
+	 * the routes loader over it, which drives the Rust file-routing core
+	 * (`@treaty/authoring-node`.`generateRoutes`) over the configured `routesRoot` so
+	 * the route graph always reflects the on-disk `routes/` tree. Omitted ⇒ the
+	 * virtual module is not wired (apps that do not use file routing are unaffected).
+	 *
+	 * The routing logic lives ONCE in Rust; the plugin is the thin Rspack shim
+	 * (alias + loader rule), mirroring the partial-declaration linker.
+	 */
+	readonly fileRoutes?: RoutesVirtualModuleOptions
 }
 
 /** The authoring extensions Treaty owns and the plugin resolves by default. */

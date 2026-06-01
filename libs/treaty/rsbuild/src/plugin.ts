@@ -38,6 +38,12 @@ import {
 } from './options.js'
 import { ServerChunkCollector } from './server-chunks.js'
 import { registerLinkPartialTransform } from './link-partial.js'
+import {
+	ROUTES_SENTINEL_TEST,
+	routesLoaderPath,
+	routesSentinelPath,
+	TREATY_ROUTES_ID,
+} from './routes-virtual.js'
 
 /**
  * The `processAssets` pipeline stage to emit server-fn chunks at. `'additional'`
@@ -114,7 +120,54 @@ export function pluginTreaty(options: TreatyPluginOptions = {}): RsbuildPlugin {
 			api.modifyRsbuildConfig((config: RsbuildConfig) => {
 				const resolve = config.resolve ?? (config.resolve = {})
 				resolve.extensions = mergeExtensions(resolve.extensions, extensions)
+
+				// File routing as a virtual module, generated during the build (no
+				// prebuilt routes.ts). Alias the `virtual:treaty-routes` import to the
+				// in-package sentinel so Rspack can resolve it; the routes loader (wired
+				// via tools.rspack below) replaces the sentinel source with the
+				// Rust-generated route graph. Only wired when the app opted in.
+				if (options.fileRoutes !== undefined) {
+					const alias = (resolve['alias'] ?? (resolve['alias'] = {})) as Record<
+						string,
+						unknown
+					>
+					alias[TREATY_ROUTES_ID] = routesSentinelPath
+				}
 			})
+
+			// Add the routes-sentinel loader rule through tools.rspack when file
+			// routing is enabled. Rsbuild has no synthetic-module load hook, so the
+			// route graph is produced by a loader matched to the aliased sentinel,
+			// mirroring @treaty/rspack.
+			if (options.fileRoutes !== undefined) {
+				const fileRoutes = options.fileRoutes
+				api.modifyRsbuildConfig((config: RsbuildConfig) => {
+					const tools = config.tools ?? (config.tools = {})
+					const rule: RspackModuleRule = {
+						test: ROUTES_SENTINEL_TEST,
+						use: [{ loader: routesLoaderPath, options: fileRoutes }],
+					}
+					const prev = tools.rspack
+					const addRule = (rspack: RspackConfig): void => {
+						const mod = rspack.module ?? (rspack.module = {})
+						const rules = mod.rules ?? (mod.rules = [])
+						rules.push(rule)
+					}
+					if (prev === undefined) {
+						tools.rspack = (rspack: RspackConfig) => {
+							addRule(rspack)
+						}
+					} else {
+						const list = Array.isArray(prev) ? prev : [prev]
+						tools.rspack = [
+							...list,
+							(rspack: RspackConfig) => {
+								addRule(rspack)
+							},
+						]
+					}
+				})
+			}
 
 			// Link published partial-compiled Angular libraries (node_modules `ɵɵngDeclare*`) to AOT
 			// via the SHARED Rust linker, so the build needs NO JIT and NO `@angular/compiler`. This

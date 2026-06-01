@@ -35,3 +35,16 @@ export {
 } from './server-chunks.js'
 
 export { default as treatyLoader } from './loader.js'
+
+// File routing as a virtual module, generated during the build (no prebuilt routes.ts). Reuses the
+// shared, Rust-backed generator from `@treaty/ts-vite` (one source of truth). `pluginTreaty` wires
+// the alias + Rspack loader rule automatically when `fileRoutes` is set; these exports let callers
+// assemble their own config or run the loader standalone.
+export {
+	routesLoader,
+	routesLoaderPath,
+	routesSentinelPath,
+	ROUTES_SENTINEL_TEST,
+	TREATY_ROUTES_ID,
+} from './routes-virtual.js'
+export type { RoutesLoaderOptions, RoutesLoaderContext } from './routes-virtual.js'

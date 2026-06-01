@@ -18,8 +18,21 @@ export { treatyLoader, loaderPath } from './loader.js'
 export { default } from './loader.js'
 export type { TreatyLoader, TreatyLoaderContext } from './loader.js'
 
-export { TreatyRspackPlugin, treatyRule, linkPartialRule } from './plugin.js'
+export { TreatyRspackPlugin, treatyRule, linkPartialRule, routesRule } from './plugin.js'
 export type { TreatyCompilerHost, TreatyCompilation } from './plugin.js'
+
+// File routing as a virtual module, generated during the build (no prebuilt routes.ts). Reuses the
+// shared, Rust-backed generator from `@treaty/ts-vite` (one source of truth). The plugin wires the
+// alias + `routesRule()` automatically when `fileRoutes` is set; these exports let callers assemble
+// their own config or run the loader standalone.
+export {
+	routesLoader,
+	routesLoaderPath,
+	routesSentinelPath,
+	ROUTES_SENTINEL_TEST,
+	TREATY_ROUTES_ID,
+} from './routes-virtual.js'
+export type { RoutesLoaderOptions, RoutesLoaderContext } from './routes-virtual.js'
 
 // The Angular partial-declaration linker loader. Reuses the shared, Rust-backed linker core from
 // `@treaty/ts-vite` (one source of truth) so published partial Angular libraries link to AOT with

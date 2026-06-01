@@ -8,6 +8,8 @@ export {
   type LinkBackend,
 };
 
+export * from './routesVirtualModule';
+
 import type { Plugin } from 'vite';
 import { DirImporterPlugin } from './dirImporterPlugin';
 import { ConfigPlugin } from './configPlugin';

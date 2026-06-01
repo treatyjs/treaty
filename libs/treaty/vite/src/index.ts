@@ -27,7 +27,13 @@ import {
 	type MfOptions,
 	type ViteFederationOptions,
 } from '@treaty/module-federation'
-import { createLinkPartialPlugins } from '@treaty/ts-vite'
+import {
+	createLinkPartialPlugins,
+	generateRoutesModule,
+	isTreatyRoutesId,
+	RESOLVED_TREATY_ROUTES_ID,
+	type RoutesVirtualModuleOptions,
+} from '@treaty/ts-vite'
 import type { Plugin } from 'vite'
 import type { EmittedFile } from 'rollup'
 import {
@@ -89,6 +95,27 @@ export interface PluginOptions extends TreatyCompilerOptions {
 	 */
 	readonly moduleFederation?: MfOptions | boolean
 	/**
+	 * File-system routing as a VIRTUAL MODULE, generated DURING the build (no
+	 * checked-in / prebuilt `routes.ts`). When set, the plugin serves
+	 * `import routes from 'virtual:treaty-routes'` by driving the Rust file-routing
+	 * core (`@treaty/authoring-node`.`generateRoutes`) over the configured
+	 * `routesRoot` on every load, so the route graph always reflects the on-disk
+	 * `routes/` tree. The route entry files the module references are registered as
+	 * Vite watch dependencies so editing/adding/removing a route regenerates the
+	 * virtual module in dev.
+	 *
+	 *   - a {@link RoutesVirtualModuleOptions} object: enable, taking `routesRoot`
+	 *     (the project root containing `routes/`/`api/`) plus the optional
+	 *     `routesDir` / `apiDir` / `dynamicSegmentStyle` / `federation` / `importBase`
+	 *     knobs forwarded to the file-routing core.
+	 *   - omitted: the virtual module is not served (apps that do not use file
+	 *     routing are unaffected).
+	 *
+	 * The routing logic itself lives ONCE in Rust; this plugin is the thin Vite
+	 * shim (resolveId/load + watch-file registration), mirroring the linker.
+	 */
+	readonly fileRoutes?: RoutesVirtualModuleOptions
+	/**
 	 * Function chunking. When `true` (the default), each server function the
 	 * compiler extracts from an authoring file is emitted as its OWN
 	 * separately-loadable Rollup chunk (`<fn-id>.server.js`), the component code
@@ -140,6 +167,69 @@ function cleanId(id: string): string {
  */
 function isCandidate(id: string): boolean {
 	return classify(cleanId(id)) !== null
+}
+
+/** The plugin name surfaced in Vite logs for the file-routes virtual module. */
+const ROUTES_PLUGIN_NAME = 'treaty:vite:file-routes'
+
+/**
+ * Build the Vite plugin that serves the file-routing virtual module
+ * (`virtual:treaty-routes`) generated DURING the build by the Rust file-routing
+ * core — no prebuilt `routes.ts`. The routing logic lives ONCE in Rust
+ * (`@treaty/authoring-node`.`generateRoutes`, the shim over `treaty_file_routing`);
+ * this plugin is the thin Vite registration (mirroring the partial-declaration
+ * linker): `resolveId` claims the id, `load` serves the freshly generated module
+ * and registers each referenced route file as a watch dependency, and
+ * `handleHotUpdate` invalidates the virtual module when a route file changes, is
+ * added, or is removed so dev regenerates it.
+ */
+function createFileRoutesPlugin(routes: RoutesVirtualModuleOptions): Plugin {
+	// The build root, captured from configResolved, used as the base for a relative
+	// routesRoot so the route graph is stable regardless of the launch cwd.
+	let root: string | undefined
+
+	return {
+		name: ROUTES_PLUGIN_NAME,
+		// Resolve/serve the virtual id before Vite's core resolution treats it as a
+		// missing file.
+		enforce: 'pre',
+
+		configResolved(resolved) {
+			root = resolved.root
+		},
+
+		resolveId(source) {
+			if (isTreatyRoutesId(source)) return RESOLVED_TREATY_ROUTES_ID
+			return null
+		},
+
+		load(id) {
+			if (!isTreatyRoutesId(id)) return null
+			const generated = generateRoutesModule({ cwd: root, ...routes })
+			// Register every referenced route entry file so a change to one
+			// invalidates this virtual module (the route module's `import(...)`
+			// targets are also added to the graph as Vite pulls them in, but watching
+			// the source files makes edits to a route re-run generation in dev).
+			for (const file of generated.watchFiles) this.addWatchFile(file)
+			return { code: generated.code, map: null }
+		},
+
+		/**
+		 * When a route source file changes (or is added/removed — Vite routes
+		 * add/unlink through this hook too), invalidate the virtual routes module so
+		 * the next request regenerates the route graph. A change to a file already in
+		 * the graph reloads naturally; this additionally covers ADD/REMOVE, where the
+		 * set of routes (not just one route's body) changed.
+		 */
+		handleHotUpdate(ctx) {
+			const graph = ctx.server.moduleGraph
+			const mod = graph.getModuleById(RESOLVED_TREATY_ROUTES_ID)
+			if (mod === undefined) return
+			graph.invalidateModule(mod)
+			ctx.server.ws.send({ type: 'full-reload' })
+			return [...ctx.modules, mod]
+		},
+	}
 }
 
 /**
@@ -391,7 +481,11 @@ export default function treaty(options: PluginOptions = {}): Plugin[] {
 	// authoring plugin: they own published `node_modules` partial Angular libraries (de-partialling
 	// `ɵɵngDeclare*` → AOT `ɵɵdefine*`) and exclude `@angular/compiler`, while `treatyPlugin` owns
 	// first-party authoring files. The two ownerships are disjoint, so ordering between them is safe.
-	return [treatyPlugin, ...createLinkPartialPlugins()]
+	const plugins: Plugin[] = [treatyPlugin, ...createLinkPartialPlugins()]
+	// File routing as a virtual module, generated during the build (no prebuilt
+	// routes.ts). Only added when the app opted in via `fileRoutes`.
+	if (options.fileRoutes !== undefined) plugins.push(createFileRoutesPlugin(options.fileRoutes))
+	return plugins
 }
 
 /**
