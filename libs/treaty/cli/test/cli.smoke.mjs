@@ -17,11 +17,14 @@
 
 import assert from 'node:assert/strict'
 import { fileURLToPath } from 'node:url'
-import { dirname, resolve as resolvePath } from 'node:path'
+import { dirname, join, resolve as resolvePath } from 'node:path'
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync, readFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import {
 	run,
 	parseArgs,
 	resolveConfig,
+	runBuild,
 	buildVitePlugins,
 	buildViteConfig,
 	buildRspackConfig,
@@ -34,11 +37,12 @@ import {
 const here = dirname(fileURLToPath(import.meta.url))
 const fixtureRoot = resolvePath(here, 'fixture-project')
 
-// The optional bundler/federation peers (vite, @rspack/*, @module-federation/*)
-// are not installed in this workspace. The auto-MF Vite plugin is a lazily-
-// resolved Promise that loads @module-federation/vite only when Vite actually
-// runs — which a dry-run never does. Node escalates that rejected dynamic-import
-// to an uncaught error during module linking, so we tolerate exactly that known,
+// `vite` is installed in this workspace (so the real-build case below runs), but
+// the optional federation/Rspack peers (@module-federation/*, @rspack/*) are not.
+// The auto-MF Vite plugin is a lazily-resolved Promise that loads
+// @module-federation/vite only when Vite actually runs with federation on — which
+// the dry-run cases never do. Node escalates that rejected dynamic-import to an
+// uncaught error during module linking, so we tolerate exactly that known,
 // expected absence here. Any OTHER error still fails the run loudly.
 const KNOWN_OPTIONAL_PEERS = /@module-federation\/(vite|enhanced)|@rspack\/(core|dev-server)|^vite$|Cannot find package 'vite'/
 function isExpectedMissingPeer(err) {
@@ -57,6 +61,47 @@ process.on('uncaughtException', (err) => {
 		process.exit(1)
 	}
 })
+
+// Parse a generated component (TypeScript AST, not source text) and assert it
+// honours the MINIMAL-TEMPLATE contract: its `@Component` decorator declares NO
+// `selector` and NO `standalone`, and the class declares NO `signal()` call.
+// Inspecting the AST (not a regex over the source) avoids matching the
+// explanatory comment that deliberately names those properties.
+async function assertMinimalComponent(source, label) {
+	const { default: ts } = await import('typescript')
+	const sf = ts.createSourceFile(`${label}.ts`, source, ts.ScriptTarget.Latest, true)
+	let sawComponentDecorator = false
+	const componentPropertyNames = new Set()
+	let sawSignalCall = false
+
+	const readComponentDecorator = (decorator) => {
+		const call = decorator.expression
+		if (!ts.isCallExpression(call)) return
+		if (!ts.isIdentifier(call.expression) || call.expression.text !== 'Component') return
+		sawComponentDecorator = true
+		const [arg] = call.arguments
+		if (arg && ts.isObjectLiteralExpression(arg)) {
+			for (const prop of arg.properties) {
+				if (prop.name && ts.isIdentifier(prop.name)) componentPropertyNames.add(prop.name.text)
+			}
+		}
+	}
+	const visit = (node) => {
+		if (ts.canHaveDecorators?.(node)) {
+			for (const dec of ts.getDecorators(node) ?? []) readComponentDecorator(dec)
+		}
+		if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === 'signal') {
+			sawSignalCall = true
+		}
+		ts.forEachChild(node, visit)
+	}
+	visit(sf)
+
+	assert.ok(sawComponentDecorator, `${label}: has a @Component decorator`)
+	assert.ok(!componentPropertyNames.has('selector'), `${label}: no selector (the compiler infers it)`)
+	assert.ok(!componentPropertyNames.has('standalone'), `${label}: no standalone (standalone by default)`)
+	assert.ok(!sawSignalCall, `${label}: no signal() ceremony (signals by default)`)
+}
 
 let failures = 0
 const results = []
@@ -188,12 +233,49 @@ await check('treaty generate plans standalone, federation-ready files (dry run)'
 
 	const compFiles = planGenerate({ kind: 'component', name: 'my-widget', cwd: fixtureRoot })
 	assert.equal(compFiles.length, 1, 'a component is a single file')
-	assert.ok(compFiles[0].contents.includes('standalone: true'), 'component is standalone')
+	// MINIMAL TEMPLATE: a scaffolded component carries no selector, no
+	// `standalone`, and no signal() ceremony — the Treaty compiler fills them in.
+	await assertMinimalComponent(compFiles[0].contents, 'cli component')
 
 	// Dry run via the full CLI must not write anything.
 	const res = await run(['generate', 'lib', 'shared-ui', '--dry-run', '--root', fixtureRoot], fixtureRoot)
 	assert.equal(res.exitCode, 0, 'generate dry-run exits 0')
 	assert.ok(res.output.join('\n').includes('plan'), 'dry-run reports planned files')
+})
+
+await check('treaty build drives Vite end-to-end and writes real output', async () => {
+	// A real, non-mocked build: drive the CLI's runBuild over a self-contained
+	// project and assert files land on disk. The project has NO Treaty-owned
+	// authoring files (no @Component / .treaty / JSX), so the Treaty plugin in the
+	// pipeline passes the entry through and the build needs only `vite` (present)
+	// — federation is off so no optional MF peer is required. This exercises the
+	// genuine runBuild → buildViteConfig → vite.build path that `treaty build` runs.
+	const projectRoot = mkdtempSync(join(tmpdir(), 'treaty-cli-build-'))
+	try {
+		mkdirSync(join(projectRoot, 'src'), { recursive: true })
+		writeFileSync(
+			join(projectRoot, 'index.html'),
+			'<!doctype html><html><head><meta charset="utf-8"><title>t</title></head>' +
+				'<body><div id="app"></div><script type="module" src="/src/main.js"></script></body></html>\n',
+		)
+		writeFileSync(
+			join(projectRoot, 'src', 'main.js'),
+			"const el = document.getElementById('app')\nif (el) el.textContent = 'treaty build output'\nexport const ok = true\n",
+		)
+
+		const base = await resolveConfig(projectRoot, { bundler: 'vite', outDir: 'dist' })
+		// Federation off (no @module-federation/vite peer here) + a plain JS entry.
+		const config = { ...base, moduleFederation: false, entry: join(projectRoot, 'src', 'main.js') }
+		const result = await runBuild(config)
+
+		assert.equal(result.bundler, 'vite', 'build reports the vite bundler')
+		assert.ok(existsSync(join(projectRoot, 'dist', 'index.html')), 'build emitted dist/index.html')
+		const html = readFileSync(join(projectRoot, 'dist', 'index.html'), 'utf-8')
+		// Vite rewrites the entry to a hashed asset chunk in the emitted HTML.
+		assert.match(html, /assets\/.+\.js/, 'emitted HTML references a built JS asset')
+	} finally {
+		rmSync(projectRoot, { recursive: true, force: true })
+	}
 })
 
 for (const line of results) console.log(line)

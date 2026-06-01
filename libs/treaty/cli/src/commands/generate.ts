@@ -78,17 +78,20 @@ function toKebabCase(name: string): string {
 /** Render a standalone component source file body. */
 function componentSource(name: string): string {
 	const className = `${toPascalCase(name)}Component`
-	const selector = `app-${toKebabCase(name)}`
+	const kebab = toKebabCase(name)
+	// MINIMAL TEMPLATE: Treaty is selectorless, standalone, and signal by default —
+	// the compiler fills the selector, `standalone`, and signal wrapping in during
+	// compilation. A scaffolded component therefore carries none of that ceremony;
+	// it is still federation-ready (exposable as a Module Federation remote) with no
+	// extra configuration.
 	return `import { Component } from '@angular/core'
 
 /**
- * ${className} — a standalone, federation-ready Treaty component. It can be
- * exposed as a Module Federation remote with no extra configuration.
+ * ${className} — a standalone, federation-ready Treaty component. The compiler
+ * fills in the selector and standalone metadata, so none is written here.
  */
 @Component({
-	selector: '${selector}',
-	standalone: true,
-	template: \`<p>${selector} works</p>\`,
+	template: \`<p>${kebab} works</p>\`,
 })
 export class ${className} {}
 `
