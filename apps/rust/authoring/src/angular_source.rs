@@ -34,12 +34,12 @@ fn map_or_none(map: String) -> Option<String> {
 
 /// The recognized top-level Angular decorator kinds a `.ts` source may carry.
 ///
-/// `Component` is the one kind the `render3` source front-end emits today. The remaining kinds
-/// (`Directive` / `Pipe` / `Injectable` / `NgModule`) are recognized so the base-Angular path can
-/// make an informed routing decision, but `render3` has no *source* extractor for them yet — their
-/// metadata-driven emitters in [`treaty_ivy::pipe_module_injector`] require structured metadata the
-/// source front-end does not build. Until that lands, a source carrying only these decorators is a
-/// faithful pass-through (see [`compile_angular_source`]).
+/// EVERY kind — `Component` / `Directive` / `Pipe` / `Injectable` / `NgModule` — is lowered to its
+/// Ivy definition by the `treaty_ivy::source_compile` driver (a `@Component` → `ɵɵdefineComponent`,
+/// `@Directive` → `ɵɵdefineDirective`, `@Pipe` → `ɵɵdefinePipe`, `@Injectable` → `ɵfac` +
+/// `ɵɵdefineInjectable`, `@NgModule` → `ɵɵdefineNgModule`). Recognition here drives the routing
+/// decision in [`compile_angular_source`]: a source carrying ANY of these is compiled to Ivy (so it
+/// never falls to Angular's JIT at runtime), and a source carrying none is a plain `.ts` pass-through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AngularDecoratorKind {
     Component,
@@ -219,23 +219,26 @@ pub fn compile_angular_component_with(
     }
 }
 
-/// The base-Angular `.ts` front-end entry, broadened across decorator kinds.
+/// The base-Angular `.ts` front-end entry, lowering EVERY Angular decorator kind to Ivy.
 ///
 /// Routing, by the top-level Angular decorator(s) the source carries:
 ///   * `@Component` — compiled to a `ɵɵdefineComponent` via [`compile_angular_component`]
 ///     (server-block aware: a `server { … }` block is lifted and routed through the default
 ///     backend, exactly as before).
-///   * `@Directive` / `@Pipe` / `@Injectable` / `@NgModule` — `render3` has metadata-driven emitters
-///     for pipes / modules / injectors ([`treaty_ivy::pipe_module_injector`]) but no *source* extractor
-///     wiring them up yet, so rather than erroring we emit the source **unchanged** (a faithful
-///     pass-through) with no diagnostics. When a source extractor for these lands, this is the one
-///     place to route them through.
+///   * `@Directive` / `@Pipe` / `@Injectable` / `@NgModule` (and multi-class files mixing kinds) —
+///     compiled to their Ivy definitions (`ɵɵdefineDirective` / `ɵɵdefinePipe` / `ɵfac` +
+///     `ɵɵdefineInjectable` / `ɵɵdefineNgModule`) through the SAME `treaty_ivy::source_compile`
+///     driver the component path uses. The driver lowers every decorated class in source order, so
+///     the emitted module carries a real Ivy definition for each class and the raw `@Directive` /
+///     `@Pipe` / `@Injectable` / `@NgModule` decorator is stripped — there is no surviving decorator
+///     that would push Angular to JIT (and crash for want of `@angular/compiler`) at runtime.
 ///   * no Angular decorator at all — a plain `.ts` module — passes through **unchanged**.
 ///
 /// The `file_name` derives the fallback element selector a SELECTORLESS `@Component` adopts (its
 /// kebab-case stem, the same Treaty convention the JSX / `.treaty` front-ends use); a `@Component`
-/// that declares its own `selector` keeps it. The base-Angular path does not derive a class name
-/// from `file_name` (the `@Component` class names itself).
+/// that declares its own `selector` keeps it. A `@Directive` is never given a fallback selector
+/// (directives are legitimately class-only), so passing the kebab stem through is harmless for the
+/// non-component kinds. The base-Angular path does not derive a class name from `file_name`.
 pub fn compile_angular_source(source: &str, file_name: &str) -> CompiledAuthoring {
     // Detect decorators on the SERVER-STRIPPED source: a `server { … }` block is not valid TS, so a
     // `@Component` that colocates one would otherwise fail to parse here and be misrouted to the
@@ -244,17 +247,37 @@ pub fn compile_angular_source(source: &str, file_name: &str) -> CompiledAuthorin
     let stripped = extract_server_block(source).client_source;
     let kinds = detect_angular_decorators(&stripped);
 
-    // A `@Component` is the only kind the source front-end emits; route it through the existing
-    // server-block-aware component path. (If a file mixes `@Component` with other decorators, the
-    // component still drives compilation — `compile_component_source` already rejects multi-class
-    // files, so the component path will report that faithfully.)
+    // A `@Component` may colocate a `server { … }` block, so it keeps the dedicated server-block-aware
+    // path (which lifts the block, applies the active backend plugin, and rewrites call sites). The
+    // `treaty_ivy` driver behind that path already lowers every OTHER decorated class in the same
+    // file too, so a file mixing `@Component` with `@Directive`/`@Pipe`/`@Injectable`/`@NgModule`
+    // emits an Ivy definition for each.
     if kinds.contains(&AngularDecoratorKind::Component) {
         return compile_angular_component(source, file_name);
     }
 
-    // Either no Angular decorator (plain `.ts`) or only decorator kinds without a source extractor
-    // yet (`@Directive` / `@Pipe` / `@Injectable` / `@NgModule`): emit the source verbatim so the
-    // bundler still gets a usable module, with no spurious diagnostics.
+    // No `@Component`, but at least one `@Directive`/`@Pipe`/`@Injectable`/`@NgModule`: route through
+    // the SAME `treaty_ivy::source_compile` driver so each decorated class lowers to its Ivy
+    // definition (`ɵɵdefineDirective`/`ɵɵdefinePipe`/`ɵfac`+`ɵɵdefineInjectable`/`ɵɵdefineNgModule`).
+    // These kinds never carry a `server { … }` block, so the cleaned client source IS the source.
+    if !kinds.is_empty() {
+        let default_selector = to_kebab_case(file_name);
+        let compiled = compile_component_source_with_map_and_selector(
+            source,
+            GENERATED_NAME,
+            SOURCE_NAME,
+            Some(&default_selector),
+        );
+        return CompiledAuthoring {
+            code: compiled.code,
+            server_module: None,
+            errors: compiled.errors,
+            map: map_or_none(compiled.map),
+        };
+    }
+
+    // No Angular decorator at all (a plain `.ts` module): emit the source verbatim so the bundler
+    // still gets a usable module, with no spurious diagnostics.
     CompiledAuthoring {
         code: source.to_string(),
         server_module: None,
@@ -506,22 +529,138 @@ export class AppComponent {}\n";
         assert_eq!(out.code, source, "plain .ts was not passed through unchanged");
     }
 
-    #[test]
-    fn source_router_passes_pipe_directive_injectable_module_through_unchanged() {
-        // Decorator kinds without a source extractor yet are faithful pass-throughs (no error).
-        for source in [
-            "import { Pipe } from '@angular/core';\n\
-@Pipe({ name: 'cap' })\nexport class CapPipe { transform(v: string) { return v; } }\n",
-            "import { Directive } from '@angular/core';\n\
-@Directive({ selector: '[foo]' })\nexport class FooDirective {}\n",
-            "import { Injectable } from '@angular/core';\n\
-@Injectable({ providedIn: 'root' })\nexport class DataService {}\n",
-            "import { NgModule } from '@angular/core';\n\
-@NgModule({ declarations: [] })\nexport class AppModule {}\n",
-        ] {
-            let out = compile_angular_source(source, "x.ts");
-            assert!(out.errors.is_empty(), "unexpected errors for {source:?}: {:?}", out.errors);
-            assert_eq!(out.code, source, "source was not passed through unchanged: {source:?}");
+    /// Parse `code` with oxc (TypeScript) and assert it has no parse errors — proving the emitted
+    /// module is syntactically valid, NOT by regex but by actually building the AST. Returns the
+    /// joined error messages on failure so the assertion message is actionable.
+    fn assert_parses(code: &str) {
+        let allocator = Allocator::default();
+        let source_type = SourceType::default().with_typescript(true);
+        let ret = Parser::new(&allocator, code, source_type).parse();
+        assert!(
+            ret.errors.is_empty(),
+            "emitted code did not parse: {:?}\n--- code ---\n{code}",
+            ret.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// True when the parsed `code` has NO top-level class carrying a decorator named `name`. Walks the
+    /// AST (not a regex) so a surviving `@Directive`/`@Pipe`/`@Injectable` decorator is caught for what
+    /// it is — a decorator node on a class — rather than a textual coincidence.
+    fn no_surviving_decorator(code: &str, name: &str) -> bool {
+        let allocator = Allocator::default();
+        let source_type = SourceType::default().with_typescript(true);
+        let ret = Parser::new(&allocator, code, source_type).parse();
+        assert!(ret.errors.is_empty(), "code under decorator check did not parse: {code}");
+        for stmt in &ret.program.body {
+            let Some(class) = statement_class(stmt) else { continue };
+            for dec in &class.decorators {
+                if decorator_name(dec) == Some(name) {
+                    return false;
+                }
+            }
         }
+        true
+    }
+
+    const DEFINE_DIRECTIVE: &str = "\u{0275}\u{0275}defineDirective";
+    const DEFINE_PIPE: &str = "\u{0275}\u{0275}definePipe";
+    const DEFINE_INJECTABLE: &str = "\u{0275}\u{0275}defineInjectable";
+    const DEFINE_NG_MODULE: &str = "\u{0275}\u{0275}defineNgModule";
+    const FAC: &str = "\u{0275}fac";
+
+    #[test]
+    fn directive_source_lowers_to_define_directive_no_raw_decorator() {
+        // The live failing file: a SELECTORLESS `@Directive` `.ts`. It must lower to a real
+        // `ɵɵdefineDirective` (+ `ɵfac`) so Angular never falls to JIT at runtime, and the raw
+        // `@Directive` decorator must NOT survive on the emitted class (verified by AST walk).
+        let source = "import { Directive, ElementRef, computed, effect, inject, input } from '@angular/core'\n\
+@Directive({ host: { '[style.color]': 'tint()' } })\n\
+export class HighlightDelta {\n\
+  readonly delta = input(0)\n\
+  private readonly host = inject(ElementRef)\n\
+  readonly tint = computed(() => this.delta() > 0 ? '#059669' : 'inherit')\n\
+}\n";
+        let out = compile_angular_source(source, "highlight-delta.directive.ts");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        assert!(out.code.contains(DEFINE_DIRECTIVE), "no ɵɵdefineDirective; got: {}", out.code);
+        assert!(out.code.contains(FAC), "no ɵfac for the directive; got: {}", out.code);
+        assert!(
+            no_surviving_decorator(&out.code, "Directive"),
+            "a raw @Directive decorator survived the lowering; got: {}",
+            out.code
+        );
+        assert_parses(&out.code);
+    }
+
+    #[test]
+    fn pipe_source_lowers_to_define_pipe_no_raw_decorator() {
+        // The live failing file: a `@Pipe` `.ts`. It must lower to `ɵɵdefinePipe` (+ `ɵfac`), with no
+        // raw `@Pipe` decorator surviving.
+        let source = "import { Pipe, type PipeTransform } from '@angular/core'\n\
+@Pipe({ name: 'percent01' })\n\
+export class Percent01Pipe implements PipeTransform {\n\
+  transform(ratio: number, fractionDigits = 0): string {\n\
+    return `${(ratio * 100).toFixed(fractionDigits)}%`\n\
+  }\n\
+}\n";
+        let out = compile_angular_source(source, "percent.pipe.ts");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        assert!(out.code.contains(DEFINE_PIPE), "no ɵɵdefinePipe; got: {}", out.code);
+        assert!(out.code.contains(FAC), "no ɵfac for the pipe; got: {}", out.code);
+        assert!(
+            no_surviving_decorator(&out.code, "Pipe"),
+            "a raw @Pipe decorator survived the lowering; got: {}",
+            out.code
+        );
+        assert_parses(&out.code);
+    }
+
+    #[test]
+    fn injectable_source_lowers_to_define_injectable_no_raw_decorator() {
+        // A `@Injectable` `.ts` must lower to `ɵfac` + `ɵɵdefineInjectable` (its `ɵprov`), with no raw
+        // `@Injectable` decorator surviving — otherwise Angular's JIT injector resolution crashes for
+        // want of `@angular/compiler`.
+        let source = "import { Injectable } from '@angular/core'\n\
+@Injectable({ providedIn: 'root' })\n\
+export class DataService { value = 1 }\n";
+        let out = compile_angular_source(source, "data.service.ts");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        assert!(out.code.contains(DEFINE_INJECTABLE), "no ɵɵdefineInjectable; got: {}", out.code);
+        assert!(out.code.contains(FAC), "no ɵfac for the injectable; got: {}", out.code);
+        assert!(
+            no_surviving_decorator(&out.code, "Injectable"),
+            "a raw @Injectable decorator survived the lowering; got: {}",
+            out.code
+        );
+        assert_parses(&out.code);
+    }
+
+    #[test]
+    fn ng_module_source_lowers_to_define_ng_module_no_raw_decorator() {
+        // A `@NgModule` `.ts` must lower to `ɵɵdefineNgModule` (+ `ɵinj`), with no raw decorator left.
+        let source = "import { NgModule } from '@angular/core'\n\
+@NgModule({ declarations: [] })\n\
+export class AppModule {}\n";
+        let out = compile_angular_source(source, "app.module.ts");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        assert!(out.code.contains(DEFINE_NG_MODULE), "no ɵɵdefineNgModule; got: {}", out.code);
+        assert!(
+            no_surviving_decorator(&out.code, "NgModule"),
+            "a raw @NgModule decorator survived the lowering; got: {}",
+            out.code
+        );
+        assert_parses(&out.code);
+    }
+
+    #[test]
+    fn plain_non_angular_ts_is_still_passed_through_unchanged() {
+        // A plain `.ts` with no Angular decorator must STILL pass through verbatim after broadening the
+        // router across decorator kinds — no compile, no errors, byte-for-byte identical.
+        let source = "export const add = (a: number, b: number): number => a + b;\n";
+        let out = compile_angular_source(source, "math.ts");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        assert!(out.server_module.is_none(), "unexpected server module");
+        assert_eq!(out.code, source, "plain .ts was not passed through unchanged");
+        assert!(out.map.is_none(), "plain .ts should carry no map");
     }
 }
