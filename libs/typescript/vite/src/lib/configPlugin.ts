@@ -4,6 +4,7 @@ import { resolve } from 'path';
 import { cwd } from 'process';
 import { getGlobalObject } from './utils/getGlobalObject';
 import { Plugin, normalizePath, searchForWorkspaceRoot } from 'vite';
+import { createLinkPartialEsbuildPlugin } from './linkPartialPlugin';
 
 const globalObject = getGlobalObject('angularConfigPlugin.ts', {
   root: undefined as string | undefined,
@@ -73,6 +74,13 @@ const ConfigPlugin: Plugin[] = [
         },
         optimizeDeps: {
           exclude: ['@angular/compiler'],
+          // Link Angular partial declarations (`ɵɵngDeclare*` -> AOT `ɵɵdefine*`) at
+          // dependency-prebundle time, so the linked output lands in `node_modules/.vite/deps`
+          // and reaches the browser without the JIT fallback. Paired with the in-graph
+          // `LinkPartialPlugin.transform` for non-prebundled / build-time modules.
+          esbuildOptions: {
+            plugins: [createLinkPartialEsbuildPlugin()],
+          },
         },
       };
     },
