@@ -1638,6 +1638,53 @@ function onClick(user) { return save(user); }\n\
         );
     }
 
+    #[test]
+    fn treaty_server_block_AFTER_html_region_does_not_leak_into_client_or_map() {
+        // F2 regression (CLIENT SECRET LEAK): a `server { … }` block placed AFTER the HTML/view
+        // region used to leak its body into BOTH the client code AND the source map, because block
+        // discovery ran a JS-only text scan over the raw `.treaty` source and the closing `>` of the
+        // preceding tag tripped the statement-position guard. The hardened lexer's first-class
+        // `server { … }` regions (R3) discover the block regardless of position, so it must extract
+        // identically whether it sits before or after the markup. A `database` call stands in for the
+        // secret the user flagged — it must appear in NEITHER the client bundle NOR `sourcesContent`.
+        let source = "import { User } from './user';\n\
+function onClick(user) { return save(user); }\n\
+<div>{{ onClick }}</div>\n\
+server {\n\
+  async function save(user: User) { return database.users.insert(user, SECRET_KEY); }\n\
+}\n";
+
+        let out = compile_treaty_authoring(source, "form.treaty");
+
+        // The server body went to the backend, not the client.
+        let server_module = out.server_module.expect("expected a server module for the after-HTML block");
+        assert!(
+            server_module.contains("\"/__server/save\""),
+            "after-HTML server block not routed to the backend; got: {server_module}"
+        );
+
+        // CLIENT CODE: neither the secret nor the body leaks; the call routes through the resource client.
+        assert!(
+            !out.code.contains("database.users.insert") && !out.code.contains("SECRET_KEY"),
+            "after-HTML server body LEAKED into client code; got: {}",
+            out.code
+        );
+        assert!(
+            out.code.contains("edenPromiseResource") && out.code.contains("'/__server/save'"),
+            "call not rewritten to the resource client; got: {}",
+            out.code
+        );
+        assert_treaty_client_parses(&out.code);
+
+        // SOURCE MAP: the verbatim block is redacted out of `sourcesContent`, so the secret cannot be
+        // recovered from the client map either (the privacy guarantee, not just the bundle).
+        let map = out.map.expect("expected a source map");
+        assert!(
+            !map.contains("database.users.insert") && !map.contains("SECRET_KEY"),
+            "after-HTML server body LEAKED into the client source map; got: {map}"
+        );
+    }
+
     /// Parse `code` as an ES module and assert it has no parse errors — by building the AST, never a
     /// regex — proving the emitted `.treaty` client module is syntactically valid.
     fn assert_treaty_client_parses(code: &str) {

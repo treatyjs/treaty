@@ -429,7 +429,9 @@ fn extract_marker_fns_detect(
         // Inside a file-level `'use server'`/`'use websocket'` module no per-fn marker is required;
         // otherwise the declaration must carry its own marker (`'use server'` body directive or `$$`
         // suffix).
-        if let Some((mut server_fn, span)) = server_fn_from_top_level(source, stmt, !file_level) {
+        if let Some((mut server_fn, span)) =
+            server_fn_from_top_level(source, stmt, !file_level, DEFAULT_LANG)
+        {
             // A file-level `'use websocket'` module forces every lifted fn onto the WebSocket
             // transport (the duplex-channel analogue of a file-level `'use server'` module).
             if file_level_websocket {
@@ -866,7 +868,11 @@ fn parse_server_fns(body: &str, lang: &str) -> Vec<ServerFn> {
     for stmt in &ret.program.body {
         // Inside an explicit `server { … }` block, every declaration is server-only, so we do not
         // gate on a marker — `require_marker = false`. Each lifted fn inherits the block's `lang`.
-        if let Some((server_fn, _span)) = build_server_fn(body, stmt, false, lang) {
+        // Route through `server_fn_from_top_level` (not `build_server_fn` directly) so `export` /
+        // `export default` declarations inside the block are unwrapped and lifted too — otherwise an
+        // `export function`/`export const` server fn would be silently dropped, leaving the client
+        // call to it dangling.
+        if let Some((server_fn, _span)) = server_fn_from_top_level(body, stmt, false, lang) {
             fns.push(server_fn);
         }
     }
@@ -885,21 +891,25 @@ fn parse_server_fns(body: &str, lang: &str) -> Vec<ServerFn> {
 /// Returns the [`ServerFn`] plus the byte span of the WHOLE top-level statement (the `export`
 /// keyword included, when present) so the caller removes the entire declaration from the client
 /// source rather than leaving a dangling `export`.
+///
+/// `lang` is the backend language the lifted fn targets: `DEFAULT_LANG` (rust) for the top-level
+/// marker forms (file-level `'use server'`, `$$`-suffix), or the enclosing `server:LANG { … }`
+/// block's tag when called from the block path.
 fn server_fn_from_top_level(
     source: &str,
     stmt: &Statement,
     require_marker: bool,
+    lang: &str,
 ) -> Option<(ServerFn, (usize, usize))> {
     use oxc_ast::ast::{Declaration, ExportDefaultDeclarationKind};
-    // Top-level marker forms always target `rust` (the default backend language).
     match stmt {
         Statement::ExportNamedDeclaration(export) => {
             let (mut server_fn, _inner_span) = match export.declaration.as_ref()? {
                 Declaration::FunctionDeclaration(func) => {
-                    build_from_function(source, func, require_marker, DEFAULT_LANG)
+                    build_from_function(source, func, require_marker, lang)
                 }
                 Declaration::VariableDeclaration(decl) => {
-                    build_from_var_decl(source, decl, require_marker, DEFAULT_LANG)
+                    build_from_var_decl(source, decl, require_marker, lang)
                 }
                 _ => None,
             }?;
@@ -915,11 +925,11 @@ fn server_fn_from_top_level(
                 return None;
             };
             let (mut server_fn, _inner_span) =
-                build_from_function(source, func, require_marker, DEFAULT_LANG)?;
+                build_from_function(source, func, require_marker, lang)?;
             server_fn.exported = true;
             Some((server_fn, (export.span.start as usize, export.span.end as usize)))
         }
-        _ => build_server_fn(source, stmt, require_marker, DEFAULT_LANG),
+        _ => build_server_fn(source, stmt, require_marker, lang),
     }
 }
 
@@ -1564,6 +1574,41 @@ const greeting = 'hi';\n";
         assert_eq!(f.params.len(), 1, "save should take one param");
         assert_eq!(f.params[0].name, "user");
         assert_eq!(f.params[0].ty.as_deref(), Some("User"));
+    }
+
+    #[test]
+    fn extract_server_block_lifts_exported_declarations() {
+        // F1 regression: `export` / `export default` declarations INSIDE a `server { … }` block must
+        // be lifted (and marked exported), not silently dropped — otherwise the client call to an
+        // exported server fn dangles. Before the fix `parse_server_fns` called `build_server_fn`
+        // directly, whose `_ => None` arm dropped every `Export*Declaration`.
+        let source = "server {\n\
+  export async function save(user: User) { return db.insert(user); }\n\
+  export const load = (id: number) => db.find(id);\n\
+  export default function audit() { return log('x'); }\n\
+  function helper() { return 1; }\n\
+}\nconst after = 1;\n";
+
+        let extraction = extract_server_block(source);
+
+        // All FOUR declarations are lifted (3 exported + 1 bare helper) — none dropped.
+        let mut names: Vec<&str> = extraction.server_fns.iter().map(|f| f.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["audit", "helper", "load", "save"], "an export form was dropped");
+
+        // The three `export` forms are flagged exported (client must re-export their bindings); the
+        // bare `helper` is not.
+        let exported_of = |n: &str| extraction.server_fns.iter().find(|f| f.name == n).unwrap().exported;
+        assert!(exported_of("save"), "exported `save` not flagged exported");
+        assert!(exported_of("load"), "exported `load` not flagged exported");
+        assert!(exported_of("audit"), "`export default audit` not flagged exported");
+        assert!(!exported_of("helper"), "bare `helper` wrongly flagged exported");
+
+        // No server body — nor any `export` keyword — leaks into the client source.
+        assert!(!extraction.client_source.contains("db.insert"), "save body leaked: {}", extraction.client_source);
+        assert!(!extraction.client_source.contains("db.find"), "load body leaked: {}", extraction.client_source);
+        assert!(!extraction.client_source.contains("export"), "dangling export left in client: {}", extraction.client_source);
+        assert!(extraction.client_source.contains("const after = 1;"), "trailing code lost: {}", extraction.client_source);
     }
 
     #[test]
