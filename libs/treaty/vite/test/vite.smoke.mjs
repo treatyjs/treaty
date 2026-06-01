@@ -66,15 +66,17 @@ await check('factory returns a well-formed Vite plugin', () => {
 	assert.equal(typeof plugin.handleHotUpdate, 'function', 'handleHotUpdate hook present')
 })
 
-// helper: call the transform hook with a benign `this`.
-function runTransform(code, id) {
+// helper: call the (async) transform hook with a benign `this` and await it. The
+// plugin's `transform` is async (it may run an esbuild type-strip pass on the
+// lowered output), so callers must await the result before asserting on it.
+async function runTransform(code, id) {
 	return plugin.transform.call({}, code, id)
 }
 
 // 2. .treaty -> Ivy JS
 let treatyOut
-await check('transform(.treaty) -> defineComponent', () => {
-	treatyOut = runTransform('<div>hello</div>\n', 'logo.treaty')
+await check('transform(.treaty) -> defineComponent', async () => {
+	treatyOut = await runTransform('<div>hello</div>\n', 'logo.treaty')
 	assert.ok(treatyOut, 'expected a non-null transform result')
 	assert.ok(
 		treatyOut.code.includes('defineComponent'),
@@ -92,12 +94,12 @@ await check('transform returns { code, map } shape', () => {
 
 // 3b. SOURCE MAP forwarding: a `.ts` @Component yields a v3 map from the core,
 //     and the plugin forwards it on transform()'s { code, map } unchanged.
-await check('transform forwards the v3 source map when the core produces one', () => {
+await check('transform forwards the v3 source map when the core produces one', async () => {
 	const tsComponent =
 		"import { Component } from '@angular/core';\n" +
 		"@Component({ selector: 'app-sm', template: '<div>sm</div>' })\n" +
 		'export class SmComponent {}\n'
-	const out = runTransform(tsComponent, 'Sm.ts')
+	const out = await runTransform(tsComponent, 'Sm.ts')
 	assert.ok(out, 'a .ts @Component is owned and transforms')
 	assert.ok(out.code.includes('defineComponent'), 'lowered to Ivy JS')
 	assert.equal(typeof out.map, 'string', 'the v3 source map is forwarded as a JSON string')
@@ -107,32 +109,32 @@ await check('transform forwards the v3 source map when the core produces one', (
 })
 
 // 3c. sourceMap:false makes the plugin return a null map so Vite skips map work.
-await check('sourceMap:false returns a null map', () => {
+await check('sourceMap:false returns a null map', async () => {
 	const p = authoringPluginOf(treaty({ sourceMap: false }))
 	const tsComponent =
 		"import { Component } from '@angular/core';\n" +
 		"@Component({ selector: 'app-nm', template: '<div>nm</div>' })\n" +
 		'export class NmComponent {}\n'
-	const out = p.transform.call({}, tsComponent, 'Nm.ts')
+	const out = await p.transform.call({}, tsComponent, 'Nm.ts')
 	assert.ok(out, 'still transforms with sourceMap disabled')
 	assert.equal(out.map, null, 'map is null when sourceMap is off')
 })
 
 // 4. .tsx @Component -> Ivy JS
-await check('transform(.tsx @Component) -> defineComponent', () => {
+await check('transform(.tsx @Component) -> defineComponent', async () => {
 	const tsxSource =
 		"import { Component } from '@angular/core';\n" +
 		"@Component({ selector: 'app-x', template: '<div>x</div>' })\n" +
 		'export class XComponent {}\n'
-	const out = runTransform(tsxSource, 'x.tsx')
+	const out = await runTransform(tsxSource, 'x.tsx')
 	assert.ok(out, 'expected a non-null transform result')
 	assert.ok(out.code.includes('defineComponent'), 'emitted Ivy JS must contain defineComponent')
 })
 
 // 4b. BARE-JSX .tsx (no @Component) now lowers to Ivy via the unified front-end
-await check('transform(bare-JSX .tsx) -> defineComponent', () => {
+await check('transform(bare-JSX .tsx) -> defineComponent', async () => {
 	const bare = 'export default function App() {\n  return <h1>bare jsx</h1>\n}\n'
-	const out = runTransform(bare, 'App.tsx')
+	const out = await runTransform(bare, 'App.tsx')
 	assert.ok(out, 'bare JSX must compile (no longer rejected)')
 	assert.ok(out.code.includes('defineComponent'), 'bare JSX must lower to Ivy JS')
 })
@@ -140,19 +142,19 @@ await check('transform(bare-JSX .tsx) -> defineComponent', () => {
 // 4c. IDEMPOTENCY: feeding a first pass's lowered Ivy output back through the
 //     transform (same owned `.tjsx` id) must NOT recompile — it returns null so the
 //     already-lowered JS passes through untouched, so each module compiles exactly once.
-await check('transform is idempotent: a second pass over lowered Ivy is skipped', () => {
+await check('transform is idempotent: a second pass over lowered Ivy is skipped', async () => {
 	const bare = 'export default function About() {\n  return <div>hi</div>\n}\n'
-	const first = runTransform(bare, 'about.tjsx')
+	const first = await runTransform(bare, 'about.tjsx')
 	assert.ok(first && first.code.includes('@angular/core'), 'first pass lowers bare JSX to Ivy')
 	// Without the guard, this second pass throws "no component … returning JSX … found".
-	const second = runTransform(first.code, 'about.tjsx')
+	const second = await runTransform(first.code, 'about.tjsx')
 	assert.equal(second, null, 'lowered Ivy is detected and passed through (no recompile)')
 })
 
 // 5. unowned files return null
-await check('unowned files return null', () => {
-	assert.equal(runTransform('export const a = 1\n', 'util.js'), null, 'plain .js => null')
-	assert.equal(runTransform('export const x = 1\n', 'plain.ts'), null, 'non-component .ts => null')
+await check('unowned files return null', async () => {
+	assert.equal(await runTransform('export const a = 1\n', 'util.js'), null, 'plain .js => null')
+	assert.equal(await runTransform('export const x = 1\n', 'plain.ts'), null, 'non-component .ts => null')
 })
 
 // 6. config() teaches esbuild the .tjsx loader
@@ -218,7 +220,7 @@ await check('cold-build prewarm warms the cache via transformMany', async () => 
 	if (started instanceof Promise) await started
 
 	// The very first transform of the prewarmed file must come back lowered.
-	const out = p.transform.call({}, code, file)
+	const out = await p.transform.call({}, code, file)
 	assert.ok(out, 'prewarmed file transforms to a result')
 	assert.ok(out.code.includes('defineComponent'), 'prewarmed bare JSX lowered to Ivy')
 })
@@ -235,7 +237,7 @@ await check('prewarm is a no-op for the dev server', async () => {
 	const started = p.buildStart.call({})
 	if (started instanceof Promise) await started
 	// Even without prewarming, the per-file transform still lowers correctly.
-	const out = p.transform.call({}, code, file)
+	const out = await p.transform.call({}, code, file)
 	assert.ok(out && out.code.includes('defineComponent'), 'dev per-file transform still works')
 })
 
@@ -297,7 +299,7 @@ await check('function chunking emits per-fn chunks + manifest, body never in cli
 		},
 	}
 
-	const out = p.transform.call(ctx, 'source-ignored', FILE)
+	const out = await p.transform.call(ctx, 'source-ignored', FILE)
 	assert.ok(out, 'transform returns a result for the server-fn file')
 
 	// Two server fns -> two emitted CHUNKS, one per fn, with stable file names.
@@ -391,7 +393,7 @@ await check('functionChunking:false leaves server fns as a single blob', async (
 	const p = authoringPluginOf(treaty({ functionChunking: false, compilerFactory: () => stub }))
 	const emitted = []
 	const ctx = { emitFile: (f) => (emitted.push(f), 'ref') }
-	const out = p.transform.call(ctx, 'x', FILE)
+	const out = await p.transform.call(ctx, 'x', FILE)
 	assert.equal(out.code, CLIENT, 'code unchanged when chunking is off')
 	assert.equal(emitted.length, 0, 'no chunks emitted when chunking is off')
 	p.generateBundle.call(ctx, {}, {})

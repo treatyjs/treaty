@@ -5,12 +5,18 @@ type: library
 tags: []
 tasks:
   build:
-    command: tsc
+    # Bundle to an ESM dist via esbuild with every @treaty/* dependency kept
+    # EXTERNAL (build.mjs), then emit declarations with tsgo. Keeping
+    # @treaty/ts-vite external is load-bearing: inlining it into this ESM bundle
+    # turns its native `require("@treaty/authoring-node")` into a throwing
+    # dynamic-require shim, silently disabling the partial-Angular linker. tsc is
+    # never used (forbidden); tsgo emits the .d.ts.
+    command: node
     args:
-    - -p
-    - $projectRoot/tsconfig.lib.json
+    - build.mjs
     inputs:
     - src/**/*
+    - build.mjs
     - tsconfig.json
     - tsconfig.lib.json
     outputs:

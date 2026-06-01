@@ -172,6 +172,7 @@ interface EsbuildLike {
 			loader?: 'ts' | 'tsx' | 'js' | 'jsx'
 			format?: 'esm'
 			target?: string
+			charset?: 'ascii' | 'utf8'
 			sourcefile?: string
 			sourcemap?: boolean | 'external'
 			tsconfigRaw?: string
@@ -534,6 +535,13 @@ export default function treaty(options: PluginOptions = {}): Plugin[] {
 						loader: stripLoader,
 						format: 'esm',
 						target: 'es2022',
+						// Keep non-ASCII identifiers (the Ivy emitter's U+0275-prefixed members —
+						// the factory/component/etc. statics) as literal UTF-8 rather than `\uXXXX`
+						// escapes. esbuild defaults to an ASCII charset, which would emit those
+						// members as escaped `ɵ`-sequences and defeat the `isLoweredIvy`
+						// idempotency guard (whose regex matches the literal U+0275 char), so a
+						// re-entrant pass would wrongly try to recompile already-lowered Ivy.
+						charset: 'utf8',
 						sourcefile: cleanId(id),
 						sourcemap: false,
 						// Skip any tsconfig the project may carry (we only strip types; we do not

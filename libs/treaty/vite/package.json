@@ -17,6 +17,10 @@
     }
   },
   "sideEffects": false,
+  "scripts": {
+    "build": "node build.mjs",
+    "watch": "node build.mjs --watch"
+  },
   "dependencies": {
     "@treaty/compiler": "*",
     "@treaty/module-federation": "*",
@@ -30,6 +34,9 @@
     "@module-federation/vite": {
       "optional": true
     }
+  },
+  "devDependencies": {
+    "esbuild": "latest"
   },
   "engines": {
     "node": ">=20.19"
