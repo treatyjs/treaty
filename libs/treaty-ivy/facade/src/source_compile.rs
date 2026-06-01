@@ -236,6 +236,39 @@ fn convert_expr<'a>(expr: &'a Expression<'a>) -> Option<Expr> {
             Some(callee.call_fn(args, false))
         }
         Expression::ParenthesizedExpression(p) => convert_expr(&p.expression),
+        // Conditional `c ? t : f` — appears in transform/host-handler bodies (`v => v ? 1 : 0`).
+        Expression::ConditionalExpression(c) => {
+            let test = convert_expr(&c.test)?;
+            let consequent = convert_expr(&c.consequent)?;
+            let alternate = convert_expr(&c.alternate)?;
+            Some(test.conditional(consequent, Some(alternate)))
+        }
+        // Binary `a <op> b` and logical `a && b` / `a || b` / `a ?? b`. The operator is matched on
+        // its source spelling (`.as_str()`) so this converter needs no direct dependency on the
+        // `oxc_syntax` operator crate.
+        Expression::BinaryExpression(b) => {
+            let op = binary_operator_of(b.operator.as_str())?;
+            let lhs = convert_expr(&b.left)?;
+            let rhs = convert_expr(&b.right)?;
+            Some(binary_expr(op, lhs, rhs))
+        }
+        Expression::LogicalExpression(l) => {
+            let op = logical_operator_of(l.operator.as_str())?;
+            let lhs = convert_expr(&l.left)?;
+            let rhs = convert_expr(&l.right)?;
+            Some(binary_expr(op, lhs, rhs))
+        }
+        // Unary `!x` / `-x` / `+x` / `typeof x` / `void x`.
+        Expression::UnaryExpression(u) => {
+            let inner = convert_expr(&u.argument)?;
+            unary_expr(u.operator.as_str(), inner)
+        }
+        // Computed member `a[k]` — `ComputedMemberExpression` in oxc.
+        Expression::ComputedMemberExpression(m) => {
+            let object = convert_expr(&m.object)?;
+            let index = convert_expr(&m.expression)?;
+            Some(object.key(index))
+        }
         // Inline arrow function — `(v) => v + 1`. Appears as an `@Input({transform})` value and
         // as a host binding/listener handler. Lowered to an output-AST arrow (faithful to ngtsc
         // copying the function node through to the emitted metadata); the body covers both the
@@ -300,6 +333,71 @@ fn convert_fn_body_stmts(body: &oxc_ast::ast::FunctionBody) -> Option<Vec<o::Stm
         }
     }
     Some(stmts)
+}
+
+/// Build a binary `lhs <op> rhs` output expression. (`Expr::binary` is private; the IR node is
+/// constructed directly, matching `expression_converter::binary_expr`.)
+fn binary_expr(op: o::BinaryOperator, lhs: Expr, rhs: Expr) -> Expr {
+    Expr::bare(o::ExprKind::Binary {
+        op,
+        lhs: Box::new(lhs),
+        rhs: Box::new(rhs),
+    })
+}
+
+/// Map an OXC binary operator (by its source spelling) to the output-AST [`o::BinaryOperator`].
+/// Returns `None` for the bitwise-shift / bitwise-xor / `instanceof` operators the output IR has no
+/// dedicated variant for (they never appear in the transform/host-handler subset this serves).
+/// Matching on `.as_str()` avoids a direct dependency on the `oxc_syntax` operator crate.
+fn binary_operator_of(op: &str) -> Option<o::BinaryOperator> {
+    use o::BinaryOperator as B;
+    Some(match op {
+        "==" => B::Equals,
+        "!=" => B::NotEquals,
+        "===" => B::Identical,
+        "!==" => B::NotIdentical,
+        "<" => B::Lower,
+        "<=" => B::LowerEquals,
+        ">" => B::Bigger,
+        ">=" => B::BiggerEquals,
+        "+" => B::Plus,
+        "-" => B::Minus,
+        "*" => B::Multiply,
+        "/" => B::Divide,
+        "%" => B::Modulo,
+        "**" => B::Exponentiation,
+        "|" => B::BitwiseOr,
+        "&" => B::BitwiseAnd,
+        "in" => B::In,
+        "instanceof" => B::InstanceOf,
+        // No output-IR variant: `<<`, `>>`, `>>>`, `^`.
+        _ => return None,
+    })
+}
+
+/// Map an OXC logical operator (`&&` / `||` / `??`, by source spelling) to the output-AST operator.
+fn logical_operator_of(op: &str) -> Option<o::BinaryOperator> {
+    use o::BinaryOperator as B;
+    Some(match op {
+        "&&" => B::And,
+        "||" => B::Or,
+        "??" => B::NullishCoalesce,
+        _ => return None,
+    })
+}
+
+/// Lower an OXC unary expression (`!x` / `-x` / `+x` / `typeof x` / `void x`, by source spelling).
+/// Returns `None` for `delete` / `~` which the output IR has no representation for in this subset.
+fn unary_expr(op: &str, inner: Expr) -> Option<Expr> {
+    Some(match op {
+        "!" => o::not(inner),
+        "-" => o::unary(o::UnaryOperator::Minus, inner, None),
+        "+" => o::unary(o::UnaryOperator::Plus, inner, None),
+        "typeof" => o::typeof_expr(inner),
+        "void" => Expr::bare(o::ExprKind::Void(Box::new(inner))),
+        // `delete x`, `~x`.
+        _ => return None,
+    })
 }
 
 /// Parse the `@Component({ foreignImports: [...] })` array into [`R3ForeignComponentMetadata`].
@@ -2937,6 +3035,52 @@ mod tests {
         assert!(
             flat.contains("declared:[2,\"pub\",\"declared\",toNumber]"),
             "input object options not captured; got: {flat}"
+        );
+    }
+
+    #[test]
+    fn input_object_options_capture_inline_arrow_transform() {
+        // An INLINE arrow transform `@Input({transform: (v) => ...})` must lower the same way an
+        // identifier transform does: the 4-element flag array `[2, "name", "name", <arrow>]`
+        // (HasDecoratorInputTransform = 2), the arrow emitted verbatim. Previously the arrow
+        // defeated the structural `convert_expr` (-> None) and the transform was silently dropped,
+        // producing a 3-element array that mismatched Angular's golden.
+        let src = r#"@Directive({selector:"[d]"})
+            export class D {
+                @Input({transform: (value) => value ? 1 : 0}) inlineFunctionInput: any;
+            }"#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let flat: String = out.code.chars().filter(|c| !c.is_whitespace()).collect();
+        // The emitter prints a single arrow parameter without parens (`value=>…`).
+        assert!(
+            flat.contains("inlineFunctionInput:[2,\"inlineFunctionInput\",\"inlineFunctionInput\",value=>"),
+            "inline arrow transform not threaded into input array; got: {flat}"
+        );
+        assert!(
+            flat.contains("value?1:0"),
+            "inline arrow transform body missing; got: {flat}"
+        );
+    }
+
+    #[test]
+    fn input_object_options_capture_inline_function_transform() {
+        // The block-bodied function-expression form `@Input({transform: function (v){return …}})`
+        // lowers identically, preserving its single `return` expression as the 4th array element.
+        let src = r#"@Directive({selector:"[d]"})
+            export class D {
+                @Input({transform: function (value) { return value + 1; }}) declared: any;
+            }"#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let flat: String = out.code.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            flat.contains("declared:[2,\"declared\",\"declared\",function"),
+            "inline function transform not threaded into input array; got: {flat}"
+        );
+        assert!(
+            flat.contains("returnvalue+1"),
+            "inline function transform body missing; got: {flat}"
         );
     }
 
