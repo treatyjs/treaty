@@ -87,6 +87,15 @@ fn ng_dir(rel: &str) -> std::path::PathBuf {
     std::fs::canonicalize(&raw).unwrap_or(raw)
 }
 
+/// Whether the `@angular` scope is installed at all (`node_modules/@angular` exists). Used to tell a
+/// bare checkout (no `npm install` — skip the gate cleanly) apart from an installed-but-broken tree
+/// (Angular present yet a bootstrap package carries no linkable partial chunks — a real failure).
+fn angular_scope_installed() -> bool {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../node_modules/@angular")
+        .is_dir()
+}
+
 /// Re-parse linked output to prove it is a well-formed ES module.
 ///
 /// oxc 0.133's parser rejects the barred-o `ɵ` (U+0275) inside a member expression / object key
@@ -257,8 +266,10 @@ fn angular_subpath_entry_points_link_to_zero_residual() {
 }
 
 /// EVERY bootstrap package together: each present one must carry partial chunks and link to ZERO
-/// residual, and at least one package must have been present (so the gate is never vacuous). This is
-/// the Phase-2 zero-residual gate over the full set a real app loads at startup.
+/// residual. When `@angular` is installed the gate is non-vacuous (at least one bootstrap package
+/// must have been present and linkable); on a bare checkout with no `node_modules/@angular` it skips
+/// cleanly so `cargo test --workspace` passes on a fresh clone. This is the Phase-2 zero-residual
+/// gate over the full set a real app loads at startup.
 #[test]
 fn whole_bootstrap_packages_link_to_zero_residual() {
     let mut any_present = false;
@@ -281,10 +292,24 @@ fn whole_bootstrap_packages_link_to_zero_residual() {
             eprintln!("@angular/{pkg}: residual ɵɵngDeclare {before} -> {after} across {chunks} chunk(s)");
         }
     }
-    assert!(
-        any_present,
-        "no bootstrap @angular package was installed; cannot verify zero-residual linking"
-    );
+    if !any_present {
+        // A bare checkout (no `npm install`) has no `node_modules/@angular` — skip cleanly like the
+        // wider-ecosystem gate rather than hard-panicking, so `cargo test --workspace` passes on a
+        // fresh clone. But if the @angular scope IS installed and yet not one bootstrap package
+        // carried a linkable partial chunk, that is a genuine regression — fail loudly.
+        if !angular_scope_installed() {
+            eprintln!(
+                "skipping whole-bootstrap zero-residual gate: no `node_modules/@angular` present; \
+                 run `npm install` (the bootstrap packages are pinned deps) to exercise it"
+            );
+            return;
+        }
+        panic!(
+            "@angular is installed but no bootstrap package (core/common/forms/router/\
+             platform-browser/platform-browser-dynamic/animations) carried a linkable partial \
+             chunk; cannot verify zero-residual linking"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
