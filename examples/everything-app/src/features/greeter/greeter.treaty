@@ -1,11 +1,13 @@
 ```
 // == Macro block (compile-time) ==
 // A fenced block at the TOP of a .treaty file is a MACRO: it runs at COMPILE
-// time (RSC/Astro-style) and whatever it assigns is inlined as constant data,
-// so there is zero runtime cost. Here we precompute a static greeting palette.
+// time (RSC/Astro-style) and its VALUE (the trailing expression) is inlined as
+// the constant `$macro`, so there is zero runtime cost. Here we precompute a
+// static greeting palette and expose it as `$macro`.
 const palette = ['#6d28d9', '#2563eb', '#059669']
 const accents = palette.map((hex, i) => ({ hex, tier: i + 1 }))
-const macroMeta = { accents, builtAt: new Date(0).toISOString() }
+// The trailing expression is the macro's value, injected as `const $macro = …`.
+;({ accents, builtAt: new Date(0).toISOString() })
 ```
 
 // == Component body (TypeScript by default -- no <script> needed) ==
@@ -40,7 +42,7 @@ async function sayHello(): Promise<void> {
 <section class="greeter">
   <header>
     <h2>{{ headline() }}</h2>
-    <small>palette built {{ macroMeta.builtAt }}</small>
+    <small>palette built {{ $macro.builtAt }}</small>
   </header>
 
   <form (submit)="sayHello()">
@@ -55,7 +57,7 @@ async function sayHello(): Promise<void> {
   }
 
   <ul class="swatches">
-    @for (accent of macroMeta.accents; track accent.tier) {
+    @for (accent of $macro.accents; track accent.tier) {
       <li [style.color]="accent.hex">tier {{ accent.tier }}: {{ accent.hex }}</li>
     }
   </ul>

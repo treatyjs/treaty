@@ -1,14 +1,16 @@
 ```
 // == Macro block (compile-time) ==
-// A fenced block at the TOP of a .treaty file runs at COMPILE time and is
-// inlined as constant data (zero runtime cost). Here we precompute the colored
-// threshold bands the gauge labels itself against.
+// A fenced block at the TOP of a .treaty file runs at COMPILE time; its VALUE
+// (the trailing expression) is inlined as the constant `$macro` (zero runtime
+// cost). Here we precompute the colored threshold bands the gauge labels itself
+// against and expose them as `$macro`.
 const bands = [
 	{ upTo: 0.5, label: 'low', hex: '#dc2626' },
 	{ upTo: 0.8, label: 'ok', hex: '#d97706' },
 	{ upTo: 1.01, label: 'high', hex: '#059669' },
 ]
-const macroMeta = { bands, builtAt: new Date(0).toISOString() }
+// The trailing expression is the macro's value, injected as `const $macro = …`.
+;({ bands, builtAt: new Date(0).toISOString() })
 ```
 
 // == Component body: SIGNALS BY DEFAULT ==
@@ -35,8 +37,8 @@ const ratio = computed(() => {
 	return span <= 0 ? 0 : (clamped() - min()) / span
 })
 
-// COMPUTED off the macro data: which precomputed band the ratio falls into.
-const band = computed(() => macroMeta.bands.find((b) => ratio() <= b.upTo) ?? macroMeta.bands[2])
+// COMPUTED off the macro data ($macro): which precomputed band the ratio falls into.
+const band = computed(() => $macro.bands.find((b) => ratio() <= b.upTo) ?? $macro.bands[2])
 
 // Local history + the per-tick delta the directive paints.
 const history = signal<number[]>([])
@@ -57,7 +59,7 @@ effect(() => {
 <section class="gauge">
   <header>
     <h3>{{ band().label }} gauge</h3>
-    <small>built {{ macroMeta.builtAt }}</small>
+    <small>built {{ $macro.builtAt }}</small>
   </header>
 
   <div class="track">

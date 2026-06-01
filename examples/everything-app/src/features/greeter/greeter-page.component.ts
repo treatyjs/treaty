@@ -24,12 +24,21 @@ import greetingCard from './greeting-card.tjsx'
 			@if (tabs().length) {
 				<nav>
 					@for (tab of tabs(); track tab) {
-						<button type="button" (click)="active.set(tab)">{{ tab }}</button>
+						<button
+							type="button"
+							[class.active]="active() === tab"
+							(click)="active.set(tab)"
+						>{{ tab }}</button>
 					}
 				</nav>
 			}
-			<Greeter />
-			<greetingCard />
+			<!-- The active tab drives which authoring surface shows, so clicking is
+			     visibly meaningful: 'sfc' -> the .treaty Greeter, else the .tjsx card. -->
+			@if (active() === 'sfc') {
+				<Greeter />
+			} @else {
+				<greetingCard />
+			}
 		</section>
 	`,
 })
