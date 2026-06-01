@@ -504,10 +504,18 @@ pub fn convert_host_property_binding_with_pure<R: LocalResolver, P: PipeSlotAllo
     expr: &AstNode,
     resolver: &R,
     pipes: &P,
+    legacy_optional_chaining: bool,
 ) -> ConvertedBinding {
     let mut cx = Converter::new(resolver).with_pipes(pipes);
     cx.extract_pure = true;
     cx.hoist_arrows = true;
+    // Under the `legacyOptionalChaining` compiler flag a safe-navigation host-binding value
+    // (`getData()?.id`) lowers to the classic guarded-temporary ternary
+    // (`($tmp0$ = ctx.getData()) == null ? null : $tmp0$.id`) with the `$tmpN$` temporaries declared
+    // ahead of the consuming instruction, rather than the native `?.` operator.
+    if legacy_optional_chaining {
+        cx.legacy_optional_chaining = true;
+    }
     let expr = cx.convert(expr);
     cx.finish(expr)
 }

@@ -78,6 +78,11 @@ pub struct CompileCtx<'a> {
     pub sibling_directives: &'a [crate::binder::SelectorDirective],
     pub resolved_content: Option<&'a ResolvedContentMap>,
     pub default_selector: Option<&'a str>,
+    /// The `legacyOptionalChaining` Angular compiler option: when set, a safe-navigation host-binding
+    /// value (`getData()?.id`) lowers to the classic guarded-temporary ternary rather than the native
+    /// `?.` operator. `false` for every default compile path; only the option-carrying entry point
+    /// (and the compliance corpus dump, which reads it per case) sets it.
+    pub legacy_optional_chaining: bool,
 }
 
 /// The Ivy emit of ONE decorated class, decomposed so the original module can be re-assembled

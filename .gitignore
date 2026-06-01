@@ -48,6 +48,7 @@
 # will have compiled files and executables
 **/debug/
 **/target/
+**/.target-*/
 
 **/*/debug/
 **/*/target/

@@ -1354,7 +1354,44 @@ pub fn compile_component_source(ts_source: &str) -> CompiledComponent {
         return err(format!("parse error: {}", msgs.join("; ")));
     }
 
-    compile_program_with_source(&ret.program, Some(ts_source), None, None, None)
+    compile_program_with_source(&ret.program, Some(ts_source), None, None, None, false)
+}
+
+/// Per-file Angular compiler options that influence the emit but are NOT expressible in the source.
+///
+/// Defaults to every option off, so [`CompileOptions::default`] reproduces [`compile_component_source`]
+/// byte-for-byte. Currently only `legacyOptionalChaining` is modelled (the compliance corpus carries
+/// it as a per-case `angularCompilerOptions.legacyOptionalChaining`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CompileOptions {
+    /// The `legacyOptionalChaining` Angular compiler option: lower a safe-navigation host-binding
+    /// value (`getData()?.id`) to the classic guarded-temporary ternary rather than the native `?.`.
+    pub legacy_optional_chaining: bool,
+}
+
+/// Like [`compile_component_source`] but honouring per-file [`CompileOptions`]. With
+/// [`CompileOptions::default`] the emit is byte-identical to [`compile_component_source`].
+pub fn compile_component_source_with_options(
+    ts_source: &str,
+    options: CompileOptions,
+) -> CompiledComponent {
+    let allocator = Allocator::default();
+    let source_type = SourceType::default().with_typescript(true);
+    let ret = Parser::new(&allocator, ts_source, source_type).parse();
+
+    if !ret.errors.is_empty() {
+        let msgs: Vec<String> = ret.errors.iter().map(|e| e.to_string()).collect();
+        return err(format!("parse error: {}", msgs.join("; ")));
+    }
+
+    compile_program_with_source(
+        &ret.program,
+        Some(ts_source),
+        None,
+        None,
+        None,
+        options.legacy_optional_chaining,
+    )
 }
 
 /// Compile a TypeScript source string, supplying host-resolved external `templateUrl`/`styleUrls`
@@ -1378,7 +1415,7 @@ pub fn compile_component_source_with_resolved(
         return err(format!("parse error: {}", msgs.join("; ")));
     }
 
-    compile_program_with_source(&ret.program, Some(ts_source), None, Some(resolved), None)
+    compile_program_with_source(&ret.program, Some(ts_source), None, Some(resolved), None, false)
 }
 
 /// Context for additive source-map emission: the original authoring source text plus the
@@ -1462,6 +1499,7 @@ pub fn compile_component_source_with_map_and_selector(
         Some((&ctx, &mut map_out)),
         None,
         default_selector,
+        false,
     );
     CompiledComponentWithMap {
         code: compiled.code,
@@ -1848,12 +1886,14 @@ fn strip_i0_import_line(block: &str) -> String {
 /// ES module augmented with the Ivy statics (the production path, fixing the missing-export bug);
 /// when `None`, the legacy bare-definition emit is produced (used only where the original source
 /// text is unavailable, e.g. internal callers that pre-parsed without retaining the text).
+#[allow(clippy::too_many_arguments)]
 fn compile_program_with_source(
     program: &Program,
     source: Option<&str>,
     map: Option<(&MapContext, &mut String)>,
     resolved: Option<&ResolvedContentMap>,
     default_selector: Option<&str>,
+    legacy_optional_chaining: bool,
 ) -> CompiledComponent {
     let imported_names = collect_imported_names(program);
 
@@ -1912,6 +1952,7 @@ fn compile_program_with_source(
             &sibling_directives,
             resolved,
             default_selector,
+            legacy_optional_chaining,
         ) {
             Ok(emit) => {
                 errors.extend(emit.errors.clone());
@@ -2090,6 +2131,7 @@ impl DecoratorCompiler for ComponentCompiler {
             ctx.resolved_content,
             // A selectorless `@Component` adopts the caller's filename-derived default selector.
             ctx.default_selector,
+            ctx.legacy_optional_chaining,
         )
     }
 }
@@ -2114,6 +2156,7 @@ impl DecoratorCompiler for DirectiveCompiler {
             ctx.resolved_content,
             // A `@Directive` is legitimately selectorless (class-only); never substitute a selector.
             None,
+            ctx.legacy_optional_chaining,
         )
     }
 }
@@ -2364,6 +2407,7 @@ fn decorator_registry() -> DecoratorRegistry {
 /// [`CompileCtx`]; the registry resolves the plugin for the class's [`AngularDecoratorKind`] and
 /// calls [`DecoratorCompiler::compile`]. The emitted definition is byte-identical to the prior
 /// per-kind `match` — the plugins delegate to the same extraction/emit helpers.
+#[allow(clippy::too_many_arguments)]
 fn compile_decorated_class(
     class: &Class,
     kind: TopLevel,
@@ -2372,6 +2416,7 @@ fn compile_decorated_class(
     sibling_directives: &[crate::binder::SelectorDirective],
     resolved_content: Option<&ResolvedContentMap>,
     default_selector: Option<&str>,
+    legacy_optional_chaining: bool,
 ) -> Result<ClassEmit, String> {
     let (class_name, class_name_span) = match &class.id {
         Some(id) => (
@@ -2393,6 +2438,7 @@ fn compile_decorated_class(
         sibling_directives,
         resolved_content,
         default_selector,
+        legacy_optional_chaining,
     };
 
     // MULTI-DECORATOR dispatch: ngtsc compiles EVERY recognized trait on a class, not only the
@@ -2471,6 +2517,7 @@ fn compile_pipe_and_injectable(class: &Class, meta: &ClassMeta) -> Result<ClassE
 /// component emitter (`compile_component_from_metadata`, with template) or the directive emitter
 /// (`compile_directive_from_metadata`, no template).
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn compile_component_or_directive(
     class: &Class,
     kind: TopLevel,
@@ -2481,6 +2528,7 @@ fn compile_component_or_directive(
     sibling_directives: &[crate::binder::SelectorDirective],
     resolved_content: Option<&ResolvedContentMap>,
     default_selector: Option<&str>,
+    legacy_optional_chaining: bool,
 ) -> Result<ClassEmit, String> {
     // The host-resolved external content for THIS class (keyed by class name), if the caller wired
     // the resolution channel and supplied an entry. Used to back `templateUrl`/`styleUrls`.
@@ -2708,7 +2756,7 @@ fn compile_component_or_directive(
         is_standalone: standalone,
         is_signal,
         host_directives,
-        legacy_optional_chaining: false,
+        legacy_optional_chaining,
     };
 
     match kind {
@@ -4860,7 +4908,6 @@ export class BCmp {}
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod corpus_dump {
-    use super::compile_component_source;
     use std::path::{Path, PathBuf};
 
     /// JSON-escape a string into `out`.
@@ -4881,29 +4928,89 @@ mod corpus_dump {
     }
 
     /// Minimal extraction of `"inputFiles": ["x.ts"]` arrays from a TEST_CASES.json blob, returning
-    /// every referenced single input-file name. We avoid a JSON dependency: the schema is fixed and
-    /// we only need the input-file string list per case.
-    fn input_files_in(json: &str) -> Vec<String> {
+    /// every referenced single input-file name PAIRED with the per-case `legacyOptionalChaining`
+    /// compiler option (`angularCompilerOptions.legacyOptionalChaining`). We avoid a JSON dependency:
+    /// the schema is fixed and we only need the input-file list plus that one flag per case.
+    ///
+    /// The flag is read from the SAME case object as the `inputFiles` array: a case spans from the
+    /// `"inputFiles"` key back to the enclosing `{` and forward to its matching `}`, so we scan the
+    /// brace-balanced slice that contains the array (cases never nest, so the nearest enclosing
+    /// object is the case). `legacyOptionalChaining` is only ever set to `true` when present.
+    fn input_files_in(json: &str) -> Vec<(String, bool)> {
+        let bytes = json.as_bytes();
         let mut files = Vec::new();
         let needle = "\"inputFiles\"";
         let mut idx = 0;
         while let Some(found) = json[idx..].find(needle) {
-            let start = idx + found + needle.len();
-            // Find the '[' then ']'.
+            let key_pos = idx + found;
+            let start = key_pos + needle.len();
+            // Find the '[' then ']' of the inputFiles array.
             let Some(open_rel) = json[start..].find('[') else { break };
             let open = start + open_rel;
             let Some(close_rel) = json[open..].find(']') else { break };
             let close = open + close_rel;
             let arr = &json[open + 1..close];
+
+            // The enclosing case object: walk back to the nearest unmatched `{` and forward to its
+            // matching `}`, then test that brace-balanced slice for the legacy flag.
+            let case_start = enclosing_object_start(bytes, key_pos);
+            let case_end = matching_object_end(bytes, case_start);
+            let case_slice = &json[case_start..case_end];
+            let legacy = case_slice.contains("\"legacyOptionalChaining\": true")
+                || case_slice.contains("\"legacyOptionalChaining\":true");
+
             for piece in arr.split(',') {
                 let t = piece.trim().trim_matches('"');
                 if !t.is_empty() {
-                    files.push(t.to_string());
+                    files.push((t.to_string(), legacy));
                 }
             }
             idx = close;
         }
         files
+    }
+
+    /// Index of the nearest enclosing `{` at-or-before `pos` (the start of the case object). Counts
+    /// braces backwards so a nested object inside the case does not falsely terminate the search.
+    fn enclosing_object_start(bytes: &[u8], pos: usize) -> usize {
+        let mut depth = 0i32;
+        let mut i = pos;
+        loop {
+            match bytes[i] {
+                b'}' => depth += 1,
+                b'{' => {
+                    if depth == 0 {
+                        return i;
+                    }
+                    depth -= 1;
+                }
+                _ => {}
+            }
+            if i == 0 {
+                return 0;
+            }
+            i -= 1;
+        }
+    }
+
+    /// Index just past the `}` matching the `{` at `start`.
+    fn matching_object_end(bytes: &[u8], start: usize) -> usize {
+        let mut depth = 0i32;
+        let mut i = start;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return i + 1;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        bytes.len()
     }
 
     /// Recursively collect every `TEST_CASES.json` under `root`.
@@ -4945,7 +5052,7 @@ mod corpus_dump {
         for tc in &test_case_files {
             let Ok(content) = std::fs::read_to_string(tc) else { continue };
             let dir = tc.parent().unwrap();
-            for input in input_files_in(&content) {
+            for (input, legacy_optional_chaining) in input_files_in(&content) {
                 let input_path = dir.join(&input);
                 let Ok(src) = std::fs::read_to_string(&input_path) else { continue };
                 let rel = input_path
@@ -4956,7 +5063,10 @@ mod corpus_dump {
                 if !seen.insert(rel.clone()) {
                     continue;
                 }
-                let out = compile_component_source(&src);
+                let out = super::compile_component_source_with_options(
+                    &src,
+                    super::CompileOptions { legacy_optional_chaining },
+                );
                 if !first {
                     json.push_str(",\n");
                 }

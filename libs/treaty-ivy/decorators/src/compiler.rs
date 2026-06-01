@@ -1062,6 +1062,7 @@ fn host_render_flag_if(flag: f64, statements: Vec<Stmt>) -> Stmt {
 fn lower_host_property_value(
     value: &str,
     pures: &HostPureFunctions,
+    legacy_optional_chaining: bool,
 ) -> crate::expression_converter::ConvertedBinding {
     let parser = crate::expression::parser::Parser::default();
     let parsed = parser.parse_binding(
@@ -1075,6 +1076,7 @@ fn lower_host_property_value(
         &parsed.ast,
         &resolver,
         pures,
+        legacy_optional_chaining,
     )
 }
 
@@ -1124,7 +1126,7 @@ impl HostBindingsBuilder for DefaultHostBindingsBuilder {
         host: &mut R3HostMetadata,
         _selector: &str,
         name: &str,
-        _legacy_optional_chaining: bool,
+        legacy_optional_chaining: bool,
         definition_map: &mut DefinitionMap,
         pool_statements: &mut Vec<Stmt>,
     ) -> Option<Expr> {
@@ -1267,7 +1269,7 @@ impl HostBindingsBuilder for DefaultHostBindingsBuilder {
         let pures = HostPureFunctions::new(regular_bindings);
 
         for (prop, value_src) in host.properties.iter() {
-            let converted = lower_host_property_value(value_src, &pures);
+            let converted = lower_host_property_value(value_src, &pures, legacy_optional_chaining);
             let value = converted.expr;
             let spill = converted.stmts;
 
@@ -3025,6 +3027,39 @@ mod tests {
         let stmts = crate::output::emitter::emit_statements(&compiled.statements);
         assert!(stmts.contains("$c0$"), "factory const not hoisted: {stmts}");
         assert!(stmts.contains("[\"red\", a0]"), "factory body wrong: {stmts}");
+    }
+
+    #[test]
+    fn host_safe_navigation_lowers_to_legacy_temporary_when_flagged() {
+        // `host: { '[id]': 'getData()?.id' }` with `legacyOptionalChaining: true` lowers the safe
+        // navigation to the classic guarded-temporary ternary with the `$tmp0$` temporary declared
+        // ahead of the consuming `ɵɵdomProperty` (mirrors
+        // r3_view_compiler_bindings/host_bindings/host_bindings_with_temporaries_use_null). Without
+        // the flag the native `?.` operator is kept verbatim.
+        let mut legacy = directive_meta("HostBindingDir", "[hostBindingDir]");
+        legacy.host.properties.insert("id".to_string(), "getData()?.id".to_string());
+        legacy.legacy_optional_chaining = true;
+        let mut hb = DefaultHostBindingsBuilder;
+        let compiled = compile_directive_from_metadata(&legacy, &mut hb);
+        let js = emit_expression(&compiled.expression);
+        assert!(js.contains("let $tmp0$;"), "legacy temp not declared: {js}");
+        assert!(
+            js.contains("ɵɵdomProperty(\"id\", ($tmp0$ = ctx.getData()) == null ? null : $tmp0$.id)"),
+            "legacy guarded-temporary lowering wrong: {js}"
+        );
+        assert!(!js.contains("ctx.getData()?.id"), "native ?. must not survive in legacy mode: {js}");
+
+        // Without the flag the native optional-chaining operator is preserved.
+        let mut native = directive_meta("HostBindingDir", "[hostBindingDir]");
+        native.host.properties.insert("id".to_string(), "getData()?.id".to_string());
+        let mut hb2 = DefaultHostBindingsBuilder;
+        let compiled_native = compile_directive_from_metadata(&native, &mut hb2);
+        let js_native = emit_expression(&compiled_native.expression);
+        assert!(
+            js_native.contains("ɵɵdomProperty(\"id\", ctx.getData()?.id)"),
+            "native ?. should be kept without the flag: {js_native}"
+        );
+        assert!(!js_native.contains("$tmp0$"), "no temporary without the flag: {js_native}");
     }
 
     #[test]
