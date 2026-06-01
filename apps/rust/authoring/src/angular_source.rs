@@ -282,7 +282,7 @@ pub fn compile_angular_source(source: &str, file_name: &str) -> CompiledAuthorin
     // client keeps ONLY the typed RPC bindings and the bodies are lifted to the backend artifact.
     let extraction = extract_server_block(source);
     if !extraction.server_fns.is_empty() {
-        return compile_plain_ts_server_module(&extraction, file_name);
+        return compile_plain_ts_server_module(source, &extraction, file_name);
     }
 
     // A genuinely plain `.ts` module: emit the source verbatim so the bundler still gets a usable
@@ -306,6 +306,7 @@ pub fn compile_angular_source(source: &str, file_name: &str) -> CompiledAuthorin
 /// `EventSource`/`fetch` resource), never the original body. The server-fn body statements are
 /// therefore ABSENT from the emitted client code.
 fn compile_plain_ts_server_module(
+    original_source: &str,
     extraction: &crate::plugin::ServerExtraction,
     _file_name: &str,
 ) -> CompiledAuthoring {
@@ -329,11 +330,26 @@ fn compile_plain_ts_server_module(
         }
     }
 
+    // CLIENT PRIVACY: emit a v3 client map whose embedded `sourcesContent` is the ORIGINAL authoring
+    // source with every lifted server-fn body blanked to position-preserving whitespace — the same
+    // defense-in-depth guarantee the inline `server { … }` path applies via
+    // `redact_server_bodies_in_map`. Without this, a bundler that re-embeds the authoring `.ts` as the
+    // map's `sourcesContent` would leak the server bodies (and any secret in them) through the map even
+    // though the client CODE no longer contains them.
+    let server_bodies: Vec<String> =
+        extraction.server_fns.iter().map(|f| f.source.clone()).collect();
+    let map = crate::source_map::client_map_with_redacted_source(
+        original_source,
+        SOURCE_NAME,
+        GENERATED_NAME,
+        &server_bodies,
+    );
+
     CompiledAuthoring {
         code,
         server_module: Some(emit.server_module),
         errors: Vec::new(),
-        map: None,
+        map: map_or_none(map),
     }
 }
 
@@ -858,6 +874,79 @@ export async function loadUser(id: number) {\n\
             out.code.contains("httpClient.post") && out.code.contains("'/__server/loadUser'"),
             "req/resp binding does not POST to the route; got:\n{}",
             out.code
+        );
+    }
+
+    #[test]
+    fn file_level_use_server_secret_is_absent_from_client_code_and_client_map() {
+        // PHASE 2 (source-map redaction): a file-level `'use server'` module whose server fn embeds a
+        // recognizable secret (a fake DB connection URL) must compile such that the secret token is
+        // ABSENT from BOTH the client code AND the client map's `sourcesContent`. The map JSON is
+        // PARSED and its `sourcesContent` scanned via the deserialized value — never a regex over the
+        // raw text — so a leak is caught structurally.
+        const SECRET: &str = "postgres://admin:hunter2@db.internal:5432/treaty_prod";
+        let source = format!(
+            "'use server'\n\
+\n\
+export async function loadSecret(id: number) {{\n\
+  const conn = '{SECRET}';\n\
+  return db.connect(conn).query(id);\n\
+}}\n"
+        );
+
+        let out = compile_angular_source(&source, "secret.store.ts");
+
+        // The server module carries the secret (it runs server-side) — that is correct.
+        let server_module = out
+            .server_module
+            .expect("file-level 'use server' must yield a server module");
+        assert!(
+            server_module.contains(SECRET),
+            "secret should live in the server module; got:\n{server_module}"
+        );
+
+        // SECURITY: the secret must NOT appear anywhere in the client code.
+        assert_client_parses(&out.code);
+        assert!(
+            !out.code.contains(SECRET),
+            "SECURITY: secret leaked into client code; got:\n{}",
+            out.code
+        );
+        assert!(
+            !out.code.contains("db.connect"),
+            "SECURITY: server body leaked into client code; got:\n{}",
+            out.code
+        );
+
+        // SECURITY: the secret must NOT appear in the client MAP's sourcesContent. Parse the map JSON
+        // and scan the deserialized `sourcesContent` strings — not a regex over raw text.
+        let map = out.map.expect("plain-ts server module must carry a redacted client map");
+        let value: serde_json::Value =
+            serde_json::from_str(&map).expect("client map should be valid JSON");
+        assert_eq!(value["version"], serde_json::json!(3), "not a v3 map: {map}");
+        let contents = value["sourcesContent"]
+            .as_array()
+            .expect("sourcesContent array present");
+        assert!(!contents.is_empty(), "sourcesContent must embed the source");
+        for c in contents {
+            let text = c.as_str().unwrap_or("");
+            assert!(
+                !text.contains(SECRET),
+                "SECURITY: secret leaked into client map sourcesContent: {text}"
+            );
+            assert!(
+                !text.contains("db.connect"),
+                "SECURITY: server body leaked into client map sourcesContent: {text}"
+            );
+        }
+
+        // The map stays valid: same byte length as the original source (redaction is
+        // position-preserving) so any client mapping still resolves.
+        let embedded = contents[0].as_str().unwrap();
+        assert_eq!(
+            embedded.len(),
+            source.len(),
+            "redaction must preserve source length so the map stays valid"
         );
     }
 

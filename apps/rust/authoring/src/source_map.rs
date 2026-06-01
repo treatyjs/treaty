@@ -58,6 +58,47 @@ pub fn redact_server_bodies_in_map(map_json: &str, server_bodies: &[String]) -> 
     serde_json::to_string(&value).unwrap_or_else(|_| map_json.to_string())
 }
 
+/// Build a Source Map v3 JSON document for an extracted plain-`.ts` SERVER module's CLIENT output,
+/// with the server-fn bodies redacted out of its embedded `sourcesContent`.
+///
+/// The file-level `'use server'` (and `$$`-suffix) extraction path produces a client module that is a
+/// transform of the original `.ts`: the server-fn declarations are lifted to the backend artifact and
+/// each is re-exported as a typed RPC binding. The client must still ship a v3 map, and — exactly like
+/// the inline `server { … }` path — that map must NOT carry the lifted server-fn bodies in its
+/// `sourcesContent`.
+///
+/// This emits a minimal but valid v3 map: `sources = [source_name]`, `file = generated_name`, an empty
+/// `names`/`mappings` (the additive byte-for-byte mapping is not threaded through the marker-extraction
+/// pre-pass, so no per-token mappings are claimed), and `sourcesContent = [redacted original source]`,
+/// where every `server_bodies` occurrence in the original source is blanked to position-preserving
+/// whitespace via [`redact_server_bodies_in_map`]'s machinery. The server source text is therefore
+/// absent from the client map's `sourcesContent`, while line/column positions of the surviving client
+/// text are preserved.
+pub fn client_map_with_redacted_source(
+    original_source: &str,
+    source_name: &str,
+    generated_name: &str,
+    server_bodies: &[String],
+) -> String {
+    // Blank each non-empty server body out of the embedded original source, preserving positions.
+    let mut content = original_source.to_string();
+    for body in server_bodies.iter().filter(|b| !b.is_empty()) {
+        content = blank_all_occurrences(&content, body);
+    }
+
+    let map = Value::Object({
+        let mut m = serde_json::Map::new();
+        m.insert("version".to_string(), Value::from(3u8));
+        m.insert("file".to_string(), Value::from(generated_name));
+        m.insert("sources".to_string(), Value::Array(vec![Value::from(source_name)]));
+        m.insert("sourcesContent".to_string(), Value::Array(vec![Value::from(content)]));
+        m.insert("names".to_string(), Value::Array(Vec::new()));
+        m.insert("mappings".to_string(), Value::from(""));
+        m
+    });
+    serde_json::to_string(&map).unwrap_or_default()
+}
+
 /// Replace every occurrence of `needle` in `haystack` with position-preserving whitespace: each
 /// matched character becomes a space, except `\n` and `\r`, which are preserved so line numbers (and
 /// the byte length of the content) are unchanged. Non-overlapping, left-to-right.
@@ -164,6 +205,34 @@ mod tests {
     fn map_without_sources_content_is_returned_unchanged() {
         let map = serde_json::json!({ "version": 3, "mappings": "" }).to_string();
         assert_eq!(redact_server_bodies_in_map(&map, &["x".to_string()]), map);
+    }
+
+    #[test]
+    fn client_map_builder_redacts_bodies_and_stays_valid_v3() {
+        let body = "async function loadSecret() { return 'postgres://secret'; }";
+        let source = format!("'use server'\n{body}\nexport const k = 1;\n");
+
+        let map = client_map_with_redacted_source(&source, "x.ts", "x.js", &[body.to_string()]);
+        let value: Value = serde_json::from_str(&map).expect("valid JSON");
+
+        assert_eq!(value["version"], serde_json::json!(3));
+        assert_eq!(value["file"], serde_json::json!("x.js"));
+        assert_eq!(value["sources"], serde_json::json!(["x.ts"]));
+
+        let content = value["sourcesContent"][0].as_str().unwrap();
+        // Body gone, surrounding text preserved, length unchanged (positions intact).
+        assert!(!content.contains("postgres://secret"), "secret leaked: {content}");
+        assert!(!content.contains("async function loadSecret"), "signature leaked: {content}");
+        assert!(content.contains("export const k = 1;"), "tail lost: {content}");
+        assert_eq!(content.len(), source.len(), "length changed (positions broken)");
+    }
+
+    #[test]
+    fn client_map_builder_with_no_bodies_embeds_source_verbatim() {
+        let source = "export const add = (a, b) => a + b;\n";
+        let map = client_map_with_redacted_source(source, "m.ts", "m.js", &[]);
+        let value: Value = serde_json::from_str(&map).expect("valid JSON");
+        assert_eq!(value["sourcesContent"][0].as_str().unwrap(), source);
     }
 
     #[test]
