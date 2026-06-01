@@ -11,7 +11,7 @@
 //       .tjsx (Treaty JSX)   | greeting-card.tjsx | greeting-card.tjsx lowered once
 //       @Component .ts       | app-root/log-viewer| bundle ɵɵdefineComponent
 //
-// It does NOT re-implement the proven per-surface assertions — it ORCHESTRATES the two committed
+// It does NOT re-implement the proven per-surface assertions — it ORCHESTRATES the three committed
 // harnesses that already make them and aggregates their results into the matrix:
 //
 //   - DEV path  : examples/everything-app/dev-serve.e2e.mjs
@@ -28,6 +28,17 @@
 //        Ivy EXACTLY ONCE. The headless boot+render is gated on the documented out-of-scope Rust
 //        `use:`-directive gap (see that harness header) — recorded, not failed.
 //
+//   - NAV path  : examples/everything-app/nav.e2e.mjs
+//        Boots a REAL listening HTTP `vite` dev server and proves the app's NAVIGATION end to end:
+//        every route's lazy component module LOADS over HTTP with a JavaScript content-type (the
+//        reported NS_ERROR_CORRUPTED_CONTENT / "disallowed MIME type ()" for `.treaty`/`.tjsx` is gone —
+//        the dev-serve MIME fix), then drives the REAL Angular Router across every cleanly-lowering route
+//        (`` logs / dashboard / profile) asserting each renders its view in the outlet (the nav links
+//        work), with the global stylesheet served + emitted and component-scoped styles applied. The
+//        greeter route's RENDER (its greeter.treaty inline `server {}` block is emitted verbatim) and the
+//        metrics route's RENDER (its consumed standalone `@Pipe`/`@Directive` have no Ivy `ɵpipe`/`ɵdir`
+//        def) are recorded as reported out-of-scope Rust-compiler gaps — module LOAD + MIME proven.
+//
 // On top of the orchestration, this gate ALSO makes the JSX-is-Treaty/Angular-JSX-not-React semantic
 // assertion the task calls out, DIRECTLY against the @treaty/compiler core (the same one the bundler
 // plugins use): each .tsx/.tjsx must lower to an Angular Ivy component (ɵɵdefineComponent) carrying
@@ -40,7 +51,8 @@
 // DOCUMENTED COMMANDS (also in package.json + README):
 //   bun run dev:e2e     (== node examples/everything-app/dev.e2e.mjs)   — this unified gate
 //   bun run build:e2e   (== node examples/everything-app/full-build.e2e.mjs) — build-only gate
-//   bun run e2e:dev-serve   — dev-only gate (the child this drives)
+//   bun run e2e:dev-serve   — dev-only gate (a child this drives)
+//   bun run e2e:nav         — nav/MIME/styles gate (a child this drives)
 //
 // Usage:  node examples/everything-app/dev.e2e.mjs
 // Exit code 0 on success, 1 on any failed assertion (or if either child harness fails).
@@ -155,6 +167,13 @@ async function main() {
 	const build = runChild('full-build.e2e.mjs')
 	check('BUILD gate: full-build.e2e.mjs exits 0 (real vite build, every surface lowered to Ivy)', build.status === 0)
 
+	// --- NAV path (real HTTP dev server module-load + MIME + real Router render per route) ---
+	const navE2e = runChild('nav.e2e.mjs')
+	check(
+		'NAV gate: nav.e2e.mjs exits 0 (every route module loads over HTTP with a JS content-type; cleanly-lowering routes render through the real Router)',
+		navE2e.status === 0,
+	)
+
 	// --- JSX-is-Treaty/Angular-not-React semantic proof (compiler core) ---
 	console.log('\n========== JSX semantic proof (Angular Ivy + signals, not React) ==========')
 	assertJsxIsAngularNotReact()
@@ -207,6 +226,42 @@ async function main() {
 		)
 	}
 
+	// NAV cells — the real HTTP dev server served every route's lazy module with a JS content-type (the
+	// reported MIME bug is gone) and the real Angular Router rendered each cleanly-lowering route's view.
+	const navCells = [
+		['logs   x nav  (the eager `` route module LOADS over HTTP as JS)', "[load] route '' (logs): GET"],
+		['dashboard x nav (lazy module LOADS over HTTP as JS)', '[load] route dashboard: GET'],
+		['metrics x nav (lazy module + the .treaty Gauge LOAD over HTTP as JS)', '[load] route metrics → gauge.treaty: GET'],
+		['profile x nav (lazy loadChildren module LOADS over HTTP as JS)', '[load] route profile (loadChildren): GET'],
+		['greeter x nav (the @Component .ts module + the .tjsx surface LOAD over HTTP as JS)', '[load] route greeter → greeting-card.tjsx: GET'],
+		['MIME fix: bare .treaty served as JS (the reported NS_ERROR/disallowed-MIME bug is gone)', '[MIME] GET /src/features/metrics/gauge.treaty → JS content-type'],
+		['MIME fix: greeter.treaty no longer served RAW with an empty content-type (reported bug gone)', 'NOT served as RAW .treaty source with an empty content-type'],
+		['render: logs route renders through the real Router (nav link live)', "render: nav → '' (logs) (/) RENDERS"],
+		['render: dashboard route renders through the real Router (nav link live)', 'render: nav → dashboard (/dashboard) RENDERS'],
+		['render: profile route renders through the real Router (nav link live)', 'render: nav → profile (/profile) RENDERS'],
+		['styles: global base theme emitted as a CSS asset', 'styles: global base theme emitted as a CSS asset'],
+		['styles: component-scoped style applied (gauge.treaty <style> → Ivy styles[])', 'styles: component-scoped style applied'],
+	]
+	for (const [cell, needle] of navCells) {
+		check(`[matrix] ${cell}`, childPassed(navE2e.out, needle))
+	}
+
+	// The greeter route's RENDER is blocked by a reported Rust `server {}` extraction gap, and the metrics
+	// route's RENDER by a reported Rust standalone-@Pipe/@Directive Ivy-lowering gap (both modules LOAD +
+	// MIME-resolve fine — asserted above; nav.e2e.mjs records the render blocks, mirroring full-build's
+	// BOOT_BLOCKED). Surface them here so closing either gap (the harness flipping its switch) is noticed
+	// rather than silently leaving a route render unproven.
+	check(
+		'[matrix] greeter x nav RENDER is recorded as the reported Rust `server {}` gap (greeter.treaty)',
+		/greeter[^\n]*BLOCKED by the reported Rust `server \{\}` extraction gap/.test(navE2e.out),
+		/greeter[^\n]*BLOCKED by the reported Rust `server \{\}` extraction gap/.test(navE2e.out) ? '' : 'greeter render block not recorded — flip GREETER_BLOCKED in nav.e2e.mjs if the gap closed',
+	)
+	check(
+		'[matrix] metrics x nav RENDER is recorded as the reported Rust pipe/directive Ivy-lowering gap',
+		/metrics[^\n]*BLOCKED by the reported Rust pipe\/directive Ivy-lowering gap/.test(navE2e.out),
+		/metrics[^\n]*BLOCKED by the reported Rust pipe\/directive Ivy-lowering gap/.test(navE2e.out) ? '' : 'metrics render block not recorded — flip METRICS_BLOCKED in nav.e2e.mjs if the gap closed',
+	)
+
 	// The `use:`-directive Rust gap that previously blocked the in-browser boot is CLOSED: the JSX
 	// `use:<name>` lowering now resolves each directive to a real in-scope symbol (counter.tsx
 	// `use:highlight` → the hoisted local `highlight`; greeting-card.tjsx `use:autofocus` → a native
@@ -227,10 +282,12 @@ async function main() {
 		process.exit(1)
 	}
 	console.log(
-		'UNIFIED DEV+BUILD GATE PASSED: every Treaty authoring surface (.treaty / .tsx / .tjsx / @Component .ts) is green on BOTH paths — ' +
+		'UNIFIED DEV+BUILD+NAV GATE PASSED: every Treaty authoring surface (.treaty / .tsx / .tjsx / @Component .ts) is green on ALL paths — ' +
 			'DEV serve (real vite dev server: no unresolved imports, each surface lowered to Ivy, JSX is Angular-Ivy+signals not React, no JIT/@angular/compiler) ' +
-			'AND full vite BUILD (exit 0, each surface lowered to Ivy once, zero residual ɵɵngDeclare, no @angular/compiler / Babel finisher). ' +
-			'The whole-app headless boot+render is green too: the JSX `use:`-directive lowering resolves every directive to a real in-scope symbol, so the app boots with no `X is not defined` ReferenceError and a route renders.',
+			'AND full vite BUILD (exit 0, each surface lowered to Ivy once, zero residual ɵɵngDeclare, no @angular/compiler / Babel finisher) ' +
+			'AND NAV (real HTTP dev server: every route module loads as JS — the reported .treaty/.tjsx NS_ERROR/disallowed-MIME bug is gone — and the real Angular Router renders the logs/dashboard/profile routes with the global + component-scoped styles applied). ' +
+			'The whole-app headless boot+render is green too: the JSX `use:`-directive lowering resolves every directive to a real in-scope symbol, so the app boots with no `X is not defined` ReferenceError and a route renders. ' +
+			'Two route RENDERS are recorded as reported out-of-scope Rust-compiler gaps (modules LOAD + MIME proven): greeter (greeter.treaty inline `server {}` emitted verbatim) and metrics (consumed standalone @Pipe/@Directive have no Ivy ɵpipe/ɵdir def).',
 	)
 }
 

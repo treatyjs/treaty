@@ -222,17 +222,62 @@ full production build — in one run, and prints the explicit pass/fail matrix:
 | `.tjsx` (JSX)     | `greeting-card.tjsx` → Ivy   | `greeting-card.tjsx` lowered once|
 | `@Component` `.ts`| `app-root` / `log-viewer`→Ivy| bundle `ɵɵdefineComponent`       |
 
-It orchestrates the two committed harnesses (`dev-serve.e2e.mjs` for the DEV path
+It orchestrates the three committed harnesses (`dev-serve.e2e.mjs` for the DEV path
 — a real `vite` dev server over the whole app, proving the user's
 `@treaty/jsx/jsx-dev-runtime could not be resolved` dep-scan error is gone and
 every surface is served lowered to Ivy with no JIT; `full-build.e2e.mjs` for the
 BUILD path — a real `vite build`, exit `0`, every surface lowered to Ivy once with
-zero residual `ɵɵngDeclare` and no `@angular/compiler` / Babel finisher), then
-aggregates their per-surface results into the matrix above. It additionally proves,
-directly against the `@treaty/compiler` core, that each `.tsx`/`.tjsx` lowers to an
-**Angular Ivy** component (`ɵɵdefineComponent` + Angular `signal()`/`computed()`),
-**not** a React element tree (no `createElement(` / `jsxDEV(` / `React.`) and with
-no foreign `@treaty/jsx` runtime import escaping to the bundler.
+zero residual `ɵɵngDeclare` and no `@angular/compiler` / Babel finisher;
+`nav.e2e.mjs` for the NAV path — see below), then aggregates their per-surface
+results into the matrix above. It additionally proves, directly against the
+`@treaty/compiler` core, that each `.tsx`/`.tjsx` lowers to an **Angular Ivy**
+component (`ɵɵdefineComponent` + Angular `signal()`/`computed()`), **not** a React
+element tree (no `createElement(` / `jsxDEV(` / `React.`) and with no foreign
+`@treaty/jsx` runtime import escaping to the bundler.
+
+### The NAV + MIME + styles dev gate (`nav.e2e.mjs`)
+
+`nav.e2e.mjs` proves the app's **navigation** works end to end and guards the
+reported dev-serve **MIME** bug, where navigating to the `greeter` route failed in
+the browser with `GET /src/features/greeter/greeter.treaty?import` →
+`NS_ERROR_CORRUPTED_CONTENT` / *"blocked because of a disallowed MIME type ()"* —
+because Vite labels a served module `text/javascript` only when the request reaches
+its transform branch (a fixed known-JS-extension regex covering `.[jt]sx?`/… plus
+`?import`/CSS/script fetches). `.treaty`/`.tjsx` are not in that regex, so a request
+for one **without** `?import` skipped transform and was served **raw** with an
+**empty** content-type, which the browser blocked → the lazy route never loaded →
+the nav links appeared dead. The `@treaty/vite` dev-serve fix (an `enforce:'pre'`
+`configureServer` middleware that injects `?import` for bare `.treaty`/`.tjsx`
+requests) routes those through Vite's JS transform branch so they are labelled
+`text/javascript`.
+
+The harness boots a **real listening HTTP `vite` dev server** and, for **every**
+route in the app's router graph, fetches the route's lazy component module over
+HTTP — asserting each is served with a **JavaScript content-type** and a lowered
+Ivy body, never an empty/octet-stream type, never the raw authoring source (the
+bare `.treaty`/`.tjsx` URLs are fetched both with and without `?import`). It then
+does a real `vite build` of the app and, in a headless jsdom, **drives the real
+Angular `Router`** across every cleanly-lowering route (`` logs / `dashboard` /
+`profile`), asserting each renders its view in the `<router-outlet>` (the nav links
+actually swap the view), with the global base stylesheet served + emitted and a
+component-scoped style applied.
+
+Two route **renders** are **recorded as reported, out-of-scope Rust-compiler gaps**
+(their modules **LOAD** + MIME-resolve fine — asserted as hard requirements; only
+the in-browser render is blocked, owned by `libs/treaty-ivy` / `libs/authoring/node`):
+
+- **greeter** — `greeter.treaty`'s inline `server { … }` block is emitted
+  **verbatim** into the lowered module instead of being extracted, producing
+  non-parseable JS (`server { async function … }` → esbuild type-strip throws
+  `Unexpected "{"`), so the module fails to transform (a 500 — **not** the MIME
+  failure; the request **did** reach the JS transform branch, proving the MIME fix).
+  Flip `GREETER_BLOCKED` to `false` when the `server {}` extraction lands in Rust.
+- **metrics** — its consumed standalone `@Pipe` (`percent01`) / `@Directive`
+  (`HighlightDelta`) are a **pass-through** at the Treaty compiler stage (only
+  components lower to `ɵɵdefineComponent`), so they ship with **no Ivy
+  `ɵpipe`/`ɵdir` definition** and Ivy's `ɵɵpipe` throws at render time. Flip
+  `METRICS_BLOCKED` to `false` when the Rust compiler lowers standalone
+  `@Pipe`/`@Directive` to Ivy.
 
 The only step NOT asserted as a hard requirement is the **whole-app headless
 boot+render**, which is gated on a documented out-of-scope Rust-compiler gap (the
@@ -250,9 +295,12 @@ bun run build:e2e        # == node examples/everything-app/full-build.e2e.mjs
 
 # Dev-only gate (the real vite dev server the unified gate drives):
 bun run e2e:dev-serve    # == node examples/everything-app/dev-serve.e2e.mjs
+
+# Nav / MIME / styles gate (real HTTP dev server module-load + real Router render):
+bun run e2e:nav          # == node examples/everything-app/nav.e2e.mjs
 ```
 
-Exit code `0` on success, `1` if either child harness fails or any matrix cell is
+Exit code `0` on success, `1` if any child harness fails or any matrix cell is
 not green.
 
 ## A note on the REPL plugin-output viewer
