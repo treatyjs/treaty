@@ -300,10 +300,58 @@ fn collect_element_tag_usages(
                 if candidates.contains(pascal.as_str()) {
                     used.insert(pascal);
                 }
+                // ATTRIBUTE-selector auto-import: an imported directive whose class name folds to
+                // an attribute used on this element (e.g. `RouterLink` ↔ `routerLink="/x"`, or the
+                // bound form `[routerLink]`) is a real template usage and must land in
+                // `dependencies`. Angular's ngtsc matches the directive's `[routerLink]` selector
+                // against the attribute via the SelectorMatcher; lacking the external `.d.ts`
+                // selector here, we fold attribute/input/output NAMES to PascalCase and treat a hit
+                // against the imported candidate set as that same match (the Angular naming
+                // convention `RouterLink → [routerLink]` holds for every attribute-selector directive).
+                collect_attr_name_usages(
+                    el.attributes.iter().map(|a| a.name.as_str()),
+                    candidates,
+                    used,
+                );
+                collect_attr_name_usages(
+                    el.inputs.iter().map(|i| i.name.as_str()),
+                    candidates,
+                    used,
+                );
+                collect_attr_name_usages(
+                    el.outputs.iter().map(|o| o.name.as_str()),
+                    candidates,
+                    used,
+                );
                 collect_element_tag_usages(&el.children, candidates, used);
             }
             Node::Component(c) => collect_element_tag_usages(&c.children, candidates, used),
-            Node::Template(t) => collect_element_tag_usages(&t.children, candidates, used),
+            Node::Template(t) => {
+                // Structural-directive / `ng-template` attribute usages match the same way.
+                collect_attr_name_usages(
+                    t.attributes.iter().map(|a| a.name.as_str()),
+                    candidates,
+                    used,
+                );
+                collect_attr_name_usages(
+                    t.inputs.iter().map(|i| i.name.as_str()),
+                    candidates,
+                    used,
+                );
+                collect_attr_name_usages(
+                    t.outputs.iter().map(|o| o.name.as_str()),
+                    candidates,
+                    used,
+                );
+                for ta in &t.template_attrs {
+                    let name = match ta {
+                        crate::template::r3_ast::TemplateAttr::Bound(b) => b.name.as_str(),
+                        crate::template::r3_ast::TemplateAttr::Text(tx) => tx.name.as_str(),
+                    };
+                    collect_attr_name_usages(std::iter::once(name), candidates, used);
+                }
+                collect_element_tag_usages(&t.children, candidates, used);
+            }
             Node::Content(c) => collect_element_tag_usages(&c.children, candidates, used),
             Node::DeferredBlock(b) => collect_element_tag_usages(&b.children, candidates, used),
             Node::DeferredBlockPlaceholder(b) => {
@@ -332,6 +380,31 @@ fn collect_element_tag_usages(
                 }
             }
             _ => {}
+        }
+    }
+}
+
+/// Fold each attribute name to PascalCase and record a usage for any imported candidate class name
+/// it equals. This is the attribute-selector arm of auto-import: a directive imported by class name
+/// (`RouterLink`) is "used" when its conventional attribute selector (`[routerLink]`) appears on a
+/// template node, mirroring how Angular's SelectorMatcher matches `[routerLink]` against the
+/// element's `routerLink` attribute. Bound (`[x]`) and plain (`x="…"`) attributes share the same
+/// underlying name, so both forms resolve identically here.
+fn collect_attr_name_usages<'a>(
+    names: impl Iterator<Item = &'a str>,
+    candidates: &std::collections::HashSet<&str>,
+    used: &mut std::collections::HashSet<String>,
+) {
+    for name in names {
+        // Skip Angular structural/template microsyntax + binding sugar prefixes that are never
+        // part of a directive's attribute name.
+        let bare = name.trim_start_matches('*');
+        if bare.is_empty() {
+            continue;
+        }
+        let pascal = tag_to_pascal_case(bare);
+        if candidates.contains(pascal.as_str()) {
+            used.insert(pascal);
         }
     }
 }

@@ -3575,6 +3575,88 @@ mod tests {
         );
     }
 
+    #[test]
+    fn auto_imports_attribute_selector_directive_into_dependencies() {
+        // BUG 1 regression: `RouterLink` is imported and used ONLY as the `routerLink` attribute on
+        // an `<a>` (its conventional `[routerLink]` selector — there is no `<RouterLink>` element).
+        // It must land in `dependencies`; the attribute-selector arm of auto-import resolves it the
+        // same way Angular's SelectorMatcher matches `[routerLink]` against the `routerLink` attr.
+        let src = r#"
+            import { RouterLink } from "@angular/router";
+            @Component({selector:"app-root",imports:[RouterLink],template:"<a routerLink=\"/x\">go</a>"})
+            export class AppRoot {}
+        "#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+        assert!(code.contains(ZWS), "no defineComponent; got: {code}");
+        let deps = extract_balanced(code, "dependencies:")
+            .unwrap_or_else(|| panic!("no dependencies array; got: {code}"));
+        assert!(
+            deps.contains("RouterLink"),
+            "attribute-selector RouterLink missing from dependencies; got: {deps}"
+        );
+    }
+
+    #[test]
+    fn auto_imports_both_element_and_attribute_directives_into_dependencies() {
+        // BUG 1 regression (the exact everything-app shell shape): `[RouterOutlet, RouterLink]` over
+        // a template that uses BOTH `<router-outlet>` (element selector) and `routerLink="…"`
+        // (attribute selector). BOTH must appear in `dependencies` — previously only RouterOutlet
+        // (the element-tag match) survived and RouterLink (the attribute match) was dropped.
+        let src = r#"
+            import { RouterLink, RouterOutlet } from "@angular/router";
+            @Component({
+                selector:"app-root",
+                imports:[RouterOutlet, RouterLink],
+                template:"<a routerLink=\"/dashboard\">dashboard</a><router-outlet></router-outlet>"
+            })
+            export class AppRoot {}
+        "#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+        let deps = extract_balanced(code, "dependencies:")
+            .unwrap_or_else(|| panic!("no dependencies array; got: {code}"));
+        assert!(
+            deps.contains("RouterOutlet"),
+            "element-selector RouterOutlet missing from dependencies; got: {deps}"
+        );
+        assert!(
+            deps.contains("RouterLink"),
+            "attribute-selector RouterLink missing from dependencies; got: {deps}"
+        );
+    }
+
+    #[test]
+    fn unused_attribute_selector_import_excluded_from_dependencies() {
+        // Tree-shaking parity: an imported directive whose conventional attribute selector is NEVER
+        // present in the template must NOT leak into `dependencies`. Here `RouterLink` is imported
+        // but the template uses only `<router-outlet>`, so only `RouterOutlet` is a real usage.
+        let src = r#"
+            import { RouterLink, RouterOutlet } from "@angular/router";
+            @Component({
+                selector:"app-root",
+                imports:[RouterOutlet, RouterLink],
+                template:"<router-outlet></router-outlet>"
+            })
+            export class AppRoot {}
+        "#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+        let deps = extract_balanced(code, "dependencies:")
+            .unwrap_or_else(|| panic!("no dependencies array; got: {code}"));
+        assert!(
+            deps.contains("RouterOutlet"),
+            "used RouterOutlet missing from dependencies; got: {deps}"
+        );
+        assert!(
+            !deps.contains("RouterLink"),
+            "unused RouterLink leaked into dependencies; got: {deps}"
+        );
+    }
+
     /// Extract the balanced `[...]` array value that follows `key` in `code` (e.g.
     /// `dependencies:[...]`). Returns the slice including the brackets, or `None` if absent.
     fn extract_balanced(code: &str, key: &str) -> Option<String> {
