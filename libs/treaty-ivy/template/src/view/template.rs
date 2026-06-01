@@ -529,18 +529,37 @@ impl LocalResolver for NestedViewResolver<'_> {
     }
 }
 
-/// Resolver for an event-handler body: roots the implicit receiver at `ctx`, resolves any in-scope
-/// `@for` loop variables to their generated locals, and resolves `$event` to the bare `$event`
-/// handler parameter (Angular's `resolveDollarEvent` — `$event` reads must NOT become `ctx.$event`).
+/// Resolver for an event-handler body: roots the implicit receiver at `ctx` (the component) for a
+/// root-view listener, or at the `ɵɵnextContext()`-walked `ctx_r<level>` for an embedded-view
+/// listener (so a read of a COMPONENT/ancestor symbol from inside a `@for`/`@if` handler does not
+/// bind to the row context). Resolves in-scope `@for` loop variables to their generated locals, and
+/// `$event` to the bare `$event` handler parameter (Angular's `resolveDollarEvent` — `$event` reads
+/// must NOT become `ctx.$event`).
 struct ListenerResolver<'a> {
     vars: &'a [LoopVar],
     /// `@let` source-name → generated readContextLet local, for lets the handler reads cross-view.
     context_let_locals: &'a [(String, String)],
+    /// The receiver an ancestor/component read roots at: `ctx` at the root view, else the shared
+    /// `ctx_r<level>` obtained via `ɵɵnextContext()` inside the handler.
+    ctx_name: String,
+    /// Whether this handler is in an embedded (nested) view, so an implicit read is an ancestor read.
+    is_embedded: bool,
+    /// Set when the handler read the implicit receiver in an embedded view (an ancestor/component
+    /// read occurred), so [`TemplateDefinitionBuilder::build_listener`] emits the matching
+    /// `const ctx_r<level> = ɵɵnextContext(<hops>);` inside the handler body.
+    reads_ancestor: &'a std::cell::Cell<bool>,
 }
 
 impl LocalResolver for ListenerResolver<'_> {
     fn resolve_implicit_receiver(&self) -> Expr {
-        o::variable(CONTEXT_NAME, None)
+        if self.is_embedded {
+            // An ancestor/component read from a nested-view handler: flag the need and root at the
+            // `ɵɵnextContext()`-walked shared context var (`ctx_r<level>`).
+            self.reads_ancestor.set(true);
+            o::variable(self.ctx_name.clone(), None)
+        } else {
+            o::variable(CONTEXT_NAME, None)
+        }
     }
 
     fn maybe_resolve_local(&self, name: &str) -> Option<Expr> {
@@ -4482,30 +4501,110 @@ impl TemplateDefinitionBuilder {
             context_let_locals.push((r.name.clone(), r.local_name.clone()));
         }
 
-        let needs_view_restore = !referenced_lets.is_empty() || !referenced_refs.is_empty();
+        // A `@for` loop variable (`item` / `$index` / `$count` / …) read in an EMBEDDED-view handler
+        // is a cross-view read too: the listener closure cannot see the loop-var `const`s of the
+        // update block, so each referenced loop var is re-read off the RESTORED view
+        // (`const x_r = restoredCtx.$implicit`) and the view must be saved/restored
+        // (`generate_variables.ts`, callback scope). Root listeners have no loop vars.
+        let referenced_loop_vars: Vec<LoopVar> = if self.view_level > 0 {
+            self.loop_vars
+                .iter()
+                .filter(|v| expr_references_implicit(&output.handler, &v.source_name))
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // Pre-mint the shared ancestor-context name (`ctx_r<level>`); it is only EMITTED if the
+        // handler actually reads an ancestor/component symbol (tracked by `reads_ancestor`, a flag
+        // LOCAL to this handler so it never triggers the update block's own `ɵɵnextContext`). At the
+        // root view the receiver stays the bare component `ctx`.
+        let reads_ancestor = std::cell::Cell::new(false);
+        let ctx_name = if self.view_level > 0 {
+            self.next_context_var_name()
+        } else {
+            CONTEXT_NAME.to_string()
+        };
 
         // Lower the handler against a resolver that keeps `$event` a bare parameter read (Angular
-        // `resolveDollarEvent`), rewrites any in-scope `@for` loop vars to their locals, and resolves
-        // cross-view `@let` reads to their `ɵɵreadContextLet` locals.
+        // `resolveDollarEvent`), rewrites any in-scope `@for` loop vars to their locals, resolves
+        // cross-view `@let` reads to their `ɵɵreadContextLet` locals, and roots an ancestor/component
+        // read at `ctx_r<level>` (embedded view) or the bare component `ctx` (root view).
         let resolver = ListenerResolver {
             vars: &self.loop_vars,
             context_let_locals: &context_let_locals,
+            ctx_name: ctx_name.clone(),
+            is_embedded: self.view_level > 0,
+            reads_ancestor: &reads_ancestor,
         };
         let converted = convert_action_binding_with(&output.handler, &resolver);
 
-        // Handler body, in order: `ɵɵrestoreView(savedView)` (when reading cross-view state), the
-        // `ɵɵreadContextLet` `const`s, any spilled statements, then the `return`. The final value is
-        // wrapped in `ɵɵresetView(...)` when the view was restored.
+        let needs_next_context = reads_ancestor.get();
+        // A view restore is needed when the handler reads ANY cross-view state: a `@let`, a `#ref`, a
+        // `@for` loop variable, or (to make `ɵɵnextContext()` walk from the right view) an
+        // ancestor/component symbol.
+        let needs_view_restore = !referenced_lets.is_empty()
+            || !referenced_refs.is_empty()
+            || !referenced_loop_vars.is_empty()
+            || needs_next_context;
+
+        // Handler body, in Angular `generate_variables.ts` (callback) order: `ɵɵrestoreView(savedView)`
+        // (capturing the restored view when a loop var is read off it), the loop-variable `const`s,
+        // the `ɵɵreadContextLet`/`ɵɵreference` `const`s, the `const ctx_r<level> = ɵɵnextContext(hops)`,
+        // any spilled statements, then the `return`. The final value is wrapped in `ɵɵresetView(...)`
+        // when the view was restored.
         let mut body: Vec<Stmt> = Vec::new();
         if needs_view_restore {
             let saved = self.saved_view_var_name();
-            body.push(
-                o::import_expr(R3::RestoreView.reference(), None)
-                    .call_fn(vec![o::variable(saved, None)], false)
-                    .to_stmt(),
-            );
+            let restore_call = o::import_expr(R3::RestoreView.reference(), None)
+                .call_fn(vec![o::variable(saved, None)], false);
+            if referenced_loop_vars.is_empty() {
+                // No loop var to read off it — a bare restore suffices.
+                body.push(restore_call.to_stmt());
+            } else {
+                // Capture the restored view so the loop variables can be read off it.
+                self.var_counter += 1;
+                let restored = format!("$restored_{}$", self.var_counter);
+                body.push(Stmt::with_modifiers(
+                    StmtKind::DeclareVar { name: restored.clone(), value: Some(restore_call), ty: None },
+                    StmtModifier::FINAL,
+                ));
+                for v in &referenced_loop_vars {
+                    // The item reads `ctx.$implicit`; the special vars (`$index`/`$count`/…) read their
+                    // own name — the same mapping as `collect_loop_vars`.
+                    let prop = if v.source_name.starts_with('$') {
+                        v.source_name.clone()
+                    } else {
+                        "$implicit".to_string()
+                    };
+                    body.push(Stmt::with_modifiers(
+                        StmtKind::DeclareVar {
+                            name: v.local_name.clone(),
+                            value: Some(o::variable(restored.clone(), None).prop(prop)),
+                            ty: None,
+                        },
+                        StmtModifier::FINAL,
+                    ));
+                }
+            }
         }
         body.extend(let_reads);
+        if needs_next_context {
+            // `ɵɵnextContext(hops)` — walk up `view_level` levels to the component (bare when one).
+            let hops = self.view_level;
+            let args = if hops <= 1 { vec![] } else { vec![num(hops as f64)] };
+            body.push(Stmt::with_modifiers(
+                StmtKind::DeclareVar {
+                    name: ctx_name.clone(),
+                    value: Some(
+                        o::import_expr(R3::NextContext.reference(), None).call_fn(args, false),
+                    ),
+                    ty: None,
+                },
+                StmtModifier::FINAL,
+            ));
+        }
         body.extend(converted.stmts);
         let ret = if needs_view_restore {
             o::import_expr(R3::ResetView.reference(), None).call_fn(vec![converted.expr], false)

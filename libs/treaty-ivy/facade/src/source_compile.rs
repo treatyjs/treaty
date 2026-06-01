@@ -3316,6 +3316,36 @@ mod tests {
     }
 
     #[test]
+    fn nested_for_in_if_listener_walks_to_component_context() {
+        // Regression (runtime crash `ctx.active is undefined`): a listener inside `@for` inside `@if`
+        // reads a COMPONENT signal (`active`) and the `@for` loop var (`tab`). The component signal
+        // must be reached via `ɵɵnextContext(2)` (NOT the `@for` row `ctx`), and the loop var read off
+        // the RESTORED view — with `ɵɵgetCurrentView`/`ɵɵrestoreView`/`ɵɵresetView` scaffolding,
+        // faithful to Angular's `generate_variables` for callbacks.
+        let src = r#"@Component({template:"@if (tabs().length) { @for (tab of tabs(); track tab) { <button (click)=\"active.set(tab)\">{{ tab }}</button> } }"}) export class C { tabs = signal([]); active = signal(""); }"#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+
+        // The broken form bound the component signal to the @for ROW context — must NOT appear.
+        assert!(
+            !code.contains("ctx.active"),
+            "component signal `active` wrongly bound to the @for row context (`ctx.active`); got: {code}"
+        );
+        // Full embedded-view listener scaffolding is present.
+        assert!(code.contains("\u{0275}\u{0275}getCurrentView("), "missing ɵɵgetCurrentView; got: {code}");
+        assert!(code.contains("\u{0275}\u{0275}restoreView("), "missing ɵɵrestoreView; got: {code}");
+        assert!(code.contains("\u{0275}\u{0275}resetView("), "missing ɵɵresetView; got: {code}");
+        // The component context is reached by walking up TWO levels (For -> Conditional -> Component).
+        assert!(
+            code.contains("\u{0275}\u{0275}nextContext(2)"),
+            "listener must walk up 2 levels to the component (ɵɵnextContext(2)); got: {code}"
+        );
+        // The loop var is re-read off the restored view (`.$implicit`).
+        assert!(code.contains(".$implicit"), "loop var not read off the restored view; got: {code}");
+    }
+
+    #[test]
     fn pipe_and_injectable_on_one_class_emits_pipe_fac_and_prov() {
         // A class with BOTH `@Pipe` and `@Injectable` (either order) emits `ɵfac` (pipe-target
         // factory `ɵɵdirectiveInject(Dep, 16)`), `ɵpipe`, AND `ɵprov` — the pipe factory takes
