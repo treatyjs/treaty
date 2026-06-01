@@ -105,6 +105,43 @@ fn decorator_object<'a>(dec: &'a Decorator<'a>) -> Option<&'a oxc_ast::ast::Obje
     None
 }
 
+/// Find a class's leading decorator whose callee identifier is `name` (`@Injectable`, `@Pipe`, …),
+/// if present. Used to detect the multi-decorator case (a class carrying BOTH `@Pipe` and
+/// `@Injectable`), where ngtsc compiles every recognized trait rather than only the first.
+fn class_decorator<'a>(class: &'a Class<'a>, name: &str) -> Option<&'a Decorator<'a>> {
+    class
+        .decorators
+        .iter()
+        .find(|dec| decorator_name(dec) == Some(name))
+}
+
+/// The byte span to excise from a kept class declaration so EVERY recognized Angular decorator is
+/// removed (not only the primary). Returns `(start, end)` covering from the first recognized Angular
+/// decorator to the last — they are contiguous on a class, so a single contiguous excision removes
+/// them all (the multi-decorator `@Pipe`+`@Injectable` case). When only the primary decorator is
+/// recognized this collapses to that decorator's own span. `primary` is the fallback span used if the
+/// scan somehow finds none (it always finds at least `primary`).
+fn recognized_decorator_strip_span(class: &Class, primary: &Decorator) -> (u32, u32) {
+    let mut start: Option<u32> = None;
+    let mut end: Option<u32> = None;
+    for dec in &class.decorators {
+        let recognized = matches!(
+            decorator_name(dec),
+            Some("Component" | "Directive" | "Pipe" | "NgModule" | "Injectable")
+        );
+        if !recognized {
+            continue;
+        }
+        let s = dec.span();
+        start = Some(start.map_or(s.start, |cur| cur.min(s.start)));
+        end = Some(end.map_or(s.end, |cur| cur.max(s.end)));
+    }
+    (
+        start.unwrap_or(primary.span().start),
+        end.unwrap_or(primary.span().end),
+    )
+}
+
 /// Reads the static-identifier name of a property key (the common case: `selector`, `template`).
 fn key_name<'a>(key: &'a PropertyKey<'a>) -> Option<&'a str> {
     match key {
@@ -1808,10 +1845,13 @@ fn compile_program_with_source(
             Ok(emit) => {
                 errors.extend(emit.errors.clone());
                 let stmt_start = decorated_stmt_start(program, class);
-                emits.insert(
-                    stmt_start,
-                    (emit, dec.span().start, dec.span().end),
-                );
+                // Excise EVERY recognized Angular decorator from the kept class declaration — not
+                // only the primary one. A class with both `@Pipe` and `@Injectable` carries two
+                // recognized decorators; ngtsc strips them all. Span the strip from the first to the
+                // last recognized Angular decorator (they are contiguous on a class), so the kept
+                // `export class X { … }` is plain TS the bundler accepts.
+                let (strip_start, strip_end) = recognized_decorator_strip_span(class, dec);
+                emits.insert(stmt_start, (emit, strip_start, strip_end));
                 produced += 1;
             }
             Err(msg) => errors.push(msg),
@@ -2274,11 +2314,75 @@ fn compile_decorated_class(
         sibling_directives,
     };
 
+    // MULTI-DECORATOR dispatch: ngtsc compiles EVERY recognized trait on a class, not only the
+    // first. A class carrying BOTH `@Pipe` and `@Injectable` (in either order) emits `ɵfac` (the
+    // pipe/directive factory form `ɵɵdirectiveInject(Dep, 16)`), `ɵpipe`, AND `ɵprov` — the pipe
+    // factory takes precedence over the injectable factory ("if a class has multiple decorators").
+    // The `@Pipe` trait owns the factory + primary definition; `@Injectable` contributes the
+    // appended `X.ɵprov = ɵɵdefineInjectable({token, factory: X.ɵfac})` (emitted AFTER `ɵpipe` so the
+    // `X.ɵfac` it references is already assigned). This is the registry's composability: each kind is
+    // dispatched independently and their emits are merged.
+    let has_pipe = class_decorator(class, "Pipe").is_some();
+    let has_injectable = class_decorator(class, "Injectable").is_some();
+    if has_pipe && has_injectable {
+        return compile_pipe_and_injectable(class, &meta);
+    }
+
     let kind = AngularDecoratorKind::from(kind);
     match decorator_registry().for_kind(kind) {
         Some(plugin) => plugin.compile(&meta, &ctx),
         None => Err(format!("no decorator compiler registered for {kind:?}")),
     }
+}
+
+/// Compile a class carrying BOTH `@Pipe` and `@Injectable`. The pipe trait drives the `ɵfac`
+/// (pipe-target factory) + `ɵpipe` definition; the injectable trait contributes the trailing
+/// `X.ɵprov = ɵɵdefineInjectable({token: X, factory: X.ɵfac})` provider definition. The `ɵprov`
+/// assignment is appended to the pipe emit's `extra_statements` with `extra_after_def = true`, so the
+/// emit order is `X.ɵfac = …; X.ɵpipe = …; X.ɵprov = …;` — exactly Angular's "prov definition must be
+/// last so X.fac is defined" ordering, in both decorator orders.
+fn compile_pipe_and_injectable(class: &Class, meta: &ClassMeta) -> Result<ClassEmit, String> {
+    // Primary definition: the `@Pipe` trait (factory + `ɵpipe`). Its `extra_statements` are pure-pool
+    // consts the `ɵpipe` references (emitted BEFORE the assignments).
+    let pipe_object = class_decorator(class, "Pipe").and_then(decorator_object);
+    let pipe_emit = compile_pipe_class(class, pipe_object, &meta.class_name)?;
+
+    // Injectable trait: build the `ɵprov` definition from the `@Injectable({...})` options (the
+    // pipe's `ɵfac` is reused — `compile_injectable_class`'s default factory delegates to `X.ɵfac`).
+    let injectable_object = class_decorator(class, "Injectable").and_then(decorator_object);
+    let injectable_emit = compile_injectable_class(class, injectable_object, &meta.class_name)?;
+
+    // The provider's own pool consts (e.g. a `useFactory` literal) come first, then the
+    // `X.ɵprov = <defineInjectable>` assignment — all AFTER the `ɵpipe` definition.
+    let mut prov_after: Vec<o::Stmt> = injectable_emit.extra_statements;
+    prov_after.push(
+        o::variable(&meta.class_name, None)
+            .prop("\u{0275}prov")
+            .set(injectable_emit.def_expression)
+            .to_stmt(),
+    );
+
+    // A `@Pipe` definition hoists no constant-pool consts (`compile_pipe_from_metadata` produces
+    // none), so the pipe emit's `extra_statements` are empty and the merged emit can use the
+    // AFTER-def slot exclusively for the trailing `ɵprov`. If a future pipe shape ever hoists pool
+    // consts they would need to precede the assignments — guard against silently dropping them.
+    debug_assert!(
+        pipe_emit.extra_statements.is_empty() && !pipe_emit.extra_after_def,
+        "a @Pipe definition unexpectedly hoisted pool consts in the multi-decorator path"
+    );
+
+    // Stitch the final emit: `X.ɵfac = …` (pipe factory), `X.ɵpipe = …` (the def), then the appended
+    // `X.ɵprov = …` (after-def). `class_static_statements` emits the factory + def, then the
+    // after-def `extra_statements`.
+    Ok(ClassEmit {
+        class_name: pipe_emit.class_name,
+        static_member: pipe_emit.static_member,
+        def_expression: pipe_emit.def_expression,
+        extra_statements: prov_after,
+        extra_after_def: true,
+        factory: pipe_emit.factory,
+        errors: pipe_emit.errors,
+    })
 }
 
 /// Compile a `@Component` or `@Directive` class. Shares the common metadata extraction (selector,
@@ -2958,6 +3062,39 @@ mod tests {
         // template fn present.
         assert!(code.contains("C_Template"), "no template fn; got: {code}");
         assert!(code.contains("ctx.x"), "template did not bind ctx.x; got: {code}");
+    }
+
+    #[test]
+    fn pipe_and_injectable_on_one_class_emits_pipe_fac_and_prov() {
+        // A class with BOTH `@Pipe` and `@Injectable` (either order) emits `ɵfac` (pipe-target
+        // factory `ɵɵdirectiveInject(Dep, 16)`), `ɵpipe`, AND `ɵprov` — the pipe factory takes
+        // precedence over the injectable factory. Both recognized decorators are stripped.
+        for src in [
+            // @Injectable BEFORE @Pipe (prov last).
+            r#"@Injectable() @Pipe({name:"myPipe",standalone:false}) export class P { constructor(s: S){} transform(v){return v;} }"#,
+            // @Pipe BEFORE @Injectable (prov last regardless).
+            r#"@Pipe({name:"myPipe",standalone:false}) @Injectable() export class P { constructor(s: S){} transform(v){return v;} }"#,
+        ] {
+            let out = compile_component_source(src);
+            assert!(out.errors.is_empty(), "unexpected errors: {:?} for {src}", out.errors);
+            let code = &out.code;
+            // All three definitions present.
+            assert!(code.contains("P.\u{0275}fac"), "missing ɵfac; got: {code}");
+            assert!(code.contains("\u{0275}\u{0275}definePipe"), "missing ɵpipe; got: {code}");
+            assert!(code.contains("\u{0275}\u{0275}defineInjectable"), "missing ɵprov; got: {code}");
+            // The factory uses the pipe/directive DI form, NOT the bare injectable `ɵɵinject`.
+            assert!(
+                code.contains("\u{0275}\u{0275}directiveInject"),
+                "pipe factory must use ɵɵdirectiveInject; got: {code}"
+            );
+            // `ɵprov` must come AFTER `ɵpipe` (so `P.ɵfac` it references is defined).
+            let pipe_at = code.find("P.\u{0275}pipe").expect("ɵpipe assignment");
+            let prov_at = code.find("P.\u{0275}prov").expect("ɵprov assignment");
+            assert!(prov_at > pipe_at, "ɵprov must follow ɵpipe; got: {code}");
+            // Both Angular decorators stripped from the kept class declaration.
+            assert!(!code.contains("@Pipe"), "@Pipe not stripped; got: {code}");
+            assert!(!code.contains("@Injectable"), "@Injectable not stripped; got: {code}");
+        }
     }
 
     #[test]
