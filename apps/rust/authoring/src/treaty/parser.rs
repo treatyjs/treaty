@@ -1,7 +1,5 @@
-use crate::treaty::token::{Token, TokenKind};
-use crate::treaty::ast::{AstNode, Ast};
-
-use super::token::{ControlFlowKind, DeferKind};
+use crate::treaty::token::{ControlFlowClause, Token, TokenKind};
+use crate::treaty::ast::{Ast, AstNode, ControlFlowBranch};
 
 pub struct Parser {
     tokens: Vec<Token>,
@@ -35,32 +33,32 @@ impl Parser {
             TokenKind::Macro { content, info } => AstNode::Macro { content, info },
             TokenKind::HTML(content) => AstNode::Html(content),
             TokenKind::TemplateExpression(expr) => AstNode::TemplateExpression(expr),
-            TokenKind::ControlFlow(kind) => self.parse_control_flow_node(&kind),
-            TokenKind::Defer(kind) => self.parse_defer_node(&kind),
+            TokenKind::ControlFlow { verbatim, clauses } => {
+                AstNode::ControlFlow { verbatim, clauses: Self::parse_clauses(clauses) }
+            }
+            TokenKind::ServerBlock { lang, body, verbatim } => {
+                AstNode::ServerBlock { lang, body, verbatim }
+            }
             TokenKind::Eof => AstNode::EOF,
         }
     }
 
-    fn parse_control_flow_node(&mut self, kind: &ControlFlowKind) -> AstNode {
-        match kind {
-            ControlFlowKind::If => AstNode::ControlFlow("@if".to_string()),
-            ControlFlowKind::ElseIf => AstNode::ControlFlow("@else if".to_string()),
-            ControlFlowKind::Else => AstNode::ControlFlow("@else".to_string()),
-            ControlFlowKind::For => AstNode::ControlFlow("@for".to_string()),
-            ControlFlowKind::Empty => AstNode::ControlFlow("@empty".to_string()),
-            ControlFlowKind::Switch => AstNode::ControlFlow("@switch".to_string()),
-            ControlFlowKind::Case => AstNode::ControlFlow("@case".to_string()),
-            ControlFlowKind::Default => AstNode::ControlFlow("@default".to_string()),
-        }
-    }
-
-    fn parse_defer_node(&mut self, kind: &DeferKind) -> AstNode {
-        match kind {
-            DeferKind::Defer => AstNode::ControlFlow("@defer".to_string()),
-            DeferKind::Placeholder => AstNode::ControlFlow("@placeholder".to_string()),
-            DeferKind::Loading => AstNode::ControlFlow("@loading".to_string()),
-            DeferKind::Error => AstNode::ControlFlow("@error".to_string()),
-        }
+    /// Turn the lexer's structured control-flow clauses into AST branches, parsing each clause's
+    /// recursively-lexed body token stream into child AST nodes — so a control-flow region is a REAL
+    /// nested AST (its body markup / JS / NESTED control flow become children), not a flat marker.
+    fn parse_clauses(clauses: Vec<ControlFlowClause>) -> Vec<ControlFlowBranch> {
+        clauses
+            .into_iter()
+            .map(|clause| {
+                let ControlFlowClause { keyword, kind, head, body } = clause;
+                // Recurse: parse the clause body's token stream into child AST nodes via a sub-parser.
+                // The lexer never emits an explicit `Eof` token (the body token stream ends naturally),
+                // and `Parser::parse` terminates on the synthetic out-of-bounds `Eof` from `peek`, so
+                // the body tokens are parsed as-is with no trailing sentinel node.
+                let body_nodes = Parser::new(body).parse().nodes;
+                ControlFlowBranch { keyword, kind, head, body: body_nodes }
+            })
+            .collect()
     }
 
     fn advance(&mut self) -> &Token {

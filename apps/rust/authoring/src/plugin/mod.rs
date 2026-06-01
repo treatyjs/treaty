@@ -267,29 +267,49 @@ fn extract_server_block_impl(
     //    When `marker_detect` is supplied (the `.treaty` masked view), the SAME block spans are removed
     //    from it in lockstep with the real source so the two stay byte-offset-identical for the
     //    parse-based marker step below.
+    //
+    //    BLOCK DISCOVERY: a `.treaty` SFC (`marker_detect.is_some()`) keys off the hardened lexer's
+    //    first-class `server { … }` regions (R3) — ONE robust, balanced, lexical-state-aware region
+    //    source — rather than the standalone text-scan ASI guard. The `.ts`/`.tsx` paths (no masked
+    //    view; whole-file TS that parses cleanly) keep the lighter text scan.
     let mut client_source = String::with_capacity(source.len());
     let mut client_detect = marker_detect.map(|_| String::with_capacity(source.len()));
     let mut server_fns: Vec<ServerFn> = Vec::new();
     let mut cursor = 0usize;
-    while let Some(block) = find_server_block(&source[cursor..]) {
-        let ServerBlock { block_start, body_start, body_end, block_end, lang } = block;
-        // Translate the block-relative offsets back to absolute positions in `source`.
-        let block_start = cursor + block_start;
-        let body_start = cursor + body_start;
-        let body_end = cursor + body_end;
-        let block_end = cursor + block_end;
 
-        // The function declarations live in the brace body (exclusive of the braces themselves).
-        let body = &source[body_start..body_end];
-        let lang = lang.unwrap_or_else(|| DEFAULT_LANG.to_string());
-        server_fns.extend(parse_server_fns(body, &lang));
+    if marker_detect.is_some() {
+        // `.treaty`: discover server blocks via the hardened lexer's first-class regions.
+        for block in crate::treaty::lexer::find_server_blocks(source) {
+            // The lexer never overlaps regions and yields them in source order, so a block that begins
+            // before the running cursor cannot occur; guard defensively all the same.
+            if block.block_start < cursor {
+                continue;
+            }
+            let lang = block.lang.unwrap_or_else(|| DEFAULT_LANG.to_string());
+            server_fns.extend(parse_server_fns(&block.body, &lang));
 
-        // Carry forward the text that precedes this block; resume scanning after it.
-        client_source.push_str(&source[cursor..block_start]);
-        if let (Some(detect), Some(mask)) = (client_detect.as_mut(), marker_detect) {
-            detect.push_str(&mask[cursor..block_start]);
+            client_source.push_str(&source[cursor..block.block_start]);
+            if let (Some(detect), Some(mask)) = (client_detect.as_mut(), marker_detect) {
+                detect.push_str(&mask[cursor..block.block_start]);
+            }
+            cursor = block.block_end;
         }
-        cursor = block_end;
+    } else {
+        // `.ts`/`.tsx`: the lighter comment/string-aware text scan.
+        while let Some(block) = find_server_block(&source[cursor..]) {
+            let ServerBlock { block_start, body_start, body_end, block_end, lang } = block;
+            let block_start = cursor + block_start;
+            let body_start = cursor + body_start;
+            let body_end = cursor + body_end;
+            let block_end = cursor + block_end;
+
+            let body = &source[body_start..body_end];
+            let lang = lang.unwrap_or_else(|| DEFAULT_LANG.to_string());
+            server_fns.extend(parse_server_fns(body, &lang));
+
+            client_source.push_str(&source[cursor..block_start]);
+            cursor = block_end;
+        }
     }
     // Whatever remains after the last block (or the whole source if there were no blocks).
     client_source.push_str(&source[cursor..]);

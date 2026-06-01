@@ -97,10 +97,20 @@ fn split_chunks(source: &str) -> TreatyChunks {
             // A compile-time macro block: capture its raw body for a later execution phase. It is
             // NOT runtime JS/template/CSS, so it never reaches the component output.
             AstNode::Macro { content, .. } => chunks.macros.push(content),
-            // Top-level interpolation/control-flow markers are not standalone template chunks in
-            // the common case (they live inside an HTML chunk); the bare markers carry no body and
-            // are ignored here.
-            AstNode::TemplateExpression(_) | AstNode::ControlFlow(_) | AstNode::EOF => {}
+            // A first-class control-flow region (R1) — `@if`/`@for`/`@switch`/`@defer` + chained
+            // clauses, even when NOT wrapped in a host element — is TEMPLATE markup: route its
+            // verbatim source into the HTML bucket so it joins the component template, where
+            // treaty_ivy's ml_parser lowers the Angular block syntax to control-flow Ivy instructions
+            // (`ɵɵconditional`/`ɵɵrepeater`/…). Previously this node was dropped, silently losing a
+            // top-level control-flow block.
+            AstNode::ControlFlow { verbatim, .. } => chunks.html.push(verbatim),
+            // A `server { … }` block is server-only: it is lifted by the server-fn extraction before
+            // the client is lexed, so it should not appear here; if it does (defensive), it is NEVER
+            // routed into a client chunk so server code can never reach the client.
+            AstNode::ServerBlock { .. } => {}
+            // A bare top-level interpolation marker carries no standalone body in the common case
+            // (it lives inside an HTML chunk); ignore it here.
+            AstNode::TemplateExpression(_) | AstNode::EOF => {}
         }
     }
     chunks
@@ -2030,6 +2040,149 @@ return { title, count };\n\
             "module did not parse as valid JS: {:?}\n--- code ---\n{code}",
             parsed.errors
         );
+    }
+
+    // ─────────────────────── R1: top-level control flow lowers to Ivy ───────────────────────
+    //
+    // The R1 fix: a control-flow block that is NOT wrapped in a host element used to be a bare marker
+    // whose body was dropped, so the block never reached the template. It now lowers to real
+    // control-flow Ivy. Each emit below is VERIFIED BY PARSING (oxc) — never a regex over the emit.
+
+    #[test]
+    fn top_level_if_lowers_to_conditional_ivy() {
+        // A bare top-level `@if` (no surrounding element) must reach the template and lower to the
+        // `ɵɵconditional` instruction family — the precise block the R1 audit said was silently lost.
+        let source = "const ready = true;\n@if (ready) {\n  <p>Go</p>\n}";
+        let out = compile_treaty_file(source, "panel.treaty");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+
+        // The emit re-parses as a valid module (proves the block did not corrupt the output).
+        let allocator = Allocator::default();
+        let module_type = SourceType::default().with_module(true).with_typescript(true);
+        let parsed = JsParser::new(&allocator, code, module_type).parse();
+        assert!(parsed.errors.is_empty(), "emit did not parse: {:?}\n{code}", parsed.errors);
+
+        assert!(code.contains(DEFINE), "no defineComponent; got: {code}");
+        // The `@if` lowered to the conditional instruction family (create + update).
+        assert!(
+            code.contains("\u{0275}\u{0275}conditionalCreate") || code.contains("\u{0275}\u{0275}conditional"),
+            "top-level @if did not lower to ɵɵconditional; got: {code}"
+        );
+        // The body content reached the template.
+        assert!(code.contains("\"p\""), "the @if body element was lost; got: {code}");
+    }
+
+    #[test]
+    fn top_level_if_else_both_branches_lower() {
+        // `@if (…) { … } @else { … }` — both branches reach the template and chain into the same
+        // conditional region.
+        let source = "const ok = false;\n@if (ok) {\n  <p>yes</p>\n} @else {\n  <span>no</span>\n}";
+        let out = compile_treaty_file(source, "branch.treaty");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+
+        let allocator = Allocator::default();
+        let module_type = SourceType::default().with_module(true).with_typescript(true);
+        let parsed = JsParser::new(&allocator, code, module_type).parse();
+        assert!(parsed.errors.is_empty(), "emit did not parse: {:?}\n{code}", parsed.errors);
+
+        assert!(code.contains(DEFINE), "no defineComponent; got: {code}");
+        assert!(
+            code.contains("\u{0275}\u{0275}conditional"),
+            "@if/@else did not lower to ɵɵconditional; got: {code}"
+        );
+        // BOTH branch elements reached the template.
+        assert!(code.contains("\"p\"") && code.contains("\"span\""), "an @if/@else branch was lost; got: {code}");
+    }
+
+    #[test]
+    fn top_level_for_lowers_to_repeater_ivy() {
+        // A bare top-level `@for (… ; track …) { … } @empty { … }` lowers to the repeater instruction
+        // family, binds the loop variable against the component context, and keeps both bodies.
+        let source = "const items = signal([1, 2, 3]);\n\
+@for (item of items(); track item) {\n  <li>{{ item }}</li>\n} @empty {\n  <li>none</li>\n}";
+        let out = compile_treaty_file(source, "list.treaty");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+
+        let allocator = Allocator::default();
+        let module_type = SourceType::default().with_module(true).with_typescript(true);
+        let parsed = JsParser::new(&allocator, code, module_type).parse();
+        assert!(parsed.errors.is_empty(), "emit did not parse: {:?}\n{code}", parsed.errors);
+
+        assert!(code.contains(DEFINE), "no defineComponent; got: {code}");
+        assert!(
+            code.contains("\u{0275}\u{0275}repeaterCreate") || code.contains("\u{0275}\u{0275}repeater"),
+            "top-level @for did not lower to ɵɵrepeater; got: {code}"
+        );
+        // The loop body element + the @empty body element both reached the template.
+        assert!(code.contains("\"li\""), "the @for body element was lost; got: {code}");
+        // The component body (the `items` signal) is still collected as a binding.
+        assert!(code.contains("const items ="), "the component-body TS was lost; got: {code}");
+    }
+
+    #[test]
+    fn control_flow_interleaved_with_html_and_trailing_ts_all_survive() {
+        // A top-level `@if` BETWEEN an HTML element and trailing TS: the element, the control-flow
+        // block, and the trailing TS must all survive — the block no longer swallows or drops siblings.
+        let source = "<h1>Title</h1>\n@if (show()) {\n  <p>body</p>\n}\nconst show = signal(true);";
+        let out = compile_treaty_file(source, "page.treaty");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+
+        let allocator = Allocator::default();
+        let module_type = SourceType::default().with_module(true).with_typescript(true);
+        let parsed = JsParser::new(&allocator, code, module_type).parse();
+        assert!(parsed.errors.is_empty(), "emit did not parse: {:?}\n{code}", parsed.errors);
+
+        assert!(code.contains(DEFINE), "no defineComponent; got: {code}");
+        // The leading <h1>, the @if body <p>, and the trailing TS binding are all present.
+        assert!(code.contains("\"h1\""), "leading HTML lost; got: {code}");
+        assert!(code.contains("\"p\""), "the @if body was lost; got: {code}");
+        assert!(
+            code.contains("\u{0275}\u{0275}conditional"),
+            "the interleaved @if did not lower to ɵɵconditional; got: {code}"
+        );
+        assert!(code.contains("const show ="), "trailing TS lost; got: {code}");
+    }
+
+    #[test]
+    fn server_block_and_top_level_control_flow_coexist() {
+        // R1 + R3 together: a `.treaty` SFC with a first-class `server { … }` block AND a TOP-LEVEL
+        // `@if`/`@else` control-flow region (not wrapped in a host element). The server body is lifted
+        // to the server module (absent from the client), and the control-flow block lowers to
+        // `ɵɵconditional` in the client template. Verified by parsing the emit.
+        let source = "import { signal } from '@angular/core'\n\
+const open = signal(false)\n\
+server {\n\
+  async function persist(v: number) { return db.save(v); }\n\
+}\n\
+function toggle() { open.set(!open()); persist(1); }\n\
+@if (open()) {\n  <p>open</p>\n} @else {\n  <p>closed</p>\n}\n";
+
+        let out = compile_treaty_authoring(source, "panel.treaty");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+
+        // The client re-parses as a valid TS module.
+        assert_treaty_client_parses(code);
+        assert!(code.contains(DEFINE), "no defineComponent; got: {code}");
+
+        // R3: the server body was lifted to a server module and is ABSENT from the client.
+        let server_module = out.server_module.expect("server block must yield a server module");
+        assert!(
+            server_module.contains("\"/__server/persist\""),
+            "no persist route in the server module; got: {server_module}"
+        );
+        assert!(!code.contains("db.save"), "server body leaked into the client; got: {code}");
+
+        // R1: the top-level @if/@else lowered to control-flow Ivy, with both branches present.
+        assert!(
+            code.contains("\u{0275}\u{0275}conditional"),
+            "top-level @if/@else did not lower to ɵɵconditional; got: {code}"
+        );
+        assert!(code.contains("\"p\""), "the control-flow branch body was lost; got: {code}");
     }
 
     /// Read an everything-app example `.treaty` file relative to this crate's manifest dir

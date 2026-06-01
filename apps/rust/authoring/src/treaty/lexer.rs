@@ -1,7 +1,7 @@
 use crate::treaty::token::{Token, TokenKind};
 use std::str::Chars;
 
-use super::token::{ControlFlowKind, DeferKind};
+use super::token::{ControlFlowClause, ControlFlowKind};
 
 /// Returns the largest byte index `<= index` that lies on a UTF-8 char boundary in `s` (or
 /// `s.len()` when `index` is past the end). This is a stable-Rust stand-in for the unstable
@@ -39,6 +39,17 @@ fn regex_allowed_after(last_significant: Option<char>) -> bool {
     }
 }
 
+/// Can the char `c` be the FINAL char of a JavaScript expression/statement, such that a line break
+/// after it triggers automatic-semicolon insertion (ASI)? True for identifier/keyword chars (the `s`
+/// of `props`, a bare `null`), a closing string/template quote, a numeric literal char, and the
+/// closing `)` / `]` of a call/index/group. A `,`, `.`, `=`, `(`, `[`, `:` etc. cannot end a
+/// statement, so a `server` keyword after one of those (even across a newline) is a value, not a
+/// block. This mirrors the ASI rule the `plugin` server-block detection uses for `server { … }`, but
+/// over `char` rather than bytes (the lexer scans by `char`).
+fn can_end_statement_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '$' || matches!(c, '\'' | '"' | '`' | ')' | ']')
+}
+
 /// The HTML void elements: elements that are always empty and have no end tag, so an authored
 /// `<br>` / `<input>` (with or without a trailing `/`) opens AND closes in one tag. Matched
 /// ASCII-case-insensitively (HTML tag names are case-insensitive). Source: the WHATWG HTML "void
@@ -55,6 +66,57 @@ fn is_void_element(tag_name: &str) -> bool {
         .any(|v| v.eq_ignore_ascii_case(tag_name))
 }
 
+/// The Angular control-flow / deferrable-view block keywords that OPEN a control-flow region (each
+/// followed by an optional `(…)` head then a `{ … }` body). A top-level one of these begins a real
+/// nested template region (see [`Lexer::consume_control_flow_region`]); the rest of the file no
+/// longer drops a control-flow block that is not wrapped in a host element.
+///
+/// `@else if` is matched as the two-word `@else` form (its `if` is part of the head, scanned after
+/// the keyword) — listing `@else` covers both `@else` and `@else if`.
+const CONTROL_FLOW_OPENERS: &[&str] = &["@if", "@for", "@switch", "@defer"];
+
+/// The SECONDARY control-flow clauses that CONTINUE an open control-flow region: they chain onto the
+/// primary opener that owns them (`@else`/`@else if` after `@if`; `@empty` after `@for`;
+/// `@case`/`@default` inside `@switch`; `@placeholder`/`@loading`/`@error` after `@defer`). The
+/// region scanner absorbs a run of these so the whole `@if (…) { … } @else { … }` construct is ONE
+/// template region (and `@else if` is the two-word lead — `@else` covers it).
+const CONTROL_FLOW_CONTINUATIONS: &[&str] = &[
+    "@else", "@empty", "@case", "@default", "@placeholder", "@loading", "@error",
+];
+
+/// True if `s` (the input from a cursor) begins with `keyword` as a WHOLE control-flow keyword — i.e.
+/// the char immediately after `keyword` is not an identifier char, so `@if` matches `@if (` and
+/// `@if{` but never `@iffy`. `@` is not an identifier char, so a bare `@` keyword boundary is exact.
+fn starts_with_block_keyword(s: &str, keyword: &str) -> bool {
+    if let Some(after) = s.strip_prefix(keyword) {
+        // The keyword ends the construct unless followed by another identifier char (`@iffy`). A
+        // following `(`, `{`, whitespace, or EOF all delimit a real block keyword.
+        !after
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '$')
+    } else {
+        false
+    }
+}
+
+/// The control-flow OPENER keyword the input `s` begins with (a whole-keyword match), or `None`.
+fn control_flow_opener(s: &str) -> Option<&'static str> {
+    CONTROL_FLOW_OPENERS
+        .iter()
+        .copied()
+        .find(|kw| starts_with_block_keyword(s, kw))
+}
+
+/// The control-flow CONTINUATION keyword the input `s` begins with (a whole-keyword match), or
+/// `None`. Used to absorb chained `@else`/`@empty`/`@case`/… clauses into the owning region.
+fn control_flow_continuation(s: &str) -> Option<&'static str> {
+    CONTROL_FLOW_CONTINUATIONS
+        .iter()
+        .copied()
+        .find(|kw| starts_with_block_keyword(s, kw))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LexerState {
     Default,
@@ -62,8 +124,54 @@ enum LexerState {
     HTML,
     CSS,
     TemplateExpression,
-    ControlFlow,
     Macro,
+}
+
+/// A located first-class `server[:LANG] { … }` block found by the hardened lexer (R3). `block_start`
+/// is the byte offset of the `server` keyword; `block_end` is just past the closing `}` PLUS a single
+/// trailing newline (so removing `block_start..block_end` from the source leaves no dangling blank
+/// line — matching the plugin block-lifter's behavior). `body` is the brace interior (the server-fn
+/// declarations, braces excluded); `lang` is the optional `:IDENT` transport-language tag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerBlockSpan {
+    pub block_start: usize,
+    pub block_end: usize,
+    pub body: String,
+    pub lang: Option<String>,
+}
+
+/// Find every first-class `server[:LANG] { … }` block in `source` via the hardened lexer (R3).
+///
+/// The lexer recognizes a statement-position `server` keyword whose head reaches a `{` — at any brace
+/// depth, with full string/template/comment/regex awareness from the balanced scanner — and emits it
+/// as a [`TokenKind::ServerBlock`] region. This is the ONE robust region the `.treaty` server-fn
+/// extraction keys off, replacing the standalone text-scan ASI guard. The returned spans are absolute
+/// byte offsets into `source`, in source order, each with a single trailing newline folded into
+/// `block_end` so a clean strip leaves no blank line.
+pub fn find_server_blocks(source: &str) -> Vec<ServerBlockSpan> {
+    let mut lexer = Lexer::new(source);
+    let mut blocks = Vec::new();
+    let bytes = source.as_bytes();
+    while let Some(token) = lexer.next_token() {
+        if let TokenKind::ServerBlock { lang, body, .. } = token.kind {
+            // Fold a single trailing newline (and a preceding `\r`) into the removed span so stripping
+            // the block does not leave a dangling blank line.
+            let mut block_end = token.end;
+            if block_end < bytes.len() && bytes[block_end] == b'\r' {
+                block_end += 1;
+            }
+            if block_end < bytes.len() && bytes[block_end] == b'\n' {
+                block_end += 1;
+            }
+            blocks.push(ServerBlockSpan {
+                block_start: token.start,
+                block_end,
+                body,
+                lang,
+            });
+        }
+    }
+    blocks
 }
 
 pub struct Lexer<'a> {
@@ -102,7 +210,6 @@ impl<'a> Lexer<'a> {
             LexerState::HTML => self.parse_html(),
             LexerState::CSS => self.parse_style(),
             LexerState::TemplateExpression => self.parse_template_expression(),
-            LexerState::ControlFlow => self.parse_control_flow(),
             LexerState::Macro => self.parse_macro(),
         }
     }
@@ -171,7 +278,22 @@ impl<'a> Lexer<'a> {
                 self.push_state(LexerState::TemplateExpression);
                 self.parse_template_expression()
             }
-            '@' => self.parse_control_flow(),
+            // A control-flow keyword at the start of a region is a first-class template region:
+            // capture the whole construct — head `(…)`, body `{ … }`, and any chained
+            // `@else`/`@empty`/`@case`/… clauses — as ONE control-flow token, so a control-flow block
+            // that is NOT wrapped in a host element is no longer silently dropped.
+            //
+            // Both an OPENER (`@if`/`@for`/`@switch`/`@defer`) and a CONTINUATION (`@case`/`@default`
+            // inside a `@switch` body, etc.) may legally begin a region here: at the TOP level only an
+            // opener occurs, but inside a recursively-lexed `@switch` body the leading clause is a
+            // `@case`/`@default`. The `@else`/`@empty` continuations are absorbed by their owner's
+            // chaining loop BEFORE the body is lexed, so they reach this arm only as a (rare) orphan,
+            // which simply forms a one-clause region rather than being dropped.
+            '@' if control_flow_opener(self.rest()).is_some()
+                || control_flow_continuation(self.rest()).is_some() =>
+            {
+                self.parse_control_flow()
+            }
             _ => {
                 self.push_state(LexerState::JavaScript);
                 self.parse_javascript()
@@ -277,14 +399,38 @@ impl<'a> Lexer<'a> {
         // The last significant (non-whitespace, non-comment) code char seen, used to disambiguate a
         // `/` as the start of a regex literal vs. a division operator.
         let mut last_significant: Option<char> = None;
+        // Whether a line break has occurred since the last significant code char (for ASI: a
+        // statement-ending token followed by a newline opens a new statement, so a no-semicolon
+        // `server { … }` on the next line is still recognized).
+        let mut newline_since_significant = false;
 
         while let Some(ch) = self.current_char {
+            // ── First-class `server[:LANG] { … }` block (R3) ──────────────────────────────────────
+            // Recognize a statement-position `server` keyword whose head reaches a `{`, at ANY brace
+            // depth, via the hardened scanner's own lexical state (we only reach here outside any
+            // string/comment/regex). Statement position = region start, or right after a `;`/`{`/`}`,
+            // or a statement-ending token followed by a newline (ASI). This replaces the fragile
+            // standalone ASI text-guard: the block is anchored as ONE robust lexer region.
+            if ch == 's'
+                && self.starts_with("server")
+                && self.server_block_in_statement_position(last_significant, newline_since_significant)
+                && self.server_block_head_reaches_brace()
+            {
+                // Emit any accumulated JS BEFORE the block as its own region; the block itself is
+                // captured on the next `next_token` call (which re-enters here at the `server`).
+                if self.pos > start_pos {
+                    break;
+                }
+                return self.consume_server_block();
+            }
+
             match ch {
                 // String / template literals: consume the whole literal (escapes + `${}` nesting for
                 // template strings) so a `<`, `{{`, `;`, newline, or `@` inside it is never a boundary.
                 '\'' | '"' | '`' => {
                     self.consume_string(ch);
                     last_significant = Some(ch);
+                    newline_since_significant = false;
                 }
 
                 // Comments and regex literals both begin with `/`.
@@ -301,10 +447,12 @@ impl<'a> Lexer<'a> {
                         // inside the body is regex content, never a region boundary.
                         self.consume_regex_literal();
                         last_significant = Some('/');
+                        newline_since_significant = false;
                     } else {
                         // Division operator.
                         self.advance();
                         last_significant = Some('/');
+                        newline_since_significant = false;
                     }
                 }
 
@@ -319,11 +467,16 @@ impl<'a> Lexer<'a> {
                     break
                 }
                 '{' if depth == 0 && self.starts_with("{{") => break,
-                '@' if depth == 0 && self.pos > start_pos => {
-                    // A control-flow marker at top level ends the JS region. Only break when there is
-                    // real JS before it (`self.pos > start_pos`) so a leading `@` is never an empty
-                    // token; the default-state router opens control flow at a leading `@`.
-                    self.push_state(LexerState::ControlFlow);
+                '@' if depth == 0
+                    && self.pos > start_pos
+                    && control_flow_opener(self.rest()).is_some() =>
+                {
+                    // A control-flow OPENER (`@if`/`@for`/`@switch`/`@defer`) at top level ends the JS
+                    // region; the default-state router then captures the whole control-flow construct
+                    // as a template region (see `consume_control_flow_region`). Only break when there
+                    // is real JS before it (`self.pos > start_pos`) so a leading `@` is never an empty
+                    // token. A non-keyword `@` (a TS decorator such as `@Component`) is NOT a boundary
+                    // and stays in the JS region.
                     break;
                 }
 
@@ -333,6 +486,7 @@ impl<'a> Lexer<'a> {
                     depth += 1;
                     self.advance();
                     last_significant = Some(ch);
+                    newline_since_significant = false;
                 }
                 ')' | ']' | '}' => {
                     if depth > 0 {
@@ -340,6 +494,7 @@ impl<'a> Lexer<'a> {
                     }
                     self.advance();
                     last_significant = Some(ch);
+                    newline_since_significant = false;
                 }
 
                 // Inside a bracket group (depth > 0) these are ordinary code, not boundaries — the
@@ -347,9 +502,13 @@ impl<'a> Lexer<'a> {
                 // are handled by the arms above/below; this arm covers the statement separators.)
                 '\n' | '\r' | '\u{000C}' | ';' => {
                     self.advance();
-                    // Whitespace is insignificant; only `;` updates `last_significant`.
+                    // A `;` is a statement-ending significant char; a newline only marks that a line
+                    // break has occurred since the last significant char (for ASI).
                     if ch == ';' {
                         last_significant = Some(';');
+                        newline_since_significant = false;
+                    } else {
+                        newline_since_significant = true;
                     }
                 }
 
@@ -358,6 +517,9 @@ impl<'a> Lexer<'a> {
                     self.advance();
                     if !ch.is_whitespace() {
                         last_significant = Some(ch);
+                        newline_since_significant = false;
+                    } else if ch == '\n' {
+                        newline_since_significant = true;
                     }
                 }
             }
@@ -367,6 +529,161 @@ impl<'a> Lexer<'a> {
         let value = self.slice(start_pos, end_pos);
         self.pop_state(); // Return to the previous state
         Some(Token::new(TokenKind::JavaScript(value), start_pos, end_pos))
+    }
+
+    /// Is a `server` keyword at the cursor in STATEMENT position — a place a `server { … }` block may
+    /// legally begin — given the last significant code char before it and whether a line break has
+    /// occurred since? (R3 statement-position test, replacing the standalone text-scan ASI guard.)
+    ///
+    /// Statement position is: the start of the JS region (`last_significant == None`); right after a
+    /// statement terminator / block boundary (`;` / `{` / `}`); or a token that can END a statement
+    /// followed by a line break (ASI — the TS-by-default no-semicolon style). A member access
+    /// (`x.server`, preceding char `.`) or an object-literal value (`{ server: … }`, preceding `:`) is
+    /// NOT statement position, so a non-block `server` stays ordinary JS. The keyword must also be a
+    /// WHOLE word (`server`, not `servery`/`myserver`); the caller checks `starts_with("server")` and
+    /// this verifies both boundaries.
+    fn server_block_in_statement_position(
+        &self,
+        last_significant: Option<char>,
+        newline_since_significant: bool,
+    ) -> bool {
+        // `server` must be a whole identifier: the preceding significant char must not be an identifier
+        // char (guards `myserver`) and the following char must not be one (guards `servery`). The
+        // preceding side is covered by `last_significant` (an identifier char there fails the match
+        // arms below); the following side is checked here.
+        let after = &self.rest()["server".len()..];
+        if after
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '$')
+        {
+            return false;
+        }
+        match last_significant {
+            // Start of the region.
+            None => true,
+            // Right after a statement terminator or a block boundary.
+            Some(';') | Some('{') | Some('}') => true,
+            // ASI: a token that can end a statement, followed by a line break, opens a new statement.
+            Some(c) if newline_since_significant && can_end_statement_char(c) => true,
+            _ => false,
+        }
+    }
+
+    /// After a `server` keyword at the cursor, does the head (optional whitespace, an optional `:IDENT`
+    /// language tag, more whitespace) reach a `{`? This is the final confirmation that the `server`
+    /// keyword opens a `server[:LANG] { … }` BLOCK rather than being a bare identifier
+    /// (`const server = …`) or a typed reference. Does not move the cursor.
+    fn server_block_head_reaches_brace(&self) -> bool {
+        let rest = self.rest();
+        let after_kw = &rest["server".len()..];
+        let trimmed = after_kw.trim_start();
+        // Optional `:IDENT` language tag.
+        let trimmed = if let Some(rest) = trimmed.strip_prefix(':') {
+            let ident = rest.trim_start();
+            let ident_rest = ident.trim_start_matches(|c: char| c.is_alphanumeric() || c == '_' || c == '$');
+            // A `:` with no identifier after it is not a valid `:LANG` tag.
+            if ident_rest.len() == ident.len() {
+                return false;
+            }
+            ident_rest.trim_start()
+        } else {
+            trimmed
+        };
+        trimmed.starts_with('{')
+    }
+
+    /// Consume a first-class `server[:LANG] { … }` block whose `server` keyword is at the cursor,
+    /// emitting a [`TokenKind::ServerBlock`] (R3). The optional `:IDENT` language tag is captured; the
+    /// `{ … }` body is captured with the balanced, lexical-state-aware brace scanner ([`consume_brace_block`]),
+    /// so a `{`/`}` inside a string / template literal / comment / regex in the body does not close it
+    /// early. Pops back to the caller's state (the `JavaScript` state pushed by `lex_default_state`),
+    /// mirroring [`parse_javascript`].
+    fn consume_server_block(&mut self) -> Option<Token> {
+        let start_pos = self.pos;
+        self.advance_by_str("server");
+
+        // Optional `:IDENT` language tag.
+        self.consume_whitespace();
+        let mut lang: Option<String> = None;
+        if self.current_char == Some(':') {
+            self.advance(); // Skip ':'
+            self.consume_whitespace();
+            let ident = self.consume_while(|c| c.is_alphanumeric() || c == '_' || c == '$');
+            if !ident.is_empty() {
+                lang = Some(ident);
+            }
+            self.consume_whitespace();
+        }
+
+        // The `{ … }` body (the cursor is at the opening `{`; the head-check guaranteed it).
+        let body = if self.current_char == Some('{') {
+            self.consume_brace_block()
+        } else {
+            String::new()
+        };
+
+        let end_pos = self.pos;
+        let verbatim = self.slice(start_pos, end_pos);
+        self.pop_state(); // Return to the previous state (mirrors `parse_javascript`).
+        Some(Token::new(
+            TokenKind::ServerBlock { lang, body, verbatim },
+            start_pos,
+            end_pos,
+        ))
+    }
+
+    /// Consume a balanced `{ … }` block whose opening `{` is at the cursor, returning the brace
+    /// INTERIOR (the braces excluded). Lexical-state-aware: strings / template literals, line + block
+    /// comments, and regex literals inside the block are consumed whole, and `{`/`}` nesting is
+    /// balanced — so a brace inside any of them does not close the block early. Used to capture a
+    /// `server { … }` body robustly (the same hardened lexing `parse_javascript` uses).
+    fn consume_brace_block(&mut self) -> String {
+        self.advance(); // Skip the opening `{`.
+        let start = self.pos;
+        let mut depth: i32 = 0;
+        let mut last_significant: Option<char> = None;
+        let mut content_end = self.pos;
+        while let Some(ch) = self.current_char {
+            match ch {
+                '\'' | '"' | '`' => {
+                    self.consume_string(ch);
+                    last_significant = Some(ch);
+                }
+                '/' if self.starts_with("//") => self.consume_line_comment(),
+                '/' if self.starts_with("/*") => self.consume_block_comment(),
+                '/' if regex_allowed_after(last_significant) => {
+                    self.consume_regex_literal();
+                    last_significant = Some('/');
+                }
+                '{' | '(' | '[' => {
+                    depth += 1;
+                    self.advance();
+                    last_significant = Some(ch);
+                }
+                '}' if depth == 0 => {
+                    content_end = self.pos;
+                    self.advance(); // Skip the closing `}`.
+                    return self.slice(start, content_end);
+                }
+                '}' | ')' | ']' => {
+                    if depth > 0 {
+                        depth -= 1;
+                    }
+                    self.advance();
+                    last_significant = Some(ch);
+                }
+                _ => {
+                    self.advance();
+                    if !ch.is_whitespace() {
+                        last_significant = Some(ch);
+                    }
+                }
+            }
+            content_end = self.pos;
+        }
+        // Unterminated block (EOF before the matching `}`): return what we captured.
+        self.slice(start, content_end)
     }
 
     /// Consumes a regex literal whose opening `/` is at the cursor. The body honors `\`-escapes and
@@ -664,52 +981,226 @@ impl<'a> Lexer<'a> {
         ))
     }
 
-    /// Parses control flow statements (@if, @for, etc.).
+    /// Captures a WHOLE control-flow / deferrable-view region as a single first-class
+    /// [`TokenKind::ControlFlow`] token (R1): the primary opener (`@if`/`@for`/`@switch`/`@defer`) plus
+    /// every chained continuation clause (`@else`/`@else if`/`@empty`/`@case`/`@default`/
+    /// `@placeholder`/`@loading`/`@error`) that follows it, each clause's optional `(…)` head and
+    /// `{ … }` body captured with the balanced scanner.
+    ///
+    /// This is what makes a control-flow block that is NOT wrapped in a host element a real nested
+    /// region instead of a dropped marker: the verbatim construct lowers as Angular block-syntax
+    /// template text (treaty_ivy's ml_parser parses `@if (…) { … } @else { … }` natively), and the
+    /// structured `clauses` carry the recursively-lexed body so the parser produces a nested
+    /// control-flow AST. The cursor must sit at a recognized opener; the caller (`lex_default_state`)
+    /// guarantees this via [`control_flow_opener`].
     fn parse_control_flow(&mut self) -> Option<Token> {
         let start_pos = self.pos;
+        let mut clauses: Vec<ControlFlowClause> = Vec::new();
 
-        if self.starts_with("@if") {
-            self.advance_by_str("@if");
-            return Some(Token::new(TokenKind::ControlFlow(ControlFlowKind::If), start_pos, self.pos));
-        } else if self.starts_with("@else if") {
-            self.advance_by_str("@else if");
-            return Some(Token::new(TokenKind::ControlFlow(ControlFlowKind::ElseIf), start_pos, self.pos));
-        } else if self.starts_with("@else") {
-            self.advance_by_str("@else");
-            return Some(Token::new(TokenKind::ControlFlow(ControlFlowKind::Else), start_pos, self.pos));
-        } else if self.starts_with("@for") {
-            self.advance_by_str("@for");
-            return Some(Token::new(TokenKind::ControlFlow(ControlFlowKind::For), start_pos, self.pos));
-        } else if self.starts_with("@empty") {
-            self.advance_by_str("@empty");
-            return Some(Token::new(TokenKind::ControlFlow(ControlFlowKind::Empty), start_pos, self.pos));
-        } else if self.starts_with("@switch") {
-            self.advance_by_str("@switch");
-            return Some(Token::new(TokenKind::ControlFlow(ControlFlowKind::Switch), start_pos, self.pos));
-        } else if self.starts_with("@case") {
-            self.advance_by_str("@case");
-            return Some(Token::new(TokenKind::ControlFlow(ControlFlowKind::Case), start_pos, self.pos));
-        } else if self.starts_with("@default") {
-            self.advance_by_str("@default");
-            return Some(Token::new(TokenKind::ControlFlow(ControlFlowKind::Default), start_pos, self.pos));
-        } else if self.starts_with("@defer") {
-            self.advance_by_str("@defer");
-            return Some(Token::new(TokenKind::Defer(DeferKind::Defer), start_pos, self.pos));
-        } else if self.starts_with("@placeholder") {
-            self.advance_by_str("@placeholder");
-            return Some(Token::new(TokenKind::Defer(DeferKind::Placeholder), start_pos, self.pos));
-        } else if self.starts_with("@loading") {
-            self.advance_by_str("@loading");
-            return Some(Token::new(TokenKind::Defer(DeferKind::Loading), start_pos, self.pos));
-        } else if self.starts_with("@error") {
-            self.advance_by_str("@error");
-            return Some(Token::new(TokenKind::Defer(DeferKind::Error), start_pos, self.pos));
-        } else {
-            // If not a recognized control flow, assume it's JavaScript
-            self.state = LexerState::JavaScript;
-            self.advance(); // Ensure we advance the position to avoid infinite loop
-            self.parse_javascript()
+        // The first clause is the opener; afterwards, absorb a run of continuation clauses, each
+        // separated only by whitespace, so `@if (…) { … } @else { … }` is ONE region.
+        loop {
+            let Some(clause) = self.consume_control_flow_clause() else {
+                break;
+            };
+            clauses.push(clause);
+
+            // Peek past whitespace for a chained continuation clause that belongs to this region.
+            let after_ws = self.rest().trim_start();
+            if control_flow_continuation(after_ws).is_some() {
+                self.consume_whitespace();
+                continue;
+            }
+            break;
         }
+
+        let end_pos = self.pos;
+        let verbatim = self.slice(start_pos, end_pos);
+        // A degenerate `@` with no real clause (the caller guards against this, but stay defensive):
+        // emit the consumed text as plain template content rather than an empty control-flow token.
+        if clauses.is_empty() {
+            return Some(Token::new(TokenKind::HTML(verbatim), start_pos, end_pos));
+        }
+        Some(Token::new(
+            TokenKind::ControlFlow { verbatim, clauses },
+            start_pos,
+            end_pos,
+        ))
+    }
+
+    /// Consume ONE control-flow clause at the cursor: its keyword, an optional `(…)` head, and an
+    /// optional `{ … }` body (recursively lexed into child tokens). Returns `None` when the cursor is
+    /// not at a recognized control-flow keyword.
+    ///
+    /// `@else if` is captured as the keyword `"@else if"` (the `if` is part of the lead, not the head)
+    /// so the else-if chain is structurally distinct from a plain `@else`. The head is the text BETWEEN
+    /// the parens (parens excluded); the body is the text between the braces, lexed recursively so
+    /// nested markup / JS / control flow becomes a real child token stream.
+    fn consume_control_flow_clause(&mut self) -> Option<ControlFlowClause> {
+        let rest = self.rest();
+        // Recognize the keyword (an opener or a continuation). `@else if` is matched first so the
+        // two-word lead is not truncated to a bare `@else`.
+        let keyword: String = if starts_with_block_keyword(rest, "@else")
+            && rest["@else".len()..].trim_start().starts_with("if")
+            // Ensure the `if` is a whole word (`@else if (` not `@else iffy`).
+            && {
+                let after_else = rest["@else".len()..].trim_start();
+                starts_with_block_keyword(&format!("@{after_else}"), "@if")
+            } {
+            "@else if".to_string()
+        } else if let Some(kw) = control_flow_opener(rest).or_else(|| control_flow_continuation(rest)) {
+            kw.to_string()
+        } else {
+            return None;
+        };
+
+        let kind = ControlFlowKind::from_keyword(&keyword)?;
+
+        // Advance past the keyword. For `@else if`, advance `@else`, skip the whitespace, then `if`.
+        if keyword == "@else if" {
+            self.advance_by_str("@else");
+            self.consume_whitespace();
+            self.advance_by_str("if");
+        } else {
+            self.advance_by_str(&keyword);
+        }
+
+        // Optional `(…)` head (the condition / loop / switch / case / trigger expression). Captured
+        // with the balanced scanner so a `)` inside a string/regex/nested paren does not close it.
+        self.consume_whitespace();
+        let head = if self.current_char == Some('(') {
+            Some(self.consume_balanced_head())
+        } else {
+            None
+        };
+
+        // Optional `{ … }` body, lexed RECURSIVELY into child tokens (markup, interpolation, JS, and
+        // nested control flow). `@defer (on …)` heads and `@case (x)` may legitimately precede a body;
+        // a clause with no `{` (rare/malformed) simply has an empty body.
+        self.consume_whitespace();
+        let body = if self.current_char == Some('{') {
+            self.consume_control_flow_body()
+        } else {
+            Vec::new()
+        };
+
+        Some(ControlFlowClause { keyword, kind, head, body })
+    }
+
+    /// Consume a parenthesized control-flow head at the cursor (the cursor is at the opening `(`),
+    /// returning the text BETWEEN the parens (parens excluded). Balanced and lexical-state-aware:
+    /// strings/template literals, comments, and regex literals inside the head are consumed whole, and
+    /// `()`/`[]`/`{}` nesting is tracked, so a `)` inside any of them does not close the head early.
+    fn consume_balanced_head(&mut self) -> String {
+        self.advance(); // Skip the opening `(`.
+        let start = self.pos;
+        let mut depth: i32 = 0;
+        let mut last_significant: Option<char> = None;
+        let mut content_end = self.pos;
+        while let Some(ch) = self.current_char {
+            match ch {
+                '\'' | '"' | '`' => {
+                    self.consume_string(ch);
+                    last_significant = Some(ch);
+                }
+                '/' if self.starts_with("//") => self.consume_line_comment(),
+                '/' if self.starts_with("/*") => self.consume_block_comment(),
+                '/' if regex_allowed_after(last_significant) => {
+                    self.consume_regex_literal();
+                    last_significant = Some('/');
+                }
+                '(' | '[' | '{' => {
+                    depth += 1;
+                    self.advance();
+                    last_significant = Some(ch);
+                }
+                ')' if depth == 0 => {
+                    content_end = self.pos;
+                    self.advance(); // Skip the closing `)`.
+                    return self.slice(start, content_end);
+                }
+                ')' | ']' | '}' => {
+                    if depth > 0 {
+                        depth -= 1;
+                    }
+                    self.advance();
+                    last_significant = Some(ch);
+                }
+                _ => {
+                    self.advance();
+                    if !ch.is_whitespace() {
+                        last_significant = Some(ch);
+                    }
+                }
+            }
+            content_end = self.pos;
+        }
+        // Unterminated head (EOF before the matching `)`): return what we have.
+        self.slice(start, content_end)
+    }
+
+    /// Consume a control-flow `{ … }` body at the cursor (the cursor is at the opening `{`) and lex its
+    /// interior RECURSIVELY into child tokens. The body interior is run through a fresh [`Lexer`] in the
+    /// default state, so nested markup, interpolation, JS, and nested control-flow regions are lexed
+    /// exactly as at top level. Returns the child token stream (the surrounding braces are not part of
+    /// it).
+    ///
+    /// The body is TEMPLATE content (markup, `{{ … }}` interpolation, attribute-string bindings, and
+    /// nested `@if`/`@for`/… blocks), NOT a JS expression — so this scanner is string- and
+    /// interpolation-aware to keep a `}` inside an attribute string or an interpolation from closing the
+    /// body, and tracks `{ … }` brace depth for nested control-flow blocks, but does NOT do JS regex /
+    /// comment disambiguation (a `/` in `</div>` is markup, never a regex). The matching top-level `}`
+    /// (depth 0, outside strings/interpolation) ends the body.
+    fn consume_control_flow_body(&mut self) -> Vec<Token> {
+        self.advance(); // Skip the opening `{`.
+        let start = self.pos;
+        let mut depth: i32 = 0;
+        let mut content_end = self.pos;
+        while let Some(ch) = self.current_char {
+            match ch {
+                // Attribute / binding strings: a `{` or `}` inside `"…"` / `'…'` / `` `…` `` is string
+                // content, never a brace.
+                '\'' | '"' | '`' => self.consume_string(ch),
+                // `{{ … }}` interpolation is template text, not a brace pair: consume it whole so its
+                // inner `}}` does not decrement the body depth.
+                '{' if self.starts_with("{{") => self.consume_interpolation(),
+                // A nested control-flow block's `{ … }` (and any other literal brace in markup) nests.
+                '{' => {
+                    depth += 1;
+                    self.advance();
+                }
+                '}' if depth == 0 => {
+                    content_end = self.pos;
+                    self.advance(); // Skip the closing `}`.
+                    let inner = self.slice(start, content_end);
+                    return Self::lex_fragment(&inner);
+                }
+                '}' => {
+                    depth -= 1;
+                    self.advance();
+                }
+                _ => self.advance(),
+            }
+            content_end = self.pos;
+        }
+        // Unterminated body (EOF before the matching `}`): lex whatever we captured.
+        let inner = self.slice(start, content_end);
+        Self::lex_fragment(&inner)
+    }
+
+    /// Lex a fragment of `.treaty` source into its token stream (used to recursively lex a
+    /// control-flow body). A fresh [`Lexer`] runs over `fragment` in the default state, so the body's
+    /// markup / interpolation / JS / nested control flow is lexed identically to the top level. The
+    /// top-of-file macro fence is NOT recognized inside a body (a control-flow body is never the file
+    /// top), so `at_file_top` is cleared before lexing.
+    fn lex_fragment(fragment: &str) -> Vec<Token> {
+        let mut sub = Lexer::new(fragment);
+        sub.at_file_top = false;
+        let mut tokens = Vec::new();
+        while let Some(tok) = sub.next_token() {
+            tokens.push(tok);
+        }
+        tokens
     }
 
     /// The remaining input from the cursor. `self.pos` is always a UTF-8 char boundary (every
@@ -1404,5 +1895,309 @@ more\u{00e9}TS();\n\
         assert!(!is_void_element("div"));
         assert!(!is_void_element("span"));
         assert!(!is_void_element("app-widget"));
+    }
+
+    // ─────────────────────────── R1 control-flow as a nested region ───────────────────────────
+    //
+    // A top-level `@if`/`@for`/`@switch`/`@defer` (and its chained clauses) is captured WHOLE as a
+    // first-class control-flow region, not dropped: its verbatim text reaches the template, and its
+    // structured clauses are recursively lexed. These tests pin the lexer-level facts; the sfc tests
+    // pin that the region lowers to control-flow Ivy.
+
+    /// The single `ControlFlow` token in the stream (verbatim text + clauses), or a panic if absent.
+    fn control_flow(input: &str) -> (String, Vec<ControlFlowClause>) {
+        lex(input)
+            .into_iter()
+            .find_map(|k| match k {
+                TokenKind::ControlFlow { verbatim, clauses } => Some((verbatim, clauses)),
+                _ => None,
+            })
+            .expect("expected a ControlFlow token")
+    }
+
+    #[test]
+    fn top_level_if_is_captured_as_a_control_flow_region() {
+        // The R1 bug: a top-level `@if` NOT wrapped in a host element used to be a bare marker whose
+        // condition + body were never captured, so the block was silently lost. It is now ONE
+        // ControlFlow region whose verbatim text is the whole construct.
+        let src = "const show = true;\n@if (show) {\n  <p>hi</p>\n}";
+        let (verbatim, clauses) = control_flow(src);
+        assert!(
+            verbatim.contains("@if (show)") && verbatim.contains("<p>hi</p>"),
+            "control-flow verbatim missing head/body; got {verbatim:?}"
+        );
+        assert_eq!(clauses.len(), 1, "expected a single @if clause; got {clauses:?}");
+        assert_eq!(clauses[0].kind, ControlFlowKind::If);
+        assert_eq!(clauses[0].head.as_deref(), Some("show"));
+        // The body was recursively lexed into child tokens carrying the markup.
+        assert!(
+            clauses[0]
+                .body
+                .iter()
+                .any(|t| matches!(&t.kind, TokenKind::HTML(h) if h.contains("<p>hi</p>"))),
+            "body markup not captured as a child token; got {:?}",
+            clauses[0].body
+        );
+        // The leading TS is preserved as its own JavaScript region (not swallowed by the block).
+        assert!(
+            joined_js(src).contains("const show = true"),
+            "leading TS lost; joined JS = {}",
+            joined_js(src)
+        );
+    }
+
+    #[test]
+    fn if_else_chain_links_to_one_region() {
+        // `@if (…) { … } @else { … }` is ONE region with two linked clauses (the `@else` continues the
+        // `@if`), so the whole construct lowers together.
+        let src = "@if (a) { <p>yes</p> } @else { <p>no</p> }";
+        let (verbatim, clauses) = control_flow(src);
+        assert!(verbatim.contains("@else"), "else clause not absorbed into the region; got {verbatim:?}");
+        assert_eq!(clauses.len(), 2, "expected @if + @else; got {clauses:?}");
+        assert_eq!(clauses[0].kind, ControlFlowKind::If);
+        assert_eq!(clauses[1].kind, ControlFlowKind::Else);
+        assert_eq!(clauses[1].head, None, "a bare @else has no head");
+    }
+
+    #[test]
+    fn else_if_is_a_distinct_two_word_clause() {
+        // `@else if (…)` is captured as the two-word `@else if` keyword (its `if` is part of the lead,
+        // not the head), distinct from a plain `@else`.
+        let src = "@if (a) { x } @else if (b) { y } @else { z }";
+        let (_verbatim, clauses) = control_flow(src);
+        assert_eq!(clauses.len(), 3, "expected @if + @else if + @else; got {clauses:?}");
+        assert_eq!(clauses[1].kind, ControlFlowKind::ElseIf);
+        assert_eq!(clauses[1].keyword, "@else if");
+        assert_eq!(clauses[1].head.as_deref(), Some("b"), "@else if head not captured");
+        assert_eq!(clauses[2].kind, ControlFlowKind::Else);
+    }
+
+    #[test]
+    fn for_empty_chain_is_one_region_with_track_in_head() {
+        // `@for (x of xs; track x) { … } @empty { … }` is one region; the head (with `track`) is
+        // captured between the parens, and `@empty` is a linked clause.
+        let src = "@for (item of items(); track item.id) {\n  <li>{{ item.name }}</li>\n} @empty {\n  <li>none</li>\n}";
+        let (_verbatim, clauses) = control_flow(src);
+        assert_eq!(clauses.len(), 2, "expected @for + @empty; got {clauses:?}");
+        assert_eq!(clauses[0].kind, ControlFlowKind::For);
+        assert_eq!(
+            clauses[0].head.as_deref(),
+            Some("item of items(); track item.id"),
+            "@for head (with track) not captured"
+        );
+        assert_eq!(clauses[1].kind, ControlFlowKind::Empty);
+        // The `{{ item.name }}` interpolation inside the body did not break the brace balance.
+        assert!(
+            clauses[0]
+                .body
+                .iter()
+                .any(|t| matches!(&t.kind, TokenKind::HTML(h) if h.contains("{{ item.name }}"))),
+            "interpolation inside the @for body broke the region; got {:?}",
+            clauses[0].body
+        );
+    }
+
+    #[test]
+    fn switch_case_default_is_one_region() {
+        // `@switch (…) { @case (…) { … } @default { … } }` — the inner `@case`/`@default` clauses are
+        // the switch's BODY (inside its braces), so the region is a single `@switch` clause whose body
+        // recursively contains the case regions.
+        let src = "@switch (mode()) {\n  @case ('a') { <p>A</p> }\n  @case ('b') { <p>B</p> }\n  @default { <p>D</p> }\n}";
+        let (verbatim, clauses) = control_flow(src);
+        assert!(verbatim.contains("@case ('a')") && verbatim.contains("@default"), "switch body lost; got {verbatim:?}");
+        assert_eq!(clauses.len(), 1, "switch is a single clause owning its cases; got {clauses:?}");
+        assert_eq!(clauses[0].kind, ControlFlowKind::Switch);
+        assert_eq!(clauses[0].head.as_deref(), Some("mode()"));
+        // The body recursively lexed the `@case`/`@default` clauses into a nested control-flow region
+        // (the cases chain into one region inside the switch's braces).
+        let nested = clauses[0]
+            .body
+            .iter()
+            .find_map(|t| match &t.kind {
+                TokenKind::ControlFlow { clauses, .. } => Some(clauses.clone()),
+                _ => None,
+            })
+            .expect("the switch body must hold a nested control-flow region for its cases");
+        assert_eq!(
+            nested.iter().filter(|c| c.kind == ControlFlowKind::Case).count(),
+            2,
+            "expected two @case clauses in the switch body; got {nested:?}"
+        );
+        assert!(
+            nested.iter().any(|c| c.kind == ControlFlowKind::Default),
+            "expected a @default clause in the switch body; got {nested:?}"
+        );
+    }
+
+    #[test]
+    fn nested_control_flow_recurses_into_the_body() {
+        // A `@for` whose body contains a nested `@if` must produce a nested control-flow region in the
+        // child token stream (the body is recursively lexed).
+        let src = "@for (t of todos(); track t.id) {\n  @if (t.done) { <s>{{ t.name }}</s> } @else { <span>{{ t.name }}</span> }\n}";
+        let (_verbatim, clauses) = control_flow(src);
+        assert_eq!(clauses[0].kind, ControlFlowKind::For);
+        let inner = clauses[0]
+            .body
+            .iter()
+            .find_map(|t| match &t.kind {
+                TokenKind::ControlFlow { clauses, .. } => Some(clauses.clone()),
+                _ => None,
+            })
+            .expect("nested @if not captured inside the @for body");
+        assert_eq!(inner.len(), 2, "nested @if/@else not both captured; got {inner:?}");
+        assert_eq!(inner[0].kind, ControlFlowKind::If);
+        assert_eq!(inner[1].kind, ControlFlowKind::Else);
+    }
+
+    #[test]
+    fn control_flow_head_balances_strings_and_nested_parens() {
+        // A head with a string containing `)` and a nested call `f(g())` must capture the WHOLE head;
+        // the `)` inside the string / inner parens must not close the head early.
+        let src = "@if (label === \")\" && f(g())) { <p>x</p> }";
+        let (_verbatim, clauses) = control_flow(src);
+        assert_eq!(
+            clauses[0].head.as_deref(),
+            Some("label === \")\" && f(g())"),
+            "head with a stringly `)` / nested parens was truncated"
+        );
+    }
+
+    #[test]
+    fn trailing_ts_after_a_control_flow_region_is_preserved() {
+        // After a top-level control-flow region the remaining TS is its own JavaScript region, not
+        // swallowed into the block.
+        let src = "@if (ready()) { <p>go</p> }\nconst after = 1;";
+        assert!(
+            joined_js(src).contains("const after = 1"),
+            "trailing TS after a control-flow region was lost; joined JS = {}",
+            joined_js(src)
+        );
+    }
+
+    #[test]
+    fn at_decorator_is_not_a_control_flow_region() {
+        // A TypeScript decorator `@Component(...)` shares the `@` lead but is NOT a control-flow
+        // keyword: it must stay in the JavaScript region, never captured as a control-flow block.
+        let src = "@Component({ selector: 'x' })\nclass X {}\n<div>hi</div>";
+        let kinds = lex(src);
+        assert!(
+            !kinds.iter().any(|k| matches!(k, TokenKind::ControlFlow { .. })),
+            "a TS decorator was misread as a control-flow region; got {kinds:?}"
+        );
+        assert!(
+            joined_js(src).contains("@Component({ selector: 'x' })"),
+            "the decorator was not kept in the JS region; joined JS = {}",
+            joined_js(src)
+        );
+    }
+
+    #[test]
+    fn defer_block_with_triggers_is_a_control_flow_region() {
+        // `@defer` and its `@placeholder`/`@loading`/`@error` clauses form one region; the `(on …)`
+        // trigger is captured as the head.
+        let src = "@defer (on viewport) { <heavy-cmp /> } @placeholder { <p>soon</p> } @loading { <p>...</p> }";
+        let (_verbatim, clauses) = control_flow(src);
+        assert_eq!(clauses[0].kind, ControlFlowKind::Defer);
+        assert_eq!(clauses[0].head.as_deref(), Some("on viewport"));
+        assert!(
+            clauses.iter().any(|c| c.kind == ControlFlowKind::Placeholder)
+                && clauses.iter().any(|c| c.kind == ControlFlowKind::Loading),
+            "defer continuation clauses not linked; got {clauses:?}"
+        );
+    }
+
+    // ───────────────────────── R3: server{} as a first-class region ─────────────────────────
+    //
+    // A statement-position `server[:LANG] { … }` block is recognized by the hardened scanner and
+    // captured WHOLE — body balanced through strings/comments/regex — so the server-fn extraction
+    // keys off ONE robust region rather than a standalone ASI text guard.
+
+    /// The first `ServerBlock` token in the stream (lang, body, verbatim), or a panic if absent.
+    fn server_block(input: &str) -> (Option<String>, String, String) {
+        lex(input)
+            .into_iter()
+            .find_map(|k| match k {
+                TokenKind::ServerBlock { lang, body, verbatim } => Some((lang, body, verbatim)),
+                _ => None,
+            })
+            .expect("expected a ServerBlock token")
+    }
+
+    #[test]
+    fn top_level_server_block_is_a_first_class_region() {
+        // A bare top-level `server { … }` after a statement is captured as a ServerBlock region; its
+        // body is the brace interior, and the surrounding TS stays JavaScript.
+        let src = "const x = 1\nserver {\n  async function save(u) { return db.insert(u); }\n}\nconst y = 2";
+        let (lang, body, verbatim) = server_block(src);
+        assert_eq!(lang, None, "bare server block has no :LANG tag");
+        assert!(body.contains("async function save"), "server body not captured; got {body:?}");
+        assert!(verbatim.starts_with("server {"), "verbatim should start at the keyword; got {verbatim:?}");
+        // The surrounding TS is preserved as JavaScript, not folded into the block.
+        let js = joined_js(src);
+        assert!(js.contains("const x = 1") && js.contains("const y = 2"), "surrounding TS lost; joined JS = {js:?}");
+        assert!(!js.contains("db.insert"), "server body leaked into the JS region; joined JS = {js:?}");
+    }
+
+    #[test]
+    fn server_block_lang_tag_is_captured() {
+        // `server:ts { … }` carries its transport-language tag.
+        let src = "server:ts {\n  export const ping = () => 'pong'\n}";
+        let (lang, body, _verbatim) = server_block(src);
+        assert_eq!(lang.as_deref(), Some("ts"), "server :LANG tag not captured");
+        assert!(body.contains("ping"), "tagged server body not captured; got {body:?}");
+    }
+
+    #[test]
+    fn server_block_body_balances_braces_in_strings_and_regex() {
+        // A `}` inside a string / template literal / regex inside the server body must NOT close the
+        // block early — the hardened balanced scanner keeps the whole body intact.
+        let src = "server {\n  function f() { const s = \"a}b\"; const re = /x}y/; return `t}${s}`; }\n}\nconst after = 1";
+        let (_lang, body, _verbatim) = server_block(src);
+        assert!(
+            body.contains("\"a}b\"") && body.contains("/x}y/") && body.contains("`t}${s}`"),
+            "a brace inside a string/regex/template closed the server body early; got {body:?}"
+        );
+        assert!(joined_js(src).contains("const after = 1"), "trailing TS lost after server block");
+    }
+
+    #[test]
+    fn in_function_server_block_is_recognized_at_depth() {
+        // A `server { … }` nested inside a function body (brace depth > 0) is still a first-class
+        // region: it begins right after the function's opening `{` (statement position at depth).
+        let src = "function setup(u) {\n  server {\n    async function save(x) { return db.insert(x); }\n  }\n  return save(u)\n}";
+        let (_lang, body, _verbatim) = server_block(src);
+        assert!(body.contains("async function save"), "in-function server body not captured; got {body:?}");
+    }
+
+    #[test]
+    fn server_identifier_is_not_a_block() {
+        // `server` used as a plain identifier (a `const server = …`, a member access `x.server`, an
+        // object property `{ server: … }`) must NOT be mistaken for a `server { … }` block.
+        for src in [
+            "const server = makeServer()\n<div>hi</div>",
+            "const s = app.server\n<div>hi</div>",
+            "const cfg = { server: { port: 1 } }\n<div>hi</div>",
+        ] {
+            assert!(
+                !lex(src).iter().any(|k| matches!(k, TokenKind::ServerBlock { .. })),
+                "a non-block `server` was misread as a server block; src = {src:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn find_server_blocks_reports_absolute_spans() {
+        // The `find_server_blocks` finder reports each block's absolute span; stripping `block_start..
+        // block_end` removes the whole block (and a trailing newline) from the source.
+        let src = "const a = 1\nserver {\n  function g() {}\n}\nconst b = 2\n";
+        let blocks = find_server_blocks(src);
+        assert_eq!(blocks.len(), 1, "expected exactly one server block; got {blocks:?}");
+        let b = &blocks[0];
+        assert!(src[b.block_start..b.block_end].starts_with("server {"), "span does not start at the block");
+        assert!(b.body.contains("function g"), "finder body not captured");
+        // Removing the span leaves clean client text with no dangling blank line.
+        let mut stripped = src.to_string();
+        stripped.replace_range(b.block_start..b.block_end, "");
+        assert_eq!(stripped, "const a = 1\nconst b = 2\n", "stripping the block left stray text; got {stripped:?}");
     }
 }
