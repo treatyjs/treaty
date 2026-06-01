@@ -21,6 +21,10 @@
     "./plugins": {
       "types": "./dist/plugins.d.ts",
       "default": "./dist/plugins.js"
+    },
+    "./oxlint-plugin": {
+      "types": "./dist/oxlint-plugin.d.ts",
+      "default": "./dist/oxlint-plugin.js"
     }
   },
   "sideEffects": false,

@@ -53,3 +53,10 @@ export {
 	applyTreatyJsxAutoTypes,
 	TREATY_JSX_IMPORT_SOURCE,
 } from './jsx-types.js'
+
+export type { OxlintPlugin } from './oxlint-plugin.js'
+export {
+	default as treatyOxlintPlugin,
+	TREATY_OXLINT_PLUGIN_NAME,
+	TREATY_NO_UNUSED_VARS_RULE,
+} from './oxlint-plugin.js'

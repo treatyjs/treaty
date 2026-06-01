@@ -1,6 +1,7 @@
 {
   "$schema": "./node_modules/oxlint/configuration_schema.json",
   "plugins": ["typescript", "oxc"],
+  "jsPlugins": ["./libs/treaty/lsp/src/oxlint-plugin.ts"],
   "categories": {
     "correctness": "error",
     "suspicious": "warn"
@@ -25,6 +26,13 @@
       "files": ["**/*.spec.ts", "**/*.test.ts", "**/*.smoke.mjs", "**/test/**", "**/testing/**"],
       "rules": {
         "no-console": "off"
+      }
+    },
+    {
+      "files": ["**/*.tsx", "**/*.tjsx", "**/*.treaty"],
+      "rules": {
+        "no-unused-vars": "off",
+        "treaty/no-unused-vars": "warn"
       }
     }
   ]
