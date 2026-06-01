@@ -33,6 +33,7 @@ import { strings } from '@angular-devkit/core'
 
 import {
 	FEDERATION_CONFIG_FILE,
+	defaultRemoteExposes,
 	federationConfig,
 	serializeFederationConfig,
 } from '../federation.js'
@@ -75,15 +76,6 @@ function convertBuilders(project: WorkspaceProject): void {
 	if (extract) {
 		extract.builder = TREATY_EXTRACT_I18N_BUILDER
 	}
-}
-
-/** Best-effort source root for a project (Angular omits it for `root: ''`). */
-function projectSourceRoot(project: WorkspaceProject): string {
-	if (project.sourceRoot) {
-		return project.sourceRoot
-	}
-	const root = project.root ?? ''
-	return root ? `${root}/src` : 'src'
 }
 
 /** Rewrite the builders for the chosen project in `angular.json`. */
@@ -204,10 +196,7 @@ function scaffoldSampleRemote(options: NgAddOptions): Rule {
 				federationConfig: serializeFederationConfig(
 					federationConfig({
 						name: strings.dasherize(remoteName),
-						exposes: {
-							'./Component': `./${sourceRoot}/app/app.component.ts`,
-							'./routes': `./${sourceRoot}/app/app.routes.ts`,
-						},
+						exposes: defaultRemoteExposes(`./${sourceRoot}`),
 					}),
 				),
 			}),

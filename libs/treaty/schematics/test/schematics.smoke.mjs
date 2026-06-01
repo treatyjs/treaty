@@ -27,6 +27,60 @@ import { dirname, join } from 'node:path'
 
 import { SchematicTestRunner } from '@angular-devkit/schematics/testing/index.js'
 import { HostTree } from '@angular-devkit/schematics/index.js'
+import ts from 'typescript'
+
+/**
+ * Parse a generated component's TypeScript source and assert it honours the
+ * MINIMAL-TEMPLATE contract: its `@Component` decorator declares NO `selector`
+ * and NO `standalone` property, and the class declares NO `signal()` call. We
+ * inspect the real AST (not the source text) so the philosophy comment in the
+ * scaffold — which deliberately names those very properties — never produces a
+ * false positive.
+ */
+function assertMinimalComponent(source, label) {
+	const sf = ts.createSourceFile(`${label}.ts`, source, ts.ScriptTarget.Latest, true)
+	let sawComponentDecorator = false
+	const componentPropertyNames = new Set()
+	let sawSignalCall = false
+
+	const decoratorObjectKeys = (decorator) => {
+		const call = decorator.expression
+		if (!ts.isCallExpression(call)) return
+		if (!ts.isIdentifier(call.expression) || call.expression.text !== 'Component') return
+		sawComponentDecorator = true
+		const [arg] = call.arguments
+		if (arg && ts.isObjectLiteralExpression(arg)) {
+			for (const prop of arg.properties) {
+				if (prop.name && ts.isIdentifier(prop.name)) {
+					componentPropertyNames.add(prop.name.text)
+				}
+			}
+		}
+	}
+
+	const visit = (node) => {
+		if (ts.canHaveDecorators?.(node)) {
+			for (const dec of ts.getDecorators(node) ?? []) decoratorObjectKeys(dec)
+		}
+		if (
+			ts.isCallExpression(node) &&
+			ts.isIdentifier(node.expression) &&
+			node.expression.text === 'signal'
+		) {
+			sawSignalCall = true
+		}
+		ts.forEachChild(node, visit)
+	}
+	visit(sf)
+
+	assert.ok(sawComponentDecorator, `${label}: has a @Component decorator`)
+	assert.ok(!componentPropertyNames.has('selector'), `${label}: no selector (the compiler infers it)`)
+	assert.ok(
+		!componentPropertyNames.has('standalone'),
+		`${label}: no standalone (standalone by default)`,
+	)
+	assert.ok(!sawSignalCall, `${label}: no signal() ceremony (signals by default)`)
+}
 
 const here = dirname(fileURLToPath(import.meta.url))
 const collectionPath = join(here, '..', 'dist', 'collection.json')
@@ -183,8 +237,10 @@ await check('generate application (host) produces expected files + wiring', asyn
 		assert.ok(tree.exists(f), `expected ${f} to be generated`)
 	}
 	const comp = tree.read(`${base}/src/app/app.component.ts`).toString('utf-8')
-	assert.match(comp, /selector: 'app-root'/, 'component selector uses prefix')
 	assert.match(comp, /export class DashboardComponent/, 'component class classified from name')
+	// MINIMAL TEMPLATE: the compiler fills in the selector, `standalone`, and
+	// signals — so a scaffolded component must carry none of that ceremony.
+	assertMinimalComponent(comp, 'app.component.ts')
 
 	const fed = readJson(tree, `${base}/federation.config.json`)
 	assert.equal(fed.name, 'dashboard', 'federation name dasherized from project name')
@@ -227,7 +283,9 @@ await check('generate library produces an exposable remote library', async () =>
 
 	const comp = tree.read(`${base}/src/lib/ui-kit.component.ts`).toString('utf-8')
 	assert.match(comp, /export class UiKitComponent/, 'component class classified from name')
-	assert.match(comp, /selector: 'lib-ui-kit'/, 'library prefix applied')
+	// MINIMAL TEMPLATE: a scaffolded library component carries no selector,
+	// no `standalone`, and no signal() ceremony — the compiler fills them in.
+	assertMinimalComponent(comp, 'ui-kit.component.ts')
 })
 
 for (const line of results) console.log(line)

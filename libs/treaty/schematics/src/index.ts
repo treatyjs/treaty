@@ -42,6 +42,7 @@ export type {
 
 export {
 	FEDERATION_CONFIG_FILE,
+	defaultRemoteExposes,
 	federationConfig,
 	serializeFederationConfig,
 } from './federation.js'

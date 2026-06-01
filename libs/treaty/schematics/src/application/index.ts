@@ -28,7 +28,7 @@ import {
 } from '@angular-devkit/schematics'
 import { strings } from '@angular-devkit/core'
 
-import { federationConfig, serializeFederationConfig } from '../federation.js'
+import { defaultRemoteExposes, federationConfig, serializeFederationConfig } from '../federation.js'
 import {
 	TREATY_BUILD_BUILDER,
 	TREATY_SERVE_BUILDER,
@@ -52,13 +52,7 @@ function federationFor(name: string, sourceRoot: string, isHost: boolean): strin
 	const dashed = strings.dasherize(name)
 	const config = isHost
 		? federationConfig({ name: dashed })
-		: federationConfig({
-				name: dashed,
-				exposes: {
-					'./Component': `./${sourceRoot}/app/app.component.ts`,
-					'./routes': `./${sourceRoot}/app/app.routes.ts`,
-				},
-		  })
+		: federationConfig({ name: dashed, exposes: defaultRemoteExposes(`./${sourceRoot}`) })
 	return serializeFederationConfig(config)
 }
 
