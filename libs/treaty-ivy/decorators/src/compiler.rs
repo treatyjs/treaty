@@ -868,6 +868,7 @@ pub trait HostBindingsBuilder {
         name: &str,
         legacy_optional_chaining: bool,
         definition_map: &mut DefinitionMap,
+        pool_statements: &mut Vec<Stmt>,
     ) -> Option<Expr>;
 }
 
@@ -888,6 +889,115 @@ pub trait HostBindingsBuilder {
 /// bindings is likewise out of scope.
 #[derive(Debug, Default)]
 pub struct DefaultHostBindingsBuilder;
+
+/// Pure-function allocator for the host-bindings function — the host analogue of the template
+/// builder's `BuilderPipes`. A host `[id]="['red', id]"` binding runs Angular's full host-bindings
+/// pipeline, which includes `generatePureLiteralStructures`: a literal array/object is extracted into
+/// a const-pool `ɵɵpureFunctionN(varOffset, $cN$, …args)` whose factory is hoisted to a module-level
+/// `const`. This allocator owns the two responsibilities the converter delegates: assigning each pure
+/// function its `varOffset` (Angular's `bindingCount` — pure functions are numbered AFTER every
+/// regular host binding, starting at `regular_bindings`, each consuming `1 + num_args` host vars) and
+/// hoisting + de-duping the factory declarations.
+///
+/// Host bindings carry no pipes/arrows in any compliance fixture, so only the pure-function hooks are
+/// implemented; `allocate_pipe` is unreachable here.
+struct HostPureFunctions {
+    state: std::cell::RefCell<HostPureState>,
+    /// The number of regular host bindings (Angular `bindingCount`): pure-function var offsets begin
+    /// here, after every `ɵɵdomProperty`/`ɵɵattribute`/`ɵɵclassProp`/`ɵɵstyleProp` op.
+    regular_bindings: usize,
+}
+
+#[derive(Default)]
+struct HostPureState {
+    /// Running var-offset cursor for the next pure function (seeded at `regular_bindings`).
+    var_cursor: usize,
+    /// Hoisted factories, de-duped structurally: `(factory_body, minted_name)`.
+    interned: Vec<(Expr, String)>,
+    /// Counter seeding the minted `$cN$` reference names.
+    next_const: usize,
+}
+
+impl HostPureFunctions {
+    fn new(regular_bindings: usize) -> Self {
+        HostPureFunctions {
+            state: std::cell::RefCell::new(HostPureState {
+                var_cursor: regular_bindings,
+                ..HostPureState::default()
+            }),
+            regular_bindings,
+        }
+    }
+
+    /// The total host vars consumed once every pure function is assigned (`bindingCount` plus the
+    /// `1 + num_args` slots each pure function reserved). Equals the regular-binding count when no
+    /// pure functions were extracted.
+    fn total_host_vars(&self) -> usize {
+        self.state.borrow().var_cursor.max(self.regular_bindings)
+    }
+
+    /// The hoisted factory declarations (`const $cN$ = (a0, …) => <literal>;`), in mint order, to be
+    /// emitted as siblings of the directive definition (Angular `ConstantPool.statements`).
+    fn factory_declarations(&self) -> Vec<Stmt> {
+        self.state
+            .borrow()
+            .interned
+            .iter()
+            .map(|(factory, name)| {
+                Stmt::with_modifiers(
+                    StmtKind::DeclareVar {
+                        name: name.clone(),
+                        value: Some(factory.clone()),
+                        ty: None,
+                    },
+                    StmtModifier::FINAL,
+                )
+            })
+            .collect()
+    }
+}
+
+impl crate::expression_converter::PipeSlotAllocator for HostPureFunctions {
+    fn allocate_pipe(
+        &self,
+        _name: &str,
+        _total_args: usize,
+    ) -> crate::expression_converter::PipeSlots {
+        // No host compliance fixture pipes through a host binding; the converter only reaches this
+        // when a `BindingPipe` is present, which the host path never produces.
+        crate::expression_converter::PipeSlots { slot: 0, var_offset: 0 }
+    }
+
+    fn allocate_pure_function_slot(&self, num_args: usize) -> Option<usize> {
+        let mut state = self.state.borrow_mut();
+        let offset = state.var_cursor;
+        state.var_cursor = offset + 1 + num_args;
+        Some(offset)
+    }
+
+    fn intern_pure_function_factory(&self, factory: &Expr, _is_arrow: bool) -> Option<String> {
+        let mut state = self.state.borrow_mut();
+        if let Some((_, name)) = state.interned.iter().find(|(f, _)| f.is_equivalent(factory)) {
+            return Some(name.clone());
+        }
+        let n = state.next_const;
+        state.next_const = n + 1;
+        let name = format!("$c{n}$");
+        state.interned.push((factory.clone(), name.clone()));
+        Some(name)
+    }
+}
+
+/// `class.X`/`style.X` host bindings reserve TWO host vars; every other regular binding reserves ONE
+/// (Angular `bindingCount`). Animation string host attrs and listeners are create-block ops that
+/// consume no host vars. Mirrors the per-binding accounting in [`DefaultHostBindingsBuilder::build`].
+fn host_binding_var_count(prop: &str) -> usize {
+    if prop.starts_with("class.") || prop.starts_with("style.") {
+        2
+    } else {
+        1
+    }
+}
 
 /// `RenderFlags.Create` / `RenderFlags.Update` (mirrors the runtime bitmask phase selector).
 const RENDER_FLAG_CREATE: f64 = 0b01 as f64;
@@ -912,18 +1022,26 @@ fn host_render_flag_if(flag: f64, statements: Vec<Stmt>) -> Stmt {
     )
 }
 
-/// Parse + lower a host *property* value (a binding expression) rooted at `ctx`.
-fn lower_host_property_value(value: &str) -> crate::expression_converter::ConvertedBinding {
+/// Parse + lower a host *property* value (a binding expression) rooted at `ctx`, extracting any
+/// literal array/object into a const-pool `ɵɵpureFunctionN(varOffset, $cN$, …args)` through `pures`
+/// (Angular's host-bindings `generatePureLiteralStructures` pass). The factory hoisting + var-offset
+/// assignment are owned by the [`HostPureFunctions`] allocator.
+fn lower_host_property_value(
+    value: &str,
+    pures: &HostPureFunctions,
+) -> crate::expression_converter::ConvertedBinding {
     let parser = crate::expression::parser::Parser::default();
     let parsed = parser.parse_binding(
         value,
         crate::expression::ast::ParseSourceSpan { start: 0, end: 0 },
         0,
     );
-    crate::expression_converter::convert_property_binding(
+    let resolver =
+        crate::expression_converter::CtxResolver::new(o::variable(HOST_CONTEXT_NAME, None));
+    crate::expression_converter::convert_host_property_binding_with_pure(
         &parsed.ast,
-        o::variable(HOST_CONTEXT_NAME, None),
-        "",
+        &resolver,
+        pures,
     )
 }
 
@@ -966,6 +1084,7 @@ impl HostBindingsBuilder for DefaultHostBindingsBuilder {
         name: &str,
         _legacy_optional_chaining: bool,
         definition_map: &mut DefinitionMap,
+        pool_statements: &mut Vec<Stmt>,
     ) -> Option<Expr> {
         // The parser treats `class`/`style` specially — fold them into the attributes map
         // (faithful to `createHostBindingsFunction`'s side effect).
@@ -1074,8 +1193,16 @@ impl HostBindingsBuilder for DefaultHostBindingsBuilder {
         // `style.X`/`class.X` styling binding reserves TWO (the bound value plus styling bookkeeping).
         let mut style_stmts: Vec<Stmt> = Vec::new();
         let mut class_stmts: Vec<Stmt> = Vec::new();
+
+        // Pure-literal extraction (`generatePureLiteralStructures`): a literal array/object host
+        // binding value becomes a `ɵɵpureFunctionN` whose `varOffset` is assigned AFTER every regular
+        // binding (Angular `bindingCount`), so pre-count the regular bindings to seed the allocator.
+        let regular_bindings: usize =
+            host.properties.keys().map(|p| host_binding_var_count(p)).sum();
+        let pures = HostPureFunctions::new(regular_bindings);
+
         for (prop, value_src) in host.properties.iter() {
-            let converted = lower_host_property_value(value_src);
+            let converted = lower_host_property_value(value_src, &pures);
             let value = converted.expr;
             let spill = converted.stmts;
 
@@ -1123,6 +1250,17 @@ impl HostBindingsBuilder for DefaultHostBindingsBuilder {
         // Styling flush: all style bindings, then all class bindings (Angular's styling order).
         update_stmts.extend(style_stmts);
         update_stmts.extend(class_stmts);
+
+        // Pure-function var slots (`1 + num_args` each, numbered after the regular bindings) grow the
+        // host-var total beyond the per-binding `host_vars` count. `total_host_vars` is that final
+        // total (equal to `host_vars` when no pure function was extracted).
+        debug_assert_eq!(host_vars as usize, regular_bindings);
+        let host_vars = pures.total_host_vars() as u32;
+
+        // Hoist each extracted pure-literal factory (`const $cN$ = (a0, …) => <literal>;`) as a
+        // sibling of the directive definition (Angular `ConstantPool.statements`), so the
+        // `ɵɵpureFunctionN(slot, $cN$, …)` call references a declared const.
+        pool_statements.extend(pures.factory_declarations());
 
         // hostVars (only when > 0).
         if host_vars > 0 {
@@ -1342,6 +1480,7 @@ impl HostBindingsBuilder for StubHostBindingsBuilder {
         name: &str,
         legacy_optional_chaining: bool,
         definition_map: &mut DefinitionMap,
+        pool_statements: &mut Vec<Stmt>,
     ) -> Option<Expr> {
         DefaultHostBindingsBuilder.build(
             host,
@@ -1349,6 +1488,7 @@ impl HostBindingsBuilder for StubHostBindingsBuilder {
             name,
             legacy_optional_chaining,
             definition_map,
+            pool_statements,
         )
     }
 }
@@ -1460,6 +1600,7 @@ fn base_directive_fields<H: HostBindingsBuilder>(
         &meta.name,
         meta.legacy_optional_chaining,
         &mut definition_map,
+        pool_statements,
     );
     definition_map.set("hostBindings", host_bindings);
 
@@ -2715,6 +2856,31 @@ mod tests {
             js.contains("hostVars: 1") || js.contains("hostVars:1"),
             "expected hostVars: 1: {js}"
         );
+    }
+
+    #[test]
+    fn host_property_array_literal_extracts_pure_function() {
+        // `host: { '[id]': '["red", id]' }` — a literal array host-binding value runs Angular's
+        // host-bindings `generatePureLiteralStructures`: the array is extracted into a hoisted
+        // factory const and the binding becomes `ɵɵdomProperty("id", ɵɵpureFunction1(1, $c0$, ctx.id))`
+        // with `hostVars: 3` (1 regular binding + 1+1 pure-function slots).
+        let mut meta = directive_meta("D", "[d]");
+        meta.host.properties.insert("id".to_string(), "[\"red\", id]".to_string());
+        let mut hb = DefaultHostBindingsBuilder;
+        let compiled = compile_directive_from_metadata(&meta, &mut hb);
+        let js = emit_expression(&compiled.expression);
+
+        assert!(js.contains("ɵɵpureFunction1(1, $c0$, ctx.id)"), "missing pureFunction call: {js}");
+        assert!(
+            js.contains("hostVars: 3") || js.contains("hostVars:3"),
+            "expected hostVars: 3: {js}"
+        );
+        // The literal must NOT be emitted inline anymore.
+        assert!(!js.contains("ɵɵdomProperty(\"id\", [\"red\""), "literal not extracted: {js}");
+        // The factory const is hoisted as a sibling statement (ConstantPool.statements).
+        let stmts = crate::output::emitter::emit_statements(&compiled.statements);
+        assert!(stmts.contains("$c0$"), "factory const not hoisted: {stmts}");
+        assert!(stmts.contains("[\"red\", a0]"), "factory body wrong: {stmts}");
     }
 
     #[test]

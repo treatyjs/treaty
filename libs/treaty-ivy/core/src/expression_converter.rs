@@ -489,6 +489,26 @@ pub fn convert_property_binding_with_pipes<R: LocalResolver, P: PipeSlotAllocato
     cx.finish(expr)
 }
 
+/// Like [`convert_property_binding_with`] but additionally extracts literal arrays/maps into
+/// const-pool `ɵɵpureFunctionN(slot, factory, …args)` calls through `pipes`, the host-bindings
+/// analogue of [`convert_property_binding_with_pipes`]. A HOST property binding runs Angular's full
+/// host-bindings pipeline, which includes `generatePureLiteralStructures` — so `host: {'[id]':
+/// '["red", id]'}` lowers to `ɵɵdomProperty("id", ɵɵpureFunction1(slot, $ff$, ctx.id))` with the
+/// factory hoisted to a module-level const. Unlike the template pipe path this does NOT enable
+/// `hoist_arrows` (no host fixture rewrites a user arrow), keeping the existing host-arrow behaviour
+/// unchanged. The supplied `pipes` allocator owns the pure-function var-offset assignment and factory
+/// hoisting; without one a literal stays a verbatim array/map.
+pub fn convert_host_property_binding_with_pure<R: LocalResolver, P: PipeSlotAllocator>(
+    expr: &AstNode,
+    resolver: &R,
+    pipes: &P,
+) -> ConvertedBinding {
+    let mut cx = Converter::new(resolver).with_pipes(pipes);
+    cx.extract_pure = true;
+    let expr = cx.convert(expr);
+    cx.finish(expr)
+}
+
 /// `convertActionBinding(ast, ...)` — lower an event-handler expression. Event
 /// handlers are an implicit [`EK::Chain`] of statements; each chained expression
 /// becomes an [`o::Stmt::Expression`], and the *last* expression's value is what a
