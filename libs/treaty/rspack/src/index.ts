@@ -18,8 +18,20 @@ export { treatyLoader, loaderPath } from './loader.js'
 export { default } from './loader.js'
 export type { TreatyLoader, TreatyLoaderContext } from './loader.js'
 
-export { TreatyRspackPlugin, treatyRule } from './plugin.js'
+export { TreatyRspackPlugin, treatyRule, linkPartialRule } from './plugin.js'
 export type { TreatyCompilerHost, TreatyCompilation } from './plugin.js'
+
+// The Angular partial-declaration linker loader. Reuses the shared, Rust-backed linker core from
+// `@treaty/ts-vite` (one source of truth) so published partial Angular libraries link to AOT with
+// NO JIT and NO `@angular/compiler`. The plugin registers `linkPartialRule()` automatically; this
+// export lets callers wire the loader into their own config.
+export {
+	linkPartialLoader,
+	linkPartialLoaderPath,
+	LINK_PARTIAL_TEST,
+	isPartialModule,
+} from './link-partial-loader.js'
+export type { LinkPartialLoader, LinkPartialLoaderContext } from './link-partial-loader.js'
 
 export {
 	emitServerFnChunks,

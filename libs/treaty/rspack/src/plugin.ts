@@ -24,6 +24,7 @@
 import { createRequire } from 'node:module'
 import { toRspackModuleFederation, type MfOptions } from '@treaty/module-federation'
 import { loaderPath } from './loader.js'
+import { LINK_PARTIAL_TEST, linkPartialLoaderPath } from './link-partial-loader.js'
 import {
 	DEFAULT_EXTENSIONS,
 	DEFAULT_TEST,
@@ -166,6 +167,24 @@ export function treatyRule(options: TreatyPluginOptions = {}): ModuleRule {
 	}
 }
 
+/**
+ * Build the module rule that runs the Angular partial-declaration linker over published
+ * `node_modules` Angular modules. The rule matches `node_modules` `.mjs`/`.js`/`.cjs` files and runs
+ * {@link linkPartialLoader}, which delegates to the SHARED Rust-backed linker from `@treaty/ts-vite`
+ * (de-partialling `ɵɵngDeclare*` → AOT `ɵɵdefine*`). The loader's own cheap partial guard keeps the
+ * link off any matched file that is not actually partial-compiled, so this is safe to register
+ * broadly. `type: 'javascript/auto'` so the rule applies to ESM `.mjs` Angular fesm chunks.
+ *
+ * Exposed so callers wiring their own config can reuse the exact same linker rule.
+ */
+export function linkPartialRule(): ModuleRule {
+	return {
+		test: LINK_PARTIAL_TEST,
+		type: 'javascript/auto',
+		use: [{ loader: linkPartialLoaderPath }],
+	}
+}
+
 /** Rspack/webpack plugin that registers the Treaty loader and resolves its extensions. */
 export class TreatyRspackPlugin {
 	/** Stable plugin name surfaced in Rspack stats/diagnostics. */
@@ -189,6 +208,9 @@ export class TreatyRspackPlugin {
 		const moduleConfig = (config.module ??= {})
 		const rules = (moduleConfig.rules ??= [])
 		rules.push(treatyRule(this.options))
+		// Link published partial-compiled Angular libraries (node_modules `ɵɵngDeclare*`) to AOT via
+		// the shared Rust linker, so the build needs NO JIT and NO `@angular/compiler`.
+		rules.push(linkPartialRule())
 
 		const resolve = (config.resolve ??= {})
 		const wanted = this.options.extensions ?? DEFAULT_EXTENSIONS

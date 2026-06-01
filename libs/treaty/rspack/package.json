@@ -19,6 +19,10 @@
       "types": "./dist/loader.d.ts",
       "default": "./dist/loader.js"
     },
+    "./link-partial-loader": {
+      "types": "./dist/link-partial-loader.d.ts",
+      "default": "./dist/link-partial-loader.js"
+    },
     "./plugin": {
       "types": "./dist/plugin.d.ts",
       "default": "./dist/plugin.js"
@@ -27,7 +31,8 @@
   "sideEffects": false,
   "dependencies": {
     "@treaty/compiler": "*",
-    "@treaty/module-federation": "*"
+    "@treaty/module-federation": "*",
+    "@treaty/ts-vite": "*"
   },
   "peerDependencies": {
     "@rspack/core": ">=1",
