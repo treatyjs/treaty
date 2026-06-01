@@ -81,6 +81,103 @@ declare global {
 		interface ChildArray extends ReadonlyArray<Children> {}
 
 		// ---------------------------------------------------------------------
+		// Directive authoring
+		// ---------------------------------------------------------------------
+
+		/**
+		 * A single Angular host-binding/listener entry, as authored on a directive's
+		 * host spec. The KEY is the binding microsyntax Angular understands
+		 * (`'[style.color]'`, `'[attr.data-hl]'`, `'(click)'`, `'class.active'`, a
+		 * plain attribute name, …) and the VALUE is the expression string evaluated
+		 * against the directive instance. Keeping the value a string mirrors how the
+		 * compiler lowers `host: { … }` to `ɵɵhostProperty` / `ɵɵlistener`.
+		 */
+		type HostBindings = Readonly<Record<string, string>>
+
+		/**
+		 * The object a directive-authoring function returns: the directive's host
+		 * spec. Mirrors the `host` field of `@Directive({ host: … })`, so a function
+		 * directive (`() => ({ host: { '[attr.data-hl]': 'on()' } })`) and a
+		 * decorated class express the same host contract. Every field is optional so
+		 * a bare side-effecting directive may return `{}`.
+		 */
+		interface HostSpec {
+			/** Host bindings/listeners, keyed by Angular host microsyntax. */
+			host?: HostBindings
+		}
+
+		/**
+		 * A directive authored as a FUNCTION. The Treaty way: a plain function whose
+		 * dependencies arrive as defaulted parameters (`el = inject(ElementRef)`),
+		 * which runs its setup (effects, signals) and returns its {@link HostSpec}
+		 * (or nothing, for a purely side-effecting directive). The compiler lowers
+		 * the function to a selectorless Ivy `ɵɵdefineDirective`.
+		 *
+		 * `A` is the directive's accepted input — the value passed at the
+		 * application site (`use:highlight={expr}`); defaults to `void` for an
+		 * input-less directive applied bare (`use:highlight`).
+		 */
+		interface DirectiveFn<A = void> {
+			(input?: A): HostSpec | void
+		}
+
+		/**
+		 * A directive authored as a CLASS — any constructable value is accepted
+		 * (the `@Directive`-decorated class form). Treaty is selectorless, so the
+		 * instance shape is irrelevant to the application site; the compiler owns
+		 * instantiation and host-binding wiring.
+		 */
+		interface DirectiveClass {
+			new (...args: never[]): object
+		}
+
+		/**
+		 * A value usable as a Treaty directive: the function form
+		 * ({@link DirectiveFn}) or the decorated-class form ({@link DirectiveClass}).
+		 * Authors annotate a directive with `Directive` (input-less) or
+		 * `Directive<Input>` and get editor support for the returned host spec
+		 * without hand-declaring anything.
+		 */
+		type Directive<A = void> = DirectiveFn<A> | DirectiveClass
+
+		/**
+		 * The input type a `use:<name>` application accepts for a given directive
+		 * value `D`. A {@link DirectiveFn} surfaces its declared parameter; any
+		 * other directive value (a class, or an untyped function) accepts `unknown`,
+		 * so an application never over-constrains.
+		 */
+		type DirectiveInput<D> = D extends DirectiveFn<infer A> ? A : unknown
+
+		// ---------------------------------------------------------------------
+		// Pipe authoring
+		// ---------------------------------------------------------------------
+
+		/**
+		 * A pipe authored as a TRANSFORM FUNCTION. The Treaty way: a plain function
+		 * mapping an input value (plus any pipe arguments) to the transformed
+		 * output, mirroring Angular `PipeTransform.transform`. The compiler lowers
+		 * it to a selectorless Ivy `ɵɵdefinePipe`. Authors annotate with
+		 * `Pipe<In, Out, Args>` to get parameter/return checking and completion.
+		 *
+		 *  - `In`   — the piped value's type (the left-hand side of `value | name`).
+		 *  - `Out`  — the transformed result.
+		 *  - `Args` — the trailing pipe arguments (`value | name:a:b`); a tuple.
+		 */
+		interface Pipe<In = unknown, Out = unknown, Args extends readonly unknown[] = readonly unknown[]> {
+			(value: In, ...args: Args): Out
+		}
+
+		/**
+		 * The Angular-shaped `PipeTransform` contract, for a pipe authored as a
+		 * CLASS (`class X implements PipeTransform { transform(…) {} }`). Provided
+		 * here so a class pipe type-checks against the same surface without pulling
+		 * in `@angular/core` purely for the interface.
+		 */
+		interface PipeTransform {
+			transform(value: unknown, ...args: readonly unknown[]): unknown
+		}
+
+		// ---------------------------------------------------------------------
 		// Framework + directive attributes
 		// ---------------------------------------------------------------------
 
@@ -91,7 +188,11 @@ declare global {
 		 *
 		 * The catch-all index keeps any `use:<name>` accepted while still typing the
 		 * well-known built-ins. Bare directives accept `true | "" | string` so both
-		 * `use:autofocus` and `use:autofocus={expr}` typecheck.
+		 * `use:autofocus` and `use:autofocus={expr}` typecheck. The index value is
+		 * intentionally open (`unknown`): a directive's concrete input is the
+		 * directive function's own parameter (see {@link DirectiveInput}), which the
+		 * compiler resolves by name; the attribute surface only guarantees the
+		 * application site is accepted.
 		 */
 		interface UseDirectives {
 			/** Focus the element once it is created. */

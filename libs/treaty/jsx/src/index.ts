@@ -27,3 +27,34 @@ import './jsx-types.js'
 
 export { jsx, jsxs, jsxDEV, Fragment } from './jsx-runtime.js'
 export type { JsxProps } from './jsx-runtime.js'
+
+/**
+ * Author-facing helper types for the Treaty authoring surface. These alias into
+ * the ambient `TreatyJsx` machinery so authors can annotate the formats Treaty
+ * lowers — a directive, its host spec, and a pipe — and get editor type-checking
+ * and completion WITHOUT hand-declaring anything:
+ *
+ *  - {@link Directive} — a directive authored as a function returning a
+ *    {@link HostSpec} (or a decorated class). `Directive<Input>` types the value
+ *    a `use:<name>={input}` application passes.
+ *  - {@link DirectiveFn} — the function form on its own (`(input?) => HostSpec`).
+ *  - {@link HostSpec} / {@link HostBindings} — the `{ host: { … } }` object a
+ *    directive function returns, keyed by Angular host microsyntax.
+ *  - {@link Pipe} — a pipe authored as a transform function
+ *    (`(value, ...args) => out`); {@link PipeTransform} is the class form's
+ *    Angular-shaped contract.
+ *
+ * They are pure type aliases (no runtime value), re-published so a `.tsx` /
+ * `.tjsx` / `.treaty` author can `import type { Directive, Pipe } from '@treaty/jsx'`.
+ */
+export type Directive<A = void> = TreatyJsx.Directive<A>
+export type DirectiveFn<A = void> = TreatyJsx.DirectiveFn<A>
+export type DirectiveInput<D> = TreatyJsx.DirectiveInput<D>
+export type HostSpec = TreatyJsx.HostSpec
+export type HostBindings = TreatyJsx.HostBindings
+export type Pipe<
+	In = unknown,
+	Out = unknown,
+	Args extends readonly unknown[] = readonly unknown[],
+> = TreatyJsx.Pipe<In, Out, Args>
+export type PipeTransform = TreatyJsx.PipeTransform
