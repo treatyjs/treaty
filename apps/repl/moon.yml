@@ -2,5 +2,39 @@ id: repl
 language: typescript
 platform: node
 tags: []
-tasks: {}
 type: application
+tasks:
+  # Headless boot/build assertion for the everything-demo: compiles every Treaty
+  # authoring surface through the bundler-plugin seam, then drives the full D2
+  # deployment-granularity stack (host + remotes, versioned manifest,
+  # build-to-deploy, single-entry rollback, runtime resolution) and asserts.
+  everything-demo:
+    command: node
+    args:
+    - $projectRoot/src/everything-demo/everything-demo.smoke.mjs
+    deps:
+    - treaty-compiler:build
+    - treaty-module-federation:build
+    - treaty-federation-deploy:build
+    - treaty-deploy:build
+    inputs:
+    - src/everything-demo/**/*
+  # Type-check the everything-demo Node ESM module + smoke (checkJs, via tsgo).
+  typecheck-demo:
+    command: tsgo
+    args:
+    - --noEmit
+    - -p
+    - $projectRoot/src/everything-demo/tsconfig.check.json
+    inputs:
+    - src/everything-demo/**/*
+  # Lint the everything-demo sources with oxlint.
+  lint-demo:
+    command: oxlint
+    args:
+    - -c
+    - $workspaceRoot/.oxlintrc.json
+    - $projectRoot/src/everything-demo
+    inputs:
+    - src/everything-demo/**/*
+    - $workspaceRoot/.oxlintrc.json
