@@ -2,7 +2,7 @@
 //!
 //! Given a library's entry source files, packagr:
 //!   1. compiles each entry to Ivy output via the committed front-ends
-//!      ([`render3`] for bare `@Component` classes, [`rust_authoring`] for
+//!      ([`treaty_ivy`] for bare `@Component` classes, [`rust_authoring`] for
 //!      authoring sources), producing per-entry ESM ([`compile`]);
 //!   2. derives the entry's TypeScript declarations with
 //!      [`oxc_isolated_declarations`] ([`dts`]);
