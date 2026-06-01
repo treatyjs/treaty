@@ -7,8 +7,9 @@
   "scripts": {
     "verify": "node verify.mjs",
     "test:e2e": "node test/routing.e2e.mjs",
+    "test:e2e:full-build": "node full-build.e2e.mjs",
     "typecheck": "tsgo --noEmit -p tsconfig.json",
-    "lint": "oxlint src test *.config.ts",
+    "lint": "oxlint src test full-build.e2e.mjs *.config.ts",
     "build:vite": "vite build",
     "dev:vite": "vite"
   },
