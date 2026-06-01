@@ -133,7 +133,9 @@ function buildPluginDist() {
 // ---------------------------------------------------------------------------
 // Step 2: real production build of the app through the @treaty plugin.
 // ---------------------------------------------------------------------------
-const outDir = join(here, 'dist-e2e');
+// Emit under `dist/` so the generated bundle falls under the repo-wide `**/dist/**` lint/ignore
+// globs (and the example's .gitignore) - it is build output, never linted or committed.
+const outDir = join(here, 'dist', 'e2e');
 async function runBuild() {
   rmSync(outDir, { recursive: true, force: true });
   await build({

@@ -11,6 +11,9 @@ import { RouterOutlet } from '@angular/router';
  * renders through a real `provideRouter` configuration. `RouterOutlet` comes from `@angular/router`
  * (referenced in the component def `dependencies`), exercising the published router package too.
  */
+// AOT Ivy component: the static ɵfac/ɵcmp fields ARE the component definition Angular's runtime
+// consumes; the class is intentionally instance-less.
+// oxlint-disable-next-line no-extraneous-class
 export class AppRoot {
   static readonly ɵfac = function AppRoot_Factory(): AppRoot {
     return new AppRoot();
