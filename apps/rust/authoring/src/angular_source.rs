@@ -125,6 +125,13 @@ fn detect_angular_decorators(source: &str) -> Vec<AngularDecoratorKind> {
     kinds
 }
 
+/// Whether `source` carries a top-level `@Component`-decorated class. The JSX front-end uses this to
+/// route a `.tsx`/`.tjsx` that contains a base-Angular `@Component` class (rather than the bare
+/// function/arrow JSX form) here instead of erroring with "no component found".
+pub fn has_angular_component(source: &str) -> bool {
+    detect_angular_decorators(source).contains(&AngularDecoratorKind::Component)
+}
+
 /// Compile a base Angular `@Component` `.ts` source, handling a top-level `server { … }` block.
 ///
 /// Steps:

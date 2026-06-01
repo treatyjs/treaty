@@ -278,6 +278,20 @@ pub fn compile(source: &str, file_name: &str) -> CompiledAuthoring {
             (component.template_html, body)
         }
         None => {
+            // F3: a `.tsx`/`.tjsx` may carry a base-Angular `@Component`-decorated CLASS rather than
+            // the bare function/arrow JSX form. Route it to the `@Component` compiler (which lowers
+            // `@Component` → ɵɵdefineComponent and is itself server-block aware), passing the ORIGINAL
+            // source so that compiler runs its own server extraction + map redaction. This makes the
+            // addon's documented "handles @Component JSX" claim hold instead of erroring with
+            // "no component found". (`directives` pass state was already drained above, so the early
+            // return leaks no thread-local state.)
+            // Detect the decorator on the SERVER-STRIPPED `client_source` (the raw `source` still
+            // carries the `server { … }` block, which is not valid bare TS and would fail the
+            // detector's parse), but DELEGATE with the original `source` so `compile_angular_source`
+            // runs its own server extraction + map redaction over the whole file.
+            if crate::angular_source::has_angular_component(&client_source) {
+                return crate::angular_source::compile_angular_source(source, file_name);
+            }
             errors.push("jsx: no component (default-export or named function returning JSX) found".to_string());
             (String::new(), client_source.clone())
         }
@@ -1028,6 +1042,54 @@ export default function greetingCard() {\n\
             .collect::<Vec<_>>()
             .join("\n");
         assert!(joined.contains("function onSave"), "client body lost from map: {joined}");
+    }
+
+    #[test]
+    fn tsx_component_class_routes_to_angular_compiler_without_leak() {
+        // F3: a `@Component`-decorated CLASS in a `.tsx` is not the bare function/arrow JSX form, so
+        // `find_component` yields None. Rather than erroring "no component found", the JSX front-end
+        // now routes it to the base-Angular `@Component` compiler (the addon doc's "handles
+        // @Component JSX" claim), which lowers it to `ɵɵdefineComponent`. The lifted server-fn body (a
+        // stand-in secret) must be absent from BOTH the client code AND the map's sourcesContent — a
+        // compile path that "just works" must never downgrade to a privacy leak.
+        let source = "import { Component } from '@angular/core';\n\
+server {\n\
+  async function save(u: User) { return database.insert(u, SECRET_TOKEN); }\n\
+}\n\
+@Component({ template: '<button>x</button>' })\n\
+export class Widget {}\n";
+        let out = compile(source, "widget.tsx");
+
+        // FUNCTIONAL: it actually compiles to an Ivy component now (delegated), not a "no component" error.
+        assert!(
+            out.code.contains("defineComponent") || out.code.contains("ɵɵdefineComponent"),
+            "@Component-in-.tsx did not lower to ɵɵdefineComponent; got: {}",
+            out.code
+        );
+        assert!(
+            !out.errors.iter().any(|e| e.contains("no component")),
+            "still erroring 'no component found' instead of delegating; errors: {:?}",
+            out.errors
+        );
+
+        // SECURITY: the server body went to the backend, and the secret leaks into neither client nor map.
+        assert!(out.server_module.is_some(), "server block should still be lifted to a backend");
+        assert!(
+            !out.code.contains("database.insert") && !out.code.contains("SECRET_TOKEN"),
+            "server body leaked into client code; got: {}",
+            out.code
+        );
+        if let Some(map) = out.map {
+            let value: serde_json::Value = serde_json::from_str(&map).expect("map is valid JSON");
+            let contents = value["sourcesContent"].as_array().expect("sourcesContent array");
+            for c in contents {
+                let text = c.as_str().unwrap_or("");
+                assert!(
+                    !text.contains("database.insert") && !text.contains("SECRET_TOKEN"),
+                    "server body leaked into client map: {text}"
+                );
+            }
+        }
     }
 
     #[test]

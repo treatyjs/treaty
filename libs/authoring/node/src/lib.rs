@@ -186,8 +186,10 @@ pub struct CompiledAuthoring {
 /// Extension routing (via `rust_authoring`'s `AuthoringRegistry`):
 ///   * `.treaty` → the `.treaty` SFC front-end.
 ///   * `.tsx` / `.tjsx` → the JSX front-end, which handles BARE JSX
-///     (`export default function App() { return <div/> }`) as well as `@Component` JSX — closing
-///     the gap left by [`compile_component_source`], which only accepts `@Component`.
+///     (`export default function App() { return <div/> }`) and, when the file instead carries a
+///     base-Angular `@Component`-decorated class, delegates to the `.ts` `@Component` compiler — so a
+///     decorator class in a `.tsx` lowers to `ɵɵdefineComponent` rather than erroring "no component
+///     found".
 ///   * `.ts` → the base-Angular front-end: `@Component` classes compile to `ɵɵdefineComponent`
 ///     (server-block aware); `@Directive`/`@Pipe`/`@Injectable`/`@NgModule` and plain non-Angular
 ///     modules pass through unchanged.
