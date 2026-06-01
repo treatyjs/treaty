@@ -251,6 +251,81 @@ function stripLoaderFor(id: string): 'ts' | 'tsx' | null {
 }
 
 /**
+ * The Treaty-only authoring extensions Vite's dev server does NOT recognise as
+ * JavaScript when it decides the HTTP `Content-Type` of a served module.
+ *
+ * Vite's transform middleware only serves a module with a JS content-type
+ * (`text/javascript`) when the request reaches its transform branch, which is
+ * gated on the request URL being a JS request (`isJSRequest` — matched against a
+ * fixed known-JS-extension regex covering `.[jt]sx?`/`.m[jt]s`/`.vue`/`.svelte`/…),
+ * a CSS request, an explicit `?import` request, or a script fetch
+ * (`sec-fetch-dest: script`). `.ts`/`.tsx` match the known-JS regex, so a bare
+ * `GET /x.tsx` is transformed and labelled JS. But `.treaty`/`.tjsx` are NOT in
+ * that regex, so a `GET /x.treaty` that arrives WITHOUT a `?import` query (a
+ * dynamic `import()` whose specifier import-analysis did not rewrite, a hard
+ * navigation, a proxy that drops `sec-fetch-dest`, or a re-request of the bare
+ * URL) skips transform entirely and falls through to Vite's static/fs middleware,
+ * which serves the RAW authoring source with an EMPTY content-type. The browser
+ * then refuses the module ("disallowed MIME type ()" / `NS_ERROR_CORRUPTED_CONTENT`)
+ * and the lazy route never loads.
+ *
+ * These are exactly the extensions this plugin lowers but Vite cannot identify as
+ * JS by extension (mirroring {@link STRIP_LOADER_BY_EXT}); `.ts`/`.tsx` are not
+ * listed because Vite already treats them as JS requests.
+ */
+const DEV_SERVE_JS_EXTS: readonly string[] = Object.keys(STRIP_LOADER_BY_EXT)
+
+/**
+ * Matches Vite's `import` query marker (`?import` / `&import`, with or without a
+ * value) — the same shape Vite's `isImportRequest` tests for. Used by the
+ * dev-serve content-type fix to avoid re-injecting the marker on a request that
+ * already carries it.
+ */
+const IMPORT_QUERY_RE = /[?&]import(?:=|&|$)/
+
+/**
+ * The minimal connect/dev-server middleware shape the dev-serve content-type fix
+ * uses: a `req` carrying a mutable `url`, a `res`, and a `next` continuation.
+ * Declared structurally so the plugin typechecks without importing Vite/connect
+ * middleware types (which it otherwise does not depend on at the value level).
+ */
+type DevMiddleware = (
+	req: { url?: string },
+	res: unknown,
+	next: () => void
+) => void
+
+/**
+ * Whether `url` (a dev-server request URL, possibly carrying a query/hash) targets
+ * a Treaty-only authoring module Vite would otherwise mislabel — i.e. its path ends
+ * in {@link DEV_SERVE_JS_EXTS}. Used by the dev-serve content-type fix to decide
+ * whether to force the request through Vite's JS transform path.
+ */
+function isOwnedAuthoringUrl(url: string): boolean {
+	const clean = cleanId(url).toLowerCase()
+	return DEV_SERVE_JS_EXTS.some((ext) => clean.endsWith(ext))
+}
+
+/**
+ * Append the `import` query Vite's transform middleware uses to claim a request,
+ * preserving any existing query string and stripping a trailing `#hash` so the
+ * marker lands on the path. Mirrors Vite's own `injectQuery('…', 'import')`: a
+ * bare `/x.treaty` becomes `/x.treaty?import`; `/x.treaty?foo` becomes
+ * `/x.treaty?import&foo`. The middleware later strips it via `removeImportQuery`
+ * before transforming, so the injected marker never reaches the compiler.
+ */
+function injectImportQuery(url: string): string {
+	const hashIndex = url.indexOf('#')
+	const hash = hashIndex === -1 ? '' : url.slice(hashIndex)
+	const path = hashIndex === -1 ? url : url.slice(0, hashIndex)
+	const queryIndex = path.indexOf('?')
+	if (queryIndex === -1) return `${path}?import${hash}`
+	const base = path.slice(0, queryIndex)
+	const query = path.slice(queryIndex + 1)
+	return `${base}?import&${query}${hash}`
+}
+
+/**
  * The signature of Ivy JS this plugin's compiler emits: the `import * as i0 from
  * "@angular/core"` namespace import the emitter always prepends, paired with one
  * of the Ivy definition members it writes (`i0.ɵɵdefine*`, a `.ɵfac =` factory,
@@ -481,6 +556,44 @@ export default function treaty(options: PluginOptions = {}): Plugin[] {
 			// that this is a cold build so `buildStart` may batch-prewarm.
 			isColdBuild = resolved.command === 'build'
 			if (isColdBuild) compiler.clearCache()
+		},
+
+		/**
+		 * DEV-SERVE CONTENT-TYPE FIX. Register a pre-middleware so the dev server
+		 * serves `.treaty`/`.tjsx` authoring modules with a JavaScript content-type.
+		 *
+		 * Vite's transform middleware labels a served module `text/javascript` only
+		 * when the request reaches its transform branch, which is gated on the URL
+		 * being a JS request (a fixed known-extension regex covering `.[jt]sx?` etc.),
+		 * a CSS request, an explicit `?import` request, or a script fetch
+		 * (`sec-fetch-dest: script`). `.ts`/`.tsx` match that regex, so they always
+		 * transform and serve as JS. `.treaty`/`.tjsx` do NOT — so a request for one
+		 * that arrives WITHOUT a `?import` query (a dynamic `import()` import-analysis
+		 * left un-rewritten, a hard navigation, or a proxy that strips
+		 * `sec-fetch-dest`) skips transform and is served RAW by the static/fs
+		 * middleware with an EMPTY content-type. The browser then blocks the module
+		 * ("disallowed MIME type ()" / `NS_ERROR_CORRUPTED_CONTENT`) and the lazy
+		 * route never loads — the exact reported failure for `import "./greeter.treaty"`.
+		 *
+		 * The fix runs before Vite's own middlewares (`pre`) and, for any request
+		 * targeting an owned authoring extension that is missing the `import` marker,
+		 * injects it into `req.url`. Vite's transform middleware then claims the
+		 * request (`isImportRequest` is true), runs this plugin's `enforce: 'pre'`
+		 * transform to lower the module to Ivy JS, strips the marker via
+		 * `removeImportQuery`, and serves the lowered code with the correct
+		 * `text/javascript` content-type. Requests that already carry `?import`, or
+		 * that are not owned authoring extensions, are passed through untouched — so
+		 * the existing transform/idempotency/linker/source-map behaviour is preserved
+		 * and only the response LABEL for these two extensions changes.
+		 */
+		configureServer(server: { middlewares: { use(fn: DevMiddleware): void } }) {
+			server.middlewares.use((req, _res, next) => {
+				const url = req.url
+				if (typeof url === 'string' && isOwnedAuthoringUrl(url) && !IMPORT_QUERY_RE.test(url)) {
+					req.url = injectImportQuery(url)
+				}
+				next()
+			})
 		},
 
 		/**

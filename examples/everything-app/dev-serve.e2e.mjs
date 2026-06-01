@@ -447,6 +447,71 @@ async function assertDevHtml(server) {
 }
 
 // ---------------------------------------------------------------------------
+// Step 4: the DEV-SERVE MIME regression guard (the reported live bug).
+//
+// A lazy `import "./greeter.treaty"` aborted in the browser with
+//   "blocked because of a disallowed MIME type ()" / NS_ERROR_CORRUPTED_CONTENT
+// because Vite labels a served module `text/javascript` ONLY when the request
+// reaches its transform branch — gated on a known-JS extension regex (`.[jt]sx?`…),
+// a CSS request, an explicit `?import` query, or a script fetch. `.ts`/`.tsx` match
+// the regex; `.treaty`/`.tjsx` do NOT, so a request for one WITHOUT `?import` skips
+// transform and is served RAW by the static/fs middleware with an EMPTY content-type,
+// which the browser blocks. We boot a REAL listening dev server and FETCH each owned
+// authoring extension over HTTP both WITHOUT and WITH `?import`, asserting every
+// response carries a JavaScript content-type and the lowered Ivy body — never an
+// empty/octet-stream type, never the raw authoring source.
+async function assertDevServeMimeIsJavascript() {
+	const port = 5393
+	const server = await createServer({
+		root: here,
+		logLevel: 'warn',
+		configFile: join(here, 'vite.config.ts'),
+		server: { port, strictPort: true, hmr: false },
+		optimizeDeps: { noDiscovery: true, include: [] },
+	})
+	try {
+		await server.listen()
+		const base = `http://localhost:${port}`
+		// `.treaty` and `.tjsx` are the Treaty-only extensions Vite does not recognise as JS;
+		// `.tsx` is the control (Vite already JS-labels it). Each is fetched WITHOUT `?import`
+		// (the exact failing shape) and WITH `?import` (must stay correct).
+		const surfaces = [
+			'/src/features/metrics/gauge.treaty',
+			'/src/features/greeter/greeting-card.tjsx',
+			'/src/components/counter.tsx',
+		]
+		for (const path of surfaces) {
+			for (const url of [path, `${path}?import`]) {
+				let ct = ''
+				let body = ''
+				let status = 0
+				try {
+					const r = await fetch(base + url)
+					status = r.status
+					ct = r.headers.get('content-type') || ''
+					body = await r.text()
+				} catch (err) {
+					body = `fetch failed: ${err?.message ?? err}`
+				}
+				const isJs = /(?:^|[^-\w])(?:text|application)\/(?:javascript|ecmascript)\b/i.test(ct)
+				check(
+					`(Step 4) GET ${url} is served with a JavaScript content-type (not empty/octet-stream)`,
+					status === 200 && isJs,
+					`status=${status} content-type="${ct}"`,
+				)
+				check(
+					`(Step 4) GET ${url} serves LOWERED Ivy (ɵɵdefineComponent), not the raw authoring source`,
+					/ɵɵdefineComponent/.test(body) && !/^```/.test(body.trimStart()),
+					body.replace(/\s+/g, ' ').slice(0, 100),
+				)
+			}
+		}
+	} finally {
+		await server.close()
+	}
+}
+
+// ---------------------------------------------------------------------------
 async function main() {
 	console.log('== Step 0: wire local node_modules (incl @treaty/jsx) ==')
 	wireNodeModules()
@@ -476,6 +541,9 @@ async function main() {
 		await assertPartialAngularLinker(server)
 		await assertDevHtml(server)
 	})
+
+	console.log('== Step 4: REAL HTTP dev server serves .treaty/.tjsx with a JS content-type (the MIME bug) ==')
+	await assertDevServeMimeIsJavascript()
 
 	console.log('')
 	if (failures.length) {

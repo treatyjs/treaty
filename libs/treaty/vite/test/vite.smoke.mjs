@@ -64,6 +64,73 @@ await check('factory returns a well-formed Vite plugin', () => {
 	assert.equal(typeof plugin.configResolved, 'function', 'configResolved hook present')
 	assert.equal(typeof plugin.resolveId, 'function', 'resolveId hook present')
 	assert.equal(typeof plugin.handleHotUpdate, 'function', 'handleHotUpdate hook present')
+	assert.equal(typeof plugin.configureServer, 'function', 'configureServer hook present')
+})
+
+// helper: drive the plugin's configureServer middleware and return the (possibly
+// rewritten) req.url for a given incoming request URL. Captures the single
+// middleware the plugin registers and runs it against a minimal connect-style req.
+function runDevMiddleware(p, url) {
+	let middleware
+	const server = { middlewares: { use(fn) { middleware = fn } } }
+	p.configureServer.call({}, server)
+	assert.equal(typeof middleware, 'function', 'configureServer registers a middleware')
+	const req = { url }
+	let nexted = false
+	middleware(req, {}, () => { nexted = true })
+	assert.ok(nexted, 'middleware always calls next()')
+	return req.url
+}
+
+// 1b. DEV-SERVE MIME FIX: the configureServer middleware forces Vite to serve
+//     `.treaty`/`.tjsx` modules with a JS content-type. Vite only labels a served
+//     module `text/javascript` when the request reaches its transform branch,
+//     which (for these Treaty-only extensions, absent from Vite's known-JS regex)
+//     requires an `?import` marker. The middleware injects that marker into a bare
+//     owned-extension request URL, so the request goes through transform (-> Ivy
+//     JS, JS content-type) instead of falling through to the static/fs middleware
+//     that serves the RAW source with an EMPTY content-type (the reported bug:
+//     "disallowed MIME type ()" / NS_ERROR_CORRUPTED_CONTENT on a lazy import).
+await check('configureServer injects ?import into a bare .treaty request URL', () => {
+	assert.equal(
+		runDevMiddleware(plugin, '/src/features/greeter/greeter.treaty'),
+		'/src/features/greeter/greeter.treaty?import',
+		'a bare .treaty request gains the ?import marker so Vite transforms + JS-labels it'
+	)
+})
+
+await check('configureServer injects ?import into a bare .tjsx request URL', () => {
+	assert.equal(
+		runDevMiddleware(plugin, '/src/x.tjsx'),
+		'/src/x.tjsx?import',
+		'a bare .tjsx request gains the ?import marker'
+	)
+})
+
+await check('configureServer preserves an existing query when injecting ?import', () => {
+	assert.equal(
+		runDevMiddleware(plugin, '/src/x.treaty?t=123'),
+		'/src/x.treaty?import&t=123',
+		'?import is prepended ahead of an existing query string (and the query is kept)'
+	)
+})
+
+await check('configureServer leaves an already-?import .treaty request untouched', () => {
+	assert.equal(
+		runDevMiddleware(plugin, '/src/x.treaty?import'),
+		'/src/x.treaty?import',
+		'a request that already carries ?import is not rewritten'
+	)
+})
+
+await check('configureServer does NOT rewrite .tsx/.ts (Vite already JS-labels them)', () => {
+	assert.equal(runDevMiddleware(plugin, '/src/x.tsx'), '/src/x.tsx', '.tsx is a known JS request to Vite')
+	assert.equal(runDevMiddleware(plugin, '/src/x.ts'), '/src/x.ts', '.ts is a known JS request to Vite')
+})
+
+await check('configureServer does NOT rewrite unowned (.css/.js) requests', () => {
+	assert.equal(runDevMiddleware(plugin, '/src/x.css'), '/src/x.css', '.css is untouched')
+	assert.equal(runDevMiddleware(plugin, '/src/x.js'), '/src/x.js', '.js is untouched')
 })
 
 // helper: call the (async) transform hook with a benign `this` and await it. The
