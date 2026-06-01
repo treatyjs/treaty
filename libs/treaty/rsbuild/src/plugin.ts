@@ -44,6 +44,7 @@ import {
 	routesSentinelPath,
 	TREATY_ROUTES_ID,
 } from './routes-virtual.js'
+import { devBackendConfigModifier, type DevServerFn } from './dev-backend.js'
 
 /**
  * The `processAssets` pipeline stage to emit server-fn chunks at. `'additional'`
@@ -183,6 +184,14 @@ export function pluginTreaty(options: TreatyPluginOptions = {}): RsbuildPlugin {
 				// Accumulates the per-fn server chunks discovered across the build so
 				// they can be code-split into their own files at asset-emit time.
 				const serverChunks = new ServerChunkCollector()
+				// DEV BACKEND registry: export name -> the ORIGINAL module whose SSR-loaded
+				// export is the real server-fn body. Populated lazily below as authoring
+				// files declaring server fns are transformed, and read at request time by
+				// the `/__server/<name>` dev middleware (mirroring @treaty/vite). Registered
+				// on Rsbuild's dev middleware chain so the client RPC stub's
+				// `fetch('/__server/<name>')` gets a genuine response in dev instead of a 404.
+				const devServerFns = new Map<string, DevServerFn>()
+				api.modifyRsbuildConfig(devBackendConfigModifier(devServerFns))
 				// Cold-build batch prewarm (opt-in), when the host exposes the hook.
 				if (prewarmFiles.length > 0 && typeof api.onBeforeBuild === 'function') {
 					api.onBeforeBuild(() => prewarm(compiler, prewarmFiles))
@@ -194,6 +203,17 @@ export function pluginTreaty(options: TreatyPluginOptions = {}): RsbuildPlugin {
 					// the returned `code` is the CLIENT module (fn bodies already
 					// replaced by the compiler with their client bindings).
 					serverChunks.add(result)
+					// Register each extracted server fn for the dev backend, routing
+					// `/__server/<exportName>` to the ORIGINAL module so its export runs
+					// the real body server-side (the client only ever sees the RPC stub).
+					if (result.serverChunks) {
+						for (const chunk of result.serverChunks) {
+							devServerFns.set(chunk.exportName, {
+								exportName: chunk.exportName,
+								moduleId: resourcePath,
+							})
+						}
+					}
 					return { code: result.code, map: result.map }
 				})
 				// Emit each server fn as its own `<id>.server.js` chunk plus the

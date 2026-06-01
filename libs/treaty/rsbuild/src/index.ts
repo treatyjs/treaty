@@ -36,6 +36,26 @@ export {
 
 export { default as treatyLoader } from './loader.js'
 
+// The server-fn DEV BACKEND. `pluginTreaty` registers it automatically on Rsbuild's dev
+// middleware chain (the `api.transform` path) so a client RPC stub's `fetch('/__server/<name>')`
+// gets a genuine response in dev — at parity with `@treaty/vite`. It reuses the SHARED,
+// bundler-agnostic server-fn middleware from `@treaty/vite` (one source of truth); these exports
+// let callers wire the backend into their own Rsbuild config or inspect the route contract.
+export {
+	devBackendConfigModifier,
+	createServerFnMiddleware,
+	parseServerFnRoute,
+	decodeArgs,
+	SERVER_ROUTE_PREFIX,
+} from './dev-backend.js'
+export type {
+	DevServerFn,
+	DevReq,
+	DevRes,
+	DevConnectMiddleware,
+	DevBackendServer,
+} from './dev-backend.js'
+
 // File routing as a virtual module, generated during the build (no prebuilt routes.ts). Reuses the
 // shared, Rust-backed generator from `@treaty/ts-vite` (one source of truth). `pluginTreaty` wires
 // the alias + Rspack loader rule automatically when `fileRoutes` is set; these exports let callers

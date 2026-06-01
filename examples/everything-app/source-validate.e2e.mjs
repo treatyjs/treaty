@@ -305,6 +305,9 @@ async function validateFile(abs) {
 // synthetic rows drive that matrix through the SAME production `@treaty/compiler` seam and assert, by
 // PARSING the emitted client (esbuild loader + @babel/parser — never a regex over the emit):
 //   - the server-fn body token is ABSENT from the client code AND the client map's sourcesContent,
+//   - a PLANTED SECRET token embedded in the server-fn body (a distinct `sk_live_…`-shaped literal,
+//     the canonical leak vector: an API key the author wrote inside the lifted body) is likewise
+//     ABSENT from BOTH the client code AND the client map's sourcesContent,
 //   - a server artifact (serverModule/chunks) is produced,
 //   - the lifted fn is re-exported as a client binding AND the resource helper is imported at module
 //     scope (so a consumer import resolves at boot, not `undefined`),
@@ -315,10 +318,15 @@ const CROSS_CUTTING_MATRIX = [
 		file: 'matrix/component-use-server.component.ts',
 		source:
 			"import { Component } from '@angular/core'\n" +
-			"export async function loadUser(id: number) { 'use server'; return db.users.findSecret(id) }\n" +
+			"export async function loadUser(id: number) {\n" +
+			"  'use server'\n" +
+			"  const KEY = 'sk_live_MATRIX_USE_SERVER_a1b2c3'\n" +
+			'  return db.users.findSecret(id, KEY)\n' +
+			'}\n' +
 			"@Component({ template: '<div>{{ x }}</div>' })\n" +
 			'export class MatrixUseServerComponent { x = 1 }\n',
 		bodyToken: 'db.users.findSecret',
+		secretToken: 'sk_live_MATRIX_USE_SERVER_a1b2c3',
 		binding: 'export const loadUser =',
 		expectedDefine: 'ɵɵdefineComponent',
 	},
@@ -326,20 +334,29 @@ const CROSS_CUTTING_MATRIX = [
 		file: 'matrix/component-dollar.component.ts',
 		source:
 			"import { Component } from '@angular/core'\n" +
-			'export async function loadOrder$$(id: number) { return db.orders.findSecret(id) }\n' +
+			'export async function loadOrder$$(id: number) {\n' +
+			"  const KEY = 'sk_live_MATRIX_DOLLAR_d4e5f6'\n" +
+			'  return db.orders.findSecret(id, KEY)\n' +
+			'}\n' +
 			"@Component({ template: '<div>{{ x }}</div>' })\n" +
 			'export class MatrixDollarComponent { x = 1 }\n',
 		bodyToken: 'db.orders.findSecret',
+		secretToken: 'sk_live_MATRIX_DOLLAR_d4e5f6',
 		binding: 'export const loadOrder$$ =',
 		expectedDefine: 'ɵɵdefineComponent',
 	},
 	{
 		file: 'matrix/sfc-use-server.treaty',
 		source:
-			"export async function loadRow(id: number) { 'use server'; return db.rows.findSecret(id) }\n" +
+			'export async function loadRow(id: number) {\n' +
+			"  'use server'\n" +
+			"  const KEY = 'sk_live_MATRIX_SFC_g7h8i9'\n" +
+			'  return db.rows.findSecret(id, KEY)\n' +
+			'}\n' +
 			"const title = 'Matrix'\n" +
 			'<div>{{ title }}</div>\n',
 		bodyToken: 'db.rows.findSecret',
+		secretToken: 'sk_live_MATRIX_SFC_g7h8i9',
 		binding: 'export const loadRow =',
 		expectedDefine: 'ɵɵdefineComponent',
 	},
@@ -347,12 +364,16 @@ const CROSS_CUTTING_MATRIX = [
 		file: 'matrix/jsx-dollar.tjsx',
 		source:
 			"import { signal } from '@angular/core'\n" +
-			'export async function loadCard$$(name: string) { return db.cards.findSecret(name) }\n' +
+			'export async function loadCard$$(name: string) {\n' +
+			"  const KEY = 'sk_live_MATRIX_JSX_j0k1l2'\n" +
+			'  return db.cards.findSecret(name, KEY)\n' +
+			'}\n' +
 			'export default function matrixCard() {\n' +
 			"  const name = signal('Grace')\n" +
 			'  return <section>{name()}</section>\n' +
 			'}\n',
 		bodyToken: 'db.cards.findSecret',
+		secretToken: 'sk_live_MATRIX_JSX_j0k1l2',
 		binding: 'export const loadCard$$ =',
 		expectedDefine: 'ɵɵdefineComponent',
 	},
@@ -403,6 +424,10 @@ async function validateCrossCuttingMatrix() {
 		// The server-fn body token is ABSENT from the client code (exact substring; not the leak vector).
 		expect(row, `server body token absent from CLIENT code: "${c.bodyToken}"`, !clientCode.includes(c.bodyToken), 'token leaked into client code')
 
+		// The PLANTED SECRET (an `sk_live_…` literal the author wrote inside the lifted body — the
+		// canonical leak vector) is ABSENT from the client code.
+		expect(row, `planted secret absent from CLIENT code: "${c.secretToken}"`, !clientCode.includes(c.secretToken), 'planted secret leaked into client code')
+
 		// The lifted fn is re-exported as its client binding (so a consumer import resolves to the stub).
 		expect(row, `lifted fn re-exported as client binding: "${c.binding}"`, clientCode.includes(c.binding), 'no re-exported client binding')
 
@@ -437,6 +462,9 @@ async function validateCrossCuttingMatrix() {
 			mapContent = mapParsed && Array.isArray(mapParsed.sourcesContent) ? mapParsed.sourcesContent.join('\n') : ''
 		}
 		expect(row, `server body token absent from client MAP sourcesContent: "${c.bodyToken}"`, !mapContent.includes(c.bodyToken), 'token leaked into client map')
+
+		// The planted secret must not survive in the client map's sourcesContent either.
+		expect(row, `planted secret absent from client MAP sourcesContent: "${c.secretToken}"`, !mapContent.includes(c.secretToken), 'planted secret leaked into client map')
 
 		// Production privacy guard over the threaded chunks/map.
 		const audit = assertNoServerBodyInMap(result)

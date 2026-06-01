@@ -22,12 +22,17 @@
     "./link-partial": {
       "types": "./dist/link-partial.d.ts",
       "default": "./dist/link-partial.js"
+    },
+    "./dev-backend": {
+      "types": "./dist/dev-backend.d.ts",
+      "default": "./dist/dev-backend.js"
     }
   },
   "sideEffects": false,
   "dependencies": {
     "@treaty/compiler": "*",
-    "@treaty/ts-vite": "*"
+    "@treaty/ts-vite": "*",
+    "@treaty/vite": "*"
   },
   "peerDependencies": {
     "@rsbuild/core": ">=1.0.0"
