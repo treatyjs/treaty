@@ -8,12 +8,14 @@
 # folder. A thin TS/NAPI binding consumes these outputs in a later step. See
 # [[rust-core-ts-shim-layering]].
 #
-# DETACHED CRATE: the empty `[workspace]` table below makes this crate its own
-# workspace root, so it is NOT a member of the parent workspace and builds
-# independently of the in-flight render3 / runtime edits. Build with:
+# This crate is `exclude`d from the parent workspace (see the repo-root
+# Cargo.toml `[workspace].exclude`) so it still builds independently with
 #   cargo build --manifest-path libs/file-routing/Cargo.toml
-[workspace]
-
+# yet can be consumed as a normal path dependency by a workspace member (the
+# NAPI addon `authoring_node`) without the "multiple workspace roots" conflict an
+# empty nested `[workspace]` table would cause. Exclusion (not a nested
+# workspace) is the right primitive: it keeps the crate out of the member glob
+# while letting members depend on it by path.
 [package]
 name = "treaty_file_routing"
 version = "0.1.0"

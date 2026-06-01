@@ -1,6 +1,10 @@
 #[macro_use]
 extern crate napi_derive;
 
+use treaty_file_routing::{
+    emit_ts as r3_emit_routes_ts, generate_routing as r3_generate_routing, referenced_files as r3_referenced_files,
+    FileRoutingConfig, PartialFileRoutingConfig, RealFsDirTree,
+};
 use treaty_ivy::compile::compile_component as r3_compile_component;
 use treaty_ivy::linker::link_partial as r3_link_partial;
 use treaty_ivy::source_compile::compile_component_source_with_map as r3_compile_component_source_with_map;
@@ -205,6 +209,86 @@ pub fn compile_many(files: Vec<AuthoringFile>) -> Vec<CompiledAuthoringEntry> {
         .collect()
 }
 
+/// The generated file-routing **virtual module** plus its watch dependency set.
+///
+/// Produced by [`generate_routes`] for a bundler plugin to serve as an in-memory
+/// module during a build (no checked-in / prebuilt `routes.ts`). `code` is the
+/// emitted TypeScript routes module — byte-identical to the `treaty-file-routing`
+/// CLI `--emit ts` output because both call the SAME pure-core emitter
+/// ([`treaty_file_routing::emit_ts`]). `files` are the tree-relative route entry
+/// files the module's lazy `import(...)` loaders reference, for the bundler to
+/// register as watch dependencies so editing a route re-runs the virtual module.
+#[napi(object)]
+pub struct GeneratedRoutes {
+    /// The emitted TypeScript routes module (`export const routes`, `export default
+    /// routes`, `export const federationRemotes`).
+    pub code: String,
+    /// Tree-relative route entry files the emitted module references (watch deps),
+    /// in route depth-first then federation order, de-duplicated.
+    pub files: Vec<String>,
+}
+
+/// The `config_json` knobs accepted by [`generate_routes`]: the
+/// [`PartialFileRoutingConfig`] routing fields (camelCase: `routesDir`, `apiDir`,
+/// `dynamicSegmentStyle` (`"bracket"`/`"colon"`), `federation`, …) plus the
+/// emit-only `importBase` prefix prepended to each loader `import(...)` path.
+///
+/// `importBase` is captured here rather than on [`PartialFileRoutingConfig`]
+/// because it governs *emission* (where the virtual module sits relative to the
+/// route files), not how the tree is *interpreted*. Absent fields fall back to
+/// the routing defaults / the `../../` base used by the CLI.
+#[derive(serde::Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+struct GenerateRoutesOptions {
+    /// Overrides overlaid onto the file-routing defaults (flattened so the JSON
+    /// is a flat object of `routesDir` / `apiDir` / `dynamicSegmentStyle` / … ).
+    #[serde(flatten)]
+    config: PartialFileRoutingConfig,
+    /// Loader `import(...)` path prefix for the emitted module's entry files.
+    import_base: Option<String>,
+}
+
+/// Generate the file-routing module for `root_dir` DURING a build, as a virtual
+/// module — the bundler-plugin shim over the pure [`treaty_file_routing`] core.
+///
+/// `root_dir` is the project root that CONTAINS the configured `routes/` and
+/// `api/` directories. `config_json` is a JSON object of the
+/// [`GenerateRoutesOptions`] knobs (`routesDir`, `apiDir`, `dynamicSegmentStyle`
+/// `"bracket"`/`"colon"`, `federation`, `importBase`, …); pass `""` or `"{}"` for
+/// the defaults.
+///
+/// Drives the SAME pipeline as the CLI: a [`RealFsDirTree`] over `root_dir` →
+/// [`generate_routing`] → [`emit_ts`], so the returned `code` matches
+/// `treaty-file-routing --emit ts` byte-for-byte for the same tree + base. The
+/// returned `files` are the route entry files the module references, for the
+/// plugin to register as watch dependencies.
+///
+/// [`generate_routing`]: treaty_file_routing::generate_routing
+/// [`emit_ts`]: treaty_file_routing::emit_ts
+#[napi]
+pub fn generate_routes(root_dir: String, config_json: String) -> napi::Result<GeneratedRoutes> {
+    let trimmed = config_json.trim();
+    let options: GenerateRoutesOptions = if trimmed.is_empty() {
+        GenerateRoutesOptions::default()
+    } else {
+        serde_json::from_str(trimmed)
+            .map_err(|e| napi::Error::from_reason(format!("invalid file-routing config JSON: {e}")))?
+    };
+
+    let config: FileRoutingConfig = FileRoutingConfig::resolve(options.config);
+    // The CLI's default import base; the bundler shim overrides it per its
+    // virtual-module location.
+    let import_base = options.import_base.as_deref().unwrap_or("../../");
+
+    let tree = RealFsDirTree::new(&root_dir);
+    let routing = r3_generate_routing(&config, &tree);
+
+    Ok(GeneratedRoutes {
+        code: r3_emit_routes_ts(&routing, import_base),
+        files: r3_referenced_files(&routing),
+    })
+}
+
 /// Execute a Treaty macro through the Nova-backed [`treaty_runtime`] and return its produced value
 /// as a JSON string.
 ///
@@ -353,5 +437,75 @@ mod tests {
         )
         .expect_err("a throwing server fn should error");
         assert!(err.reason.contains("server fn failed"), "got: {}", err.reason);
+    }
+
+    /// The example app's routes root — `examples/file-routed-app` relative to the
+    /// addon crate (libs/authoring/node → up four to repo root).
+    fn example_routes_root() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("..")
+            .join("examples")
+            .join("file-routed-app")
+    }
+
+    #[test]
+    fn generate_routes_emits_module_and_watch_files() {
+        let root = example_routes_root().to_string_lossy().to_string();
+        let out = generate_routes(root, String::new()).expect("default config generates");
+
+        // The emitted code is a consumable Angular route module.
+        assert!(out.code.contains("export const routes: Routes = ["));
+        assert!(out.code.contains("export default routes"));
+        assert!(out.code.contains("export const federationRemotes = "));
+        assert!(out.code.contains("loadComponent: () => import("));
+
+        // The default import base (../../) prefixes the tree-relative entries.
+        assert!(out.code.contains("import(\"../../routes/index.treaty\")"));
+
+        // The watch-dependency list carries the referenced route entry files
+        // (tree-relative, no import base), de-duplicated.
+        assert!(out.files.iter().any(|f| f == "routes/layout.treaty"));
+        assert!(out.files.iter().any(|f| f == "routes/index.treaty"));
+        let mut sorted = out.files.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), out.files.len(), "watch files are unique");
+    }
+
+    #[test]
+    fn generate_routes_honors_config_and_import_base() {
+        let root = example_routes_root().to_string_lossy().to_string();
+        // Colon style + custom import base + federation off.
+        let cfg = r#"{"dynamicSegmentStyle":"colon","federation":false,"importBase":"@routes"}"#;
+        let out = generate_routes(root, cfg.to_string()).expect("config generates");
+
+        // Federation off → empty remotes.
+        assert!(out.code.contains("export const federationRemotes = [] as const"));
+        // Custom import base honored (a single separator inserted).
+        assert!(out.code.contains("import(\"@routes/routes/index.treaty\")"));
+        // Colon style honored: no surviving bracket dynamic segments in paths.
+        assert!(!out.code.contains("path: \"[slug]\""));
+    }
+
+    #[test]
+    fn generate_routes_rejects_invalid_config_json() {
+        let result = generate_routes("whatever".to_string(), "{ not json".to_string());
+        let err = match result {
+            Ok(_) => panic!("invalid config JSON should error"),
+            Err(e) => e,
+        };
+        assert!(err.reason.contains("invalid file-routing config JSON"), "got: {}", err.reason);
+    }
+
+    #[test]
+    fn generate_routes_empty_root_yields_empty_module() {
+        // A root with no routes/ dir contributes nothing but still emits a
+        // well-formed (empty) module rather than failing.
+        let out = generate_routes("definitely/not/a/real/path".to_string(), "{}".to_string())
+            .expect("missing root generates an empty module");
+        assert!(out.code.contains("export const routes: Routes = [\n]"));
+        assert!(out.files.is_empty());
     }
 }

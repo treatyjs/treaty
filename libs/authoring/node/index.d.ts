@@ -163,3 +163,41 @@ export declare function runServerFn(tsSource: string, argsJson: string): string
  * byte-identical; `errors` is empty on success.
  */
 export declare function linkPartial(code: string, fileName: string): CompiledComponent
+/**
+ * The generated file-routing virtual module plus its watch dependency set.
+ *
+ * Produced by `generateRoutes` for a bundler plugin to serve as an in-memory module during a build
+ * (no checked-in / prebuilt `routes.ts`). `code` is the emitted TypeScript routes module —
+ * byte-identical to the `treaty-file-routing` CLI `--emit ts` output because both call the SAME
+ * pure-core emitter. `files` are the tree-relative route entry files the module's lazy `import(...)`
+ * loaders reference, for the bundler to register as watch dependencies so editing a route re-runs
+ * the virtual module.
+ */
+export interface GeneratedRoutes {
+  /**
+   * The emitted TypeScript routes module (`export const routes`, `export default routes`,
+   * `export const federationRemotes`).
+   */
+  code: string
+  /**
+   * Tree-relative route entry files the emitted module references (watch deps), in route
+   * depth-first then federation order, de-duplicated.
+   */
+  files: Array<string>
+}
+/**
+ * Generate the file-routing module for `rootDir` DURING a build, as a virtual module — the
+ * bundler-plugin shim over the pure `treaty_file_routing` core.
+ *
+ * `rootDir` is the project root that CONTAINS the configured `routes/` and `api/` directories.
+ * `configJson` is a JSON object of file-routing knobs (`routesDir`, `apiDir`, `dynamicSegmentStyle`
+ * `"bracket"`/`"colon"`, `federation`, `importBase`, …); pass `""` or `"{}"` for the defaults.
+ *
+ * Drives the SAME pipeline as the CLI: a real-filesystem `DirTree` over `rootDir` → `generateRouting`
+ * → `emitTs`, so the returned `code` matches `treaty-file-routing --emit ts` byte-for-byte for the
+ * same tree + base. The returned `files` are the route entry files the module references, for the
+ * plugin to register as watch dependencies.
+ *
+ * Throws if `configJson` is non-empty and not valid JSON.
+ */
+export declare function generateRoutes(rootDir: string, configJson: string): GeneratedRoutes
