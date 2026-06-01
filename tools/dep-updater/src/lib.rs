@@ -22,7 +22,7 @@
 //!
 //! This crate is a **standalone** Cargo workspace (its `Cargo.toml` declares an
 //! empty `[workspace]`); it is deliberately *not* a member of the parent treaty
-//! workspace so that building or testing it never compiles `libs/render3` or
+//! workspace so that building or testing it never compiles `libs/treaty-ivy` or
 //! `apps/**`.
 
 pub mod codemod;

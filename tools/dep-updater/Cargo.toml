@@ -1,6 +1,6 @@
 # Standalone crate: NOT a member of the parent treaty workspace.
 # The empty [workspace] table below makes Cargo treat this directory as its
-# own workspace root, so building/testing here never touches libs/render3 or
+# own workspace root, so building/testing here never touches libs/treaty-ivy or
 # apps/**. This is intentional and required by the dep-updater plan.
 [workspace]
 

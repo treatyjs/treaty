@@ -47,7 +47,7 @@ pub struct Dependency {
     /// what the manifest said.
     pub requirement: String,
     /// Manifest path the dependency was read from, relative to the repo root
-    /// (e.g. `Cargo.toml`, `libs/render3/Cargo.toml`, `package.json`).
+    /// (e.g. `Cargo.toml`, `libs/treaty-ivy/facade/Cargo.toml`, `package.json`).
     pub manifest: String,
 }
 
@@ -703,7 +703,7 @@ edition = "2021"
 oxc_ast = "0.133.0"
 serde = { version = "1", features = ["derive"] }
 napi = { version = "2.10.2", default-features = false, features = ["napi4"] }
-render3 = { path = "../../render3" }
+treaty_ivy = { path = "../../libs/treaty-ivy/facade" }
 inherited = { workspace = true }
 some_git = { git = "https://example.com/x.git" }
 
@@ -719,7 +719,7 @@ proptest = "1.4.0"
         let mut deps = parse_cargo_manifest(SAMPLE_CARGO, "Cargo.toml").unwrap();
         deps.sort_by(|a, b| a.name.cmp(&b.name));
         let names: Vec<&str> = deps.iter().map(|d| d.name.as_str()).collect();
-        // path (render3), workspace (inherited), and git (some_git) deps are skipped.
+        // path (treaty_ivy), workspace (inherited), and git (some_git) deps are skipped.
         assert_eq!(
             names,
             vec!["napi", "napi-build", "oxc_ast", "proptest", "serde"]
@@ -921,7 +921,7 @@ local = { path = "x" }
     #[test]
     fn build_plan_keeps_only_outdated_and_classifies() {
         let deps = vec![
-            dep("oxc_ast", DepKind::Crate, "0.133.0", "libs/render3/Cargo.toml"),
+            dep("oxc_ast", DepKind::Crate, "0.133.0", "libs/treaty-ivy/facade/Cargo.toml"),
             dep("serde", DepKind::Crate, "1.0.200", "Cargo.toml"),
             dep("up_to_date", DepKind::Crate, "2.0.0", "Cargo.toml"),
             dep("typescript", DepKind::Npm, "5.9.0", "package.json"),
@@ -951,7 +951,7 @@ local = { path = "x" }
         let oxc = &plans[0];
         assert_eq!(oxc.current, v("0.133.0"));
         assert_eq!(oxc.latest, v("0.140.0"));
-        assert_eq!(oxc.manifest, "libs/render3/Cargo.toml");
+        assert_eq!(oxc.manifest, "libs/treaty-ivy/facade/Cargo.toml");
         assert_eq!(oxc.id(), "crate-oxc_ast-0.133.0-to-0.140.0");
     }
 

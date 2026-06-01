@@ -110,7 +110,7 @@ pub struct UpdatePlan {
     pub latest: semver::Version,
     /// Semver delta from `current` to `latest`.
     pub class: SemverClass,
-    /// Manifest the dependency was read from (e.g. `Cargo.toml`, `libs/render3/Cargo.toml`).
+    /// Manifest the dependency was read from (e.g. `Cargo.toml`, `libs/treaty-ivy/facade/Cargo.toml`).
     ///
     /// Recorded so the orchestration knows which file to edit for the bump and
     /// so reports point a human at the exact source of the pin.
