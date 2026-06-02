@@ -103,26 +103,26 @@ Harness moved into the facade crate:
 > **Angular Linker** work below brings that whole class into scope.
 >
 > Corpus dump env var renamed `RENDER3_CORPUS_DUMP` → **`TREATY_IVY_CORPUS_DUMP`**.
-> The committed `COMPLIANCE-REPORT.md` is regenerated to 170/185 (`--report`).
+> The live harness now scores **181/185**; re-run `run-compliance.mjs --report`
+> after a fresh `corpus_dump` to regenerate the committed `COMPLIANCE-REPORT.md`.
 
 ### Ranked DIFF gaps (the work toward full parity)
 
-The live harness reports **15 matchGolden DIFFs** of the 185 runnable cases. The
-categories below enumerate the outstanding gap shapes (genuine compiler features
-plus harness/golden-authoring limits); a few categories collapse to one DIFF case
-each, so the per-category tallies are upper bounds, not the headline DIFF count.
+The live harness reports **4 matchGolden DIFFs** of the 185 runnable cases — and
+**all 4 are by-design**, not compiler defects:
 
-Genuine features (large / bespoke):
-- control / `field` bindings (2) — need `ɵɵcontrolCreate` (create) + `ɵɵcontrol` (update), breaking the element-create chain (`R3DirectiveMetadata.control_create` scaffolding exists, unpopulated).
-- inline arrows in host binding/listener (2) + inline-arrow `@Input` transform (1) — need full OXC arrow/function-expression → output-AST conversion in `convert_expr`.
-- host-binding array/object literal value → `ɵɵpureFunctionN` + hoisted factory (1).
-- a class with both `@Pipe` and `@Injectable` (ctor DI + `ɵpipe` + `ɵprov`) (1).
-- deep i18n in `@switch`/`@defer`/`@let` (3), defer local deps (1), animation `syntheticHostListener` (1), signal-query `queryAdvance` (1).
+- `ng_modules` JIT-mode goldens (4) — these goldens are authored in Angular's
+  legacy **jit** mode. treaty_ivy emits the modern AOT `setNgModuleScope` shape, so
+  matching them byte-for-byte would *regress* the output away from current Angular.
+  The harness can't request linker JIT mode, and we don't want it to.
 
-Harness / golden-authoring limits (not compiler defects):
-- `ng_modules` JIT-mode goldens (4) — the harness can't request linker JIT mode.
-- `value_composition` `@let` spread (2) — Angular's own goldens spell the binding name two incompatible ways under the canonicalizer.
-- standalone `forwardRef`-in-imports thunk shape (1).
+The genuine compiler-feature gaps that used to sit here are now **closed**:
+control / `field` bindings (`ɵɵcontrolCreate`/`ɵɵcontrol`), inline arrows in host
+binding/listener + inline-arrow `@Input` transform (full OXC arrow → output-AST
+conversion in `convert_expr`), host-binding array/object literal →
+`ɵɵpureFunctionN` + hoisted factory, `@Pipe`+`@Injectable` on one class, deep i18n
+in `@switch`/`@defer`/`@let`, defer local deps, and the `value_composition` `@let`
+spread (folded equivalently in the canonicalizer behind a no-false-pass gate).
 
 ---
 
@@ -228,9 +228,10 @@ Node-compatible Nova runtime (pure-Rust JS engine).
   In dev they **run** over a `/__server/*` connect middleware that SSR-loads the
   original module so the real body executes without shipping to the client.
   Backend-agnostic (axum default, Elysia opt-in).
-- REMAINING: server-fn extraction UNIFICATION across all marker forms (in
-  progress); production (non-dev) backend hosting + real SSE/WS transport fan-out
-  (the dev backend runs; the production axum handlers are skeletons).
+- DONE: production (non-dev) backend hosting — the generated axum `Api`
+  (`Json<Req>`→`Json<Resp>`), SSE (`Sse<Stream>`) and WebSocket handlers + a
+  runnable host (`build_router()` + `main.rs`) are real (real-`cargo build`
+  verified). Server-fn extraction is unified across the marker forms.
 
 ---
 
@@ -269,13 +270,15 @@ NAPI `linkPartial` (real `@angular/*` + CDK/Material to zero residual); the real
 build → boot e2e for both example apps; the source-validate gate; the file-level
 `'use server'` client leak CLOSED and server fns running in dev.
 
-1. **Close the remaining 15 compliance DIFFs** (toward 185) — see the ranked DIFF
-   gaps above (control/`field` bindings, inline-arrow host/transform conversion,
-   host-binding literal → `ɵɵpureFunctionN`, `@Pipe`+`@Injectable`, deep i18n in
-   `@switch`/`@defer`/`@let`, plus the harness-limited goldens).
-2. **Server-fn extraction UNIFICATION** across all marker forms (in progress), then
-   production (non-dev) backend **hosting** + real SSE/WS transport fan-out (the
-   dev `/__server/*` backend runs them; the production axum handlers are skeletons).
+1. **Compliance is at the modern-Angular ceiling: 181/185 (97.8%).** The remaining
+   **4 DIFFs are NgModule jit-mode goldens — by design**: treaty_ivy emits modern
+   `setNgModuleScope`, and matching the legacy jit-mode golden would *regress* the
+   output. Not defects, not targeted for "fixing". (The earlier genuine gaps —
+   control/`field` bindings, inline-arrow host/transform conversion, host-binding
+   literal → `ɵɵpureFunctionN`, deep i18n in `@switch`/`@defer`/`@let` — are closed.)
+2. **DONE: server-fn extraction UNIFICATION** across all marker forms + production
+   (non-dev) backend **hosting** — real axum `Api`/SSE/WebSocket handlers + a
+   runnable host, real-`cargo build`-against-axum verified.
 3. **SSR / SSG Rust core** (in progress).
 4. **Angular-CLI builders / schematics / CLI** (in progress).
 5. **JSX / `.treaty` directive authoring**; macro-data inlining; multi-casing
