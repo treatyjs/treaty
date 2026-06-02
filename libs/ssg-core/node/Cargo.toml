@@ -19,7 +19,7 @@
 [package]
 name = "treaty_ssg_node"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 napi = { version = "2.16", default-features = false, features = ["napi4"] }

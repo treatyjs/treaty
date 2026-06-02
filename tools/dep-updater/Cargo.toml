@@ -7,7 +7,7 @@
 [package]
 name = "dep-updater"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "Deterministic, AI-free self-updater for the treaty repo's own crate/npm dependencies, with a codemod registry that fixes breaking changes (seeded from the OXC 0.29->0.133 migration crib)."
 license = "MIT OR Apache-2.0"
 publish = false
