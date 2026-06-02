@@ -344,6 +344,6 @@ compliance DIFFs; production (non-dev) backend hosting + SSE/WS fan-out.
   bug, an unreachable WS tail) were caught and fixed. rust_authoring is at **427 tests**.
 
 **Roadmap status:** the four parallel workstreams (compliance climb, FESM, Api hosting,
-SSE/WS+host) all LANDED. matchGolden **178/185**; the remaining 7 DIFFs are
+SSE/WS+host) all LANDED. matchGolden **181/185** (97.8%); the remaining 4 DIFFs are
 harness/golden-vintage (legacy naming the canonicalizer doesn't fold + jit-mode-only
 NgModule goldens), not compiler defects — matching them would diverge from modern Angular.

@@ -12,7 +12,7 @@ JSX-flavored Angular — signals by default.
 
 | Area | What | Status |
 | --- | --- | --- |
-| Compiler | `treaty_ivy` — direct-to-Ivy in Rust (4-crate carve: core/template/decorators/facade), `DecoratorCompiler` registry | ✅ 178/185 runnable Angular golden parity (96.2%, climbing) |
+| Compiler | `treaty_ivy` — direct-to-Ivy in Rust (4-crate carve: core/template/decorators/facade), `DecoratorCompiler` registry | ✅ 181/185 runnable Angular golden parity (97.8%) |
 | All decorators → Ivy AOT | `@Component/@Directive/@Pipe/@Injectable/@NgModule` lower to Ivy `ɵɵdefine*` (no JIT) on every entry, including the unified `compile()` path | ✅ |
 | Authoring → Ivy | `.treaty` SFC + JSX-flavored Angular authoring plugins → `treaty_ivy`; selectorless multi-form selector (kebab/camel/Pascal) + class name derived from the file name (no `<ng-component>`) | ✅ |
 | **React → Angular** | A plain **React** `.tsx`/`.jsx` (imports from `react`, hooks) compiles to Angular Ivy: `useState`→`signal` (setter→`.set`/`.update`), `useEffect`→`effect`, `useMemo`→`computed`, `useCallback`/`useRef`/`useContext`, **props→`input()`**; signal reads auto-called in body, control-flow conditions, and handlers; inline-arrow handlers unwrapped; `react` import stripped | ✅ (`examples/treaty-shadcn` Card/Alert) |
@@ -21,7 +21,7 @@ JSX-flavored Angular — signals by default.
 | Nav / RouterLink | `RouterLink` + attribute-selector directives auto-imported into `dependencies[]` so navigation works | ✅ |
 | Component style encapsulation | Emulated encapsulation via a ported `ShadowCss` (`_ngcontent-%COMP%` scoping) | ✅ |
 | File-based routing | `treaty_file_routing` crate + CLI; build-time `virtual:treaty-routes` module (no prebuilt `routes.ts`) across vite/rspack/rsbuild | ✅ (`examples/file-routed-app`) |
-| Server functions | Inline by default (`server{}` / file-level `'use server'` / `$$` / `use websocket`); bodies extracted to the backend and stripped from client code **and** the source map; run in dev over `/__server/*`. Backend-agnostic (axum default, Elysia opt-in) | ✅ extracted + run in dev (production hosting + real SSE/WS fan-out queued) |
+| Server functions | Inline by default (`server{}` / file-level `'use server'` / `$$` / `use websocket`); bodies extracted to the backend and stripped from client code **and** the source map; run in dev over `/__server/*`. Backend-agnostic (axum default, Elysia opt-in). **Production**: generates real axum Api (`Json<Req>`→`Json<Resp>`) + SSE (`Sse<Stream>`) + WebSocket handlers + a runnable host (`build_router()` + `main.rs`) — verified by a real `cargo build` against axum | ✅ dev + production hosting (Api/SSE/WS) |
 | Runtime | Node-compatible Nova runtime, module-granular `node:` builtins, real `node:tls`/`node:https` over rustls (ring), offline-clean | ✅ 483 tests; conformance 51/0 + corpus 68/0 |
 | SSR / SSG | Server render + static generation cores (Rust-first deterministic logic) | 🏗️ |
 | Source maps | v3 maps (Ivy JS ↔ authoring source) threaded through addon + bundler plugins; server-fn bodies excluded | ✅ |
