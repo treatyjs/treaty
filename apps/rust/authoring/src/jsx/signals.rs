@@ -113,13 +113,14 @@ pub fn transform(javascript: &str) -> SignalTransform {
 
     let body = apply_edits(javascript, edits);
 
-    // Inject the reactive imports when we actually produced signals.
-    let javascript = if signals.is_empty() {
-        body
-    } else {
-        let needs_computed = references_call(&body, "computed");
-        prepend_core_import(&body, needs_computed)
-    };
+    // Inject the reactive `@angular/core` import for every primitive the (possibly already
+    // react-lowered) body references. We wrap declarations into `signal(...)` above AND the React
+    // pre-pass may have already produced `signal(...)` / `computed(...)` / `effect(...)` / `input(...)`
+    // / `inject(...)` calls before this pass ran — so the import set is driven by what the body
+    // actually references, not only by whether THIS pass wrapped anything. `ensure_core_import` is a
+    // no-op for any name already imported (so a hand-written `import { signal } from '@angular/core'`
+    // is not duplicated), and merges all missing names into a single `@angular/core` import.
+    let javascript = ensure_core_import(&body);
 
     SignalTransform { javascript, signals }
 }
@@ -782,15 +783,127 @@ fn apply_edits(source: &str, mut edits: Vec<Edit>) -> String {
     out
 }
 
-/// Prepend the Angular-core import for the reactive primitives we emitted. `signal` is always
-/// included; `computed` is added when the body references `computed(...)`.
-fn prepend_core_import(body: &str, needs_computed: bool) -> String {
-    let names = if needs_computed {
-        "signal, computed"
-    } else {
-        "signal"
-    };
-    format!("import {{ {names} }} from \"@angular/core\";\n{body}")
+/// The Angular reactive primitives the JSX/React lowering may emit calls to and which must be
+/// imported from `@angular/core`. Order is the emission order for a freshly-prepended import.
+const CORE_PRIMITIVES: [&str; 5] = ["signal", "computed", "effect", "input", "inject"];
+
+/// Ensure `body` imports every `@angular/core` reactive primitive it references, with EXACTLY ONE
+/// merged `@angular/core` import and no duplicate specifier.
+///
+/// The signals pass wraps declarations into `signal(...)`, and the React pre-pass may already have
+/// produced `signal(...)` / `computed(...)` / `effect(...)` / `input(...)` / `inject(...)` calls
+/// before this pass runs. Either way, the needed import set is whatever primitives the body now
+/// references. This:
+///   * scans the body for each primitive used as a bare call (`signal(` — not `.signal(`),
+///   * parses the body to find an existing `@angular/core` import and which names it already binds,
+///   * MERGES any missing primitive into that existing import (a span edit appended before its `}`),
+///     so a hand-written `import { signal } from '@angular/core'` is extended in place rather than
+///     duplicated; OR prepends a fresh `import { … } from "@angular/core";` when none exists.
+///
+/// A primitive already imported (by the author, or by a prior pass) is never re-added. When the body
+/// references no primitive, it is returned unchanged.
+fn ensure_core_import(body: &str) -> String {
+    // 1. Which primitives does the body reference as a bare call?
+    let used: Vec<&str> = CORE_PRIMITIVES
+        .iter()
+        .copied()
+        .filter(|name| references_call(body, name))
+        .collect();
+    if used.is_empty() {
+        return body.to_string();
+    }
+
+    // 2. Find an existing `@angular/core` import, its already-bound names, and the byte position of
+    //    its closing `}` (the merge point). Parsed off the AST, never a regex.
+    let existing = find_core_import(body);
+    let already: HashSet<&str> = existing
+        .as_ref()
+        .map(|e| e.bound_names.iter().map(|s| s.as_str()).collect())
+        .unwrap_or_default();
+
+    let missing: Vec<&str> = used
+        .into_iter()
+        .filter(|name| !already.contains(name))
+        .collect();
+    if missing.is_empty() {
+        // Every referenced primitive is already imported — nothing to add.
+        return body.to_string();
+    }
+
+    match existing {
+        // Merge into the existing import: insert `, a, b` just before its closing `}`.
+        Some(e) => {
+            let insert = format!(", {}", missing.join(", "));
+            let mut out = String::with_capacity(body.len() + insert.len());
+            out.push_str(&body[..e.insert_at]);
+            out.push_str(&insert);
+            out.push_str(&body[e.insert_at..]);
+            out
+        }
+        // No existing import: prepend a fresh one with the missing names in canonical order.
+        None => {
+            let ordered: Vec<&str> = CORE_PRIMITIVES
+                .iter()
+                .copied()
+                .filter(|p| missing.contains(p))
+                .collect();
+            format!(
+                "import {{ {} }} from \"@angular/core\";\n{body}",
+                ordered.join(", ")
+            )
+        }
+    }
+}
+
+/// A located `import { … } from '@angular/core'` declaration: the names it already binds and the
+/// byte offset just before its closing `}` (where a merged specifier list is inserted).
+struct CoreImport {
+    bound_names: Vec<String>,
+    insert_at: usize,
+}
+
+/// Locate an existing named `@angular/core` import in `body` via the parsed AST. Returns the bound
+/// specifier locals and the byte offset of the position immediately before the import's closing `}`
+/// (so a `, name` can be appended into the brace list). A namespace/default-only import, or no
+/// `@angular/core` import at all, yields `None` (a fresh import is prepended instead).
+fn find_core_import(body: &str) -> Option<CoreImport> {
+    let allocator = Allocator::default();
+    let source_type = SourceType::default().with_typescript(true).with_module(true);
+    let ret = JsParser::new(&allocator, body, source_type).parse();
+    if !ret.errors.is_empty() {
+        return None;
+    }
+
+    for stmt in &ret.program.body {
+        let Statement::ImportDeclaration(import) = stmt else {
+            continue;
+        };
+        if import.source.value.as_str() != "@angular/core" {
+            continue;
+        }
+        let Some(specifiers) = &import.specifiers else {
+            continue;
+        };
+        let mut bound_names = Vec::new();
+        let mut last_named_end: Option<usize> = None;
+        for spec in specifiers {
+            use oxc_ast::ast::ImportDeclarationSpecifier::*;
+            match spec {
+                ImportSpecifier(s) => {
+                    bound_names.push(s.local.name.to_string());
+                    last_named_end = Some(oxc_span::GetSpan::span(s.as_ref()).end as usize);
+                }
+                ImportDefaultSpecifier(s) => bound_names.push(s.local.name.to_string()),
+                ImportNamespaceSpecifier(s) => bound_names.push(s.local.name.to_string()),
+            }
+        }
+        // Only a braced (named) import can be merged into. Insert right after the last named
+        // specifier (before the closing `}`), preserving any trailing whitespace/comma the source had.
+        if let Some(insert_at) = last_named_end {
+            return Some(CoreImport { bound_names, insert_at });
+        }
+    }
+    None
 }
 
 /// Whether `body` contains a call to the named function (`name(`), ignoring a member-access

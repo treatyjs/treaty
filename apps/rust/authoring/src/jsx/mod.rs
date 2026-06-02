@@ -17,6 +17,7 @@
 pub mod angular_blocks;
 pub mod control_flow;
 pub mod directives;
+pub mod react;
 pub mod signals;
 pub mod template;
 pub mod ts_erase;
@@ -205,6 +206,13 @@ struct LoweredComponent {
     /// the component by name — the backend emits its own `export default {Class};`. A bare default
     /// export (`export default function () {}` / `export default () => …`) has no name and is `None`.
     name: Option<String>,
+    /// The prop names lowered from the component's destructured props parameter to signal `input()`s
+    /// (e.g. `function C({ a, b = 5 })` → `const a = input(); const b = input(5);`). Recorded so the
+    /// template auto-calls a bare `{{ a }}` prop read just like any other signal.
+    prop_signals: Vec<String>,
+    /// Non-fatal diagnostics from props lowering (e.g. a non-destructured `(props)` parameter that
+    /// cannot be enumerated into discrete inputs).
+    prop_diagnostics: Vec<String>,
 }
 
 /// Compile a JSX component source into an Angular Ivy component.
@@ -259,8 +267,15 @@ pub fn compile(source: &str, file_name: &str) -> CompiledAuthoring {
     // diagnostic so the gap is explicit rather than a runtime `<Name> is not defined` at boot.
     let unresolved_directives = directives::take_unresolved_directives();
 
+    // Props lowered to signal `input()`s carry their names (template auto-call) and any diagnostics
+    // out of the located component so they survive the `match` that consumes it.
+    let mut prop_signals: Vec<String> = Vec::new();
+    let mut prop_diagnostics: Vec<String> = Vec::new();
+
     let (template_html, javascript) = match lowered {
         Some(component) => {
+            prop_signals = component.prop_signals.clone();
+            prop_diagnostics = component.prop_diagnostics.clone();
             // Assemble a FLAT module-top-level body: every top-level statement EXCEPT the component
             // declaration is kept verbatim (this hoists the author's `import`s and sibling helpers),
             // and the component declaration is replaced by its flattened inner body (the function /
@@ -330,13 +345,37 @@ pub fn compile(source: &str, file_name: &str) -> CompiledAuthoring {
             (rewritten, Some(emit.server_module), bodies, emit.client_bindings)
         };
 
+    // 4b. REACT-COMPAT PRE-NORMALIZATION: when the source is a plain React component (it imports from
+    //     `react`/`react-dom`, or calls a React hook), lower its hook idioms to Angular primitives
+    //     BEFORE the signals-by-default pass runs over the body — `useState`→`signal`, `setX`→`.set`/
+    //     `.update`, `useEffect`→`effect`, `useMemo`→`computed`, `useCallback`→its fn, etc. (see
+    //     [`react`]). Detection reuses the JSX-aware parse already in hand (`ret.program`); the
+    //     rewrite is a no-op when no React idiom is present, so it is safe to run after the server
+    //     rewrite over the final client JS. The signal names React produced are merged into the
+    //     template auto-call set, and the `@angular/core` import for the emitted primitives is left to
+    //     the signals pass (step 5), which owns the single merged import.
+    let react_mode = react::detect_react_mode(&ret.program);
+    let (javascript, mut react_signals, react_diagnostics) = if react_mode {
+        let rt = react::transform(&javascript);
+        (rt.javascript, rt.signals, rt.diagnostics)
+    } else {
+        (javascript, std::collections::HashSet::new(), Vec::new())
+    };
+
     // 5. Signals-by-default: every component variable is a signal. Wrap simple-value declarations in
     //    `signal(...)`, rewrite writes to `.set(...)` / `.update(...)`, and inject the `signal`
     //    import. The discovered signal names drive the template auto-call so a bare `{{ x }}` read of
-    //    a signal becomes `{{ x() }}`. Run after the server rewrite so it sees the final client JS.
+    //    a signal becomes `{{ x() }}`. Run after the server + React rewrites so it sees the final
+    //    client JS (React's emitted `signal(...)` are reactive primitives the signals pass skips).
     let transform = signals::transform(&javascript);
     let javascript = transform.javascript;
-    let template_html = signals::auto_call_template(&template_html, &transform.signals);
+    // The auto-call candidate set is the union of the signals the pass wrapped, the props lowered to
+    // `input()`s, and the names React lowered to `signal`/`computed`/`useRef`-signals — so a bare
+    // `{{ x }}` read of ANY of them auto-calls to `{{ x() }}`.
+    let mut auto_call_signals = transform.signals;
+    auto_call_signals.extend(react_signals.drain());
+    auto_call_signals.extend(prop_signals.iter().cloned());
+    let template_html = signals::auto_call_template(&template_html, &auto_call_signals);
 
     // 6. Reuse the shared render3 backend. JSX components carry no `<style>` chunk yet, so styles
     //    are empty for this phase. The directive classes applied in the template (collected during
@@ -361,6 +400,11 @@ pub fn compile(source: &str, file_name: &str) -> CompiledAuthoring {
     let map = map.map(|m| redact_server_bodies_in_map(&m, &server_bodies));
 
     let mut all_errors = errors;
+    // Surface the non-fatal React-compat + props-lowering diagnostics (an un-lowerable `useReducer`,
+    // a non-destructured `(props)` parameter, …). These are gaps the author should see, not hard
+    // failures — the rest of the component still compiled.
+    all_errors.extend(react_diagnostics);
+    all_errors.extend(prop_diagnostics);
     // Surface every value-binding / structural `use:` directive that resolved to no in-scope symbol
     // (a genuinely dangling directive). The dependency was already dropped so the module does not
     // throw `<Name> is not defined` at boot, but the author still bound an input on / wrapped the
@@ -410,8 +454,14 @@ pub fn compile(source: &str, file_name: &str) -> CompiledAuthoring {
 struct LoweredBody {
     template_html: String,
     /// The component function/arrow inner body, JSX `return` removed. Empty for an expression-bodied
-    /// arrow (`() => <JSX/>`), which has no statements besides the returned JSX.
+    /// arrow (`() => <JSX/>`), which has no statements besides the returned JSX. When the component
+    /// took a destructured props parameter, the synthesized `const <prop> = input(...)` declarations
+    /// are PREPENDED here (and the param dropped), so each prop reads as a signal input.
     inner: String,
+    /// Prop names lowered to signal inputs (for template auto-call).
+    prop_signals: Vec<String>,
+    /// Non-fatal props-lowering diagnostics.
+    prop_diagnostics: Vec<String>,
 }
 
 /// Scan top-level statements for the component function and lower its returned JSX.
@@ -510,11 +560,15 @@ fn component_from(stmt: &Statement, lowered: LoweredBody, name: Option<String>) 
         declaration_span: (span.start as usize, span.end as usize),
         component_body: lowered.inner,
         name,
+        prop_signals: lowered.prop_signals,
+        prop_diagnostics: lowered.prop_diagnostics,
     }
 }
 
 /// Lower a `function` component: find the `return <JSX>` in its body, and extract the body's inner
-/// statements with that return removed.
+/// statements with that return removed. A destructured props parameter is lowered to signal
+/// `input()` declarations prepended to the inner body (and the param dropped — the JSX assembler
+/// keeps only the inner body, so the parameter never survives).
 fn lower_function(func: &Function, source: &str) -> Option<LoweredBody> {
     let body = func.body.as_deref()?;
     let return_span = jsx_return_span(&body.statements, source)?;
@@ -525,7 +579,8 @@ fn lower_function(func: &Function, source: &str) -> Option<LoweredBody> {
         source,
     );
     let template_html = lower_jsx_return(&body.statements, source)?;
-    Some(LoweredBody { template_html, inner })
+    let props = lower_props(&func.params, source);
+    Some(props.into_body(template_html, inner))
 }
 
 /// Lower an arrow component: either an expression body that is JSX, or a block body with a
@@ -538,10 +593,8 @@ fn lower_arrow(arrow: &ArrowFunctionExpression, source: &str) -> Option<LoweredB
         let stmt = arrow.body.statements.first()?;
         if let Statement::ExpressionStatement(expr_stmt) = stmt {
             if let Some(html) = lower_jsx_expression(&expr_stmt.expression, source) {
-                return Some(LoweredBody {
-                    template_html: html,
-                    inner: String::new(),
-                });
+                let props = lower_props(&arrow.params, source);
+                return Some(props.into_body(html, String::new()));
             }
         }
         return None;
@@ -554,7 +607,8 @@ fn lower_arrow(arrow: &ArrowFunctionExpression, source: &str) -> Option<LoweredB
         source,
     );
     let template_html = lower_jsx_return(&arrow.body.statements, source)?;
-    Some(LoweredBody { template_html, inner })
+    let props = lower_props(&arrow.params, source);
+    Some(props.into_body(template_html, inner))
 }
 
 /// The byte span of the first `return <JSX>` statement among `statements`, or `None`.
@@ -610,6 +664,136 @@ fn body_inner_without_return(
         inner.push_str(&source[ret_end..inner_end]);
     }
     inner
+}
+
+/// The result of lowering a component's props parameter: the synthesized signal-`input()`
+/// declarations (a JS chunk to prepend to the component body), the prop names (for template
+/// auto-call), and any non-fatal diagnostics.
+struct LoweredProps {
+    /// The `const <prop> = input(...);` declarations, newline-separated and terminated, or empty.
+    decls: String,
+    /// The lowered prop names (template auto-call candidates).
+    names: Vec<String>,
+    /// Non-fatal diagnostics (a non-destructured `(props)` parameter).
+    diagnostics: Vec<String>,
+}
+
+impl LoweredProps {
+    /// Build the final [`LoweredBody`], prepending the synthesized `input()` declarations to the
+    /// component's inner body so each prop reads as a signal input that the backend extracts.
+    fn into_body(self, template_html: String, inner: String) -> LoweredBody {
+        let inner = if self.decls.is_empty() {
+            inner
+        } else if inner.trim().is_empty() {
+            self.decls
+        } else {
+            format!("{}\n{inner}", self.decls)
+        };
+        LoweredBody {
+            template_html,
+            inner,
+            prop_signals: self.names,
+            prop_diagnostics: self.diagnostics,
+        }
+    }
+}
+
+/// Lower a component's PROPS parameter to Angular signal `input()` declarations.
+///
+/// The existing JSX front-end drops the component function's parameters entirely (only the inner
+/// body survives module assembly), so a React/`.tsx` component that declared `props` had no inputs.
+/// This closes that gap for BOTH React and our `.tsx`: a destructured object parameter
+/// `function C({ a, b = 5 }: P)` lowers each property to a signal input —
+///   * `a`      (no default) → `const a = input();`
+///   * `b = 5`  (default)    → `const b = input(5);`
+/// — and the prop names are recorded so a bare `{{ a }}` template read auto-calls. The signals pass
+/// recognizes `input()` initializers as reactive primitives (it does not double-wrap them), and the
+/// shared backend's `extract_io` turns the top-level `const a = input()` into the component's
+/// `inputs`. A non-destructured `(props)` parameter cannot be enumerated into discrete inputs, so it
+/// is left alone with a diagnostic (the "surface the gap, do not mis-compile" contract).
+fn lower_props(params: &oxc_ast::ast::FormalParameters, source: &str) -> LoweredProps {
+    use oxc_ast::ast::BindingPattern;
+
+    let mut decls: Vec<String> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
+    let mut diagnostics: Vec<String> = Vec::new();
+
+    // Only the FIRST parameter is the component's props (React + our `.tsx` convention). A second
+    // parameter (e.g. a `ref`) is out of scope.
+    if let Some(first) = params.items.first() {
+        match &first.pattern {
+            // `function C({ a, b = 5 })` — lower each destructured property to a signal input.
+            BindingPattern::ObjectPattern(obj) => {
+                for prop in &obj.properties {
+                    // The bound local name (for `{ a }` it is `a`; for `{ a: x }` the local is `x`).
+                    let local = binding_pattern_local(&prop.value);
+                    let Some(local) = local else {
+                        diagnostics.push(
+                            "jsx/props: a destructured prop is not a simple binding (nested \
+                             destructure / rename); skipped from `input()` lowering".to_string(),
+                        );
+                        continue;
+                    };
+                    // A `b = 5` default lives on the property value's `AssignmentPattern` right side.
+                    let default = binding_pattern_default(&prop.value, source);
+                    match default {
+                        Some(d) => decls.push(format!("const {local} = input({d});")),
+                        None => decls.push(format!("const {local} = input();")),
+                    }
+                    names.push(local);
+                }
+                if obj.rest.is_some() {
+                    diagnostics.push(
+                        "jsx/props: a `...rest` props pattern cannot be enumerated into discrete \
+                         inputs; the rest binding was dropped".to_string(),
+                    );
+                }
+            }
+            // A bare `(props)` identifier — the props are accessed as `props.x`, which cannot be
+            // enumerated into discrete `input()`s at compile time. Surface a diagnostic; leave it.
+            BindingPattern::BindingIdentifier(id) => {
+                diagnostics.push(format!(
+                    "jsx/props: a non-destructured props parameter `{}` cannot be lowered to discrete \
+                     `input()`s; destructure the props (e.g. `{{ a, b }}`) so each becomes a signal input. \
+                     (TODO: support member-access prop reads.)",
+                    id.name
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    LoweredProps {
+        decls: if decls.is_empty() {
+            String::new()
+        } else {
+            decls.join("\n")
+        },
+        names,
+        diagnostics,
+    }
+}
+
+/// The single local identifier bound by a (possibly defaulted) binding pattern: `a` for `a`, and the
+/// `left` identifier for an `a = default` assignment pattern. `None` for a nested destructure.
+fn binding_pattern_local(pat: &oxc_ast::ast::BindingPattern) -> Option<String> {
+    use oxc_ast::ast::BindingPattern;
+    match pat {
+        BindingPattern::BindingIdentifier(id) => Some(id.name.to_string()),
+        BindingPattern::AssignmentPattern(assign) => binding_pattern_local(&assign.left),
+        _ => None,
+    }
+}
+
+/// The verbatim default-value source text of a defaulted binding pattern (`5` for `b = 5`), or
+/// `None` when the pattern has no default.
+fn binding_pattern_default(pat: &oxc_ast::ast::BindingPattern, source: &str) -> Option<String> {
+    use oxc_ast::ast::BindingPattern;
+    let BindingPattern::AssignmentPattern(assign) = pat else {
+        return None;
+    };
+    let span = oxc_span::GetSpan::span(&assign.right);
+    Some(source[span.start as usize..span.end as usize].trim().to_string())
 }
 
 /// Lower an expression to template HTML if it is a JSX element or fragment.
@@ -1664,8 +1848,10 @@ export default function Counter() {\n\
 
     #[test]
     fn signals_by_default_skips_reactive_primitives_end_to_end() {
-        // An existing `input()` / `computed(...)` must not be double-wrapped, and a `computed`
-        // reference pulls `computed` into the injected import alongside `signal`.
+        // An existing `input()` / `computed(...)` must not be double-wrapped, and every referenced
+        // reactive primitive is pulled into ONE merged `@angular/core` import (so the emitted module
+        // resolves `signal`, `computed`, AND the author's `input` at boot — `input` was previously
+        // left unimported, a latent `input is not defined`).
         let source = "export default function Widget() {\n\
   const label = input('hi');\n\
   let count = 0;\n\
@@ -1684,10 +1870,39 @@ export default function Counter() {\n\
             code.contains("count = signal(0)"),
             "plain count not wrapped; got: {code}"
         );
-        assert!(
-            code.contains("import { signal, computed } from \"@angular/core\";"),
-            "computed not added to import; got: {code}"
-        );
+        // Exactly one merged `@angular/core` import binds `signal`, `computed`, and `input` (verified
+        // off the parsed AST, never a substring race).
+        for name in ["signal", "computed", "input"] {
+            assert!(
+                core_import_binds(code, name),
+                "`{name}` not imported from a single merged @angular/core import; got: {code}"
+            );
+        }
+    }
+
+    /// Whether `code` binds `name` via a named specifier of an `@angular/core` import, read off the
+    /// parsed module AST (never a substring scan).
+    fn core_import_binds(code: &str, name: &str) -> bool {
+        use oxc_ast::ast::ImportDeclarationSpecifier;
+        let allocator = Allocator::default();
+        let module_type = SourceType::default().with_module(true).with_typescript(true);
+        let ret = JsParser::new(&allocator, code, module_type).parse();
+        assert!(ret.errors.is_empty(), "emitted module did not parse: {code}");
+        ret.program.body.iter().any(|stmt| {
+            let Statement::ImportDeclaration(import) = stmt else { return false };
+            if import.source.value.as_str() != "@angular/core" {
+                return false;
+            }
+            import
+                .specifiers
+                .as_ref()
+                .map(|specs| {
+                    specs.iter().any(|s| {
+                        matches!(s, ImportDeclarationSpecifier::ImportSpecifier(s) if s.local.name == name)
+                    })
+                })
+                .unwrap_or(false)
+        })
     }
 
     // --- Module assembly: the emitted module must be a VALID re-parseable ES module ------------
@@ -1986,5 +2201,200 @@ export default function greetingCard() {\n\
         assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
         assert_well_formed_module(&out.code);
         assert!(out.code.contains("export default About;"), "wrong default export; got: {}", out.code);
+    }
+
+    // --- React-compat mode -----------------------------------------------------
+    // A plain React component (hooks + JSX) compiles to Angular Ivy through the same backend.
+
+    #[test]
+    fn react_use_state_component_compiles_to_ivy() {
+        // `useState` lowers to a signal, the setter to `.set`/`.update`, the read auto-calls, and the
+        // whole thing compiles to a valid `ɵɵdefineComponent`.
+        let source = "import { useState } from 'react';\n\
+export default function Counter() {\n\
+  const [count, setCount] = useState(0);\n\
+  const inc = () => setCount(prev => prev + 1);\n\
+  return <button onClick={inc}>{count}</button>;\n\
+}\n";
+        let out = compile(source, "counter.tsx");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+
+        assert_well_formed_module(code);
+        assert!(code.contains(DEFINE), "no defineComponent; got: {code}");
+        // The react `react` import is gone, `useState` lowered to a signal.
+        assert!(!code.contains("from 'react'"), "react import survived; got: {code}");
+        assert!(code.contains("count = signal(0)"), "useState not lowered to signal; got: {code}");
+        // The functional updater lowered to `.update`.
+        assert!(
+            code.contains("count.update(prev => prev + 1)"),
+            "setCount(prev=>…) not lowered to .update; got: {code}"
+        );
+        // The template read auto-calls the signal.
+        assert!(code.contains("ctx.count()"), "signal read not auto-called; got: {code}");
+        // `signal` is imported from @angular/core.
+        assert!(core_import_binds(code, "signal"), "signal not imported; got: {code}");
+    }
+
+    #[test]
+    fn react_full_component_use_state_effect_memo_props_compiles_to_ivy() {
+        // The headline acceptance: a full small React component using useState + useEffect + useMemo
+        // + props + JSX compiles to a valid `ɵɵdefineComponent`.
+        let source = "import { useState, useEffect, useMemo } from 'react';\n\
+export default function Counter({ start, step = 1 }) {\n\
+  const [count, setCount] = useState(start);\n\
+  const doubled = useMemo(() => count * 2, [count]);\n\
+  useEffect(() => { console.log(count); }, [count]);\n\
+  const inc = () => setCount(prev => prev + step);\n\
+  return <button onClick={inc}>{count} / {doubled}</button>;\n\
+}\n";
+        let out = compile(source, "counter.tsx");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+
+        assert_well_formed_module(code);
+        assert!(code.contains(DEFINE), "no defineComponent; got: {code}");
+        // useState -> signal, useMemo -> computed, useEffect -> effect, all imported in one merge.
+        assert!(code.contains("count = signal(start"), "useState not lowered; got: {code}");
+        assert!(code.contains("doubled = computed("), "useMemo not lowered; got: {code}");
+        assert!(code.contains("effect(() =>"), "useEffect not lowered to effect; got: {code}");
+        assert!(!code.contains("useEffect"), "useEffect leaked; got: {code}");
+        assert!(!code.contains("useMemo"), "useMemo leaked; got: {code}");
+        for name in ["signal", "computed", "effect", "input"] {
+            assert!(core_import_binds(code, name), "`{name}` not imported; got: {code}");
+        }
+        // Props lowered to signal inputs and land in the component `inputs`.
+        assert!(code.contains("start = input()"), "prop `start` not an input(); got: {code}");
+        assert!(code.contains("step = input(1)"), "prop `step` default lost; got: {code}");
+        assert!(code.contains("inputs"), "no inputs map; got: {code}");
+        // The template reads auto-call the signals (count + computed memo).
+        assert!(code.contains("ctx.count()"), "count read not auto-called; got: {code}");
+        assert!(code.contains("ctx.doubled()"), "doubled read not auto-called; got: {code}");
+    }
+
+    #[test]
+    fn react_use_effect_deps_are_dropped() {
+        let source = "import { useState, useEffect } from 'react';\n\
+export default function Logger() {\n\
+  const [n, setN] = useState(0);\n\
+  useEffect(() => { document.title = String(n); }, [n]);\n\
+  return <div>{n}</div>;\n\
+}\n";
+        let out = compile(source, "logger.tsx");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+        assert!(code.contains(DEFINE), "no defineComponent; got: {code}");
+        // The effect body survived; the deps array did not become a second effect argument.
+        assert!(code.contains("effect(() =>"), "no effect; got: {code}");
+        assert!(
+            !code.contains("], [n])") && !code.contains(", [n])"),
+            "effect deps array not dropped; got: {code}"
+        );
+    }
+
+    // --- props -> input() (BOTH react and our .tsx) ----------------------------
+
+    #[test]
+    fn tsx_destructured_props_lower_to_signal_inputs() {
+        // NOT react mode (no hooks/imports): our plain `.tsx` must ALSO lower a destructured props
+        // parameter to signal inputs (the front-end used to drop the parameter entirely).
+        let source = "export default function Greeting({ name, exclaim = false }) {\n\
+  return <p>{name}</p>;\n\
+}\n";
+        let out = compile(source, "greeting.tsx");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+
+        assert_well_formed_module(code);
+        assert!(code.contains(DEFINE), "no defineComponent; got: {code}");
+        // Each prop became a signal input(); the default is preserved.
+        assert!(code.contains("name = input()"), "prop `name` not input(); got: {code}");
+        assert!(code.contains("exclaim = input(false)"), "prop `exclaim` default lost; got: {code}");
+        // The inputs reach the component metadata.
+        assert!(code.contains("inputs"), "no inputs map; got: {code}");
+        assert!(core_import_binds(code, "input"), "input not imported; got: {code}");
+        // The `{name}` template read auto-calls the input signal.
+        assert!(code.contains("ctx.name()"), "prop read not auto-called; got: {code}");
+    }
+
+    #[test]
+    fn tsx_props_inputs_appear_in_component_inputs_map() {
+        // Verify (by PARSING the emitted module) that a lowered prop appears as a declared
+        // `input` binding at module scope inside the wrapper, and the `inputs` metadata names it.
+        let source = "export default function Card({ title }) {\n  return <h1>{title}</h1>;\n}\n";
+        let out = compile(source, "card.tsx");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+        assert_well_formed_module(code);
+        // The Ivy `inputs` metadata names `title`.
+        assert!(
+            code.contains("inputs") && code.contains("title"),
+            "title not surfaced as an input; got: {code}"
+        );
+        // The synthesized declaration is present.
+        assert!(code.contains("title = input()"), "title input declaration missing; got: {code}");
+    }
+
+    #[test]
+    fn non_destructured_props_param_reports_a_diagnostic() {
+        // A bare `(props)` parameter cannot be enumerated into discrete inputs — surface a clear
+        // diagnostic rather than silently dropping it or mis-compiling.
+        let source = "export default function Widget(props) {\n  return <div>{props.label}</div>;\n}\n";
+        let out = compile(source, "widget.tsx");
+        assert!(
+            out.errors.iter().any(|e| e.contains("non-destructured props")),
+            "expected a non-destructured-props diagnostic; got: {:?}",
+            out.errors
+        );
+        // It still compiles to a component (does not hard-fail).
+        assert!(out.code.contains(DEFINE), "no defineComponent; got: {}", out.code);
+    }
+
+    #[test]
+    fn react_imports_do_not_duplicate_angular_core_import() {
+        // When the author ALSO hand-wrote an `@angular/core` import, the React/signals lowering must
+        // MERGE the needed primitives into it — exactly one `@angular/core` import, no duplicate.
+        let source = "import { inject } from '@angular/core';\n\
+import { useState, useEffect } from 'react';\n\
+export default function App() {\n\
+  const [n, setN] = useState(0);\n\
+  useEffect(() => { track(n); }, [n]);\n\
+  return <div>{n}</div>;\n\
+}\n";
+        let out = compile(source, "app.tsx");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+        assert_well_formed_module(code);
+
+        // Count the NAMED `@angular/core` imports off the parsed AST — there must be exactly one (the
+        // merged authoring import). The render3 backend additionally emits an `import * as i0 from
+        // "@angular/core"` namespace import; that is the backend's and is a distinct, expected form,
+        // so we count only braced/named specifier imports (the authoring-level merge target).
+        let allocator = Allocator::default();
+        let module_type = SourceType::default().with_module(true).with_typescript(true);
+        let parsed = JsParser::new(&allocator, code, module_type).parse();
+        assert!(parsed.errors.is_empty(), "did not parse: {code}");
+        let named_core_imports = parsed
+            .program
+            .body
+            .iter()
+            .filter(|s| {
+                let Statement::ImportDeclaration(i) = s else { return false };
+                i.source.value == "@angular/core"
+                    && i.specifiers.as_ref().is_some_and(|specs| {
+                        specs.iter().any(|sp| {
+                            matches!(sp, oxc_ast::ast::ImportDeclarationSpecifier::ImportSpecifier(_))
+                        })
+                    })
+            })
+            .count();
+        assert_eq!(
+            named_core_imports, 1,
+            "expected exactly one merged named @angular/core import, found {named_core_imports}; got: {code}"
+        );
+        // The merged import binds both the author's `inject` and the lowered `signal` + `effect`.
+        for name in ["inject", "signal", "effect"] {
+            assert!(core_import_binds(code, name), "`{name}` not in merged import; got: {code}");
+        }
     }
 }
