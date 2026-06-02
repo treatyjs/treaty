@@ -1,0 +1,37 @@
+name: 🦀 Rust tests
+
+on:
+  push:
+    branches: ["master", "migration/v22-oxc133"]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: rust-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - name: 🚚 Checkout
+        uses: actions/checkout@v4
+
+      # The repo pins its toolchain via rust-toolchain.toml (edition 2024); rustup honours it
+      # automatically when cargo runs in the repo, installing it on demand.
+      - name: 🦀 Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # The whole workspace. The real-Angular linker integration test
+      # (libs/treaty-ivy/facade/tests/link_real_packages.rs) SKIPS cleanly when no
+      # node_modules/@angular is present (a fresh CI checkout), so this passes without an npm install.
+      - name: Workspace tests
+        run: cargo test --workspace
+
+      # libs/file-routing is `exclude`d from the workspace (so the NAPI addon can depend on it by path
+      # without a "multiple workspace roots" conflict), which means `--workspace` never runs its ~90
+      # tests. Run them explicitly so the file-routing core is covered in CI.
+      - name: file-routing crate (excluded from the workspace by design)
+        run: cargo test --manifest-path libs/file-routing/Cargo.toml
