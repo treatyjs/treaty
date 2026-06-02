@@ -337,5 +337,13 @@ compliance DIFFs; production (non-dev) backend hosting + SSE/WS fan-out.
 - **Production Api hosting** — the generated axum Api handler is now real: it
   deserializes the request, runs the (transpiled/rust) body, and returns `Json<RESP>`
   (previously emitted `return a + b;` against a `Json<f64>` signature — would not have
-  compiled). SSE/WebSocket production handlers + a runnable host are being rebased onto
-  this base and verified against a real `cargo build` against axum.
+  compiled). **SSE + WebSocket production handlers + a runnable host (`emit_production_host`)
+  are now real too** — a multi-transport server module + its host were emitted into a
+  scratch crate and `cargo build` against REAL axum (0.7.9/0.8.9 + tokio + futures)
+  succeeds (exit 0); two defects only a live compile surfaces (an SSE `as`-precedence
+  bug, an unreachable WS tail) were caught and fixed. rust_authoring is at **427 tests**.
+
+**Roadmap status:** the four parallel workstreams (compliance climb, FESM, Api hosting,
+SSE/WS+host) all LANDED. matchGolden **178/185**; the remaining 7 DIFFs are
+harness/golden-vintage (legacy naming the canonicalizer doesn't fold + jit-mode-only
+NgModule goldens), not compiler defects — matching them would diverge from modern Angular.
