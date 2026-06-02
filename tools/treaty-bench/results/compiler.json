@@ -1,6 +1,6 @@
 {
   "benchmark": "compiler-ivy-lowering",
-  "generatedAt": "2026-06-02T17:59:43.001Z",
+  "generatedAt": "2026-06-02T18:25:04.021Z",
   "corpus": {
     "source": "libs/treaty-ivy/facade/parity/parity.mjs#FIXTURES",
     "totalFixtures": 29
@@ -16,23 +16,81 @@
     "measureIters": 2000,
     "bestOf": 3
   },
-  "angularCompilerVersionNote": "angular-compiler row measured with the @angular/compiler resolved at repo node_modules",
+  "angularCompilerVersions": {
+    "v22": "22.0.0-rc.3",
+    "v21": "21.2.15",
+    "v21Status": "isolated+measured"
+  },
+  "correctness": {
+    "file": "correctness.json",
+    "summary": "0/27 renderable fixtures STRICTLY byte/AST-equivalent under parity normalize(); 27/27 are equivalent except the Rust emitter writes a `changeDetection:0` field the v22 oracle now omits (single metadata field, instruction streams identical); 0 genuine lowering divergence(s); 2 not renderable by the oracle printer (i18n)",
+    "match": 0,
+    "diff": 27,
+    "oracleError": 2,
+    "diffFixtures": [
+      "static-element",
+      "interpolation",
+      "nested",
+      "attribute",
+      "multiple-bindings",
+      "property-binding",
+      "event-binding",
+      "two-interpolations",
+      "class-binding",
+      "style-binding",
+      "control-flow-if",
+      "control-flow-for",
+      "deep-nesting",
+      "sibling-elements",
+      "static-and-bound-mix",
+      "control-flow-if-elseif-else",
+      "control-flow-switch",
+      "nested-for-in-if",
+      "multiple-event-bindings",
+      "mixed-bindings-element",
+      "for-index-count",
+      "ng-template-ref",
+      "attr-binding",
+      "pipe-simple",
+      "pipe-with-args",
+      "pipe-chained",
+      "pipe-in-binding"
+    ]
+  },
   "results": [
     {
-      "compiler": "angular-compiler",
+      "compiler": "angular-compiler@22",
       "status": "measured",
       "fixtures": 27,
       "components": 54000,
       "iterations": 2000,
       "warmup": 200,
-      "totalMs": 14971.728,
-      "msPerComponent": 0.277254,
-      "opsPerSec": 3606.8,
+      "totalMs": 20004.108,
+      "msPerComponent": 0.370446,
+      "opsPerSec": 2699.4,
       "skipped": [
         "i18n-static",
         "i18n-interp"
       ],
-      "note": "27 shared fixtures timed (intersection both compilers can lower); this compiler also cannot render: i18n-static, i18n-interp"
+      "note": "27 shared fixtures timed (intersection both compilers can lower); this compiler also cannot render: i18n-static, i18n-interp",
+      "angularVersion": "22.0.0-rc.3"
+    },
+    {
+      "compiler": "angular-compiler@21",
+      "status": "measured",
+      "fixtures": 27,
+      "components": 54000,
+      "iterations": 2000,
+      "warmup": 200,
+      "totalMs": 16840.101,
+      "msPerComponent": 0.311854,
+      "opsPerSec": 3206.6,
+      "skipped": [
+        "i18n-static",
+        "i18n-interp"
+      ],
+      "note": "27 shared fixtures timed (intersection both compilers can lower); this compiler also cannot render: i18n-static, i18n-interp",
+      "angularVersion": "21.2.15"
     },
     {
       "compiler": "treaty-oxc",
@@ -41,9 +99,9 @@
       "components": 54000,
       "iterations": 2000,
       "warmup": 200,
-      "totalMs": 6174.895,
-      "msPerComponent": 0.11435,
-      "opsPerSec": 8745.1,
+      "totalMs": 5895.618,
+      "msPerComponent": 0.109178,
+      "opsPerSec": 9159.3,
       "skipped": [],
       "note": "27 shared fixtures timed (intersection both compilers can lower)"
     },

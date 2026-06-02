@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-06-02T18:04:43.557Z",
+  "generatedAt": "2026-06-02T18:13:11.383Z",
   "app": "examples/linker-smoke",
   "appNote": "Smallest viable real Angular app: bootstrapApplication + provideRouter + inject(PlatformLocation), consuming published partial-compiled @angular/* libraries. First-party code is hand-authored AOT Ivy, so the per-tool variable is bundling + @angular/* partial linking.",
   "host": {
@@ -7,7 +7,7 @@
     "arch": "x64",
     "node": "v24.7.0"
   },
-  "runsPerTool": 3,
+  "runsPerTool": 1,
   "versions": {
     "@angular/core": "22.0.0-rc.3",
     "vite": "7.3.3",
@@ -20,38 +20,50 @@
     {
       "tool": "vite",
       "status": "measured",
-      "buildMs": 1725,
+      "buildMs": 2992,
       "distBytes": 563759,
-      "note": "best of 3 run(s); times(ms)=[2205, 1887, 1725]; jsFiles=1 ivyDefs(literal,minify-sensitive)=6 residualNgDeclare=0 importsCompiler=false linkedOk=true"
+      "note": "best of 1 run(s); times(ms)=[2992]; jsFiles=1 ivyDefs(literal,minify-sensitive)=6 residualNgDeclare=0 importsCompiler=false linkedOk=true",
+      "works": "PASS",
+      "worksReason": "routed component rendered (\"Linker smoke\") with no JIT / @angular/compiler error"
     },
     {
       "tool": "rolldown",
       "status": "measured",
-      "buildMs": 298,
+      "buildMs": 415,
       "distBytes": 556986,
-      "note": "best of 3 run(s); times(ms)=[321, 314, 298]; jsFiles=1 ivyDefs(literal,minify-sensitive)=6 residualNgDeclare=0 importsCompiler=false linkedOk=true"
+      "note": "best of 1 run(s); times(ms)=[415]; jsFiles=1 ivyDefs(literal,minify-sensitive)=6 residualNgDeclare=0 importsCompiler=false linkedOk=true",
+      "works": "PASS",
+      "worksReason": "routed component rendered (\"Linker smoke\") with no JIT / @angular/compiler error"
     },
     {
       "tool": "rspack",
       "status": "pending",
-      "note": "peer @rspack/core not installed in this monorepo — @treaty/rspack's plugin dist is present but the bundler core it drives is absent, so no build can run here. Install @rspack/core to measure."
+      "note": "peer @rspack/core not installed in this monorepo — @treaty/rspack's plugin dist is present but the bundler core it drives is absent, so no build can run here. Install @rspack/core to measure.",
+      "works": "SKIPPED",
+      "worksReason": "not booted: build status=\"pending\" (peer @rspack/core not installed in this monorepo — @treaty/rspack's plugin dist is present but the bundler core it drives is absent, so no build can run here. Install @rspack/core to measure.)"
     },
     {
       "tool": "rsbuild",
       "status": "pending",
-      "note": "peer @rsbuild/core not installed in this monorepo — @treaty/rsbuild's plugin dist is present but the bundler core it drives is absent, so no build can run here. Install @rsbuild/core to measure."
+      "note": "peer @rsbuild/core not installed in this monorepo — @treaty/rsbuild's plugin dist is present but the bundler core it drives is absent, so no build can run here. Install @rsbuild/core to measure.",
+      "works": "SKIPPED",
+      "worksReason": "not booted: build status=\"pending\" (peer @rsbuild/core not installed in this monorepo — @treaty/rsbuild's plugin dist is present but the bundler core it drives is absent, so no build can run here. Install @rsbuild/core to measure.)"
     },
     {
       "tool": "rslib",
       "status": "pending",
-      "note": "peer @rslib/core not installed in this monorepo — @treaty/rslib's plugin dist is present but the bundler core it drives is absent, so no build can run here. Install @rslib/core to measure."
+      "note": "peer @rslib/core not installed in this monorepo — @treaty/rslib's plugin dist is present but the bundler core it drives is absent, so no build can run here. Install @rslib/core to measure.",
+      "works": "SKIPPED",
+      "worksReason": "not booted: build status=\"pending\" (peer @rslib/core not installed in this monorepo — @treaty/rslib's plugin dist is present but the bundler core it drives is absent, so no build can run here. Install @rslib/core to measure.)"
     },
     {
       "tool": "ng-cli",
       "status": "measured",
-      "buildMs": 4572,
+      "buildMs": 11270,
       "distBytes": 188342,
-      "note": "best of 3 run(s); times(ms)=[10224, 5862, 4572]; jsFiles=1 ivyDefs(literal,minify-sensitive)=0 residualNgDeclare=0 importsCompiler=false linkedOk=true"
+      "note": "best of 1 run(s); times(ms)=[11270]; jsFiles=1 ivyDefs(literal,minify-sensitive)=0 residualNgDeclare=0 importsCompiler=false linkedOk=true",
+      "works": "PASS",
+      "worksReason": "routed component rendered (\"Linker smoke\") with no JIT / @angular/compiler error"
     }
   ]
 }

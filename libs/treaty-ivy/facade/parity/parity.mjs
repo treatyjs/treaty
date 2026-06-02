@@ -537,10 +537,10 @@ function compileWithOracle({ template, selector, className }, ngc = ng) {
       viewQueries: [],
     },
     constantPool,
-    ng.makeBindingParser(),
+    ngc.makeBindingParser(),
   );
 
-  const { Printer, Context } = makePrinter();
+  const { Printer, Context } = makePrinter(ngc);
   const printer = new Printer();
   let code = out.expression.visitExpression(printer, new Context(false));
   for (const stmt of constantPool.statements) {

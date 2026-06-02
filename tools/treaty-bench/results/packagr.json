@@ -1,0 +1,113 @@
+{
+  "benchmark": "packagr-treaty-vs-ngpackagr",
+  "generatedAt": "2026-06-02T18:23:45.966Z",
+  "library": {
+    "path": "tools/treaty-bench/sample-lib",
+    "note": "Standard-Angular library: 2 plain @Component .ts classes (one @Input, one event listener) + a public-api.ts barrel — authored as standard Angular TS so BOTH packagers can compile it.",
+    "components": [
+      {
+        "name": "HelloComponent",
+        "selector": "tb-hello",
+        "file": "hello.component.ts"
+      },
+      {
+        "name": "CounterComponent",
+        "selector": "tb-counter",
+        "file": "counter.component.ts"
+      }
+    ]
+  },
+  "host": {
+    "platform": "win32",
+    "arch": "x64",
+    "node": "v24.7.0",
+    "cpu": "AMD Ryzen 7 PRO 5850U with Radeon Graphics"
+  },
+  "runsPerTool": 2,
+  "versions": {
+    "ng-packagr": "21.2.3",
+    "@angular/core": "22.0.0-rc.3",
+    "@angular/compiler-cli": "22.0.0-rc.3",
+    "typescript": "6.0.3"
+  },
+  "metric": "treaty-packagr buildMs = its own in-process build_to_disk() time (compile every entry to Ivy + .d.ts + write APF dist); ng-packagr buildMs = ngPackagr().build() wall time. best (min) of N. distBytes = sum of emitted dist files.",
+  "ivyComparison": "ng-packagr driven in compilationMode:\"full\" so BOTH emit ɵɵdefineComponent; per-component define block + .d.ts ɵcmp decl normalized (unify i0 alias, drop /*@__PURE__*/, \"->\", collapse whitespace; arg ORDER/VALUES preserved) and diffed.",
+  "results": [
+    {
+      "tool": "treaty-packagr",
+      "status": "measured",
+      "buildMs": 30.59,
+      "distBytes": 2975,
+      "dest": "D:\\dev\\treaty\\tools\\treaty-bench\\sample-lib\\dist",
+      "note": "best of 2 run(s); times(ms)=[35, 31]"
+    },
+    {
+      "tool": "ng-packagr",
+      "status": "measured",
+      "buildMs": 1527.29,
+      "distBytes": 6834,
+      "dest": "D:\\dev\\treaty\\tools\\treaty-bench\\sample-lib\\dist-ng-full",
+      "note": "best of 2 run(s); times(ms)=[3159, 1527]"
+    }
+  ],
+  "equivalence": {
+    "ivyAllEqual": true,
+    "dtsAllEqual": false,
+    "perComponent": [
+      {
+        "component": "HelloComponent",
+        "ivyEqual": true,
+        "ivyDiff": null,
+        "ivyTreatyLen": 298,
+        "ivyNgpLen": 298,
+        "dtsEqual": false,
+        "dtsDiff": {
+          "index": 96,
+          "treaty": ":\"name\";\"required\":false;\"isSignal\":true;}},{},never,never,t",
+          "ngp": ":\"name\";\"required\":false;};},{},never,never,true,never>"
+        },
+        "dtsTreaty": "ɵɵComponentDeclaration<HelloComponent,\"tb-hello\",never,{\"name\":{\"alias\":\"name\";\"required\":false;\"isSignal\":true;}},{},never,never,true,never>",
+        "dtsNgp": "ɵɵComponentDeclaration<HelloComponent,\"tb-hello\",never,{\"name\":{\"alias\":\"name\";\"required\":false;};},{},never,never,true,never>"
+      },
+      {
+        "component": "CounterComponent",
+        "ivyEqual": true,
+        "ivyDiff": null,
+        "ivyTreatyLen": 386,
+        "ivyNgpLen": 386,
+        "dtsEqual": true,
+        "dtsDiff": null,
+        "dtsTreaty": "ɵɵComponentDeclaration<CounterComponent,\"tb-counter\",never,{},{},never,never,true,never>",
+        "dtsNgp": "ɵɵComponentDeclaration<CounterComponent,\"tb-counter\",never,{},{},never,never,true,never>"
+      }
+    ],
+    "packageJson": {
+      "name": {
+        "treaty": "@treaty-bench/widgets",
+        "ngp": "@treaty-bench/widgets",
+        "equal": true
+      },
+      "version": {
+        "treaty": "1.0.0",
+        "ngp": "1.0.0",
+        "equal": true
+      },
+      "type": {
+        "treaty": "module",
+        "ngp": "module",
+        "equal": true
+      },
+      "sideEffects": {
+        "treaty": false,
+        "ngp": false,
+        "equal": true
+      },
+      "hasPrimaryExport": {
+        "treaty": true,
+        "ngp": true,
+        "equal": true
+      }
+    }
+  },
+  "speedNote": "treaty-packagr 30.59 ms vs ng-packagr 1527.29 ms — treaty-packagr is 49.9x faster"
+}

@@ -21,11 +21,19 @@
 // status:"pending"/"failed" and the REAL reason (e.g. "peer @rspack/core not installed"); its
 // numbers are NEVER faked.
 //
+// e2e-of-output: a fast build is worthless if it ships output that does not actually run. So AFTER
+// timing+sizing, every tool that produced a dist is BOOTED headlessly (jsdom, in a fresh child
+// process per tool, reusing the linker-smoke e2e Step-4 boot pattern) and assigned a `works`
+// verdict — PASS / FAIL / SKIPPED — by asserting (a) bootstrap throws no JIT / "@angular/compiler
+// not available" error and (b) the routed component renders into the DOM. A fast build with a FAIL
+// `works` is flagged, never rewarded.
+//
 // This is a standalone .mjs benchmark: it MAY use performance.now() freely for timing (the
 // workflow-script-only clock restriction does not apply to benchmark files).
 //
 // Usage:  node tools/treaty-bench/buildtool-bench.mjs [--runs N]
-// Writes: tools/treaty-bench/results/buildtool.json
+// Writes: tools/treaty-bench/results/buildtool.json   (build time/size + folded-in `works` verdict)
+//         tools/treaty-bench/results/e2e.json         (detailed per-tool boot verdict)
 
 import { build as viteBuild } from 'vite'
 import { build as rolldownBuild } from 'rolldown'
@@ -144,6 +152,86 @@ function inspectBundle(dir) {
 }
 
 // ---------------------------------------------------------------------------
+// e2e-of-output layer.
+//
+// A fast build that ships BROKEN output (one that bootstraps into a JIT / "@angular/compiler not
+// available" error, or renders nothing) must be FLAGGED, not rewarded. After timing+sizing each
+// tool's dist, we BOOT the emitted bundle headlessly (jsdom) — reusing the linker-smoke e2e's Step-4
+// boot pattern — in a fresh child process per tool, and assert: (a) bootstrap throws no JIT /
+// @angular/compiler error, and (b) the routed component actually renders into the DOM.
+// ---------------------------------------------------------------------------
+const bootScript = join(here, 'boot-headless.mjs')
+const appNodeModules = join(appDir, 'node_modules') // jsdom + @angular/* symlink farm (wired in Step 1)
+
+// Find the JS module a browser would execute for a given dist dir: prefer the entry referenced by the
+// emitted index.html's `<script type="module" src=...>` (handles vite's hashed `assets/index-*.js`
+// and the Angular CLI's `browser/main.js`); otherwise fall back to a `main`-named JS, then any JS.
+function findBootEntry(distDir) {
+	if (!distDir || !existsSync(distDir)) return null
+	const jsFiles = []
+	let indexHtml = null
+	for (const entry of readdirSync(distDir, { recursive: true })) {
+		if (typeof entry !== 'string') continue
+		if (entry.endsWith('.js') || entry.endsWith('.mjs')) jsFiles.push(entry)
+		else if (/(^|[\\/])index\.html$/.test(entry) && indexHtml === null) indexHtml = entry
+	}
+	if (jsFiles.length === 0) return null
+	// (1) Resolve the module entry from index.html's module <script src>.
+	if (indexHtml) {
+		const htmlDir = dirname(join(distDir, indexHtml))
+		const html = readFileSync(join(distDir, indexHtml), 'utf-8')
+		const m = html.match(/<script[^>]*type=["']module["'][^>]*\bsrc=["']([^"']+)["']/i)
+		if (m) {
+			// src may be root-absolute ("/assets/x.js") or relative ("main.js"): resolve against the
+			// html's own directory, stripping a leading slash to a dist-relative path.
+			const src = m[1].replace(/^\//, '')
+			const candidate = existsSync(join(htmlDir, src)) ? join(htmlDir, src) : join(distDir, src)
+			if (existsSync(candidate)) return candidate
+		}
+	}
+	// (2) A `main`-named entry chunk (rolldown emits `main.js`).
+	const mainEntry = jsFiles.find((f) => /(^|[\\/])main[.-][^\\/]*\.m?js$/i.test(f) || /(^|[\\/])main\.m?js$/i.test(f))
+	if (mainEntry) return join(distDir, mainEntry)
+	// (3) Last resort: the first JS file.
+	return join(distDir, jsFiles[0])
+}
+
+// Boot one tool's emitted bundle in a fresh child process and return the verdict record.
+// `works`: 'PASS' | 'FAIL' | 'SKIPPED' with a human-readable `reason`.
+function bootDist(tool, distDir) {
+	const entry = findBootEntry(distDir)
+	if (!entry) {
+		return { tool, works: 'SKIPPED', reason: `no bootable JS entry found in dist (${distDir ?? 'no dist'})` }
+	}
+	let stdout = ''
+	try {
+		stdout = execFileSync(process.execPath, [bootScript, tool, entry, appNodeModules], {
+			encoding: 'utf-8',
+			stdio: ['ignore', 'pipe', 'inherit'],
+			timeout: 120000,
+		})
+	} catch (err) {
+		// The probe always exits 0 with a BOOT_RESULT line; a throw here means the child itself crashed
+		// (timeout, OOM). Surface that as a FAIL with the captured reason.
+		stdout = String(err?.stdout ?? '')
+		const tail = String(err?.message ?? err).split('\n').slice(0, 2).join(' ')
+		if (!/BOOT_RESULT:/.test(stdout)) {
+			return { tool, works: 'FAIL', reason: `boot child process crashed: ${tail}`, entry }
+		}
+	}
+	const line = stdout.split('\n').find((l) => l.startsWith('BOOT_RESULT:'))
+	if (!line) {
+		return { tool, works: 'FAIL', reason: 'boot probe produced no BOOT_RESULT verdict', entry }
+	}
+	try {
+		const verdict = JSON.parse(line.slice('BOOT_RESULT:'.length))
+		return { ...verdict, entry }
+	} catch (e) {
+		return { tool, works: 'FAIL', reason: `unparseable boot verdict: ${String(e?.message ?? e)}`, entry }
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Step 0: build the @treaty plugin dists from current source, so the wiring under
 // test is the committed source (mirrors the linker-smoke e2e's plugin rebuild step).
 // ---------------------------------------------------------------------------
@@ -188,6 +276,8 @@ function wireNodeModules() {
 		'@angular/platform-browser',
 		'rxjs',
 		'tslib',
+		// jsdom is needed by the e2e-of-output boot layer (boot-headless.mjs resolves it from this farm).
+		'jsdom',
 	]) {
 		link(nm, name, resolvePkgDir(name))
 	}
@@ -391,7 +481,10 @@ async function measure(tool, outDirFor, runFn, { inspect = true } = {}) {
 	}
 	const buildMs = Math.round(Math.min(...times))
 	const distBytes = dirBytes(lastOut)
+	// Keep the produced dist dir on the record (non-enumerable so it never lands in the JSON) so the
+	// e2e-of-output layer can boot exactly the bundle this tool just emitted.
 	const rec = { tool, status: 'measured', buildMs, distBytes }
+	Object.defineProperty(rec, 'distDir', { value: lastOut, enumerable: false })
 	rec.note = `best of ${times.length} run(s); times(ms)=[${times.map((t) => Math.round(t)).join(', ')}]`
 	if (inspect) {
 		try {
@@ -482,6 +575,43 @@ async function main() {
 	}
 
 	// ---------------------------------------------------------------------------
+	// e2e-of-output: BOOT every tool that produced a dist and record a PASS/FAIL/SKIPPED `works`
+	// verdict. This is what keeps the benchmark honest — a tool with the fastest buildMs but a FAIL
+	// `works` shipped broken output (JIT/@angular/compiler error, or rendered nothing) and must not be
+	// treated as a winner. The `works` field is folded into each buildtool.json result AND captured in
+	// detail in results/e2e.json.
+	// ---------------------------------------------------------------------------
+	console.log('\n-- e2e-of-output: booting each built dist headlessly (jsdom) --')
+	const e2eResults = []
+	for (const r of results) {
+		if (r.status !== 'measured') {
+			// A tool that did not build cannot be booted; record SKIPPED with the build status as reason.
+			r.works = 'SKIPPED'
+			r.worksReason = `not booted: build status="${r.status}" (${r.note ?? 'no dist produced'})`
+			e2eResults.push({ tool: r.tool, works: 'SKIPPED', reason: r.worksReason })
+			continue
+		}
+		const verdict = bootDist(r.tool, r.distDir)
+		r.works = verdict.works
+		r.worksReason = verdict.reason
+		console.log(`  ${r.tool.padEnd(9)} works=${verdict.works.padEnd(7)} ${verdict.reason}`)
+		e2eResults.push(verdict)
+	}
+
+	// Write the dedicated e2e-of-output report.
+	const e2eOut = {
+		generatedAt: new Date().toISOString(),
+		app: 'examples/linker-smoke',
+		layer: 'e2e-of-output',
+		method:
+			'After timing+sizing each build tool, boot its emitted bundle headlessly in jsdom (a fresh child process per tool, reusing the linker-smoke e2e Step-4 boot pattern) and assert: (a) bootstrap throws NO JIT / "@angular/compiler not available" error, and (b) the routed component renders into the DOM (an <h1 id="smoke-heading">Linker smoke</h1>). A fast build that ships broken output is flagged works:"FAIL", never rewarded.',
+		host: { platform: process.platform, arch: process.arch, node: process.version },
+		results: e2eResults,
+	}
+	const e2ePath = join(resultsDir, 'e2e.json')
+	writeFileSync(e2ePath, JSON.stringify(e2eOut, null, 2) + '\n')
+
+	// ---------------------------------------------------------------------------
 	const out = {
 		generatedAt: new Date().toISOString(),
 		app: 'examples/linker-smoke',
@@ -506,9 +636,11 @@ async function main() {
 	for (const r of results) {
 		const size = r.distBytes != null ? `${(r.distBytes / 1024).toFixed(1)} KiB` : '—'
 		const ms = r.buildMs != null ? `${r.buildMs} ms` : '—'
-		console.log(`  ${r.tool.padEnd(9)} ${r.status.padEnd(9)} ${ms.padStart(9)}  ${size.padStart(11)}`)
+		const works = r.works ?? '—'
+		console.log(`  ${r.tool.padEnd(9)} ${r.status.padEnd(9)} ${ms.padStart(9)}  ${size.padStart(11)}  works=${works}`)
 	}
 	console.log(`\nwrote ${outPath}`)
+	console.log(`wrote ${e2ePath}`)
 	return out
 }
 

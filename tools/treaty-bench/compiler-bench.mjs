@@ -30,8 +30,10 @@
  * Out:  prints a table + writes tools/treaty-bench/results/compiler.json
  */
 
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { performance } from 'node:perf_hooks';
+import { createRequire } from 'node:module';
+import { execSync } from 'node:child_process';
 import path from 'node:path';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -40,10 +42,88 @@ import {
   FIXTURES,
   compileWithOracle,
   loadRustAddon,
+  normalize,
 } from '../../libs/treaty-ivy/facade/parity/parity.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const require = createRequire(import.meta.url);
+const repoRoot = path.resolve(__dirname, '..', '..');
+
+// ---------------------------------------------------------------------------
+// Resolve the @angular/compiler version the repo currently builds against
+// (the "v22" oracle row). Read straight from the installed package.json so the
+// row is labelled with the REAL resolved version, never a hard-coded guess.
+// ---------------------------------------------------------------------------
+function resolvedAngularVersion() {
+  try {
+    const pkg = require('@angular/compiler/package.json');
+    return pkg.version;
+  } catch {
+    return 'unknown';
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Second, ISOLATED @angular/compiler version, installed into a temp prefix so
+// BOTH versions can be timed in one process. We never touch the repo's own
+// node_modules: the older compiler lives under os.tmpdir()/treaty-bench-ng<ver>
+// and is loaded by its absolute fesm2022 path via a file:// dynamic import.
+//
+// Returns { ok, ng, version, from } or { ok:false, reason }. The "reason" on
+// failure is the REAL installer/loader error so the row can be marked pending
+// with a truthful explanation (never faked).
+// ---------------------------------------------------------------------------
+const ISOLATED_NG_VERSION = '21.2.15';
+
+function loadIsolatedAngular(version) {
+  const prefix = path.join(os.tmpdir(), `treaty-bench-ng${version}`);
+  const compilerEntry = path.join(
+    prefix,
+    'node_modules',
+    '@angular',
+    'compiler',
+    'fesm2022',
+    'compiler.mjs',
+  );
+  try {
+    // Install only if not already present (idempotent across re-runs).
+    if (!fs.existsSync(compilerEntry)) {
+      fs.mkdirSync(prefix, { recursive: true });
+      // Minimal package.json so npm has a project to install into.
+      const pj = path.join(prefix, 'package.json');
+      if (!fs.existsSync(pj)) {
+        fs.writeFileSync(
+          pj,
+          JSON.stringify({ name: 'treaty-bench-isolated-ng', private: true }, null, 2),
+        );
+      }
+      // @angular/compiler@<version> only runtime-depends on tslib; install both
+      // into the isolated prefix. --no-save keeps it out of any lockfile.
+      // NOTE: on Windows `npm` is a `.cmd` shim — execFileSync without a shell
+      // throws EINVAL spawning it, so run the whole install line through the
+      // shell as a single string (quoting the prefix path for spaces). Inputs
+      // here are this file's own constants, not user data.
+      const isWin = process.platform === 'win32';
+      const cmd =
+        `npm install --prefix "${prefix}" ` +
+        `@angular/compiler@${version} tslib@^2.3.0 ` +
+        `--no-save --no-audit --no-fund --silent`;
+      execSync(cmd, {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 180000,
+        shell: isWin ? true : '/bin/sh',
+      });
+    }
+    if (!fs.existsSync(compilerEntry)) {
+      return { ok: false, reason: `install completed but ${compilerEntry} not found` };
+    }
+    return { ok: true, entry: compilerEntry };
+  } catch (err) {
+    const msg = (err && (err.stderr?.toString() || err.message)) || String(err);
+    return { ok: false, reason: msg.split('\n').slice(0, 3).join(' ').trim() };
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Iteration budget. "Iteration" = one full sweep compiling EVERY usable fixture
@@ -79,7 +159,12 @@ function usableFixtures(compileOne) {
 }
 
 // ---------------------------------------------------------------------------
-// The two measurable compile closures, each: fixture -> emitted Ivy JS string.
+// The measurable compile closures, each: fixture -> emitted Ivy JS string.
+//   compileAngular     -> the repo's @angular/compiler (v22) oracle
+//   compileAngularV21  -> the isolated @angular/compiler@21 oracle (set in main)
+//   compileTreatyOxc   -> the Rust NAPI addon (oxc backend)
+// All three drive the IDENTICAL parity printer + minimal metadata, so the only
+// thing differing per row is the compiler doing the lowering.
 // ---------------------------------------------------------------------------
 const compileAngular = (fx) => compileWithOracle(fx);
 
@@ -180,10 +265,145 @@ function round(n, dp) {
   return Math.round(n * f) / f;
 }
 
+// ===========================================================================
+// CORRECTNESS — prove the Rust (oxc) output MATCHES the Angular oracle, not just
+// that it is fast. Reuses the EXACT oracle + normalize() from parity.mjs (the
+// same comparison the parity harness reports), so this bench's correctness
+// verdict is byte-for-byte the same check, never a re-implementation.
+//
+// For each fixture: compile via @angular/compiler (oracle) AND via the Rust
+// addon, normalize() BOTH, and compare. We classify the outcome so the report is
+// honest and informative rather than a bare pass/fail:
+//   - "match"        : normalized oracle === normalized rust (byte/AST-equivalent)
+//   - "diff"         : a genuine template-lowering divergence
+//   - "oracle-error" : the parity printer cannot render this fixture (the i18n
+//                      `only important for i18n` throw) — excluded from scoring,
+//                      same as the parity harness treats them.
+// For every non-matching renderable fixture we also record WHICH normalized field
+// first diverges, so a single-field metadata delta (e.g. the v22 emit dropping a
+// `changeDetection` field the Rust side still writes) is visible and not hidden.
+// ===========================================================================
+function firstDivergence(a, b) {
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i++) {
+    if (a[i] !== b[i]) {
+      const s = Math.max(0, i - 24);
+      return { index: i, oracle: a.slice(s, i + 28), rust: b.slice(s, i + 28) };
+    }
+  }
+  if (a.length !== b.length) {
+    return {
+      index: n,
+      oracle: a.slice(Math.max(0, n - 24)),
+      rust: b.slice(Math.max(0, n - 24)),
+    };
+  }
+  return null;
+}
+
+// The Rust emitter writes `changeDetection:0` into the definition object; the
+// v22 @angular/compiler oracle OMITS the field entirely for the same metadata
+// (an emit-default change in v22). Stripping that single field from BOTH sides
+// (NOT from normalize() — only inside this classifier, transparently) tells us
+// whether a fixture's ONLY divergence is that one metadata field versus a real
+// template-lowering difference. We report both verdicts so nothing is masked.
+const stripChangeDetectionField = (s) => s.replace(/,?changeDetection:\d+/g, '');
+
+function runCorrectness() {
+  const perFixture = [];
+  let match = 0; // normalized oracle === normalized rust (strict, parity's check)
+  let diff = 0; // any non-match (strict)
+  let oracleError = 0; // oracle printer cannot render (i18n)
+  let changeDetectionOnly = 0; // diff whose SOLE divergence is the changeDetection field
+
+  for (const fx of FIXTURES) {
+    let oracleCode;
+    try {
+      oracleCode = compileWithOracle(fx);
+    } catch (err) {
+      oracleError++;
+      perFixture.push({
+        id: fx.id,
+        result: 'oracle-error',
+        reason: (err && err.message) || String(err),
+      });
+      continue;
+    }
+
+    if (!compileTreatyOxc) {
+      perFixture.push({ id: fx.id, result: 'rust-unavailable' });
+      continue;
+    }
+
+    let rustResult;
+    try {
+      rustResult = rust.compile(fx.template, fx.selector, fx.className);
+    } catch (err) {
+      diff++;
+      perFixture.push({
+        id: fx.id,
+        result: 'diff',
+        reason: 'rust threw: ' + ((err && err.message) || String(err)),
+      });
+      continue;
+    }
+    const rustDiag =
+      rustResult.errors && rustResult.errors.length ? rustResult.errors : null;
+
+    const nOracle = normalize(oracleCode);
+    const nRust = normalize(rustResult.code);
+    const d = firstDivergence(nOracle, nRust);
+    if (d === null) {
+      match++;
+      perFixture.push({ id: fx.id, result: 'match', rustDiagnostics: rustDiag });
+    } else {
+      diff++;
+      // Is the changeDetection metadata field the ONLY thing that differs?
+      const cdOnly =
+        stripChangeDetectionField(nOracle) === stripChangeDetectionField(nRust);
+      if (cdOnly) changeDetectionOnly++;
+      perFixture.push({
+        id: fx.id,
+        result: 'diff',
+        category: cdOnly ? 'changeDetection-field-only' : 'lowering-divergence',
+        rustDiagnostics: rustDiag,
+        firstDivergenceIndex: d.index,
+        oracleNear: d.oracle,
+        rustNear: d.rust,
+      });
+    }
+  }
+
+  const renderable = FIXTURES.length - oracleError;
+  const realDiff = diff - changeDetectionOnly;
+  const equivalentIgnoringCd = match + changeDetectionOnly;
+  return {
+    total: FIXTURES.length,
+    renderable,
+    match, // strict byte/AST equivalence under parity's normalize()
+    diff,
+    oracleError,
+    changeDetectionOnly,
+    loweringDivergences: realDiff,
+    equivalentIgnoringChangeDetectionField: equivalentIgnoringCd,
+    summary:
+      `${match}/${renderable} renderable fixtures STRICTLY byte/AST-equivalent under parity normalize(); ` +
+      `${equivalentIgnoringCd}/${renderable} are equivalent except the Rust emitter writes a ` +
+      `\`changeDetection:0\` field the v22 oracle now omits (single metadata field, instruction ` +
+      `streams identical); ${realDiff} genuine lowering divergence(s); ` +
+      `${oracleError} not renderable by the oracle printer (i18n)`,
+    diffFixtures: perFixture.filter((f) => f.result === 'diff').map((f) => f.id),
+    loweringDivergenceFixtures: perFixture
+      .filter((f) => f.result === 'diff' && f.category === 'lowering-divergence')
+      .map((f) => f.id),
+    perFixture,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Run.
 // ---------------------------------------------------------------------------
-function main() {
+async function main() {
   console.log('Treaty compiler micro-benchmark — Ivy lowering throughput');
   console.log('='.repeat(72));
   console.log(`corpus fixtures (shared, from parity.mjs): ${FIXTURES.length}`);
@@ -192,26 +412,93 @@ function main() {
   console.log(
     `treaty-oxc addon: ${rust.ok ? 'LOADED from ' + path.basename(rust.from) : 'NOT AVAILABLE'}`,
   );
+
+  const v22Version = resolvedAngularVersion();
+  console.log(`angular-compiler (repo): @angular/compiler@${v22Version}`);
+
+  // Load the isolated older @angular/compiler so v21 and v22 are timed in ONE
+  // run. If install/load fails the v21 row becomes status:"pending" with the
+  // REAL reason (never faked).
+  console.log(`isolating @angular/compiler@${ISOLATED_NG_VERSION} ...`);
+  const isolated = loadIsolatedAngular(ISOLATED_NG_VERSION);
+  let ng21 = null;
+  let v21LoadReason = isolated.ok ? null : isolated.reason;
+  if (isolated.ok) {
+    try {
+      ng21 = await import(pathToFileURL(isolated.entry).href);
+      const got = ng21.VERSION ? ng21.VERSION.full : ISOLATED_NG_VERSION;
+      console.log(`  loaded @angular/compiler@${got} from ${isolated.entry}`);
+    } catch (err) {
+      ng21 = null;
+      v21LoadReason = 'dynamic import failed: ' + ((err && err.message) || String(err));
+    }
+  }
+  if (!ng21) console.log(`  v21 NOT AVAILABLE: ${v21LoadReason}`);
+  // v21 oracle closure: identical printer/metadata path, driven by the v21 module.
+  const compileAngularV21 = ng21 ? (fx) => compileWithOracle(fx, ng21) : null;
   console.log('');
 
   const results = [];
 
-  // Build the SHARED timed set = fixtures BOTH measured compilers can lower, so
+  // -----------------------------------------------------------------------
+  // CORRECTNESS first — does Treaty-oxc's emitted Ivy MATCH the Angular oracle?
+  // -----------------------------------------------------------------------
+  console.log('checking correctness (treaty-oxc vs @angular/compiler oracle) ...');
+  const correctness = runCorrectness();
+  console.log(`  strict match (parity normalize): ${correctness.match}/${correctness.renderable}`);
+  console.log(
+    `  equivalent except the v22 changeDetection-field emit change: ` +
+      `${correctness.equivalentIgnoringChangeDetectionField}/${correctness.renderable} ` +
+      `(${correctness.changeDetectionOnly} fixtures differ ONLY by \`changeDetection:0\`)`,
+  );
+  console.log(`  genuine lowering divergences: ${correctness.loweringDivergences}`);
+  if (correctness.loweringDivergenceFixtures.length) {
+    console.log(`  lowering-divergence fixtures: ${correctness.loweringDivergenceFixtures.join(', ')}`);
+  }
+  console.log(`  oracle-unrenderable (i18n): ${correctness.oracleError}`);
+  console.log('');
+
+  // Build the SHARED timed set = fixtures ALL measured compilers can lower, so
   // every compiler is timed over the identical templates (the Angular oracle
-  // printer throws on the i18n fixtures; the intersection drops those for both).
+  // printer throws on the i18n fixtures; the intersection drops those for all).
   const angOk = new Set(usableFixtures(compileAngular).ok.map((f) => f.id));
   const oxcOk = compileTreatyOxc
     ? new Set(usableFixtures(compileTreatyOxc).ok.map((f) => f.id))
     : new Set();
+  const v21Ok = compileAngularV21
+    ? new Set(usableFixtures(compileAngularV21).ok.map((f) => f.id))
+    : null;
   const shared = FIXTURES.map((f) => f.id).filter(
-    (id) => angOk.has(id) && (!compileTreatyOxc || oxcOk.has(id)),
+    (id) =>
+      angOk.has(id) &&
+      (!compileTreatyOxc || oxcOk.has(id)) &&
+      (!v21Ok || v21Ok.has(id)),
   );
   console.log(`shared timed fixtures (intersection): ${shared.length}/${FIXTURES.length}`);
   console.log('');
 
-  // angular-compiler — @angular/compiler oracle (measured today).
-  console.log('measuring angular-compiler ...');
-  results.push(measure('angular-compiler', compileAngular, shared));
+  // angular-compiler@22 — the repo's @angular/compiler oracle.
+  console.log(`measuring angular-compiler@22 (${v22Version}) ...`);
+  const r22 = measure(`angular-compiler@22`, compileAngular, shared);
+  r22.angularVersion = v22Version;
+  results.push(r22);
+
+  // angular-compiler@21 — the isolated older @angular/compiler oracle.
+  if (compileAngularV21) {
+    console.log(`measuring angular-compiler@21 (${ISOLATED_NG_VERSION}) ...`);
+    const r21 = measure(`angular-compiler@21`, compileAngularV21, shared);
+    r21.angularVersion = ISOLATED_NG_VERSION;
+    results.push(r21);
+  } else {
+    results.push({
+      compiler: 'angular-compiler@21',
+      status: 'pending',
+      angularVersion: ISOLATED_NG_VERSION,
+      note:
+        `@angular/compiler@${ISOLATED_NG_VERSION} could not be isolated on this ` +
+        `machine: ${v21LoadReason}`,
+    });
+  }
 
   // treaty-oxc — the Rust NAPI addon, oxc backend (measured today).
   console.log('measuring treaty-oxc ...');
@@ -275,10 +562,43 @@ function main() {
   }
 
   // -----------------------------------------------------------------------
-  // JSON artifact.
+  // JSON artifacts.
   // -----------------------------------------------------------------------
   const outDir = path.join(__dirname, 'results');
   fs.mkdirSync(outDir, { recursive: true });
+  const env = {
+    node: process.version,
+    platform: process.platform,
+    arch: process.arch,
+    cpu: os.cpus()[0]?.model?.trim() || 'unknown',
+  };
+
+  // (1) correctness.json — oracle parity verdict (treaty-oxc vs @angular/compiler).
+  const correctnessFile = path.join(outDir, 'correctness.json');
+  fs.writeFileSync(
+    correctnessFile,
+    JSON.stringify(
+      {
+        benchmark: 'compiler-correctness',
+        generatedAt: new Date().toISOString(),
+        oracle: `@angular/compiler@${v22Version}`,
+        treaty: rust.ok ? path.basename(rust.from) : 'NOT AVAILABLE',
+        comparison:
+          'normalize() from libs/treaty-ivy/facade/parity/parity.mjs (same check the parity harness reports)',
+        corpus: {
+          source: 'libs/treaty-ivy/facade/parity/parity.mjs#FIXTURES',
+          totalFixtures: FIXTURES.length,
+        },
+        env,
+        ...correctness,
+      },
+      null,
+      2,
+    ) + '\n',
+    'utf8',
+  );
+
+  // (2) compiler.json — timing rows (v21 vs v22 vs treaty-oxc) + correctness summary.
   const outFile = path.join(outDir, 'compiler.json');
   const payload = {
     benchmark: 'compiler-ivy-lowering',
@@ -287,20 +607,27 @@ function main() {
       source: 'libs/treaty-ivy/facade/parity/parity.mjs#FIXTURES',
       totalFixtures: FIXTURES.length,
     },
-    env: {
-      node: process.version,
-      platform: process.platform,
-      arch: process.arch,
-      cpu: os.cpus()[0]?.model?.trim() || 'unknown',
-    },
+    env,
     config: { warmupIters: WARMUP_ITERS, measureIters: MEASURE_ITERS, bestOf: 3 },
-    angularCompilerVersionNote:
-      'angular-compiler row measured with the @angular/compiler resolved at repo node_modules',
+    angularCompilerVersions: {
+      v22: v22Version,
+      v21: ng21 ? (ng21.VERSION ? ng21.VERSION.full : ISOLATED_NG_VERSION) : null,
+      v21Status: ng21 ? 'isolated+measured' : 'pending: ' + v21LoadReason,
+    },
+    correctness: {
+      file: 'correctness.json',
+      summary: correctness.summary,
+      match: correctness.match,
+      diff: correctness.diff,
+      oracleError: correctness.oracleError,
+      diffFixtures: correctness.diffFixtures,
+    },
     results,
   };
   fs.writeFileSync(outFile, JSON.stringify(payload, null, 2) + '\n', 'utf8');
   console.log('');
-  console.log(`wrote ${path.relative(path.resolve(__dirname, '..', '..'), outFile)}`);
+  console.log(`wrote ${path.relative(repoRoot, correctnessFile)}`);
+  console.log(`wrote ${path.relative(repoRoot, outFile)}`);
 
   return results;
 }
@@ -310,4 +637,7 @@ function pad(s, n) {
   return s.length >= n ? s + ' ' : s + ' '.repeat(n - s.length);
 }
 
-main();
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});

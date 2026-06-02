@@ -1,0 +1,311 @@
+{
+  "benchmark": "compiler-correctness",
+  "generatedAt": "2026-06-02T18:25:04.015Z",
+  "oracle": "@angular/compiler@22.0.0-rc.3",
+  "treaty": "authoring_node.win32-x64-msvc.node",
+  "comparison": "normalize() from libs/treaty-ivy/facade/parity/parity.mjs (same check the parity harness reports)",
+  "corpus": {
+    "source": "libs/treaty-ivy/facade/parity/parity.mjs#FIXTURES",
+    "totalFixtures": 29
+  },
+  "env": {
+    "node": "v24.7.0",
+    "platform": "win32",
+    "arch": "x64",
+    "cpu": "AMD Ryzen 7 PRO 5850U with Radeon Graphics"
+  },
+  "total": 29,
+  "renderable": 27,
+  "match": 0,
+  "diff": 27,
+  "oracleError": 2,
+  "changeDetectionOnly": 27,
+  "loweringDivergences": 0,
+  "equivalentIgnoringChangeDetectionField": 27,
+  "summary": "0/27 renderable fixtures STRICTLY byte/AST-equivalent under parity normalize(); 27/27 are equivalent except the Rust emitter writes a `changeDetection:0` field the v22 oracle now omits (single metadata field, instruction streams identical); 0 genuine lowering divergence(s); 2 not renderable by the oracle printer (i18n)",
+  "diffFixtures": [
+    "static-element",
+    "interpolation",
+    "nested",
+    "attribute",
+    "multiple-bindings",
+    "property-binding",
+    "event-binding",
+    "two-interpolations",
+    "class-binding",
+    "style-binding",
+    "control-flow-if",
+    "control-flow-for",
+    "deep-nesting",
+    "sibling-elements",
+    "static-and-bound-mix",
+    "control-flow-if-elseif-else",
+    "control-flow-switch",
+    "nested-for-in-if",
+    "multiple-event-bindings",
+    "mixed-bindings-element",
+    "for-index-count",
+    "ng-template-ref",
+    "attr-binding",
+    "pipe-simple",
+    "pipe-with-args",
+    "pipe-chained",
+    "pipe-in-binding"
+  ],
+  "loweringDivergenceFixtures": [],
+  "perFixture": [
+    {
+      "id": "static-element",
+      "result": "diff",
+      "category": "changeDetection-field-only",
+      "rustDiagnostics": null,
+      "firstDivergenceIndex": 84,
+      "oracleNear": "emplate:,encapsulation:2})FNSfunctionBtnComponent_Te",
+      "rustNear": "emplate:,encapsulation:2,changeDetection:0})FNSfunct"
+    },
+    {
+      "id": "interpolation",
+      "result": "diff",
+      "category": "changeDetection-field-only",
+      "rustDiagnostics": null,
+      "firstDivergenceIndex": 86,
+      "oracleNear": "emplate:,encapsulation:2})FNSfunctionHelloComponent_",
+      "rustNear": "emplate:,encapsulation:2,changeDetection:0})FNSfunct"
+    },
+    {
+      "id": "nested",
+      "result": "diff",
+      "category": "changeDetection-field-only",
+      "rustDiagnostics": null,
+      "firstDivergenceIndex": 87,
+      "oracleNear": "emplate:,encapsulation:2})FNSfunctionNestedComponent",
+      "rustNear": "emplate:,encapsulation:2,changeDetection:0})FNSfunct"
+    },
+    {
+      "id": "attribute",
+      "result": "diff",
+      "category": "changeDetection-field-only",
+      "rustDiagnostics": null,
+      "firstDivergenceIndex": 113,
+      "oracleNear": "emplate:,encapsulation:2})FNSfunctionAttrComponent_T",
+      "rustNear": "emplate:,encapsulation:2,changeDetection:0})FNSfunct"
+    },
+    {
+      "id": "multiple-bindings",
+      "result": "diff",
+      "category": "changeDetection-field-only",
+      "rustDiagnostics": null,
+      "firstDivergenceIndex": 86,
+      "oracleNear": "emplate:,encapsulation:2})FNSfunctionMultiComponent_",
+      "rustNear": "emplate:,encapsulation:2,changeDetection:0})FNSfunct"
+    },
+    {
+      "id": "property-binding",
+      "result": "diff",
+      "category": "changeDetection-field-only",
+      "rustDiagnostics": null,
+      "firstDivergenceIndex": 103,
+      "oracleNear": "emplate:,encapsulation:2})FNSfunctionPropComponent_T",
+      "rustNear": "emplate:,encapsulation:2,changeDetection:0})FNSfunct"
+    },
+    {
+      "id": "event-binding",
+      "result": "diff",
+      "category": "changeDetection-field-only",
+      "rustDiagnostics": null,
+      "firstDivergenceIndex": 107,
+      "oracleNear": "emplate:,encapsulation:2})FNSfunctionEventComponent_",
+      "rustNear": "emplate:,encapsulation:2,changeDetection:0})FNSfunct"
+    },
+    {
+      "id": "two-interpolations",
+      "result": "diff",
+      "category": "changeDetection-field-only",
+      "rustDiagnostics": null,
+      "firstDivergenceIndex": 91,
+      "oracleNear": "emplate:,encapsulation:2})FNSfunctionTwoInterpCompon",
+      "rustNear": "emplate:,encapsulation:2,changeDetection:0})FNSfunct"
+    },
+    {
+      "id": "class-binding",
+      "result": "diff",
+      "category": "changeDetection-field-only",
+      "rustDiagnostics": null,
+      "firstDivergenceIndex": 86,
+      "oracleNear": "emplate:,encapsulation:2})FNSfunctionClassComponent_",
+      "rustNear": "emplate:,encapsulation:2,changeDetection:0})FNSfunct"
+    },
+    {
+      "id": "style-binding",
+      "result": "diff",
+      "category": "changeDetection-field-only",
+      "rustDiagnostics": null,
+      "firstDivergenceIndex": 86,
+      "oracleNear": "emplate:,encapsulation:2})FNSfunctionStyleComponent_",
+      "rustNear": "emplate:,encapsulation:2,changeDetection:0})FNSfunct"
+    },
+    {
+      "id": "control-flow-if",
+      "result": "diff",
+      "category": "changeDetection-field-only",
+      "rustDiagnostics": null,
+      "firstDivergenceIndex": 83,
+      "oracleNear": "emplate:,encapsulation:2})FNSfunctionIfComponent_Con",
+      "rustNear": "emplate:,encapsulation:2,changeDetection:0})FNSfunct"
+    },
+    {
+      "id": "control-flow-for",
+      "result": "diff",
+      "category": "changeDetection-field-only",
+      "rustDiagnostics": null,
+      "firstDivergenceIndex": 84,
+      "oracleNear": "emplate:,encapsulation:2})FNSfunctionForComponent_Fo",
+      "rustNear": "emplate:,encapsulation:2,changeDetection:0})FNSfunct"
+    },
+    {
+      "id": "deep-nesting",
+      "result": "diff",
+      "category": "changeDetection-field-only",
+      "rustDiagnostics": null,
+      "firstDivergenceIndex": 85,
+      "oracleNear": "emplate:,encapsulation:2})FNSfunctionDeepComponent_T",
+      "rustNear": "emplate:,encapsulation:2,changeDetection:0})FNSfunct"
+    },
+    {
+      "id": "sibling-elements",
+      "result": "diff",
+      "category": "changeDetection-field-only",
+      "rustDiagnostics": null,
+      "firstDivergenceIndex": 89,
+      "oracleNear": "emplate:,encapsulation:2})FNSfunctionSiblingsCompone",
+      "rustNear": "emplate:,encapsulation:2,changeDetection:0})FNSfunct"
+    },
+    {
+      "id": "static-and-bound-mix",
+      "result": "diff",
+      "category": "changeDetection-field-only",
+      "rustDiagnostics": null,
+      "firstDivergenceIndex": 110,
+      "oracleNear": "emplate:,encapsulation:2})FNSfunctionMixComponent_Te",
+      "rustNear": "emplate:,encapsulation:2,changeDetection:0})FNSfunct"
+    },
+    {
+      "id": "control-flow-if-elseif-else",
+      "result": "diff",
+      "category": "changeDetection-field-only",
+      "rustDiagnostics": null,
+      "firstDivergenceIndex": 89,
+      "oracleNear": "emplate:,encapsulation:2})FNSfunctionIfChainComponen",
+      "rustNear": "emplate:,encapsulation:2,changeDetection:0})FNSfunct"
+    },
+    {
+      "id": "control-flow-switch",
+      "result": "diff",
+      "category": "changeDetection-field-only",
+      "rustDiagnostics": null,
+      "firstDivergenceIndex": 87,
+      "oracleNear": "emplate:,encapsulation:2})FNSfunctionSwitchComponent",
+      "rustNear": "emplate:,encapsulation:2,changeDetection:0})FNSfunct"
+    },
+    {
+      "id": "nested-for-in-if",
+      "result": "diff",
+      "category": "changeDetection-field-only",
+      "rustDiagnostics": null,
+      "firstDivergenceIndex": 94,
+      "oracleNear": "emplate:,encapsulation:2})FNSfunctionNestedForIfComp",
+      "rustNear": "emplate:,encapsulation:2,changeDetection:0})FNSfunct"
+    },
+    {
+      "id": "multiple-event-bindings",
+      "result": "diff",
+      "category": "changeDetection-field-only",
+      "rustDiagnostics": null,
+      "firstDivergenceIndex": 126,
+      "oracleNear": "emplate:,encapsulation:2})FNSfunctionMultiEventCompo",
+      "rustNear": "emplate:,encapsulation:2,changeDetection:0})FNSfunct"
+    },
+    {
+      "id": "mixed-bindings-element",
+      "result": "diff",
+      "category": "changeDetection-field-only",
+      "rustDiagnostics": null,
+      "firstDivergenceIndex": 120,
+      "oracleNear": "emplate:,encapsulation:2})FNSfunctionMixedBindCompon",
+      "rustNear": "emplate:,encapsulation:2,changeDetection:0})FNSfunct"
+    },
+    {
+      "id": "for-index-count",
+      "result": "diff",
+      "category": "changeDetection-field-only",
+      "rustDiagnostics": null,
+      "firstDivergenceIndex": 90,
+      "oracleNear": "emplate:,encapsulation:2})FNSfunctionForIndexCompone",
+      "rustNear": "emplate:,encapsulation:2,changeDetection:0})FNSfunct"
+    },
+    {
+      "id": "ng-template-ref",
+      "result": "diff",
+      "category": "changeDetection-field-only",
+      "rustDiagnostics": null,
+      "firstDivergenceIndex": 108,
+      "oracleNear": "emplate:,encapsulation:2})FNSfunctionTplRefComponent",
+      "rustNear": "emplate:,encapsulation:2,changeDetection:0})FNSfunct"
+    },
+    {
+      "id": "attr-binding",
+      "result": "diff",
+      "category": "changeDetection-field-only",
+      "rustDiagnostics": null,
+      "firstDivergenceIndex": 90,
+      "oracleNear": "emplate:,encapsulation:2})FNSfunctionAttrBindCompone",
+      "rustNear": "emplate:,encapsulation:2,changeDetection:0})FNSfunct"
+    },
+    {
+      "id": "pipe-simple",
+      "result": "diff",
+      "category": "changeDetection-field-only",
+      "rustDiagnostics": null,
+      "firstDivergenceIndex": 92,
+      "oracleNear": "emplate:,encapsulation:2})FNSfunctionPipeSimpleCompo",
+      "rustNear": "emplate:,encapsulation:2,changeDetection:0})FNSfunct"
+    },
+    {
+      "id": "pipe-with-args",
+      "result": "diff",
+      "category": "changeDetection-field-only",
+      "rustDiagnostics": null,
+      "firstDivergenceIndex": 90,
+      "oracleNear": "emplate:,encapsulation:2})FNSfunctionPipeArgsCompone",
+      "rustNear": "emplate:,encapsulation:2,changeDetection:0})FNSfunct"
+    },
+    {
+      "id": "pipe-chained",
+      "result": "diff",
+      "category": "changeDetection-field-only",
+      "rustDiagnostics": null,
+      "firstDivergenceIndex": 93,
+      "oracleNear": "emplate:,encapsulation:2})FNSfunctionPipeChainedComp",
+      "rustNear": "emplate:,encapsulation:2,changeDetection:0})FNSfunct"
+    },
+    {
+      "id": "pipe-in-binding",
+      "result": "diff",
+      "category": "changeDetection-field-only",
+      "rustDiagnostics": null,
+      "firstDivergenceIndex": 114,
+      "oracleNear": "emplate:,encapsulation:2})FNSfunctionPipeBindingComp",
+      "rustNear": "emplate:,encapsulation:2,changeDetection:0})FNSfunct"
+    },
+    {
+      "id": "i18n-static",
+      "result": "oracle-error",
+      "reason": "only important for i18n"
+    },
+    {
+      "id": "i18n-interp",
+      "result": "oracle-error",
+      "reason": "only important for i18n"
+    }
+  ]
+}
