@@ -320,3 +320,22 @@ decorators/facade, packagr 19 lib + 2 integration):
 
 Remaining (non-correctness): FESM flattening (rolldown) in packagr; the 10 genuine
 compliance DIFFs; production (non-dev) backend hosting + SSE/WS fan-out.
+
+### 2026-06-02 (later) — roadmap climb (parallel workflows)
+
+- **matchGolden 175 → 178/185 (96.2%)** — three genuine compliance DIFFs closed with
+  ZERO regression: forward-ref-in-imports thunking for standalone components
+  (`dependencies: () => [Fwd]`), `@defer` per-block lazy **dependency-resolver fns**
+  (`ɵɵdefer(…, DepsFn)` + eager/lazy split), and `@defer` blocks **linked into i18n
+  messages** (trigger clause in the message + i18n sub-template continuation). The
+  remaining 7 DIFFs are harness/golden-vintage (legacy `contFlowTmp`/`_r`-suffix
+  naming the canonicalizer doesn't fold, and jit-mode-only NgModule goldens) — not
+  compiler defects.
+- **FESM flattening** — packagr now flattens each entry's PRIVATE relative imports
+  into one flat APF ESM via a self-contained oxc inliner (bails to identity on a
+  name collision; `@angular/*` + sibling-entry imports stay external).
+- **Production Api hosting** — the generated axum Api handler is now real: it
+  deserializes the request, runs the (transpiled/rust) body, and returns `Json<RESP>`
+  (previously emitted `return a + b;` against a `Json<f64>` signature — would not have
+  compiled). SSE/WebSocket production handlers + a runnable host are being rebased onto
+  this base and verified against a real `cargo build` against axum.

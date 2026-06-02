@@ -12,7 +12,7 @@ JSX-flavored Angular — signals by default.
 
 | Area | What | Status |
 | --- | --- | --- |
-| Compiler | `treaty_ivy` — direct-to-Ivy in Rust (4-crate carve: core/template/decorators/facade), `DecoratorCompiler` registry | ✅ 175/185 runnable Angular golden parity (94.6%, climbing) |
+| Compiler | `treaty_ivy` — direct-to-Ivy in Rust (4-crate carve: core/template/decorators/facade), `DecoratorCompiler` registry | ✅ 178/185 runnable Angular golden parity (96.2%, climbing) |
 | All decorators → Ivy AOT | `@Component/@Directive/@Pipe/@Injectable/@NgModule` lower to Ivy `ɵɵdefine*` (no JIT) on every entry, including the unified `compile()` path | ✅ |
 | Authoring → Ivy | `.treaty` SFC + JSX-flavored Angular authoring plugins → `treaty_ivy`; selectorless multi-form selector (kebab/camel/Pascal) + class name derived from the file name (no `<ng-component>`) | ✅ |
 | **React → Angular** | A plain **React** `.tsx`/`.jsx` (imports from `react`, hooks) compiles to Angular Ivy: `useState`→`signal` (setter→`.set`/`.update`), `useEffect`→`effect`, `useMemo`→`computed`, `useCallback`/`useRef`/`useContext`, **props→`input()`**; signal reads auto-called in body, control-flow conditions, and handlers; inline-arrow handlers unwrapped; `react` import stripped | ✅ (`examples/treaty-shadcn` Card/Alert) |
