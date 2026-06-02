@@ -37,6 +37,10 @@ grass = "0.13"
 
 miette     = { version = "7.1.0", features = ["fancy-no-backtrace"] }
 ouroboros  = "0.18.3"
+# Parses the GENERATED axum server module as real Rust in tests, asserting the emit is well-formed
+# (a far stronger check than substring matching). Already in the lockfile transitively, so this adds
+# no new download. `full` enables item/fn/expr parsing of a whole `syn::File`.
+syn        = { version = "2", features = ["full", "parsing"] }
 
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

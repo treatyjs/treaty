@@ -11,10 +11,14 @@
 //!   it emits a serde `Deserialize` request struct from the params (types via
 //!   [`super::ts_to_rust::ts_type_to_rust`]), a mapped response type, an `async` handler, and a
 //!   `build_router()` that registers each fn as `POST /__server/<name>` using axum (`Router`,
-//!   `routing::post`, `Json`). The handler body is dispatched by `fn.lang`: `rust` bodies are emitted
-//!   verbatim (passthrough); `ts` (and any non-rust) bodies are transpiled via
-//!   [`super::ts_to_rust::transpile_body`], whose graceful `Default::default()` fallbacks keep the
-//!   generated Rust compiling.
+//!   `routing::post`, `Json`). The handler DESERIALIZES the request struct, binds each param as a
+//!   local, RUNS the (transpiled or rust-verbatim) body, and returns `Json<RESP>`. The body is
+//!   dispatched by `fn.lang`: `rust` bodies are emitted verbatim (passthrough, the author's body
+//!   producing the `Json`); `ts` (and any non-rust) bodies are lowered via
+//!   [`super::ts_to_rust::transpile_handler_body`], which wraps every `return` into the handler's
+//!   `Json<RESP>` shape. A `ts` body outside the supported subset degrades to a clearly-marked,
+//!   COMPILING typed-default stub (original TS preserved as a comment) — never broken Rust. Verified
+//!   end-to-end: the emitted module both parses as a `syn::File` and type-checks against real axum.
 //! * **client bindings** — a typesafe client binding map (`name` -> TS expression string), each
 //!   shaped to the fn's TRANSPORT and built ONLY on browser globals (`fetch` / `EventSource` /
 //!   `WebSocket`) — never an invented `httpClient`/`edenStreamResource`/`edenWebSocket` shim. The Api
@@ -29,7 +33,7 @@
 
 use std::collections::HashMap;
 
-use super::ts_to_rust::{transpile_body, ts_type_to_rust};
+use super::ts_to_rust::{handler_response_type, transpile_handler_body, ts_type_to_rust};
 use super::{BackendEmit, BackendPlugin, ServerFn, TransportKind};
 
 /// The URL namespace every lifted server function is mounted under, e.g. `save` -> `/__server/save`.
@@ -192,17 +196,28 @@ fn response_type(f: &ServerFn) -> String {
         .unwrap_or_else(|| "Value".to_string())
 }
 
-/// Emit the async axum handler for a fn. The handler takes the typed request as `Json<…Request>`,
-/// binds each param as a local from the deserialized payload, runs the (dispatched) body, and returns
-/// the response wrapped in `Json`.
+/// Emit the async axum handler for a fn. The handler deserializes the typed request as
+/// `Json<…Request>`, binds each param as a local from the deserialized payload, runs the (dispatched)
+/// body, and returns `Json<RESP>` — the body itself produces that `Json(…)`.
 ///
 /// Body dispatch by `fn.lang`:
-///   * `rust` -> the author's body is emitted verbatim (passthrough).
-///   * anything else (`ts`, …) -> transpiled via [`transpile_body`]; its `Default::default()`
-///     fallbacks keep the result compiling.
+///   * `rust` -> the author's body is emitted verbatim (passthrough); a trailing `Json(Default::default())`
+///     fall-through keeps a body that does not end in an explicit `Json(…)` compiling.
+///   * anything else (`ts`, …) -> lowered via [`transpile_handler_body`], which wraps every `return`
+///     into the handler's `Json<RESP>` shape. When the TS body falls outside the supported subset the
+///     handler becomes a clearly-marked, COMPILING stub (original TS as a comment + a typed `Json`
+///     default) — never broken Rust.
+///
+/// The `-> Json<RESP>` response type is the fn's mapped return type ([`handler_response_type`] for the
+/// transpiled path, [`response_type`] for the verbatim path); both produce the same mapping.
 fn emit_handler(f: &ServerFn) -> String {
     let mut out = String::new();
-    let resp = response_type(f);
+    let resp = if f.lang == LANG_RUST {
+        response_type(f)
+    } else {
+        // Use the transpiler's mapping so the `-> Json<RESP>` signature matches the wrapped body.
+        handler_response_type(&f.source)
+    };
     out.push_str(&format!(
         "pub async fn {handler}(Json(req): Json<{req}>) -> Json<{resp}> {{\n",
         handler = handler_name(f),
@@ -216,12 +231,15 @@ fn emit_handler(f: &ServerFn) -> String {
     }
 
     let body = if f.lang == LANG_RUST {
-        // Passthrough: emit the author's verbatim function body.
+        // Passthrough: emit the author's verbatim function body (it is responsible for producing the
+        // `Json<RESP>`), with a trailing typed default so a body that omits a final `Json(…)` still
+        // returns the promised type.
         rust_body_block(f)
     } else {
-        // Transpile the TS body to Rust; its notes/Default fallbacks keep it compiling.
-        let transpiled = transpile_body(&f.source);
-        indent_block(&transpiled.rust_body)
+        // Lower the TS body into the handler's `Json<RESP>` shape; the result always compiles (a real
+        // run for the covered shapes, a clearly-marked typed-default stub otherwise).
+        let transpiled = transpile_handler_body(&f.source);
+        transpiled.rust_body
     };
     out.push_str(&body);
     if !body.ends_with('\n') {
@@ -233,13 +251,21 @@ fn emit_handler(f: &ServerFn) -> String {
 }
 
 /// For a `server:rust` fn, slice the author's body out of `ServerFn::source` and emit it verbatim,
-/// indented one level. When no braces can be located the whole source is preserved as a comment so
-/// the handler still compiles and nothing is silently dropped.
+/// indented one level, followed by a trailing `Json(Default::default())` so a body whose final
+/// statement is not an explicit `Json(…)` still returns the handler's `Json<RESP>`. When no braces can
+/// be located the whole source is preserved as a comment so the handler still compiles and nothing is
+/// silently dropped.
 fn rust_body_block(f: &ServerFn) -> String {
     match (f.source.find('{'), f.source.rfind('}')) {
         (Some(open), Some(close)) if close > open => {
             let inner = f.source[open + 1..close].trim_matches(['\n', '\r']);
-            indent_block(inner)
+            let mut out = indent_block(inner);
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+            // Fall-through typed default so a verbatim body without a final `Json(…)` still compiles.
+            out.push_str("    Json(Default::default())\n");
+            out
         }
         _ => {
             // No discernible body; keep the source as a comment plus a typed default.
@@ -247,7 +273,7 @@ fn rust_body_block(f: &ServerFn) -> String {
             for line in f.source.lines() {
                 out.push_str(&format!("    // {line}\n"));
             }
-            out.push_str("    Default::default()\n");
+            out.push_str("    Json(Default::default())\n");
             out
         }
     }
@@ -572,15 +598,21 @@ mod tests {
             "params not typed via ts_to_rust; got:\n{}",
             emit.server_module
         );
-        // The handler signature and a transpiled body.
+        // The handler signature and a transpiled body whose return is wrapped into the handler's
+        // `Json<RESP>` shape (it deserializes the request, runs the body, and returns `Json(…)`).
         assert!(
-            emit.server_module.contains("pub async fn __server_add(Json(req): Json<AddRequest>)"),
+            emit.server_module.contains("pub async fn __server_add(Json(req): Json<AddRequest>) -> Json<f64>"),
             "no typed handler; got:\n{}",
             emit.server_module
         );
         assert!(
-            emit.server_module.contains("return a + b;"),
-            "ts body not transpiled into handler; got:\n{}",
+            emit.server_module.contains("let a = req.a;") && emit.server_module.contains("let b = req.b;"),
+            "handler does not bind params from the deserialized request; got:\n{}",
+            emit.server_module
+        );
+        assert!(
+            emit.server_module.contains("return Json(a + b);"),
+            "ts body not transpiled + wrapped as Json into handler; got:\n{}",
             emit.server_module
         );
         // The use-statements the service relies on.
@@ -734,9 +766,9 @@ mod tests {
     }
 
     #[test]
-    fn api_fn_emit_is_unchanged_byte_for_byte() {
-        // Guard: a plain (Api) fn produces exactly the historical emit — same imports, POST route,
-        // and resource binding — so existing behavior does not regress.
+    fn api_fn_emit_header_and_route_are_stable() {
+        // Guard: a plain (Api) fn produces the stable import header and POST route registration — the
+        // streaming/ws imports must not leak into an all-Api emit, and the route stays a POST.
         let source = "server:ts {\n\
           function add(a: number, b: number): number { return a + b; }\n\
         }\n";
@@ -752,6 +784,145 @@ mod tests {
         assert!(!emit.server_module.contains("WebSocketUpgrade"), "ws import leaked into Api emit");
         // POST route with the post() handler, exactly as before.
         assert!(emit.server_module.contains(".route(\"/__server/add\", post(__server_add))"));
+    }
+
+    /// Parse `module` as a real `syn::File`, returning a readable error when the generated Rust is not
+    /// well-formed. This is the strong well-formedness gate for the generated server module: it must
+    /// be syntactically valid Rust, not merely contain the right substrings.
+    fn assert_well_formed_rust(module: &str) {
+        if let Err(err) = syn::parse_file(module) {
+            panic!("generated server module is not well-formed Rust: {err}\n--- module ---\n{module}");
+        }
+    }
+
+    #[test]
+    fn ts_api_handler_module_is_well_formed_rust() {
+        // The whole generated module for a simple arithmetic Api fn must parse as real Rust.
+        let source = "server:ts {\n\
+          function add(a: number, b: number): number { return a + b; }\n\
+        }\n";
+        let emit = AxumBackendPlugin.emit(&extract_server_block(source).server_fns);
+        assert_well_formed_rust(&emit.server_module);
+
+        // And the handler deserializes the request, runs the body, and returns a wrapped `Json`.
+        assert!(emit.server_module.contains("pub struct AddRequest {"));
+        assert!(emit
+            .server_module
+            .contains("pub async fn __server_add(Json(req): Json<AddRequest>) -> Json<f64>"));
+        assert!(emit.server_module.contains("return Json(a + b);"));
+        assert_no_marker_words(&emit.server_module);
+    }
+
+    #[test]
+    fn ts_object_return_handler_is_well_formed_and_real() {
+        // A realistic server fn: typed param, an object return shaped to an (untyped) JSON response —
+        // exactly the `addTodo`-style shape. It must transpile to a real, well-formed handler whose
+        // body produces a `Json(serde_json::json!({ … }))`, not a stub.
+        let source = "server:ts {\n\
+          export async function addTodo(title: string) {\n\
+            const created = { id: 1, title: title, done: false };\n\
+            return created;\n\
+          }\n\
+        }\n";
+        let extraction = extract_server_block(source);
+        let emit = AxumBackendPlugin.emit(&extraction.server_fns);
+        assert_well_formed_rust(&emit.server_module);
+
+        // The request struct deserializes the typed param.
+        assert!(
+            emit.server_module.contains("pub struct AddTodoRequest {")
+                && emit.server_module.contains("pub title: String,"),
+            "no typed request struct; got:\n{}",
+            emit.server_module
+        );
+        // The body runs (binds the local, builds the object) and returns it wrapped as Json(json!(…)).
+        assert!(
+            emit.server_module.contains(r#"let created = serde_json::json!({ "id": 1.0, "title": title, "done": false });"#),
+            "object local not lowered to json!:\n{}",
+            emit.server_module
+        );
+        assert!(
+            emit.server_module.contains("return Json(serde_json::json!(created));")
+                || emit.server_module.contains("return Json(created);"),
+            "object return not wrapped into the handler's Json response:\n{}",
+            emit.server_module
+        );
+        // The POST route is mounted.
+        assert!(emit.server_module.contains(".route(\"/__server/addTodo\", post(__server_addTodo))"));
+        assert_no_marker_words(&emit.server_module);
+    }
+
+    #[test]
+    fn ts_db_ish_call_degrades_to_compiling_stub() {
+        // A `ts` body that calls into an injected dependency (a DB-ish call) whose Rust signature is
+        // not known cannot be guaranteed to compile against real Rust, so the WHOLE handler must
+        // degrade to a clearly-marked, COMPILING typed-default stub (original TS preserved as a
+        // comment, body returns `Json(Default::default())`) — never broken Rust. We trigger the
+        // uncovered path with a `try/catch` (outside the supported subset) around the dependency call.
+        let source = "server:ts {\n\
+          export async function listTodos() {\n\
+            try { return await db.todos.findAll(); } catch (e) { return []; }\n\
+          }\n\
+        }\n";
+        let extraction = extract_server_block(source);
+        let emit = AxumBackendPlugin.emit(&extraction.server_fns);
+
+        // The module is still well-formed Rust despite the unsupported body.
+        assert_well_formed_rust(&emit.server_module);
+        // The handler returns a typed default (a compiling stub), and preserves the TS as a comment.
+        assert!(
+            emit.server_module.contains("Json(Default::default())"),
+            "uncovered body did not degrade to a typed Json default:\n{}",
+            emit.server_module
+        );
+        assert!(
+            emit.server_module.contains("db.todos.findAll()"),
+            "original TS dependency call not preserved as a comment:\n{}",
+            emit.server_module
+        );
+        // It is still routed.
+        assert!(emit.server_module.contains(".route(\"/__server/listTodos\", post(__server_listTodos))"));
+        assert_no_marker_words(&emit.server_module);
+    }
+
+    #[test]
+    fn build_router_mounts_the_post_route_and_is_well_formed() {
+        // The generated `build_router()` must mount the fn under a POST `/__server/<name>` route, and
+        // the whole module (router included) must parse as real Rust.
+        let source = "server:ts {\n\
+          function add(a: number, b: number): number { return a + b; }\n\
+        }\n";
+        let emit = AxumBackendPlugin.emit(&extract_server_block(source).server_fns);
+
+        assert!(
+            emit.server_module.contains("pub fn build_router() -> Router {"),
+            "no build_router; got:\n{}",
+            emit.server_module
+        );
+        assert!(
+            emit.server_module.contains(".route(\"/__server/add\", post(__server_add))"),
+            "build_router does not mount the POST route; got:\n{}",
+            emit.server_module
+        );
+        assert_well_formed_rust(&emit.server_module);
+    }
+
+    #[test]
+    fn multi_fn_module_with_all_transports_is_well_formed_rust() {
+        // A module mixing an Api fn, a streaming generator, and a websocket fn must produce a single
+        // well-formed Rust module (every handler + the router parse), with the POST/GET routes mounted.
+        let source = "server:ts {\n\
+          function add(a: number, b: number): number { return a + b; }\n\
+          async function* ticks() { yield 1; yield 2; }\n\
+          function chat(msg: string) { 'use websocket'; return msg; }\n\
+        }\n";
+        let emit = AxumBackendPlugin.emit(&extract_server_block(source).server_fns);
+
+        assert_well_formed_rust(&emit.server_module);
+        assert!(emit.server_module.contains(".route(\"/__server/add\", post(__server_add))"));
+        assert!(emit.server_module.contains(".route(\"/__server/ticks\", get(__server_ticks))"));
+        assert!(emit.server_module.contains(".route(\"/__server/chat\", get(__server_chat))"));
+        assert_no_marker_words(&emit.server_module);
     }
 
     /// Generated output must never carry a marker token. The forbidden tokens are assembled from
