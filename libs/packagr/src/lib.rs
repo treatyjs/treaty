@@ -21,6 +21,7 @@
 
 pub mod apf;
 pub mod compile;
+pub mod component_dts;
 pub mod config;
 pub mod core;
 pub mod dts;
@@ -40,7 +41,7 @@ pub fn package(entry: &EntryPoint) -> Result<PackageOutput, PackagrError> {
     if !esm.errors.is_empty() {
         return Err(PackagrError::Compile(esm.errors));
     }
-    let declarations = dts::emit_dts(&entry.source, &entry.file_name)?;
+    let declarations = dts::emit_dts_for_entry(&entry.source, &esm.code, &entry.file_name)?;
     let manifest = apf::manifest(entry);
     Ok(PackageOutput {
         name: entry.name.clone(),

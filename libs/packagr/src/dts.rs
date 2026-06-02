@@ -8,10 +8,19 @@
 //! Compiled Ivy ESM (the output of a `.treaty` SFC or other authoring source)
 //! is *not* authored against isolated declarations — it is machine-generated
 //! JavaScript with un-annotated exports — so isolated declarations rejects it.
-//! For those entries we synthesize a faithful declaration from the compiled
-//! module's *export surface*: each export becomes a `declare`d binding (typed
-//! as the precise Angular type where derivable, else `unknown`). This keeps the
-//! published `.d.ts` resolvable by consumers without inventing types.
+//!
+//! The dominant such case is an **Angular component**: a Treaty/JSX/`.treaty`
+//! source lowers to a plain `function Button() { … }` with static `ɵfac`/`ɵcmp`
+//! fields. The function has no return type, so isolated declarations fails with
+//! `TS9007`. For these we reconstruct the *component class* `.d.ts` (typed
+//! signal inputs + `ɵfac`/`ɵcmp` declarations) from the emitted Ivy metadata —
+//! see [`crate::component_dts`] — exactly what `ngc`/`ng-packagr` would emit.
+//!
+//! For any other machine-generated module we synthesize a faithful declaration
+//! from the compiled module's *export surface*: each export becomes a `declare`d
+//! binding (typed as the precise Angular type where derivable, else `unknown`).
+//! This keeps the published `.d.ts` resolvable by consumers without inventing
+//! types.
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{Declaration, ModuleExportName, Statement};
@@ -20,6 +29,7 @@ use oxc_isolated_declarations::{IsolatedDeclarations, IsolatedDeclarationsOption
 use oxc_parser::Parser;
 use oxc_span::SourceType;
 
+use crate::component_dts;
 use crate::core::PackagrError;
 
 /// Emit the `.d.ts` source for a single entry.
@@ -39,23 +49,41 @@ pub fn emit_dts(source: &str, file_name: &str) -> Result<String, PackagrError> {
 
 /// Choose the right declaration input for an entry.
 ///
-/// Plain TypeScript-syntax sources (`.ts`/`.tsx`) are declared directly from
-/// their source via isolated declarations so explicit type annotations survive.
-/// Authoring SFCs (`.treaty`/`.tjsx`) — whose raw text is not TypeScript — are
-/// declared from their compiled Ivy ESM: isolated declarations is attempted
-/// first, and if it rejects the machine-generated output we fall back to
-/// synthesizing a declaration from the module's export surface.
+/// The selection is driven by the *compiled* output, not the source extension:
+///
+/// 1. If the compiled ESM is an Angular **component** (a lowered function with
+///    `ɵɵdefineComponent`), reconstruct its component-class `.d.ts` from the Ivy
+///    metadata. This is the path every Treaty/JSX/`.treaty` component takes; it
+///    sidesteps `TS9007` (the lowered function has no return-type annotation
+///    that isolated declarations would require).
+/// 2. Otherwise, plain TypeScript-syntax sources (`.ts`/`.tsx`) are declared
+///    directly from their source via isolated declarations so explicit type
+///    annotations survive (e.g. a `public-api.ts` of typed re-exports).
+/// 3. Otherwise (authoring SFCs whose raw text is not TypeScript, or anything
+///    isolated declarations rejects), synthesize a declaration from the compiled
+///    module's export surface.
 pub fn emit_dts_for_entry(
     source: &str,
     compiled: &str,
     file_name: &str,
 ) -> Result<String, PackagrError> {
+    // (1) Angular component → reconstruct the component class.
+    if let Some(dts) = component_dts::synthesize_component_dts(compiled) {
+        return Ok(dts);
+    }
+
     let lower = file_name.to_ascii_lowercase();
     let raw_is_typescript = lower.ends_with(".ts") || lower.ends_with(".tsx");
     if raw_is_typescript {
-        return emit_dts(source, file_name);
+        // (2) Typed TS source — declare it directly; fall back to the compiled
+        // export surface if isolated declarations rejects the raw source.
+        return match emit_dts(source, file_name) {
+            Ok(dts) => Ok(dts),
+            Err(_) => synthesize_dts_from_exports(compiled),
+        };
     }
 
+    // (3) Authoring SFC output that is not a component.
     match emit_dts_with_type(compiled, SourceType::default().with_typescript(true)) {
         Ok(dts) => Ok(dts),
         Err(_) => synthesize_dts_from_exports(compiled),
