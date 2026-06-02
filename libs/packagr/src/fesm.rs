@@ -236,8 +236,11 @@ fn collect_modules(
         }
 
         let source = std::fs::read_to_string(dep_path).ok()?;
-        let file_name = dep_path.file_name().and_then(|n| n.to_str()).unwrap_or("dep.ts");
-        let compiled = compile::compile_entry(&source, file_name);
+        // Compile the private dependency with its on-disk path known, so a `@Component` it
+        // declares with external `styleUrls`/`styleUrl` has those files resolved + preprocessed
+        // and folded into its scoped `styles: [...]` — exactly as a top-level entry would. For a
+        // dependency with no external styles this is byte-identical to the path-less compile.
+        let compiled = compile::compile_entry_at(&source, dep_path);
         if !compiled.errors.is_empty() {
             return None; // a dependency failed to compile — bail.
         }
@@ -757,18 +760,30 @@ fn resolve_private(
     let base = dir.join(spec);
 
     // Candidate resolutions, in extension precedence order, then `index.*`.
+    //
+    // Extensions are APPENDED to the full base path, never substituted: a
+    // specifier like `./button.component` (the standard Angular `.component` file
+    // stem) must resolve to `button.component.ts`, not `button.ts`. Using
+    // `Path::with_extension` would wrongly treat the `.component` segment as an
+    // extension and replace it. The base is therefore joined as a string with
+    // each `.{ext}` suffix.
     let mut candidates: Vec<PathBuf> = Vec::new();
-    if base.extension().is_some() && base.is_file() {
+    // 1. The base exactly as written, if the spec already carried a real file
+    //    extension that resolves on disk (`./button.component.ts`).
+    if base.is_file() {
         candidates.push(base.clone());
     }
+    // 2. `<base>.<ext>` for each source extension (`button.component` → `button.component.ts`).
+    let base_str = base.as_os_str().to_string_lossy().into_owned();
     for ext in RESOLVE_EXTENSIONS {
-        candidates.push(base.with_extension(ext));
+        candidates.push(PathBuf::from(format!("{base_str}.{ext}")));
     }
+    // 3. `<base>/index.<ext>` for a directory specifier.
     for ext in RESOLVE_EXTENSIONS {
         candidates.push(base.join(format!("index.{ext}")));
     }
 
-    let resolved = candidates.into_iter().find(|c| c.is_file())?;
+    let resolved = candidates.iter().find(|c| c.is_file())?.clone();
     let canonical = std::fs::canonicalize(&resolved).unwrap_or(resolved);
 
     // A relative import that points at another PUBLISHED entry point is left as

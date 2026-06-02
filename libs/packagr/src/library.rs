@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 
 use crate::apf;
 use crate::compile;
-use crate::config::{self, PackageConfig, ResolvedEntry};
+use crate::config::{self, CompilationMode, PackageConfig, ResolvedEntry};
 use crate::core::{DistEntry, DistManifest, PackagrError};
 use crate::dts;
 use crate::fesm;
@@ -63,6 +63,7 @@ fn resolve_name_version(package_dir: &Path, config: &PackageConfig) -> (String, 
 fn build_entry(
     entry: &ResolvedEntry,
     entry_source_set: &HashSet<PathBuf>,
+    mode: CompilationMode,
 ) -> Result<DistEntry, PackagrError> {
     let source = std::fs::read_to_string(&entry.source_path).map_err(PackagrError::from)?;
     let file_name = entry
@@ -71,42 +72,171 @@ fn build_entry(
         .and_then(|n| n.to_str())
         .unwrap_or("index.ts");
 
-    let esm = compile::compile_entry(&source, file_name);
+    // Compile with the entry's on-disk path known, so a `@Component` declaring
+    // external `styleUrls`/`styleUrl` has those files resolved + preprocessed
+    // (SCSS/Sass) and folded into its scoped `styles: [...]` — exactly ng-packagr's
+    // pre-`ngc` step. For authoring sources and inline-only-style entries this is
+    // byte-identical to `compile_entry`.
+    let esm = compile::compile_entry_at(&source, &entry.source_path);
     if !esm.errors.is_empty() {
         return Err(PackagrError::Compile(esm.errors));
     }
+    // The `.d.ts` is derived from the AOT compile and is IDENTICAL regardless of
+    // compilation mode (the declared type surface does not change between full and
+    // partial emit), so it is always derived from the AOT `esm.code`.
     let declarations = dts::emit_dts_for_entry(&source, &esm.code, file_name)?;
 
     // Flatten the entry's own internal modules into one FESM module. For a
     // single-file entry this is a byte-for-byte identity.
     let flat_esm = fesm::flatten_entry_esm(&esm.code, &entry.source_path, entry_source_set);
 
+    // PARTIAL compilation mode: rewrite the flattened AOT module's DI/pipe-family
+    // `ɵɵdefine*` definitions to their `ɵɵngDeclare*` partial form (the Angular-CLI
+    // library publish format). Mode-gated — `Full` (the default) returns the AOT
+    // module unchanged, byte-for-byte. The partial form round-trips back to the AOT
+    // form through the Angular linker (verified in `treaty_ivy::partial_emit`).
+    let esm_out = match mode {
+        CompilationMode::Full => flat_esm,
+        CompilationMode::Partial => treaty_ivy::emit_partial(&flat_esm).code,
+    };
+
     Ok(DistEntry {
         sub_path: entry.sub_path.clone(),
         dir: apf::dir_for_sub_path(&entry.sub_path),
-        esm: flat_esm,
+        esm: esm_out,
         declarations,
     })
 }
 
-/// Resolve the assets named in `config` to their copyable file names.
+/// One resolved asset to copy into the dist root: its destination path relative
+/// to `dest` (preserving the glob-matched directory structure) and its raw bytes
+/// (binary-safe, so `.svg`/`.png`/font assets copy verbatim).
+#[derive(Debug, Clone)]
+pub struct CollectedAsset {
+    /// The path under the dist root to write to (e.g. `assets/icons/x.svg`).
+    pub rel_path: String,
+    /// The file's raw bytes.
+    pub bytes: Vec<u8>,
+}
+
+/// Resolve the assets declared in `config` to their copyable bytes + dist paths.
 ///
-/// Assets are resolved relative to `package_dir`; missing assets are skipped
-/// rather than failing the build (matching ng-packagr's lenient copy step).
-fn collect_assets(package_dir: &Path, config: &PackageConfig) -> Vec<(String, String)> {
-    let mut out = Vec::new();
+/// Each `assets` entry is resolved relative to `package_dir`. A plain path
+/// (`README.md`) copies that one file to the dist root by its file name. A GLOB
+/// pattern (`assets/**/*.{svg,png}`) is expanded against the package root and each
+/// match copies into the dist preserving its path RELATIVE to the glob's
+/// non-wildcard base directory — so `assets/icons/x.svg` lands at
+/// `<dest>/assets/icons/x.svg` (ng-packagr's asset-copy behaviour). The configured
+/// `readmeFile`/`licenseFile` (or, when unset, an implicit root `README.md` /
+/// `LICENSE*`) are appended.
+///
+/// Missing assets / non-matching globs are skipped rather than failing the build
+/// (matching ng-packagr's lenient copy step). Assets are read as raw bytes so
+/// binary files copy verbatim.
+fn collect_assets(package_dir: &Path, config: &PackageConfig) -> Vec<CollectedAsset> {
+    let mut out: Vec<CollectedAsset> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    let mut push = |rel_path: String, bytes: Vec<u8>, out: &mut Vec<CollectedAsset>, seen: &mut HashSet<String>| {
+        if seen.insert(rel_path.clone()) {
+            out.push(CollectedAsset { rel_path, bytes });
+        }
+    };
+
     for asset in &config.assets {
-        let src = package_dir.join(asset);
-        if let Ok(contents) = std::fs::read_to_string(&src) {
-            let file_name = Path::new(asset)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(asset)
-                .to_string();
-            out.push((file_name, contents));
+        if is_glob(asset) {
+            // Expand the glob against the package root; preserve each match's path
+            // relative to the glob's literal base directory.
+            let base = glob_base_dir(asset);
+            let pattern = package_dir.join(asset);
+            let Some(pattern_str) = pattern.to_str() else { continue };
+            if let Ok(paths) = glob::glob(pattern_str) {
+                for entry in paths.flatten() {
+                    if !entry.is_file() {
+                        continue;
+                    }
+                    let Ok(bytes) = std::fs::read(&entry) else { continue };
+                    // The path relative to the package root, keeping the glob's
+                    // base directory prefix (`assets/...`).
+                    let rel = entry
+                        .strip_prefix(package_dir)
+                        .ok()
+                        .and_then(|p| p.to_str())
+                        .map(|s| s.replace('\\', "/"))
+                        .unwrap_or_else(|| {
+                            // Fallback: base dir + file name.
+                            let fname = entry.file_name().and_then(|n| n.to_str()).unwrap_or("asset");
+                            if base.is_empty() {
+                                fname.to_string()
+                            } else {
+                                format!("{base}/{fname}")
+                            }
+                        });
+                    push(rel, bytes, &mut out, &mut seen);
+                }
+            }
+        } else {
+            let src = package_dir.join(asset);
+            if let Ok(bytes) = std::fs::read(&src) {
+                // A plain asset copies to the dist root by its file name.
+                let file_name = Path::new(asset)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(asset)
+                    .to_string();
+                push(file_name, bytes, &mut out, &mut seen);
+            }
         }
     }
+
+    // README + LICENSE auto-copy. An explicit `readmeFile`/`licenseFile` wins;
+    // otherwise fall back to the conventional root files if present.
+    for (explicit, fallbacks) in [
+        (&config.readme_file, &["README.md", "README"][..]),
+        (
+            &config.license_file,
+            &["LICENSE", "LICENSE.md", "LICENSE.txt"][..],
+        ),
+    ] {
+        if let Some(explicit) = explicit {
+            if let Ok(bytes) = std::fs::read(package_dir.join(explicit)) {
+                let name = Path::new(explicit)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(explicit)
+                    .to_string();
+                push(name, bytes, &mut out, &mut seen);
+            }
+        } else {
+            for candidate in fallbacks {
+                if let Ok(bytes) = std::fs::read(package_dir.join(candidate)) {
+                    push(candidate.to_string(), bytes, &mut out, &mut seen);
+                    break;
+                }
+            }
+        }
+    }
+
     out
+}
+
+/// Whether an asset entry is a glob pattern (carries a `*`, `?`, `[`, or `{`).
+fn is_glob(s: &str) -> bool {
+    s.contains('*') || s.contains('?') || s.contains('[') || s.contains('{')
+}
+
+/// The literal (non-wildcard) leading directory of a glob pattern, with forward
+/// slashes (`assets/**/*.svg` → `assets`). Used to preserve match structure.
+fn glob_base_dir(pattern: &str) -> String {
+    let normalized = pattern.replace('\\', "/");
+    let mut base = Vec::new();
+    for seg in normalized.split('/') {
+        if is_glob(seg) {
+            break;
+        }
+        base.push(seg);
+    }
+    base.join("/")
 }
 
 /// Package the library rooted at `package_dir` described by `config`.
@@ -129,16 +259,17 @@ pub fn package_library(
         resolved.iter().map(|e| e.source_path.clone()).collect();
     let entry_source_set = fesm::canonical_entry_set(&entry_source_paths);
 
+    let mode = config.compilation_mode();
     let mut entries = Vec::with_capacity(resolved.len());
     for entry in &resolved {
-        entries.push(build_entry(entry, &entry_source_set)?);
+        entries.push(build_entry(entry, &entry_source_set, mode)?);
     }
 
     let sub_paths: Vec<String> = entries.iter().map(|e| e.sub_path.clone()).collect();
     let manifest = apf::package_manifest_json(&name, &version, &sub_paths);
 
     let assets = collect_assets(package_dir, config);
-    let asset_names = assets.iter().map(|(n, _)| n.clone()).collect();
+    let asset_names = assets.iter().map(|a| a.rel_path.clone()).collect();
 
     Ok(DistManifest {
         name,
@@ -175,8 +306,13 @@ pub fn build_to_disk(
     let dist = package_library(package_dir, config)?;
     let dest = package_dir.join(config.dest());
     dist.write_to(&dest)?;
-    for (file_name, contents) in collect_assets(package_dir, config) {
-        std::fs::write(dest.join(file_name), contents).map_err(PackagrError::from)?;
+    for asset in collect_assets(package_dir, config) {
+        // The dest path may carry a glob-preserved sub-directory; create it.
+        let target = dest.join(&asset.rel_path);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).map_err(PackagrError::from)?;
+        }
+        std::fs::write(&target, &asset.bytes).map_err(PackagrError::from)?;
     }
     Ok(dist)
 }
@@ -328,5 +464,178 @@ mod tests {
         assert!(dist.manifest.contains("\"./testing\""));
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn glob_assets_and_readme_license_auto_copy() {
+        let root = scratch("assets_glob");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("treaty-package.json"),
+            r#"{ "name": "@acme/assets", "dest": "dist", "assets": ["assets/**/*.svg"] }"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("src/public-api.ts"), "export const A: number = 1;").unwrap();
+
+        // A nested glob-matched binary-ish asset.
+        std::fs::create_dir_all(root.join("assets/icons")).unwrap();
+        std::fs::write(root.join("assets/icons/star.svg"), "<svg></svg>").unwrap();
+        std::fs::write(root.join("assets/logo.svg"), "<svg/>").unwrap();
+        // A non-matching file is NOT copied.
+        std::fs::write(root.join("assets/notes.txt"), "ignore me").unwrap();
+        // Implicit README + LICENSE auto-copy (no explicit `assets`/`readmeFile` entry).
+        std::fs::write(root.join("README.md"), "# readme").unwrap();
+        std::fs::write(root.join("LICENSE"), "MIT").unwrap();
+
+        let cfg = PackageConfig::from_json(
+            &std::fs::read_to_string(root.join("treaty-package.json")).unwrap(),
+        )
+        .unwrap();
+        let dist = build_to_disk(&root, &cfg).expect("build should succeed");
+
+        let dest = root.join("dist");
+        // The glob matches preserve their directory structure under the dist root.
+        assert!(dest.join("assets/icons/star.svg").is_file(), "nested glob asset not copied");
+        assert!(dest.join("assets/logo.svg").is_file(), "top glob asset not copied");
+        assert!(!dest.join("assets/notes.txt").exists(), "non-matching file copied");
+        // README + LICENSE auto-copied to the dist root.
+        assert!(dest.join("README.md").is_file(), "README not auto-copied");
+        assert!(dest.join("LICENSE").is_file(), "LICENSE not auto-copied");
+
+        // The asset name list records every copied path (glob-relative + readme/license).
+        assert!(dist.assets.iter().any(|a| a == "assets/icons/star.svg"));
+        assert!(dist.assets.iter().any(|a| a == "README.md"));
+        assert!(dist.assets.iter().any(|a| a == "LICENSE"));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn partial_compilation_mode_emits_ng_declare_and_round_trips() {
+        let root = scratch("partial_mode");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("treaty-package.json"),
+            r#"{ "name": "@acme/pipes", "version": "1.0.0", "dest": "dist",
+                 "compilationMode": "partial",
+                 "lib": { "entryFile": "src/public-api.ts" } }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/public-api.ts"),
+            "import { Pipe } from '@angular/core';\n\
+             @Pipe({ name: 'shout', standalone: true })\n\
+             export class ShoutPipe { transform(v: string): string { return v.toUpperCase(); } }\n",
+        )
+        .unwrap();
+
+        let cfg = PackageConfig::from_json(
+            &std::fs::read_to_string(root.join("treaty-package.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cfg.compilation_mode(), CompilationMode::Partial);
+
+        let dist = package_library(&root, &cfg).expect("partial build should succeed");
+        let primary = &dist.entries[0];
+
+        // The published ESM is in PARTIAL format: ɵɵngDeclare*, no AOT ɵɵdefine*.
+        assert!(
+            primary.esm.contains("\u{0275}\u{0275}ngDeclarePipe"),
+            "partial mode must emit ɵɵngDeclarePipe; got:\n{}",
+            primary.esm
+        );
+        assert!(
+            primary.esm.contains("\u{0275}\u{0275}ngDeclareFactory"),
+            "partial mode must emit ɵɵngDeclareFactory; got:\n{}",
+            primary.esm
+        );
+        assert!(
+            !primary.esm.contains("\u{0275}\u{0275}definePipe"),
+            "partial mode must NOT emit AOT ɵɵdefinePipe; got:\n{}",
+            primary.esm
+        );
+
+        // ROUND-TRIP: the published partial module must link back through the
+        // Angular linker to a valid AOT module carrying the ɵɵdefinePipe. Treaty's
+        // emitted module is TypeScript-flavoured ESM (it does not strip type
+        // annotations — that is a downstream bundler concern), so link it under a
+        // `.ts` name to parse those annotations, exactly as the bundler-integrated
+        // linker sees post-transpile source.
+        let relinked = treaty_ivy::link_partial(&primary.esm, "index.ts");
+        assert!(relinked.errors.is_empty(), "relink errors: {:?}", relinked.errors);
+        assert!(
+            relinked.code.contains("\u{0275}\u{0275}definePipe"),
+            "linker must restore ɵɵdefinePipe from the partial form; got:\n{}",
+            relinked.code
+        );
+        assert!(
+            !relinked.code.contains("\u{0275}\u{0275}ngDeclare"),
+            "no ɵɵngDeclare may survive linking; got:\n{}",
+            relinked.code
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn full_mode_is_default_and_unchanged_by_partial_plumbing() {
+        // A library with NO compilationMode (or "full") emits the AOT ɵɵdefine* form,
+        // byte-identical to before the partial-mode plumbing.
+        let root = scratch("full_default");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("treaty-package.json"),
+            r#"{ "name": "@acme/pipes", "version": "1.0.0", "dest": "dist",
+                 "lib": { "entryFile": "src/public-api.ts" } }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/public-api.ts"),
+            "import { Pipe } from '@angular/core';\n\
+             @Pipe({ name: 'shout', standalone: true })\n\
+             export class ShoutPipe { transform(v: string): string { return v; } }\n",
+        )
+        .unwrap();
+
+        let cfg = PackageConfig::from_json(
+            &std::fs::read_to_string(root.join("treaty-package.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cfg.compilation_mode(), CompilationMode::Full);
+        let dist = package_library(&root, &cfg).unwrap();
+        let primary = &dist.entries[0];
+        assert!(primary.esm.contains("\u{0275}\u{0275}definePipe"), "full mode must emit AOT define");
+        assert!(!primary.esm.contains("\u{0275}\u{0275}ngDeclare"), "full mode must NOT emit ngDeclare");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn parses_full_ng_package_json_fields() {
+        // A full ng-package.json with fields packagr accepts for compatibility must parse.
+        let cfg = PackageConfig::from_json(
+            r#"{
+                "$schema": "./node_modules/ng-packagr/ng-package.schema.json",
+                "dest": "../dist/lib",
+                "lib": {
+                    "entryFile": "src/public-api.ts",
+                    "flatModuleFile": "my-lib",
+                    "umdModuleIds": { "lodash": "_" },
+                    "cssUrl": "inline",
+                    "styleIncludePaths": ["src/styles"]
+                },
+                "assets": ["README.md", "assets/**/*.svg"],
+                "inlineStyleLanguage": "scss",
+                "allowedNonPeerDependencies": ["tslib"],
+                "keepLifecycleScripts": true
+            }"#,
+        )
+        .expect("full ng-package.json should parse");
+        assert_eq!(cfg.entry_file(), "src/public-api.ts");
+        assert_eq!(cfg.dest(), "../dist/lib");
+        assert_eq!(cfg.lib.flat_module_file.as_deref(), Some("my-lib"));
+        assert_eq!(cfg.inline_style_language.as_deref(), Some("scss"));
+        assert_eq!(cfg.allowed_non_peer_dependencies, vec!["tslib".to_string()]);
+        // An unrecognised top-level key (`keepLifecycleScripts`) is ignored, not an error.
     }
 }

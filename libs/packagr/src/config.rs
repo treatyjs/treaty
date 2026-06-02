@@ -31,6 +31,27 @@ pub struct LibConfig {
     /// `src/public-api.ts`. Defaults to `src/public-api.ts` when omitted.
     #[serde(rename = "entryFile", default)]
     pub entry_file: Option<String>,
+    /// ng-packagr's `lib.flatModuleFile` — the base name for the flattened module
+    /// file (the FESM bundle name hint). Parsed for drop-in ng-package.json
+    /// compatibility; packagr's per-entry layout names every entry `index.mjs`, so
+    /// this currently only affects nothing emitted, but accepting it lets an
+    /// existing `ng-package.json` parse unchanged.
+    #[serde(rename = "flatModuleFile", default)]
+    pub flat_module_file: Option<String>,
+    /// ng-packagr's `lib.umdModuleIds` — external UMD module id overrides. Accepted
+    /// for ng-package.json compatibility (UMD output is legacy and not emitted).
+    #[serde(rename = "umdModuleIds", default)]
+    pub umd_module_ids: Option<serde_json::Value>,
+    /// ng-packagr's `lib.cssUrl` — how `url()`s in component styles are handled
+    /// (`inline` / `none`). Accepted for compatibility; component styles are
+    /// folded as-is.
+    #[serde(rename = "cssUrl", default)]
+    pub css_url: Option<String>,
+    /// ng-packagr's `lib.styleIncludePaths` — extra SCSS/Less include directories.
+    /// Accepted for compatibility; resolution of `@import`/`@use` include paths is
+    /// a future stylesheet enhancement.
+    #[serde(rename = "styleIncludePaths", default)]
+    pub style_include_paths: Vec<String>,
 }
 
 /// An explicitly-listed secondary entry point.
@@ -66,9 +87,57 @@ pub struct PackageConfig {
     /// discovered on disk).
     #[serde(rename = "secondaryEntryPoints", default)]
     pub secondary_entry_points: Vec<SecondaryEntryConfig>,
-    /// Asset globs/paths to copy verbatim into `dest` (e.g. `README.md`).
+    /// Asset globs/paths to copy verbatim into `dest` (e.g. `README.md`,
+    /// `assets/**/*.svg`). Glob patterns are expanded against the package root.
     #[serde(default)]
     pub assets: Vec<String>,
+    /// The stylesheet preprocessor language for INLINE `styles: [...]` blocks
+    /// (ng-packagr's `inlineStyleLanguage`: `css` | `scss` | `sass` | `less`).
+    /// Accepted for compatibility; inline styles are currently treated as CSS.
+    #[serde(rename = "inlineStyleLanguage", default)]
+    pub inline_style_language: Option<String>,
+    /// ng-packagr's `allowedNonPeerDependencies` /
+    /// `whitelistedNonPeerDependencies` — package names allowed in `dependencies`
+    /// without being peers. Accepted for ng-package.json compatibility (packagr
+    /// does not rewrite `dependencies`).
+    #[serde(
+        rename = "allowedNonPeerDependencies",
+        alias = "whitelistedNonPeerDependencies",
+        default
+    )]
+    pub allowed_non_peer_dependencies: Vec<String>,
+    /// ng-packagr's `assets` sibling `keepLifecycleScripts` / `enableIvy` etc. are
+    /// not modelled individually; any unrecognised descriptor key is ignored
+    /// (serde drops unknown fields), so an existing `ng-package.json` parses.
+    ///
+    /// An explicit README file to copy into the dist root. When omitted, a
+    /// `README.md` at the package root is auto-copied if present (ng-packagr's
+    /// implicit readme behaviour).
+    #[serde(rename = "readmeFile", default)]
+    pub readme_file: Option<String>,
+    /// An explicit LICENSE file to copy into the dist root. When omitted, a
+    /// `LICENSE` (or `LICENSE.md`/`LICENSE.txt`) at the package root is auto-copied
+    /// if present.
+    #[serde(rename = "licenseFile", default)]
+    pub license_file: Option<String>,
+    /// The Angular `compilationMode` for the published output: `"full"` (the
+    /// default — AOT `ɵɵdefine*`) or `"partial"` (`ɵɵngDeclare*`, the format the
+    /// Angular CLI publishes libraries in so the app build's linker can re-target
+    /// them). Drives whether packagr runs the partial-declaration emitter over the
+    /// compiled output (see [`crate::compile`]). Unrecognised values are treated as
+    /// `"full"`.
+    #[serde(rename = "compilationMode", default)]
+    pub compilation_mode: Option<String>,
+}
+
+/// The compilation mode for the published output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CompilationMode {
+    /// AOT `ɵɵdefine*` definitions (the default).
+    #[default]
+    Full,
+    /// `ɵɵngDeclare*` partial declarations (the Angular-CLI library publish format).
+    Partial,
 }
 
 impl PackageConfig {
@@ -89,6 +158,21 @@ impl PackageConfig {
     /// The resolved output directory, defaulting to `dist`.
     pub fn dest(&self) -> &str {
         self.dest.as_deref().unwrap_or("dist")
+    }
+
+    /// The resolved compilation mode. `"partial"` (case-insensitive) selects the
+    /// `ɵɵngDeclare*` partial-declaration emit; `"experimental-local"` (Angular's
+    /// per-file/local AOT mode) maps to `Full` because treaty_ivy's source
+    /// front-end is ALREADY per-file/local — it compiles each file independently
+    /// without a whole-program graph, so its AOT `ɵɵdefine*` output is the
+    /// local-mode shape; anything else (including the default) is full AOT
+    /// `ɵɵdefine*`. (Angular defines no `"optimized"` compilation mode.)
+    pub fn compilation_mode(&self) -> CompilationMode {
+        match self.compilation_mode.as_deref() {
+            Some(m) if m.eq_ignore_ascii_case("partial") => CompilationMode::Partial,
+            // `full`, `experimental-local`, and any unrecognised value → full AOT.
+            _ => CompilationMode::Full,
+        }
     }
 }
 

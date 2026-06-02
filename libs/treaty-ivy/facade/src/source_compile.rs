@@ -1522,6 +1522,39 @@ pub fn compile_component_source_with_map_and_selector(
     source_name: &str,
     default_selector: Option<&str>,
 ) -> CompiledComponentWithMap {
+    compile_component_source_full(ts_source, file_name, source_name, default_selector, None)
+}
+
+/// Like [`compile_component_source_with_map_and_selector`] but ALSO supplying the
+/// host-resolved external `templateUrl`/`styleUrls`/`styleUrl` content per component class.
+///
+/// This is the entry the base-Angular `.ts` authoring path uses when a component declares
+/// external stylesheets the host (packagr / a bundler plugin) has already read + preprocessed:
+/// it keeps the SAME default-selector + additive-source-map behaviour as
+/// [`compile_component_source_with_map_and_selector`], and additionally folds the resolved
+/// styles into the component's (scoped) `styles: [...]`. With `resolved == None` (or no entry for
+/// a given class) the emit is byte-identical to
+/// [`compile_component_source_with_map_and_selector`], so the existing inline-only path is
+/// untouched.
+pub fn compile_component_source_with_map_selector_and_resolved(
+    ts_source: &str,
+    file_name: &str,
+    source_name: &str,
+    default_selector: Option<&str>,
+    resolved: Option<&ResolvedContentMap>,
+) -> CompiledComponentWithMap {
+    compile_component_source_full(ts_source, file_name, source_name, default_selector, resolved)
+}
+
+/// The shared body of the map-emitting source compile entries: parse, thread the
+/// optional default selector + host-resolved content, and emit with an additive v3 map.
+fn compile_component_source_full(
+    ts_source: &str,
+    file_name: &str,
+    source_name: &str,
+    default_selector: Option<&str>,
+    resolved: Option<&ResolvedContentMap>,
+) -> CompiledComponentWithMap {
     let allocator = Allocator::default();
     let source_type = SourceType::default().with_typescript(true);
     let ret = Parser::new(&allocator, ts_source, source_type).parse();
@@ -1546,7 +1579,7 @@ pub fn compile_component_source_with_map_and_selector(
         &ret.program,
         Some(ts_source),
         Some((&ctx, &mut map_out)),
-        None,
+        resolved,
         default_selector,
         false,
         ModernizeOptions::default(),

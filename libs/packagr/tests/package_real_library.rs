@@ -328,8 +328,15 @@ fn packages_a_real_multi_frontend_library_end_to_end() {
         assert_eq!(cond["import"], format!("./{sub}/index.mjs"));
         assert_eq!(cond["default"], format!("./{sub}/index.mjs"));
     }
-    // The exports map covers exactly the five entries (primary + 4 secondary).
-    assert_eq!(exports.len(), 5, "exports map: {exports:?}");
+    // The exports map covers exactly the five entries (primary + 4 secondary)
+    // plus the `./package.json` self-export every APF package advertises (so a
+    // consumer can resolve `<pkg>/package.json` under the `exports` gate) — six
+    // keys total.
+    assert_eq!(exports.len(), 6, "exports map: {exports:?}");
+    assert_eq!(
+        exports["./package.json"]["default"], "./package.json",
+        "APF requires a ./package.json self-export"
+    );
 
     // The README asset was copied verbatim into the dist root.
     assert!(destdir.join("README.md").is_file(), "README asset not copied");

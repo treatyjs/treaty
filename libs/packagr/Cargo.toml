@@ -21,3 +21,8 @@ oxc_isolated_declarations = "0.133.0"
 oxc_codegen = "0.133.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Pure-Rust Sass/SCSS compiler for component `styleUrls` preprocessing (the
+# ng-packagr `stylesheetExtension: "scss"` path). No JS / dart-sass dependency.
+grass = { version = "0.13", default-features = false }
+# Glob expansion for asset patterns (`assets/**/*.{svg,png}`).
+glob = "0.3"

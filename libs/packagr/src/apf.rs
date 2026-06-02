@@ -17,6 +17,32 @@ use serde::Serialize;
 
 use crate::core::EntryPoint;
 
+/// One `exports` map value. Either a full entry-point condition set
+/// ([`ExportConditions`]) or the bare `./package.json` self-export
+/// (`{ "default": "./package.json" }`), which APF/Node tooling expects so a
+/// consumer can `import '<pkg>/package.json'`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum ExportEntry {
+    /// A normal entry point's condition set.
+    Conditions(ExportConditions),
+    /// A bare single-condition export (the `./package.json` self-export).
+    Single {
+        default: String,
+    },
+}
+
+impl ExportEntry {
+    /// The full entry-point condition set, if this is one (not the bare
+    /// `./package.json` self-export). Convenience accessor for callers/tests.
+    pub fn conditions(&self) -> Option<&ExportConditions> {
+        match self {
+            ExportEntry::Conditions(c) => Some(c),
+            ExportEntry::Single { .. } => None,
+        }
+    }
+}
+
 /// The `exports` conditions for a single entry sub-path.
 ///
 /// `types` is emitted first so resolvers that honour condition order pick up
@@ -59,8 +85,9 @@ pub struct ApfManifest {
     pub types: String,
     #[serde(rename = "sideEffects")]
     pub side_effects: bool,
-    /// The `package.json#exports` subpath map.
-    pub exports: BTreeMap<String, ExportConditions>,
+    /// The `package.json#exports` subpath map. Carries each entry point's
+    /// condition set plus the `./package.json` self-export.
+    pub exports: BTreeMap<String, ExportEntry>,
 }
 
 /// The relative directory (under the package root) for a published sub-path.
@@ -86,12 +113,21 @@ pub fn package_manifest(name: &str, version: &str, sub_paths: &[String]) -> ApfM
     for sub in sub_paths {
         let key = export_key(sub);
         let dir = dir_for_sub_path(sub);
-        exports.insert(key, ExportConditions::for_dir(&dir));
+        exports.insert(key, ExportEntry::Conditions(ExportConditions::for_dir(&dir)));
     }
     // Guarantee the primary export is always present.
     exports
         .entry(".".to_string())
-        .or_insert_with(|| ExportConditions::for_dir("."));
+        .or_insert_with(|| ExportEntry::Conditions(ExportConditions::for_dir(".")));
+
+    // The `./package.json` self-export — APF/Node tooling (and ng-packagr) emit it
+    // so a consumer can resolve `<pkg>/package.json` under the `exports` gate.
+    exports.insert(
+        "./package.json".to_string(),
+        ExportEntry::Single {
+            default: "./package.json".to_string(),
+        },
+    );
 
     ApfManifest {
         name: name.to_string(),
@@ -144,15 +180,21 @@ mod tests {
             package_manifest("@acme/widgets", "1.2.3", &["".into(), "testing".into()]);
 
         // Primary export under ".".
-        let primary = &manifest.exports["."];
+        let primary = manifest.exports["."].conditions().expect("primary conditions");
         assert_eq!(primary.types, "./index.d.ts");
         assert_eq!(primary.import, "./index.mjs");
         assert_eq!(primary.default, "./index.mjs");
 
         // Secondary export under "./testing".
-        let testing = &manifest.exports["./testing"];
+        let testing = manifest.exports["./testing"].conditions().expect("testing conditions");
         assert_eq!(testing.types, "./testing/index.d.ts");
         assert_eq!(testing.import, "./testing/index.mjs");
+
+        // The `./package.json` self-export is always present.
+        match &manifest.exports["./package.json"] {
+            ExportEntry::Single { default } => assert_eq!(default, "./package.json"),
+            other => panic!("expected ./package.json self-export, got {other:?}"),
+        }
 
         // APF legacy + flags.
         assert_eq!(manifest.module_type, "module");

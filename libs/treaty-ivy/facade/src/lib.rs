@@ -131,3 +131,11 @@ pub mod source_compile;
 pub mod linker;
 
 pub use linker::link_partial;
+
+/// The Angular **partial-declaration emitter** — the INVERSE of [`linker`]: rewrite an AOT
+/// `ɵɵdefine*({...})` module into the `ɵɵngDeclare*({...})` partial form a library publishes with
+/// `compilationMode: "partial"`. Mode-gated: the AOT default path never calls it, so the default
+/// emit is byte-unchanged. The DI/pipe family round-trips exactly back through [`linker`].
+pub mod partial_emit;
+
+pub use partial_emit::{emit_partial, PartialEmit};

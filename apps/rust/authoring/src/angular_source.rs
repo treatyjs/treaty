@@ -9,7 +9,10 @@ use oxc_allocator::Allocator;
 use oxc_ast::ast::{Class, Decorator, Expression, Statement};
 use oxc_parser::Parser;
 use oxc_span::SourceType;
-use treaty_ivy::source_compile::compile_component_source_with_map_and_selector;
+use treaty_ivy::source_compile::{
+    compile_component_source_with_map_and_selector,
+    compile_component_source_with_map_selector_and_resolved, ResolvedContentMap,
+};
 
 use crate::plugin::{extract_server_block, rewrite_call_sites, PluginRegistry};
 use crate::sfc::to_multi_selector;
@@ -322,6 +325,50 @@ pub fn compile_angular_source(source: &str, file_name: &str) -> CompiledAuthorin
         errors: Vec::new(),
         map: None,
     }
+}
+
+/// Like [`compile_angular_source`] but threading host-resolved external
+/// `templateUrl`/`styleUrls`/`styleUrl` content (already read + preprocessed by the host —
+/// e.g. `treaty_packagr`) into the compile, so a `@Component`/`@Directive` that declares
+/// external stylesheets emits the SAME scoped `styles: [...]` it would for inline `styles`.
+///
+/// With `resolved` empty (no class has external content) this is BYTE-IDENTICAL to
+/// [`compile_angular_source`] — it routes through the SAME default-selector + map path and only
+/// passes the resolution channel through. It deliberately does NOT thread the resolution channel
+/// through the `server { … }`-block component path (a server-colocated component is an app concern,
+/// not a library one); such a component falls back to the unresolved server-aware path.
+pub fn compile_angular_source_with_resolved(
+    source: &str,
+    file_name: &str,
+    resolved: &ResolvedContentMap,
+) -> CompiledAuthoring {
+    let extraction = extract_server_block(source);
+    let kinds = detect_angular_decorators(&extraction.client_source);
+
+    // A component (or directive) with NO server block: route through the resolution-aware compile
+    // so external stylesheets fold into the scoped `styles: [...]`. A `@Component` colocating a
+    // `server { … }` block is out of scope for the resolution channel; defer to the server-aware
+    // path (which threads no resolved styles — acceptable, libraries don't ship server blocks).
+    if !kinds.is_empty() && extraction.server_fns.is_empty() {
+        let default_selector = to_multi_selector(file_name);
+        let compiled = compile_component_source_with_map_selector_and_resolved(
+            source,
+            GENERATED_NAME,
+            SOURCE_NAME,
+            Some(&default_selector),
+            Some(resolved),
+        );
+        return CompiledAuthoring {
+            code: compiled.code,
+            server_module: None,
+            errors: compiled.errors,
+            map: map_or_none(compiled.map),
+        };
+    }
+
+    // Server-block component, or a plain/server-only `.ts` module: the resolution channel does not
+    // apply — fall back to the standard path (byte-identical to the no-resolved case).
+    compile_angular_source(source, file_name)
 }
 
 /// Emit a server module + a client stub for a plain (non-Angular) `.ts` module whose top-level

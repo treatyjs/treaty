@@ -30,8 +30,9 @@ pub mod core;
 pub mod dts;
 pub mod fesm;
 pub mod library;
+pub mod stylesheet;
 
-pub use config::{PackageConfig, ResolvedEntry, SecondaryEntryConfig};
+pub use config::{CompilationMode, PackageConfig, ResolvedEntry, SecondaryEntryConfig};
 pub use core::{DistEntry, DistManifest, EntryPoint, PackageOutput, PackagrError};
 pub use library::{build_to_disk, package_library, package_library_at};
 
