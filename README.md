@@ -5,7 +5,7 @@ Angular **directly to Ivy** in Rust (no `tsc`, no `@angular/compiler` at runtime
 ships its own Node-compatible runtime, and lets you author with `.treaty` SFCs or
 JSX-flavored Angular — signals by default.
 
-> Branch: `migration/v22-oxc133` · OXC 0.133 · Angular 22 targets.
+> Branch: `migration/v22-oxc133` · OXC 0.133 · Angular **22.0.0-rc.3** (re-pin to `22.0.0` when it ships) · TypeScript 6.0.
 > Detailed state: [`migration/STATUS.md`](migration/STATUS.md).
 
 ## Features
@@ -23,10 +23,11 @@ JSX-flavored Angular — signals by default.
 | File-based routing | `treaty_file_routing` crate + CLI; build-time `virtual:treaty-routes` module (no prebuilt `routes.ts`) across vite/rspack/rsbuild | ✅ (`examples/file-routed-app`) |
 | Server functions | Inline by default (`server{}` / file-level `'use server'` / `$$` / `use websocket`); bodies extracted to the backend and stripped from client code **and** the source map; run in dev over `/__server/*`. Backend-agnostic (axum default, Elysia opt-in). **Production**: generates real axum Api (`Json<Req>`→`Json<Resp>`) + SSE (`Sse<Stream>`) + WebSocket handlers + a runnable host (`build_router()` + `main.rs`) — verified by a real `cargo build` against axum | ✅ dev + production hosting (Api/SSE/WS) |
 | Runtime | Node-compatible Nova runtime, module-granular `node:` builtins, real `node:tls`/`node:https` over rustls (ring), offline-clean | ✅ 483 tests; conformance 51/0 + corpus 68/0 |
-| SSR / SSG | Server render + static generation cores (Rust-first deterministic logic) | 🏗️ |
+| SSG (static generation) | Rust-first `treaty_ssg` core: route discovery → static Ivy-template interpret → hydration-ready document + per-route hydration manifest + `sitemap.xml`/`robots.txt` (Nova prerender execution injected) | ✅ core (`libs/ssg-core`) |
+| SSR (request-time render) | Live server render over the same interpreter | 🏗️ |
 | Source maps | v3 maps (Ivy JS ↔ authoring source) threaded through addon + bundler plugins; server-fn bodies excluded | ✅ |
 | Bundler / NAPI | `compileComponent`, `compileComponentSource`, `compileTreatyFile`, `compile`, `compileMany`, `runMacro`, `linkPartial` | ✅ |
-| Tooling | Typecheck **tsgo**, lint **oxlint**, no `tsc` | ✅ |
+| Tooling | Typecheck with **tsgo** (TS native/Go — no `tsc` in the typecheck path), lint with **oxlint**. Library JS/`.d.ts` *emit* still goes through `tsc` in the Moon `build` tasks (removing `tsc` from emit too is a tracked goal) | ✅ typecheck/lint |
 | Build → boot e2e | Real vite build + boot of `everything-app` / `file-routed-app`; a source-validate gate parses every authoring source | ✅ (e2e-gated) |
 
 Legend: ✅ done · 🏗️ in progress · ⏳ queued.

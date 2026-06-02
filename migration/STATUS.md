@@ -2,7 +2,7 @@
 
 **Branch:** `migration/v22-oxc133`
 
-**Updated:** 2026-06-01
+**Updated:** 2026-06-02
 
 > Companion docs: [OXC migration crib](OXC-MIGRATION-CRIB.md) ·
 > [Treaty versions May 2026](treaty-versions-may-2026.md)
@@ -245,11 +245,18 @@ Node-compatible Nova runtime (pure-Rust JS engine).
 
 **Status: DONE.**
 
-- Typecheck with **tsgo** (TS native/Go). Lint with **oxlint**. **No `tsc`**
-  anywhere.
+- Typecheck with **tsgo** (TS native/Go) — no `tsc` in the typecheck path. Lint
+  with **oxlint**. The library `build` tasks (Moon) still emit JS/`.d.ts` via `tsc`;
+  removing `tsc` from emit too is a tracked goal (not yet done).
 - Rust-first: deterministic compile-time logic is Rust; TS is only NAPI bindings
   + bundler plugins.
-- Branch: `migration/v22-oxc133`. OXC 0.133, Angular 22 targets.
+- Build orchestration is **Moon** (Nx was removed). The CI gate is `cargo test
+  --workspace` + the file-routing crate tests (`.github/workflows/rust-tests.yml`)
+  plus the example build→boot e2es; there is no `nx run-many` (the plan's Phase-1c
+  `nx run-many` criterion was superseded by the Moon move).
+- Branch: `migration/v22-oxc133`. OXC 0.133; **Angular 22.0.0-rc.3** + TypeScript
+  6.0 (re-pin to `22.0.0` when stable ships). The Rust partial-linker links the new
+  Angular 22 `@Service` DI primitive (`ɵɵngDeclareService` → `ɵɵdefineService`).
 
 ---
 

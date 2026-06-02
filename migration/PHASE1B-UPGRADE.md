@@ -1,11 +1,21 @@
 # Phase 1b — JS/Angular upgrade plan (from `angular-upgrade-research` workflow)
 
+> **UPDATE 2026-06-02 — the fast-follow happened.** The workspace is now on
+> **Angular `22.0.0-rc.3`** (the 22.0.0 release line; `22.0.0` final is still not on
+> npm — `latest` is 21.2.15, so we pin the rc and re-pin to `22.0.0` when it ships)
+> and **TypeScript `~6.0` (6.0.3)** (Angular 22 peer `>=6.0 <6.1`). The move surfaced
+> and fixed a real linker gap — Angular 22's new `@Service` DI primitive
+> (`FactoryTarget.Service`, `ɵɵngDeclareService` → `ɵɵdefineService`). Verified by
+> the 12 real-`@angular@22`-package linker tests + the full linker-smoke build→boot
+> e2e (Rust-only link, `babel=0`). Decision 1 below is kept for history.
+
 ## Decisions (flag for user override)
-1. **Angular → `21.2.15` stable, NOT 22.** Angular 22 is not on npm as stable yet (only
-   `22.x-next` prereleases — which is what we cloned as the *port reference*). 21.2.15 is the latest
-   installable stable and is what lets the workspace build green. **22 is a fast-follow re-bump**
-   when it ships stable (~early June 2026); the render3 *port* already targets 22 internals via
-   `tools/angular-ref`, so the compiler work is unaffected.
+1. **Angular → `21.2.15` stable, NOT 22.** *(Superseded — see the 2026-06-02 update
+   above; now on `22.0.0-rc.3`.)* Angular 22 was not on npm as stable yet (only
+   `22.x-next`/`rc` prereleases — which is what we cloned as the *port reference*). 21.2.15 was the
+   latest installable stable and is what let the workspace build green. **22 was a fast-follow re-bump**
+   when it shipped (we took `22.0.0-rc.3` on 2026-06-02); the render3 *port* already targeted 22
+   internals via `tools/angular-ref`, so the compiler work was unaffected.
 2. **Remove Nx entirely.** The repo migrated to **moon** (`.moon/`, `moon.yml`); there is no
    `nx.json` or `project.json`. All `@nx/*`, `nx`, `@nrwl/*`, plus the unmaintained blockers
    `@nx-bun/nx` and `@monodon/rust`, are vestigial. Removing them avoids a 5-major Nx migration and
