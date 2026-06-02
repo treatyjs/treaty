@@ -28,8 +28,16 @@
 //! emitted `ɵɵdefineComponent` metadata; each input's *type* is recovered from
 //! the explicit `input<T>(…)` type argument in the component function body, and
 //! otherwise inferred from the `input(default)` argument (`boolean`/`string`/
-//! `number`), falling back to `unknown`. The result is valid, useful, and never
-//! trips isolated-declarations.
+//! `number`).
+//!
+//! When neither of those is available — the dominant case for a PLAIN-REACT
+//! component whose destructured props (`function Card({ title, description })`)
+//! lower to a bare, untyped `input()` — the type is recovered from the input's
+//! USAGE in the lowered template: a prop read directly as display text
+//! (`ɵɵtextInterpolate(ctx.title())`) is a `string`. This is conservative — it
+//! only narrows when the usage positively supports it — and where nothing is
+//! recoverable the type stays `unknown` (sound). The result is valid, useful,
+//! and never trips isolated-declarations.
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
@@ -137,14 +145,24 @@ fn extract_component(body: &[Statement<'_>], source: &str) -> Option<ComponentMo
     //    `const <name> = input<T>(default)` declarations.
     let type_map = input_types_from_function(body, &name, source);
 
+    // 2b. For inputs left `unknown` by step 2 (the bare-`input()` case a
+    //     plain-React destructured prop lowers to), recover a primitive from how
+    //     the prop is USED in the lowered template — see `usage_inferred_types`.
+    let usage_types = usage_inferred_types(body);
+
     let inputs = input_specs
         .into_iter()
         .map(|(input_name, alias)| {
-            let (ty, required) = type_map
+            let (mut ty, required) = type_map
                 .iter()
                 .find(|(n, _, _)| *n == input_name)
                 .map(|(_, ty, req)| (ty.clone(), *req))
                 .unwrap_or_else(|| ("unknown".to_string(), false));
+            if ty == "unknown"
+                && let Some(usage_ty) = usage_types.get(input_name.as_str())
+            {
+                ty = usage_ty.clone();
+            }
             ComponentInput {
                 name: input_name,
                 alias,
@@ -363,6 +381,173 @@ fn input_type(call: &oxc_ast::ast::CallExpression<'_>, source: &str) -> String {
     }
 }
 
+/// Infer a primitive type for each input from how it is USED in the lowered
+/// template, keyed by input name.
+///
+/// This is the recovery path for a bare, untyped `input()` — the shape a
+/// plain-React destructured prop (`function Card({ title })`) lowers to, where
+/// neither an `input<T>()` type argument nor a typed default survives. Angular
+/// reads each prop through its signal accessor (`ctx.title()` /
+/// `ctx_r1.title()`); the surrounding instruction tells us the prop's role:
+///
+///   - `ɵɵtextInterpolate*(…, ctx.title(), …)` — the prop is rendered as
+///     *display text*, so it is a `string`.
+///
+/// The inference is deliberately conservative: it only records a type when an
+/// accessor read appears in a position that positively implies that type, and
+/// it never contradicts the precise `input<T>()` path (callers apply it only
+/// where the type would otherwise be `unknown`). Anything not positively
+/// recoverable is simply absent from the map, leaving the input `unknown`
+/// (sound). Every type it emits (`string`) trivially re-parses.
+fn usage_inferred_types(body: &[Statement<'_>]) -> std::collections::HashMap<String, String> {
+    let mut acc = std::collections::HashMap::new();
+    for stmt in body {
+        collect_usage_in_statement(stmt, &mut acc);
+    }
+    acc
+}
+
+/// Walk a statement for `ɵɵtextInterpolate*` calls and record their signal-read
+/// arguments as `string` uses. Only the nested template *functions* carry the
+/// instructions, so this recurses into function bodies via their statements.
+fn collect_usage_in_statement(stmt: &Statement<'_>, acc: &mut std::collections::HashMap<String, String>) {
+    match stmt {
+        Statement::FunctionDeclaration(f) => collect_usage_in_function_body(f, acc),
+        Statement::ExpressionStatement(e) => collect_usage_in_expr(&e.expression, acc),
+        Statement::IfStatement(iff) => {
+            collect_usage_in_statement(&iff.consequent, acc);
+            if let Some(alt) = &iff.alternate {
+                collect_usage_in_statement(alt, acc);
+            }
+        }
+        Statement::BlockStatement(b) => {
+            for s in &b.body {
+                collect_usage_in_statement(s, acc);
+            }
+        }
+        Statement::VariableDeclaration(v) => {
+            for d in &v.declarations {
+                if let Some(init) = &d.init {
+                    collect_usage_in_expr(init, acc);
+                }
+            }
+        }
+        Statement::ReturnStatement(r) => {
+            if let Some(arg) = &r.argument {
+                collect_usage_in_expr(arg, acc);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Inspect an expression: when it is a call, hand it to [`collect_usage_in_call`];
+/// when it is a function expression or object literal, recurse into its body /
+/// property values so we reach the instructions nested inside them.
+fn collect_usage_in_expr(expr: &Expression<'_>, acc: &mut std::collections::HashMap<String, String>) {
+    match expr {
+        Expression::CallExpression(call) => collect_usage_in_call(call, acc),
+        Expression::FunctionExpression(f) => collect_usage_in_function_body(f, acc),
+        Expression::ObjectExpression(obj) => {
+            for prop in &obj.properties {
+                if let ObjectPropertyKind::ObjectProperty(p) = prop {
+                    collect_usage_in_expr(&p.value, acc);
+                }
+            }
+        }
+        // `Name.ɵcmp = i0.ɵɵdefineComponent({ template: function … })`: the root
+        // template fn lives on the RHS of this assignment statement.
+        Expression::AssignmentExpression(assign) => collect_usage_in_expr(&assign.right, acc),
+        _ => {}
+    }
+}
+
+/// A call instruction: when it is a text interpolation, mark each signal-read
+/// argument (`ctx.title()`) as a `string` use; otherwise recurse into the
+/// structural arguments so interpolation instructions nested anywhere are
+/// reached — the root template fn sits in the `ɵɵdefineComponent({ template:
+/// function … })` metadata object, while nested views are handed as function
+/// expressions to `ɵɵconditionalCreate(…)`.
+fn collect_usage_in_call(
+    call: &oxc_ast::ast::CallExpression<'_>,
+    acc: &mut std::collections::HashMap<String, String>,
+) {
+    if is_text_interpolate(&call.callee) {
+        for arg in &call.arguments {
+            if let Argument::CallExpression(read) = arg
+                && let Some(prop) = signal_read_property(&read.callee)
+            {
+                // First positive evidence wins; never override an existing entry.
+                acc.entry(prop.to_string()).or_insert_with(|| "string".to_string());
+            }
+        }
+        return;
+    }
+    // `Argument` inherits `Expression`'s variants; recurse into the structural
+    // ones (nested call / template fn-expr / metadata object).
+    for arg in &call.arguments {
+        match arg {
+            Argument::CallExpression(inner) => collect_usage_in_call(inner, acc),
+            Argument::FunctionExpression(f) => collect_usage_in_function_body(f, acc),
+            Argument::ObjectExpression(obj) => {
+                for prop in &obj.properties {
+                    if let ObjectPropertyKind::ObjectProperty(p) = prop {
+                        collect_usage_in_expr(&p.value, acc);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Walk a function's body statements (template fns hold the instructions).
+fn collect_usage_in_function_body(
+    func: &oxc_ast::ast::Function<'_>,
+    acc: &mut std::collections::HashMap<String, String>,
+) {
+    if let Some(body) = &func.body {
+        for s in &body.statements {
+            collect_usage_in_statement(s, acc);
+        }
+    }
+}
+
+/// Is `callee` a text-interpolation instruction (`ɵɵtextInterpolate`,
+/// `ɵɵtextInterpolate1` … `ɵɵtextInterpolateV`), bare or `i0.`-qualified? Its
+/// interpolated arguments are rendered as display text → `string`.
+fn is_text_interpolate(callee: &Expression<'_>) -> bool {
+    let prop = match callee {
+        Expression::Identifier(id) => Some(id.name.as_str()),
+        Expression::StaticMemberExpression(m) => Some(m.property.name.as_str()),
+        _ => None,
+    };
+    prop.is_some_and(|p| {
+        // `ɵɵtextInterpolate` + the arity variants `…1`..`…V`.
+        p.strip_prefix("\u{0275}\u{0275}textInterpolate")
+            .is_some_and(|rest| rest.is_empty() || rest == "V" || rest.chars().all(|c| c.is_ascii_digit()))
+    })
+}
+
+/// For a `ctx.<name>` / `ctx_r1.<name>` member access being CALLED (a signal
+/// read `ctx.title()`), return `<name>`. The receiver must be a plain context
+/// identifier so we do not mistake unrelated member calls for prop reads.
+fn signal_read_property<'a>(callee: &'a Expression<'a>) -> Option<&'a str> {
+    let Expression::StaticMemberExpression(member) = callee else {
+        return None;
+    };
+    let Expression::Identifier(obj) = &member.object else {
+        return None;
+    };
+    // The Ivy template context is `ctx`, or `ctx_rN` in nested views.
+    let recv = obj.name.as_str();
+    if recv == "ctx" || recv.starts_with("ctx_r") {
+        Some(member.property.name.as_str())
+    } else {
+        None
+    }
+}
+
 /// Render the reconstructed component as a `.d.ts` module.
 fn render_component_dts(model: &ComponentModel) -> String {
     let core = "@angular/core";
@@ -481,9 +666,108 @@ Card.ɵcmp = i0.ɵɵdefineComponent({
 export default Card;
 "#;
         let dts = synthesize_component_dts(src).unwrap();
-        // No type arg + no default → `unknown` (sound, re-parseable).
+        // No type arg, no default, AND no template usage to learn from →
+        // `unknown` (sound, re-parseable).
         assert!(dts.contains("title: import(\"@angular/core\").InputSignal<unknown>;"));
+        assert!(dts.contains("description: import(\"@angular/core\").InputSignal<unknown>;"));
         assert!(dts.contains("export declare class Card {"));
+    }
+
+    /// A plain-React component whose destructured props lower to bare `input()`
+    /// (no type arg, no default) recovers `string` for props read as display
+    /// text in the template, while props with no recoverable usage stay
+    /// `unknown`. Mirrors the real `examples/treaty-shadcn` Card/Alert emit.
+    #[test]
+    fn recovers_string_input_from_text_interpolation_usage() {
+        let src = r#"
+import * as i0 from "@angular/core";
+import { signal, input } from "@angular/core";
+function Card_Conditional_7_Template(rf, ctx) {
+    if (rf & 1) {
+        i0.ɵɵdomElementStart(0, "p", 0);
+        i0.ɵɵtext(1);
+        i0.ɵɵdomElementEnd();
+    }
+    if (rf & 2) {
+        const ctx_r1 = i0.ɵɵnextContext();
+        i0.ɵɵadvance();
+        i0.ɵɵtextInterpolate(ctx_r1.description());
+    }
+}
+function Card() {
+    const title = input();
+    const description = input();
+    const hidden = input();
+    return { title, description, hidden };
+}
+Card.ɵfac = function Card_Factory(t) { return (t || Card)(); };
+Card.ɵcmp = i0.ɵɵdefineComponent({
+    type: Card,
+    selectors: [["card"], ["Card"]],
+    inputs: { title: [1, "title"], description: [1, "description"], hidden: [1, "hidden"] },
+    signals: true,
+    template: function Card_Template(rf, ctx) {
+        if (rf & 1) {
+            i0.ɵɵconditionalCreate(7, Card_Conditional_7_Template, 2, 1, "p");
+        }
+        if (rf & 2) {
+            i0.ɵɵadvance(2);
+            i0.ɵɵtextInterpolate(ctx.title());
+        }
+    }
+});
+export default Card;
+"#;
+        let dts = synthesize_component_dts(src).unwrap();
+        // `title` is interpolated directly in the root template fn → string.
+        assert!(
+            dts.contains("title: import(\"@angular/core\").InputSignal<string>;"),
+            "title should recover to string from text interpolation:\n{dts}"
+        );
+        // `description` is interpolated inside a NESTED conditional template fn
+        // (read as `ctx_r1.description()`) → string.
+        assert!(
+            dts.contains("description: import(\"@angular/core\").InputSignal<string>;"),
+            "description should recover to string from nested interpolation:\n{dts}"
+        );
+        // `hidden` is never read in the template → stays `unknown` (conservative).
+        assert!(
+            dts.contains("hidden: import(\"@angular/core\").InputSignal<unknown>;"),
+            "hidden has no recoverable usage and must stay unknown:\n{dts}"
+        );
+    }
+
+    /// Usage-based recovery must NEVER override the precise `input<T>()` path:
+    /// an explicit type argument wins even when the prop is also interpolated.
+    #[test]
+    fn usage_inference_never_overrides_explicit_type_arg() {
+        let src = r#"
+import * as i0 from "@angular/core";
+import { input } from "@angular/core";
+function Badge() {
+    const variant = input<'a' | 'b'>('a');
+    return { variant };
+}
+Badge.ɵfac = function Badge_Factory(t) { return (t || Badge)(); };
+Badge.ɵcmp = i0.ɵɵdefineComponent({
+    type: Badge,
+    selectors: [["badge"], ["Badge"]],
+    inputs: { variant: [1, "variant"] },
+    signals: true,
+    template: function Badge_Template(rf, ctx) {
+        if (rf & 2) {
+            i0.ɵɵtextInterpolate(ctx.variant());
+        }
+    }
+});
+export default Badge;
+"#;
+        let dts = synthesize_component_dts(src).unwrap();
+        // The `<'a' | 'b'>` type argument survives despite the interpolation use.
+        assert!(
+            dts.contains("variant: import(\"@angular/core\").InputSignal<'a' | 'b'>;"),
+            "explicit type arg must win over usage inference:\n{dts}"
+        );
     }
 
     #[test]
