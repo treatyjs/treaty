@@ -286,36 +286,41 @@ const FIXTURES = [
 // A Huge thanks to Alex Rickabaugh for the original. Implements the subset of
 // ExpressionVisitor / StatementVisitor needed to serialise the definition.
 // ---------------------------------------------------------------------------
-function makePrinter() {
+// `ng` defaults to the top-level v22 @angular/compiler import, but the printer
+// and oracle accept ANY @angular/compiler module instance so the bench can drive
+// a second, isolated version (e.g. v21) through the identical printer/metadata
+// path. The injected module supplies all the enums/classes the printer reads
+// (UnaryOperator, BinaryOperator, ConditionalExpr, BinaryOperatorExpr, ...).
+function makePrinter(ngc = ng) {
   const UNARY_OPERATORS = new Map([
-    [ng.UnaryOperator.Minus, '-'],
-    [ng.UnaryOperator.Plus, '+'],
+    [ngc.UnaryOperator.Minus, '-'],
+    [ngc.UnaryOperator.Plus, '+'],
   ]);
   const BINARY_OPERATORS = new Map([
-    [ng.BinaryOperator.And, '&&'],
-    [ng.BinaryOperator.Bigger, '>'],
-    [ng.BinaryOperator.BiggerEquals, '>='],
-    [ng.BinaryOperator.BitwiseAnd, '&'],
-    [ng.BinaryOperator.BitwiseOr, '|'],
-    [ng.BinaryOperator.Divide, '/'],
-    [ng.BinaryOperator.Equals, '=='],
-    [ng.BinaryOperator.Identical, '==='],
-    [ng.BinaryOperator.Lower, '<'],
-    [ng.BinaryOperator.LowerEquals, '<='],
-    [ng.BinaryOperator.Minus, '-'],
-    [ng.BinaryOperator.Modulo, '%'],
-    [ng.BinaryOperator.Multiply, '*'],
-    [ng.BinaryOperator.NotEquals, '!='],
-    [ng.BinaryOperator.NotIdentical, '!=='],
-    [ng.BinaryOperator.Or, '||'],
-    [ng.BinaryOperator.Plus, '+'],
-    [ng.BinaryOperator.NullishCoalesce, '??'],
+    [ngc.BinaryOperator.And, '&&'],
+    [ngc.BinaryOperator.Bigger, '>'],
+    [ngc.BinaryOperator.BiggerEquals, '>='],
+    [ngc.BinaryOperator.BitwiseAnd, '&'],
+    [ngc.BinaryOperator.BitwiseOr, '|'],
+    [ngc.BinaryOperator.Divide, '/'],
+    [ngc.BinaryOperator.Equals, '=='],
+    [ngc.BinaryOperator.Identical, '==='],
+    [ngc.BinaryOperator.Lower, '<'],
+    [ngc.BinaryOperator.LowerEquals, '<='],
+    [ngc.BinaryOperator.Minus, '-'],
+    [ngc.BinaryOperator.Modulo, '%'],
+    [ngc.BinaryOperator.Multiply, '*'],
+    [ngc.BinaryOperator.NotEquals, '!='],
+    [ngc.BinaryOperator.NotIdentical, '!=='],
+    [ngc.BinaryOperator.Or, '||'],
+    [ngc.BinaryOperator.Plus, '+'],
+    [ngc.BinaryOperator.NullishCoalesce, '??'],
     // `=` assignment. The original printer.ts port omitted this; @switch lowering
     // emits an assignment expression (the switch-value temp), so without it the
     // oracle THROWS "Unknown binary operator: Assign" and the fixture is scored a
     // DIFF purely because the oracle could not render — not a Rust divergence.
     // Adding the real operator lets the @switch oracle compile and be compared.
-    [ng.BinaryOperator.Assign, '='],
+    [ngc.BinaryOperator.Assign, '='],
   ]);
 
   class Context {
@@ -326,7 +331,7 @@ function makePrinter() {
 
   class Printer {
     visitDeclareVarStmt(stmt, context) {
-      let varStmt = stmt.hasModifier(ng.StmtModifier.Final) ? 'const' : 'let';
+      let varStmt = stmt.hasModifier(ngc.StmtModifier.Final) ? 'const' : 'let';
       varStmt += ' ' + stmt.name;
       if (stmt.value) varStmt += ' = ' + stmt.value.visitExpression(this, context.withExpressionMode);
       // Terminate with ';' like every other statement visitor (visitExpressionStmt /
@@ -400,7 +405,7 @@ function makePrinter() {
     }
     visitConditionalExpr(ast, context) {
       let cond = ast.condition.visitExpression(this, context);
-      if (ast.condition instanceof ng.ConditionalExpr) cond = `(${cond})`;
+      if (ast.condition instanceof ngc.ConditionalExpr) cond = `(${cond})`;
       return cond + ' ? ' + ast.trueCase.visitExpression(this, context) + ' : ' + ast.falseCase.visitExpression(this, context);
     }
     visitDynamicImportExpr(ast) { return `import('${ast.url}')`; }
@@ -421,7 +426,7 @@ function makePrinter() {
       return `(${params}) => ${body}`;
     }
     visitBinaryOperatorExpr(ast, context) {
-      if (!BINARY_OPERATORS.has(ast.operator)) throw new Error(`Unknown binary operator: ${ng.BinaryOperator[ast.operator]}`);
+      if (!BINARY_OPERATORS.has(ast.operator)) throw new Error(`Unknown binary operator: ${ngc.BinaryOperator[ast.operator]}`);
       // Operand parenthesization: this printer concatenates operands verbatim and is
       // PRECEDENCE-BLIND, unlike Angular's real ngtsc emitter (TypeScript's printer) and
       // the Rust oxc_codegen backend, both of which insert parentheses by JS precedence.
@@ -437,9 +442,9 @@ function makePrinter() {
       const wrap = (operand) => {
         const s = operand.visitExpression(this, context);
         if (
-          operand instanceof ng.BinaryOperatorExpr &&
-          operand.operator === ng.BinaryOperator.Assign &&
-          ast.operator !== ng.BinaryOperator.Assign
+          operand instanceof ngc.BinaryOperatorExpr &&
+          operand.operator === ngc.BinaryOperator.Assign &&
+          ast.operator !== ngc.BinaryOperator.Assign
         ) {
           return `(${s})`;
         }
@@ -467,7 +472,7 @@ function makePrinter() {
     visitTypeofExpr(ast, context) { return 'typeof ' + ast.expr.visitExpression(this, context); }
     visitVoidExpr(ast, context) { return 'void ' + ast.expr.visitExpression(this, context); }
     visitUnaryOperatorExpr(ast, context) {
-      if (!UNARY_OPERATORS.has(ast.operator)) throw new Error(`Unknown unary operator: ${ng.UnaryOperator[ast.operator]}`);
+      if (!UNARY_OPERATORS.has(ast.operator)) throw new Error(`Unknown unary operator: ${ngc.UnaryOperator[ast.operator]}`);
       return UNARY_OPERATORS.get(ast.operator) + ast.expr.visitExpression(this, context);
     }
     visitStatements(statements, context) {
@@ -486,14 +491,14 @@ function makePrinter() {
 // Mirrors treat-to-ivy.ts but with no inputs/outputs/queries (matches the
 // minimal metadata the Rust compile_component builds).
 // ---------------------------------------------------------------------------
-function compileWithOracle({ template, selector, className }) {
-  const parsed = ng.parseTemplate(template, `${className}.html`);
+function compileWithOracle({ template, selector, className }, ngc = ng) {
+  const parsed = ngc.parseTemplate(template, `${className}.html`);
   if (parsed.errors && parsed.errors.length) {
     throw new Error('oracle parseTemplate errors: ' + parsed.errors.map((e) => String(e)).join('; '));
   }
 
-  const constantPool = new ng.ConstantPool();
-  const out = ng.compileComponentFromMetadata(
+  const constantPool = new ngc.ConstantPool();
+  const out = ngc.compileComponentFromMetadata(
     {
       name: className,
       isStandalone: true,
@@ -516,15 +521,15 @@ function compileWithOracle({ template, selector, className }) {
       queries: [],
       styles: [],
       template: parsed,
-      encapsulation: ng.ViewEncapsulation.Emulated,
+      encapsulation: ngc.ViewEncapsulation.Emulated,
       exportAs: null,
       // OnPush so the oracle matches the Rust side, which sets OnPush to keep
       // changeDetection out of the emitted definition.
-      changeDetection: ng.ChangeDetectionStrategy.OnPush,
+      changeDetection: ngc.ChangeDetectionStrategy.OnPush,
       relativeContextFilePath: '',
       relativeTemplatePath: null,
       hasDirectiveDependencies: false,
-      type: { value: new ng.WrappedNodeExpr(className), type: new ng.WrappedNodeExpr(className) },
+      type: { value: new ngc.WrappedNodeExpr(className), type: new ngc.WrappedNodeExpr(className) },
       typeArgumentCount: 0,
       typeSourceSpan: null,
       usesInheritance: false,
@@ -789,4 +794,16 @@ function main() {
   process.exit(diff > 0 ? 1 : 0);
 }
 
-main();
+// Export the oracle building blocks so sibling tooling (e.g. the compiler
+// micro-benchmark in tools/treaty-bench/compiler-bench.mjs) can reuse the SAME
+// FIXTURES corpus and the SAME @angular/compiler oracle compile + Rust addon
+// loader instead of duplicating them — keeping the bench's "angular-compiler"
+// row exactly what this harness measures. Only run the CLI harness when this
+// file is the process entry point (node parity.mjs), not when imported.
+export { FIXTURES, compileWithOracle, loadRustAddon, normalize };
+
+const isEntry =
+  process.argv[1] && path.resolve(process.argv[1]) === path.resolve(__filename);
+if (isEntry) {
+  main();
+}
