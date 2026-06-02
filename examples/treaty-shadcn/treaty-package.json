@@ -1,0 +1,17 @@
+{
+  "name": "treaty-shadcn",
+  "version": "0.1.0",
+  "dest": "dist",
+  "lib": {
+    "entryFile": "src/public-api.ts"
+  },
+  "secondaryEntryPoints": [
+    { "path": "button", "entryFile": "src/button.tsx" },
+    { "path": "badge", "entryFile": "src/badge.treaty" },
+    { "path": "card", "entryFile": "src/card.tsx" },
+    { "path": "alert", "entryFile": "src/alert.tsx" },
+    { "path": "input", "entryFile": "src/input.tsx" },
+    { "path": "switch", "entryFile": "src/switch.treaty" }
+  ],
+  "assets": ["README.md"]
+}

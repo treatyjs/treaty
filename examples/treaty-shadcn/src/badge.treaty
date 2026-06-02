@@ -1,0 +1,57 @@
+// == Badge (treaty-shadcn) ==
+// A small status badge, shadcn-style. Treaty defaults to standalone + signal +
+// selectorless, so there is no @Component, selector, or standalone:true here --
+// the class/selector derive from the filename (badge.treaty -> Badge).
+//
+// Two signal INPUTS, bound by the host: <Badge [variant]="..." [label]="..." />.
+//   - `variant` selects the visual style (default 'default');
+//   - `label` is the text the badge renders.
+import { input } from '@angular/core'
+
+// `input(...)` declares Angular signal inputs; read them as variant()/label().
+const variant = input<'default' | 'secondary' | 'destructive' | 'outline'>('default')
+const label = input<string>('')
+
+// == View (interleaved tag-HTML, NO <template> wrapper) ==
+// One <span> whose variant classes toggle off the `variant()` input signal.
+<span
+  class="badge"
+  [class.badge-secondary]="variant() === 'secondary'"
+  [class.badge-destructive]="variant() === 'destructive'"
+  [class.badge-outline]="variant() === 'outline'"
+>{{ label() }}</span>
+
+<style lang="scss">
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    border: 1px solid transparent;
+    border-radius: 9999px;
+    padding: 0.125rem 0.625rem;
+    font-family: system-ui, sans-serif;
+    font-size: 0.75rem;
+    font-weight: 600;
+    line-height: 1;
+    white-space: nowrap;
+
+    // default variant
+    background: #18181b;
+    color: #fafafa;
+
+    &.badge-secondary {
+      background: #f4f4f5;
+      color: #18181b;
+    }
+
+    &.badge-destructive {
+      background: #dc2626;
+      color: #fafafa;
+    }
+
+    &.badge-outline {
+      background: transparent;
+      color: #18181b;
+      border-color: #e4e4e7;
+    }
+  }
+</style>
