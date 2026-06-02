@@ -256,11 +256,27 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(not(feature = "swc"))]
     fn parity_is_all_ok_with_only_oxc_enabled() {
         // With the default (oxc-only) feature set, every fixture is in parity with itself.
         let report = run_parity();
         assert_eq!(report.backends, vec!["oxc".to_string()]);
         assert!(report.is_all_ok(), "oxc-only parity must be all-ok; diffs: {:?}", report.diffs());
+        assert_eq!(report.fixtures.len(), CORPUS.len());
+    }
+
+    #[test]
+    #[cfg(feature = "swc")]
+    fn parity_oxc_vs_swc_is_byte_identical_across_corpus() {
+        // With `--features swc` the gate does REAL work: every corpus fixture must emit
+        // byte-identical Ivy through the oxc emitter and the neutral (swc-side) printer.
+        let report = run_parity();
+        assert_eq!(report.backends, vec!["oxc".to_string(), "swc".to_string()]);
+        assert!(
+            report.is_all_ok(),
+            "oxc vs swc must be byte-identical across the corpus; diffs: {:?}",
+            report.diffs()
+        );
         assert_eq!(report.fixtures.len(), CORPUS.len());
     }
 

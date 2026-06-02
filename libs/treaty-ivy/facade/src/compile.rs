@@ -800,10 +800,52 @@ fn base_metadata(selector: &str, class_name: &str) -> R3DirectiveMetadata {
 ///
 /// Returns the emitted JS for the `ɵɵdefineComponent({...})` expression (with a real template
 /// instruction function) plus any template-parse diagnostics.
+/// Which emit backend renders the assembled `output_ast` to text.
+///
+/// Both backends consume the IDENTICAL `output_ast`; they differ only in the final printer. This
+/// lets a single process (notably `tools/backend-parity`) drive both and assert byte-equality
+/// without rebuilding the crate under a different Cargo feature (SWC-BACKEND-PLAN.md §3.3 / §4.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmitBackend {
+    /// Lower `output_ast` → `oxc_ast` and print via `oxc_codegen` (the default, reference path).
+    Oxc,
+    /// The engine-neutral printer (`treaty_ivy_core::output::emitter_swc`) — the SWC-side emitter,
+    /// tuned to emit byte-identical output to the oxc path.
+    Swc,
+}
+
+/// Compile a component to its Ivy definition using the **oxc** emit backend (the default path used
+/// everywhere in the product). Identical to calling [`compile_component_with`] with
+/// [`EmitBackend::Oxc`] under the default build.
 pub fn compile_component(
     template_html: &str,
     selector: &str,
     class_name: &str,
+) -> CompiledComponent {
+    // Under the default build this uses the oxc emitter via the feature-gated dispatch in
+    // `emitter.rs`; under `--features swc` that dispatch already routes to the neutral printer, so
+    // `EmitBackend::Oxc` here would be overridden — callers wanting an explicit backend use
+    // `compile_component_with`. The product entry point keeps the historical signature.
+    compile_component_with(template_html, selector, class_name, EmitBackend::Oxc)
+}
+
+/// Compile a component to its Ivy definition using the **neutral (SWC-side)** printer explicitly,
+/// regardless of Cargo features. Used by `tools/backend-parity` to diff the two printers in one
+/// process.
+pub fn compile_component_swc(
+    template_html: &str,
+    selector: &str,
+    class_name: &str,
+) -> CompiledComponent {
+    compile_component_with(template_html, selector, class_name, EmitBackend::Swc)
+}
+
+/// Compile a single standalone component, choosing the [`EmitBackend`] for the final print step.
+pub fn compile_component_with(
+    template_html: &str,
+    selector: &str,
+    class_name: &str,
+    emit_backend: EmitBackend,
 ) -> CompiledComponent {
     let mut errors: Vec<String> = Vec::new();
 
@@ -890,17 +932,31 @@ pub fn compile_component(
     // as top-level sibling declarations BEFORE the `ɵɵdefineComponent({…})` call. Mirror that:
     // print the pool statements first, then the definition expression. The wrapped-node side table
     // must be resolved inside the pool statements too (they reference the component class etc.).
+    // Pick the printer. Both consume the same `output_ast`; only the final text differs.
+    let emit_expr = |e: &Expr| -> String {
+        match emit_backend {
+            EmitBackend::Oxc => emit_expression(e),
+            EmitBackend::Swc => crate::output::emitter_swc::emit_expression(e),
+        }
+    };
+    let emit_stmts = |s: &[Stmt]| -> String {
+        match emit_backend {
+            EmitBackend::Oxc => emit_statements(s),
+            EmitBackend::Swc => crate::output::emitter_swc::emit_statements(s),
+        }
+    };
+
     let code = if pool_statements.is_empty() {
-        emit_expression(&compiled.expression)
+        emit_expr(&compiled.expression)
     } else {
         for stmt in &mut pool_statements {
             resolve_wrapped_nodes_stmt(stmt);
         }
-        let mut out = emit_statements(&pool_statements);
+        let mut out = emit_stmts(&pool_statements);
         if !out.ends_with('\n') {
             out.push('\n');
         }
-        out.push_str(&emit_expression(&compiled.expression));
+        out.push_str(&emit_expr(&compiled.expression));
         out
     };
 

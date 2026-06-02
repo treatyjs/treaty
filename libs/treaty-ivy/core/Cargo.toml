@@ -8,6 +8,16 @@ edition = "2024"
 # binding-expression lexer/parser/converter, util helpers, and the i18n
 # message-id digest primitives. Ported from Angular 22.1 packages/compiler.
 
+[features]
+# `oxc` (default) is the reference emit backend: lower output_ast -> oxc_ast -> oxc_codegen.
+# `swc` swaps the four public emit functions to the engine-neutral printer in `output/emitter_swc.rs`
+# (see migration/SWC-BACKEND-PLAN.md §3.3 / phase 2). It is additive: the oxc lowering stays compiled
+# (the public dispatch just routes to the neutral printer), so the default build is byte-for-byte
+# unchanged. The two backends are gated 1:1 by `tools/backend-parity`.
+default = ["oxc"]
+oxc = []
+swc = []
+
 [dependencies]
 oxc_allocator = "0.133.0"
 oxc_ast = "0.133.0"

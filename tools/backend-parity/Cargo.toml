@@ -27,17 +27,24 @@ name = "backend-parity"
 path = "src/main.rs"
 
 [features]
-# `oxc` is the default and the reference backend — it is REAL and works today. `swc` is a
-# placeholder gate (see `src/backend/swc.rs`): when off, the swc backend is SKIPPED with a
-# logged notice so the harness compiles + runs on oxc alone, and is READY to diff swc the
-# moment the SWC emit/parse backends land (SWC-BACKEND-PLAN.md phases 2-3).
+# `oxc` is the default + reference backend (REAL today). `swc` gates IN the second backend
+# (`src/backend/swc.rs`): the engine-neutral printer surfaced as `compile_component_swc`. When off,
+# the swc backend is SKIPPED with a logged notice so the harness runs oxc-only.
+#
+# IMPORTANT: `swc` here is a LOCAL gate — it does NOT enable `treaty_ivy/swc`. The neutral printer
+# (`compile_component_swc`) is ALWAYS compiled into `treaty_ivy`, so a single backend-parity binary
+# can drive both the oxc emit path (OxcBackend → `compile_component`) and the neutral path
+# (SwcBackend → `compile_component_swc`) and diff the two printers in one process. Turning on
+# `treaty_ivy/swc` would flip the oxc path to the neutral printer too (feature-global emit dispatch),
+# making the diff trivially pass — so we deliberately do not.
 default = ["oxc"]
 oxc = []
 swc = []
 
 [dependencies]
-# The REAL Treaty Ivy compiler (the facade crate, package name `treaty_ivy`). The OxcBackend
-# calls its `compile::compile_component` entry point to emit Ivy for each fixture for real.
+# The REAL Treaty Ivy compiler (the facade crate, package name `treaty_ivy`), built with its DEFAULT
+# (oxc) features. OxcBackend calls `compile::compile_component` (oxc emit); SwcBackend calls
+# `compile::compile_component_swc` (the always-compiled neutral printer).
 treaty_ivy = { path = "../../libs/treaty-ivy/facade" }
 
 serde = { version = "1", features = ["derive"] }

@@ -60,8 +60,24 @@ use crate::output_ast::{
 
 /// Lower a slice of `output_ast` statements to JS and return the printed source.
 ///
+/// Default (oxc) build: allocates its own arena, lowers each statement, wraps them in a
+/// [`Program`], and codegens to a [`String`].
+///
+/// `--features swc` build: delegates to the engine-neutral printer in
+/// [`crate::output::emitter_swc`], which walks the SAME `output_ast` and is tuned to emit the
+/// exact bytes oxc_codegen produces (proven byte-for-byte by `tools/backend-parity`). See the
+/// module header of `emitter_swc.rs` for why a neutral printer — not `swc_ecma_codegen` — is the
+/// SWC-side emitter.
+#[cfg(feature = "swc")]
+pub fn emit_statements(stmts: &[o::Stmt]) -> String {
+    crate::output::emitter_swc::emit_statements(stmts)
+}
+
+/// Lower a slice of `output_ast` statements to JS and return the printed source.
+///
 /// Allocates its own arena, lowers each statement, wraps them in a [`Program`],
 /// and codegens to a [`String`].
+#[cfg(not(feature = "swc"))]
 pub fn emit_statements(stmts: &[o::Stmt]) -> String {
     let allocator = Allocator::default();
     let lowerer = Lowerer::new(&allocator);
@@ -84,9 +100,19 @@ pub fn emit_statements(stmts: &[o::Stmt]) -> String {
 
 /// Lower a single `output_ast` expression to JS and return the printed source.
 ///
+/// `--features swc` build: delegates to the engine-neutral printer in
+/// [`crate::output::emitter_swc`] (byte-identical to the oxc path, gated by `backend-parity`).
+#[cfg(feature = "swc")]
+pub fn emit_expression(expr: &o::Expr) -> String {
+    crate::output::emitter_swc::emit_expression(expr)
+}
+
+/// Lower a single `output_ast` expression to JS and return the printed source.
+///
 /// The expression is wrapped in an expression statement so codegen has a complete
 /// program to print (the trailing `;` codegen adds is left intact, matching
 /// Angular's `visitExpressionStmt`).
+#[cfg(not(feature = "swc"))]
 pub fn emit_expression(expr: &o::Expr) -> String {
     let allocator = Allocator::default();
     let lowerer = Lowerer::new(&allocator);
@@ -218,6 +244,7 @@ fn generated_byte_to_line_col(
 /// Emit `(code, source_map_json)` for a slice of statements, where `code` is BYTE-IDENTICAL
 /// to [`emit_statements`]. The v3 source map maps span-carrying nodes back into
 /// `source_content` (named `source_name`); the generated file is `file_name`.
+#[cfg(not(feature = "swc"))]
 pub fn emit_statements_with_map(
     stmts: &[o::Stmt],
     file_name: &str,
@@ -229,6 +256,17 @@ pub fn emit_statements_with_map(
     (code, map.to_json())
 }
 
+/// `--features swc` build of [`emit_statements_with_map`] — delegates to the neutral printer.
+#[cfg(feature = "swc")]
+pub fn emit_statements_with_map(
+    stmts: &[o::Stmt],
+    file_name: &str,
+    source_name: &str,
+    source_content: &str,
+) -> (String, String) {
+    crate::output::emitter_swc::emit_statements_with_map(stmts, file_name, source_name, source_content)
+}
+
 /// Build a v3 source-map JSON for a definition `expr` that has already been printed into
 /// `full_code` starting at byte offset `expr_offset` (e.g. after a pool-statement prefix).
 ///
@@ -236,6 +274,26 @@ pub fn emit_statements_with_map(
 /// token in `full_code` from `expr_offset` onward — so the generated positions are correct
 /// in the FINAL concatenated artifact, not in the isolated expression slice. The code is
 /// never reprinted into `full_code` here; this is map-only and additive.
+#[cfg(feature = "swc")]
+pub fn build_definition_map(
+    file_name: &str,
+    source_name: &str,
+    source_content: &str,
+    full_code: &str,
+    expr_offset: usize,
+    expr: &o::Expr,
+) -> String {
+    crate::output::emitter_swc::build_definition_map(
+        file_name,
+        source_name,
+        source_content,
+        full_code,
+        expr_offset,
+        expr,
+    )
+}
+
+#[cfg(not(feature = "swc"))]
 pub fn build_definition_map(
     file_name: &str,
     source_name: &str,
@@ -268,6 +326,7 @@ pub fn build_definition_map(
 
 /// Emit `(code, source_map_json)` for a single expression, where `code` is BYTE-IDENTICAL
 /// to [`emit_expression`].
+#[cfg(not(feature = "swc"))]
 pub fn emit_expression_with_map(
     expr: &o::Expr,
     file_name: &str,
@@ -277,6 +336,17 @@ pub fn emit_expression_with_map(
     let (code, anchors) = emit_with_anchors_expr(expr);
     let map = build_source_map(file_name, source_name, source_content, &code, &anchors);
     (code, map.to_json())
+}
+
+/// `--features swc` build of [`emit_expression_with_map`] — delegates to the neutral printer.
+#[cfg(feature = "swc")]
+pub fn emit_expression_with_map(
+    expr: &o::Expr,
+    file_name: &str,
+    source_name: &str,
+    source_content: &str,
+) -> (String, String) {
+    crate::output::emitter_swc::emit_expression_with_map(expr, file_name, source_name, source_content)
 }
 
 // ---------------------------------------------------------------------------

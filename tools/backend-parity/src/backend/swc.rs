@@ -1,25 +1,32 @@
-//! The **swc** backend — a feature-gated PLACEHOLDER, ready to light up.
+//! The **swc** backend — the engine-neutral (SWC-side) printer over Treaty's `output_ast`.
 //!
-//! This module exists only under `#[cfg(feature = "swc")]`. The whole struct is gated, so when the
-//! `swc` feature is OFF the backend is not compiled at all and [`enabled_backends`] omits it (with a
-//! logged notice) — the harness then runs oxc-only and STILL compiles + runs today, exactly the
-//! Phase-1 state in SWC-BACKEND-PLAN.md §5.
+//! This module exists only under `#[cfg(feature = "swc")]`. When the `swc` feature is OFF the
+//! backend is not compiled and [`enabled_backends`](super::enabled_backends) omits it (with a
+//! logged notice) — the harness then runs oxc-only and STILL compiles + runs, the Phase-1 state in
+//! SWC-BACKEND-PLAN.md §5.
 //!
-//! When the `swc` feature is ON, [`SwcBackend::compile`] currently returns a clear, actionable
-//! "not yet implemented" error rather than silently passing. That keeps the gate honest: as soon as
-//! the real SWC emit backend (`emitter_swc.rs`, plan §3.3 / phase 2) and parse backend (plan §3.2 /
-//! phase 3) land, this method is swapped to call the same `treaty_ivy` entry point built under
-//! `--features swc`, and the byte-equality gate ([`crate::parity`]) immediately does real work
-//! (oxc-emitted vs swc-emitted Ivy).
+//! # How it works
 //!
-//! [`enabled_backends`]: super::enabled_backends
+//! Both backends link the SAME `treaty_ivy` crate (default features → oxc emit). The two emit
+//! paths coexist in one binary because the neutral printer
+//! (`treaty_ivy_core::output::emitter_swc`, surfaced as `treaty_ivy::compile::compile_component_swc`)
+//! is always compiled, NOT feature-gated. So:
+//!   * [`OxcBackend`](super::oxc::OxcBackend) calls `compile_component` (oxc emit), and
+//!   * [`SwcBackend`] calls `compile_component_swc` (the neutral SWC-side printer),
+//! and the gate diffs the two printers in a single process — no rebuild-under-a-different-feature
+//! dance (SWC-BACKEND-PLAN.md §4.2 is satisfied structurally instead).
+//!
+//! Both consume the IDENTICAL assembled `output_ast`; only the final printer differs, so any byte
+//! diff is a genuine printer-divergence bug — exactly what the gate is for.
 
 #[cfg(feature = "swc")]
 mod imp {
+    use treaty_ivy::compile::compile_component_swc;
+
     use super::super::Backend;
     use crate::corpus::Fixture;
 
-    /// The SWC-backed Treaty Ivy compiler backend (placeholder until the SWC port lands).
+    /// The SWC-backed (engine-neutral printer) Treaty Ivy compiler backend.
     pub struct SwcBackend;
 
     impl Backend for SwcBackend {
@@ -27,13 +34,16 @@ mod imp {
             "swc"
         }
 
-        fn compile(&self, _fixture: &Fixture) -> Result<String, String> {
-            Err(
-                "swc backend not yet implemented (see migration/SWC-BACKEND-PLAN.md §3.3 emit \
-                 + §3.2 parse / phases 2-3). Once the SWC emit/parse backends land, swap this to \
-                 call treaty_ivy built under `--features swc`."
-                    .to_string(),
-            )
+        fn compile(&self, fixture: &Fixture) -> Result<String, String> {
+            let compiled =
+                compile_component_swc(fixture.template, fixture.selector, fixture.class_name);
+            if !compiled.errors.is_empty() {
+                return Err(format!(
+                    "treaty_ivy (swc emit) compile diagnostics: {}",
+                    compiled.errors.join("; ")
+                ));
+            }
+            Ok(compiled.code)
         }
     }
 }
