@@ -1,0 +1,28 @@
+{
+  "name": "@treaty-examples/ng-bench-app",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Standard, pure-Angular full application used as a fair apples-to-apples compile benchmark fixture: it builds with BOTH the Angular CLI (`ng build` / @angular/build:application) AND Treaty's bundler plugins, because it uses ZERO Treaty-only features (no .treaty SFCs, no JSX/.tsx, no React, no macros, no server{} blocks) -- only standard Angular .ts the Angular compiler accepts.",
+  "scripts": {
+    "ng": "ng",
+    "build": "ng build",
+    "start": "ng serve",
+    "watch": "ng build --watch --configuration development"
+  },
+  "dependencies": {
+    "@angular/common": "22.0.0-rc.3",
+    "@angular/compiler": "22.0.0-rc.3",
+    "@angular/core": "22.0.0-rc.3",
+    "@angular/forms": "22.0.0-rc.3",
+    "@angular/platform-browser": "22.0.0-rc.3",
+    "@angular/router": "22.0.0-rc.3",
+    "rxjs": "~7.8.0",
+    "tslib": "^2.3.0"
+  },
+  "devDependencies": {
+    "@angular/build": "22.0.0-rc.3",
+    "@angular/cli": "22.0.0-rc.3",
+    "@angular/compiler-cli": "22.0.0-rc.3",
+    "typescript": "~6.0.0"
+  }
+}
