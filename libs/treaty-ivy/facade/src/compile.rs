@@ -56,6 +56,7 @@ impl TemplateBuilder for RealTemplateBuilder {
         &mut self,
         meta: &R3ComponentMetadata<D>,
         _all_deferrable_deps_fn: Option<&Expr>,
+        deferred_deps: &std::collections::HashMap<(u32, u32), Expr>,
     ) -> TemplateBuilderResult {
         let name = format!("{}_Template", meta.base.name);
         // Angular selects the `DomOnly` instruction family (`ɵɵdomElement*`/`ɵɵdomListener`/
@@ -63,8 +64,9 @@ impl TemplateBuilder for RealTemplateBuilder {
         // (`render3/view/compiler.ts`), otherwise the classic `Full` family (`ɵɵelement*`/`ɵɵlistener`/
         // `ɵɵproperty`/`ɵɵtemplate`). Thread that decision into the view builder.
         let dom_only = meta.base.is_standalone && !meta.has_directive_dependencies;
-        let input =
-            TemplateCompilationInput::new(name, meta.template.nodes.clone()).with_dom_only(dom_only);
+        let input = TemplateCompilationInput::new(name, meta.template.nodes.clone())
+            .with_dom_only(dom_only)
+            .with_deferred_deps(deferred_deps.clone());
         let mut builder = TemplateDefinitionBuilder::new(&input);
         let template_fn = builder.build_template_function(&input);
 
@@ -428,6 +430,220 @@ fn collect_attr_name_usages<'a>(
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// `@defer` dependency analysis.
+//
+// Angular splits a component's template directive/pipe dependencies into the EAGER set (everything
+// outside a `@defer` block's MAIN body — including its `@placeholder`/`@loading`/`@error` views,
+// which render before/while the deferred content loads) and the per-block LAZY set (the directives
+// used only in a `@defer` block's main body). The runtime `dependencies` array carries the eager
+// set; each block's lazy set becomes a `() => [Dep, …]` resolver thunk passed as the third
+// `ɵɵdefer(slot, mainSlot, resolverFn, …)` argument (`render3/view/compiler.ts`
+// `compileDeferResolverFunction` + compiler-cli `resolveDeferBlocks`/`compileDeferBlocks`).
+//
+// We reproduce the eager/lazy split by re-running the SAME matching passes the eager
+// `dependencies` array is built from (the selectorless class-name + element-tag matcher and the
+// CSS-selector binder) over two derived node sets:
+//   * the EAGER PROJECTION — the template with every `@defer` MAIN body emptied — to learn which
+//     deps are referenced eagerly, and
+//   * each `@defer` block's MAIN body in isolation — to learn that block's lazy deps.
+// The binder (`R3TargetBinder`) is already `@defer`-aware (it flips `is_in_defer_block` only inside
+// the main body, treating the secondary views as eager), so the eager projection mirrors
+// `getEagerlyUsedDirectives` exactly.
+// ---------------------------------------------------------------------------
+
+/// One `@defer` block's lazy dependency set, keyed by the block's main-body source span (so the
+/// template builder can match it back to the block it is lowering, independent of document order /
+/// nesting). `names` is ordered by the component's import/declaration order, matching how Angular's
+/// `compileDeferResolverFunction` walks `meta.dependencies`.
+#[derive(Debug, Clone, Default)]
+pub struct DeferBlockDeps {
+    /// `(start, end)` of the block's `main_block_span` (the `DeferredBlock` AST node's span).
+    pub span: (u32, u32),
+    pub names: Vec<String>,
+}
+
+/// The eager/lazy dependency split for a template (see module note above).
+#[derive(Debug, Clone, Default)]
+pub struct DeferDependencyInfo {
+    /// Names referenced EAGERLY (outside any `@defer` main body). The runtime `dependencies` array
+    /// keeps exactly these.
+    pub eager_names: std::collections::HashSet<String>,
+    /// Per-`@defer`-block lazy dependency sets, in document order.
+    pub blocks: Vec<DeferBlockDeps>,
+}
+
+impl DeferDependencyInfo {
+    /// Whether the template carries any `@defer` block at all (when not, the caller leaves the
+    /// existing PerComponent / no-resolver path untouched — byte-identical to before this analysis).
+    pub fn has_defer_blocks(&self) -> bool {
+        !self.blocks.is_empty()
+    }
+}
+
+/// Recursively clone `nodes`, emptying every `@defer` block's MAIN body (`children`) while keeping
+/// its `@placeholder`/`@loading`/`@error` sub-blocks (which render eagerly). Recurses through every
+/// container so nested `@defer` blocks (inside `@if`/`@for`/`@switch`/elements/etc.) are handled.
+fn strip_defer_main_bodies(nodes: &[crate::template::r3_ast::Node]) -> Vec<crate::template::r3_ast::Node> {
+    use crate::template::r3_ast::Node;
+    nodes
+        .iter()
+        .map(|node| {
+            let mut n = node.clone();
+            match &mut n {
+                Node::Element(el) => el.children = strip_defer_main_bodies(&el.children),
+                Node::Component(c) => c.children = strip_defer_main_bodies(&c.children),
+                Node::Template(t) => t.children = strip_defer_main_bodies(&t.children),
+                Node::Content(c) => c.children = strip_defer_main_bodies(&c.children),
+                Node::SwitchBlock(b) => {
+                    for g in &mut b.groups {
+                        g.children = strip_defer_main_bodies(&g.children);
+                    }
+                }
+                Node::ForLoopBlock(b) => {
+                    b.children = strip_defer_main_bodies(&b.children);
+                    if let Some(empty) = &mut b.empty {
+                        empty.children = strip_defer_main_bodies(&empty.children);
+                    }
+                }
+                Node::IfBlock(b) => {
+                    for branch in &mut b.branches {
+                        branch.children = strip_defer_main_bodies(&branch.children);
+                    }
+                }
+                Node::DeferredBlock(d) => {
+                    // The MAIN body is the lazy region — empty it. Its secondary views are eager,
+                    // so keep them (but still recurse, in case THEY contain nested `@defer` blocks).
+                    d.children = Vec::new();
+                    if let Some(p) = &mut d.placeholder {
+                        p.children = strip_defer_main_bodies(&p.children);
+                    }
+                    if let Some(l) = &mut d.loading {
+                        l.children = strip_defer_main_bodies(&l.children);
+                    }
+                    if let Some(e) = &mut d.error {
+                        e.children = strip_defer_main_bodies(&e.children);
+                    }
+                }
+                _ => {}
+            }
+            n
+        })
+        .collect()
+}
+
+/// Collect every `@defer` block's `(main_block_span, main-body children)` in document (pre-order)
+/// order, recursing through all containers (including secondary views and nested `@defer` blocks).
+fn collect_defer_blocks<'a>(
+    nodes: &'a [crate::template::r3_ast::Node],
+    out: &mut Vec<(&'a crate::template::r3_ast::DeferredBlock, (u32, u32))>,
+) {
+    use crate::template::r3_ast::Node;
+    for node in nodes {
+        match node {
+            Node::Element(el) => collect_defer_blocks(&el.children, out),
+            Node::Component(c) => collect_defer_blocks(&c.children, out),
+            Node::Template(t) => collect_defer_blocks(&t.children, out),
+            Node::Content(c) => collect_defer_blocks(&c.children, out),
+            Node::SwitchBlock(b) => {
+                for g in &b.groups {
+                    collect_defer_blocks(&g.children, out);
+                }
+            }
+            Node::ForLoopBlock(b) => {
+                collect_defer_blocks(&b.children, out);
+                if let Some(empty) = &b.empty {
+                    collect_defer_blocks(&empty.children, out);
+                }
+            }
+            Node::IfBlock(b) => {
+                for branch in &b.branches {
+                    collect_defer_blocks(&branch.children, out);
+                }
+            }
+            Node::DeferredBlock(d) => {
+                let span = (d.main_block_span.start, d.main_block_span.end);
+                out.push((d, span));
+                // Recurse into the main body + secondary views for nested `@defer` blocks.
+                collect_defer_blocks(&d.children, out);
+                if let Some(p) = &d.placeholder {
+                    collect_defer_blocks(&p.children, out);
+                }
+                if let Some(l) = &d.loading {
+                    collect_defer_blocks(&l.children, out);
+                }
+                if let Some(e) = &d.error {
+                    collect_defer_blocks(&e.children, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Match the directive/pipe candidates against a SUBTREE of template nodes, returning the matched
+/// class names in candidate (import/declaration) order. This is the shared kernel behind both the
+/// eager-projection and per-`@defer`-block analyses: it runs the SAME two matching passes the main
+/// `dependencies` array is built from — the selectorless class-name + element-tag matcher
+/// ([`resolve_template_dependencies`]) and the CSS-selector binder
+/// ([`crate::binder::resolve_selector_dependencies`]) — and merges their hits, preserving the
+/// canonical emission order (import order for the selectorless hits, then selector-only matches).
+fn match_dependencies_in(
+    nodes: &[crate::template::r3_ast::Node],
+    imported_names: &[String],
+    selector_candidates: &[crate::binder::SelectorDirective],
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for dep in resolve_template_dependencies(imported_names, nodes) {
+        if let ExprKind::ReadVar { name } = &dep.ty.kind {
+            if seen.insert(name.clone()) {
+                out.push(name.clone());
+            }
+        }
+    }
+    if !selector_candidates.is_empty() {
+        for name in crate::binder::resolve_selector_dependencies(nodes, selector_candidates) {
+            if seen.insert(name.clone()) {
+                out.push(name);
+            }
+        }
+    }
+    out
+}
+
+/// Compute the eager/lazy dependency split for a template (see module note above). `imported_names`
+/// are the selectorless class-name + element-tag candidates; `selector_candidates` the CSS-selector
+/// directives — exactly the two candidate sets the main `dependencies` array is matched from.
+pub fn compute_defer_dependencies(
+    nodes: &[crate::template::r3_ast::Node],
+    imported_names: &[String],
+    selector_candidates: &[crate::binder::SelectorDirective],
+) -> DeferDependencyInfo {
+    let mut info = DeferDependencyInfo::default();
+
+    // EAGER: match over the template with every `@defer` main body emptied. The binder treats the
+    // secondary (`@placeholder`/`@loading`/`@error`) views as eager, and the element-tag walk only
+    // sees the kept nodes, so this yields exactly `getEagerlyUsedDirectives` ∪ eager element/attr
+    // usages.
+    let eager_nodes = strip_defer_main_bodies(nodes);
+    info.eager_names = match_dependencies_in(&eager_nodes, imported_names, selector_candidates)
+        .into_iter()
+        .collect();
+
+    // LAZY: for each `@defer` block, match over its MAIN body in isolation. The block's lazy
+    // resolver lists exactly these (`resolveDeferBlocks` binds `deferBlock.children` separately).
+    let mut blocks = Vec::new();
+    collect_defer_blocks(nodes, &mut blocks);
+    for (block, span) in blocks {
+        let names = match_dependencies_in(&block.children, imported_names, selector_candidates);
+        info.blocks.push(DeferBlockDeps { span, names });
+    }
+
+    info
 }
 
 // ---------------------------------------------------------------------------

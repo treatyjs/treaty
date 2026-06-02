@@ -112,6 +112,14 @@ pub struct TemplateCompilationInput {
     /// which Angular emits the DOM family. The source/decorator front-end overrides it via
     /// [`Self::with_dom_only`] from the parsed `standalone` flag + resolved directive dependencies.
     pub dom_only: bool,
+    /// Per-`@defer`-block lazy dependency resolver thunks, keyed by the block's `main_block_span`
+    /// `(start, end)`. Each value is the `() => [Dep, …]` arrow function
+    /// (`compileDeferResolverFunction`); `build_deferred_block` hoists it as a top-level
+    /// `const <Base>_Defer_<slot>_DepsFn = …` and passes the reference as the third `ɵɵdefer`
+    /// argument. Empty for templates without `@defer` blocks (or whose blocks have no lazy deps),
+    /// in which case `ɵɵdefer` keeps its `null` resolver — byte-identical to before. Keyed by span
+    /// (not document order) so the lookup is correct regardless of nesting / view boundaries.
+    pub deferred_deps: std::collections::HashMap<(u32, u32), Expr>,
 }
 
 impl TemplateCompilationInput {
@@ -120,6 +128,7 @@ impl TemplateCompilationInput {
             name: name.into(),
             nodes,
             dom_only: true,
+            deferred_deps: std::collections::HashMap::new(),
         }
     }
 
@@ -128,6 +137,16 @@ impl TemplateCompilationInput {
     /// instruction family.
     pub fn with_dom_only(mut self, dom_only: bool) -> Self {
         self.dom_only = dom_only;
+        self
+    }
+
+    /// Set the per-`@defer`-block lazy dependency resolver thunks (see [`Self::deferred_deps`]) and
+    /// return `self`.
+    pub fn with_deferred_deps(
+        mut self,
+        deferred_deps: std::collections::HashMap<(u32, u32), Expr>,
+    ) -> Self {
+        self.deferred_deps = deferred_deps;
         self
     }
 }
@@ -2467,6 +2486,13 @@ pub struct TemplateDefinitionBuilder {
     /// `ɵɵelement` unless it has nested element/control-flow children, and its children are walked via
     /// [`Self::visit_i18n_create_children`].
     in_i18n_create: bool,
+    /// Per-`@defer`-block lazy dependency resolver thunks, keyed by the block's `main_block_span`
+    /// `(start, end)`. Threaded from [`TemplateCompilationInput::deferred_deps`] into the root view
+    /// and propagated to every embedded view (a nested `@defer` block lowers in an embedded view),
+    /// so `build_deferred_block` can look up the resolver for the block it lowers regardless of view
+    /// nesting. Empty for `@defer`-free templates (and blocks without lazy deps) — leaving the
+    /// existing `null`-resolver `ɵɵdefer(…)` path byte-identical.
+    deferred_deps: std::collections::HashMap<(u32, u32), Expr>,
 }
 
 /// The i18n continuation context threaded into a child view spawned inside an `i18n` block.
@@ -2544,6 +2570,7 @@ impl TemplateDefinitionBuilder {
             i18n_child_view: None,
             i18n_block_ctx: None,
             in_i18n_create: false,
+            deferred_deps: input.deferred_deps.clone(),
         }
     }
 
@@ -5015,8 +5042,9 @@ impl TemplateDefinitionBuilder {
         update_prelude: Vec<Stmt>,
         i18n_child_view: Option<I18nChildView>,
     ) -> (Expr, usize, usize) {
-        let nested_input =
-            TemplateCompilationInput::new(fn_name.clone(), children).with_dom_only(self.dom_only);
+        let nested_input = TemplateCompilationInput::new(fn_name.clone(), children)
+            .with_dom_only(self.dom_only)
+            .with_deferred_deps(self.deferred_deps.clone());
         let mut nested = TemplateDefinitionBuilder::new(&nested_input);
         nested.i18n_child_view = i18n_child_view;
         // An embedded view is never the root: its hoisted descendant fns bubble up to the root
@@ -5874,6 +5902,28 @@ impl TemplateDefinitionBuilder {
         let defer_slot = self.allocate_data_slot();
         let _defer_slot_2 = self.allocate_data_slot();
 
+        // Per-block dependency resolver thunk. Angular's `resolveDeferDepsFns` names the analysed
+        // `() => [Dep, …]` arrow `<fullPathName>_Defer_<deferSlot>_DepsFn` (the shared-pool function
+        // reference, `useUniqueName: false`) and hoists it as a top-level `const`. We look the arrow
+        // up by the block's `main_block_span` (threaded in from the component-level defer analysis),
+        // hoist it under that name, and pass the reference as the third `ɵɵdefer` argument. Blocks
+        // with no lazy deps carry no entry and keep the `null` resolver.
+        let resolver_fn_ref: Option<Expr> = {
+            let key = (deferred.main_block_span.start, deferred.main_block_span.end);
+            self.deferred_deps.get(&key).cloned().map(|deps_fn| {
+                let fn_name = format!("{}_Defer_{}_DepsFn", self.base_name, defer_slot);
+                self.hoisted_fns.push(Stmt::with_modifiers(
+                    StmtKind::DeclareVar {
+                        name: fn_name.clone(),
+                        value: Some(deps_fn),
+                        ty: None,
+                    },
+                    StmtModifier::FINAL,
+                ));
+                o::variable(fn_name, None)
+            })
+        };
+
         let emit_template = |this: &mut Self, slot: usize, r: Expr, d: usize, v: usize| {
             let params = vec![num(slot as f64), r, num(d as f64), num(v as f64)];
             this.creation_code.push(instruction(R3::DomTemplate, params));
@@ -5898,7 +5948,7 @@ impl TemplateDefinitionBuilder {
         let mut defer_params = vec![
             num(defer_slot as f64),
             num(main_slot as f64),
-            o::null_expr(), // dependencyResolverFn (per-block resolver not modelled here)
+            resolver_fn_ref.unwrap_or_else(o::null_expr), // dependencyResolverFn
             loading
                 .as_ref()
                 .map(|(s, ..)| num(*s as f64))
@@ -6000,8 +6050,9 @@ impl TemplateDefinitionBuilder {
     /// `(fnNameRef, decls, vars)`. Like [`Self::build_embedded_view`] but the body always compiles
     /// DOM-only (`reify.ts`: block templates are `ɵɵdomTemplate`).
     fn build_deferred_view(&mut self, fn_name: String, children: Vec<Node>) -> (Expr, usize, usize) {
-        let nested_input =
-            TemplateCompilationInput::new(fn_name.clone(), children).with_dom_only(true);
+        let nested_input = TemplateCompilationInput::new(fn_name.clone(), children)
+            .with_dom_only(true)
+            .with_deferred_deps(self.deferred_deps.clone());
         let mut nested = TemplateDefinitionBuilder::new(&nested_input);
         nested.is_root = false;
         nested.view_level = self.view_level + 1;

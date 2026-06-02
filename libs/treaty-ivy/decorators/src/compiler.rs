@@ -725,11 +725,14 @@ pub struct ComponentTemplate {
     pub preserve_whitespaces: Option<bool>,
 }
 
-/// `R3ComponentDeferMetadata` (`api.ts` discriminated union). `PerBlock` keys by a stable id
-/// (never AST-node pointer identity).
+/// `R3ComponentDeferMetadata` (`api.ts` discriminated union). `PerBlock` keys each block's lazy
+/// dependency resolver thunk by the block's `main_block_span` `(start, end)` — a stable id derived
+/// from source position (never AST-node pointer identity), so the template builder can match a
+/// resolver back to the `@defer` block it lowers regardless of document order / view nesting. A
+/// block with no lazy deps maps to `None` (no resolver — `ɵɵdefer` keeps its `null` argument).
 #[derive(Debug, Clone, PartialEq)]
 pub enum R3ComponentDeferMetadata {
-    PerBlock { blocks: HashMap<usize, Option<Expr>> },
+    PerBlock { blocks: HashMap<(u32, u32), Option<Expr>> },
     PerComponent { dependencies_fn: Option<Expr> },
 }
 
@@ -822,10 +825,16 @@ pub struct TemplateBuilderResult {
 /// [`StubTemplateBuilder`] default.
 pub trait TemplateBuilder {
     /// Ingest + transform + emit the template for the given component metadata.
+    ///
+    /// `deferred_deps` carries each `@defer` block's lazy dependency resolver thunk
+    /// (`() => [Dep, …]`), keyed by the block's `main_block_span` `(start, end)`. The builder hoists
+    /// each as `const <Base>_Defer_<slot>_DepsFn = …` and passes the reference as the third
+    /// `ɵɵdefer` argument. Empty for `PerComponent` mode and `@defer`-free templates.
     fn build<D: R3TemplateDependency>(
         &mut self,
         meta: &R3ComponentMetadata<D>,
         all_deferrable_deps_fn: Option<&Expr>,
+        deferred_deps: &HashMap<(u32, u32), Expr>,
     ) -> TemplateBuilderResult;
 }
 
@@ -840,6 +849,7 @@ impl TemplateBuilder for StubTemplateBuilder {
         &mut self,
         meta: &R3ComponentMetadata<D>,
         _all_deferrable_deps_fn: Option<&Expr>,
+        _deferred_deps: &HashMap<(u32, u32), Expr>,
     ) -> TemplateBuilderResult {
         let template_fn = o::fn_(
             vec![
@@ -1829,18 +1839,31 @@ where
 
     // Defer deps fn (PerComponent only).
     let mut all_deferrable_deps_fn: Option<Expr> = None;
-    if let R3ComponentDeferMetadata::PerComponent { dependencies_fn } = &meta.defer {
-        if let Some(deps_fn) = dependencies_fn {
-            let fn_name = format!("{template_type_name}_DeferFn");
-            pool_statements.push(Stmt::with_modifiers(
-                StmtKind::DeclareVar {
-                    name: fn_name.clone(),
-                    value: Some(deps_fn.clone()),
-                    ty: None,
-                },
-                StmtModifier::FINAL,
-            ));
-            all_deferrable_deps_fn = Some(o::variable(fn_name, None));
+    // Per-`@defer`-block lazy dependency resolver thunks (PerBlock mode), keyed by the block's
+    // `main_block_span` `(start, end)`. Threaded into the template builder, which hoists each as a
+    // `const <Base>_Defer_<slot>_DepsFn = …` and passes the reference as `ɵɵdefer`'s third argument.
+    let mut deferred_deps: HashMap<(u32, u32), Expr> = HashMap::new();
+    match &meta.defer {
+        R3ComponentDeferMetadata::PerComponent { dependencies_fn } => {
+            if let Some(deps_fn) = dependencies_fn {
+                let fn_name = format!("{template_type_name}_DeferFn");
+                pool_statements.push(Stmt::with_modifiers(
+                    StmtKind::DeclareVar {
+                        name: fn_name.clone(),
+                        value: Some(deps_fn.clone()),
+                        ty: None,
+                    },
+                    StmtModifier::FINAL,
+                ));
+                all_deferrable_deps_fn = Some(o::variable(fn_name, None));
+            }
+        }
+        R3ComponentDeferMetadata::PerBlock { blocks } => {
+            for (span, resolver) in blocks {
+                if let Some(resolver) = resolver {
+                    deferred_deps.insert(*span, resolver.clone());
+                }
+            }
         }
     }
 
@@ -1850,7 +1873,7 @@ where
     // [`TemplateBuilder`] is mode-agnostic, so there is nothing to thread through here.
 
     // Ingest + transform + emit (delegated to the template-builder abstraction).
-    let tpl = template_builder.build(meta, all_deferrable_deps_fn.as_ref());
+    let tpl = template_builder.build(meta, all_deferrable_deps_fn.as_ref(), &deferred_deps);
 
     // Hoisted nested-view functions live on `ConstantPool.statements` — top-level siblings emitted
     // before the `ɵɵdefineComponent({…})` call (Angular `ɵɵdefineComponent` is preceded by every

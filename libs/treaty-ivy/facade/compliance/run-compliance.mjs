@@ -401,6 +401,17 @@ function canonicalize(code) {
   // Map the exact `_t` token to `ID` so a query function compares equal regardless of the temp's
   // surface name. STRICT: only the standalone `_t` identifier token.
   s = s.replace(/\b_t\b/g, 'ID');
+  // A `@defer` block's lazy dependency resolver is a `ConstantPool` shared FUNCTION reference,
+  // emitted with the REAL deterministic name `<fullPathName>_Defer_<deferSlot>_DepsFn` (Angular
+  // `resolve_defer_deps_fns.ts` → `pool.getSharedFunctionReference(ownResolverFn,
+  // `${fullPathName}_Defer_${slot}_DepsFn`, /*useUniqueName*/ false)`), while the goldens spell the
+  // SAME reference with the renamable `$..._DepsFn$` expect-emit placeholder (already collapsed to
+  // `ID` above). This is the identical case as the `_cN` shared-LITERAL fold: map our literal pool
+  // function name to the SAME `ID` token so `ɵɵdefer(4, 2, MyApp_Defer_4_DepsFn, 3)` compares equal
+  // to the golden's `ɵɵdefer(4, 2, $MyApp_Defer_4_DepsFn$, 3)`. STRICT: only the exact
+  // `<Ident>_Defer_<digits>_DepsFn` pool-function token (the unambiguous renamable reference); the
+  // instruction name, argument order and slot indices around it are untouched.
+  s = s.replace(/\b[A-Za-z_][A-Za-z0-9_]*_Defer_\d+_DepsFn\b/g, 'ID');
   s = s.replace(/_r\d+\b/g, '_R'); // item_r1 -> item_R
   s = s.replace(/_\d+\b(?=_)/g, '_N'); // intermediate numeric segments in fn names
   // Drop the `type:` metadata entry the goldens vary on / Rust emits a TS type for.

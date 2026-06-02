@@ -3175,11 +3175,12 @@ impl TemplateBuilder for ForeignAwareTemplateBuilder {
         &mut self,
         meta: &R3ComponentMetadata<D>,
         all_deferrable_deps_fn: Option<&Expr>,
+        deferred_deps: &std::collections::HashMap<(u32, u32), Expr>,
     ) -> TemplateBuilderResult {
         if let Some(result) = Self::try_foreign(meta) {
             return result;
         }
-        self.inner.build(meta, all_deferrable_deps_fn)
+        self.inner.build(meta, all_deferrable_deps_fn, deferred_deps)
     }
 }
 
@@ -3278,6 +3279,58 @@ fn compile_component_meta(
         }
     }
 
+    // `@defer` DEPENDENCY SPLIT. A directive/pipe used only inside a `@defer` block's MAIN body is
+    // NOT eager: Angular drops it from the runtime `dependencies` array (it stays referenced solely
+    // through the block's lazy resolver thunk) and lists it in that block's `() => [Dep, …]`
+    // resolver, passed as `ɵɵdefer`'s third argument. Compute the eager/lazy split over the SAME
+    // candidate sets `declarations` was matched from, then (a) filter `declarations` to the eager
+    // set and (b) build a PerBlock resolver per block (keyed by the block's `main_block_span`).
+    let defer_info = crate::compile::compute_defer_dependencies(
+        &r3.nodes,
+        &candidates,
+        selector_candidates,
+    );
+    let defer_meta = if defer_info.has_defer_blocks() {
+        // Drop deps that are referenced ONLY inside a `@defer` main body (not in the eager set).
+        declarations.retain(|d| match &d.ty.kind {
+            crate::output_ast::ExprKind::ReadVar { name } => defer_info.eager_names.contains(name),
+            // Non-identifier dependency types are left untouched (never produced by this front-end).
+            _ => true,
+        });
+
+        // One resolver thunk per block. A block with NO lazy deps maps to `None` (no resolver).
+        // Local (in-scope, non-deferrable) deps emit as a bare type reference — `() => [LazyDep]`
+        // (`compileDeferResolverFunction`: `isDeferrable: false` → `dep.typeReference`).
+        let mut blocks: std::collections::HashMap<(u32, u32), Option<Expr>> =
+            std::collections::HashMap::new();
+        for block in &defer_info.blocks {
+            let resolver = if block.names.is_empty() {
+                None
+            } else {
+                let dependencies = block
+                    .names
+                    .iter()
+                    .map(|name| crate::view::compiler::R3DeferPerBlockDependency {
+                        type_reference: o::variable(name, None),
+                        symbol_name: name.clone(),
+                        is_deferrable: false,
+                        import_path: None,
+                        is_default_import: false,
+                    })
+                    .collect();
+                Some(crate::view::compiler::compile_defer_resolver_function(
+                    &crate::view::compiler::R3DeferResolverFunctionMetadata::PerBlock { dependencies },
+                ))
+            };
+            blocks.insert(block.span, resolver);
+        }
+        R3ComponentDeferMetadata::PerBlock { blocks }
+    } else {
+        R3ComponentDeferMetadata::PerComponent {
+            dependencies_fn: None,
+        }
+    };
+
     let has_directive_dependencies = !declarations.is_empty();
 
     // DECLARATION-LIST EMIT MODE (Angular `DeclarationListEmitMode`). The runtime `dependencies`
@@ -3315,9 +3368,10 @@ fn compile_component_meta(
             preserve_whitespaces: None,
         },
         declarations,
-        defer: R3ComponentDeferMetadata::PerComponent {
-            dependencies_fn: None,
-        },
+        // @defer per-block lazy dependency resolver fns (c9fcec3) + closure-wrapped forward-ref
+        // dependency thunking (f8cca19): keep BOTH — the defer metadata AND the forward-ref-driven
+        // declaration_list_emit_mode variable.
+        defer: defer_meta,
         declaration_list_emit_mode,
         styles,
         external_styles: None,
