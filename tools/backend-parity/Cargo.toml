@@ -1,0 +1,44 @@
+# backend-parity — deterministic (NO-AI) backend-parity harness for Treaty's Ivy compiler.
+#
+# Mirrors `tools/render3-sync` in shape + spirit, but the two sides it diffs are
+# **oxc-built Treaty vs swc-built Treaty** (same compiler, two parser/codegen backends)
+# rather than Treaty vs Angular. See `migration/SWC-BACKEND-PLAN.md` §4 — this tool is
+# specified there as `tools/backend-parity`, asserting BYTE-IDENTICAL Ivy across backends.
+#
+# STANDALONE: this crate carries its OWN empty [workspace] table so it detaches from the
+# parent Treaty workspace (`D:/dev/treaty/Cargo.toml`). It is built/tested in isolation
+# (`cargo run -p backend-parity -- parity`) and depends on the REAL compiler crate
+# `treaty_ivy` (the facade) BY PATH so it compiles fixtures for real on the oxc side.
+[workspace]
+
+[package]
+name = "backend-parity"
+version = "0.1.0"
+edition = "2024"
+description = "Deterministic backend-parity harness asserting byte-identical Ivy across Treaty's oxc/swc backends (NO AI)"
+publish = false
+
+[lib]
+name = "backend_parity"
+path = "src/lib.rs"
+
+[[bin]]
+name = "backend-parity"
+path = "src/main.rs"
+
+[features]
+# `oxc` is the default and the reference backend — it is REAL and works today. `swc` is a
+# placeholder gate (see `src/backend/swc.rs`): when off, the swc backend is SKIPPED with a
+# logged notice so the harness compiles + runs on oxc alone, and is READY to diff swc the
+# moment the SWC emit/parse backends land (SWC-BACKEND-PLAN.md phases 2-3).
+default = ["oxc"]
+oxc = []
+swc = []
+
+[dependencies]
+# The REAL Treaty Ivy compiler (the facade crate, package name `treaty_ivy`). The OxcBackend
+# calls its `compile::compile_component` entry point to emit Ivy for each fixture for real.
+treaty_ivy = { path = "../../libs/treaty-ivy/facade" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

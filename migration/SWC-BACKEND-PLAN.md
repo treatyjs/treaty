@@ -218,6 +218,9 @@ sufficient to keep the backends 1:1.
 
 ## 4. The 1:1 parity harness (CI gate) — `tools/backend-parity`
 
+> Status: the parity harness (§4) is now scaffolded at `tools/backend-parity` and gated in CI
+> (`parity` + `drift` in `.github/workflows/rust-tests.yml`); see `migration/BACKEND-PARITY.md`.
+
 Mirror the deterministic NO-AI shape of `tools/render3-sync` (a Rust CLI that exits non-zero on
 drift; see `tools/render3-sync/src/main.rs` and its `drift` / `codegen-verify` subcommands). The
 backend gate is conceptually `render3-sync drift`, but the two sides being diffed are

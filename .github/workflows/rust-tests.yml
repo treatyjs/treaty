@@ -40,3 +40,19 @@ jobs:
       # likewise outside `--workspace`. Gate it here so the dep-updater core is covered too.
       - name: dep-updater crate (standalone workspace)
         run: cargo test --manifest-path tools/dep-updater/Cargo.toml
+
+      # tools/backend-parity is the deterministic (NO-AI) backend-parity harness (see
+      # migration/SWC-BACKEND-PLAN.md §4 and migration/BACKEND-PARITY.md). Like dep-updater it is its
+      # own standalone workspace, so it is outside `--workspace` and must be gated explicitly. The
+      # `parity` subcommand compiles the shared corpus through every wired backend and asserts the
+      # emitted Ivy is byte-identical (today: the oxc baseline oxc-vs-oxc; once the swc feature lands,
+      # real oxc<->swc cross-backend parity). It exits non-zero on any byte diff.
+      - name: backend-parity — oxc baseline + cross-backend parity (standalone workspace)
+        run: cargo run --manifest-path tools/backend-parity/Cargo.toml -- parity
+
+      # `drift` re-fingerprints the live corpus against the committed parity baseline (the
+      # tripwire artifact, mirroring tools/render3-sync/baseline.json) and exits non-zero when the
+      # emitted Ivy for any fixture has moved out from under the baseline, so unreviewed output
+      # changes fail the build.
+      - name: backend-parity — drift vs committed baseline (standalone workspace)
+        run: cargo run --manifest-path tools/backend-parity/Cargo.toml -- drift
