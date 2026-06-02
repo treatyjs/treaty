@@ -855,6 +855,16 @@ fn assemble_flat_body(
         let span = oxc_span::GetSpan::span(stmt);
         let (start, end) = (span.start as usize, span.end as usize);
 
+        // TS type-only declarations (`type X = …`, `interface X {}`) carry no runtime and are NOT
+        // valid JavaScript — splicing them into the emitted `.mjs` makes Node/esbuild choke on the
+        // bare `type`/`interface` keyword ("Expected ;"). Drop them.
+        if matches!(
+            stmt,
+            Statement::TSTypeAliasDeclaration(_) | Statement::TSInterfaceDeclaration(_)
+        ) {
+            continue;
+        }
+
         // The component declaration → its flattened inner body.
         if start == decl_start && end == decl_end {
             out.push_str(component.component_body.trim());
@@ -883,6 +893,15 @@ fn assemble_flat_body(
         // `export … from '…'`) carries nothing to keep in the body and is dropped.
         if let Statement::ExportNamedDeclaration(export) = stmt {
             if let Some(declaration) = &export.declaration {
+                // `export type X = …` / `export interface X {}` are type-only — drop, don't splice
+                // the inner type decl (it is not valid JS in the emitted module).
+                use oxc_ast::ast::Declaration;
+                if matches!(
+                    declaration,
+                    Declaration::TSTypeAliasDeclaration(_) | Declaration::TSInterfaceDeclaration(_)
+                ) {
+                    continue;
+                }
                 let decl_span = oxc_span::GetSpan::span(declaration);
                 out.push_str(&source[decl_span.start as usize..decl_span.end as usize]);
                 out.push('\n');
@@ -961,6 +980,27 @@ export default function counter() {\n  return <section>hi</section>;\n}\n";
             "ng-component default must not survive; got: {}",
             out.code
         );
+    }
+
+    #[test]
+    fn top_level_type_and_interface_declarations_are_stripped() {
+        // Regression: a top-level TS `type X = …` / `interface Y {}` (and their `export` forms) are
+        // type-only and must NOT survive into the emitted `.mjs` — they are not valid JavaScript, so
+        // esbuild/Node choke on the bare `type`/`interface` keyword ("Expected ;"). The React Alert
+        // showcase component declared `type AlertType = 'info' | …` and broke the packaged bundle.
+        let source = "import { useState } from 'react';\n\
+type AlertType = 'info' | 'warning' | 'error' | 'success';\n\
+interface Props { kind: AlertType }\n\
+export type Alias = string;\n\
+export default function Alert({ kind }: Props) {\n  const [open, setOpen] = useState(true);\n  return <div className={kind}>{open}</div>;\n}\n";
+        let out = compile(source, "alert.tsx");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+        assert!(!code.contains("type AlertType"), "top-level `type` alias leaked: {code}");
+        assert!(!code.contains("interface Props"), "top-level `interface` leaked: {code}");
+        assert!(!code.contains("export type Alias"), "`export type` leaked: {code}");
+        // The emitted client module must parse as valid JS/TS (no bare `type`/`interface` statement).
+        assert_well_formed_module(code);
     }
 
     #[test]
