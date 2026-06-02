@@ -127,17 +127,31 @@ pub fn transform(javascript: &str) -> SignalTransform {
 
 /// Auto-call signal reads in an already-lowered template HTML string.
 ///
-/// A bare interpolation `{{ x }}` whose expression reads a signal variable `x` becomes `{{ x() }}`
-/// so the value (not the signal function) renders. The rewrite is identifier-scoped: it auto-calls
-/// `x` as a standalone read and as the *object* of a member/access chain (`{{ x.name }}` →
-/// `{{ x().name }}`, `{{ x[0] }}` → `{{ x()[0] }}`), but never an `x` that is already a call
-/// (`{{ x() }}` stays `{{ x() }}`) or a property name (`{{ obj.x }}` is untouched). Identifiers that
-/// are not in `signals` pass through unchanged.
+/// Two kinds of region are rewritten so a signal read evaluates the VALUE (calling the signal
+/// function) rather than the signal function itself:
 ///
-/// Only `{{ … }}` interpolation regions are touched; element/attribute markup outside them is left
-/// exactly as produced by the template lowering.
+///   * **interpolation** — a bare `{{ x }}` whose expression reads a signal `x` becomes `{{ x() }}`.
+///     The rewrite is identifier-scoped: it auto-calls `x` as a standalone read and as the *object*
+///     of a member/access chain (`{{ x.name }}` → `{{ x().name }}`, `{{ x[0] }}` → `{{ x()[0] }}`),
+///     but never an `x` that is already a call (`{{ x() }}`) or a property name (`{{ obj.x }}`).
+///   * **control-flow heads** — the parenthesized condition/iterable/subject of an Angular block
+///     control-flow keyword (`@if (cond)`, `@else if (cond)`, `@for (item of items; track …)`,
+///     `@switch (subject)`, `@case (value)`) is rewritten the SAME way. This is the critical case
+///     behind the toggle bug: a React `{expanded && <X/>}` lowers to `@if (expanded) { … }`, and
+///     because `expanded` is a `WritableSignal` (a function, always truthy) the bare `@if (expanded)`
+///     never toggled — it must read `@if (expanded()) { … }`. The `@for` head's loop variable, the
+///     `of`/`track`/`let` keywords, and the implicit `$index`/`$count`/… variables are never in the
+///     component signal set, so running the same identifier-scoped auto-call over the whole head only
+///     ever calls the genuine signal reads (the iterable, the switch subject, the case value).
+///
+/// Identifiers that are not in `signals` pass through unchanged, and all markup outside an
+/// interpolation region or a control-flow head is left exactly as produced by the template lowering.
 pub fn auto_call_template(template_html: &str, signals: &HashSet<String>) -> String {
-    if signals.is_empty() || !template_html.contains("{{") {
+    // Nothing to do without signals, or without either an interpolation or a control-flow head to
+    // rewrite. (`@` alone is the cheap pre-check for any `@if`/`@for`/`@switch`/`@case` head.)
+    if signals.is_empty()
+        || (!template_html.contains("{{") && !template_html.contains('@'))
+    {
         return template_html.to_string();
     }
 
@@ -157,12 +171,106 @@ pub fn auto_call_template(template_html: &str, signals: &HashSet<String>) -> Str
                 continue;
             }
         }
-        // Copy this byte verbatim (UTF-8 safe: we only special-case ASCII `{`).
+        // A control-flow keyword head: `@if (…)` / `@else if (…)` / `@for (…)` / `@switch (…)` /
+        // `@case (…)`. Auto-call the signal reads inside the parenthesized head so the condition /
+        // iterable / subject evaluates the signal VALUE rather than the always-truthy function.
+        if bytes[i] == b'@' {
+            if let Some((head_open, head_close)) = control_flow_head_span(template_html, i) {
+                // Copy `@keyword [if] (` verbatim, rewrite the head body, copy the closing `)`.
+                out.push_str(&template_html[i..head_open + 1]);
+                let head = &template_html[head_open + 1..head_close];
+                out.push_str(&auto_call_expression(head, signals));
+                out.push(')');
+                i = head_close + 1;
+                continue;
+            }
+        }
+        // Copy this byte verbatim (UTF-8 safe: we only special-case ASCII `{` / `@`).
         let ch_len = utf8_char_len(bytes[i]);
         out.push_str(&template_html[i..i + ch_len]);
         i += ch_len;
     }
     out
+}
+
+/// The control-flow keywords whose parenthesized head carries a binding expression that may read a
+/// signal: `@if`/`@else if`/`@for`/`@switch`/`@case`. (`@else`, `@empty`, `@default` have no head;
+/// `@for`'s head is included so its iterable read auto-calls.)
+const CONTROL_FLOW_HEAD_KEYWORDS: &[&str] = &["if", "for", "switch", "case"];
+
+/// If an Angular control-flow keyword with a parenthesized head begins at byte `at` (where
+/// `template_html.as_bytes()[at] == b'@'`), return `(open_paren_index, close_paren_index)` — the byte
+/// offset of the head's opening `(` and of its matching `)`. Returns `None` when the `@` is not a
+/// head-bearing control-flow keyword (`@else`/`@empty`/`@default`, a decorator, stray `@`), or the
+/// head is not a balanced parenthesized group.
+///
+/// `@else if (…)` is recognized: after `@else` the `if` keyword is skipped before the head paren, so
+/// the `else-if` condition is rewritten just like a leading `@if`.
+fn control_flow_head_span(template_html: &str, at: usize) -> Option<(usize, usize)> {
+    let bytes = template_html.as_bytes();
+    let kw_start = at + 1;
+    let kw_end = ident_end_in(bytes, kw_start);
+    let keyword = &template_html[kw_start..kw_end];
+
+    // Only a head-bearing keyword (and `@else if`, handled below) carries a condition to rewrite.
+    let mut cursor = skip_ws_in(bytes, kw_end);
+    if keyword == "else" {
+        // `@else if (…)` — skip the `if` keyword to reach its head; bare `@else` has no head.
+        let kw2_end = ident_end_in(bytes, cursor);
+        if &template_html[cursor..kw2_end] != "if" {
+            return None;
+        }
+        cursor = skip_ws_in(bytes, kw2_end);
+    } else if !CONTROL_FLOW_HEAD_KEYWORDS.contains(&keyword) {
+        return None;
+    }
+
+    if cursor >= bytes.len() || bytes[cursor] != b'(' {
+        return None;
+    }
+    let open = cursor;
+    let after = match_balanced_parens(bytes, open)?;
+    // `after` is one past the matching `)`; the head body is `[open+1, after-1)`.
+    Some((open, after - 1))
+}
+
+/// Index just past the identifier starting at `start` (ASCII identifier bytes).
+fn ident_end_in(bytes: &[u8], start: usize) -> usize {
+    let mut i = start;
+    while i < bytes.len() && is_ident_byte(bytes[i]) {
+        i += 1;
+    }
+    i
+}
+
+/// Index of the first non-whitespace byte at or after `start`.
+fn skip_ws_in(bytes: &[u8], start: usize) -> usize {
+    let mut i = start;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+/// Given `bytes[open] == b'('`, return the index just past the matching `)`, honouring nested
+/// parens (a head like `@if (a(b) > 0)` balances). Returns `None` if never closed.
+fn match_balanced_parens(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = open;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -1352,6 +1460,103 @@ mod tests {
         assert_eq!(
             auto_call_template("<div count=\"x\">text</div>", &signals),
             "<div count=\"x\">text</div>"
+        );
+    }
+
+    // --- Control-flow head auto-call (GAP 1) ----------------------------------
+
+    #[test]
+    fn if_condition_signal_read_is_auto_called() {
+        // The headline toggle bug: `{expanded && <p/>}` lowers to `@if (expanded) { … }`, and
+        // `expanded` is a WritableSignal (a function, always truthy) — the head MUST call it.
+        let signals = sig_set(&["expanded"]);
+        assert_eq!(
+            auto_call_template("@if (expanded) { <p>x</p> }", &signals),
+            "@if (expanded()) { <p>x</p> }"
+        );
+    }
+
+    #[test]
+    fn if_already_called_condition_is_not_double_called() {
+        let signals = sig_set(&["expanded"]);
+        assert_eq!(
+            auto_call_template("@if (expanded()) { <p>x</p> }", &signals),
+            "@if (expanded()) { <p>x</p> }"
+        );
+    }
+
+    #[test]
+    fn negated_if_condition_signal_read_is_auto_called() {
+        // `{!dismissed && <div/>}` (alert.tsx) → `@if (!dismissed) { … }` → `@if (!dismissed()) { … }`.
+        let signals = sig_set(&["dismissed"]);
+        assert_eq!(
+            auto_call_template("@if (!dismissed) { <div>x</div> }", &signals),
+            "@if (!dismissed()) { <div>x</div> }"
+        );
+    }
+
+    #[test]
+    fn if_else_if_else_conditions_all_auto_call() {
+        // Every condition in an `@if`/`@else if`/`@else` chain auto-calls its signal reads; the
+        // value-less `@else` keyword (no head) is untouched.
+        let signals = sig_set(&["a", "b"]);
+        assert_eq!(
+            auto_call_template(
+                "@if (a) { <p>a</p> } @else if (b) { <p>b</p> } @else { <p>c</p> }",
+                &signals
+            ),
+            "@if (a()) { <p>a</p> } @else if (b()) { <p>b</p> } @else { <p>c</p> }"
+        );
+    }
+
+    #[test]
+    fn for_iterable_signal_read_is_auto_called_but_loop_var_is_not() {
+        // The `@for` iterable is a signal read and must be called; the loop variable `item`, the
+        // `track` expression's `item`, the `of`/`track` keywords, and `$index` are NOT component
+        // signals and are left untouched.
+        let signals = sig_set(&["items"]);
+        assert_eq!(
+            auto_call_template(
+                "@for (item of items; track item; let i = $index) { <li>{{ item }}</li> }",
+                &signals
+            ),
+            "@for (item of items(); track item; let i = $index) { <li>{{ item }}</li> }"
+        );
+    }
+
+    #[test]
+    fn switch_subject_and_case_value_signal_reads_auto_call() {
+        let signals = sig_set(&["mode", "state"]);
+        assert_eq!(
+            auto_call_template(
+                "@switch (mode) { @case (state) { <p>x</p> } @default { <p>y</p> } }",
+                &signals
+            ),
+            "@switch (mode()) { @case (state()) { <p>x</p> } @default { <p>y</p> } }"
+        );
+    }
+
+    #[test]
+    fn decorator_at_sign_is_not_a_control_flow_head() {
+        // A non-control-flow `@` (an `@switchblade`-style identifier, or a stray `@`) is left alone:
+        // only the reserved control-flow keywords have a head that is rewritten.
+        let signals = sig_set(&["x"]);
+        assert_eq!(
+            auto_call_template("<div data-at=\"@x\">@ x</div>", &signals),
+            "<div data-at=\"@x\">@ x</div>"
+        );
+    }
+
+    #[test]
+    fn interpolation_and_if_head_both_rewrite_in_one_template() {
+        // Both region kinds coexist: the `@if` head AND a body interpolation are auto-called.
+        let signals = sig_set(&["expanded", "description"]);
+        assert_eq!(
+            auto_call_template(
+                "@if (expanded) { <p>{{ description }}</p> }",
+                &signals
+            ),
+            "@if (expanded()) { <p>{{ description() }}</p> }"
         );
     }
 }

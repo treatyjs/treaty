@@ -31,7 +31,7 @@
 
 use oxc_ast::ast::{
     Expression, JSXAttributeItem, JSXAttributeName, JSXAttributeValue, JSXChild, JSXElement,
-    JSXElementName, JSXExpression, JSXFragment, ObjectExpression, ObjectPropertyKind,
+    JSXElementName, JSXExpression, JSXFragment, ObjectExpression, ObjectPropertyKind, Statement,
 };
 
 /// Lower a JSX element into its Angular template HTML string.
@@ -293,6 +293,15 @@ fn lower_attribute(out: &mut String, attr: &oxc_ast::ast::JSXAttribute, source: 
     // `on`-prefix is intact.
     if let Some(event) = super::directives::event_name(&raw_name) {
         if let Some(JSXAttributeValue::ExpressionContainer(container)) = &attr.value {
+            // An INLINE-ARROW handler (`onClick={() => doThing()}` / `onClick={(e) => f(e)}`) must be
+            // UNWRAPPED: an Angular event binding's value IS the action statement, so emitting the
+            // arrow verbatim binds an action that merely *returns* a function (it never runs). Unwrap
+            // the arrow to its body, mapping a single parameter to Angular's `$event`. A non-arrow
+            // handler (a bare reference or a call) falls through to `lower_event`.
+            if let Some(action) = unwrap_inline_arrow_handler(&container.expression, source) {
+                push_event_binding(out, &event, action.trim());
+                return;
+            }
             if let Some(text) = expression_text(&container.expression, source) {
                 lower_event(out, &event, text.trim());
             }
@@ -514,17 +523,207 @@ fn push_property_binding(out: &mut String, name: &str, expr: &str) {
 /// (it contains a `(`), it is emitted verbatim; a bare reference (`handler`) is invoked with
 /// `$event` so the DOM event reaches the handler.
 fn lower_event(out: &mut String, event: &str, handler: &str) {
+    let action = if handler.contains('(') {
+        handler.to_string()
+    } else {
+        format!("{handler}($event)")
+    };
+    push_event_binding(out, event, &action);
+}
+
+/// `(event)="action"` (Angular event binding) — emit the exact action expression as the binding
+/// value. The caller has already produced the final action text (a call, a bare-reference invocation,
+/// or an unwrapped inline-arrow body).
+fn push_event_binding(out: &mut String, event: &str, action: &str) {
     out.push(' ');
     out.push('(');
     out.push_str(event);
     out.push_str(")=\"");
-    if handler.contains('(') {
-        out.push_str(handler);
-    } else {
-        out.push_str(handler);
-        out.push_str("($event)");
-    }
+    out.push_str(action);
     out.push('"');
+}
+
+/// If `expression` is an INLINE ARROW handler (`() => BODY` / `(e) => BODY` / `(e) => { … }`),
+/// return its body lowered to an Angular event ACTION string (the arrow envelope removed), or `None`
+/// for any non-arrow handler (a bare reference / call), which the caller lowers normally.
+///
+/// Why unwrap: an Angular event binding's value is an action *statement*, evaluated when the event
+/// fires — `(click)="doThing()"`. Emitting the React arrow verbatim (`(click)="() => doThing()"`)
+/// binds an action that merely **constructs and returns** a function; the body never runs. So we drop
+/// the arrow and bind its body directly.
+///
+/// Parameter mapping: an event arrow takes the DOM event as its first parameter, which Angular
+/// exposes as the implicit `$event`. A single simple parameter (`(e) => …`) is renamed to `$event`
+/// throughout the body; a zero-parameter arrow (`() => …`) needs no mapping. An arrow with a
+/// destructured / multi parameter is out of scope (returns `None` → emitted verbatim, the prior
+/// behaviour), since it has no single `$event` mapping.
+///
+/// Body shape: an expression body (`() => f()`) lowers its expression; a block body (`() => { a(); b(); }`)
+/// lowers to its inner statements joined with `; ` (Angular allows a `;`-separated action chain). The
+/// body text is TS-erased via [`expression_source`] so the template-expression parser accepts it.
+fn unwrap_inline_arrow_handler(expression: &JSXExpression, source: &str) -> Option<String> {
+    let expr = expression.as_expression()?;
+    let arrow = match expr {
+        Expression::ArrowFunctionExpression(arrow) => arrow.as_ref(),
+        // A parenthesized arrow (`onClick={(() => f())}`) unwraps the same.
+        Expression::ParenthesizedExpression(p) => {
+            return unwrap_inline_arrow_handler_expr(&p.expression, source);
+        }
+        _ => return None,
+    };
+    unwrap_arrow(arrow, source)
+}
+
+/// [`unwrap_inline_arrow_handler`] over a plain `Expression` (used to recurse through a parenthesized
+/// wrapper).
+fn unwrap_inline_arrow_handler_expr(expr: &Expression, source: &str) -> Option<String> {
+    match expr {
+        Expression::ArrowFunctionExpression(arrow) => unwrap_arrow(arrow, source),
+        Expression::ParenthesizedExpression(p) => {
+            unwrap_inline_arrow_handler_expr(&p.expression, source)
+        }
+        _ => None,
+    }
+}
+
+/// Lower an arrow handler's body to an Angular action string, mapping a single parameter to `$event`.
+fn unwrap_arrow(
+    arrow: &oxc_ast::ast::ArrowFunctionExpression,
+    source: &str,
+) -> Option<String> {
+    // Determine the single parameter name to map to `$event`, if any. Zero params → no mapping; a
+    // single simple identifier param → map it; anything else (destructure / multiple) → out of scope.
+    let param_name: Option<String> = match arrow.params.items.len() {
+        0 => None,
+        1 => {
+            let pat = &arrow.params.items[0].pattern;
+            match pat {
+                oxc_ast::ast::BindingPattern::BindingIdentifier(id) => Some(id.name.to_string()),
+                // A destructured / defaulted single param has no single `$event` rename target.
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+
+    // Lower the body: an expression body is the single expression; a block body is its statements
+    // joined into a `;`-separated action chain. Each piece is TS-erased.
+    let body_text = if arrow.expression {
+        let Statement::ExpressionStatement(stmt) = arrow.body.statements.first()? else {
+            return None;
+        };
+        expression_source(&stmt.expression, source)
+    } else {
+        let mut actions: Vec<String> = Vec::new();
+        for stmt in &arrow.body.statements {
+            match stmt {
+                Statement::ExpressionStatement(s) => {
+                    actions.push(expression_source(&s.expression, source));
+                }
+                // A `return EXPR;` inside the action body contributes the expression (the return value
+                // is meaningless for an event action, but the expression's side effects matter).
+                Statement::ReturnStatement(r) => {
+                    if let Some(arg) = &r.argument {
+                        actions.push(expression_source(arg, source));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if actions.is_empty() {
+            return None;
+        }
+        actions.join("; ")
+    };
+
+    // Map the parameter to `$event` if there was one. The rename is identifier-scoped over the body
+    // text (a tokenizing pass that skips string literals and member-property positions), so a `prop`
+    // named the same as the param is not rewritten.
+    let action = match param_name {
+        Some(name) => rename_identifier(&body_text, &name, "$event"),
+        None => body_text,
+    };
+    Some(action.trim().to_string())
+}
+
+/// Rename every standalone identifier read `from` → `to` in a template-expression string, skipping
+/// string literals and member-property positions (`obj.from` keeps its property name). Used to map an
+/// unwrapped arrow handler's single parameter onto Angular's implicit `$event`.
+fn rename_identifier(expr: &str, from: &str, to: &str) -> String {
+    let bytes = expr.as_bytes();
+    let mut out = String::with_capacity(expr.len());
+    let mut i = 0usize;
+    let mut prev_was_dot = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        // Skip string literals verbatim.
+        if b == b'"' || b == b'\'' || b == b'`' {
+            let quote = b;
+            let start = i;
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == quote {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            out.push_str(&expr[start..i.min(expr.len())]);
+            prev_was_dot = false;
+            continue;
+        }
+        if is_ident_start(b) {
+            let start = i;
+            i += 1;
+            while i < bytes.len() && is_ident_continue(bytes[i]) {
+                i += 1;
+            }
+            let word = &expr[start..i];
+            if !prev_was_dot && word == from {
+                out.push_str(to);
+            } else {
+                out.push_str(word);
+            }
+            prev_was_dot = false;
+            continue;
+        }
+        if b.is_ascii_whitespace() {
+            out.push(b as char);
+            i += 1;
+            continue;
+        }
+        prev_was_dot = b == b'.';
+        let ch_len = char_len(b);
+        out.push_str(&expr[i..i + ch_len]);
+        i += ch_len;
+    }
+    out
+}
+
+fn is_ident_start(b: u8) -> bool {
+    b.is_ascii_alphabetic() || b == b'_' || b == b'$'
+}
+
+fn is_ident_continue(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
+}
+
+fn char_len(b: u8) -> usize {
+    if b < 0x80 {
+        1
+    } else if b >> 5 == 0b110 {
+        2
+    } else if b >> 4 == 0b1110 {
+        3
+    } else if b >> 3 == 0b11110 {
+        4
+    } else {
+        1
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -796,6 +995,64 @@ mod tests {
         );
     }
 
+    // ----- inline-arrow event handlers (GAP 2) ------------------------------
+
+    #[test]
+    fn inline_zero_arg_arrow_handler_is_unwrapped() {
+        // `onClick={() => setCount(c => c + 1)}` must NOT bind the arrow verbatim (which would only
+        // RETURN a function). The arrow is unwrapped to its body — the action that actually runs.
+        // (The `setCount` setter rewrite is a later react-mode pass; here we assert the unwrap.)
+        let out = lower("<button onClick={() => setCount(c => c + 1)}>x</button>");
+        assert_eq!(
+            out,
+            "<button (click)=\"setCount(c => c + 1)\">x</button>",
+            "inline arrow not unwrapped; got {out}"
+        );
+    }
+
+    #[test]
+    fn inline_single_param_arrow_handler_maps_param_to_dollar_event() {
+        // A single-parameter arrow maps its param to Angular's implicit `$event`.
+        let out = lower("<input onInput={(e) => handle(e.target.value)} />");
+        assert_eq!(
+            out,
+            "<input (input)=\"handle($event.target.value)\" />",
+            "param not mapped to $event; got {out}"
+        );
+    }
+
+    #[test]
+    fn inline_block_body_arrow_handler_joins_statements() {
+        // A block-bodied arrow lowers to a `;`-separated action chain.
+        let out = lower("<button onClick={() => { a(); b(); }}>x</button>");
+        assert_eq!(
+            out,
+            "<button (click)=\"a(); b()\">x</button>",
+            "block body not joined; got {out}"
+        );
+    }
+
+    #[test]
+    fn inline_arrow_param_shadows_property_name_only_renames_reads() {
+        // The param rename is identifier-scoped: a property named the same as the param (`o.e`) is
+        // NOT renamed, only the standalone read.
+        let out = lower("<button onClick={(e) => use(e, o.e)}>x</button>");
+        assert_eq!(
+            out,
+            "<button (click)=\"use($event, o.e)\">x</button>",
+            "property-name wrongly renamed; got {out}"
+        );
+    }
+
+    #[test]
+    fn plain_reference_handler_still_invokes_with_dollar_event() {
+        // A NON-arrow handler (a bare reference) is unchanged: it is still invoked with `$event`.
+        assert_eq!(
+            lower("<button onClick={toggle}>x</button>"),
+            "<button (click)=\"toggle($event)\">x</button>"
+        );
+    }
+
     #[test]
     fn event_name_derivation() {
         assert!(lower("<a onMouseEnter={h}></a>").contains("(mouseenter)="));
@@ -947,9 +1204,10 @@ mod tests {
 
     #[test]
     fn handler_inline_arrow_with_as_assertion_erases_to_input_binding_without_as() {
-        // (1) The headline case: an inline `onInput` handler that casts the event target. The `as`
-        //     assertion is erased, so the emitted `(input)` binding carries plain JS the template
-        //     grammar can parse — and crucially contains no `as`.
+        // (1) The headline case: an inline `onInput` handler that casts the event target. The arrow
+        //     is UNWRAPPED (its body is the action), the single `event` param maps to `$event`, and
+        //     the `as` assertion is erased — so the emitted `(input)` binding is plain JS the template
+        //     grammar can parse, with no `as` and no leftover arrow.
         let out = lower(
             "<input onInput={(event) => name.set((event.target as HTMLInputElement).value)} />",
         );
@@ -961,34 +1219,41 @@ mod tests {
             !out.contains(" as "),
             "TS `as` assertion was not erased; got {out}"
         );
-        // The behaviour-bearing JS is intact: the arrow still sets the signal from the target value.
+        assert!(!out.contains("=>"), "inline arrow not unwrapped; got {out}");
+        // The behaviour-bearing JS is intact: the action sets the signal from the `$event` target.
         assert!(
-            out.contains("name.set((event.target).value)")
-                || out.contains("name.set(event.target.value)"),
+            out.contains("name.set(($event.target).value)")
+                || out.contains("name.set($event.target.value)"),
             "handler body lost/garbled; got {out}"
         );
     }
 
     #[test]
     fn handler_arrow_with_typed_params_drops_annotation() {
-        // (2) An arrow with a typed parameter drops the `: Event` annotation but keeps the param.
+        // (2) An arrow with a typed parameter is UNWRAPPED, the `: Event` annotation is erased, and
+        //     the param maps to `$event`.
         let out = lower("<button onClick={(e: Event) => handle(e)}>x</button>");
         assert!(out.contains("(click)="), "no click binding; got {out}");
         assert!(!out.contains(": Event"), "param type not erased; got {out}");
         assert!(!out.contains(" Event"), "type leaked into output; got {out}");
-        assert!(
-            out.contains("(e) =>") && out.contains("handle(e)"),
-            "arrow param/body garbled; got {out}"
+        assert!(!out.contains("=>"), "inline arrow not unwrapped; got {out}");
+        assert_eq!(
+            out, "<button (click)=\"handle($event)\">x</button>",
+            "arrow not unwrapped to its $event-mapped body; got {out}"
         );
     }
 
     #[test]
     fn handler_arrow_with_return_type_drops_annotation() {
-        // A return-type annotation on the arrow is erased too.
+        // A return-type annotation on the (unwrapped) arrow is erased too.
         let out = lower("<button onClick={(): void => go()}>x</button>");
         assert!(out.contains("(click)="), "no click binding; got {out}");
         assert!(!out.contains("void"), "return type not erased; got {out}");
-        assert!(out.contains("() =>") && out.contains("go()"), "arrow garbled; got {out}");
+        assert!(!out.contains("=>"), "inline arrow not unwrapped; got {out}");
+        assert_eq!(
+            out, "<button (click)=\"go()\">x</button>",
+            "arrow not unwrapped to its body; got {out}"
+        );
     }
 
     #[test]

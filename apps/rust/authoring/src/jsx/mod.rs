@@ -315,7 +315,7 @@ pub fn compile(source: &str, file_name: &str) -> CompiledAuthoring {
     // 3b. Restore the Angular control-flow blocks lifted in step 1b: swap each `<treaty-cf-N />`
     //     placeholder back to its lowered `@if`/`@for`/`@switch` HTML. Done before the signals pass
     //     so block-body interpolations are auto-called consistently with the rest of the template.
-    let template_html = angular_blocks::restore(&template_html, &cf_blocks);
+    let mut template_html = angular_blocks::restore(&template_html, &cf_blocks);
 
     // 4. When a server fn was lifted (a `server { … }` block, OR a top-level `$$` / `'use server'` /
     //    `'use websocket'` marker), emit it through the backend [`PluginRegistry`] default (axum +
@@ -367,6 +367,14 @@ pub fn compile(source: &str, file_name: &str) -> CompiledAuthoring {
         let mut body_call_signals = rt.signals.clone();
         body_call_signals.extend(prop_signals.iter().cloned());
         let javascript = react::auto_call_body(&rt.javascript, &body_call_signals);
+        // TEMPLATE EVENT HANDLERS (react mode): an inline-arrow handler in the JSX was UNWRAPPED to
+        // its body by the template lowering (so the template already carries `(click)="setCount(c =>
+        // c + 1)"`), but its React setter call and any bare signal reads still need the same setter /
+        // auto-call rewrites the body got. Run them now that the setters/signals are known:
+        // `setCount(c => c + 1)` → `count.update(c => c + 1)`, a `setX(v)` → `x.set(v)`, a bare read →
+        // a call. This is scoped to react mode for the same reason the body auto-call is.
+        template_html =
+            react::rewrite_template_handlers(&template_html, &rt.setters, &body_call_signals);
         (javascript, rt.signals, rt.diagnostics)
     } else {
         (javascript, std::collections::HashSet::new(), Vec::new())
@@ -1848,10 +1856,11 @@ export default function Counter() {\n\
             "@if/@else did not lower to a conditional; got: {code}"
         );
         // The `@else` produced a two-arm conditional: the selector picks branch 1 or 2 on the
-        // condition (`ctx.ok ? 1 : 2`), not the single-arm `? 1 : -1` form.
+        // condition, not the single-arm `? 1 : -1` form. `ok` is a signal-by-default (`const ok =
+        // true`), so the `@if` head auto-calls the signal read: `ctx.ok() ? 1 : 2` (GAP 1).
         assert!(
-            code.contains("ctx.ok ? 1 : 2"),
-            "@else branch not emitted as a second conditional arm; got: {code}"
+            code.contains("ctx.ok() ? 1 : 2"),
+            "@else branch not emitted as a second auto-called conditional arm; got: {code}"
         );
     }
 
@@ -2535,5 +2544,180 @@ export default function App() {\n\
         for name in ["inject", "signal", "effect"] {
             assert!(core_import_binds(code, name), "`{name}` not in merged import; got: {code}");
         }
+    }
+
+    // --- GAP 1: control-flow CONDITION signal reads auto-called (end to end) ----
+
+    #[test]
+    fn react_if_condition_signal_read_is_auto_called_end_to_end() {
+        // GAP 1: the `examples/treaty-shadcn/src/card.tsx` shape. `{expanded && <p/>}` lowers to an
+        // `@if (expanded)` whose head reads a WritableSignal — bare, the `@if` never toggles. The head
+        // MUST auto-call the signal: the emitted Ivy conditional binds `ctx.expanded()`, not the bare
+        // (always-truthy) `ctx.expanded`.
+        let source = "import { useState } from 'react';\n\
+export default function Card({ title, description }) {\n\
+  const [expanded, setExpanded] = useState(false);\n\
+  const toggle = () => setExpanded((v) => !v);\n\
+  return (\n\
+    <div className=\"card\">\n\
+      <h3>{title}</h3>\n\
+      <button className=\"card-toggle\" onClick={toggle}>{expanded ? 'Hide' : 'Show'} details</button>\n\
+      {expanded && <p className=\"card-description\">{description}</p>}\n\
+    </div>\n\
+  );\n\
+}\n";
+        let out = compile(source, "card.tsx");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+        assert_well_formed_module(code);
+        assert!(code.contains(DEFINE), "no defineComponent; got: {code}");
+
+        // The `@if` condition reads the CALLED signal in the Ivy conditional binding.
+        assert!(
+            code.contains("ctx.expanded()"),
+            "@if condition signal read not auto-called (the toggle bug); got: {code}"
+        );
+        // And it is NOT the bare (always-truthy) function reference: there is no `ctx.expanded ?`
+        // / `ctx.expanded :` / `ctx.expanded ;` / `ctx.expanded )` form (a bare read in the binding).
+        for bare in ["ctx.expanded ?", "ctx.expanded :", "ctx.expanded;", "ctx.expanded)"] {
+            assert!(
+                !code.contains(bare),
+                "bare (uncalled) `expanded` signal still in a conditional binding (`{bare}`); got: {code}"
+            );
+        }
+    }
+
+    // --- GAP 2: inline-arrow event handlers unwrapped + setter rewritten (e2e) --
+
+    #[test]
+    fn react_inline_arrow_setter_handler_unwraps_and_rewrites_to_update() {
+        // GAP 2: `onClick={() => setCount(c => c + 1)}` must NOT bind a returned function and must
+        // rewrite the React setter. The emitted listener action is `count.update(c => c + 1)` — no
+        // wrapping arrow (no `() =>`), and no `setCount` (the setter is gone).
+        let source = "import { useState } from 'react';\n\
+export default function Counter() {\n\
+  const [count, setCount] = useState(0);\n\
+  return <button onClick={() => setCount(c => c + 1)}>{count}</button>;\n\
+}\n";
+        let out = compile(source, "counter.tsx");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+        assert_well_formed_module(code);
+        assert!(code.contains(DEFINE), "no defineComponent; got: {code}");
+
+        // The listener action is the unwrapped, setter-rewritten body.
+        assert!(
+            code.contains("count.update(c => c + 1)"),
+            "inline-arrow setter not rewritten to count.update; got: {code}"
+        );
+        // No wrapping arrow leaked into the listener (it would only RETURN a function).
+        assert!(
+            !code.contains("ctx.setCount") && !code.contains("setCount("),
+            "React setter `setCount` survived in the listener; got: {code}"
+        );
+        // A real listener instruction was emitted for the click.
+        assert!(
+            code.contains("\u{0275}\u{0275}listener") || code.contains("\u{0275}\u{0275}domListener"),
+            "no listener instruction for onClick; got: {code}"
+        );
+    }
+
+    #[test]
+    fn react_inline_arrow_event_param_handler_unwraps_and_maps_dollar_event() {
+        // An inline arrow taking the event maps the param to `$event`, unwraps, and rewrites the
+        // setter: `onInput={(e) => setName(e.target.value)}` → `name.set($event.target.value)`.
+        let source = "import { useState } from 'react';\n\
+export default function Field() {\n\
+  const [name, setName] = useState('');\n\
+  return <input onInput={(e) => setName(e.target.value)} />;\n\
+}\n";
+        let out = compile(source, "field.tsx");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+        assert_well_formed_module(code);
+        assert!(code.contains(DEFINE), "no defineComponent; got: {code}");
+        assert!(
+            code.contains("name.set($event.target.value)"),
+            "inline-arrow event handler not unwrapped/$event-mapped/setter-rewritten; got: {code}"
+        );
+        assert!(!code.contains("setName"), "React setter survived; got: {code}");
+    }
+
+    // --- the real shadcn example files compile correctly (GAP 1 + GAP 2) -------
+
+    /// Read a `examples/treaty-shadcn/src/<name>` file relative to the repo root (four levels up from
+    /// this crate's `apps/rust/authoring` manifest dir).
+    fn read_shadcn_example(name: &str) -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../examples/treaty-shadcn/src")
+            .join(name);
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read example {}: {e}", path.display()))
+    }
+
+    #[test]
+    fn real_card_tsx_example_if_condition_is_auto_called() {
+        // The literal `examples/treaty-shadcn/src/card.tsx`, compiled through the JSX front-end, must
+        // produce a toggling `@if`: its condition reads the CALLED `expanded` signal (`ctx.expanded()`),
+        // not the always-truthy bare function — the GAP 1 fix, verified on the shipped source.
+        let source = read_shadcn_example("card.tsx");
+        let out = compile(&source, "card.tsx");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+        assert_well_formed_module(code);
+        assert!(code.contains(DEFINE), "card.tsx did not compile to a component; got: {code}");
+
+        // GAP 1: the `{expanded && <p/>}` conditional binds the CALLED signal.
+        assert!(
+            code.contains("ctx.expanded()"),
+            "card.tsx @if condition not auto-called (toggle bug); got: {code}"
+        );
+        for bare in ["ctx.expanded ?", "ctx.expanded :", "ctx.expanded;", "ctx.expanded)"] {
+            assert!(
+                !code.contains(bare),
+                "card.tsx still binds a bare (always-truthy) `expanded` (`{bare}`); got: {code}"
+            );
+        }
+        // The `useState` lowered to a signal and the named `toggle` handler's setter became `.update`.
+        assert!(code.contains("expanded = signal(false)"), "useState not lowered; got: {code}");
+        assert!(
+            code.contains("expanded.update("),
+            "setExpanded(v => !v) not lowered to update; got: {code}"
+        );
+    }
+
+    #[test]
+    fn real_alert_tsx_example_negated_if_condition_is_auto_called() {
+        // `examples/treaty-shadcn/src/alert.tsx`: `{!dismissed && <div/>}` → `@if (!dismissed())`, and
+        // the nested `{isDismissible && <button/>}` → `@if (isDismissible())`. Both heads auto-call.
+        let source = read_shadcn_example("alert.tsx");
+        let out = compile(&source, "alert.tsx");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+        // alert.tsx carries TS-only syntax in its body (a top-level `type AlertType = …` alias and a
+        // `'info' as AlertType` prop default that the front-end splices verbatim), so it must re-parse
+        // as a TYPESCRIPT module (the plain-JS `assert_well_formed_module` would reject the alias —
+        // that is an orthogonal, pre-existing TS-in-body gap, not a GAP-1/2 regression).
+        assert_jsx_client_parses(code);
+        assert!(code.contains(DEFINE), "alert.tsx did not compile to a component; got: {code}");
+
+        // The dismissed-state signal read is CALLED in its (outer) conditional binding.
+        assert!(
+            code.contains("dismissed()"),
+            "alert.tsx `!dismissed` condition not auto-called; got: {code}"
+        );
+        assert!(
+            !code.contains("!ctx.dismissed ?") && !code.contains("ctx.dismissed ?"),
+            "alert.tsx still binds a bare (always-truthy) `dismissed`; got: {code}"
+        );
+        // The `isDismissible` prop input read is CALLED in its (nested) conditional binding. The
+        // nested embedded view references it through the restored context (`ctx_r1.isDismissible()`).
+        assert!(
+            code.contains("isDismissible()"),
+            "alert.tsx `isDismissible` condition not auto-called; got: {code}"
+        );
+        // `useState` lowered + the named `dismiss` setter became `.set(true)`.
+        assert!(code.contains("dismissed = signal(false)"), "useState not lowered; got: {code}");
+        assert!(code.contains("dismissed.set(true)"), "setDismissed(true) not lowered; got: {code}");
     }
 }

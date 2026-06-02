@@ -43,6 +43,11 @@ pub struct ReactTransform {
     /// The names that became signals (a `useState` state var, a `useMemo`/`useRef` binding) — merged
     /// by [`super`] into the template auto-call candidate set so a bare `{{ x }}` read auto-calls.
     pub signals: HashSet<String>,
+    /// The discovered `useState` setters as `(setterName, signalName)` pairs (`setCount` → `count`).
+    /// Exposed so the template's inline-arrow event handlers — lowered to Angular `(event)="…"`
+    /// actions BEFORE this pass ran — can have their `setX(…)` calls rewritten to `x.set/x.update`
+    /// with the SAME setter machinery the body uses (see [`rewrite_template_handlers`]).
+    pub setters: Vec<(String, String)>,
     /// Non-fatal diagnostics (an un-lowerable `useReducer`, an opaque `useState` destructure, …).
     pub diagnostics: Vec<String>,
 }
@@ -191,6 +196,7 @@ pub fn transform(javascript: &str) -> ReactTransform {
     let empty = || ReactTransform {
         javascript: javascript.to_string(),
         signals: HashSet::new(),
+        setters: Vec::new(),
         diagnostics: Vec::new(),
     };
     if javascript.trim().is_empty() {
@@ -236,6 +242,7 @@ pub fn transform(javascript: &str) -> ReactTransform {
     ReactTransform {
         javascript,
         signals,
+        setters,
         diagnostics,
     }
 }
@@ -274,6 +281,137 @@ pub fn auto_call_body(javascript: &str, signals: &HashSet<String>) -> String {
         autocall_statement(stmt, signals, &mut edits);
     }
     apply_edits(javascript, edits)
+}
+
+// ---------------------------------------------------------------------------
+// Template event-handler rewriting (react mode).
+// ---------------------------------------------------------------------------
+
+/// Rewrite the React setter calls and signal reads inside every `(event)="ACTION"` binding of a
+/// lowered template.
+///
+/// An inline-arrow JSX handler (`onClick={() => setCount(c => c + 1)}`) is UNWRAPPED to its body by
+/// the template lowering ([`super::template`]) BEFORE this pass — so the template already carries
+/// `(click)="setCount(c => c + 1)"`. But the body still references the React setter `setCount` and any
+/// bare signal reads, which only this pass (which knows the discovered `setters` / `signals`) can
+/// rewrite: `setCount(c => c + 1)` → `count.update(c => c + 1)`, a `setX(v)` → `x.set(v)`, and a bare
+/// signal read inside the action → a call. The rewrite REUSES the exact body machinery
+/// ([`rewrite_uses_in_statement`] + [`autocall_statement`]) so the template and the body lower setters
+/// identically.
+///
+/// Only the `(name)="…"` event-binding VALUES emitted by the JSX template lowering are touched; all
+/// other markup (interpolations, attributes, property bindings) is left untouched here — interpolation
+/// auto-call is owned by [`super::signals::auto_call_template`]. The binding value is always
+/// double-quoted and never contains a literal `"` (its handler body is TS-erased JS whose own string
+/// literals use `'`/`` ` ``), so each value is delimited unambiguously by the surrounding `"`.
+pub fn rewrite_template_handlers(
+    template_html: &str,
+    setters: &[(String, String)],
+    signals: &HashSet<String>,
+) -> String {
+    if setters.is_empty() && signals.is_empty() {
+        return template_html.to_string();
+    }
+    let bytes = template_html.as_bytes();
+    let mut out = String::with_capacity(template_html.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        // Recognize an event binding `(name)="`. The `(` must open an event name (letters), close
+        // with `)`, then be immediately followed by `="`.
+        if bytes[i] == b'(' {
+            if let Some((value_start, value_end)) = event_binding_value_span(template_html, i) {
+                // Copy `(name)="` verbatim, rewrite the value, then re-emit the closing `"`.
+                out.push_str(&template_html[i..value_start]);
+                let value = &template_html[value_start..value_end];
+                out.push_str(&rewrite_handler_action(value, setters, signals));
+                out.push('"');
+                i = value_end + 1; // skip past the closing quote
+                continue;
+            }
+        }
+        let ch_len = utf8_len_byte(bytes[i]);
+        out.push_str(&template_html[i..i + ch_len]);
+        i += ch_len;
+    }
+    out
+}
+
+/// Given `template_html.as_bytes()[at] == b'('`, recognize an Angular event binding `(name)="value"`
+/// and return `(value_start, value_end)` — the byte offsets of the binding value (between the quotes).
+/// Returns `None` if `at` is not the start of an `(eventname)="…"` binding.
+fn event_binding_value_span(template_html: &str, at: usize) -> Option<(usize, usize)> {
+    let bytes = template_html.as_bytes();
+    let mut j = at + 1;
+    // Event name: identifier chars (Angular event names are letters; `.` allowed for `keydown.enter`).
+    let name_start = j;
+    while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'.' || bytes[j] == b'_') {
+        j += 1;
+    }
+    if j == name_start || j >= bytes.len() || bytes[j] != b')' {
+        return None;
+    }
+    j += 1; // past ')'
+    // Must be immediately followed by `="`.
+    if j + 1 >= bytes.len() || bytes[j] != b'=' || bytes[j + 1] != b'"' {
+        return None;
+    }
+    let value_start = j + 2;
+    // The value runs to the next `"` (handler bodies never contain a literal `"`).
+    let mut k = value_start;
+    while k < bytes.len() && bytes[k] != b'"' {
+        k += 1;
+    }
+    if k >= bytes.len() {
+        return None;
+    }
+    Some((value_start, k))
+}
+
+/// Rewrite the setter calls and signal reads in one event-handler ACTION string (`setCount(c => c + 1)`,
+/// `count++`, `doThing(); count.set(0)`) using the body machinery. Parsed as a statement list (the
+/// action may be a `;`-separated chain); on a parse failure the action is returned unchanged.
+fn rewrite_handler_action(
+    action: &str,
+    setters: &[(String, String)],
+    signals: &HashSet<String>,
+) -> String {
+    if action.trim().is_empty() {
+        return action.to_string();
+    }
+    let allocator = Allocator::default();
+    let source_type = SourceType::default().with_typescript(true);
+    let ret = JsParser::new(&allocator, action, source_type).parse();
+    if !ret.errors.is_empty() {
+        return action.to_string();
+    }
+
+    let mut edits: Vec<Edit> = Vec::new();
+    // 1. Setter calls (`setX(…)` → `x.set/x.update`) and `ref.current` reads — the body's pass 2.
+    let no_refs: HashSet<String> = HashSet::new();
+    for stmt in &ret.program.body {
+        rewrite_uses_in_statement(stmt, action, setters, &no_refs, &mut edits);
+    }
+    // 2. Bare signal reads (`count` → `count()`) — the body auto-call. A read that is the ARGUMENT of
+    //    a setter (`setCount(count + 1)`) is itself auto-called, mirroring the body behaviour.
+    for stmt in &ret.program.body {
+        autocall_statement(stmt, signals, &mut edits);
+    }
+    apply_edits(action, edits)
+}
+
+/// Length in bytes of the UTF-8 character whose lead byte is `b`.
+fn utf8_len_byte(b: u8) -> usize {
+    if b < 0x80 {
+        1
+    } else if b >> 5 == 0b110 {
+        2
+    } else if b >> 4 == 0b1110 {
+        3
+    } else if b >> 3 == 0b11110 {
+        4
+    } else {
+        1
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1505,5 +1643,85 @@ mod tests {
         // never disturbed).
         let body = "const x = compute(1) + go();";
         assert_eq!(auto_call_body(body, &HashSet::new()), body);
+    }
+
+    // --- template event-handler rewrite (GAP 2) -------------------------------
+
+    fn setters(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
+    }
+
+    fn sig(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn template_handler_functional_setter_becomes_update() {
+        // GAP 2 verification: an UNWRAPPED inline-arrow handler `(click)="setCount(c => c + 1)"` has
+        // its functional-updater setter rewritten to `count.update(c => c + 1)`.
+        let out = rewrite_template_handlers(
+            "<button (click)=\"setCount(c => c + 1)\">x</button>",
+            &setters(&[("setCount", "count")]),
+            &sig(&["count"]),
+        );
+        assert_eq!(
+            out,
+            "<button (click)=\"count.update(c => c + 1)\">x</button>",
+            "functional setter not lowered to update; got: {out}"
+        );
+    }
+
+    #[test]
+    fn template_handler_value_setter_becomes_set_and_arg_auto_calls() {
+        // A value setter `setCount(count + 1)` → `count.set(count() + 1)`: the setter becomes `.set`
+        // and the bare signal read in the argument auto-calls.
+        let out = rewrite_template_handlers(
+            "<button (click)=\"setCount(count + 1)\">x</button>",
+            &setters(&[("setCount", "count")]),
+            &sig(&["count"]),
+        );
+        assert_eq!(
+            out,
+            "<button (click)=\"count.set(count() + 1)\">x</button>",
+            "value setter / arg auto-call wrong; got: {out}"
+        );
+    }
+
+    #[test]
+    fn template_handler_plain_setter_set_value() {
+        // `setDismissed(true)` (alert.tsx) → `dismissed.set(true)`.
+        let out = rewrite_template_handlers(
+            "<button (click)=\"setDismissed(true)\">x</button>",
+            &setters(&[("setDismissed", "dismissed")]),
+            &sig(&["dismissed"]),
+        );
+        assert_eq!(
+            out,
+            "<button (click)=\"dismissed.set(true)\">x</button>",
+            "plain setter not lowered; got: {out}"
+        );
+    }
+
+    #[test]
+    fn template_handler_leaves_non_event_markup_untouched() {
+        // Interpolations, attributes, and property bindings are NOT event bindings and are untouched
+        // (interpolation auto-call is owned by the signals pass). A `(click)` next to them still
+        // rewrites.
+        let out = rewrite_template_handlers(
+            "<div [id]=\"setCount\">{{ count }}</div><button (click)=\"setCount(1)\">x</button>",
+            &setters(&[("setCount", "count")]),
+            &sig(&["count"]),
+        );
+        assert_eq!(
+            out,
+            "<div [id]=\"setCount\">{{ count }}</div><button (click)=\"count.set(1)\">x</button>",
+            "non-event markup wrongly touched; got: {out}"
+        );
+    }
+
+    #[test]
+    fn template_handler_noop_without_setters_or_signals() {
+        let html = "<button (click)=\"doThing()\">x</button>";
+        assert_eq!(rewrite_template_handlers(html, &[], &HashSet::new()), html);
     }
 }
