@@ -15,16 +15,17 @@
 //!   verbatim (passthrough); `ts` (and any non-rust) bodies are transpiled via
 //!   [`super::ts_to_rust::transpile_body`], whose graceful `Default::default()` fallbacks keep the
 //!   generated Rust compiling.
-//! * **client bindings** — a typesafe resource-client binding map (`name` -> TS expression string),
-//!   each shaped to the fn's TRANSPORT and built ONLY on symbols the real `@treaty/httpclient`
-//!   resources layer actually exports (`edenPromiseResource`) plus browser globals (`fetch` /
-//!   `EventSource` / `WebSocket`) — never an invented `httpClient`/`edenStreamResource`/`edenWebSocket`
-//!   shim. The Api binding `POST`s to `/__server/<name>` via `fetch` and wraps the one-shot response in
-//!   `edenPromiseResource`. The Stream binding is a native async-iterable factory backed by an
-//!   `EventSource` (consumed with `for await`), and the WebSocket binding opens a live `WebSocket` and
-//!   returns a duplex control handle — neither is a one-shot resource, so neither references the
-//!   resource helper (see `stream_client_binding` / `ws_client_binding`). This is the typesafe
-//!   resource-client binding, distinct from the Eden binding emitted by [`super::ElysiaEdenPlugin`].
+//! * **client bindings** — a typesafe client binding map (`name` -> TS expression string), each
+//!   shaped to the fn's TRANSPORT and built ONLY on browser globals (`fetch` / `EventSource` /
+//!   `WebSocket`) — never an invented `httpClient`/`edenStreamResource`/`edenWebSocket` shim. The Api
+//!   binding is an imperative RPC call: it `POST`s to `/__server/<name>` via `fetch` and resolves the
+//!   JSON response as a PLAIN PROMISE, so `await fn(x)` works inside an event handler (NOT an Angular
+//!   injection context — wrapping it in `resource()`/`edenPromiseResource` there throws NG0203; a
+//!   caller who wants reactive loading can wrap it themselves at field-init via `resource(() => fn(x))`).
+//!   The Stream binding is a native async-iterable factory backed by an `EventSource` (consumed with
+//!   `for await`), and the WebSocket binding opens a live `WebSocket` and returns a duplex control
+//!   handle (see `stream_client_binding` / `ws_client_binding`). This is the typesafe client binding,
+//!   distinct from the Eden binding emitted by [`super::ElysiaEdenPlugin`].
 
 use std::collections::HashMap;
 
