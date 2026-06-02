@@ -33,7 +33,10 @@
 
 use std::collections::HashMap;
 
-use super::ts_to_rust::{handler_response_type, transpile_handler_body, ts_type_to_rust};
+use super::ts_to_rust::{
+    ends_in_unconditional_return, handler_response_type, transpile_handler_body,
+    transpile_stream_body, transpile_ws_body, ts_type_to_rust,
+};
 use super::{BackendEmit, BackendPlugin, ServerFn, TransportKind};
 
 /// The URL namespace every lifted server function is mounted under, e.g. `save` -> `/__server/save`.
@@ -58,12 +61,16 @@ impl BackendPlugin for AxumBackendPlugin {
     fn emit(&self, fns: &[ServerFn]) -> BackendEmit {
         let mut server_module = String::new();
 
-        // Use-statements the generated service relies on. The base set (Api) is emitted unconditionally
-        // and byte-for-byte as before; streaming/websocket fns pull in their extra axum imports only
-        // when present, so an all-Api emit is unchanged.
+        // Use-statements the generated service relies on. The base axum/serde set is always present;
+        // the bare `serde_json::Value` import is emitted only when the generated body actually uses
+        // the bare `Value` type (an untyped Api param/return) — a fully-typed module references no
+        // bare `Value`, so importing it would be an unused-import warning in the generated crate.
+        // Streaming/websocket fns pull in their extra axum imports only when present.
         server_module.push_str("use axum::{Json, Router, routing::post};\n");
         server_module.push_str("use serde::Deserialize;\n");
-        server_module.push_str("use serde_json::Value;\n");
+        if uses_bare_value(fns) {
+            server_module.push_str("use serde_json::Value;\n");
+        }
         if fns.iter().any(|f| f.transport == TransportKind::Stream) {
             server_module.push_str("use axum::response::sse::{Event, Sse};\n");
             server_module.push_str("use axum::routing::get;\n");
@@ -168,8 +175,23 @@ fn to_pascal_case(name: &str) -> String {
     out
 }
 
+/// Does the generated module reference the bare `Value` type, requiring `use serde_json::Value;`?
+///
+/// The bare `Value` shorthand is emitted ONLY as the fallback for an untyped Api param (a request
+/// struct field, see [`emit_request_struct`]) or an untyped `server:rust` Api return ([`response_type`]).
+/// Every other "no useful Rust type" mapping (`object`/`unknown`/named interfaces, the ws/stream JSON
+/// payloads) uses the fully-qualified `serde_json::Value`, which needs no import. So the import is
+/// needed exactly when some Api fn has an untyped param, or some `rust`-lang Api fn has an untyped
+/// return — otherwise it would be an unused import in the generated crate.
+fn uses_bare_value(fns: &[ServerFn]) -> bool {
+    fns.iter().filter(|f| f.transport == TransportKind::Api).any(|f| {
+        f.params.iter().any(|p| p.ty.is_none())
+            || (f.lang == LANG_RUST && f.return_type.is_none())
+    })
+}
+
 /// Emit the serde `Deserialize` request struct for a fn's params. Each param becomes a typed field
-/// (TS type via [`ts_type_to_rust`], untyped params fall back to `serde_json::Value`). A no-param fn
+/// (TS type via [`ts_type_to_rust`], untyped params fall back to the bare `Value`). A no-param fn
 /// still gets a struct (an empty payload) so handlers have a uniform `Json<…Request>` signature.
 fn emit_request_struct(f: &ServerFn) -> String {
     let mut out = String::new();
@@ -351,47 +373,242 @@ fn client_binding(f: &ServerFn) -> String {
 
 /// Emit the axum SSE handler for a [`TransportKind::Stream`] fn. The handler returns an
 /// `Sse<impl Stream<Item = Result<Event, Infallible>>>`, the streaming response axum mounts on a GET
-/// route. The author's body (which yields values) becomes the stream source; the generated wrapper
-/// maps each yielded value into an SSE `Event`.
+/// route. The author's async-generator body becomes the stream source: it is transpiled with
+/// [`transpile_stream_body`], which lowers every `yield X` into a push of `serde_json::json!(X)` onto
+/// an `__items` accumulator. The generated wrapper then turns that accumulator into the SSE stream,
+/// mapping each value to `Event::default().json_data(value)`.
+///
+/// The streaming transport is defined by JavaScript constructs (`function*` / `yield`), so the body
+/// is ALWAYS lowered through the yield-aware [`transpile_stream_body`] — even for a `server:rust` block
+/// (whose bare-`server { … }` default is `rust`), because a generator body is JS, not Rust. The
+/// transpiler's graceful degradation guarantees the result still compiles.
+///
+/// GRACEFUL DEGRADATION: when the body cannot be fully transpiled (a `while`/`switch`/value-position
+/// `yield`, etc.), the generated handler still COMPILES — it wires the real transport and yields a
+/// typed PLACEHOLDER stream (`futures::stream::empty()`) while preserving the author's body verbatim
+/// as a `//` comment, so nothing is silently dropped and the route is never broken Rust.
 fn emit_stream_handler(f: &ServerFn) -> String {
     let mut out = String::new();
-    out.push_str(&format!(
-        "pub async fn {handler}() -> Sse<impl Stream<Item = Result<Event, Infallible>>> {{\n",
-        handler = handler_name(f),
-    ));
-    // Surface the author's streaming body as a comment so nothing is dropped, then build the SSE
-    // stream that carries the yielded items to the client.
-    for line in f.source.lines() {
-        out.push_str(&format!("    // {line}\n"));
+
+    // A stream fn's args travel in the EventSource URL query string as a JSON `args` array (see
+    // `stream_client_binding`). A param-less fn keeps the historical no-arg signature; a fn WITH params
+    // takes `Query<HashMap<String, String>>`, parses the `args` entry as a JSON array, and binds each
+    // param by index with a typed default so the bind always compiles for any param type.
+    if f.params.is_empty() {
+        out.push_str(&format!(
+            "pub async fn {handler}() -> Sse<impl Stream<Item = Result<Event, Infallible>>> {{\n",
+            handler = handler_name(f),
+        ));
+    } else {
+        out.push_str(&format!(
+            "pub async fn {handler}(axum::extract::Query(__query): axum::extract::Query<std::collections::HashMap<String, String>>) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {{\n",
+            handler = handler_name(f),
+        ));
     }
-    out.push_str("    let stream = futures::stream::empty::<Result<Event, Infallible>>();\n");
-    out.push_str("    Sse::new(stream)\n");
+
+    // Lower the generator body through the yield-aware stream transpiler.
+    let transpiled = transpile_stream_body(&f.source);
+    let body = indent_block(&transpiled.rust_body);
+    let covered = transpiled.covered;
+
+    if covered {
+        // Bind each param from the query `args` JSON array before the body references it.
+        out.push_str(&stream_param_bindings(f));
+        // Drive the generator's yields: accumulate each yielded value into `__items`, then turn the
+        // accumulator into the SSE stream, mapping each value to a JSON SSE frame. `json_data` only
+        // fails if serialization fails (it cannot here — the items are already `serde_json::Value`),
+        // so the `unwrap_or_else` fallback keeps the item type `Result<Event, Infallible>`.
+        out.push_str("    let mut __items: Vec<serde_json::Value> = Vec::new();\n");
+        out.push_str(&body);
+        if !body.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str("    let stream = futures::stream::iter(__items.into_iter().map(|__value| {\n");
+        out.push_str("        Ok::<Event, Infallible>(\n");
+        out.push_str("            Event::default()\n");
+        out.push_str("                .json_data(&__value)\n");
+        out.push_str("                .unwrap_or_else(|_| Event::default().data(\"null\")),\n");
+        out.push_str("        )\n");
+        out.push_str("    }));\n");
+        out.push_str("    Sse::new(stream)\n");
+    } else {
+        // Could not fully lower the body: wire the transport with a typed placeholder stream and keep
+        // the author's body verbatim as a comment so its intent survives and the handler still
+        // compiles.
+        for line in f.source.lines() {
+            out.push_str(&format!("    // {line}\n"));
+        }
+        out.push_str("    let stream = futures::stream::empty::<Result<Event, Infallible>>();\n");
+        out.push_str("    Sse::new(stream)\n");
+    }
     out.push_str("}\n");
     out
 }
 
+/// Bind each parameter of a stream fn from the EventSource URL's `args` query entry (a JSON array),
+/// deserializing each by index into its mapped Rust type with a typed default fallback so the bind
+/// always compiles for any param type. Emits nothing for a param-less fn (its handler takes no query).
+fn stream_param_bindings(f: &ServerFn) -> String {
+    if f.params.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    out.push_str(
+        "    let __args: serde_json::Value = __query.get(\"args\")\n        .and_then(|__s| serde_json::from_str(__s).ok()).unwrap_or(serde_json::Value::Null);\n",
+    );
+    for (i, p) in f.params.iter().enumerate() {
+        let ty = p
+            .ty
+            .as_deref()
+            .map(ts_type_to_rust)
+            .unwrap_or_else(|| "serde_json::Value".to_string());
+        out.push_str(&format!(
+            "    let {name}: {ty} = __args.get({i}).cloned()\n        .and_then(|__v| serde_json::from_value(__v).ok()).unwrap_or_default();\n",
+            name = p.name,
+        ));
+    }
+    out
+}
+
 /// Emit the axum WebSocket handler for a [`TransportKind::WebSocket`] fn. The route handler upgrades
-/// the connection (`WebSocketUpgrade`) and hands the socket to a generated per-fn task; the author's
-/// body is preserved as a comment so its intent is not lost.
+/// the connection (`WebSocketUpgrade`) and hands the socket to a generated per-fn task that runs the
+/// real duplex body: a `recv` loop that, for each incoming Text frame, binds the fn's DATA params
+/// from the frame's `args` array, runs the (transpiled) body to compute a response, and `send`s that
+/// response back as a JSON Text frame — the duplex echo-of-logic contract a WebSocket server fn
+/// presents to its peer. A `Close` frame ends the loop.
+///
+/// The body is ALWAYS lowered through [`transpile_ws_body`] — even for a `server:rust` block (whose
+/// bare-`server { … }` default is `rust`), because a duplex server fn is authored in JS (the
+/// `'use websocket'` directive, the event-callback param). The transpiler wraps every return in
+/// `serde_json::json!`, so the per-message result is a uniform `serde_json::Value` regardless of the
+/// source return type and serializes the same way over the socket. A function-typed param (its type
+/// text contains `=>`, e.g. an event callback like `onEvent: (e) => void`) is the client-side message
+/// sink and carries no server value, so it is EXCLUDED from the server-side data params.
+///
+/// GRACEFUL DEGRADATION: when the body cannot be fully transpiled, the generated handler still
+/// COMPILES — it wires the real transport (the upgrade + the `recv` loop) and uses a typed PLACEHOLDER
+/// per-message handler (an echo of the inbound frame) while preserving the author's body verbatim as a
+/// `//` comment, so the route is never broken Rust.
 fn emit_ws_handler(f: &ServerFn) -> String {
     let mut out = String::new();
     let socket_fn = format!("{}_socket", handler_name(f));
+    let handle_fn = format!("{}_handle", handler_name(f));
+
+    // The DATA params (everything but the function-typed callback param the client wires to its own
+    // message sink).
+    let data_params: Vec<&super::ServerParam> = f
+        .params
+        .iter()
+        .filter(|p| !p.ty.as_deref().is_some_and(|t| t.contains("=>")))
+        .collect();
+
+    // Lower the duplex body through the JSON-value transpiler so the per-message handler returns a
+    // uniform `serde_json::Value`.
+    let transpiled = transpile_ws_body(&f.source);
+    let body = indent_block(&transpiled.rust_body);
+    let covered = transpiled.covered;
+
+    // The upgrade handler.
     out.push_str(&format!(
         "pub async fn {handler}(ws: WebSocketUpgrade) -> Response {{\n",
         handler = handler_name(f),
     ));
     out.push_str(&format!("    ws.on_upgrade({socket_fn})\n"));
     out.push_str("}\n");
+
+    // The per-connection socket task: a recv loop that binds data params from each frame, runs the
+    // body, and sends the response back.
     out.push_str(&format!("pub async fn {socket_fn}(mut socket: WebSocket) {{\n"));
-    for line in f.source.lines() {
-        out.push_str(&format!("    // {line}\n"));
+    out.push_str("    use axum::extract::ws::Message;\n");
+    out.push_str("    while let Some(Ok(__msg)) = socket.recv().await {\n");
+    out.push_str("        match __msg {\n");
+    out.push_str("            Message::Text(__text) => {\n");
+    if covered {
+        // Decode the frame and bind each data param from its `args` array by index, deserializing
+        // into the mapped Rust type with a typed default fallback so the bind always compiles for any
+        // param type. (The placeholder echo path needs none of this, so it is emitted only here.)
+        out.push_str(
+            "                let __frame: serde_json::Value =\n                    serde_json::from_str(&__text).unwrap_or(serde_json::Value::Null);\n",
+        );
+        out.push_str(
+            "                let __args = __frame.get(\"args\").cloned().unwrap_or(serde_json::Value::Null);\n",
+        );
+        let mut call_args = Vec::with_capacity(data_params.len());
+        for (i, p) in data_params.iter().enumerate() {
+            let ty = p
+                .ty
+                .as_deref()
+                .map(ts_type_to_rust)
+                .unwrap_or_else(|| "serde_json::Value".to_string());
+            out.push_str(&format!(
+                "                let {name}: {ty} = __args.get({i}).cloned()\n                    .and_then(|__v| serde_json::from_value(__v).ok()).unwrap_or_default();\n",
+                name = p.name,
+            ));
+            call_args.push(p.name.clone());
+        }
+        // Run the body via the generated per-message handler and send its JSON result back.
+        out.push_str(&format!(
+            "                let __response = {handle_fn}({args}).await;\n",
+            args = call_args.join(", "),
+        ));
+        out.push_str(
+            "                let __payload = serde_json::to_string(&__response).unwrap_or_else(|_| String::from(\"null\"));\n",
+        );
+        out.push_str("                if socket.send(Message::Text(__payload.into())).await.is_err() {\n");
+        out.push_str("                    break;\n");
+        out.push_str("                }\n");
+    } else {
+        // Placeholder per-message handler: echo the inbound text back so the transport is live and the
+        // route compiles. The author's body is preserved as a comment below.
+        out.push_str("                if socket.send(Message::Text(__text)).await.is_err() {\n");
+        out.push_str("                    break;\n");
+        out.push_str("                }\n");
     }
-    out.push_str("    while let Some(Ok(msg)) = socket.recv().await {\n");
-    out.push_str("        if socket.send(msg).await.is_err() {\n");
-    out.push_str("            break;\n");
+    out.push_str("            }\n");
+    out.push_str("            Message::Close(_) => break,\n");
+    out.push_str("            _ => {}\n");
     out.push_str("        }\n");
     out.push_str("    }\n");
     out.push_str("}\n");
+
+    // The per-message body handler (covered bodies only). Data params in, a uniform
+    // `serde_json::Value` out.
+    if covered {
+        let sig_params = data_params
+            .iter()
+            .map(|p| {
+                let ty = p
+                    .ty
+                    .as_deref()
+                    .map(ts_type_to_rust)
+                    .unwrap_or_else(|| "serde_json::Value".to_string());
+                format!("{}: {}", p.name, ty)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!(
+            "pub async fn {handle_fn}({sig_params}) -> serde_json::Value {{\n"
+        ));
+        out.push_str(&body);
+        if !body.ends_with('\n') {
+            out.push('\n');
+        }
+        // A body that can fall through without an explicit return still type-checks to the declared
+        // `serde_json::Value` return. Skip the tail when the body always returns, so the generated
+        // handler has no unreachable-code warning. The check runs on the canonical one-level-indented
+        // `transpiled.rust_body` (the form `ends_in_unconditional_return` expects), not the deeper
+        // `body` re-indented for emission.
+        if !ends_in_unconditional_return(&transpiled.rust_body) {
+            out.push_str("    serde_json::Value::Null\n");
+        }
+        out.push_str("}\n");
+    } else {
+        // The author's body, preserved verbatim as a comment, so a placeholder-echo connection does
+        // not silently drop the authored intent.
+        for line in f.source.lines() {
+            out.push_str(&format!("// {line}\n"));
+        }
+    }
     out
 }
 
@@ -412,16 +629,27 @@ fn emit_ws_handler(f: &ServerFn) -> String {
 /// rather than throwing `EventSource is not defined` — so a component that opens a stream in its
 /// constructor still boots in a non-browser host; the live stream attaches only where `EventSource`
 /// exists.
+///
+/// ARGS: a stream fn's args travel in the URL query string as a JSON `args` array
+/// (`?args=<encoded JSON>`); the generated SSE handler decodes them back into its typed params (see
+/// `stream_param_bindings`). A param-less fn opens the bare route with no query.
 fn stream_client_binding(f: &ServerFn) -> String {
     let route = format!("{SERVER_ROUTE_PREFIX}/{}", f.name);
     let arg_list = binding_arg_list(f);
+    // The args JSON array, by param name; param-less fns open the bare route.
+    let arg_names = f.params.iter().map(|p| p.name.clone()).collect::<Vec<_>>().join(", ");
+    let url_expr = if f.params.is_empty() {
+        format!("'{route}'")
+    } else {
+        format!("'{route}?args=' + encodeURIComponent(JSON.stringify([{arg_names}]))")
+    };
     // A self-contained async generator: an EventSource feeds a queue of pending values and a queue of
     // waiting consumers; `next()` resolves from whichever is ready. `event: end` ends iteration and
     // closes the socket; an error rejects the in-flight pull and closes the socket.
     format!(
         "(async function* ({arg_list}) {{ \
          if (typeof EventSource === 'undefined') return; \
-         const source = new EventSource('{route}'); \
+         const source = new EventSource({url_expr}); \
          const values = []; const waiters = []; let done = false; let failure = null; \
          const settle = () => {{ while (waiters.length) {{ const w = waiters.shift(); \
          if (failure) w.reject(failure); else if (values.length) w.resolve({{ value: values.shift(), done: false }}); \
@@ -673,6 +901,32 @@ mod tests {
             "no streaming handler signature; got:\n{}",
             emit.server_module
         );
+        // The async-generator body must actually DRIVE the stream: each `yield` becomes a push onto
+        // the `__items` accumulator, and the accumulator is mapped into JSON SSE frames. This must
+        // NOT be the empty-stream placeholder for a body the transpiler fully covers.
+        assert!(
+            emit.server_module.contains("let mut __items: Vec<serde_json::Value> = Vec::new();"),
+            "stream handler does not declare the yield accumulator; got:\n{}",
+            emit.server_module
+        );
+        assert!(
+            emit.server_module.contains("__items.push(serde_json::json!(1.0));")
+                && emit.server_module.contains("__items.push(serde_json::json!(2.0));"),
+            "yielded values not lowered into accumulator pushes; got:\n{}",
+            emit.server_module
+        );
+        assert!(
+            emit.server_module.contains(".json_data(&__value)"),
+            "accumulated values not mapped into SSE events; got:\n{}",
+            emit.server_module
+        );
+        assert!(
+            !emit.server_module.contains("futures::stream::empty"),
+            "a fully-covered generator body must not fall back to the empty-stream placeholder; got:\n{}",
+            emit.server_module
+        );
+        // The generated stream handler is well-formed Rust (balanced delimiters).
+        assert_balanced_delimiters(&emit.server_module);
         // The route is registered as a GET (SSE) under /__server.
         assert!(
             emit.server_module.contains(".route(\"/__server/ticks\", get(__server_ticks))"),
@@ -732,6 +986,40 @@ mod tests {
             "no upgrade dispatch; got:\n{}",
             emit.server_module
         );
+        // The socket task must run the REAL duplex body: a recv loop that binds the data param from
+        // the frame, runs the per-message handler, and sends the JSON response back — not a bare echo
+        // of the inbound message, since this body is fully covered.
+        assert!(
+            emit.server_module.contains("pub async fn __server_chat_socket(mut socket: WebSocket)"),
+            "no socket task; got:\n{}",
+            emit.server_module
+        );
+        assert!(
+            emit.server_module.contains("while let Some(Ok(__msg)) = socket.recv().await")
+                && emit.server_module.contains("Message::Text(__text)"),
+            "no recv loop over Text frames; got:\n{}",
+            emit.server_module
+        );
+        assert!(
+            emit.server_module.contains("let msg: String = __args.get(0).cloned()"),
+            "data param not bound from the inbound frame; got:\n{}",
+            emit.server_module
+        );
+        assert!(
+            emit.server_module.contains("let __response = __server_chat_handle(msg).await;")
+                && emit.server_module.contains("socket.send(Message::Text(__payload.into()))"),
+            "per-message handler result not sent back over the socket; got:\n{}",
+            emit.server_module
+        );
+        assert!(
+            emit.server_module
+                .contains("pub async fn __server_chat_handle(msg: String) -> serde_json::Value")
+                && emit.server_module.contains("return serde_json::json!(msg);"),
+            "no per-message body handler returning a uniform JSON value; got:\n{}",
+            emit.server_module
+        );
+        // The generated ws handler is well-formed Rust (balanced delimiters).
+        assert_balanced_delimiters(&emit.server_module);
         // The route is registered as a GET (ws upgrade) under /__server.
         assert!(
             emit.server_module.contains(".route(\"/__server/chat\", get(__server_chat))"),
@@ -776,14 +1064,40 @@ mod tests {
         assert_eq!(extraction.server_fns[0].transport, super::TransportKind::Api);
         let emit = AxumBackendPlugin.emit(&extraction.server_fns);
 
-        // The base import block is intact and free of stream/ws imports.
+        // The base import block is intact and free of stream/ws imports. This fully-typed fn references
+        // no bare `Value`, so the `use serde_json::Value;` import is omitted (it would be unused).
         assert!(emit.server_module.starts_with(
-            "use axum::{Json, Router, routing::post};\nuse serde::Deserialize;\nuse serde_json::Value;\n\n"
+            "use axum::{Json, Router, routing::post};\nuse serde::Deserialize;\n\n"
         ), "Api import header changed; got:\n{}", emit.server_module);
+        assert!(!emit.server_module.contains("use serde_json::Value;"),
+            "a fully-typed Api fn must not import the unused bare Value; got:\n{}", emit.server_module);
         assert!(!emit.server_module.contains("Sse"), "stream import leaked into Api emit");
         assert!(!emit.server_module.contains("WebSocketUpgrade"), "ws import leaked into Api emit");
         // POST route with the post() handler, exactly as before.
         assert!(emit.server_module.contains(".route(\"/__server/add\", post(__server_add))"));
+    }
+
+    #[test]
+    fn untyped_api_param_keeps_the_bare_value_import() {
+        // An Api fn with an untyped param falls back to the bare `Value` in its request struct, so the
+        // `use serde_json::Value;` import must be present (and the module still parses as real Rust).
+        let source = "server:ts {\n\
+          function echo(payload): number { return 1; }\n\
+        }\n";
+        let extraction = extract_server_block(source);
+        assert_eq!(extraction.server_fns[0].transport, super::TransportKind::Api);
+        let emit = AxumBackendPlugin.emit(&extraction.server_fns);
+
+        assert!(
+            emit.server_module.contains("use serde_json::Value;"),
+            "an untyped Api param must keep the bare Value import; got:\n{}",
+            emit.server_module
+        );
+        assert!(
+            emit.server_module.contains("pub payload: Value,"),
+            "untyped param not lowered to the bare Value field; got:\n{}",
+            emit.server_module
+        );
     }
 
     /// Parse `module` as a real `syn::File`, returning a readable error when the generated Rust is not
@@ -853,6 +1167,36 @@ mod tests {
     }
 
     #[test]
+    fn stream_handler_with_loop_yield_drives_the_stream() {
+        // A generator that yields inside a numeric for-loop must still drive the stream: the loop is
+        // lowered to a Rust range loop and the `yield` inside it pushes onto the accumulator.
+        let source = "server {\n\
+          async function* counter(n: number) { for (let i = 0; i < n; i++) { yield i; } }\n\
+        }\n";
+        let extraction = extract_server_block(source);
+        assert_eq!(extraction.server_fns[0].transport, super::TransportKind::Stream);
+        let emit = AxumBackendPlugin.emit(&extraction.server_fns);
+
+        assert!(
+            emit.server_module.contains("for i in ((0.0) as i64)..((n) as i64) {"),
+            "for-loop not lowered inside the stream body; got:\n{}",
+            emit.server_module
+        );
+        assert!(
+            emit.server_module.contains("__items.push(serde_json::json!(i));"),
+            "loop yield not lowered into an accumulator push; got:\n{}",
+            emit.server_module
+        );
+        assert!(
+            !emit.server_module.contains("futures::stream::empty"),
+            "a covered loop+yield body must not fall back to the empty placeholder; got:\n{}",
+            emit.server_module
+        );
+        assert_balanced_delimiters(&emit.server_module);
+        assert_no_marker_words(&emit.server_module);
+    }
+
+    #[test]
     fn ts_db_ish_call_degrades_to_compiling_stub() {
         // A `ts` body that calls into an injected dependency (a DB-ish call) whose Rust signature is
         // not known cannot be guaranteed to compile against real Rust, so the WHOLE handler must
@@ -882,6 +1226,47 @@ mod tests {
         );
         // It is still routed.
         assert!(emit.server_module.contains(".route(\"/__server/listTodos\", post(__server_listTodos))"));
+        assert_no_marker_words(&emit.server_module);
+    }
+
+    #[test]
+    fn stream_handler_degrades_to_a_compiling_placeholder() {
+        // A generator whose body is outside the supported subset (a `while` loop) cannot be fully
+        // lowered. The handler must still COMPILE: it wires the SSE transport with the empty-stream
+        // placeholder and preserves the author body as a comment — never broken Rust, no marker words.
+        let source = "server {\n\
+          async function* live() { while (true) { yield Date.now(); } }\n\
+        }\n";
+        let extraction = extract_server_block(source);
+        assert_eq!(extraction.server_fns[0].transport, super::TransportKind::Stream);
+        let emit = AxumBackendPlugin.emit(&extraction.server_fns);
+
+        // Still a real SSE handler with the right signature mounted on a GET route.
+        assert!(
+            emit.server_module.contains("-> Sse<impl Stream<Item = Result<Event, Infallible>>>"),
+            "degraded stream still needs the SSE signature; got:\n{}",
+            emit.server_module
+        );
+        assert!(
+            emit.server_module.contains(".route(\"/__server/live\", get(__server_live))"),
+            "degraded stream still needs its GET route; got:\n{}",
+            emit.server_module
+        );
+        // The transport is wired with the typed placeholder stream.
+        assert!(
+            emit.server_module
+                .contains("let stream = futures::stream::empty::<Result<Event, Infallible>>();")
+                && emit.server_module.contains("Sse::new(stream)"),
+            "degraded stream did not wire the placeholder transport; got:\n{}",
+            emit.server_module
+        );
+        // The author's intent survives as a comment.
+        assert!(
+            emit.server_module.contains("// async function* live()"),
+            "degraded stream dropped the author body; got:\n{}",
+            emit.server_module
+        );
+        assert_balanced_delimiters(&emit.server_module);
         assert_no_marker_words(&emit.server_module);
     }
 
@@ -923,6 +1308,166 @@ mod tests {
         assert!(emit.server_module.contains(".route(\"/__server/ticks\", get(__server_ticks))"));
         assert!(emit.server_module.contains(".route(\"/__server/chat\", get(__server_chat))"));
         assert_no_marker_words(&emit.server_module);
+    }
+
+    #[test]
+    fn ws_handler_degrades_to_a_compiling_echo() {
+        // A ws body outside the supported subset (a `try`/`catch`) cannot be fully lowered. The
+        // handler must still COMPILE: it wires the upgrade + recv loop with a placeholder echo and
+        // preserves the author body as a comment — never broken Rust, no marker words.
+        let source = "server {\n\
+          function relay(msg: string) { 'use websocket'; try { return msg; } catch (e) { return null; } }\n\
+        }\n";
+        let extraction = extract_server_block(source);
+        assert_eq!(extraction.server_fns[0].transport, super::TransportKind::WebSocket);
+        let emit = AxumBackendPlugin.emit(&extraction.server_fns);
+
+        // Still a real upgrade handler + socket task on a GET route.
+        assert!(
+            emit.server_module.contains("ws: WebSocketUpgrade) -> Response")
+                && emit.server_module.contains("ws.on_upgrade(__server_relay_socket)"),
+            "degraded ws still needs the upgrade handler; got:\n{}",
+            emit.server_module
+        );
+        assert!(
+            emit.server_module.contains(".route(\"/__server/relay\", get(__server_relay))"),
+            "degraded ws still needs its GET route; got:\n{}",
+            emit.server_module
+        );
+        assert!(
+            emit.server_module.contains("while let Some(Ok(__msg)) = socket.recv().await"),
+            "degraded ws still needs the recv loop; got:\n{}",
+            emit.server_module
+        );
+        // The placeholder echoes the inbound frame; no per-message body handler is generated.
+        assert!(
+            emit.server_module.contains("socket.send(Message::Text(__text))"),
+            "degraded ws did not wire the placeholder echo; got:\n{}",
+            emit.server_module
+        );
+        assert!(
+            !emit.server_module.contains("__server_relay_handle"),
+            "degraded ws must not call a body handler it cannot soundly generate; got:\n{}",
+            emit.server_module
+        );
+        assert_balanced_delimiters(&emit.server_module);
+        assert_no_marker_words(&emit.server_module);
+    }
+
+    #[test]
+    fn router_mounts_get_routes_for_stream_and_websocket() {
+        // A module mixing an Api, a Stream, and a WebSocket fn: the router must mount the Api fn with
+        // POST and BOTH the stream and websocket fns with GET (SSE / ws upgrade are GET in axum), and
+        // pull in each transport's imports exactly once.
+        let source = "server {\n\
+          function add(a: number, b: number): number { return a + b; }\n\
+          async function* ticks() { yield 1; }\n\
+          function chat(msg: string) { 'use websocket'; return msg; }\n\
+        }\n";
+        let extraction = extract_server_block(source);
+        assert_eq!(extraction.server_fns.len(), 3);
+        let emit = AxumBackendPlugin.emit(&extraction.server_fns);
+
+        // The router builder mounts each transport on the right verb.
+        assert!(
+            emit.server_module.contains(".route(\"/__server/add\", post(__server_add))"),
+            "Api fn not mounted as POST; got:\n{}",
+            emit.server_module
+        );
+        assert!(
+            emit.server_module.contains(".route(\"/__server/ticks\", get(__server_ticks))"),
+            "Stream fn not mounted as GET; got:\n{}",
+            emit.server_module
+        );
+        assert!(
+            emit.server_module.contains(".route(\"/__server/chat\", get(__server_chat))"),
+            "WebSocket fn not mounted as GET; got:\n{}",
+            emit.server_module
+        );
+        // The `get` routing import is pulled in exactly once even with both GET transports present.
+        assert_eq!(
+            emit.server_module.matches("use axum::routing::get;").count(),
+            1,
+            "the `get` routing import must appear exactly once; got:\n{}",
+            emit.server_module
+        );
+        // Both transport import blocks are present.
+        assert!(emit.server_module.contains("use axum::response::sse::{Event, Sse};"));
+        assert!(emit.server_module.contains("use axum::extract::ws::{WebSocket, WebSocketUpgrade};"));
+        // The whole generated module is well-formed (balanced delimiters) and marker-free.
+        assert_balanced_delimiters(&emit.server_module);
+        assert_no_marker_words(&emit.server_module);
+    }
+
+    #[test]
+    fn explicit_ts_stream_body_is_transpiled_and_drives_the_stream() {
+        // An explicit `server:ts` generator is lowered the same way as a bare `server { … }` one: the
+        // generator body is JS regardless of the block's language tag, so it always transpiles into the
+        // yield-driven SSE stream rather than passing through as (invalid) verbatim Rust.
+        let source = "server:ts {\n\
+          async function* squares(n: number) { for (let i = 0; i < n; i++) { yield i * i; } }\n\
+        }\n";
+        let extraction = extract_server_block(source);
+        assert_eq!(extraction.server_fns[0].lang, "ts");
+        assert_eq!(extraction.server_fns[0].transport, super::TransportKind::Stream);
+        let emit = AxumBackendPlugin.emit(&extraction.server_fns);
+
+        assert!(
+            emit.server_module.contains("for i in ((0.0) as i64)..((n) as i64) {")
+                && emit.server_module.contains("__items.push(serde_json::json!(i * i));"),
+            "explicit-ts generator body not transpiled into the stream; got:\n{}",
+            emit.server_module
+        );
+        assert!(
+            emit.server_module.contains(".json_data(&__value)"),
+            "ts stream body not wired to the SSE transport; got:\n{}",
+            emit.server_module
+        );
+        assert!(
+            !emit.server_module.contains("futures::stream::empty"),
+            "a covered ts generator body must not fall back to the placeholder; got:\n{}",
+            emit.server_module
+        );
+        assert_balanced_delimiters(&emit.server_module);
+        assert_no_marker_words(&emit.server_module);
+    }
+
+    /// Assert a generated Rust string is well-formed enough to parse: its `()`, `[]`, and `{}`
+    /// delimiters are balanced and never close out of order. `//`-comment lines are skipped (an author
+    /// body preserved as a comment may carry unbalanced delimiters that are not part of the Rust). This
+    /// is a structural smoke check — the `rust_authoring` crate does not depend on axum, so the
+    /// generated service is validated by shape, not by compiling it in-crate.
+    fn assert_balanced_delimiters(text: &str) {
+        let mut stack: Vec<char> = Vec::new();
+        for line in text.lines() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            for ch in line.chars() {
+                match ch {
+                    '(' | '[' | '{' => stack.push(ch),
+                    ')' | ']' | '}' => {
+                        let want = match ch {
+                            ')' => '(',
+                            ']' => '[',
+                            _ => '{',
+                        };
+                        match stack.pop() {
+                            Some(open) => assert_eq!(
+                                open, want,
+                                "mismatched closing `{ch}` in generated Rust:\n{text}"
+                            ),
+                            None => panic!("unmatched closing `{ch}` in generated Rust:\n{text}"),
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(
+            stack.is_empty(),
+            "unbalanced opening delimiters {stack:?} in generated Rust:\n{text}"
+        );
     }
 
     /// Generated output must never carry a marker token. The forbidden tokens are assembled from

@@ -994,7 +994,9 @@ export async function* streamLogs(count: number): AsyncGenerator<LogLine> {\n\
             out.code.contains("export const streamLogs =")
                 && out.code.contains("async function*")
                 && out.code.contains("EventSource")
-                && out.code.contains("'/__server/streamLogs'"),
+                // The fn takes a `count` param, so its args travel in the EventSource URL query as a
+                // JSON `args` array; the route prefix is still present, now followed by `?args=`.
+                && out.code.contains("'/__server/streamLogs?args='"),
             "no async-iterable stream client binding backed by EventSource; got:\n{}",
             out.code
         );
@@ -1040,12 +1042,13 @@ export async function loadUser(id: number) {\n\
         let out = compile_angular_source(source, "logs.stream.ts");
 
         // A server module is populated and contains BOTH bodies (the whole point: bodies live on the
-        // server, not the client).
+        // server, not the client). The stream generator body is now lowered into the real SSE handler:
+        // its loop becomes a Rust range loop and each `yield` pushes the serialized value onto the
+        // `__items` accumulator (no longer a verbatim comment).
         let server_module = out.server_module.expect("file-level 'use server' must yield a server module");
         assert!(
-            server_module.contains("yield { seq }") || server_module.contains("yield {seq}")
-                || server_module.contains("for (let seq"),
-            "stream body not carried into server module; got:\n{server_module}"
+            server_module.contains("for seq in") && server_module.contains("__items.push(serde_json::json!("),
+            "stream body not lowered into the SSE handler; got:\n{server_module}"
         );
         assert!(
             server_module.contains("db.users.findSecretById"),
@@ -1106,7 +1109,7 @@ export async function loadUser(id: number) {\n\
             out.code
         );
         assert!(
-            out.code.contains("EventSource") && out.code.contains("'/__server/streamLogs'"),
+            out.code.contains("EventSource") && out.code.contains("'/__server/streamLogs?args='"),
             "stream binding is not an EventSource subscription; got:\n{}",
             out.code
         );

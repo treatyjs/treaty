@@ -48,6 +48,11 @@ use oxc_ast::ast::{
 use oxc_parser::Parser as JsParser;
 use oxc_span::{GetSpan, SourceType, Span};
 
+/// The accumulator local the stream (`transpile_stream_body`) lowering pushes each yielded value
+/// onto. The SSE handler declares this `Vec<serde_json::Value>` before the body and turns it into the
+/// stream after.
+pub const STREAM_ITEMS: &str = "__items";
+
 /// The outcome of transpiling a server-fn body to Rust.
 ///
 /// `rust_body` is the lowered handler body (a sequence of Rust statements, not wrapped in braces).
@@ -184,7 +189,28 @@ fn generic_arg<'t>(ts: &'t str, wrapper: &str) -> Option<&'t str> {
 /// exercise directly), kept for callers/tests that want the unwrapped statements.
 #[allow(dead_code)] // Public raw-lowering API + test surface; the axum path uses `transpile_handler_body`.
 pub fn transpile_body(source: &str) -> TranspileResult {
-    transpile_with_mode(source, ReturnMode::Bare)
+    transpile_with_mode(source, ReturnMode::Bare, false)
+}
+
+/// Transpile a server-fn body for a WebSocket per-message handler. Identical to [`transpile_body`]
+/// except every `return X` is wrapped as `return serde_json::json!(X)` and a bare `return;` becomes
+/// `return serde_json::Value::Null;`, so the lowered body always yields a single `serde_json::Value`
+/// — the uniform payload the duplex handler serializes back over the socket regardless of the source
+/// return type. The reported `return_ty` is therefore always `serde_json::Value`.
+pub fn transpile_ws_body(source: &str) -> TranspileResult {
+    let mut result = transpile_with_mode(source, ReturnMode::JsonValue, false);
+    result.return_ty = "serde_json::Value".to_string();
+    result
+}
+
+/// Transpile a generator (stream) server-fn body for an SSE handler. Each `yield X` statement is
+/// lowered to `__items.push(serde_json::json!(X));` (see [`STREAM_ITEMS`]); the surrounding control
+/// flow (loops, `if`/`else`, locals) lowers exactly as in [`transpile_body`]. A `yield` used as a
+/// value (`const v = yield x`) is outside the supported subset and degrades. The SSE handler declares
+/// the `__items` accumulator before this body and turns it into the response stream afterward, so the
+/// generator's yields drive real SSE frames.
+pub fn transpile_stream_body(source: &str) -> TranspileResult {
+    transpile_with_mode(source, ReturnMode::Bare, true)
 }
 
 /// Transpile a server-fn body into the BODY of an axum handler that returns `Json<RESP>`.
@@ -201,7 +227,7 @@ pub fn transpile_body(source: &str) -> TranspileResult {
 /// consistently.
 pub fn transpile_handler_body(source: &str) -> TranspileResult {
     let resp = handler_response_type(source);
-    let lowered = transpile_with_mode(source, ReturnMode::Json { resp: resp.clone() });
+    let lowered = transpile_with_mode(source, ReturnMode::Json { resp: resp.clone() }, false);
 
     if lowered.covered {
         // The body transpiled cleanly. Append a trailing typed `Json` default ONLY when control can
@@ -274,10 +300,19 @@ enum ReturnMode {
     /// `return EXPR;` becomes `return Json(<coerced EXPR>);`, coercing the value to `resp` so it
     /// matches an axum handler's `-> Json<RESP>` signature.
     Json { resp: String },
+    /// `return EXPR;` becomes `return serde_json::json!(EXPR);` and a bare `return;` becomes
+    /// `return serde_json::Value::Null;`, so the body always yields a single `serde_json::Value` —
+    /// the uniform payload the WebSocket per-message handler serializes back over the socket
+    /// regardless of the (often unannotated) source return type.
+    JsonValue,
 }
 
-/// Shared driver for [`transpile_body`] / [`transpile_handler_body`].
-fn transpile_with_mode(source: &str, return_mode: ReturnMode) -> TranspileResult {
+/// Shared driver for the public lowering entry points ([`transpile_body`] /
+/// [`transpile_handler_body`] / [`transpile_ws_body`] / [`transpile_stream_body`]). `return_mode`
+/// controls how `return` is rendered; `stream` enables generator lowering — a bare `yield X;` is
+/// lowered to a push of `serde_json::json!(X)` onto the [`STREAM_ITEMS`] accumulator the SSE handler
+/// declares around the body.
+fn transpile_with_mode(source: &str, return_mode: ReturnMode, stream: bool) -> TranspileResult {
     let allocator = Allocator::default();
     let source_type = SourceType::default().with_typescript(true);
     let ret = JsParser::new(&allocator, source, source_type).parse();
@@ -316,6 +351,9 @@ fn transpile_with_mode(source: &str, return_mode: ReturnMode) -> TranspileResult
 
     let return_ty = match &return_mode {
         ReturnMode::Json { resp } => resp.clone(),
+        // The WebSocket per-message body erases its return to a uniform `serde_json::Value`
+        // (`transpile_ws_body` reasserts this on the result regardless).
+        ReturnMode::JsonValue => "serde_json::Value".to_string(),
         ReturnMode::Bare => return_ty_text
             .as_deref()
             .map(ts_type_to_rust)
@@ -331,7 +369,7 @@ fn transpile_with_mode(source: &str, return_mode: ReturnMode) -> TranspileResult
         };
     };
 
-    let mut tx = Transpiler { source, notes: Vec::new(), covered: true, return_mode };
+    let mut tx = Transpiler { source, notes: Vec::new(), covered: true, return_mode, stream };
     let mut out = String::new();
     for stmt in stmts {
         let rendered = tx.statement(stmt, 1);
@@ -372,12 +410,16 @@ fn body_source_text(source: &str) -> String {
 
 /// Walker state shared across the recursive lowering. `source` is the original text (for slicing
 /// out unsupported nodes verbatim); `notes`/`covered` accumulate degradation info; `return_mode`
-/// drives how `return` statements are rendered.
+/// drives how `return` statements are rendered; `stream` enables generator (`yield`) lowering.
 struct Transpiler<'a> {
     source: &'a str,
     notes: Vec<String>,
     covered: bool,
+    /// How `return` statements are rendered (see [`ReturnMode`]).
     return_mode: ReturnMode,
+    /// When `true` the body is a generator: a bare `yield X;` is lowered to a push of
+    /// `serde_json::json!(X)` onto the [`STREAM_ITEMS`] accumulator the SSE handler declares.
+    stream: bool,
 }
 
 impl<'a> Transpiler<'a> {
@@ -398,8 +440,10 @@ impl<'a> Transpiler<'a> {
         format!("{pad}// {slice}\n{pad}Default::default()")
     }
 
-    /// Render a `return EXPR` statement honoring [`ReturnMode`]: a bare `return EXPR;`, or — for an
-    /// axum handler — `return Json(<EXPR coerced to RESP>);`.
+    /// Render a `return EXPR` statement honoring [`ReturnMode`]: a bare `return EXPR;`, an axum
+    /// handler's `return Json(<EXPR coerced to RESP>);`, or — for a WebSocket per-message handler —
+    /// `return serde_json::json!(EXPR);` so any source return type erases to a uniform
+    /// `serde_json::Value`.
     fn render_return(&mut self, expr: &Expression, indent: usize) -> String {
         let pad = Self::pad(indent);
         let value = self.expression(expr, indent);
@@ -409,15 +453,18 @@ impl<'a> Transpiler<'a> {
                 let coerced = coerce_to_response(&value, resp, expr);
                 format!("{pad}return Json({coerced});")
             }
+            ReturnMode::JsonValue => format!("{pad}return serde_json::json!({value});"),
         }
     }
 
-    /// Render a value-less `return;`. In `Json` mode there is no value, so we return the typed default.
+    /// Render a value-less `return;`. In `Json` mode there is no value, so we return the typed default;
+    /// in `JsonValue` mode (WebSocket) it returns a JSON null.
     fn render_empty_return(&self, indent: usize) -> String {
         let pad = Self::pad(indent);
         match &self.return_mode {
             ReturnMode::Bare => format!("{pad}return;"),
             ReturnMode::Json { .. } => format!("{pad}return Json(Default::default());"),
+            ReturnMode::JsonValue => format!("{pad}return serde_json::Value::Null;"),
         }
     }
 
@@ -429,6 +476,27 @@ impl<'a> Transpiler<'a> {
                 Some(expr) => self.render_return(expr, indent),
                 None => self.render_empty_return(indent),
             },
+            // A bare `yield X;` in a generator body (stream mode) pushes the serialized value onto the
+            // SSE accumulator. Outside stream mode (or as a value), yield falls through to the
+            // expression lowering, which degrades gracefully.
+            Statement::ExpressionStatement(es)
+                if self.stream
+                    && matches!(&es.expression, Expression::YieldExpression(_)) =>
+            {
+                let Expression::YieldExpression(y) = &es.expression else { unreachable!() };
+                if y.delegate {
+                    // `yield*` (delegation) is outside the supported subset.
+                    return self.fallback("unsupported yield* delegation", y.span, indent);
+                }
+                match &y.argument {
+                    Some(arg) => {
+                        let value = self.expression(arg, indent);
+                        format!("{pad}{STREAM_ITEMS}.push(serde_json::json!({value}));")
+                    }
+                    // A bare `yield;` pushes a JSON null frame.
+                    None => format!("{pad}{STREAM_ITEMS}.push(serde_json::Value::Null);"),
+                }
+            }
             Statement::ExpressionStatement(es) => {
                 let value = self.expression(&es.expression, indent);
                 format!("{pad}{value};")
@@ -499,7 +567,15 @@ impl<'a> Transpiler<'a> {
         let pad = Self::pad(indent);
         if let Some((var, start, end)) = self.numeric_for_shape(for_stmt, indent) {
             let body = self.block_or_stmt(&for_stmt.body, indent);
-            return format!("{pad}for {var} in {start}..{end} {{\n{body}\n{pad}}}");
+            // JS numbers lower to `f64`, but a `Range<f64>` is not iterable in Rust — cast each bound
+            // to `i64` so the loop actually iterates AND compiles. The bound expression is wrapped in
+            // its own parens BEFORE the cast (`((count + 1.0) as i64)`), because Rust's `as` binds
+            // tighter than `+`/`-`: a bare `(count + 1.0 as i64)` would parse as `count + (1.0 as i64)`
+            // (an `f64 + i64` type error). The whole cast is then parenthesised so it composes as a
+            // range bound.
+            return format!(
+                "{pad}for {var} in (({start}) as i64)..(({end}) as i64) {{\n{body}\n{pad}}}"
+            );
         }
         self.fallback("unsupported for-loop shape", for_stmt.span, indent)
     }
@@ -536,7 +612,10 @@ impl<'a> Transpiler<'a> {
         let end_expr = self.expression(&test.right, indent);
         let end = match test.operator {
             BinaryOperator::LessThan => end_expr,
-            BinaryOperator::LessEqualThan => format!("{end_expr} + 1"),
+            // `i <= END` is an inclusive bound; normalise to the exclusive `END + 1`. JS numbers lower
+            // to `f64`, so the `+ 1` uses the `1.0` float literal — a bare `+ 1` would be `f64 +
+            // {integer}`, which does not compile.
+            BinaryOperator::LessEqualThan => format!("{end_expr} + 1.0"),
             _ => return None,
         };
 
@@ -826,10 +905,10 @@ fn coerce_to_response(value: &str, resp: &str, _expr: &Expression) -> String {
 }
 
 /// Does the lowered handler body end in an unconditional top-level `return …;`? Used to decide whether
-/// a trailing fall-through `Json(Default::default())` is needed (it is not when control can never reach
-/// the end). The final TOP-LEVEL statement is a line indented exactly one level (four spaces); a
-/// deeper-indented `return` inside an `if`/`for` block is not a guaranteed-reached tail.
-fn ends_in_unconditional_return(body: &str) -> bool {
+/// a trailing fall-through default is needed (it is not when control can never reach the end). The
+/// final TOP-LEVEL statement is a line indented exactly one level (four spaces); a deeper-indented
+/// `return` inside an `if`/`for` block is not a guaranteed-reached tail.
+pub(crate) fn ends_in_unconditional_return(body: &str) -> bool {
     body.lines()
         .rev()
         .find(|l| !l.trim().is_empty())
@@ -958,10 +1037,11 @@ mod tests {
 
         assert!(result.covered, "string concat should be covered; notes: {:?}", result.notes);
         assert_eq!(result.return_ty, "String");
-        // String `+` is lowered to a `format!` concatenation (so it reliably yields a `String`).
+        // JS string `+` lowers to `format!` (a `String`), so `&str + String` never reaches Rust (which
+        // would not compile); the result matches the `-> String` return type.
         assert!(
-            result.rust_body.contains(r#"format!("{}{}", "hello ", name)"#),
-            "string concat not lowered to format!:\n{}",
+            result.rust_body.contains(r#"return format!("{}{}", "hello ", name);"#),
+            "string concat not lowered to a compiling format!:\n{}",
             result.rust_body
         );
         assert_no_marker_words(&result.rust_body);
@@ -1014,8 +1094,8 @@ mod tests {
         let result = transpile_body(source);
 
         assert!(
-            result.rust_body.contains("for i in 0.0..n {"),
-            "for loop not lowered to a range:\n{}",
+            result.rust_body.contains("for i in ((0.0) as i64)..((n) as i64) {"),
+            "for loop not lowered to an iterable integer range:\n{}",
             result.rust_body
         );
         assert!(result.rust_body.contains("let total = 0.0;"));
@@ -1225,5 +1305,105 @@ mod tests {
         for note in &result.notes {
             assert_no_marker_words(note);
         }
+    }
+
+    #[test]
+    fn stream_body_lowers_each_yield_into_an_accumulator_push() {
+        // Each `yield X` becomes a push of the serialized value onto the SSE accumulator; the
+        // surrounding control flow lowers exactly as a plain body.
+        let source = "async function* ticks() { yield 1; yield 2 + 3; }";
+        let result = transpile_stream_body(source);
+
+        assert!(result.covered, "yield-only generator should be covered; notes: {:?}", result.notes);
+        assert!(
+            result.rust_body.contains(&format!("{STREAM_ITEMS}.push(serde_json::json!(1.0));")),
+            "first yield not lowered:\n{}",
+            result.rust_body
+        );
+        assert!(
+            result.rust_body.contains(&format!("{STREAM_ITEMS}.push(serde_json::json!(2.0 + 3.0));")),
+            "expression yield not lowered:\n{}",
+            result.rust_body
+        );
+        assert_no_marker_words(&result.rust_body);
+    }
+
+    #[test]
+    fn stream_body_yields_inside_a_loop_are_lowered() {
+        let source = "async function* counter(n: number) { for (let i = 0; i < n; i++) { yield i; } }";
+        let result = transpile_stream_body(source);
+
+        assert!(result.covered, "loop+yield should be covered; notes: {:?}", result.notes);
+        assert!(
+            result.rust_body.contains("for i in ((0.0) as i64)..((n) as i64) {"),
+            "loop not lowered to an iterable integer range:\n{}",
+            result.rust_body
+        );
+        assert!(
+            result.rust_body.contains(&format!("{STREAM_ITEMS}.push(serde_json::json!(i));")),
+            "loop-body yield not lowered:\n{}",
+            result.rust_body
+        );
+        assert_no_marker_words(&result.rust_body);
+    }
+
+    #[test]
+    fn stream_body_with_yield_star_degrades_without_marker_words() {
+        // `yield*` delegation is outside the supported subset and must degrade, not panic.
+        let source = "async function* fan() { yield* other(); }";
+        let result = transpile_stream_body(source);
+
+        assert!(!result.covered, "yield* must mark the body uncovered");
+        assert!(
+            result.rust_body.contains("Default::default()"),
+            "yield* should degrade to a typed default:\n{}",
+            result.rust_body
+        );
+        assert!(!result.notes.is_empty(), "expected a degradation note for yield*");
+        assert_no_marker_words(&result.rust_body);
+    }
+
+    #[test]
+    fn ws_body_wraps_returns_in_a_uniform_json_value() {
+        // The WS lowering erases the body's return type through `serde_json::json!` and always reports
+        // a `serde_json::Value` return type, so the duplex handler serializes a uniform payload.
+        let source = "function chat(msg: string) { return msg; }";
+        let result = transpile_ws_body(source);
+
+        assert!(result.covered, "simple return should be covered; notes: {:?}", result.notes);
+        assert_eq!(result.return_ty, "serde_json::Value");
+        assert!(
+            result.rust_body.contains("return serde_json::json!(msg);"),
+            "ws return not wrapped in json!:\n{}",
+            result.rust_body
+        );
+        assert_no_marker_words(&result.rust_body);
+    }
+
+    #[test]
+    fn ws_body_bare_return_becomes_a_json_null() {
+        let source = "function ping() { return; }";
+        let result = transpile_ws_body(source);
+
+        assert!(
+            result.rust_body.contains("return serde_json::Value::Null;"),
+            "bare ws return not lowered to a JSON null:\n{}",
+            result.rust_body
+        );
+        assert_no_marker_words(&result.rust_body);
+    }
+
+    #[test]
+    fn plain_body_returns_are_left_unwrapped() {
+        // Guard: the Api (plain) lowering is unchanged — returns are NOT json!-wrapped.
+        let source = "function add(a: number, b: number): number { return a + b; }";
+        let result = transpile_body(source);
+
+        assert!(result.rust_body.contains("return a + b;"));
+        assert!(
+            !result.rust_body.contains("serde_json::json!"),
+            "plain body must not wrap returns in json!:\n{}",
+            result.rust_body
+        );
     }
 }
