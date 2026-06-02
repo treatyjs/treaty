@@ -129,7 +129,9 @@ Harness / golden-authoring limits (not compiler defects):
 ## (2) Angular Linker — partial → AOT
 
 **Status: DONE for the link path (`libs/treaty-ivy/facade/src/linker.rs` + NAPI
-`linkPartial`). Production backend HOSTING of server fns is the remaining piece.**
+`linkPartial`). Production backend hosting of server fns is now DONE too — the
+generated axum Api/SSE/WebSocket handlers + runnable host are real
+(real-`cargo build`-against-axum verified).**
 
 Published Angular libraries ship **partial-compilation** output
 (`ɵɵngDeclareComponent` / `ɵɵngDeclareDirective` / … the `ɵɵngDeclare*` family).
@@ -148,9 +150,10 @@ production** builds.
 - DONE: bundler wiring — the linker runs over `node_modules` partial libs across
   `@treaty/{vite,rspack,rsbuild,rslib}` (dev + prod) and NAPI surfaces
   `linkPartial` in the addon.
-- REMAINING: production (non-dev) backend **hosting** of server fns — real SSE/WS
-  transport fan-out (the in-dev `/__server/*` backend already runs them; the
-  production axum handlers are skeletons).
+- DONE: production (non-dev) backend **hosting** of server fns — the generated
+  axum `Api` (`Json<Req>`→`Json<Resp>`), SSE (`Sse<Stream>`) and WebSocket
+  handlers + a runnable host (`build_router()` + `main.rs`) are real, replacing
+  the earlier skeletons; verified by a real `cargo build` against axum.
 
 Why it matters: it is the gate to using the existing Angular ecosystem
 unmodified, AOT, without bundling `@angular/compiler` into the app.
