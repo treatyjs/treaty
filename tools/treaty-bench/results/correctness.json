@@ -1,6 +1,6 @@
 {
   "benchmark": "compiler-correctness",
-  "generatedAt": "2026-06-02T19:38:00.530Z",
+  "generatedAt": "2026-06-02T21:51:10.462Z",
   "oracle": "@angular/compiler@22.0.0-rc.3",
   "treaty": "authoring_node.win32-x64-msvc.node",
   "comparison": "normalize() from libs/treaty-ivy/facade/parity/parity.mjs (same check the parity harness reports)",
@@ -15,16 +15,22 @@
     "cpu": "AMD Ryzen 7 PRO 5850U with Radeon Graphics"
   },
   "total": 29,
-  "renderable": 27,
+  "renderable": 29,
   "match": 27,
-  "diff": 0,
-  "oracleError": 2,
+  "diff": 2,
+  "oracleError": 0,
   "changeDetectionOnly": 0,
-  "loweringDivergences": 0,
+  "loweringDivergences": 2,
   "equivalentIgnoringChangeDetectionField": 27,
-  "summary": "27/27 renderable fixtures STRICTLY byte/AST-equivalent under parity normalize(); 27/27 are equivalent except the Rust emitter writes a `changeDetection:0` field the v22 oracle now omits (single metadata field, instruction streams identical); 0 genuine lowering divergence(s); 2 not renderable by the oracle printer (i18n)",
-  "diffFixtures": [],
-  "loweringDivergenceFixtures": [],
+  "summary": "27/29 renderable fixtures STRICTLY byte/AST-equivalent under parity normalize(); 27/29 are equivalent except the Rust emitter writes a `changeDetection:0` field the v22 oracle now omits (single metadata field, instruction streams identical); 2 genuine lowering divergence(s); 0 not renderable by the oracle printer (i18n is now rendered + compared, so this is 0 unless a new unsupported node appears)",
+  "diffFixtures": [
+    "i18n-static",
+    "i18n-interp"
+  ],
+  "loweringDivergenceFixtures": [
+    "i18n-static",
+    "i18n-interp"
+  ],
   "perFixture": [
     {
       "id": "static-element",
@@ -163,13 +169,21 @@
     },
     {
       "id": "i18n-static",
-      "result": "oracle-error",
-      "reason": "only important for i18n"
+      "result": "diff",
+      "category": "lowering-divergence",
+      "rustDiagnostics": null,
+      "firstDivergenceIndex": 82,
+      "oracleNear": "2,vars:0,consts:()=>{leti18n_0;if(typeofngI18nClosur",
+      "rustNear": "2,vars:0,consts:()=>{let$i18n_0$;if(typeofngI18nClos"
     },
     {
       "id": "i18n-interp",
-      "result": "oracle-error",
-      "reason": "only important for i18n"
+      "result": "diff",
+      "category": "lowering-divergence",
+      "rustDiagnostics": null,
+      "firstDivergenceIndex": 82,
+      "oracleNear": "2,vars:1,consts:()=>{leti18n_0;if(typeofngI18nClosur",
+      "rustNear": "2,vars:1,consts:()=>{let$i18n_0$;if(typeofngI18nClos"
     }
   ]
 }

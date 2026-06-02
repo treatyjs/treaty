@@ -241,31 +241,29 @@ const FIXTURES = [
   },
   // -------------------------------------------------------------------------
   // Fifth batch: i18n. A `<div i18n>...</div>` MARKS the element for translation.
-  // Crucially, the Rust `compile_component` does NOT pass any i18n options and its
-  // template transform leaves i18n handling entirely INERT — see the NOTE(port) in
-  // libs/treaty-ivy/template/src/template/template_transform.rs:44 ("all i18n handling (root
-  // detection, ICU expansion) is inert (`None`)") and compile.rs, which builds its
-  // metadata with `i18n_use_external_ids: false` and never enables i18n. The Rust
-  // side therefore treats the `i18n` marker as a PLAIN static attribute named
-  // `i18n` (no message extraction, no `ɵɵi18n`/`ɵɵi18nStart` instruction stream,
-  // no `$localize` tagged-template const).
+  // BOTH sides now fully lower i18n: @angular/compiler's `parseTemplate` extracts
+  // the message and `compileComponentFromMetadata` emits the `consts: () => {…}`
+  // factory (a closure-mode `goog.getMsg` branch + a `$localize\`…\`` else branch),
+  // a `ɵɵi18n(slot, constIndex)` create instruction, and — for interpolation —
+  // `ɵɵi18nExp(ctx.x)` / `ɵɵi18nApply(slot)` in the update block. The Rust
+  // treaty_ivy emitter produces the IDENTICAL instruction stream and const factory
+  // (verified: same decls/vars, same `goog.getMsg`/`$localize` shape, same
+  // placeholder map + `original_code`).
   //
-  // To keep the comparison apples-to-apples the oracle here uses the SAME minimal
-  // config it already uses in compileWithOracle: i18n is NOT enabled (no extra
-  // parseTemplate i18n options, `i18nUseExternalIds: false`, unchanged). Because
-  // `compile_component` does not yet pass i18n options, mirroring that minimal
-  // config is exactly what the task calls for — both sides see `<div i18n>` with
-  // `i18n` as an ordinary attribute. (If/when the Rust side starts honoring i18n,
-  // the oracle would flip to enableI18nLegacyMessageIdFormat + the matching flags;
-  // until then enabling it on the oracle alone would be a FALSE apples-to-oranges
-  // diff — and would also trip the printer's `visitLocalizedString` /
-  // `visitTaggedTemplateExpr` "only important for i18n" throws.)
-  //
-  // These fixtures will very likely DIFF: the oracle's `parseTemplate` understands
-  // the `i18n` marker and may drop/relocate it (it is not emitted as a literal
-  // attribute the way a normal attr is), whereas the Rust side carries `i18n`
-  // through as a plain attribute const. That divergence is the informative signal —
-  // it pinpoints exactly where the Rust i18n wiring is still absent.
+  // The oracle printer below now RENDERS these (visitLocalizedString /
+  // visitTemplateLiteralExpr / visitTaggedTemplateLiteralExpr implemented), so the
+  // two i18n fixtures are COMPARED, not skipped. After normalize() they reduce to
+  // exactly two residual divergences — both real Rust-side emit choices, not oracle
+  // gaps:
+  //   1. const-pool LOCAL VARIABLE NAMES: oracle `i18n_0` / `MSG__0` vs Rust
+  //      `$i18n_0$` / `$MSG_ID_WITH_SUFFIX$` (the Rust side still emits the literal
+  //      `$MSG_ID_WITH_SUFFIX$` placeholder pending message-id substitution).
+  //   2. (interp only) the U+FFFD placeholder marker: Angular writes the RAW U+FFFD
+  //      code point into the string literal, the Rust emitter escapes it as the
+  //      6-char backslash-u-FFFD sequence. Semantically equal JS, byte-different
+  //      source.
+  // Both are reported as genuine lowering-divergences (i18n-static, i18n-interp) by
+  // the bench's correctness pass — nothing is masked.
   // -------------------------------------------------------------------------
   {
     id: 'i18n-static',
@@ -381,7 +379,34 @@ function makePrinter(ngc = ng) {
       const args = ast.args.map((arg) => arg.visitExpression(this, context));
       return `${fn}(${args.join(', ')})`;
     }
-    visitTaggedTemplateExpr() { throw new Error('only important for i18n'); }
+    // Tagged template literal — `tag\`...\``. Used by i18n only when the const-pool
+    // message is itself a tagged template (rare for these fixtures, which use the
+    // `$localize\`...\`` LocalizedString node below), but rendered faithfully so the
+    // oracle never falls back to a throw if it is ever reached. Mirrors Angular's
+    // AbstractEmitterVisitor.visitTaggedTemplateLiteralExpr: print the tag, then the
+    // template literal. v22 dispatches TaggedTemplateLiteralExpr to
+    // `visitTaggedTemplateLiteralExpr`; older @angular/compiler used
+    // `visitTaggedTemplateExpr`. Provide BOTH so the printer works across the bench's
+    // v21/v22 oracle modules.
+    visitTaggedTemplateLiteralExpr(ast, context) {
+      return ast.tag.visitExpression(this, context) + ast.template.visitExpression(this, context);
+    }
+    visitTaggedTemplateExpr(ast, context) {
+      return this.visitTaggedTemplateLiteralExpr(ast, context);
+    }
+    // Template literal `\`a${x}b\`` — mirrors AbstractEmitterVisitor.visitTemplateLiteralExpr:
+    // interleave each cooked element with `${ expr }` for the matching expression.
+    visitTemplateLiteralExpr(ast, context) {
+      let s = '`';
+      for (let i = 0; i < ast.elements.length; i++) {
+        s += ast.elements[i].visitExpression(this, context);
+        const expr = i < ast.expressions.length ? ast.expressions[i] : null;
+        if (expr !== null) s += '${' + expr.visitExpression(this, context) + '}';
+      }
+      return s + '`';
+    }
+    // A single literal segment of a template literal — Angular prints its rawText.
+    visitTemplateLiteralElementExpr(ast) { return ast.rawText; }
     visitInstantiateExpr(ast, context) {
       const ctor = ast.classExpr.visitExpression(this, context);
       const args = ast.args.map((arg) => arg.visitExpression(this, context));
@@ -395,7 +420,33 @@ function makePrinter(ngc = ng) {
       else value = ast.value.toString();
       return value;
     }
-    visitLocalizedString() { throw new Error('only important for i18n'); }
+    // i18n `$localize` tagged-template message. This is the node the two i18n
+    // fixtures (<div i18n>Hello</div> / <div i18n>Hello {{name}}</div>) actually hit:
+    // @angular/compiler lowers each i18n message to a const-pool entry whose runtime
+    // value, in the non-closure branch, is a `$localize\`...\`` LocalizedString. The
+    // Rust treaty_ivy emitter produces the IDENTICAL shape (see the `consts: () => {…}`
+    // closure with the `$localize\`Hello ${"…"}:INTERPOLATION:\`` else-branch). This
+    // reproduces Angular's AbstractEmitterVisitor.visitLocalizedString EXACTLY:
+    //   `$localize \`` + head.raw, then for each subsequent message part i,
+    //   `${` + expression[i-1] + `}` + serializeI18nTemplatePart(i).raw, closing with `\``.
+    // serializeI18nHead()/serializeI18nTemplatePart() carry the `:PLACEHOLDER:` post-
+    // colon block that the runtime parser strips, so this yields the canonical
+    // `$localize \`Hello ${'�0�'}:INTERPOLATION:\`` text. normalize() unifies
+    // the single/double quote on the placeholder expression and collapses the one
+    // space @angular emits after `$localize`, so it compares byte-equal to the Rust
+    // emitter's `$localize\`…\``. (Angular emits the placeholder expr single-quoted,
+    // the Rust side double-quoted — normalize() folds both to double quotes.)
+    visitLocalizedString(ast, context) {
+      let s = '$localize `' + ast.serializeI18nHead().raw;
+      for (let i = 1; i < ast.messageParts.length; i++) {
+        s +=
+          '${' +
+          ast.expressions[i - 1].visitExpression(this, context) +
+          '}' +
+          ast.serializeI18nTemplatePart(i).raw;
+      }
+      return s + '`';
+    }
     visitExternalExpr(ast) {
       if (ast.value.name === null) {
         if (ast.value.moduleName === null) throw new Error('Invalid import without name nor moduleName');

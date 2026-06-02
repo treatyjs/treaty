@@ -19,6 +19,7 @@
  * dependency (`this.addDependency`) so editing a route re-runs the loader in watch.
  */
 
+import { fileURLToPath } from 'node:url'
 import { generateRoutesModule, type RoutesVirtualModuleOptions } from '@treaty/ts-vite'
 
 export { TREATY_ROUTES_ID } from '@treaty/ts-vite'
@@ -27,13 +28,16 @@ export { TREATY_ROUTES_ID } from '@treaty/ts-vite'
  * Absolute path to the on-disk sentinel module the `virtual:treaty-routes` import
  * is aliased to. Its contents are irrelevant — the loader overwrites them — but it
  * must exist so Rspack can resolve the import to a real module.
+ * `fileURLToPath` keeps the path resolvable on Windows (no leading-slash `/C:/...`).
  */
-export const routesSentinelPath: string = new URL('./routes-virtual-entry.js', import.meta.url)
-	.pathname
+export const routesSentinelPath: string = fileURLToPath(
+	new URL('./routes-virtual-entry.js', import.meta.url),
+)
 
 /** Absolute path to the routes-generating loader module, for a `rules[].use.loader` entry. */
-export const routesLoaderPath: string = new URL('./routes-virtual-loader.js', import.meta.url)
-	.pathname
+export const routesLoaderPath: string = fileURLToPath(
+	new URL('./routes-virtual-loader.js', import.meta.url),
+)
 
 /** The module-rule `test` that selects the sentinel so the routes loader runs over it. */
 export const ROUTES_SENTINEL_TEST: RegExp = /routes-virtual-entry\.js$/

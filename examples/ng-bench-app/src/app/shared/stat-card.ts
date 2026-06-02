@@ -14,7 +14,7 @@ export type Trend = 'up' | 'down' | 'flat';
  * a computed() derived value.
  */
 @Component({
-  selector: 'app-stat-card',
+  selector: 'stat-card',
   changeDetection: ChangeDetectionStrategy.OnPush,
   template: `
     <article class="panel">

@@ -12,7 +12,7 @@ import { LoggerService } from '../../core/logger.service';
 import { Product } from '../../core/product.model';
 import { ProductService } from '../../core/product.service';
 import { CurrencyFormatPipe } from '../../shared/currency-format.pipe';
-import { StatCard, Trend } from '../../shared/stat-card';
+import { StatCard, type Trend } from '../../shared/stat-card';
 
 @Component({
   selector: 'app-dashboard',
@@ -23,19 +23,19 @@ import { StatCard, Trend } from '../../shared/stat-card';
       <h2>Inventory dashboard</h2>
 
       <div class="cards">
-        <app-stat-card
+        <stat-card
           label="Products"
           [value]="products().length"
           trend="up"
           (refresh)="onRefresh($event)"
         />
-        <app-stat-card
+        <stat-card
           label="In stock"
           [value]="inStockCount()"
           [trend]="stockTrend()"
           (refresh)="onRefresh($event)"
         />
-        <app-stat-card
+        <stat-card
           label="Catalogue value (cents)"
           [value]="totalValueCents()"
           trend="flat"

@@ -1562,18 +1562,35 @@ pub fn compile_component_source_with_map_and_selector(
 /// Collect the file's imported identifier names — the auto-import candidate set. Mirrors
 /// `extractImportStrings` in the REPL's `treat-to-ivy.ts`, but over the AST: every default,
 /// namespace and named binding introduced by an `import` declaration.
+///
+/// TYPE-ONLY imports are EXCLUDED. A `import type { … }` declaration, or an inline
+/// `import { type Trend }` specifier, introduces a binding that exists only in TypeScript type
+/// space — it is erased at emit and can never be a runtime directive/component/pipe. Including it
+/// would let the attribute/input auto-import matcher fold a binding name (e.g. an input `[trend]`)
+/// onto a same-named type import (`Trend`) and emit it into the runtime `dependencies` array, which
+/// then fails to resolve at bundle time (the export does not exist as a value). Honouring the `type`
+/// qualifier keeps such an import out of the candidate set entirely.
 fn collect_imported_names(program: &Program) -> Vec<String> {
+    use oxc_ast::ast::ImportOrExportKind;
     let mut names: Vec<String> = Vec::new();
     for stmt in &program.body {
         let Statement::ImportDeclaration(import) = stmt else {
             continue;
         };
+        // `import type { … } from …` / `import type Foo from …`: every binding is type-only.
+        if import.import_kind == ImportOrExportKind::Type {
+            continue;
+        }
         let Some(specifiers) = &import.specifiers else {
             continue;
         };
         for spec in specifiers {
             match spec {
                 oxc_ast::ast::ImportDeclarationSpecifier::ImportSpecifier(s) => {
+                    // Inline `import { type Bar }`: this single specifier is type-only.
+                    if s.import_kind == ImportOrExportKind::Type {
+                        continue;
+                    }
                     names.push(s.local.name.to_string());
                 }
                 oxc_ast::ast::ImportDeclarationSpecifier::ImportDefaultSpecifier(s) => {

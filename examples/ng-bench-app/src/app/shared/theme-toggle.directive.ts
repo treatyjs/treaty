@@ -10,9 +10,9 @@ import {
  * Toggles a `data-theme` attribute and an `is-dark` class on its host element.
  */
 @Directive({
-  selector: '[appThemeToggle]',
+  selector: '[themeToggle]',
 })
-export class ThemeToggleDirective {
+export class ThemeToggle {
   private readonly dark = signal(true);
 
   @HostBinding('attr.data-theme')

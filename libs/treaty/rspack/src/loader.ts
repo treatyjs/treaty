@@ -13,6 +13,7 @@
  * incremental cache survives across module builds in one Rspack run.
  */
 
+import { fileURLToPath } from 'node:url'
 import {
 	createTreatyCompiler,
 	type TransformResult,
@@ -183,5 +184,10 @@ function report(
 
 export default treatyLoader
 
-/** Absolute path to this loader module, for use in a `rules[].use.loader` entry. */
-export const loaderPath = new URL(import.meta.url).pathname
+/**
+ * Absolute path to this loader module, for use in a `rules[].use.loader` entry.
+ * Uses `fileURLToPath` rather than `new URL(...).pathname` so the path is a real
+ * OS path on every platform — on Windows `.pathname` yields a leading-slash
+ * `/C:/...` string that Rspack cannot resolve as a loader.
+ */
+export const loaderPath = fileURLToPath(import.meta.url)

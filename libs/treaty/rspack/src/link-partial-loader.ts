@@ -20,6 +20,7 @@
  * unchanged so the rest of the loader chain still runs.
  */
 
+import { fileURLToPath } from 'node:url'
 import { isPartialModule, linkPartialCode } from '@treaty/ts-vite'
 
 /**
@@ -96,8 +97,12 @@ function report(
 
 export default linkPartialLoader
 
-/** Absolute path to this loader module, for use in a `rules[].use.loader` entry. */
-export const linkPartialLoaderPath = new URL(import.meta.url).pathname
+/**
+ * Absolute path to this loader module, for use in a `rules[].use.loader` entry.
+ * Uses `fileURLToPath` (not `new URL(...).pathname`) so the path is a real OS path
+ * on Windows too — `.pathname` would yield an unresolvable leading-slash `/C:/...`.
+ */
+export const linkPartialLoaderPath = fileURLToPath(import.meta.url)
 
 /**
  * The module-rule `test` for the linker loader: `node_modules` `.mjs`/`.js`/`.cjs` files. The cheap

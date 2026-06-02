@@ -1,12 +1,12 @@
 import { ChangeDetectionStrategy, Component, signal } from '@angular/core';
 import { RouterLink, RouterLinkActive, RouterOutlet } from '@angular/router';
 
-import { ThemeToggleDirective } from './shared/theme-toggle.directive';
+import { ThemeToggle } from './shared/theme-toggle.directive';
 
 @Component({
   selector: 'app-root',
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [RouterOutlet, RouterLink, RouterLinkActive, ThemeToggleDirective],
+  imports: [RouterOutlet, RouterLink, RouterLinkActive, ThemeToggle],
   template: `
     <header class="container">
       <h1>{{ title() }}</h1>
@@ -16,7 +16,7 @@ import { ThemeToggleDirective } from './shared/theme-toggle.directive';
         </a>
         <a routerLink="/catalog" routerLinkActive="active">Catalog</a>
         <a routerLink="/about" routerLinkActive="active">About</a>
-        <button type="button" class="secondary" appThemeToggle>Toggle theme</button>
+        <button type="button" class="secondary" themeToggle>Toggle theme</button>
       </nav>
     </header>
 

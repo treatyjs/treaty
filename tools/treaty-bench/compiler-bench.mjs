@@ -135,10 +135,11 @@ const MEASURE_ITERS = 2000; // timed warm iterations
 
 // ---------------------------------------------------------------------------
 // Determine which fixtures each compiler can actually lower. The Angular oracle
-// printer THROWS on the i18n fixtures ("only important for i18n") and on any
-// shape it cannot render — those are not a fair timing target, so we restrict
-// the timed corpus to fixtures BOTH measured compilers can compile, keeping the
-// ms/component apples-to-apples (identical work per iteration per compiler).
+// printer now renders the i18n fixtures too (visitLocalizedString +
+// visitTemplateLiteralExpr implemented in parity.mjs), so the whole 29-fixture
+// corpus is usable; this guard simply drops anything a compiler genuinely cannot
+// render so the timed corpus stays the intersection BOTH measured compilers can
+// compile, keeping ms/component apples-to-apples (identical work per iteration).
 // ---------------------------------------------------------------------------
 function usableFixtures(compileOne) {
   const ok = [];
@@ -276,9 +277,10 @@ function round(n, dp) {
 // honest and informative rather than a bare pass/fail:
 //   - "match"        : normalized oracle === normalized rust (byte/AST-equivalent)
 //   - "diff"         : a genuine template-lowering divergence
-//   - "oracle-error" : the parity printer cannot render this fixture (the i18n
-//                      `only important for i18n` throw) — excluded from scoring,
-//                      same as the parity harness treats them.
+//   - "oracle-error" : the parity printer cannot render this fixture — now only if
+//                      a NEW unsupported output_ast node appears; the i18n fixtures
+//                      no longer land here (visitLocalizedString is implemented),
+//                      so all 29 are scored, none excluded.
 // For every non-matching renderable fixture we also record WHICH normalized field
 // first diverges, so a single-field metadata delta (e.g. the v22 emit dropping a
 // `changeDetection` field the Rust side still writes) is visible and not hidden.
@@ -391,7 +393,8 @@ function runCorrectness() {
       `${equivalentIgnoringCd}/${renderable} are equivalent except the Rust emitter writes a ` +
       `\`changeDetection:0\` field the v22 oracle now omits (single metadata field, instruction ` +
       `streams identical); ${realDiff} genuine lowering divergence(s); ` +
-      `${oracleError} not renderable by the oracle printer (i18n)`,
+      `${oracleError} not renderable by the oracle printer ` +
+      `(i18n is now rendered + compared, so this is 0 unless a new unsupported node appears)`,
     diffFixtures: perFixture.filter((f) => f.result === 'diff').map((f) => f.id),
     loweringDivergenceFixtures: perFixture
       .filter((f) => f.result === 'diff' && f.category === 'lowering-divergence')
@@ -459,8 +462,9 @@ async function main() {
   console.log('');
 
   // Build the SHARED timed set = fixtures ALL measured compilers can lower, so
-  // every compiler is timed over the identical templates (the Angular oracle
-  // printer throws on the i18n fixtures; the intersection drops those for all).
+  // every compiler is timed over the identical templates. With the i18n fixtures
+  // now renderable by the oracle printer, the intersection is the full 29-fixture
+  // corpus (i18n is timed + compared, no longer excluded).
   const angOk = new Set(usableFixtures(compileAngular).ok.map((f) => f.id));
   const oxcOk = compileTreatyOxc
     ? new Set(usableFixtures(compileTreatyOxc).ok.map((f) => f.id))

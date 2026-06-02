@@ -1,0 +1,186 @@
+{
+  "generatedAt": "2026-06-02T21:54:49.702Z",
+  "app": "examples/ng-bench-app",
+  "appNote": "Realistic standard-Angular application (6 components, a service layer, a pure pipe, an attribute directive, an eager route + 3 lazy routes). Pure @Component/@Directive/@Pipe .ts — zero Treaty-only features — so it builds with BOTH the Angular CLI (@angular/build:application) and every Treaty bundler plugin, exercising the FULL Treaty compile path (decorator lowering + template codegen), not just the linker. Component selectors and the directive selector are class-name-convention-aligned (e.g. class StatCard ↔ selector \"stat-card\", class ThemeToggle ↔ \"[themeToggle]\") so the Treaty compiler resolves every cross-file template dependency by its class-name↔selector convention.",
+  "matchedOptimization": "Every tool builds in PRODUCTION mode with minify + tree-shake ON, so dist sizes are apples-to-apples — EXCEPT rslib, which is a LIBRARY builder that externalizes @angular/* by design (its dist excludes the Angular runtime; flagged on its row).",
+  "host": {
+    "platform": "win32",
+    "arch": "x64",
+    "node": "v24.7.0"
+  },
+  "runsPerTool": 3,
+  "versions": {
+    "@angular/core": "22.0.0-rc.3",
+    "vite": "7.3.3",
+    "rolldown": "1.0.0-rc.4",
+    "@rspack/core": "2.0.6",
+    "@rsbuild/core": "2.0.10",
+    "@rslib/core": "0.22.0",
+    "@angular/build": "22.0.0-rc.3"
+  },
+  "metric": "best (min) wall-clock build time over N clean builds; distBytes = sum of all emitted output files; works = headless jsdom boot verdict (renders the eager Dashboard route with no JIT / @angular/compiler error).",
+  "e2e": {
+    "layer": "e2e-of-output",
+    "method": "After timing+sizing each build tool, boot its emitted bundle headlessly in jsdom (a fresh child process per tool, reusing the linker-smoke e2e Step-4 boot pattern via boot-fullapp.mjs) and assert: (a) bootstrap throws NO JIT / \"@angular/compiler not available\" error, and (b) the eager Dashboard route renders (<h2>Inventory dashboard</h2>). statCards/navLinks report cross-file component-resolution completeness.",
+    "results": [
+      {
+        "tool": "vite",
+        "works": "PASS",
+        "reason": "eager Dashboard route rendered (\"Inventory dashboard\") with no JIT / @angular/compiler error; statCards=3 navLinks=3",
+        "jitError": false,
+        "importError": null,
+        "rendered": true,
+        "renderedAnything": true,
+        "statCards": 3,
+        "navLinks": 3,
+        "headings": [
+          "Inventory dashboard"
+        ],
+        "entry": "D:\\dev\\treaty\\examples\\ng-bench-app\\dist\\fullapp-bench\\vite-2\\assets\\main-C6JRRZBo.js"
+      },
+      {
+        "tool": "rspack",
+        "works": "PASS",
+        "reason": "eager Dashboard route rendered (\"Inventory dashboard\") with no JIT / @angular/compiler error; statCards=3 navLinks=3",
+        "jitError": false,
+        "importError": null,
+        "rendered": true,
+        "renderedAnything": true,
+        "statCards": 3,
+        "navLinks": 3,
+        "headings": [
+          "Inventory dashboard"
+        ],
+        "entry": "D:\\dev\\treaty\\examples\\ng-bench-app\\dist\\fullapp-bench\\rspack-2\\main.js"
+      },
+      {
+        "tool": "rsbuild",
+        "works": "PASS",
+        "reason": "eager Dashboard route rendered (\"Inventory dashboard\") with no JIT / @angular/compiler error; statCards=3 navLinks=3",
+        "jitError": false,
+        "importError": null,
+        "rendered": true,
+        "renderedAnything": true,
+        "statCards": 3,
+        "navLinks": 3,
+        "headings": [
+          "Inventory dashboard"
+        ],
+        "entry": "D:\\dev\\treaty\\examples\\ng-bench-app\\dist\\fullapp-bench\\rsbuild-2\\static\\js\\index.cfb8dd1dca.js"
+      },
+      {
+        "tool": "rslib",
+        "works": "PASS",
+        "reason": "eager Dashboard route rendered (\"Inventory dashboard\") with no JIT / @angular/compiler error; statCards=3 navLinks=3",
+        "jitError": false,
+        "importError": null,
+        "rendered": true,
+        "renderedAnything": true,
+        "statCards": 3,
+        "navLinks": 3,
+        "headings": [
+          "Inventory dashboard"
+        ],
+        "entry": "D:\\dev\\treaty\\examples\\ng-bench-app\\dist\\fullapp-bench\\rslib-2\\main.mjs"
+      },
+      {
+        "tool": "rolldown",
+        "works": "PASS",
+        "reason": "eager Dashboard route rendered (\"Inventory dashboard\") with no JIT / @angular/compiler error; statCards=3 navLinks=3",
+        "jitError": false,
+        "importError": null,
+        "rendered": true,
+        "renderedAnything": true,
+        "statCards": 3,
+        "navLinks": 3,
+        "headings": [
+          "Inventory dashboard"
+        ],
+        "entry": "D:\\dev\\treaty\\examples\\ng-bench-app\\dist\\fullapp-bench\\rolldown-2\\main.js"
+      },
+      {
+        "tool": "ng",
+        "works": "PASS",
+        "reason": "eager Dashboard route rendered (\"Inventory dashboard\") with no JIT / @angular/compiler error; statCards=3 navLinks=3",
+        "jitError": false,
+        "importError": null,
+        "rendered": true,
+        "renderedAnything": true,
+        "statCards": 3,
+        "navLinks": 3,
+        "headings": [
+          "Inventory dashboard"
+        ],
+        "entry": "D:\\dev\\treaty\\examples\\ng-bench-app\\dist\\fullapp-bench\\ng-project\\dist\\browser\\main.js"
+      }
+    ]
+  },
+  "results": [
+    {
+      "tool": "vite",
+      "status": "measured",
+      "buildMs": 2360,
+      "distBytes": 582439,
+      "note": "best of 3 run(s); times(ms)=[3166, 2630, 2360]; jsFiles=4 residualNgDeclare=0 importsCompiler=false linkedOk=true",
+      "works": "PASS",
+      "worksReason": "eager Dashboard route rendered (\"Inventory dashboard\") with no JIT / @angular/compiler error; statCards=3 navLinks=3",
+      "statCards": 3,
+      "navLinks": 3
+    },
+    {
+      "tool": "rspack",
+      "status": "measured",
+      "buildMs": 891,
+      "distBytes": 599310,
+      "note": "best of 3 run(s); times(ms)=[916, 958, 891]; jsFiles=4 residualNgDeclare=0 importsCompiler=false linkedOk=true",
+      "works": "PASS",
+      "worksReason": "eager Dashboard route rendered (\"Inventory dashboard\") with no JIT / @angular/compiler error; statCards=3 navLinks=3",
+      "statCards": 3,
+      "navLinks": 3
+    },
+    {
+      "tool": "rsbuild",
+      "status": "measured",
+      "buildMs": 955,
+      "distBytes": 603102,
+      "note": "best of 3 run(s); times(ms)=[982, 955, 1052]; jsFiles=4 residualNgDeclare=0 importsCompiler=false linkedOk=true",
+      "works": "PASS",
+      "worksReason": "eager Dashboard route rendered (\"Inventory dashboard\") with no JIT / @angular/compiler error; statCards=3 navLinks=3",
+      "statCards": 3,
+      "navLinks": 3
+    },
+    {
+      "tool": "rslib",
+      "status": "measured",
+      "buildMs": 499,
+      "distBytes": 18404,
+      "note": "LIBRARY build — EXTERNALIZES @angular/* (not bundled), so dist excludes the Angular runtime and is NOT a like-for-like app-size comparison with the app bundlers. best of 3 run(s); times(ms)=[576, 499, 520]; jsFiles=5 residualNgDeclare=0 importsCompiler=false linkedOk=true",
+      "works": "PASS",
+      "worksReason": "eager Dashboard route rendered (\"Inventory dashboard\") with no JIT / @angular/compiler error; statCards=3 navLinks=3",
+      "statCards": 3,
+      "navLinks": 3
+    },
+    {
+      "tool": "rolldown",
+      "status": "measured",
+      "buildMs": 430,
+      "distBytes": 575150,
+      "note": "best of 3 run(s); times(ms)=[489, 430, 461]; jsFiles=4 residualNgDeclare=0 importsCompiler=false linkedOk=true",
+      "works": "PASS",
+      "worksReason": "eager Dashboard route rendered (\"Inventory dashboard\") with no JIT / @angular/compiler error; statCards=3 navLinks=3",
+      "statCards": 3,
+      "navLinks": 3
+    },
+    {
+      "tool": "ng",
+      "status": "measured",
+      "buildMs": 5958,
+      "distBytes": 253529,
+      "note": "best of 3 run(s); times(ms)=[11564, 6143, 5958]; jsFiles=4 residualNgDeclare=0 importsCompiler=false linkedOk=true",
+      "works": "PASS",
+      "worksReason": "eager Dashboard route rendered (\"Inventory dashboard\") with no JIT / @angular/compiler error; statCards=3 navLinks=3",
+      "statCards": 3,
+      "navLinks": 3
+    }
+  ]
+}

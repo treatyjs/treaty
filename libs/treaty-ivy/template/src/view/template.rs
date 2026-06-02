@@ -2424,7 +2424,15 @@ pub struct TemplateDefinitionBuilder {
     binding_slots: usize,
     creation_code: Vec<Stmt>,
     update_code: Vec<Stmt>,
-    const_pool: ConstantPool,
+    /// The component's constant pool. SHARED by reference across the entire view tree (root + every
+    /// nested structural/control-flow view), mirroring Angular's single per-component
+    /// `ConstantPool`. Each nested view interns directly into this one pool, so a const index baked
+    /// into a nested view's instruction (`ɵɵelementStart(slot, tag, constIndex)`) is the GLOBAL
+    /// index into the emitted `consts:` array. A per-view pool would (and previously did) number a
+    /// nested view's consts from 0 locally and append them to the parent at different positions,
+    /// leaving the nested instruction pointing at the wrong (or an out-of-range) const — corrupting
+    /// `@for`/`@if`-nested static-attribute elements at runtime (`getOrCreateTNode` on a bad slot).
+    const_pool: std::rc::Rc<std::cell::RefCell<ConstantPool>>,
     /// Loop variables in scope for this (embedded) view — `@for` item / `$index` / `$count`.
     /// Empty for the root view. Reads of these names lower to their generated locals.
     loop_vars: Vec<LoopVar>,
@@ -2621,7 +2629,7 @@ impl TemplateDefinitionBuilder {
             binding_slots: 0,
             creation_code: Vec::new(),
             update_code: Vec::new(),
-            const_pool: ConstantPool::new(),
+            const_pool: std::rc::Rc::new(std::cell::RefCell::new(ConstantPool::new())),
             loop_vars: Vec::new(),
             context_lets: Vec::new(),
             external_lets: std::collections::HashMap::new(),
@@ -2875,9 +2883,11 @@ impl TemplateDefinitionBuilder {
         self.creation_code = creation;
     }
 
-    /// Borrow the constant pool collected during [`Self::build_template_function`].
-    pub fn const_pool(&self) -> &ConstantPool {
-        &self.const_pool
+    /// Borrow the constant pool collected during [`Self::build_template_function`]. Returns a
+    /// [`std::cell::Ref`] guard (the pool is shared across the view tree behind an `Rc<RefCell>`);
+    /// it derefs to `&ConstantPool`, so `entries()`/`to_const_array()`/`is_empty()` read through it.
+    pub fn const_pool(&self) -> std::cell::Ref<'_, ConstantPool> {
+        self.const_pool.borrow()
     }
 
     /// The number of allocated data slots after [`Self::build_template_function`] — this is the
@@ -3334,7 +3344,7 @@ impl TemplateDefinitionBuilder {
         template_names: &[String],
     ) -> Option<usize> {
         let entries = self.serialize_attrs_entries(attributes, binding_names, template_names)?;
-        Some(self.const_pool.intern(o::literal_arr(entries, None)))
+        Some(self.const_pool.borrow_mut().intern(o::literal_arr(entries, None)))
     }
 
     /// Build the raw serialized-attributes array contents (`Vec<Expr>`) without interning, or `None`
@@ -4324,7 +4334,7 @@ impl TemplateDefinitionBuilder {
         });
 
         // The message's const ordinal — Angular numbers `i18n_n` from the const-array position.
-        let index = self.const_pool.entries().len();
+        let index = self.const_pool.borrow().entries().len();
 
         // Two context-dependent emit forms Angular's own compiler chooses between (proven by the
         // goldens). (1) `bare_name`: a message that brackets control-flow blocks
@@ -4347,6 +4357,7 @@ impl TemplateDefinitionBuilder {
             },
         );
         self.const_pool
+            .borrow_mut()
             .add_const_with_initializers(i18n_const.const_entry, i18n_const.initializers)
     }
 
@@ -5087,7 +5098,7 @@ impl TemplateDefinitionBuilder {
             entries.push(str_lit(&r.name));
             entries.push(str_lit(&r.value));
         }
-        Some(self.const_pool.intern(o::literal_arr(entries, None)))
+        Some(self.const_pool.borrow_mut().intern(o::literal_arr(entries, None)))
     }
 
     /// Build a nested embedded-view function for a control-flow branch / loop body, HOISTING it as a
@@ -5125,6 +5136,12 @@ impl TemplateDefinitionBuilder {
             .with_dom_only(self.dom_only)
             .with_deferred_deps(self.deferred_deps.clone());
         let mut nested = TemplateDefinitionBuilder::new(&nested_input);
+        // SHARE the component's single constant pool with the nested view (Angular threads one
+        // `ConstantPool` through the whole view tree). The nested view interns its own element-attr /
+        // local-ref consts DIRECTLY into this pool, so the const index baked into each nested
+        // instruction is the GLOBAL `consts:` index — no post-hoc re-intern (which would renumber the
+        // nested consts and leave the instructions pointing at the wrong entry).
+        nested.const_pool = std::rc::Rc::clone(&self.const_pool);
         nested.i18n_child_view = i18n_child_view;
         // An embedded view is never the root: its hoisted descendant fns bubble up to the root
         // (below) rather than being inlined into this view body, so each is emitted exactly once.
@@ -5155,9 +5172,8 @@ impl TemplateDefinitionBuilder {
         self.projection_count = nested.projection_count;
         self.all_projection_selectors = std::mem::take(&mut nested.all_projection_selectors);
         self.has_default_projection = nested.has_default_projection;
-        for entry in nested.const_pool.entries() {
-            self.const_pool.intern(entry.clone());
-        }
+        // The const pool is SHARED (same `Rc<RefCell<ConstantPool>>`): the nested view already
+        // interned its consts into it at their global indices, so there is nothing to re-intern.
         // Hoist the nested view function itself, plus any functions it hoisted from deeper blocks.
         // Depth-first order (descendants first) matches Angular's `emitChildViews`.
         self.hoisted_fns.append(&mut nested.hoisted_fns);
@@ -5421,11 +5437,24 @@ impl TemplateDefinitionBuilder {
     /// - `ɵɵrepeaterCreate(slot, ForFn, decls, vars, tag, attrs?, trackByFn[, usesComponentInstance,
     ///   EmptyFn, emptyDecls, emptyVars])`, then `ɵɵrepeater(<collection>)` in update.
     fn build_for_block(&mut self, block: &ForLoopBlock) {
-        // Main repeater slot, then a second (hidden) slot the runtime uses internally for the view
-        // container — the repeater always allocates 2 slots (the primary view fn is at slot+1, the
-        // empty view fn at slot+2, per `naming.ts`).
+        // Slot reservation, faithful to `ɵɵrepeaterCreate` (`control_flow.ts`): the repeater metadata
+        // lives at `slot`, the MAIN view container TNode at `slot + 1`
+        // (`declareNoDirectiveHostTemplate(..., index + 1, ...)`), and — WHEN an `@empty` block is
+        // present — the EMPTY view container TNode at `slot + 2`
+        // (`declareNoDirectiveHostTemplate(..., index + 2, ...)`). Each of those container TNodes must
+        // have a real data slot reserved in THIS view, or the runtime's `getOrCreateTNode(index + 2)`
+        // reads an unallocated slot and throws (`Cannot read properties of undefined (reading
+        // 'type')`). So reserve 3 slots with `@empty`, 2 without.
         let slot = self.allocate_data_slot();
-        let _container_slot = self.allocate_data_slot();
+        let _main_container_slot = self.allocate_data_slot();
+        if block.empty.is_some() {
+            let _empty_container_slot = self.allocate_data_slot();
+            // A `@for` with an `@empty` view also reserves ONE binding (var) slot in this parent view
+            // (Angular: a `@for`+`@empty` compiles to `vars: 1`, vs `vars: 0` without `@empty`). The
+            // runtime uses it to change-detect the empty-block visibility; without it the view's `vars`
+            // is undercounted by one and the runtime's NO_CHANGE slot assertion fires at update.
+            self.allocate_binding_slots(1);
+        }
 
         // Collect the loop variables this body references, in Angular's fixed order
         // (item, $index, $count, …), assigning each a globally-unique `_rN` local and a
@@ -5922,7 +5951,7 @@ impl TemplateDefinitionBuilder {
             .and_then(|ph| ph.minimum_time)
             .map(|t| {
                 let arr = o::literal_arr(vec![num(t)], None);
-                self.const_pool.intern(arr)
+                self.const_pool.borrow_mut().intern(arr)
             });
         let loading_config_index = deferred.loading.as_ref().and_then(|ld| {
             if ld.minimum_time.is_some() || ld.after_time.is_some() {
@@ -5934,7 +5963,7 @@ impl TemplateDefinitionBuilder {
                     ],
                     None,
                 );
-                Some(self.const_pool.intern(arr))
+                Some(self.const_pool.borrow_mut().intern(arr))
             } else {
                 None
             }
@@ -6170,6 +6199,10 @@ impl TemplateDefinitionBuilder {
         nested.var_counter = self.var_counter;
         nested.context_lets = self.context_lets.clone();
         nested.base_name = self.base_name.clone();
+        // SHARE the component's single const pool (see `build_embedded_view_i18n`): the deferred view
+        // interns its consts at their global indices, so its instructions carry global const indices
+        // and no re-intern (which would renumber them) is needed.
+        nested.const_pool = std::rc::Rc::clone(&self.const_pool);
         // When the defer block is inside an `i18n` region, thread the sub-template continuation so
         // the view brackets its content in `ɵɵi18nStart(0, msg, subIdx)` … `ɵɵi18nEnd()` and folds
         // its text/element children into the i18n placeholder ops (see `build_deferred_block`).
@@ -6178,9 +6211,6 @@ impl TemplateDefinitionBuilder {
         let decls = nested.data_index;
         let vars = nested.binding_slots;
         self.var_counter = nested.var_counter;
-        for entry in nested.const_pool.entries() {
-            self.const_pool.intern(entry.clone());
-        }
         self.hoisted_fns.append(&mut nested.hoisted_fns);
         self.hoisted_fns
             .push(declare_function_from(&fn_name, tmpl_fn));

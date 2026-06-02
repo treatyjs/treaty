@@ -21,6 +21,7 @@
  */
 
 import { readFile } from 'node:fs/promises'
+import { fileURLToPath } from 'node:url'
 import { createTreatyCompiler, type TransformInput, type TreatyCompiler } from '@treaty/compiler'
 import type {
 	ProcessAssetsArgs,
@@ -56,9 +57,13 @@ const SERVER_CHUNK_STAGE = 'additional'
 /** Stable plugin name, also asserted by the smoke test. */
 export const PLUGIN_NAME = 'treaty:rsbuild'
 
-/** Resolve the loader module path used by the `tools.rspack` fallback. */
+/**
+ * Resolve the loader module path used by the `tools.rspack` fallback. Uses
+ * `fileURLToPath` (not `.pathname`) so the path is a real OS path on Windows too —
+ * `.pathname` yields an unresolvable leading-slash `/C:/...`.
+ */
 function loaderPath(): string {
-	return new URL('./loader.js', import.meta.url).pathname
+	return fileURLToPath(new URL('./loader.js', import.meta.url))
 }
 
 /** Merge Treaty extensions into an existing `resolve.extensions` array. */
