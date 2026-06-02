@@ -1,10 +1,12 @@
-name: 🚀 Deploy website on push
+name: 🚀 Deploy REPL website (manual)
 
+# NOTE: This deploys the LEGACY REPL playground. It is manual-only for now:
+# the browser bundle currently imports the node-only `@treaty/compiler` (which
+# reaches the native NAPI addon) via `apps/repl/src/app/plugin-output-viewer.component.ts`,
+# so a browser `vite build` fails to bundle the native addon. Giving the in-browser
+# REPL a browser-safe compile path (the TS `treat-to-ivy` path, not the native addon)
+# is tracked separately. Until then, don't auto-deploy on push.
 on:
-  # Runs on pushes targeting the default branch
-  push:
-    branches: ["master"]
-
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
 
@@ -24,7 +26,6 @@ jobs:
   web-deploy:
     name: 🎉 Deploy
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/master'
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
@@ -32,16 +33,23 @@ jobs:
       - name: Setup Node.js for use with actions
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
 
       - name: 🚚 Get latest code
         uses: actions/checkout@v4
 
-      - name: Clean install dependencies
-        run: npm install
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
 
+      - name: Clean install dependencies
+        run: bun install
+
+      # The REPL is a Vite app (root apps/repl, build.outDir = dist/apps/repl). The
+      # previous `npx nx run repl:build` was dead (Nx was removed for Moon, and there
+      # is no `repl:build` Nx target). See the workflow-level NOTE about the legacy
+      # browser-bundle limitation.
       - name: Build app
-        run: npx nx run repl:build
+        run: npx vite build --config apps/repl/vite.config.ts
 
       - name: Rewrite base href
         uses: SteveSandersonMS/ghaction-rewrite-base-href@v1

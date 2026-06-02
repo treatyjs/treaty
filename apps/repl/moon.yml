@@ -4,6 +4,19 @@ platform: node
 tags: []
 type: application
 tasks:
+  # Production website build (Vite) for the GitHub Pages deploy. Emits to
+  # ../../dist/apps/repl (see vite.config.ts `build.outDir`); the `.treaty` sources
+  # compile through the Rust authoring addon via the treatySFC() Vite plugin.
+  build:
+    command: vite
+    args:
+      - build
+    inputs:
+      - src/**/*
+      - index.html
+      - vite.config.ts
+    outputs:
+      - ../../dist/apps/repl
   # Headless boot/build assertion for the everything-demo: compiles every Treaty
   # authoring surface through the bundler-plugin seam, then drives the full D2
   # deployment-granularity stack (host + remotes, versioned manifest,

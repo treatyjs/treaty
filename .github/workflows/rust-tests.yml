@@ -35,3 +35,8 @@ jobs:
       # tests. Run them explicitly so the file-routing core is covered in CI.
       - name: file-routing crate (excluded from the workspace by design)
         run: cargo test --manifest-path libs/file-routing/Cargo.toml
+
+      # tools/dep-updater is its own standalone workspace (has its own [workspace] table), so it is
+      # likewise outside `--workspace`. Gate it here so the dep-updater core is covered too.
+      - name: dep-updater crate (standalone workspace)
+        run: cargo test --manifest-path tools/dep-updater/Cargo.toml
