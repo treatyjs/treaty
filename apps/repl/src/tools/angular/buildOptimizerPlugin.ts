@@ -8,9 +8,9 @@ import { requiresLinking } from './requiresLinking';
 
 const BuildOptimizerPlugin: Plugin = {
   name: 'vite-plugin-angular-optimizer',
-  apply(config, env) {
-    // return env.command === 'build';
-    return false
+  apply(_config, env) {
+    // The build optimizer only runs for production builds, not the dev server.
+    return env.command === 'build';
   },
   enforce: 'post',
   config() {
