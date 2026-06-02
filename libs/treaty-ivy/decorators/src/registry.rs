@@ -78,6 +78,13 @@ pub struct CompileCtx<'a> {
     pub sibling_directives: &'a [crate::binder::SelectorDirective],
     pub resolved_content: Option<&'a ResolvedContentMap>,
     pub default_selector: Option<&'a str>,
+    /// The source-start offset of every decorated class in the file, keyed by class name. A
+    /// standalone/NgModule-scoped component whose emitted `dependencies` array references a class
+    /// declared LATER in the same file (a forward reference) must wrap that array in a `() => [...]`
+    /// closure — Angular's `DeclarationListEmitMode.Closure` (`isExpressionForwardReference`:
+    /// `context.pos < node.pos`). The component path compares each dependency's offset against its
+    /// own to decide. Empty for callers that do not supply it (legacy bare-definition path).
+    pub class_decl_positions: &'a std::collections::HashMap<String, u32>,
     /// The `legacyOptionalChaining` Angular compiler option: when set, a safe-navigation host-binding
     /// value (`getData()?.id`) lowers to the classic guarded-temporary ternary rather than the native
     /// `?.` operator. `false` for every default compile path; only the option-carrying entry point

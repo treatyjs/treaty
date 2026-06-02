@@ -1935,6 +1935,18 @@ fn compile_program_with_source(
     // `compile_component_meta`).
     let sibling_directives = collect_sibling_directives(&decorated);
 
+    // Source-start offset of every decorated class, keyed by class name. A component whose emitted
+    // `dependencies` array references a class declared LATER in this file (a forward reference) must
+    // wrap the array in a `() => [...]` closure (Angular `DeclarationListEmitMode.Closure`,
+    // `isExpressionForwardReference`: `context.pos < node.pos`). The per-class compile compares each
+    // dependency's offset against the component's own to decide.
+    let class_decl_positions: std::collections::HashMap<String, u32> = decorated
+        .iter()
+        .filter_map(|TopStmt::Decorated(class, _, _)| {
+            class.id.as_ref().map(|id| (id.name.to_string(), class.span().start))
+        })
+        .collect();
+
     // Compile EVERY decorated class to a structured [`ClassEmit`]. The def block render3 produces is
     // unchanged; we only decompose it (def expression + pool/side-effect statements + factory) so the
     // ORIGINAL module can be re-assembled around the kept class declarations.
@@ -1953,6 +1965,7 @@ fn compile_program_with_source(
             resolved,
             default_selector,
             legacy_optional_chaining,
+            &class_decl_positions,
         ) {
             Ok(emit) => {
                 errors.extend(emit.errors.clone());
@@ -2132,6 +2145,7 @@ impl DecoratorCompiler for ComponentCompiler {
             // A selectorless `@Component` adopts the caller's filename-derived default selector.
             ctx.default_selector,
             ctx.legacy_optional_chaining,
+            ctx.class_decl_positions,
         )
     }
 }
@@ -2157,6 +2171,7 @@ impl DecoratorCompiler for DirectiveCompiler {
             // A `@Directive` is legitimately selectorless (class-only); never substitute a selector.
             None,
             ctx.legacy_optional_chaining,
+            ctx.class_decl_positions,
         )
     }
 }
@@ -2302,6 +2317,33 @@ fn is_forward_ref_call(expr: &Expression) -> bool {
     }
 }
 
+/// Whether a standalone `@Component({imports: [...]})` array carries any `forwardRef(() => X)` entry.
+///
+/// Angular's component handler wraps a standalone component's `dependencies` array in a `() => [...]`
+/// closure (`DeclarationListEmitMode.Closure`) whenever any resolved import may be forward-declared.
+/// It cannot tell directly whether a `Reference` came through a `forwardRef`, so it flags the
+/// reference as `synthetic` (set by ANY foreign-function resolver, incl. the `forwardRef` resolver)
+/// — see component `handler.ts` `standaloneImportMayBeForwardDeclared`. We model the common, exact
+/// case: an `imports:` entry that is a literal `forwardRef(() => …)` call (incl. a flattened nested
+/// array of imports). A non-array `imports` value, or one with no forwardRef entry, returns `false`.
+fn imports_has_forward_ref(obj: Option<&oxc_ast::ast::ObjectExpression>) -> bool {
+    let Some(expr) = obj.and_then(|o| find_prop(o, "imports")) else {
+        return false;
+    };
+    fn scan(expr: &Expression) -> bool {
+        match expr {
+            Expression::ParenthesizedExpression(p) => scan(&p.expression),
+            Expression::ArrayExpression(arr) => arr
+                .elements
+                .iter()
+                .filter_map(|el| el.as_expression())
+                .any(scan),
+            other => is_forward_ref_call(other),
+        }
+    }
+    scan(expr)
+}
+
 /// Parse an `@Injectable({deps: [...]})` array into [`R3DependencyMetadata`]. Each element is either
 /// a bare token (`Dep`) or a `[token, new Optional(), new SkipSelf(), …]` array whose trailing
 /// entries are `new Optional()`/`new Self()`/`new SkipSelf()`/`new Host()` qualifier markers, or a
@@ -2417,6 +2459,7 @@ fn compile_decorated_class(
     resolved_content: Option<&ResolvedContentMap>,
     default_selector: Option<&str>,
     legacy_optional_chaining: bool,
+    class_decl_positions: &std::collections::HashMap<String, u32>,
 ) -> Result<ClassEmit, String> {
     let (class_name, class_name_span) = match &class.id {
         Some(id) => (
@@ -2439,6 +2482,7 @@ fn compile_decorated_class(
         resolved_content,
         default_selector,
         legacy_optional_chaining,
+        class_decl_positions,
     };
 
     // MULTI-DECORATOR dispatch: ngtsc compiles EVERY recognized trait on a class, not only the
@@ -2529,6 +2573,7 @@ fn compile_component_or_directive(
     resolved_content: Option<&ResolvedContentMap>,
     default_selector: Option<&str>,
     legacy_optional_chaining: bool,
+    class_decl_positions: &std::collections::HashMap<String, u32>,
 ) -> Result<ClassEmit, String> {
     // The host-resolved external content for THIS class (keyed by class name), if the caller wired
     // the resolution channel and supplied an entry. Used to back `templateUrl`/`styleUrls`.
@@ -2770,6 +2815,11 @@ fn compile_component_or_directive(
                 .cloned()
                 .collect();
             let factory = class_factory(class, &class_name, FactoryTarget::Component);
+            // Closure-wrap inputs: a literal `forwardRef(() => …)` in this standalone component's
+            // `imports:` array, and the component's own source position (used to detect a dependency
+            // class declared LATER in the file). See `compile_component_meta` for the decision.
+            let import_has_forward_ref = imports_has_forward_ref(obj);
+            let own_position = class.span().start;
             compile_component_meta(
                 base,
                 &template_html.unwrap_or_default(),
@@ -2782,6 +2832,9 @@ fn compile_component_or_directive(
                 foreign_imports,
                 view_providers,
                 factory,
+                import_has_forward_ref,
+                own_position,
+                class_decl_positions,
             )
         }
         // R4: @Directive — drive the existing `compile_directive_from_metadata` emitter (no
@@ -3169,6 +3222,9 @@ fn compile_component_meta(
     foreign_imports: Option<Vec<R3ForeignComponentMetadata>>,
     view_providers: Option<Expr>,
     factory: R3FactoryMetadata,
+    import_has_forward_ref: bool,
+    own_position: u32,
+    class_decl_positions: &std::collections::HashMap<String, u32>,
 ) -> Result<ClassEmit, String> {
     let class_name = base.name.clone();
     let mut errors: Vec<String> = Vec::new();
@@ -3224,6 +3280,33 @@ fn compile_component_meta(
 
     let has_directive_dependencies = !declarations.is_empty();
 
+    // DECLARATION-LIST EMIT MODE (Angular `DeclarationListEmitMode`). The runtime `dependencies`
+    // array is wrapped in a `() => [...]` closure (`Closure`) instead of emitted directly (`Direct`)
+    // when a reference may be forward-declared, so the lazily-evaluated thunk defers reading the
+    // class binding until after the whole module has initialised. Angular sets `Closure` when EITHER:
+    //   * a standalone component's `imports:` carries a `forwardRef(() => …)` entry
+    //     (`standaloneImportMayBeForwardDeclared` — it cannot inspect the resolved reference, so any
+    //     forwardRef-resolved import is treated as possibly forward), OR
+    //   * an emitted dependency class is declared LATER in the same file than the component
+    //     (`isExpressionForwardReference`: `context.pos < node.pos`).
+    // A self-referential dependency (a recursive component) is NOT forward (`own == dep`, strict `<`).
+    let declaration_is_forward_declared = declarations.iter().any(|d| {
+        let dep_name = match &d.ty.kind {
+            crate::output_ast::ExprKind::ReadVar { name } => name.as_str(),
+            _ => return false,
+        };
+        class_decl_positions
+            .get(dep_name)
+            .is_some_and(|&dep_pos| own_position < dep_pos)
+    });
+    let standalone_import_may_be_forward = base.is_standalone && import_has_forward_ref;
+    let declaration_list_emit_mode =
+        if declaration_is_forward_declared || standalone_import_may_be_forward {
+            DeclarationListEmitMode::Closure
+        } else {
+            DeclarationListEmitMode::Direct
+        };
+
     let mut meta: R3ComponentMetadata<R3TemplateDependencyMetadata> = R3ComponentMetadata {
         base,
         template: ComponentTemplate {
@@ -3235,7 +3318,7 @@ fn compile_component_meta(
         defer: R3ComponentDeferMetadata::PerComponent {
             dependencies_fn: None,
         },
-        declaration_list_emit_mode: DeclarationListEmitMode::Direct,
+        declaration_list_emit_mode,
         styles,
         external_styles: None,
         encapsulation,
@@ -3807,6 +3890,109 @@ mod tests {
         assert!(
             !code.contains("dependencies"),
             "dependencies emitted for an unused import; got: {code}"
+        );
+    }
+
+    #[test]
+    fn standalone_forward_ref_import_wraps_dependencies_in_closure() {
+        // Mirrors r3_compiler_compliance/.../standalone/forward_ref.ts. A standalone component whose
+        // `imports:` carries a `forwardRef(() => StandaloneComponent)` entry must emit the runtime
+        // `dependencies` array as a `() => [...]` thunk (Angular `DeclarationListEmitMode.Closure`,
+        // driven by `standaloneImportMayBeForwardDeclared`), NOT the direct `[StandaloneComponent]`.
+        let src = r#"
+            import {Component, forwardRef} from "@angular/core";
+            @Component({
+              selector: "test",
+              imports: [forwardRef(() => StandaloneComponent)],
+              template: "<other-standalone></other-standalone>",
+            })
+            export class TestComponent {}
+            @Component({selector: "other-standalone", template: ""})
+            export class StandaloneComponent {}
+        "#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = out.code.replace(char::is_whitespace, "");
+        assert!(
+            code.contains("dependencies:()=>[StandaloneComponent]"),
+            "forwardRef import did not produce a `() => [...]` dependencies thunk; got: {}",
+            out.code
+        );
+    }
+
+    #[test]
+    fn forward_declared_dependency_wraps_dependencies_in_closure() {
+        // Mirrors r3_compiler_compliance/.../forward_referenced_directive.ts. A dependency class
+        // declared AFTER the component in the same file is a forward reference
+        // (`isExpressionForwardReference`: `context.pos < node.pos`), so the `dependencies` array is
+        // wrapped in a `() => [...]` closure even without an explicit `forwardRef(...)` import.
+        let src = r#"
+            @Component({
+              selector: "host-binding-comp",
+              template: "<my-forward-directive></my-forward-directive>",
+              standalone: false
+            })
+            export class HostBindingComp {}
+            @Directive({selector: "my-forward-directive", standalone: false})
+            export class MyForwardDirective {}
+        "#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = out.code.replace(char::is_whitespace, "");
+        assert!(
+            code.contains("dependencies:()=>[MyForwardDirective]"),
+            "forward-declared dependency did not produce a `() => [...]` thunk; got: {}",
+            out.code
+        );
+    }
+
+    #[test]
+    fn backward_declared_and_self_referential_dependencies_stay_direct() {
+        // A dependency declared BEFORE the component is NOT forward, and a recursive component
+        // referencing its OWN selector is NOT forward (strict `own.pos < dep.pos`). Both keep the
+        // direct `dependencies: [...]` array (Angular `DeclarationListEmitMode.Direct`). Mirrors
+        // the standalone `recursive.ts` golden (`dependencies: [RecursiveComponent]`) and the common
+        // declared-before ordering of `value_composition/directives.ts`.
+        let backward = r#"
+            @Directive({selector: "[some-directive]", standalone: false})
+            export class SomeDirective {}
+            @Component({
+              selector: "my-component",
+              template: "<div some-directive></div>",
+              standalone: false
+            })
+            export class MyComponent {}
+        "#;
+        let out = compile_component_source(backward);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = out.code.replace(char::is_whitespace, "");
+        assert!(
+            code.contains("dependencies:[SomeDirective]"),
+            "declared-before dependency must stay a direct array; got: {}",
+            out.code
+        );
+        assert!(
+            !code.contains("dependencies:()=>"),
+            "declared-before dependency was wrongly wrapped in a closure; got: {}",
+            out.code
+        );
+
+        // A recursive component referencing its OWN selector is NOT a forward reference (strict
+        // `own.pos < dep.pos` is false for `own == dep`), so it must NEVER be closure-wrapped. (The
+        // front-end does not currently add the self-reference to `dependencies` at all — a separate,
+        // pre-existing gap from THIS change; what matters for the emit-mode decision is only that the
+        // recursive case is not wrapped in a `() => [...]` thunk.)
+        let recursive = r#"
+            @Component({selector: "recursive-cmp", template: "<recursive-cmp></recursive-cmp>"})
+            export class RecursiveComponent {}
+        "#;
+        let out = compile_component_source(recursive);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = out.code.replace(char::is_whitespace, "");
+        assert!(
+            !code.contains("dependencies:()=>"),
+            "self-referential (recursive) dependency must not be closure-wrapped; got: {}",
+            out.code
         );
     }
 
