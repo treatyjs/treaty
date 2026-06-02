@@ -108,13 +108,19 @@ Harness moved into the facade crate:
 
 ### Ranked DIFF gaps (the work toward full parity)
 
-The live harness reports **4 matchGolden DIFFs** of the 185 runnable cases — and
-**all 4 are by-design**, not compiler defects:
+The live harness reports **4 matchGolden DIFFs** of the 185 runnable cases. **All
+4 are in the `ng_modules` corpus and are golden-mode/shape artifacts, not compiler
+defects** — they ask for an NgModule output mode the harness can't request:
 
-- `ng_modules` JIT-mode goldens (4) — these goldens are authored in Angular's
-  legacy **jit** mode. treaty_ivy emits the modern AOT `setNgModuleScope` shape, so
-  matching them byte-for-byte would *regress* the output away from current Angular.
-  The harness can't request linker JIT mode, and we don't want it to.
+- *"…with declarations and bootstrap (**jit mode**)"* and *"…with imports and
+  exports (**jit mode**)"* (2) — authored in Angular's legacy **jit** mode.
+  treaty_ivy emits the modern AOT `setNgModuleScope` shape; matching the jit golden
+  byte-for-byte would *regress* the output away from current Angular.
+- *"…with **forward refs**"* (1) — the golden spells the imports thunk
+  `imports: () => [ForwardModule]` a different way than our emit (a forwardRef-in-
+  imports thunk-shape difference, not a missing feature).
+- *"…all NgModule options in **local and optimized** mode"* (1) — exercises the
+  local/optimized compilation mode the harness has no way to select.
 
 The genuine compiler-feature gaps that used to sit here are now **closed**:
 control / `field` bindings (`ɵɵcontrolCreate`/`ɵɵcontrol`), inline arrows in host
@@ -271,9 +277,11 @@ build → boot e2e for both example apps; the source-validate gate; the file-lev
 `'use server'` client leak CLOSED and server fns running in dev.
 
 1. **Compliance is at the modern-Angular ceiling: 181/185 (97.8%).** The remaining
-   **4 DIFFs are NgModule jit-mode goldens — by design**: treaty_ivy emits modern
-   `setNgModuleScope`, and matching the legacy jit-mode golden would *regress* the
-   output. Not defects, not targeted for "fixing". (The earlier genuine gaps —
+   **4 DIFFs are all `ng_modules` golden-mode/shape artifacts — by design** (2 jit
+   mode, 1 forwardRef-in-imports thunk shape, 1 local/optimized mode): treaty_ivy
+   emits the modern `setNgModuleScope` AOT shape, and matching the legacy/jit golden
+   would *regress* the output. Not defects, not targeted for "fixing". (The earlier
+   genuine gaps —
    control/`field` bindings, inline-arrow host/transform conversion, host-binding
    literal → `ɵɵpureFunctionN`, deep i18n in `@switch`/`@defer`/`@let` — are closed.)
 2. **DONE: server-fn extraction UNIFICATION** across all marker forms + production

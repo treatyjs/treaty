@@ -14,11 +14,11 @@ This harness runs Treaty's Rust/OXC Angular compiler (`render3` crate, via the
 | --- | --- |
 | Total compliance cases | 642 |
 | Compiled (runnable) | 185 |
-| PASS | 176 |
-| DIFF | 9 |
+| PASS | 181 |
+| DIFF | 4 |
 | Skipped (un-runnable) | 457 |
-| **Pass-rate (of runnable subset)** | **95.1%** (176/185) |
-| Pass-rate (of full corpus) | 27.4% (176/642) |
+| **Pass-rate (of runnable subset)** | **97.8%** (181/185) |
+| Pass-rate (of full corpus) | 28.2% (181/642) |
 
 ### How a case is run and matched
 
@@ -43,31 +43,17 @@ from our output. Top entry = implement first to raise the score.
 
 | Count | Category (instruction / shape at first missing fragment) |
 | --- | --- |
-| 5 | `misc-shape` |
-| 2 | `ɵɵpureFunction1` |
-| 1 | `ɵɵadvance` |
-| 1 | `ɵɵelementStart` |
+| 4 | `misc-shape` |
 
 ### Sample diverging cases
 
-- **`misc-shape`** (5):
+- **`misc-shape`** (4):
   - r3_compiler_compliance/ng_modules/should define an NgModule with declarations and bootstrap (jit mode)
     - near: `ent],declarations:[FooComponent,Ba`
   - r3_compiler_compliance/ng_modules/should define NgModules with imports and exports (jit mode)
     - near: `({,declarations:[A1Component,A2C`
   - r3_compiler_compliance/ng_modules/should handle NgModules with forward refs
     - near: `({,imports:()=>[ForwardModule]})`
-- **`ɵɵpureFunction1`** (2):
-  - r3_compiler_compliance/components_and_directives/value_composition/should support spread elements in array literals
-    - near: `onstsimple_R=ɵɵpureFunction1(4,ID,`
-  - r3_compiler_compliance/components_and_directives/value_composition/should support object literals with spread assignments
-    - near: `onstsimple_R=ɵɵpureFunction1(4,ID,`
-- **`ɵɵadvance`** (1):
-  - r3_view_compiler_i18n/blocks/should support @switch blocks
-    - near: `{letID;ɵɵadvance(2);ɵɵconditional(`
-- **`ɵɵelementStart`** (1):
-  - r3_view_compiler_i18n/blocks/should support @defer blocks
-    - near: `efer(whenisLoaded){","startBlockEr`
 
 ## Skip categories (cases not runnable through the source front-end)
 
@@ -84,7 +70,7 @@ error-expectation cases).
 
 ## Passing cases
 
-176 runnable compliance cases match Angular's golden `ɵɵdefineComponent` block:
+181 runnable compliance cases match Angular's golden `ɵɵdefineComponent` block:
 
 - model_inputs/should capture input/output pair in a component definition
 - model_inputs/should capture input/output pair in a directive definition
@@ -120,6 +106,7 @@ error-expectation cases).
 - r3_compiler_compliance/components_and_directives/should support empty property bindings on ng-template
 - r3_compiler_compliance/components_and_directives/signals/should properly compile a signal component
 - r3_compiler_compliance/components_and_directives/signals/should properly compile a signal directive
+- r3_compiler_compliance/components_and_directives/standalone/should handle a forwardRef in the imports of a standalone component
 - r3_compiler_compliance/components_and_directives/standalone/should properly compile a standalone component
 - r3_compiler_compliance/components_and_directives/standalone/should properly compile a standalone directive
 - r3_compiler_compliance/components_and_directives/standalone/should properly compile a standalone pipe
@@ -135,7 +122,9 @@ error-expectation cases).
 - r3_compiler_compliance/components_and_directives/value_composition/should support dollar escape in template
 - r3_compiler_compliance/components_and_directives/value_composition/should support expressions nested deeply in object/array literals
 - r3_compiler_compliance/components_and_directives/value_composition/should support object literals
+- r3_compiler_compliance/components_and_directives/value_composition/should support object literals with spread assignments
 - r3_compiler_compliance/components_and_directives/value_composition/should support rest arguments in a function call
+- r3_compiler_compliance/components_and_directives/value_composition/should support spread elements in array literals
 - r3_compiler_compliance/components_and_directives/value_composition/should support structural directives
 - r3_compiler_compliance/elements/should bind to class and style names
 - r3_compiler_compliance/ng_modules/should define NgModules with imports and exports
@@ -205,8 +194,10 @@ error-expectation cases).
 - r3_view_compiler_directives/matching/should match directives on property bindings
 - r3_view_compiler_directives/matching/should match structural directives
 - r3_view_compiler_directives/matching/should not match directives on i18n attribute
+- r3_view_compiler_i18n/blocks/should support @defer blocks
 - r3_view_compiler_i18n/blocks/should support @for blocks
 - r3_view_compiler_i18n/blocks/should support @if blocks
+- r3_view_compiler_i18n/blocks/should support @switch blocks
 - r3_view_compiler_input_outputs/should declare inputs with transform functions
 - r3_view_compiler_input_outputs/should declare inputs/outputs on a component
 - r3_view_compiler_input_outputs/should declare inputs/outputs on a directive
