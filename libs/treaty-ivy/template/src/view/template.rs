@@ -39,8 +39,8 @@ use crate::output_ast as o;
 use crate::output_ast::{Expr, FnParam, Stmt, StmtKind, StmtModifier};
 use crate::template::r3_ast::{
     BoundAttribute, BoundEvent, BoundText, Content, DeferredBlock, DeferredBlockTriggers,
-    DeferredTriggerKind, Element, ForLoopBlock, Icu, IfBlock, LetDeclaration, Node,
-    SwitchBlock, SwitchBlockCase, Template, Text, TextAttribute, Visitor,
+    DeferredTrigger, DeferredTriggerKind, Element, ForLoopBlock, Icu, IfBlock, LetDeclaration,
+    Node, SwitchBlock, SwitchBlockCase, Template, Text, TextAttribute, Visitor,
 };
 
 // ---------------------------------------------------------------------------
@@ -1530,7 +1530,17 @@ impl I18nSentinelResolver {
                                 "}".to_string(),
                             );
                         };
-                    record_block(self, reg, "defer", "@defer {", main_slot, main_sub);
+                    // The START_BLOCK `original_code` is Angular's `block.startSourceSpan.toString()`
+                    // (`i18n_parser.ts::visitBlock`): the literal authored opener INCLUDING any
+                    // trigger clause — `@defer (when isLoaded) {`, not a bare `@defer {`. The view
+                    // layer carries only offset spans (no retained source text), so we reconstruct the
+                    // opener from the trigger AST, the way `if_branch_header`/the `@for` header rebuild
+                    // theirs. The connected `@placeholder`/`@loading`/`@error` openers carry only
+                    // `minimum`/`after` time parameters (stored as resolved ms, whose exact authored
+                    // unit is lossy); none appear in the i18n corpus, so we keep their canonical bare
+                    // form, matching what the parser yields when no parameters are authored.
+                    let defer_header = defer_block_header(b);
+                    record_block(self, reg, "defer", &defer_header, main_slot, main_sub);
                     if let (Some(s), Some(sub)) = (placeholder_slot, placeholder_sub) {
                         record_block(self, reg, "placeholder", "@placeholder {", s, sub);
                     }
@@ -2058,6 +2068,75 @@ fn instruction(reference: R3, params: Vec<Expr>) -> Stmt {
     o::import_expr(reference.reference(), None)
         .call_fn(params, false)
         .to_stmt()
+}
+
+/// The START_BLOCK `original_code` fragment for a `@defer` block: Angular records the authored
+/// block opener verbatim (`i18n_parser.ts::visitBlock` → `block.startSourceSpan.toString()`),
+/// which for a triggered `@defer` is `@defer (when isLoaded) {`, not the bare `@defer {`. We
+/// reconstruct that opener from the trigger AST (the offset-only spans the view layer carries do
+/// not retain source text), mirroring how `if_branch_header`/`switch_group_header`/the `@for`
+/// header rebuild their openers from the parsed metadata.
+///
+/// Angular's `R3DeferBlockMetadata`/`r3_template_transform` serialise the defer parameter list as
+/// the regular triggers (in authored key order), then `prefetch <trigger>` for each prefetch
+/// trigger and `hydrate <trigger>` for each hydrate trigger, joined by `; ` inside one set of
+/// parens. An empty parameter list (`@defer {`) emits no parens. Each individual trigger renders
+/// as `when <expr>` for the bound `when` trigger or `on <name>[(<args>)]` for the `on …` triggers.
+fn defer_block_header(block: &DeferredBlock) -> String {
+    let mut params: Vec<String> = Vec::new();
+    for t in block.triggers.defined_in_order() {
+        params.push(defer_trigger_source(t, None));
+    }
+    for t in block.prefetch_triggers.defined_in_order() {
+        params.push(defer_trigger_source(t, Some("prefetch")));
+    }
+    for t in block.hydrate_triggers.defined_in_order() {
+        params.push(defer_trigger_source(t, Some("hydrate")));
+    }
+    if params.is_empty() {
+        "@defer {".to_string()
+    } else {
+        format!("@defer ({}) {{", params.join("; "))
+    }
+}
+
+/// Render one `@defer` trigger as authored source, e.g. `when isLoaded`, `on idle`,
+/// `on hover(ref)`, `on timer(500ms)`, `on viewport`. `qualifier` prefixes `prefetch`/`hydrate`
+/// triggers. Mirrors the surface forms Angular's template parser accepts (`r3_deferred_triggers`).
+fn defer_trigger_source(trigger: &DeferredTrigger, qualifier: Option<&str>) -> String {
+    use crate::template::r3_ast::DeferredTriggerKind as K;
+    let body = match &trigger.kind {
+        K::When { value } => format!("when {}", ast_to_source(value)),
+        K::Never => "never".to_string(),
+        K::Idle { .. } => "on idle".to_string(),
+        K::Immediate => "on immediate".to_string(),
+        K::Hover { reference } => match reference {
+            Some(r) => format!("on hover({r})"),
+            None => "on hover".to_string(),
+        },
+        K::Timer { delay } => format!("on timer({}ms)", format_defer_number(*delay)),
+        K::Interaction { reference } => match reference {
+            Some(r) => format!("on interaction({r})"),
+            None => "on interaction".to_string(),
+        },
+        K::Viewport { reference, .. } => match reference {
+            Some(r) => format!("on viewport({r})"),
+            None => "on viewport".to_string(),
+        },
+    };
+    match qualifier {
+        Some(q) => format!("{q} {body}"),
+        None => body,
+    }
+}
+
+/// Format an f64 trigger delay as the authored integer-or-decimal literal (`500`, not `500.0`).
+fn format_defer_number(value: f64) -> String {
+    if value.fract() == 0.0 && value.is_finite() {
+        format!("{}", value as i64)
+    } else {
+        format!("{value}")
+    }
 }
 
 /// The `original_code` fragment for an `@if`/`@else if`/`@else` branch's START_BLOCK placeholder
@@ -5865,11 +5944,35 @@ impl TemplateDefinitionBuilder {
         let enable_timer_scheduling = placeholder_config_index.is_some()
             || loading_config_index.is_some();
 
+        // When this `@defer` block sits inside an `i18n` region, each of its views (main, then
+        // loading, placeholder, error — the view-creation order) becomes an i18n sub-template
+        // continuation: it is allocated the next sub-template index off the active `i18n_block_ctx`
+        // (DFS order, the SAME order the sentinel resolver in `resolve_in_view` assigns the `*N:sub`
+        // block placeholders) and its create ops are bracketed in `ɵɵi18nStart(0, msg, subIdx)` …
+        // `ɵɵi18nEnd()`, collapsing the body's text/element nodes into the i18n placeholder ops (so a
+        // `before<span>middle</span>after` view is `i18nStart` + `element("span")` = 2 decls, not the
+        // 4 raw text/element decls of the non-i18n lowering — mirroring the `@if` branch threading).
+        // The indices MUST be reserved in this view-creation order, BEFORE building any view, so they
+        // line up with the message sentinels regardless of how the views are nested.
+        let main_child_i18n = self.if_branch_i18n_child_view(&deferred.children);
+        let loading_child_i18n = deferred
+            .loading
+            .as_ref()
+            .and_then(|ld| self.if_branch_i18n_child_view(&ld.children));
+        let placeholder_child_i18n = deferred
+            .placeholder
+            .as_ref()
+            .and_then(|ph| self.if_branch_i18n_child_view(&ph.children));
+        let error_child_i18n = deferred
+            .error
+            .as_ref()
+            .and_then(|er| self.if_branch_i18n_child_view(&er.children));
+
         // Main deferred view — one data slot, named `<Base>_Defer_<mainSlot>_Template` (`naming.ts`).
         let main_slot = self.allocate_data_slot();
         let main_fn = format!("{}_Defer_{}_Template", self.base_name, main_slot);
         let (main_ref, main_decls, main_vars) =
-            self.build_deferred_view(main_fn, deferred.children.clone());
+            self.build_deferred_view(main_fn, deferred.children.clone(), main_child_i18n);
 
         // Secondary views (`@placeholder`/`@loading`/`@error`), each a one-slot `ɵɵdomTemplate`,
         // allocated before the `ɵɵdefer` op (Angular ingests their views ahead of the defer op).
@@ -5882,19 +5985,20 @@ impl TemplateDefinitionBuilder {
         if let Some(ld) = &deferred.loading {
             let s = self.allocate_data_slot();
             let f = format!("{}_DeferLoading_{}_Template", self.base_name, s);
-            let (r, d, v) = self.build_deferred_view(f, ld.children.clone());
+            let (r, d, v) = self.build_deferred_view(f, ld.children.clone(), loading_child_i18n);
             loading = Some((s, r, d, v));
         }
         if let Some(ph) = &deferred.placeholder {
             let s = self.allocate_data_slot();
             let f = format!("{}_DeferPlaceholder_{}_Template", self.base_name, s);
-            let (r, d, v) = self.build_deferred_view(f, ph.children.clone());
+            let (r, d, v) =
+                self.build_deferred_view(f, ph.children.clone(), placeholder_child_i18n);
             placeholder = Some((s, r, d, v));
         }
         if let Some(er) = &deferred.error {
             let s = self.allocate_data_slot();
             let f = format!("{}_DeferError_{}_Template", self.base_name, s);
-            let (r, d, v) = self.build_deferred_view(f, er.children.clone());
+            let (r, d, v) = self.build_deferred_view(f, er.children.clone(), error_child_i18n);
             error = Some((s, r, d, v));
         }
 
@@ -6049,7 +6153,14 @@ impl TemplateDefinitionBuilder {
     /// Build a `@defer` secondary/main view as a hoisted, named DOM-only embedded view, returning
     /// `(fnNameRef, decls, vars)`. Like [`Self::build_embedded_view`] but the body always compiles
     /// DOM-only (`reify.ts`: block templates are `ɵɵdomTemplate`).
-    fn build_deferred_view(&mut self, fn_name: String, children: Vec<Node>) -> (Expr, usize, usize) {
+    fn build_deferred_view(
+        &mut self,
+        fn_name: String,
+        children: Vec<Node>,
+        i18n_child_view: Option<I18nChildView>,
+    ) -> (Expr, usize, usize) {
+        // Carry BOTH the per-block lazy dependency set (463ad8a) and the i18n sub-template
+        // continuation (21f8979).
         let nested_input = TemplateCompilationInput::new(fn_name.clone(), children)
             .with_dom_only(true)
             .with_deferred_deps(self.deferred_deps.clone());
@@ -6059,6 +6170,10 @@ impl TemplateDefinitionBuilder {
         nested.var_counter = self.var_counter;
         nested.context_lets = self.context_lets.clone();
         nested.base_name = self.base_name.clone();
+        // When the defer block is inside an `i18n` region, thread the sub-template continuation so
+        // the view brackets its content in `ɵɵi18nStart(0, msg, subIdx)` … `ɵɵi18nEnd()` and folds
+        // its text/element children into the i18n placeholder ops (see `build_deferred_block`).
+        nested.i18n_child_view = i18n_child_view;
         let tmpl_fn = nested.build_template_function(&nested_input);
         let decls = nested.data_index;
         let vars = nested.binding_slots;
