@@ -309,14 +309,16 @@ fn client_binding(f: &ServerFn) -> String {
         }
     };
 
-    // A typed promise signal resource: each invocation POSTs the typed args to the route via the
-    // `fetch` browser global and resolves the JSON response, wrapped in the REAL
-    // `edenPromiseResource` export (no invented `httpClient`). The resource is typed to the route's
-    // response.
+    // A typed imperative RPC call: each invocation POSTs the typed args to the route via the `fetch`
+    // browser global and resolves the JSON response as a PLAIN PROMISE. A server fn is most often
+    // called imperatively (`await save(x)` inside an event handler), which is NOT an Angular injection
+    // context — so the binding must NOT wrap the call in `resource()`/`edenPromiseResource` (that
+    // throws NG0203 outside a constructor/field initializer). A caller who wants reactive,
+    // signal-based loading can still wrap it themselves at field-init: `resource(() => save(x))`.
     format!(
-        "(({arg_list}) => edenPromiseResource(() => \
+        "(({arg_list}) => \
          fetch('{route}', {{ method: 'POST', headers: {{ 'content-type': 'application/json' }}, \
-         body: JSON.stringify({body_expr}) }}).then((res) => res.json())))",
+         body: JSON.stringify({body_expr}) }}).then((res) => res.json()))",
     )
 }
 
@@ -595,10 +597,11 @@ mod tests {
         let emit = AxumBackendPlugin.emit(&extraction.server_fns);
 
         let binding = emit.client_bindings.get("add").expect("binding for add");
-        // A typed signal-resource call wrapping the REAL `edenPromiseResource` export.
+        // An imperative fetch POST — NOT wrapped in `resource()`/`edenPromiseResource` (calling a
+        // server fn imperatively inside an event handler outside an injection context threw NG0203).
         assert!(
-            binding.contains("edenPromiseResource"),
-            "binding is not a signal resource; got: {binding}"
+            binding.contains("fetch('/__server/") && !binding.contains("edenPromiseResource"),
+            "binding is not a plain imperative fetch POST; got: {binding}"
         );
         assert!(
             binding.contains("'/__server/add'"),

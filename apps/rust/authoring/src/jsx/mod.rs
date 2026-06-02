@@ -878,6 +878,9 @@ export default function counter() {\n  return <section>hi</section>;\n}\n";
 
     /// Parse `code` and assert `name` is bound at MODULE SCOPE by a top-level `import` specifier local,
     /// read off the PARSED AST (never a regex).
+    // Retained AST-based import checker (server-fn bindings are now imperative fetch and import no
+    // resource helper, so it currently has no callers).
+    #[allow(dead_code)]
     fn assert_jsx_imported_at_module_scope(code: &str, name: &str) {
         use oxc_ast::ast::ImportDeclarationSpecifier;
         let allocator = Allocator::default();
@@ -937,12 +940,12 @@ export default function greetingCard() {\n\
             "no re-exported client binding for the lifted $$ fn; got:\n{}",
             out.code
         );
+        // The imperative binding does NOT wrap in `resource()`, so the resource helper is NOT imported.
         assert!(
-            out.code.contains("import { edenPromiseResource } from '@treaty/httpclient/resources'"),
-            "no real resource-client import; got:\n{}",
+            !out.code.contains("edenPromiseResource"),
+            "imperative server-fn binding must not wrap in resource() (NG0203); got:\n{}",
             out.code
         );
-        assert_jsx_imported_at_module_scope(&out.code, "edenPromiseResource");
     }
 
     #[test]
@@ -966,20 +969,19 @@ export default function greetingCard() {\n\
             server_module.contains("\"/__server/save\"") && server_module.contains("post(__server_save)"),
             "no save route in axum server module; got: {server_module}"
         );
-        // The free call to `save` in the component body is rewritten to the axum resource-client
-        // binding (`edenPromiseResource` POSTing to `/__server/save` via fetch), and the server body
-        // never leaks into the client JS.
+        // The free call to `save` in the component body is rewritten to the axum client binding: an
+        // imperative `fetch` POST to `/__server/save` (NOT a `resource()` wrapper, which threw NG0203
+        // when called imperatively in an event handler outside an injection context), and the server
+        // body never leaks into the client JS.
         assert!(
-            out.code.contains("edenPromiseResource") && out.code.contains("'/__server/save'"),
-            "call site not rewritten to axum resource client; got: {}",
+            out.code.contains("fetch('/__server/save'") && out.code.contains("'/__server/save'"),
+            "call site not rewritten to the imperative axum fetch client; got: {}",
             out.code
         );
-        // The resource-client runtime symbol the binding references is IMPORTED from the real
-        // `@treaty/httpclient` runtime, so the client resolves it at boot rather than throwing
-        // `edenPromiseResource is not defined` — and it is NOT a self-defined stub.
+        // The imperative binding does NOT wrap in `resource()`, so the resource helper is NOT imported.
         assert!(
-            out.code.contains("import { edenPromiseResource } from '@treaty/httpclient/resources'"),
-            "no real resource-client import for the referenced binding; got: {}",
+            !out.code.contains("edenPromiseResource"),
+            "imperative server-fn binding must not wrap in resource() (NG0203); got: {}",
             out.code
         );
         assert!(
@@ -1874,13 +1876,17 @@ export default function greetingCard() {\n\
                 && !code.contains("export async function loadGreeting$$"),
             "the `$$` server fn declaration leaked into the client; got: {code}"
         );
-        // The call site routes through the axum resource-client binding, whose runtime symbol is
-        // IMPORTED from the real `@treaty/httpclient` runtime (not a self-defined stub) so it resolves
-        // at boot.
+        // The call site routes through the axum client binding: an imperative `fetch` POST to the
+        // server route (NOT a `resource()` wrapper, which threw NG0203 when a server fn was called
+        // imperatively in an event handler outside an injection context), so the resource helper is
+        // NOT imported.
         assert!(
-            code.contains("edenPromiseResource")
-                && code.contains("import { edenPromiseResource } from '@treaty/httpclient/resources'"),
-            "call site not rewritten to an imported resource-client binding; got: {code}"
+            code.contains("fetch('/__server/loadGreeting$$'"),
+            "call site not rewritten to the imperative axum fetch binding; got: {code}"
+        );
+        assert!(
+            !code.contains("edenPromiseResource"),
+            "imperative server-fn binding must not wrap in resource() (NG0203); got: {code}"
         );
         assert!(code.contains("export default GreetingCard;"), "no class default export; got: {code}");
     }
@@ -1956,12 +1962,17 @@ export default function greetingCard() {\n\
             "SECURITY: `$$` server body leaked into the client; got:\n{}",
             out.code
         );
-        // A binding is present and its runtime symbol is IMPORTED from the real runtime (not a stub)
-        // so the client resolves it at boot.
+        // A binding is present: an imperative `fetch` POST to the server route, NOT a `resource()`
+        // wrapper (which threw NG0203 when a server fn was called imperatively in an event handler
+        // outside an injection context), so the resource helper is NOT imported.
         assert!(
-            out.code.contains("edenPromiseResource")
-                && out.code.contains("import { edenPromiseResource } from '@treaty/httpclient/resources'"),
-            "no imported resource-client binding for the lifted fn; got:\n{}",
+            out.code.contains("fetch('/__server/loadGreeting$$'"),
+            "no imperative fetch binding for the lifted fn; got:\n{}",
+            out.code
+        );
+        assert!(
+            !out.code.contains("edenPromiseResource"),
+            "imperative server-fn binding must not wrap in resource() (NG0203); got:\n{}",
             out.code
         );
     }

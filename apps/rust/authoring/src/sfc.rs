@@ -1714,17 +1714,18 @@ function onClick(user) { return save(user); }\n\
             "default path should not emit an Elysia app; got: {server_module}"
         );
 
-        // The compiled client routes the call through the axum typesafe resource client binding,
-        // wrapping the REAL `edenPromiseResource` export.
+        // The compiled client routes the call through the axum typesafe client binding: an imperative
+        // `fetch` POST to the server route (NOT a `resource()` wrapper, which threw NG0203 when a
+        // server fn was called imperatively in an event handler outside an injection context).
         assert!(
-            out.code.contains("edenPromiseResource") && out.code.contains("'/__server/save'"),
-            "call not rewritten to axum resource client; got: {}",
+            out.code.contains("fetch('/__server/save'") && out.code.contains("'/__server/save'"),
+            "call not rewritten to the imperative axum fetch client; got: {}",
             out.code
         );
-        // The resource helper is IMPORTED from the published runtime so the `.treaty` client boots.
+        // The imperative binding does NOT wrap in `resource()`, so the resource helper is NOT imported.
         assert!(
-            out.code.contains("import { edenPromiseResource } from '@treaty/httpclient/resources'"),
-            "no real resource-client import in the compiled .treaty client; got: {}",
+            !out.code.contains("edenPromiseResource"),
+            "imperative server-fn binding must not wrap in resource() (NG0203); got: {}",
             out.code
         );
         assert!(
@@ -1772,8 +1773,13 @@ server {\n\
             out.code
         );
         assert!(
-            out.code.contains("edenPromiseResource") && out.code.contains("'/__server/save'"),
-            "call not rewritten to the resource client; got: {}",
+            out.code.contains("fetch('/__server/save'") && out.code.contains("'/__server/save'"),
+            "call not rewritten to the imperative fetch client; got: {}",
+            out.code
+        );
+        assert!(
+            !out.code.contains("edenPromiseResource"),
+            "imperative server-fn binding must not wrap in resource() (NG0203); got: {}",
             out.code
         );
         assert_treaty_client_parses(&out.code);
@@ -1802,6 +1808,9 @@ server {\n\
 
     /// Parse `code` and assert `name` is bound at MODULE SCOPE by a top-level `import` specifier local,
     /// read off the PARSED AST (never a regex).
+    // Retained AST-based import checker (server-fn bindings are now imperative fetch and import no
+    // resource helper, so it currently has no callers).
+    #[allow(dead_code)]
     fn assert_treaty_imported_at_module_scope(code: &str, name: &str) {
         use oxc_ast::ast::ImportDeclarationSpecifier;
         let allocator = Allocator::default();
@@ -1852,12 +1861,12 @@ const title = 'Form';\n\
             "no re-exported client binding for the lifted use-server fn; got:\n{}",
             out.code
         );
+        // The imperative binding does NOT wrap in `resource()`, so the resource helper is NOT imported.
         assert!(
-            out.code.contains("import { edenPromiseResource } from '@treaty/httpclient/resources'"),
-            "no real resource-client import; got:\n{}",
+            !out.code.contains("edenPromiseResource"),
+            "imperative server-fn binding must not wrap in resource() (NG0203); got: {}",
             out.code
         );
-        assert_treaty_imported_at_module_scope(&out.code, "edenPromiseResource");
     }
 
     #[test]
