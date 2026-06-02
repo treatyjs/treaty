@@ -283,3 +283,40 @@ build → boot e2e for both example apps; the source-validate gate; the file-lev
    remotes, partial deploy/rollback).
 8. **Promote sibling tooling** (treaty-packagr, ngx-maintenance, dep-updater) on
    the green compiler.
+
+---
+
+## 2026-06-02 — React→Angular authoring + the `treaty-shadcn` showcase library
+
+Delivered this session (all on `migration/v22-oxc133`; matchGolden held 175/185
+throughout; crate suites green — rust_authoring 397, treaty_ivy core/template/
+decorators/facade, packagr 19 lib + 2 integration):
+
+- **React→Angular compiler** (`apps/rust/authoring/src/jsx/react.rs`): a `.tsx`/`.jsx`
+  that imports from `react` / uses hooks compiles to Angular Ivy. `useState`→`signal`
+  (+ setter → `.set`/`.update`), `useEffect`→`effect`, `useMemo`→`computed`,
+  `useCallback`→its fn, `useRef`→`signal`, `useContext`→`inject`; **props→`input()`**
+  (destructured params — closes the long-standing props gap for React AND our `.tsx`);
+  signal reads auto-called in the body, in control-flow **conditions** (`@if`/`@for`/
+  `@switch` heads), and in event handlers; inline-arrow handlers unwrapped (single
+  param → `$event`); `react` imports stripped; top-level `type`/`interface` + TS prop
+  defaults erased. Adversarially verified across 4 rounds (overlapping-edit panics +
+  the body/condition auto-call gap caught and fixed).
+- **`treaty-shadcn`** (`examples/treaty-shadcn/`): a publishable shadcn-style library —
+  6 components across ALL THREE surfaces (`.treaty`: Badge/Switch; Treaty `.tsx`:
+  Button/Input; **plain React `.tsx`**: Card/Alert) — every one → `ɵɵdefineComponent`.
+- **treaty-packagr**: emits a typed Angular **component-class `.d.ts`** (TS9007 closed;
+  recovers `InputSignal<T>` from `input<T>()` and from React-prop usage); packages the
+  library to `dist/` (7 entries + an APF `package.json` exports map).
+- **`treaty-shadcn-demo`** (`examples/treaty-shadcn-demo/`): an Angular gallery app
+  consuming the built library; real `vite build` (AOT, 0 residual `ngDeclare`, no JIT)
+  + headless render of all 6 components.
+- **Showcase runtime bugs fixed** (everything-app, each caught by running the app):
+  embedded-listener context crash; selectorless interop (multi-form kebab/camel/Pascal
+  selector + camelCase dependency collection); macro `$macro` inlining; hoisted
+  control-flow template fns dropped from `.treaty`/`.tjsx` modules; server-fn binding
+  NG0203 (an imperative server-fn call now returns a plain `fetch` Promise, not
+  `resource()`).
+
+Remaining (non-correctness): FESM flattening (rolldown) in packagr; the 10 genuine
+compliance DIFFs; production (non-dev) backend hosting + SSE/WS fan-out.
