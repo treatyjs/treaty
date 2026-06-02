@@ -46,16 +46,22 @@ use oxc_ast::ast::{
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType};
 
-/// One reconstructed signal input on the component class.
+/// One reconstructed input on the component class.
 struct ComponentInput {
     /// Property / public name (e.g. `variant`).
     name: String,
     /// Public binding alias (the second element of the `ɵcmp` input tuple).
     alias: String,
-    /// The TypeScript type carried by the `InputSignal<…>` (e.g. `boolean`).
+    /// The TypeScript type carried by the input (the `InputSignal<…>` arg for a signal input, or
+    /// the plain property type for a classic `@Input`).
     ty: String,
     /// Whether the input is required (no default / `input.required`).
     required: bool,
+    /// Whether this input is SIGNAL-based (`input()` → `InputSignal<T>` property, `"isSignal": true`)
+    /// vs a CLASSIC `@Input` (a plain `T` property, `"isSignal": false`). Read from the emitted
+    /// `inputs` metadata shape: a signal input carries the `InputFlags.SignalBased` bit (bit 0) in
+    /// its flag-array form; a classic input is a plain string or a flag-array without that bit.
+    is_signal: bool,
 }
 
 /// A component reconstructed from compiled Ivy ESM.
@@ -94,7 +100,7 @@ fn extract_component(body: &[Statement<'_>], source: &str) -> Option<ComponentMo
     //    the `ɵɵdefineComponent({ … })` metadata object from it.
     let mut name: Option<String> = None;
     let mut selector: Option<String> = None;
-    let mut input_specs: Vec<(String, String)> = Vec::new(); // (name, alias)
+    let mut input_specs: Vec<(String, String, bool)> = Vec::new(); // (name, alias, is_signal)
 
     for stmt in body {
         let Statement::ExpressionStatement(expr_stmt) = stmt else {
@@ -152,7 +158,7 @@ fn extract_component(body: &[Statement<'_>], source: &str) -> Option<ComponentMo
 
     let inputs = input_specs
         .into_iter()
-        .map(|(input_name, alias)| {
+        .map(|(input_name, alias, is_signal)| {
             let (mut ty, required) = type_map
                 .iter()
                 .find(|(n, _, _)| *n == input_name)
@@ -168,6 +174,7 @@ fn extract_component(body: &[Statement<'_>], source: &str) -> Option<ComponentMo
                 alias,
                 ty,
                 required,
+                is_signal,
             }
         })
         .collect();
@@ -245,9 +252,18 @@ fn first_selector(value: &Expression<'_>) -> Option<String> {
     None
 }
 
-/// Read the `inputs: { name: [flags, "alias"], … }` metadata into `(name, alias)`
-/// pairs, preserving declaration order.
-fn read_inputs(value: &Expression<'_>) -> Vec<(String, String)> {
+/// `InputFlags.SignalBased` — bit 0 of an input's flag tuple (mirrors `core.InputFlags`). A signal
+/// `input()` sets it; a classic `@Input` never does.
+const INPUT_FLAG_SIGNAL_BASED: f64 = 1.0;
+
+/// Read the `inputs: { name: [flags, "alias"[, "declared"]], … }` (or legacy `name: "alias"`)
+/// metadata into `(name, alias, is_signal)` triples, preserving declaration order.
+///
+/// `is_signal` is recovered from the metadata SHAPE — the first array element is the
+/// `InputFlags` bitfield, and a signal `input()` carries the `SignalBased` bit (bit 0). A classic
+/// `@Input` is emitted either as a bare alias string or as a flag-array WITHOUT that bit (e.g. a
+/// renamed `@Input('pub') x` → `[0, "pub", "x"]`), so neither form is reported as a signal.
+fn read_inputs(value: &Expression<'_>) -> Vec<(String, String, bool)> {
     let mut out = Vec::new();
     let Expression::ObjectExpression(obj) = value else {
         return out;
@@ -259,23 +275,34 @@ fn read_inputs(value: &Expression<'_>) -> Vec<(String, String)> {
         let Some(name) = property_name(&p.key) else {
             continue;
         };
-        // The value is `[flags, "alias"]` (modern) or `"alias"` (legacy). Read
-        // the alias where present, defaulting to the property name.
-        let alias = match &p.value {
-            Expression::ArrayExpression(arr) => arr
-                .elements
-                .iter()
-                .find_map(|el| match el {
-                    oxc_ast::ast::ArrayExpressionElement::StringLiteral(s) => {
-                        Some(s.value.to_string())
-                    }
+        // The value is `[flags, "alias"[, "declared"]]` (flag-array form) or `"alias"` (bare
+        // string). Read the alias and, for the array form, the `SignalBased` flag bit.
+        let (alias, is_signal) = match &p.value {
+            Expression::ArrayExpression(arr) => {
+                let flags = arr.elements.first().and_then(|el| match el {
+                    oxc_ast::ast::ArrayExpressionElement::NumericLiteral(n) => Some(n.value),
                     _ => None,
-                })
-                .unwrap_or_else(|| name.clone()),
-            Expression::StringLiteral(s) => s.value.to_string(),
-            _ => name.clone(),
+                });
+                let is_signal = flags
+                    .map(|f| (f as i64) & (INPUT_FLAG_SIGNAL_BASED as i64) != 0)
+                    .unwrap_or(false);
+                let alias = arr
+                    .elements
+                    .iter()
+                    .find_map(|el| match el {
+                        oxc_ast::ast::ArrayExpressionElement::StringLiteral(s) => {
+                            Some(s.value.to_string())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| name.clone());
+                (alias, is_signal)
+            }
+            // A bare alias string is the CLASSIC (non-signal) `@Input` form.
+            Expression::StringLiteral(s) => (s.value.to_string(), false),
+            _ => (name.clone(), false),
         };
-        out.push((name, alias));
+        out.push((name, alias, is_signal));
     }
     out
 }
@@ -556,12 +583,17 @@ fn render_component_dts(model: &ComponentModel) -> String {
     out.push_str("import * as i0 from \"@angular/core\";\n");
     out.push_str(&format!("export declare class {name} {{\n"));
 
-    // Signal input properties.
+    // Input properties. A SIGNAL `input()` is reconstructed as an `InputSignal<T>` member; a
+    // CLASSIC `@Input` is a plain `T` property (exactly what ngc/ng-packagr emit for each form).
     for input in &model.inputs {
-        out.push_str(&format!(
-            "    {}: import(\"{core}\").InputSignal<{}>;\n",
-            input.name, input.ty
-        ));
+        if input.is_signal {
+            out.push_str(&format!(
+                "    {}: import(\"{core}\").InputSignal<{}>;\n",
+                input.name, input.ty
+            ));
+        } else {
+            out.push_str(&format!("    {}: {};\n", input.name, input.ty));
+        }
     }
 
     // ɵfac
@@ -577,9 +609,11 @@ fn render_component_dts(model: &ComponentModel) -> String {
             .inputs
             .iter()
             .map(|i| {
+                // `isSignal` MUST reflect the actual compiled metadata: `true` only for a signal
+                // `input()` (`InputSignal<T>`), `false` for a classic `@Input` (a plain property).
                 format!(
-                    "\"{}\": {{ \"alias\": \"{}\"; \"required\": {}; \"isSignal\": true; }}",
-                    i.name, i.alias, i.required
+                    "\"{}\": {{ \"alias\": \"{}\"; \"required\": {}; \"isSignal\": {}; }}",
+                    i.name, i.alias, i.required, i.is_signal
                 )
             })
             .collect();
@@ -790,5 +824,120 @@ export default Alert;
         // The local `AlertType` is out of scope → we emit the primitive `string`.
         assert!(dts.contains("type: import(\"@angular/core\").InputSignal<string>;"));
         assert!(!dts.contains("AlertType"));
+    }
+
+    // -----------------------------------------------------------------------
+    // .d.ts consistency bug: classic @Input must be isSignal:false (a plain property),
+    // signal input() → isSignal:true (an InputSignal<T>). The two MUST NOT be conflated.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn classic_input_string_form_is_not_signal() {
+        // A classic `@Input() foo;` lowers to the BARE-STRING inputs form `{ foo: "foo" }`. The
+        // `.d.ts` must report `isSignal: false` and emit a PLAIN property (not `InputSignal<…>`).
+        let src = r#"
+import * as i0 from "@angular/core";
+class Widget {}
+Widget.ɵfac = function Widget_Factory(t) { return (t || Widget)(); };
+Widget.ɵcmp = i0.ɵɵdefineComponent({
+    type: Widget,
+    selectors: [["widget"]],
+    inputs: { foo: "foo" },
+    template: function Widget_Template(rf, ctx) {}
+});
+"#;
+        let dts = synthesize_component_dts(src).expect("should recognize the component");
+        assert!(
+            dts.contains("\"foo\": { \"alias\": \"foo\"; \"required\": false; \"isSignal\": false; }"),
+            "classic @Input must report isSignal:false:\n{dts}"
+        );
+        // Plain property, NOT an InputSignal.
+        assert!(dts.contains("foo: unknown;"), "classic @Input should be a plain property:\n{dts}");
+        assert!(
+            !dts.contains("foo: import(\"@angular/core\").InputSignal"),
+            "classic @Input must NOT be reconstructed as InputSignal:\n{dts}"
+        );
+    }
+
+    #[test]
+    fn classic_renamed_input_flag_array_without_signal_bit_is_not_signal() {
+        // A renamed classic `@Input('pub') foo;` emits `[0, "pub", "foo"]` — a flag array whose
+        // first element (flags) does NOT carry the SignalBased bit. Must be `isSignal: false`.
+        let src = r#"
+import * as i0 from "@angular/core";
+class Widget {}
+Widget.ɵcmp = i0.ɵɵdefineComponent({
+    type: Widget,
+    selectors: [["widget"]],
+    inputs: { foo: [0, "pub", "foo"] },
+    template: function Widget_Template(rf, ctx) {}
+});
+"#;
+        let dts = synthesize_component_dts(src).unwrap();
+        assert!(
+            dts.contains("\"foo\": { \"alias\": \"pub\"; \"required\": false; \"isSignal\": false; }"),
+            "renamed classic @Input (flags=0) must report isSignal:false:\n{dts}"
+        );
+        assert!(dts.contains("foo: unknown;"), "renamed classic @Input should be a plain property:\n{dts}");
+    }
+
+    #[test]
+    fn signal_input_flag_array_with_signal_bit_is_signal() {
+        // A signal `input()` emits `[1, "foo"]` (SignalBased bit set) → `isSignal: true` +
+        // `InputSignal<…>` member. This is the form the existing BUTTON fixture exercises; assert
+        // it directly to lock the signal/classic distinction.
+        let src = r#"
+import * as i0 from "@angular/core";
+import { input } from "@angular/core";
+function Widget() { const foo = input<string>(""); return { foo }; }
+Widget.ɵcmp = i0.ɵɵdefineComponent({
+    type: Widget,
+    selectors: [["widget"]],
+    inputs: { foo: [1, "foo"] },
+    signals: true,
+    template: function Widget_Template(rf, ctx) {}
+});
+"#;
+        let dts = synthesize_component_dts(src).unwrap();
+        assert!(
+            dts.contains("\"foo\": { \"alias\": \"foo\"; \"required\": false; \"isSignal\": true; }"),
+            "signal input() must report isSignal:true:\n{dts}"
+        );
+        assert!(
+            dts.contains("foo: import(\"@angular/core\").InputSignal<string>;"),
+            "signal input() should be an InputSignal property:\n{dts}"
+        );
+    }
+
+    #[test]
+    fn mixed_classic_and_signal_inputs_each_keep_their_flag() {
+        // A component carrying BOTH a classic `@Input` and a signal `input()` must report each
+        // input's `isSignal` independently — the bug conflated them to always-true.
+        let src = r#"
+import * as i0 from "@angular/core";
+import { input } from "@angular/core";
+function Widget() { const sig = input<number>(0); return { sig }; }
+Widget.ɵcmp = i0.ɵɵdefineComponent({
+    type: Widget,
+    selectors: [["widget"]],
+    inputs: { classic: "classic", sig: [1, "sig"] },
+    signals: true,
+    template: function Widget_Template(rf, ctx) {}
+});
+"#;
+        let dts = synthesize_component_dts(src).unwrap();
+        assert!(
+            dts.contains("\"classic\": { \"alias\": \"classic\"; \"required\": false; \"isSignal\": false; }"),
+            "classic input in a mixed component must stay isSignal:false:\n{dts}"
+        );
+        assert!(
+            dts.contains("\"sig\": { \"alias\": \"sig\"; \"required\": false; \"isSignal\": true; }"),
+            "signal input in a mixed component must stay isSignal:true:\n{dts}"
+        );
+        assert!(dts.contains("classic: unknown;"), "classic prop should be plain:\n{dts}");
+        assert!(
+            dts.contains("sig: import(\"@angular/core\").InputSignal<number>;"),
+            "signal prop should be InputSignal:\n{dts}"
+        );
     }
 }

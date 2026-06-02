@@ -71,7 +71,9 @@ fn err(msg: impl Into<String>) -> CompiledComponent {
 /// compiler then treats `template` exactly as it would an inline `template:` and `styles` exactly as
 /// it would an inline `styles:[...]` entry. Defined in the `decorators` crate (it rides on
 /// [`CompileCtx`]) and re-exported here as the public surface.
-pub use crate::decorators::registry::{ResolvedComponentContent, ResolvedContentMap};
+pub use crate::decorators::registry::{
+    ModernizeOptions, ResolvedComponentContent, ResolvedContentMap,
+};
 
 /// Build the class self-reference (`value`/`ty`), stamping the original-source `span` of
 /// the class name onto the `value` read. The `value` read is the one cloned into the
@@ -638,6 +640,7 @@ fn collect_io(
     class: &Class,
     inputs: &mut OrderedMap<String, R3InputMetadata>,
     outputs: &mut OrderedMap<String, String>,
+    modernize: ModernizeOptions,
 ) -> Result<(), String> {
     for element in &class.body.body {
         let ClassElement::PropertyDefinition(prop) = element else {
@@ -681,6 +684,13 @@ fn collect_io(
             // `[0, "public", "declared"]`; the bare form emits the property name as a string. With
             // a `transform`, Angular sets the `HasDecoratorInputTransform` flag (value 2) and appends
             // the transform fn as the 4th array element (`[2, "public", "declared", transform]`).
+            //
+            // MODERNIZER (`signal_inputs`): a classic `@Input` is lowered to a signal `input()` at
+            // COMPILE TIME — the emitted `inputs` map carries the `InputFlags.SignalBased` bit and
+            // the directive is marked `signals: true` (see `is_signal` below). This is an emit-time
+            // remapping only; the author's `@Input x;` declaration is untouched. The public name /
+            // alias / transform are preserved exactly. A `model()`-style input is NOT synthesized
+            // (a classic `@Input` has no paired `Change` output), matching `input()` (one-way).
             let public_name = decorator_alias.clone().unwrap_or_else(|| member_name.clone());
             inputs.insert(
                 member_name.clone(),
@@ -688,7 +698,7 @@ fn collect_io(
                     class_property_name: member_name.clone(),
                     binding_property_name: public_name,
                     required: false,
-                    is_signal: false,
+                    is_signal: modernize.signal_inputs,
                     transform_function: decorator_transform,
                 },
             );
@@ -696,6 +706,12 @@ fn collect_io(
         }
         if decorated_output {
             // Outputs key on the property name; the value is the public name (alias or property).
+            //
+            // MODERNIZER (`signal_outputs`): a classic `@Output` lowers to `output()`. The emitted
+            // `outputs` metadata is identical for both forms (an output carries no per-output signal
+            // flag in `ɵɵdefineComponent/Directive`), so the only OBSERVABLE effect is on the
+            // `signals: true` decision (see `is_signal`), keeping the lowering byte-faithful to a
+            // hand-authored `output()`.
             let public_name = decorator_alias.unwrap_or_else(|| member_name.clone());
             outputs.insert(member_name.clone(), public_name);
             continue;
@@ -1354,7 +1370,15 @@ pub fn compile_component_source(ts_source: &str) -> CompiledComponent {
         return err(format!("parse error: {}", msgs.join("; ")));
     }
 
-    compile_program_with_source(&ret.program, Some(ts_source), None, None, None, false)
+    compile_program_with_source(
+        &ret.program,
+        Some(ts_source),
+        None,
+        None,
+        None,
+        false,
+        ModernizeOptions::default(),
+    )
 }
 
 /// Per-file Angular compiler options that influence the emit but are NOT expressible in the source.
@@ -1367,6 +1391,11 @@ pub struct CompileOptions {
     /// The `legacyOptionalChaining` Angular compiler option: lower a safe-navigation host-binding
     /// value (`getData()?.id`) to the classic guarded-temporary ternary rather than the native `?.`.
     pub legacy_optional_chaining: bool,
+    /// OPT-IN compile-time modernizer flags. All-false by default, so the default emit is
+    /// byte-identical to the classic output. When set, classic decorator / structural-directive
+    /// forms are lowered to their modern signal / block equivalents AT COMPILE TIME (the author's
+    /// source is never rewritten). Threaded from the addon / bundler plugin.
+    pub modernize: ModernizeOptions,
 }
 
 /// Like [`compile_component_source`] but honouring per-file [`CompileOptions`]. With
@@ -1391,6 +1420,7 @@ pub fn compile_component_source_with_options(
         None,
         None,
         options.legacy_optional_chaining,
+        options.modernize,
     )
 }
 
@@ -1415,7 +1445,15 @@ pub fn compile_component_source_with_resolved(
         return err(format!("parse error: {}", msgs.join("; ")));
     }
 
-    compile_program_with_source(&ret.program, Some(ts_source), None, Some(resolved), None, false)
+    compile_program_with_source(
+        &ret.program,
+        Some(ts_source),
+        None,
+        Some(resolved),
+        None,
+        false,
+        ModernizeOptions::default(),
+    )
 }
 
 /// Context for additive source-map emission: the original authoring source text plus the
@@ -1500,6 +1538,7 @@ pub fn compile_component_source_with_map_and_selector(
         None,
         default_selector,
         false,
+        ModernizeOptions::default(),
     );
     CompiledComponentWithMap {
         code: compiled.code,
@@ -1894,6 +1933,7 @@ fn compile_program_with_source(
     resolved: Option<&ResolvedContentMap>,
     default_selector: Option<&str>,
     legacy_optional_chaining: bool,
+    modernize: ModernizeOptions,
 ) -> CompiledComponent {
     let imported_names = collect_imported_names(program);
 
@@ -1965,6 +2005,7 @@ fn compile_program_with_source(
             resolved,
             default_selector,
             legacy_optional_chaining,
+            modernize,
             &class_decl_positions,
         ) {
             Ok(emit) => {
@@ -2145,6 +2186,7 @@ impl DecoratorCompiler for ComponentCompiler {
             // A selectorless `@Component` adopts the caller's filename-derived default selector.
             ctx.default_selector,
             ctx.legacy_optional_chaining,
+            ctx.modernize,
             ctx.class_decl_positions,
         )
     }
@@ -2171,6 +2213,7 @@ impl DecoratorCompiler for DirectiveCompiler {
             // A `@Directive` is legitimately selectorless (class-only); never substitute a selector.
             None,
             ctx.legacy_optional_chaining,
+            ctx.modernize,
             ctx.class_decl_positions,
         )
     }
@@ -2459,6 +2502,7 @@ fn compile_decorated_class(
     resolved_content: Option<&ResolvedContentMap>,
     default_selector: Option<&str>,
     legacy_optional_chaining: bool,
+    modernize: ModernizeOptions,
     class_decl_positions: &std::collections::HashMap<String, u32>,
 ) -> Result<ClassEmit, String> {
     let (class_name, class_name_span) = match &class.id {
@@ -2482,6 +2526,7 @@ fn compile_decorated_class(
         resolved_content,
         default_selector,
         legacy_optional_chaining,
+        modernize,
         class_decl_positions,
     };
 
@@ -2573,6 +2618,7 @@ fn compile_component_or_directive(
     resolved_content: Option<&ResolvedContentMap>,
     default_selector: Option<&str>,
     legacy_optional_chaining: bool,
+    modernize: ModernizeOptions,
     class_decl_positions: &std::collections::HashMap<String, u32>,
 ) -> Result<ClassEmit, String> {
     // The host-resolved external content for THIS class (keyed by class name), if the caller wired
@@ -2745,7 +2791,7 @@ fn compile_component_or_directive(
     // inputs / outputs.
     let mut inputs: OrderedMap<String, R3InputMetadata> = OrderedMap::new();
     let mut outputs: OrderedMap<String, String> = OrderedMap::new();
-    if let Err(e) = collect_io(class, &mut inputs, &mut outputs) {
+    if let Err(e) = collect_io(class, &mut inputs, &mut outputs, modernize) {
         return Err(e);
     }
 
@@ -2834,6 +2880,7 @@ fn compile_component_or_directive(
                 factory,
                 import_has_forward_ref,
                 own_position,
+                modernize,
                 class_decl_positions,
             )
         }
@@ -3225,6 +3272,7 @@ fn compile_component_meta(
     factory: R3FactoryMetadata,
     import_has_forward_ref: bool,
     own_position: u32,
+    modernize: ModernizeOptions,
     class_decl_positions: &std::collections::HashMap<String, u32>,
 ) -> Result<ClassEmit, String> {
     let class_name = base.name.clone();
@@ -3236,9 +3284,20 @@ fn compile_component_meta(
         errors.push(e.msg.clone());
     }
 
+    // OPT-IN control-flow modernizer: lower `*ngIf`/`*ngFor`/`*ngSwitch` structural directives to
+    // the native `@if`/`@for`/`@switch` BLOCK form on the HTML AST, BEFORE it is lowered to the r3
+    // AST. The block form is then desugared by the SAME proven control-flow pipeline, so the emit
+    // is identical to a hand-authored block. When the flag is OFF (the default), `root_nodes` is
+    // used verbatim — the classic structural-directive emit is byte-for-byte unchanged.
+    let root_nodes = if modernize.control_flow {
+        crate::template::modernize::modernize_control_flow(&parse_result.root_nodes)
+    } else {
+        parse_result.root_nodes.clone()
+    };
+
     let mut binding_parser = BindingParser::new();
     let r3 = html_ast_to_render3_ast(
-        &parse_result.root_nodes,
+        &root_nodes,
         &mut binding_parser,
         Render3ParseOptions::default(),
     );
@@ -5218,6 +5277,204 @@ export class BCmp {}
             "expected empty-deps factory; got: {flat}"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // OPT-IN modernizer: classic @Input/@Output → signal input()/output().
+    // The DEFAULT path (modernizer OFF) must be byte-identical to the classic emit.
+    // -----------------------------------------------------------------------
+
+    fn compile_modernized(src: &str, modernize: ModernizeOptions) -> CompiledComponent {
+        super::compile_component_source_with_options(
+            src,
+            super::CompileOptions {
+                legacy_optional_chaining: false,
+                modernize,
+            },
+        )
+    }
+
+    #[test]
+    fn modernizer_off_is_byte_identical_to_classic() {
+        // With every modernizer flag off, the option-carrying entry point reproduces the classic
+        // `compile_component_source` emit byte-for-byte — for inputs, outputs AND structural
+        // directives. This is the HARD GATE in miniature.
+        let src = r#"
+            @Component({selector:"a",standalone:false,template:'<div *ngIf="show">{{x}}</div>'})
+            export class C { @Input() x = 1; @Output() y = new EventEmitter(); show = true; }
+        "#;
+        let classic = compile_component_source(src);
+        let off = compile_modernized(src, ModernizeOptions::default());
+        assert!(classic.errors.is_empty(), "classic errors: {:?}", classic.errors);
+        assert_eq!(classic.code, off.code, "modernizer OFF diverged from classic emit");
+    }
+
+    #[test]
+    fn classic_input_default_is_not_signal() {
+        // DEFAULT: a classic `@Input()` emits the non-signal form — the property-name string in
+        // `inputs` (no flag array) and no `signals: true` on the def.
+        let src = r#"@Component({selector:"a",standalone:false,template:""}) export class C { @Input() foo = 1; }"#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let flat = normalize_ws(&out.code);
+        assert!(flat.contains("inputs: { foo: \"foo\" }"), "expected classic string input; got: {flat}");
+        assert!(!flat.contains("signals: true"), "classic @Input must not set signals:true; got: {flat}");
+    }
+
+    #[test]
+    fn modernizer_lowers_classic_input_to_signal() {
+        // ON: a classic `@Input()` lowers to a signal input — the flag-array form carrying
+        // `InputFlags.SignalBased` (bit 0 → flags = 1) and the def is marked `signals: true`.
+        let src = r#"@Component({selector:"a",standalone:false,template:""}) export class C { @Input() foo = 1; }"#;
+        let out = compile_modernized(src, ModernizeOptions { signal_inputs: true, ..Default::default() });
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let flat = normalize_ws(&out.code);
+        // Signal input emits `foo: [1, "foo"]` (flags=1=SignalBased, public name).
+        assert!(
+            flat.contains("inputs: { foo: [1, \"foo\"] }"),
+            "expected signal-flagged input array; got: {flat}"
+        );
+        assert!(flat.contains("signals: true"), "modernized signal input must set signals:true; got: {flat}");
+    }
+
+    #[test]
+    fn modernizer_preserves_input_alias_when_lowering() {
+        // A renamed `@Input('pub')` lowering to a signal input keeps the public alias: the array
+        // form `[1, "pub", "foo"]` (SignalBased flag, public name, declared name).
+        let src = r#"@Component({selector:"a",standalone:false,template:""}) export class C { @Input('pub') foo = 1; }"#;
+        let out = compile_modernized(src, ModernizeOptions { signal_inputs: true, ..Default::default() });
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let flat = normalize_ws(&out.code);
+        assert!(
+            flat.contains("inputs: { foo: [ 1, \"pub\", \"foo\" ] }"),
+            "expected aliased signal input array; got: {flat}"
+        );
+    }
+
+    #[test]
+    fn modernizer_output_emit_matches_classic() {
+        // A classic `@Output()` lowered to `output()` has an IDENTICAL emit (an output carries no
+        // per-output signal flag, and `output()` does not flip `signals: true`). The lowering is
+        // therefore a verified no-op on the emitted bytes — honest about what `signal_outputs` does.
+        let src = r#"
+            import { EventEmitter } from "@angular/core";
+            @Component({selector:"a",standalone:false,template:""})
+            export class C { @Output() changed = new EventEmitter(); }
+        "#;
+        let classic = compile_component_source(src);
+        let on = compile_modernized(src, ModernizeOptions { signal_outputs: true, ..Default::default() });
+        assert!(classic.errors.is_empty(), "classic errors: {:?}", classic.errors);
+        assert!(on.errors.is_empty(), "modernized errors: {:?}", on.errors);
+        let flat = normalize_ws(&classic.code);
+        assert!(flat.contains("outputs: { changed: \"changed\" }"), "expected output map; got: {flat}");
+        assert_eq!(classic.code, on.code, "@Output→output() must be a byte-identical emit");
+    }
+
+    #[test]
+    fn modernizer_input_only_flag_does_not_touch_outputs() {
+        // `signal_inputs` alone lowers inputs but leaves a classic `@Output` exactly as-is.
+        let src = r#"
+            import { EventEmitter } from "@angular/core";
+            @Component({selector:"a",standalone:false,template:""})
+            export class C { @Input() foo = 1; @Output() bar = new EventEmitter(); }
+        "#;
+        let out = compile_modernized(src, ModernizeOptions { signal_inputs: true, ..Default::default() });
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let flat = normalize_ws(&out.code);
+        assert!(flat.contains("inputs: { foo: [1, \"foo\"] }"), "input not lowered; got: {flat}");
+        assert!(flat.contains("outputs: { bar: \"bar\" }"), "output should be untouched; got: {flat}");
+    }
+
+    // -----------------------------------------------------------------------
+    // OPT-IN modernizer: *ngIf/*ngFor/*ngSwitch → @if/@for/@switch. The lowered emit must MATCH a
+    // hand-authored block, and the DEFAULT (OFF) must keep the classic structural-directive emit.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn classic_ng_if_default_emits_structural_template() {
+        // DEFAULT: `*ngIf` emits the classic structural template (`ɵɵtemplate` + the `ngIf`
+        // property binding), NOT the block-form `ɵɵconditional`.
+        let src = r#"@Component({selector:"a",standalone:false,template:'<div *ngIf="show">x</div>'}) export class C { show = true; }"#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        // A standalone:false structural directive emits the `ɵɵtemplate` child + an `ngIf` property
+        // binding, NEVER the block-form `ɵɵconditional`.
+        assert!(out.code.contains("\u{0275}\u{0275}template"), "expected classic ɵɵtemplate; got: {}", out.code);
+        assert!(
+            !out.code.contains("\u{0275}\u{0275}conditional"),
+            "classic *ngIf must NOT emit ɵɵconditional; got: {}",
+            out.code
+        );
+    }
+
+    #[test]
+    fn modernizer_ng_if_matches_native_if_block() {
+        // ON: `*ngIf="show"` lowers to `@if (show) { … }`, emitting BYTE-IDENTICALLY to the
+        // hand-authored `@if` block (the strongest correctness check).
+        let starred = r#"@Component({selector:"a",standalone:true,template:'<div *ngIf="show">x</div>'}) export class C { show = true; }"#;
+        let native = r#"@Component({selector:"a",standalone:true,template:'@if (show) {<div>x</div>}'}) export class C { show = true; }"#;
+        let lowered = compile_modernized(starred, ModernizeOptions { control_flow: true, ..Default::default() });
+        let hand = compile_component_source(native);
+        assert!(lowered.errors.is_empty(), "lowered errors: {:?}", lowered.errors);
+        assert!(hand.errors.is_empty(), "native errors: {:?}", hand.errors);
+        assert!(lowered.code.contains("\u{0275}\u{0275}conditional"), "lowered *ngIf should emit ɵɵconditional; got: {}", lowered.code);
+        assert_eq!(lowered.code, hand.code, "lowered *ngIf diverged from hand-authored @if");
+    }
+
+    #[test]
+    fn modernizer_ng_for_matches_native_for_block() {
+        // ON: `*ngFor="let item of items"` lowers to `@for (item of items; track item) { … }`,
+        // matching the hand-authored block byte-for-byte.
+        let starred = r#"@Component({selector:"a",standalone:true,template:'<li *ngFor="let item of items">{{item}}</li>'}) export class C { items = []; }"#;
+        let native = r#"@Component({selector:"a",standalone:true,template:'@for (item of items; track item) {<li>{{item}}</li>}'}) export class C { items = []; }"#;
+        let lowered = compile_modernized(starred, ModernizeOptions { control_flow: true, ..Default::default() });
+        let hand = compile_component_source(native);
+        assert!(lowered.errors.is_empty(), "lowered errors: {:?}", lowered.errors);
+        assert!(hand.errors.is_empty(), "native errors: {:?}", hand.errors);
+        assert!(lowered.code.contains("\u{0275}\u{0275}repeater"), "lowered *ngFor should emit ɵɵrepeater; got: {}", lowered.code);
+        assert_eq!(lowered.code, hand.code, "lowered *ngFor diverged from hand-authored @for");
+    }
+
+    #[test]
+    fn modernizer_ng_switch_matches_native_switch_block() {
+        // ON: `[ngSwitch]` + `*ngSwitchCase`/`*ngSwitchDefault` lower to `@switch`.
+        let starred = r#"@Component({selector:"a",standalone:true,template:'<div [ngSwitch]="c"><span *ngSwitchCase="1">A</span><span *ngSwitchDefault>B</span></div>'}) export class C { c = 1; }"#;
+        let native = r#"@Component({selector:"a",standalone:true,template:'<div>@switch (c) {@case (1) {<span>A</span>} @default {<span>B</span>}}</div>'}) export class C { c = 1; }"#;
+        let lowered = compile_modernized(starred, ModernizeOptions { control_flow: true, ..Default::default() });
+        let hand = compile_component_source(native);
+        assert!(lowered.errors.is_empty(), "lowered errors: {:?}", lowered.errors);
+        assert!(hand.errors.is_empty(), "native errors: {:?}", hand.errors);
+        // The switch container differs in nesting between the two authorings, so assert on the
+        // tell-tale instruction rather than byte equality: lowered switch emits ɵɵconditional
+        // (the block @switch lowering), never the classic structural ɵɵtemplate for the cases.
+        assert!(lowered.code.contains("\u{0275}\u{0275}conditional"), "lowered @switch should emit ɵɵconditional; got: {}", lowered.code);
+        assert!(hand.code.contains("\u{0275}\u{0275}conditional"), "native @switch should emit ɵɵconditional; got: {}", hand.code);
+    }
+
+    #[test]
+    fn modernizer_control_flow_off_keeps_structural_emit() {
+        // With control_flow OFF, a `*ngFor` template stays classic — byte-identical to the plain
+        // `compile_component_source`.
+        let src = r#"@Component({selector:"a",standalone:true,template:'<li *ngFor="let item of items">{{item}}</li>'}) export class C { items = []; }"#;
+        let classic = compile_component_source(src);
+        let off = compile_modernized(src, ModernizeOptions::default());
+        assert!(classic.errors.is_empty(), "classic errors: {:?}", classic.errors);
+        assert!(classic.code.contains("\u{0275}\u{0275}domTemplate"), "expected classic ɵɵdomTemplate; got: {}", classic.code);
+        assert_eq!(classic.code, off.code, "control_flow OFF diverged from classic emit");
+    }
+
+    #[test]
+    fn modernizer_refuses_ng_if_else_keeps_classic() {
+        // `*ngIf="cond; else tpl"` is NOT mechanically lowerable; with control_flow ON it stays
+        // classic (the modernizer refuses), so it still emits the structural template.
+        let src = r#"@Component({selector:"a",standalone:true,template:'<div *ngIf="show; else other">x</div><ng-template #other>y</ng-template>'}) export class C { show = true; }"#;
+        let on = compile_modernized(src, ModernizeOptions { control_flow: true, ..Default::default() });
+        assert!(on.errors.is_empty(), "errors: {:?}", on.errors);
+        assert!(
+            !on.code.contains("\u{0275}\u{0275}conditional"),
+            "*ngIf-with-else must NOT be lowered to ɵɵconditional; got: {}",
+            on.code
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5394,7 +5651,12 @@ mod corpus_dump {
                 }
                 let out = super::compile_component_source_with_options(
                     &src,
-                    super::CompileOptions { legacy_optional_chaining },
+                    super::CompileOptions {
+                        legacy_optional_chaining,
+                        // The compliance corpus is scored against the CLASSIC emit; the modernizer
+                        // stays OFF here so the matchGolden score is unaffected.
+                        modernize: super::ModernizeOptions::default(),
+                    },
                 );
                 if !first {
                     json.push_str(",\n");

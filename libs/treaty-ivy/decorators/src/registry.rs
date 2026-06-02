@@ -61,6 +61,37 @@ pub struct ResolvedComponentContent {
 /// name so multi-class files resolve each component independently.
 pub type ResolvedContentMap = std::collections::HashMap<String, ResolvedComponentContent>;
 
+/// OPT-IN compile-time modernizer flags. Every flag defaults to `false`, so
+/// [`ModernizeOptions::default`] (the value carried on every default compile path) leaves the emit
+/// byte-identical to the classic, un-modernized output.
+///
+/// When a flag is set the corresponding *compile-time lowering* runs (the AUTHOR's source is never
+/// rewritten): the input metadata / emitted Ivy reflects the modern form, but the kept class
+/// declaration the bundler sees is untouched. These are NOT source codemods — they are emit-time
+/// remappings, so turning a flag off restores the classic emit exactly.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ModernizeOptions {
+    /// Lower classic `@Input(...)` members to signal `input()` inputs: the emitted `inputs` map
+    /// carries the `InputFlags.SignalBased` bit and the directive is marked `signals: true`.
+    pub signal_inputs: bool,
+    /// Lower classic `@Output(...)` members to `output()` outputs. (Outputs carry no per-output
+    /// signal flag in the emit; this exists for symmetry / future-proofing and to drive the
+    /// `signals: true` decision alongside `signal_inputs`.)
+    pub signal_outputs: bool,
+    /// Lower `*ngIf` / `*ngFor` / `*ngSwitch` structural directives in templates to the native
+    /// `@if` / `@for` / `@switch` block control-flow form BEFORE the template is parsed to the
+    /// r3 AST, reusing the proven block control-flow lowering.
+    pub control_flow: bool,
+}
+
+impl ModernizeOptions {
+    /// Whether any modernizer flag is set (the fast-path guard that keeps the default compile free
+    /// of every modernizer code path).
+    pub fn any(&self) -> bool {
+        self.signal_inputs || self.signal_outputs || self.control_flow
+    }
+}
+
 /// Cross-class context shared by every class in a file, needed to resolve template dependencies in
 /// a multi-class module. `auto_import_candidates` is the union of the file's imported names and the
 /// sibling class names (for selectorless auto-import); `sibling_directives` is every sibling
@@ -90,6 +121,9 @@ pub struct CompileCtx<'a> {
     /// `?.` operator. `false` for every default compile path; only the option-carrying entry point
     /// (and the compliance corpus dump, which reads it per case) sets it.
     pub legacy_optional_chaining: bool,
+    /// OPT-IN modernizer flags (see [`ModernizeOptions`]). [`ModernizeOptions::default`] (all-false)
+    /// on every default compile path leaves the emit byte-identical to the classic output.
+    pub modernize: ModernizeOptions,
 }
 
 /// The Ivy emit of ONE decorated class, decomposed so the original module can be re-assembled
