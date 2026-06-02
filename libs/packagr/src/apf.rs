@@ -5,6 +5,11 @@
 //! `exports` map (`types` + `default`/`import` conditions per sub-path) and the
 //! legacy top-level `module` / `types` fields, marking the package
 //! `sideEffects: false` and `type: module` as APF requires.
+//!
+//! The `module` field and every `exports` `import`/`default` condition point at
+//! the entry's `index.mjs`, which packagr emits as the *flattened* FESM module
+//! (see [`crate::fesm`]) — so consumers resolve the flattened ES module for each
+//! entry while the on-disk layout stays the stable per-entry `index.mjs`.
 
 use std::collections::BTreeMap;
 

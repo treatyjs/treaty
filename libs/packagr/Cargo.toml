@@ -6,8 +6,9 @@ edition = "2024"
 # treaty_packagr — the Rust-native ng-packagr successor.
 # Compiles a library's entries through treaty_ivy + rust_authoring, emits `.d.ts`
 # via oxc_isolated_declarations, and produces an Angular Package Format (APF)
-# manifest plus per-entry ESM. FESM flattening (via rolldown) is documented as
-# the next step. See migration/ROADMAP-PHASE2 + [[treaty-packagr]].
+# manifest plus per-entry FESM ESM. FESM flattening is a self-contained oxc-based
+# internal-module inliner (src/fesm.rs) — no external bundler. See
+# migration/ROADMAP-PHASE2 + [[treaty-packagr]].
 
 [dependencies]
 treaty_ivy = { path = "../treaty-ivy/facade" }

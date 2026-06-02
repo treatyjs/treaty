@@ -53,7 +53,12 @@ pub struct DistEntry {
     /// The directory, relative to the dist root, holding this entry's
     /// artifacts (`"."` for the primary, `"./testing"` for a secondary).
     pub dir: String,
-    /// The compiled ESM module source.
+    /// The entry's flattened (FESM) ESM module source — the entry's own private
+    /// internal modules inlined into one file, with external/bare specifiers and
+    /// sibling-entry references left as imports (see [`crate::fesm`]). This is the
+    /// module emitted as the entry's `index.mjs`, i.e. what the published
+    /// `package.json` `module`/`exports` point at. A single-file entry's flattened
+    /// ESM is byte-identical to its compiled ESM.
     pub esm: String,
     /// The generated `.d.ts` source.
     pub declarations: String,
@@ -84,7 +89,10 @@ pub struct DistManifest {
 
 impl DistManifest {
     /// Write the whole dist tree under `dest`: the root `package.json`, then
-    /// each entry's `index.mjs` + `index.d.ts` under its directory.
+    /// each entry's `index.mjs` + `index.d.ts` under its directory. The emitted
+    /// `index.mjs` is the entry's flattened FESM module ([`DistEntry::esm`]) — the
+    /// exact bytes the manifest's `module`/`exports` point at — so the per-entry
+    /// layout is preserved while the module content is the flattened one.
     ///
     /// Returns every path written, in deterministic order.
     pub fn write_to(&self, dest: &Path) -> Result<Vec<std::path::PathBuf>, PackagrError> {

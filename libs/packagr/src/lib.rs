@@ -11,13 +11,16 @@
 //!
 //! The library-wide flow lives in [`library`]: [`library::package_library`]
 //! reads a [`config::PackageConfig`], discovers the primary + secondary entry
-//! points, compiles/declares each, and returns a [`core::DistManifest`] (the
+//! points, compiles/declares each, flattens each entry's internal modules into a
+//! single APF FESM module ([`fesm`]), and returns a [`core::DistManifest`] (the
 //! APF `package.json` plus per-entry artifacts).
 //!
-//! What is intentionally NOT done yet, and is tracked as next work:
-//!   * FESM flattening (one flattened ES module per entry) via `rolldown` —
-//!     today each entry emits a single ESM file, which is APF-valid but not
-//!     flattened across its internal modules.
+//! FESM flattening ([`fesm::flatten_entry_esm`]) inlines an entry's *private*
+//! relative modules into one flat ES module while leaving bare specifiers
+//! (`@angular/*`, `tslib`, npm deps) external and sibling published entries as
+//! cross-entry references — the APF `fesm2022` shape, done with a self-contained
+//! oxc-based inliner rather than a heavyweight bundler. A single-file component
+//! entry has no inlinable modules, so flattening is a byte-for-byte identity.
 
 pub mod apf;
 pub mod compile;
@@ -25,6 +28,7 @@ pub mod component_dts;
 pub mod config;
 pub mod core;
 pub mod dts;
+pub mod fesm;
 pub mod library;
 
 pub use config::{PackageConfig, ResolvedEntry, SecondaryEntryConfig};

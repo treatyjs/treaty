@@ -8,19 +8,22 @@
 //! primary entry plus each secondary. The returned [`DistManifest`] holds every
 //! artifact in memory; [`DistManifest::write_to`] commits it to disk.
 //!
-//! Entries emit per-entry ESM today (one `index.mjs` per entry). FESM
-//! flattening — collapsing each entry's internal modules into a single
-//! flattened ES module with `rolldown` — is the documented next step and would
-//! slot in between compilation and manifest assembly without changing this
-//! signature.
+//! Each entry's `index.mjs` is a *flattened* FESM module: [`build_entry`] runs
+//! [`crate::fesm::flatten_entry_esm`] after compilation, inlining the entry's own
+//! private internal modules into one ES module while leaving bare specifiers and
+//! sibling published entries as imports. A single-file entry flattens to itself
+//! (identity). This slots between compilation and manifest assembly without
+//! changing [`package_library`]'s signature.
 
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use crate::apf;
 use crate::compile;
 use crate::config::{self, PackageConfig, ResolvedEntry};
 use crate::core::{DistEntry, DistManifest, PackagrError};
 use crate::dts;
+use crate::fesm;
 
 /// Read the published name/version, preferring the descriptor's own fields and
 /// otherwise falling back to a sibling `package.json`.
@@ -49,8 +52,18 @@ fn resolve_name_version(package_dir: &Path, config: &PackageConfig) -> (String, 
     )
 }
 
-/// Compile one resolved entry to its ESM + `.d.ts` artifacts.
-fn build_entry(entry: &ResolvedEntry) -> Result<DistEntry, PackagrError> {
+/// Compile one resolved entry to its ESM + `.d.ts` artifacts, then flatten its
+/// private internal modules into a single APF FESM module.
+///
+/// `entry_source_set` is the canonical set of *all* entry source paths; the
+/// flatten step uses it to distinguish a private helper (inlined) from a sibling
+/// published entry (left as a cross-entry reference). The `.d.ts` is derived from
+/// the un-flattened compile so isolated-declarations/component reconstruction
+/// continue to see the entry's own source surface.
+fn build_entry(
+    entry: &ResolvedEntry,
+    entry_source_set: &HashSet<PathBuf>,
+) -> Result<DistEntry, PackagrError> {
     let source = std::fs::read_to_string(&entry.source_path).map_err(PackagrError::from)?;
     let file_name = entry
         .source_path
@@ -64,10 +77,14 @@ fn build_entry(entry: &ResolvedEntry) -> Result<DistEntry, PackagrError> {
     }
     let declarations = dts::emit_dts_for_entry(&source, &esm.code, file_name)?;
 
+    // Flatten the entry's own internal modules into one FESM module. For a
+    // single-file entry this is a byte-for-byte identity.
+    let flat_esm = fesm::flatten_entry_esm(&esm.code, &entry.source_path, entry_source_set);
+
     Ok(DistEntry {
         sub_path: entry.sub_path.clone(),
         dir: apf::dir_for_sub_path(&entry.sub_path),
-        esm: esm.code,
+        esm: flat_esm,
         declarations,
     })
 }
@@ -105,9 +122,16 @@ pub fn package_library(
     let (name, version) = resolve_name_version(package_dir, config);
     let resolved = config::discover_entries(package_dir, config)?;
 
+    // The canonical set of every entry's source path. The FESM flattener inlines
+    // a relative import only when it resolves to a PRIVATE module — one that is
+    // not in this set — leaving sibling published entries as cross-entry refs.
+    let entry_source_paths: Vec<PathBuf> =
+        resolved.iter().map(|e| e.source_path.clone()).collect();
+    let entry_source_set = fesm::canonical_entry_set(&entry_source_paths);
+
     let mut entries = Vec::with_capacity(resolved.len());
     for entry in &resolved {
-        entries.push(build_entry(entry)?);
+        entries.push(build_entry(entry, &entry_source_set)?);
     }
 
     let sub_paths: Vec<String> = entries.iter().map(|e| e.sub_path.clone()).collect();
