@@ -22,7 +22,7 @@ Where things stand:
   complete ES-module Ivy output. **Every Angular decorator**
   (`@Component/@Directive/@Pipe/@Injectable/@NgModule`) lowers to Ivy AOT (no JIT)
   on every entry point, including the unified `compile()` path. Golden parity vs
-  Angular's own corpus: **170 / 185 runnable = 91.9%** (live-scored), climbing
+  Angular's own corpus: **181 / 185 runnable = 97.8%** (live-scored), at the modern-Angular ceiling
   toward full parity as the ranked DIFFs are closed.
 - **Angular Linker** — DONE for the LINK path: partial `ɵɵngDeclare*` → AOT
   `ɵɵdefine*` in Rust (`libs/treaty-ivy/facade/src/linker.rs` + NAPI `linkPartial`).
@@ -93,11 +93,11 @@ Harness moved into the facade crate:
 | --- | --- |
 | Total cases | 642 |
 | Compiled (runnable) | 185 |
-| **matchGolden PASS** | **170** |
-| matchGolden DIFF | 15 |
+| **matchGolden PASS** | **181** |
+| matchGolden DIFF | 4 |
 | Skipped (no runnable golden) | 457 |
 | compile-without-error (of 619-entry dump) | 594 |
-| **Pass-rate (runnable subset)** | **91.9%** |
+| **Pass-rate (runnable subset)** | **97.8%** |
 
 > ~435 of the skips are partial / `ngDeclare`-only fixtures (no full golden); the
 > **Angular Linker** work below brings that whole class into scope.
