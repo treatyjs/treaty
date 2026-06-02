@@ -386,6 +386,54 @@ function canonicalize(code) {
   // to `ctx` BEFORE the generic `$name$ -> ID` collapse so the golden's $ctx$ compares
   // EQUAL to our real literal `ctx`. STRICT: only the exact `$ctx$` token.
   s = s.replace(/\$ctx\$/g, 'ctx');
+  // GENERATED-TEMPORARY NAME FOLD (names only, never semantics). Two of Treaty's
+  // generated locals are spelled differently from the legacy-TDB golden even though the
+  // emitted Ivy is functionally identical; we fold the EQUIVALENT spellings to one canonical
+  // token on BOTH the golden and our emit so a correct emit matches regardless of the
+  // local-variable spelling. STRICT: each rule matches ONLY a generated-temporary name
+  // pattern (never a user identifier) and preserves the base name where one exists, so two
+  // genuinely-different identifiers can NEVER collapse to the same token — only the
+  // index/decoration that varies between the two compilers' naming schemes is erased. The
+  // load-bearing parts (instruction names, argument order, slot indices) are untouched.
+  //
+  // (A) Control-flow conditional temporary. Angular's `@switch`/`@if` lowering allocates a
+  // single scratch local for the conditional discriminant: the golden spells it
+  // `$<Component>_contFlowTmp$` or `$tmp_<level>_<index>$` (both renamable expect-emit
+  // placeholders that the generic `$name$ -> ID` collapse below already maps to `ID`), while
+  // Treaty emits the SAME temporary UNWRAPPED as `tmp_<level>_<index>` (e.g. `tmp_0_0`). Map
+  // our unwrapped form to the SAME `ID` token. STRICT: `tmp_<digits>_<digits>` is exclusively
+  // this generated scratch name (no user identifier has that shape); a self-consistent temp
+  // (assignment + every read share the name) still folds to a single `ID` on both sides, so a
+  // wrong discriminant read — which would carry a DIFFERENT token/expression — still diverges.
+  s = s.replace(/\btmp_\d+_\d+\b/g, 'ID');
+  // (B) Spread-value view-reference local (`@let x = [...]` / `{...}` array/object spread).
+  // Angular's golden spells these locals `<base>_r<N>` (the `_r<N>` view-reference suffix —
+  // `simple_r1`, `otherEntries_r2`, …; the `_r\d+ -> _R` rule below already canonicalises that
+  // suffix to `<base>_R`), while Treaty emits the SAME local as `$<base>_<N>$` (e.g.
+  // `$simple_1$`). Map our `$<base>_<N>$` spelling to the SAME `<base>_R` token — KEEPING THE
+  // BASE NAME — so `$simple_1$` compares equal to the golden's `simple_r1` while staying
+  // DISTINCT from `$otherEntries_2$`.
+  //
+  // We must NOT fold every `$<base>_<N>$` (that conflates Treaty's `@let`/storeLet &c. locals,
+  // which Angular's golden deliberately distinguishes — e.g. `$value_0$` readContextLet vs
+  // `$value_r0$` storeLet in the SAME golden). The spread value local is uniquely the LHS of a
+  // `const <local> = ɵɵpureFunction<N>(…)` shared-pure-literal assignment, so we restrict the
+  // fold to EXACTLY the base+index tokens that appear in that position, then rewrite every
+  // occurrence (declaration AND each read) of those tokens to `<base>_R`. STRICT: only a
+  // `ɵɵpureFunction`-assigned generated local is touched; the base name is preserved so two
+  // distinct spread locals keep distinct tokens (a swapped/mis-bound read still diverges), and
+  // non-spread `$<base>_<N>$` locals (storeLet/readContextLet/reference/getCurrentView/…) fall
+  // through to the coarser `$name$ -> ID` collapse below exactly as before.
+  {
+    const spreadLocals = new Set();
+    const declRe = /\$([A-Za-z_][A-Za-z0-9_]*?_\d+)\$\s*=\s*ɵɵpureFunction\d+\b/g;
+    let dm;
+    while ((dm = declRe.exec(s)) !== null) spreadLocals.add(dm[1]);
+    for (const tok of spreadLocals) {
+      const base = tok.replace(/_\d+$/, '');
+      s = s.split('$' + tok + '$').join(base + '_R');
+    }
+  }
   s = s.replace(/\$[A-Za-z_][A-Za-z0-9_]*\$/g, 'ID'); // $ctx_r1$, $_r2$, $i0$ already gone
   // Angular's `ConstantPool` shared-literal references are emitted with the REAL `_cN` name
   // (`constant_pool.ts` CONSTANT_PREFIX = "_c"), while the goldens spell the SAME reference with a
