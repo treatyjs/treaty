@@ -1378,6 +1378,7 @@ pub fn compile_component_source(ts_source: &str) -> CompiledComponent {
         None,
         false,
         ModernizeOptions::default(),
+        false,
     )
 }
 
@@ -1396,6 +1397,14 @@ pub struct CompileOptions {
     /// forms are lowered to their modern signal / block equivalents AT COMPILE TIME (the author's
     /// source is never rewritten). Threaded from the addon / bundler plugin.
     pub modernize: ModernizeOptions,
+    /// The `linkerJitMode` Angular compiler option. `false` (AOT/optimized) on every default compile
+    /// path, so the default NgModule emit is byte-identical to the classic full/local output (selector
+    /// scope routed through a tree-shakeable `ɵɵsetNgModuleScope` side effect). When `true` the NgModule
+    /// def is emitted in the JIT-linker shape: declarations/imports/exports are folded DIRECTLY into the
+    /// `ɵɵdefineNgModule({...})` call (matching what Angular's partial-declaration linker produces with
+    /// `supportJit=true`). Only the option-carrying entry point — and the compliance corpus dump, which
+    /// reads `angularCompilerOptions.linkerJitMode` per case — sets it.
+    pub jit_mode: bool,
 }
 
 /// Like [`compile_component_source`] but honouring per-file [`CompileOptions`]. With
@@ -1421,6 +1430,7 @@ pub fn compile_component_source_with_options(
         None,
         options.legacy_optional_chaining,
         options.modernize,
+        options.jit_mode,
     )
 }
 
@@ -1453,6 +1463,7 @@ pub fn compile_component_source_with_resolved(
         None,
         false,
         ModernizeOptions::default(),
+        false,
     )
 }
 
@@ -1539,6 +1550,7 @@ pub fn compile_component_source_with_map_and_selector(
         default_selector,
         false,
         ModernizeOptions::default(),
+        false,
     );
     CompiledComponentWithMap {
         code: compiled.code,
@@ -1574,6 +1586,58 @@ fn collect_imported_names(program: &Program) -> Vec<String> {
         }
     }
     names
+}
+
+/// Collect every top-level `function f(): ModuleWithProviders<T> {...}` as `f -> T`. A jit-mode
+/// NgModule whose `imports` references such a factory CALL (`provideModule()`) resolves the import to
+/// that ngModule type (`T`) on its inline def, matching Angular's partial compiler (the linker unwraps
+/// the `ModuleWithProviders` to its `ngModule` field). Both bare `function …` and `export function …`
+/// declarations are scanned; only functions whose annotated return type is exactly `ModuleWithProviders
+/// <T>` with a single type-reference argument `T` are recorded.
+fn collect_module_with_providers_returns(
+    program: &Program,
+) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    for stmt in &program.body {
+        let func = match stmt {
+            Statement::FunctionDeclaration(f) => Some(&**f),
+            Statement::ExportNamedDeclaration(e) => match &e.declaration {
+                Some(oxc_ast::ast::Declaration::FunctionDeclaration(f)) => Some(&**f),
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some(func) = func else { continue };
+        let Some(id) = &func.id else { continue };
+        let Some(ret) = &func.return_type else { continue };
+        if let Some(module_ty) = module_with_providers_type_arg(&ret.type_annotation) {
+            out.insert(id.name.to_string(), module_ty);
+        }
+    }
+    out
+}
+
+/// The `T` of a `ModuleWithProviders<T>` type annotation where `T` is a bare type reference (the
+/// ngModule type). Returns `None` for any other type shape.
+fn module_with_providers_type_arg(ty: &TSType) -> Option<String> {
+    let TSType::TSTypeReference(tref) = ty else {
+        return None;
+    };
+    let TSTypeName::IdentifierReference(name) = &tref.type_name else {
+        return None;
+    };
+    if name.name != "ModuleWithProviders" {
+        return None;
+    }
+    let args = tref.type_arguments.as_ref()?;
+    let first = args.params.first()?;
+    let TSType::TSTypeReference(arg_ref) = first else {
+        return None;
+    };
+    match &arg_ref.type_name {
+        TSTypeName::IdentifierReference(arg_name) => Some(arg_name.name.to_string()),
+        _ => None,
+    }
 }
 
 /// A top-level statement classified for source-order re-assembly.
@@ -1934,6 +1998,7 @@ fn compile_program_with_source(
     default_selector: Option<&str>,
     legacy_optional_chaining: bool,
     modernize: ModernizeOptions,
+    jit_mode: bool,
 ) -> CompiledComponent {
     let imported_names = collect_imported_names(program);
 
@@ -1987,6 +2052,12 @@ fn compile_program_with_source(
         })
         .collect();
 
+    // Map every top-level `function f(): ModuleWithProviders<T> {...}` to its `T`. A jit-mode NgModule
+    // whose `imports` references such a factory CALL (`provideModule()`) resolves the import to that
+    // ngModule type (`ForwardModule`) on the inline def, matching Angular's partial compiler. Empty when
+    // the file declares no such function; only `@NgModule` jit-mode compilation consults it.
+    let module_with_providers = collect_module_with_providers_returns(program);
+
     // Compile EVERY decorated class to a structured [`ClassEmit`]. The def block render3 produces is
     // unchanged; we only decompose it (def expression + pool/side-effect statements + factory) so the
     // ORIGINAL module can be re-assembled around the kept class declarations.
@@ -2007,6 +2078,8 @@ fn compile_program_with_source(
             legacy_optional_chaining,
             modernize,
             &class_decl_positions,
+            jit_mode,
+            &module_with_providers,
         ) {
             Ok(emit) => {
                 errors.extend(emit.errors.clone());
@@ -2237,8 +2310,15 @@ impl DecoratorCompiler for NgModuleCompiler {
     fn kind(&self) -> AngularDecoratorKind {
         AngularDecoratorKind::NgModule
     }
-    fn compile(&self, c: &ClassMeta, _ctx: &CompileCtx) -> Result<ClassEmit, String> {
-        compile_ng_module_class(c.class, c.object, &c.class_name)
+    fn compile(&self, c: &ClassMeta, ctx: &CompileCtx) -> Result<ClassEmit, String> {
+        compile_ng_module_class(
+            c.class,
+            c.object,
+            &c.class_name,
+            ctx.jit_mode,
+            ctx.class_decl_positions,
+            ctx.module_with_providers,
+        )
     }
 }
 
@@ -2504,6 +2584,8 @@ fn compile_decorated_class(
     legacy_optional_chaining: bool,
     modernize: ModernizeOptions,
     class_decl_positions: &std::collections::HashMap<String, u32>,
+    jit_mode: bool,
+    module_with_providers: &std::collections::HashMap<String, String>,
 ) -> Result<ClassEmit, String> {
     let (class_name, class_name_span) = match &class.id {
         Some(id) => (
@@ -2528,6 +2610,8 @@ fn compile_decorated_class(
         legacy_optional_chaining,
         modernize,
         class_decl_positions,
+        jit_mode,
+        module_with_providers,
     };
 
     // MULTI-DECORATOR dispatch: ngtsc compiles EVERY recognized trait on a class, not only the
@@ -2981,23 +3065,80 @@ fn compile_ng_module_class(
     class: &Class,
     obj: Option<&oxc_ast::ast::ObjectExpression>,
     class_name: &str,
+    jit_mode: bool,
+    class_decl_positions: &std::collections::HashMap<String, u32>,
+    module_with_providers: &std::collections::HashMap<String, String>,
 ) -> Result<ClassEmit, String> {
     use crate::pipe_module_injector::{
         compile_injector, compile_ng_module, R3InjectorMetadata, R3NgModuleCommon,
         R3NgModuleMetadata, R3NgModuleMetadataGlobal, R3SelectorScopeMode,
     };
 
-    // Each scope array (`declarations`/`imports`/`exports`/`bootstrap`) is a list of bare class
-    // identifiers; resolve each to its self-reference. Non-identifier entries are skipped.
-    let refs_of = |key: &str| -> Vec<DirRef> {
-        obj.and_then(|o| find_prop(o, key))
-            .map(identifier_refs)
-            .unwrap_or_default()
+    // Each scope array (`declarations`/`imports`/`exports`/`bootstrap`) is a list of class references.
+    // Resolve each to its self-reference, unwrapping a `forwardRef(() => X)` to the bare `X` (faithful
+    // to ngtsc's `forwardRefResolver` applied during decorator evaluation), AND tracking the resolved
+    // class names so we can decide `containsForwardDecls` by source position below. Non-class entries
+    // (e.g. a `ModuleWithProviders` factory call in `imports`) are resolved separately for jit mode.
+    let refs_of = |key: &str| -> (Vec<DirRef>, Vec<String>) {
+        let mut names: Vec<String> = Vec::new();
+        let refs = obj
+            .and_then(|o| find_prop(o, key))
+            .map(|e| resolve_scope_refs(e, &mut names))
+            .unwrap_or_default();
+        (refs, names)
     };
-    let declarations = refs_of("declarations");
-    let imports = refs_of("imports");
-    let exports = refs_of("exports");
-    let bootstrap = refs_of("bootstrap");
+    let (declarations, declaration_names) = refs_of("declarations");
+    let (mut imports, mut import_names) = refs_of("imports");
+    let (exports, export_names) = refs_of("exports");
+    let (bootstrap, bootstrap_names) = refs_of("bootstrap");
+
+    // JIT/linker mode (`linkerJitMode`) emits the NgModule def in the partial-declaration LINKER shape:
+    // the selector scope (declarations/imports/exports) is folded DIRECTLY into the `ɵɵdefineNgModule`
+    // call (`R3SelectorScopeMode::Inline`) instead of a tree-shakeable `ɵɵsetNgModuleScope` side effect.
+    // In AOT (the default) the scope stays a side effect, so the default emit is byte-unchanged.
+    let selector_scope_mode = if jit_mode {
+        R3SelectorScopeMode::Inline
+    } else {
+        R3SelectorScopeMode::SideEffect
+    };
+
+    // In jit/inline mode, an `imports` entry that is a `ModuleWithProviders` factory CALL
+    // (`provideModule()` whose declared return type is `ModuleWithProviders<ForwardModule>`) is
+    // resolved by Angular's partial compiler to the bare `ngModule` type (`ForwardModule`) on the
+    // module def's inline `imports`, while the INJECTOR keeps the verbatim call. The source front-end
+    // recovers this from the local function's `ModuleWithProviders<T>` return-type annotation. The AOT
+    // path never inlines `imports` onto the def (they only feed the injector), so this is jit-only.
+    if jit_mode {
+        if let Some(Expression::ArrayExpression(arr)) =
+            obj.and_then(|o| find_prop(o, "imports"))
+        {
+            let resolved = resolve_module_with_providers_imports(arr, module_with_providers);
+            if let Some((refs, names)) = resolved {
+                imports = refs;
+                import_names = names;
+            }
+        }
+    }
+
+    // `containsForwardDecls` — whether any RESOLVED scope reference points at a class declared LATER in
+    // the file than this module (Angular `isExpressionForwardReference`: `context.pos < node.pos`). When
+    // true, `refsToArray` wraps the affected def arrays in a `() => [...]` thunk so the runtime read is
+    // deferred past the forward declaration. Only meaningful for the inline (jit) def shape; the AOT
+    // side-effect scope is already deferred inside the guarded IIFE.
+    let module_pos = class.span().start;
+    let is_forward = |name: &str| -> bool {
+        class_decl_positions
+            .get(name)
+            .map(|&pos| module_pos < pos)
+            .unwrap_or(false)
+    };
+    let contains_forward_decls = jit_mode
+        && bootstrap_names
+            .iter()
+            .chain(declaration_names.iter())
+            .chain(import_names.iter())
+            .chain(export_names.iter())
+            .any(|n| is_forward(n));
 
     // `id: '<string>'` -> a string-literal expression on the module def. Its presence also drives
     // the trailing `ɵɵregisterNgModuleType(Type, id)` side effect emitted by `compile_ng_module`.
@@ -3022,7 +3163,7 @@ fn compile_ng_module_class(
     let meta = R3NgModuleMetadata::Global(R3NgModuleMetadataGlobal {
         common: R3NgModuleCommon {
             r#type: directive_ref(class_name),
-            selector_scope_mode: R3SelectorScopeMode::SideEffect,
+            selector_scope_mode,
             schemas: None,
             id,
         },
@@ -3032,7 +3173,7 @@ fn compile_ng_module_class(
         imports,
         include_import_types: true,
         exports,
-        contains_forward_decls: false,
+        contains_forward_decls,
     });
     let compiled = compile_ng_module(&meta);
 
@@ -3124,6 +3265,86 @@ fn collect_identifier_refs(expr: &Expression, out: &mut Vec<DirRef>) {
             Expression::ParenthesizedExpression(p) => collect_identifier_refs(&p.expression, out),
             _ => {}
         }
+    }
+}
+
+/// Resolve an NgModule scope array (`declarations`/`imports`/`exports`/`bootstrap`) into its class
+/// self-references, recording the RESOLVED class name of each entry in `names` (for `containsForward
+/// Decls` position analysis). Like [`collect_identifier_refs`] but ALSO unwraps a `forwardRef(() => X)`
+/// entry to the bare class `X` — faithful to ngtsc's `forwardRefResolver`, which the NgModule handler
+/// applies when evaluating these arrays (so `bootstrap: [forwardRef(() => MyBootstrap)]` resolves to
+/// `MyBootstrap`, exactly as the full/local goldens emit). Nested arrays are flattened; entries that
+/// resolve to no class name (e.g. a `ModuleWithProviders` factory call) are skipped here and handled
+/// by the jit-only `imports` resolver.
+fn resolve_scope_refs(expr: &Expression, names: &mut Vec<String>) -> Vec<DirRef> {
+    let mut out: Vec<DirRef> = Vec::new();
+    collect_scope_refs(expr, &mut out, names);
+    out
+}
+
+fn collect_scope_refs(expr: &Expression, out: &mut Vec<DirRef>, names: &mut Vec<String>) {
+    let Expression::ArrayExpression(arr) = expr else {
+        return;
+    };
+    for el in &arr.elements {
+        let Some(inner) = el.as_expression() else { continue };
+        match inner {
+            Expression::ArrayExpression(_) => collect_scope_refs(inner, out, names),
+            Expression::ParenthesizedExpression(p) => collect_scope_refs(&p.expression, out, names),
+            // Bare identifier or `forwardRef(() => X)` → the resolved class reference.
+            _ => {
+                if let Some((name, _was_forward)) = directive_name_maybe_forward(inner) {
+                    out.push(directive_ref(&name));
+                    names.push(name);
+                }
+            }
+        }
+    }
+}
+
+/// Resolve a jit-mode NgModule `imports: [...]` array where one or more entries are `ModuleWithProviders`
+/// factory CALLS (e.g. `provideModule()` declared as `function provideModule(): ModuleWithProviders<Forward
+/// Module> { ... }`). Angular's partial compiler lowers such an import to the bare `ngModule` TYPE on the
+/// module def's inline `imports` (`ForwardModule`), recovered here from the local function's `ModuleWith
+/// Providers<T>` return-type annotation (`mwp_returns`: function name → ngModule type). Returns
+/// `Some((refs, names))` ONLY when EVERY entry resolves (a bare class identifier, a `forwardRef(() => X)`,
+/// or a resolvable `ModuleWithProviders` factory call); otherwise `None`, so the caller keeps the plain
+/// identifier-only resolution (an unresolved factory call is simply omitted from the def's inline imports).
+fn resolve_module_with_providers_imports(
+    arr: &oxc_ast::ast::ArrayExpression,
+    mwp_returns: &std::collections::HashMap<String, String>,
+) -> Option<(Vec<DirRef>, Vec<String>)> {
+    let mut refs: Vec<DirRef> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
+    let mut saw_factory = false;
+    for el in &arr.elements {
+        let Some(inner) = el.as_expression() else { continue };
+        // A bare class / `forwardRef(() => X)` import resolves directly.
+        if let Some((name, _)) = directive_name_maybe_forward(inner) {
+            refs.push(directive_ref(&name));
+            names.push(name);
+            continue;
+        }
+        // A `provideModule()` factory call → its declared `ModuleWithProviders<T>` ngModule type.
+        if let Expression::CallExpression(call) = inner {
+            if let Expression::Identifier(callee) = &call.callee {
+                if let Some(module_ty) = mwp_returns.get(callee.name.as_str()) {
+                    refs.push(directive_ref(module_ty));
+                    names.push(module_ty.clone());
+                    saw_factory = true;
+                    continue;
+                }
+            }
+        }
+        // Any entry we cannot resolve to a class type → bail (keep identifier-only resolution).
+        return None;
+    }
+    // Only override when at least one `ModuleWithProviders` factory call was resolved; a pure
+    // identifier list is already handled by `resolve_scope_refs` and need not be recomputed.
+    if saw_factory {
+        Some((refs, names))
+    } else {
+        None
     }
 }
 
@@ -5294,6 +5515,7 @@ export class BCmp {}
             super::CompileOptions {
                 legacy_optional_chaining: false,
                 modernize,
+                jit_mode: false,
             },
         )
     }
@@ -5567,15 +5789,16 @@ mod corpus_dump {
     }
 
     /// Minimal extraction of `"inputFiles": ["x.ts"]` arrays from a TEST_CASES.json blob, returning
-    /// every referenced single input-file name PAIRED with the per-case `legacyOptionalChaining`
-    /// compiler option (`angularCompilerOptions.legacyOptionalChaining`). We avoid a JSON dependency:
-    /// the schema is fixed and we only need the input-file list plus that one flag per case.
+    /// every referenced single input-file name PAIRED with the per-case `legacyOptionalChaining` AND
+    /// `linkerJitMode` compiler options (`angularCompilerOptions.{legacyOptionalChaining,linkerJit
+    /// Mode}`). We avoid a JSON dependency: the schema is fixed and we only need the input-file list
+    /// plus those flags per case.
     ///
-    /// The flag is read from the SAME case object as the `inputFiles` array: a case spans from the
+    /// Each flag is read from the SAME case object as the `inputFiles` array: a case spans from the
     /// `"inputFiles"` key back to the enclosing `{` and forward to its matching `}`, so we scan the
     /// brace-balanced slice that contains the array (cases never nest, so the nearest enclosing
-    /// object is the case). `legacyOptionalChaining` is only ever set to `true` when present.
-    fn input_files_in(json: &str) -> Vec<(String, bool)> {
+    /// object is the case). Each flag is only ever set to `true` when present.
+    fn input_files_in(json: &str) -> Vec<(String, bool, bool)> {
         let bytes = json.as_bytes();
         let mut files = Vec::new();
         let needle = "\"inputFiles\"";
@@ -5591,17 +5814,19 @@ mod corpus_dump {
             let arr = &json[open + 1..close];
 
             // The enclosing case object: walk back to the nearest unmatched `{` and forward to its
-            // matching `}`, then test that brace-balanced slice for the legacy flag.
+            // matching `}`, then test that brace-balanced slice for each flag.
             let case_start = enclosing_object_start(bytes, key_pos);
             let case_end = matching_object_end(bytes, case_start);
             let case_slice = &json[case_start..case_end];
             let legacy = case_slice.contains("\"legacyOptionalChaining\": true")
                 || case_slice.contains("\"legacyOptionalChaining\":true");
+            let jit = case_slice.contains("\"linkerJitMode\": true")
+                || case_slice.contains("\"linkerJitMode\":true");
 
             for piece in arr.split(',') {
                 let t = piece.trim().trim_matches('"');
                 if !t.is_empty() {
-                    files.push((t.to_string(), legacy));
+                    files.push((t.to_string(), legacy, jit));
                 }
             }
             idx = close;
@@ -5691,7 +5916,7 @@ mod corpus_dump {
         for tc in &test_case_files {
             let Ok(content) = std::fs::read_to_string(tc) else { continue };
             let dir = tc.parent().unwrap();
-            for (input, legacy_optional_chaining) in input_files_in(&content) {
+            for (input, legacy_optional_chaining, jit_mode) in input_files_in(&content) {
                 let input_path = dir.join(&input);
                 let Ok(src) = std::fs::read_to_string(&input_path) else { continue };
                 let rel = input_path
@@ -5709,6 +5934,10 @@ mod corpus_dump {
                         // The compliance corpus is scored against the CLASSIC emit; the modernizer
                         // stays OFF here so the matchGolden score is unaffected.
                         modernize: super::ModernizeOptions::default(),
+                        // `linkerJitMode` per case (the jit-mode NgModule fixtures set it) selects the
+                        // JIT-linker NgModule def shape (inline declarations/imports/exports). Off by
+                        // default, so every other case's emit is byte-unchanged.
+                        jit_mode,
                     },
                 );
                 if !first {

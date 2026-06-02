@@ -338,18 +338,40 @@ pub fn compile_ng_module(meta: &R3NgModuleMetadata) -> R3CompiledExpression {
     }
 
     match common.selector_scope_mode {
-        // Scope emission. Both `Inline` and `SideEffect` route the selector scope
-        // (declarations/imports/exports) through the `ngJitMode`-guarded `ɵɵsetNgModuleScope` side
-        // effect rather than inlining it into the `ɵɵdefineNgModule({...})` call.
-        //
-        // Angular's `Inline` mode literally inlines the scope arrays (a JIT-only, tree-shaking-
-        // hostile form). It is never used for the **Global** (full/partial AOT) kind that the source
-        // front-end produces: the full/local goldens emit `ɵɵdefineNgModule({type[, bootstrap]
-        // [, id]})` with the scope in a separate guarded `ɵɵsetNgModuleScope` so unused declarations
-        // can be tree-shaken. The genuine JIT-inline facade has its own emitter
-        // (`compile_ng_module_declaration_expression`). Treating `Inline` and `SideEffect`
-        // identically here makes the AOT module def match Angular's full/local define-block shape.
-        R3SelectorScopeMode::Inline | R3SelectorScopeMode::SideEffect => {
+        // `Inline` — fold the selector scope (declarations/imports/exports) DIRECTLY into the
+        // `ɵɵdefineNgModule({...})` call (Angular `r3_module_compiler.ts` `compileNgModule`). This is
+        // the JIT-required, tree-shaking-hostile form the LINKER emits when `linkerJitMode` is set
+        // (`partial_ng_module_linker_1.ts` `toR3NgModuleMeta(meta, supportJit=true)`). Each array is
+        // emitted only when non-empty, in `declarations`/`imports`/`exports` order, AFTER `bootstrap`.
+        // The AOT source front-end never selects this mode by default (it uses `SideEffect`), so the
+        // default emit is unchanged; it is selected only for a `linkerJitMode` NgModule.
+        R3SelectorScopeMode::Inline => {
+            if let R3NgModuleMetadata::Global(g) = meta {
+                if !g.declarations.is_empty() {
+                    definition_map.set(
+                        "declarations",
+                        Some(refs_to_array(&g.declarations, g.contains_forward_decls)),
+                    );
+                }
+                if !g.imports.is_empty() {
+                    definition_map.set(
+                        "imports",
+                        Some(refs_to_array(&g.imports, g.contains_forward_decls)),
+                    );
+                }
+                if !g.exports.is_empty() {
+                    definition_map.set(
+                        "exports",
+                        Some(refs_to_array(&g.exports, g.contains_forward_decls)),
+                    );
+                }
+            }
+        }
+        // `SideEffect` — patch the scope onto the def via a `ngJitMode`-guarded `ɵɵsetNgModuleScope`
+        // IIFE so unused declarations/imports/exports stay tree-shakeable. This is the AOT full/local
+        // default the source front-end produces; the `ɵɵdefineNgModule({...})` call carries only
+        // `{type[, bootstrap][, id]}`.
+        R3SelectorScopeMode::SideEffect => {
             if let Some(call) = generate_set_ng_module_scope_call(meta) {
                 statements.push(call);
             }
@@ -887,15 +909,15 @@ mod tests {
             compiled.expression.kind,
             ExprKind::Invoke { pure: true, .. }
         ));
-        // Global modules route their selector scope to a guarded `ɵɵsetNgModuleScope` side effect
-        // (full/local AOT shape) under BOTH `Inline` and `SideEffect`, so a non-empty
-        // declarations/imports set produces exactly one IIFE side-effect statement.
-        assert_eq!(compiled.statements.len(), 1);
+        // `Inline` mode folds the selector scope DIRECTLY into `ɵɵdefineNgModule({...})` (Angular's
+        // JIT-linker shape), so there is NO `ɵɵsetNgModuleScope` side effect.
+        assert_eq!(compiled.statements.len(), 0);
 
         let entries = map_entries_of_call_arg(&compiled.expression);
         let keys: Vec<&str> = entries.iter().map(|(k, _)| k.as_str()).collect();
-        // The define block carries ONLY `type` (bootstrap empty -> omitted; scope is side-effected).
-        assert_eq!(keys, vec!["type"]);
+        // The define block carries `type` + the non-empty inline scope arrays (bootstrap empty ->
+        // omitted; exports empty -> omitted).
+        assert_eq!(keys, vec!["type", "declarations", "imports"]);
     }
 
     #[test]

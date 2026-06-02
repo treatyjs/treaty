@@ -14,11 +14,11 @@ This harness runs Treaty's Rust/OXC Angular compiler (`render3` crate, via the
 | --- | --- |
 | Total compliance cases | 642 |
 | Compiled (runnable) | 185 |
-| PASS | 181 |
-| DIFF | 4 |
+| PASS | 185 |
+| DIFF | 0 |
 | Skipped (un-runnable) | 457 |
-| **Pass-rate (of runnable subset)** | **97.8%** (181/185) |
-| Pass-rate (of full corpus) | 28.2% (181/642) |
+| **Pass-rate (of runnable subset)** | **100.0%** (185/185) |
+| Pass-rate (of full corpus) | 28.8% (185/642) |
 
 ### How a case is run and matched
 
@@ -43,17 +43,9 @@ from our output. Top entry = implement first to raise the score.
 
 | Count | Category (instruction / shape at first missing fragment) |
 | --- | --- |
-| 4 | `misc-shape` |
 
 ### Sample diverging cases
 
-- **`misc-shape`** (4):
-  - r3_compiler_compliance/ng_modules/should define an NgModule with declarations and bootstrap (jit mode)
-    - near: `ent],declarations:[FooComponent,Ba`
-  - r3_compiler_compliance/ng_modules/should define NgModules with imports and exports (jit mode)
-    - near: `({,declarations:[A1Component,A2C`
-  - r3_compiler_compliance/ng_modules/should handle NgModules with forward refs
-    - near: `({,imports:()=>[ForwardModule]})`
 
 ## Skip categories (cases not runnable through the source front-end)
 
@@ -70,7 +62,7 @@ error-expectation cases).
 
 ## Passing cases
 
-181 runnable compliance cases match Angular's golden `ɵɵdefineComponent` block:
+185 runnable compliance cases match Angular's golden `ɵɵdefineComponent` block:
 
 - model_inputs/should capture input/output pair in a component definition
 - model_inputs/should capture input/output pair in a directive definition
@@ -128,11 +120,15 @@ error-expectation cases).
 - r3_compiler_compliance/components_and_directives/value_composition/should support structural directives
 - r3_compiler_compliance/elements/should bind to class and style names
 - r3_compiler_compliance/ng_modules/should define NgModules with imports and exports
+- r3_compiler_compliance/ng_modules/should define NgModules with imports and exports (jit mode)
 - r3_compiler_compliance/ng_modules/should define a basic NgModule (full/local)
 - r3_compiler_compliance/ng_modules/should define a basic NgModule (linked)
 - r3_compiler_compliance/ng_modules/should define an NgModule and injector with providers
 - r3_compiler_compliance/ng_modules/should define an NgModule with declarations and bootstrap
+- r3_compiler_compliance/ng_modules/should define an NgModule with declarations and bootstrap (jit mode)
+- r3_compiler_compliance/ng_modules/should exercise all NgModule options in local and optimized mode
 - r3_compiler_compliance/ng_modules/should handle NgModules that extend other classes
+- r3_compiler_compliance/ng_modules/should handle NgModules with forward refs
 - r3_view_compiler/animations/should generate animate enter instructions on element with a binding
 - r3_view_compiler/animations/should generate animate enter instructions on element with a simple string
 - r3_view_compiler/animations/should generate animate enter instructions on element with a structural directive

@@ -130,6 +130,17 @@ pub struct CompileCtx<'a> {
     /// OPT-IN modernizer flags (see [`ModernizeOptions`]). [`ModernizeOptions::default`] (all-false)
     /// on every default compile path leaves the emit byte-identical to the classic output.
     pub modernize: ModernizeOptions,
+    /// The `linkerJitMode` Angular compiler option. `false` (AOT/optimized) on every default compile
+    /// path, so a default `@NgModule` emit is byte-identical to the classic full/local output (its
+    /// selector scope routed through a tree-shakeable `ɵɵsetNgModuleScope` side effect). When `true`
+    /// the NgModule def is emitted in the JIT-linker shape: declarations/imports/exports are folded
+    /// DIRECTLY into the `ɵɵdefineNgModule({...})` call. Only `@NgModule` compilation consults it.
+    pub jit_mode: bool,
+    /// Map from a same-file factory-function name to the `T` of its `ModuleWithProviders<T>` return-type
+    /// annotation (e.g. `provideModule` → `ForwardModule`). In jit/inline NgModule mode an `imports`
+    /// entry that is such a factory CALL is lowered to the bare `ngModule` type on the module def's
+    /// inline `imports`, matching Angular's partial compiler. Empty on every path that supplies none.
+    pub module_with_providers: &'a std::collections::HashMap<String, String>,
 }
 
 /// The Ivy emit of ONE decorated class, decomposed so the original module can be re-assembled
