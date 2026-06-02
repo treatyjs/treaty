@@ -897,10 +897,12 @@ pub fn compile_component_with(
         view_providers: None,
         relative_context_file_path: String::new(),
         i18n_use_external_ids: false,
-        // This authoring model has no `@Component` decorator to read a `changeDetection` from, so the
-        // implicit Ivy default (OnPush) is used; it matches the runtime default and so is not emitted
-        // into the definition, keeping the output minimal.
-        change_detection: Some(ChangeDetection::Strategy(ChangeDetectionStrategy::OnPush)),
+        // This authoring model has no `@Component` decorator to read a `changeDetection` from, so it
+        // defaults to `ChangeDetectionStrategy.Default` — which matches Angular's runtime default and
+        // is therefore OMITTED from the emitted definition (byte-matching the @angular/compiler
+        // oracle). OnPush is opt-in via the signal modernizer (`ModernizeOptions::on_push`), which
+        // this minimal selectorless entry point does not thread.
+        change_detection: Some(ChangeDetection::Strategy(ChangeDetectionStrategy::Default)),
         relative_template_path: None,
         has_directive_dependencies: false,
         raw_imports: None,

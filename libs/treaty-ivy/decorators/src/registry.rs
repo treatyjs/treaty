@@ -82,13 +82,19 @@ pub struct ModernizeOptions {
     /// `@if` / `@for` / `@switch` block control-flow form BEFORE the template is parsed to the
     /// r3 AST, reusing the proven block control-flow lowering.
     pub control_flow: bool,
+    /// Opt into `ChangeDetectionStrategy.OnPush` for compiled components (the signals-by-default
+    /// design). When OFF, a component whose source declares no `changeDetection` defaults to
+    /// `ChangeDetectionStrategy.Default` — OMITTED from the emit, byte-matching the Angular default.
+    /// An EXPLICIT `@Component({changeDetection: OnPush})` in source still emits OnPush regardless
+    /// of this flag; this flag only governs the IMPLICIT default for sources that declare none.
+    pub on_push: bool,
 }
 
 impl ModernizeOptions {
     /// Whether any modernizer flag is set (the fast-path guard that keeps the default compile free
     /// of every modernizer code path).
     pub fn any(&self) -> bool {
-        self.signal_inputs || self.signal_outputs || self.control_flow
+        self.signal_inputs || self.signal_outputs || self.control_flow || self.on_push
     }
 }
 

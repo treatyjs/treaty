@@ -856,6 +856,9 @@ pub fn compile_from_parts_with_directives(
         file_name,
         extra_directives,
         None,
+        // OnPush is opt-in (the signal modernizer); the default authoring path emits Angular's
+        // omitted `Default` strategy.
+        false,
     )
     .0
 }
@@ -891,6 +894,9 @@ pub fn compile_from_parts_with_directives_and_map(
         file_name,
         extra_directives,
         Some((source_name, source_content)),
+        // OnPush is opt-in (the signal modernizer); the default authoring path emits Angular's
+        // omitted `Default` strategy.
+        false,
     )
 }
 
@@ -910,6 +916,7 @@ fn compile_from_parts_inner(
     file_name: &str,
     extra_directives: &[String],
     source_map: Option<(&str, &str)>,
+    on_push: bool,
 ) -> (CompiledComponent, Option<String>) {
     let mut errors: Vec<String> = Vec::new();
 
@@ -1038,7 +1045,15 @@ fn compile_from_parts_inner(
         view_providers: None,
         relative_context_file_path: file_name.to_string(),
         i18n_use_external_ids: false,
-        change_detection: Some(ChangeDetection::Strategy(ChangeDetectionStrategy::OnPush)),
+        // Default to `ChangeDetectionStrategy.Default` — Angular's runtime default, which is OMITTED
+        // from the emitted definition (byte-matching the @angular/compiler oracle). The
+        // signals-by-default → OnPush design is now OPT-IN: OnPush is emitted only when the
+        // `on_push` modernizer flag is threaded in (see `ModernizeOptions::on_push`).
+        change_detection: Some(ChangeDetection::Strategy(if on_push {
+            ChangeDetectionStrategy::OnPush
+        } else {
+            ChangeDetectionStrategy::Default
+        })),
         relative_template_path: None,
         has_directive_dependencies,
         raw_imports: None,

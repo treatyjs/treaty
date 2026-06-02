@@ -1,6 +1,6 @@
 {
   "benchmark": "compiler-ivy-lowering",
-  "generatedAt": "2026-06-02T18:25:04.021Z",
+  "generatedAt": "2026-06-02T19:38:00.539Z",
   "corpus": {
     "source": "libs/treaty-ivy/facade/parity/parity.mjs#FIXTURES",
     "totalFixtures": 29
@@ -23,39 +23,11 @@
   },
   "correctness": {
     "file": "correctness.json",
-    "summary": "0/27 renderable fixtures STRICTLY byte/AST-equivalent under parity normalize(); 27/27 are equivalent except the Rust emitter writes a `changeDetection:0` field the v22 oracle now omits (single metadata field, instruction streams identical); 0 genuine lowering divergence(s); 2 not renderable by the oracle printer (i18n)",
-    "match": 0,
-    "diff": 27,
+    "summary": "27/27 renderable fixtures STRICTLY byte/AST-equivalent under parity normalize(); 27/27 are equivalent except the Rust emitter writes a `changeDetection:0` field the v22 oracle now omits (single metadata field, instruction streams identical); 0 genuine lowering divergence(s); 2 not renderable by the oracle printer (i18n)",
+    "match": 27,
+    "diff": 0,
     "oracleError": 2,
-    "diffFixtures": [
-      "static-element",
-      "interpolation",
-      "nested",
-      "attribute",
-      "multiple-bindings",
-      "property-binding",
-      "event-binding",
-      "two-interpolations",
-      "class-binding",
-      "style-binding",
-      "control-flow-if",
-      "control-flow-for",
-      "deep-nesting",
-      "sibling-elements",
-      "static-and-bound-mix",
-      "control-flow-if-elseif-else",
-      "control-flow-switch",
-      "nested-for-in-if",
-      "multiple-event-bindings",
-      "mixed-bindings-element",
-      "for-index-count",
-      "ng-template-ref",
-      "attr-binding",
-      "pipe-simple",
-      "pipe-with-args",
-      "pipe-chained",
-      "pipe-in-binding"
-    ]
+    "diffFixtures": []
   },
   "results": [
     {
@@ -65,9 +37,9 @@
       "components": 54000,
       "iterations": 2000,
       "warmup": 200,
-      "totalMs": 20004.108,
-      "msPerComponent": 0.370446,
-      "opsPerSec": 2699.4,
+      "totalMs": 19019.924,
+      "msPerComponent": 0.352221,
+      "opsPerSec": 2839.1,
       "skipped": [
         "i18n-static",
         "i18n-interp"
@@ -82,9 +54,9 @@
       "components": 54000,
       "iterations": 2000,
       "warmup": 200,
-      "totalMs": 16840.101,
-      "msPerComponent": 0.311854,
-      "opsPerSec": 3206.6,
+      "totalMs": 18810.489,
+      "msPerComponent": 0.348342,
+      "opsPerSec": 2870.7,
       "skipped": [
         "i18n-static",
         "i18n-interp"
@@ -99,9 +71,9 @@
       "components": 54000,
       "iterations": 2000,
       "warmup": 200,
-      "totalMs": 5895.618,
-      "msPerComponent": 0.109178,
-      "opsPerSec": 9159.3,
+      "totalMs": 7508.879,
+      "msPerComponent": 0.139053,
+      "opsPerSec": 7191.5,
       "skipped": [],
       "note": "27 shared fixtures timed (intersection both compilers can lower)"
     },

@@ -2695,7 +2695,8 @@ fn compile_component_or_directive(
     // changeDetection (OnPush vs Default). Angular's runtime default is `Default`, which is
     // OMITTED from the emitted definition; an explicit `OnPush` emits `changeDetection: 0`.
     // So when the source `@Component` has no `changeDetection` property we default to `Default`
-    // (omitted) — matching the golden — and only emit `OnPush` when explicitly requested.
+    // (omitted) — matching the golden — and only emit `OnPush` when the source EXPLICITLY declares
+    // it, OR the opt-in `modernize.on_push` flag (the signals-by-default design) is set.
     let change_detection = obj
         .and_then(|o| find_prop(o, "changeDetection"))
         .and_then(|e| match e {
@@ -2706,7 +2707,11 @@ fn compile_component_or_directive(
             "OnPush" => ChangeDetectionStrategy::OnPush,
             _ => ChangeDetectionStrategy::Default,
         })
-        .unwrap_or(ChangeDetectionStrategy::Default);
+        .unwrap_or(if modernize.on_push {
+            ChangeDetectionStrategy::OnPush
+        } else {
+            ChangeDetectionStrategy::Default
+        });
 
     // styles: ['...', ...] — inline component styles. Threaded into the definition `styles:[...]`
     // array (and, for emulated encapsulation, scoped) by the emitter. The HOST-RESOLVED `styleUrls`/
@@ -5473,6 +5478,54 @@ export class BCmp {}
             !on.code.contains("\u{0275}\u{0275}conditional"),
             "*ngIf-with-else must NOT be lowered to ɵɵconditional; got: {}",
             on.code
+        );
+    }
+
+    #[test]
+    fn change_detection_default_is_omitted() {
+        // DEFAULT (no `changeDetection` in source, modernizer OFF): the strategy is Angular's
+        // runtime `Default`, which is OMITTED from the emitted definition — byte-matching the
+        // @angular/compiler oracle. No `changeDetection:` key.
+        let src = r#"@Component({selector:"a",standalone:true,template:'<div>{{x}}</div>'}) export class C { x = 1; }"#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "errors: {:?}", out.errors);
+        assert!(
+            !out.code.contains("changeDetection"),
+            "Default strategy must be omitted; got: {}",
+            out.code
+        );
+    }
+
+    #[test]
+    fn modernizer_on_push_emits_change_detection_zero() {
+        // OPT-IN `on_push` modernizer (the signals-by-default → OnPush design, now opt-in): a
+        // source with NO `changeDetection` now emits `changeDetection: 0` (OnPush).
+        let src = r#"@Component({selector:"a",standalone:true,template:'<div>{{x}}</div>'}) export class C { x = 1; }"#;
+        let on = compile_modernized(src, ModernizeOptions { on_push: true, ..Default::default() });
+        assert!(on.errors.is_empty(), "errors: {:?}", on.errors);
+        assert!(
+            on.code.contains("changeDetection"),
+            "on_push flag must emit changeDetection; got: {}",
+            on.code
+        );
+        let flat = normalize_ws(&on.code);
+        assert!(
+            flat.contains("changeDetection: 0"),
+            "on_push must emit OnPush (changeDetection: 0); got: {flat}"
+        );
+    }
+
+    #[test]
+    fn explicit_on_push_emits_regardless_of_flag() {
+        // An EXPLICIT `@Component({changeDetection: ChangeDetectionStrategy.OnPush})` emits
+        // `changeDetection: 0` even with the modernizer OFF — the source's explicit choice wins.
+        let src = r#"@Component({selector:"a",standalone:true,changeDetection:ChangeDetectionStrategy.OnPush,template:'<div>{{x}}</div>'}) export class C { x = 1; }"#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "errors: {:?}", out.errors);
+        let flat = normalize_ws(&out.code);
+        assert!(
+            flat.contains("changeDetection: 0"),
+            "explicit OnPush must emit changeDetection: 0 even with modernizer OFF; got: {flat}"
         );
     }
 }
