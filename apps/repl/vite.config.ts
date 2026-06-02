@@ -1,8 +1,10 @@
 /// <reference types='vitest' />
+import { join } from 'node:path';
 import { defineConfig } from 'vite';
 
 import { treatySFC } from './src/tools/treaty-sfc/compiler'
 import { angular } from './src/tools/angular'
+import { treatyGallery } from './src/tools/gallery-plugin'
 
 
 export default defineConfig({
@@ -25,6 +27,7 @@ export default defineConfig({
 
 
   plugins: [
+    treatyGallery(join(__dirname, 'src/gallery/samples')),
     treatySFC(),
     angular(),
   ],
