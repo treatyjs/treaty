@@ -744,23 +744,30 @@ fn rewrite_setter_call(
     source: &str,
     edits: &mut Vec<Edit>,
 ) {
-    let span = call.span;
-    let (method, arg_text) = match call.arguments.first().and_then(|a| a.as_expression()) {
-        Some(arg) => {
-            let is_updater = matches!(
+    // `setX(v)` → `x.set(v)`, `setX(fn)` → `x.update(fn)`. A functional-updater argument picks `update`.
+    let method = match call.arguments.first().and_then(|a| a.as_expression()) {
+        Some(arg)
+            if matches!(
                 arg,
                 Expression::ArrowFunctionExpression(_) | Expression::FunctionExpression(_)
-            );
-            let arg_span = arg.span();
-            let text = source[arg_span.start as usize..arg_span.end as usize].trim().to_string();
-            (if is_updater { "update" } else { "set" }, text)
+            ) =>
+        {
+            "update"
         }
-        None => ("set", "undefined".to_string()),
+        _ => "set",
     };
+    // MINIMAL-SPAN edit: rename ONLY the callee identifier (`setX` → `x.set`/`x.update`), leaving the
+    // argument list and parens untouched. Replacing the WHOLE call span would OVERLAP any sub-edit
+    // another pass queues inside the argument — a `r.current` → `r()` ref read, or a body signal-read
+    // auto-call — which panics `apply_edits` (the bug class behind the useRef-in-updater repro). A
+    // callee rename is disjoint from those inner spans, so every rewrite composes; the argument's own
+    // contents are rewritten in place by the body passes.
+    let _ = source;
+    let callee_span = call.callee.span();
     edits.push(Edit {
-        start: span.start as usize,
-        end: span.end as usize,
-        text: format!("{signal_name}.{method}({arg_text})"),
+        start: callee_span.start as usize,
+        end: callee_span.end as usize,
+        text: format!("{signal_name}.{method}"),
     });
 }
 
@@ -1240,6 +1247,28 @@ mod tests {
         assert!(
             out.javascript.contains("count.update(prev => prev + 1)"),
             "functional updater not lowered to .update; got: {}",
+            out.javascript
+        );
+        let _ = out;
+    }
+
+    #[test]
+    fn setter_updater_reading_a_ref_composes_without_panic() {
+        // Regression (4th overlapping-edit case): a functional setter updater whose body reads a
+        // `useRef` `.current` must NOT panic — the setter rewrite is minimal-span (callee rename
+        // only), so the inner `.current` → `r()` ref read composes instead of overlapping the whole
+        // call span. `setN(prev => prev + r.current)` → `n.update(prev => prev + r())`.
+        let out = transform(
+            "const [n, setN] = useState(0);\nconst r = useRef(0);\nfunction bump() { setN(prev => prev + r.current); }",
+        );
+        assert!(
+            out.javascript.contains("n.update(prev => prev + r())"),
+            "setter updater with a ref read not lowered correctly; got: {}",
+            out.javascript
+        );
+        assert!(
+            !out.javascript.contains("r.current"),
+            "useRef `.current` read not auto-called; got: {}",
             out.javascript
         );
     }
