@@ -357,7 +357,17 @@ pub fn compile(source: &str, file_name: &str) -> CompiledAuthoring {
     let react_mode = react::detect_react_mode(&ret.program);
     let (javascript, mut react_signals, react_diagnostics) = if react_mode {
         let rt = react::transform(&javascript);
-        (rt.javascript, rt.signals, rt.diagnostics)
+        // BODY AUTO-CALL (react mode only): a `useState`/`useMemo`/`useRef` signal or a props-as-
+        // `input()` name read INSIDE the body (`count * 2`, `console.log(count)`, `prev + step`) is a
+        // read of a signal *function* — it must be called to read the value, or a `computed` returns
+        // `NaN` and an `effect` never re-runs. Run after the hook rewrites, over the union of the
+        // React-discovered signals and the lowered prop names. This is SCOPED to react mode so the
+        // plain `.tsx`/`.treaty` signals path (which auto-calls templates only, and which the
+        // matchGolden corpus depends on) is left untouched.
+        let mut body_call_signals = rt.signals.clone();
+        body_call_signals.extend(prop_signals.iter().cloned());
+        let javascript = react::auto_call_body(&rt.javascript, &body_call_signals);
+        (javascript, rt.signals, rt.diagnostics)
     } else {
         (javascript, std::collections::HashSet::new(), Vec::new())
     };
@@ -2270,6 +2280,71 @@ export default function Counter({ start, step = 1 }) {\n\
         // The template reads auto-call the signals (count + computed memo).
         assert!(code.contains("ctx.count()"), "count read not auto-called; got: {code}");
         assert!(code.contains("ctx.doubled()"), "doubled read not auto-called; got: {code}");
+    }
+
+    // --- adversarial regression repros (full pipeline → parseable Ivy) --------
+
+    #[test]
+    fn repro1_use_ref_in_use_memo_compiles_to_parseable_ivy() {
+        // BUG 1 end-to-end: `useRef` inside `useMemo` used to panic `apply_edits` (overlapping edits).
+        // It must now compile to a single parseable `ɵɵdefineComponent`.
+        let source = "import { useRef, useMemo } from 'react';\n\
+export default function W() {\n\
+  const r = useRef(0);\n\
+  const m = useMemo(() => r.current + 1, []);\n\
+  return <div>{m}</div>;\n\
+}\n";
+        let out = compile(source, "w.tsx");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+        assert_well_formed_module(code); // exactly one `export default`, re-parses as a valid ES module
+        assert!(code.contains(DEFINE), "no defineComponent; got: {code}");
+        // The `.current` read composed with the `useMemo`→`computed` rewrite (no overlap panic).
+        assert!(code.contains("computed(() => r() + 1)"), "useRef-in-useMemo not composed; got: {code}");
+        assert!(!code.contains("useMemo") && !code.contains("useRef"), "hook leaked; got: {code}");
+    }
+
+    #[test]
+    fn repro2_use_callback_setter_compiles_to_parseable_ivy_with_setter_rewritten() {
+        // BUG 2 end-to-end: the useCallback unwrap emitted a stray trailing `)` (unparseable) and did
+        // not rewrite the inner setter. It must now compile to a single parseable `ɵɵdefineComponent`
+        // with `setVal(...)` rewritten to `val.set(...)`.
+        let source = "import { useState, useCallback } from 'react';\n\
+export default function Field() {\n\
+  const [val, setVal] = useState('');\n\
+  const onInput = useCallback((e) => setVal(e.target.value), []);\n\
+  return <input value={val} onInput={onInput} />;\n\
+}\n";
+        let out = compile(source, "field.tsx");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+        assert_well_formed_module(code);
+        assert!(code.contains(DEFINE), "no defineComponent; got: {code}");
+        // The inner setter was rewritten and the unwrap left no stray paren.
+        assert!(code.contains("val.set(e.target.value)"), "inner setter not rewritten; got: {code}");
+        assert!(!code.contains("value));"), "stray trailing paren leaked; got: {code}");
+        assert!(!code.contains("useCallback"), "useCallback leaked; got: {code}");
+    }
+
+    #[test]
+    fn repro3_body_signal_reads_auto_called_in_computed_and_effect() {
+        // BUG 3 end-to-end: a useState signal read inside a `useMemo`/`useEffect` body must be
+        // auto-called so the computed is not `NaN` and the effect actually tracks/re-runs.
+        let source = "import { useState, useMemo, useEffect } from 'react';\n\
+export default function Doubler() {\n\
+  const [count, setCount] = useState(0);\n\
+  const doubled = useMemo(() => count * 2, [count]);\n\
+  useEffect(() => console.log(count), [count]);\n\
+  return <div>{doubled}</div>;\n\
+}\n";
+        let out = compile(source, "doubler.tsx");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+        assert_well_formed_module(code);
+        assert!(code.contains(DEFINE), "no defineComponent; got: {code}");
+        // The signal read is auto-called INSIDE both the emitted computed and effect bodies.
+        assert!(code.contains("computed(() => count() * 2)"), "computed body read not called; got: {code}");
+        assert!(code.contains("effect(() => console.log(count()))"), "effect body read not called; got: {code}");
     }
 
     #[test]

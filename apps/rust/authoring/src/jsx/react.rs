@@ -240,6 +240,42 @@ pub fn transform(javascript: &str) -> ReactTransform {
     }
 }
 
+/// Auto-call signal-typed name READS inside the React component **body** code.
+///
+/// In React-compat mode a `useState` var, a `useMemo` computed, a `useRef` signal, and a props-as-
+/// `input()` name are all Angular signals — i.e. *functions*. A body expression that reads one of
+/// them by bare name (`count * 2`, `console.log(count)`, `prev + step`) would otherwise operate on
+/// the signal function itself (`count * 2` → `NaN`; an `effect` that reads `count` never re-runs
+/// because it logs the function and tracks nothing). This rewrites each such read `count` → `count()`
+/// so the body reads the VALUE and the surrounding `computed`/`effect`/callback/handler tracks it.
+///
+/// This is the body-code counterpart to [`super::signals::auto_call_template`] (which only auto-calls
+/// template interpolations) and MUST run only in React mode — the plain `.tsx`/`.treaty` signals path
+/// deliberately does NOT auto-call body reads, and the matchGolden corpus depends on that behaviour.
+///
+/// It is AST-aware (not a textual tokenizer like the template pass) because a component body is full
+/// JS: it must never call a property key (`obj.count`), the LHS of a declaration, an already-called
+/// `count()`, or the signal-mutation receiver in `count.set(…)` / `count.update(…)`. A read that is
+/// the OBJECT of a plain member access IS called (`user.name` → `user().name`), mirroring the
+/// template rule. Parse failures are non-fatal (the input is returned unchanged).
+pub fn auto_call_body(javascript: &str, signals: &HashSet<String>) -> String {
+    if signals.is_empty() || javascript.trim().is_empty() {
+        return javascript.to_string();
+    }
+    let allocator = Allocator::default();
+    let source_type = SourceType::default().with_typescript(true);
+    let ret = JsParser::new(&allocator, javascript, source_type).parse();
+    if !ret.errors.is_empty() {
+        return javascript.to_string();
+    }
+
+    let mut edits: Vec<Edit> = Vec::new();
+    for stmt in &ret.program.body {
+        autocall_statement(stmt, signals, &mut edits);
+    }
+    apply_edits(javascript, edits)
+}
+
 // ---------------------------------------------------------------------------
 // Pass 1: declaration / statement lowering.
 // ---------------------------------------------------------------------------
@@ -388,19 +424,28 @@ fn lower_declarator(
             setters.push((setter_name, state_name));
         }
         // `const m = useMemo(fn, deps?)` → `const m = computed(fn)`.
+        //
+        // MINIMAL-SPAN: rename the callee `useMemo` → `computed` and delete the trailing `, deps`
+        // argument, leaving the `fn` body's bytes untouched so pass 2's setter/`.current`/body
+        // auto-call rewrites INSIDE the body compose without overlapping this edit (the
+        // overlapping-whole-init edit was the `apply_edits` panic — see the module note on edit
+        // composition).
         "useMemo" => {
             if let Some(name) = binding_ident_name(&declarator.id) {
-                if let Some(fn_text) = first_arg_text(call, source) {
-                    replace_init(init, &format!("computed({fn_text})"), edits);
+                if rename_callee_and_drop_deps(call, "computed", edits) {
                     signals.insert(name);
                 }
             }
         }
         // `const c = useCallback(fn, deps?)` → `const c = fn` (behaviour, not state).
+        //
+        // MINIMAL-SPAN: delete only the `useCallback(` prefix and the trailing `, deps)` suffix,
+        // leaving the function expression itself byte-for-byte (so a `setX(...)` / body read inside
+        // it is still rewritten by pass 2 without an overlapping edit). The function's own
+        // surrounding parens (e.g. `(e) => …`) are part of its span and are preserved — no paren is
+        // stripped or left dangling.
         "useCallback" => {
-            if let Some(fn_text) = first_arg_text(call, source) {
-                replace_init(init, fn_text, edits);
-            }
+            unwrap_callback(call, edits);
         }
         // `const r = useRef(v)` → `const r = signal(v)`; `.current` reads are rewritten to calls.
         "useRef" => {
@@ -433,22 +478,18 @@ fn lower_declarator(
 
 /// If `expr` is a `useEffect(fn, deps?)` call, rewrite it to `effect(fn)` (the deps array is dropped:
 /// Angular's `effect` auto-tracks the signals its `fn` reads).
-fn lower_effect_call(expr: &Expression, source: &str, edits: &mut Vec<Edit>) {
+///
+/// MINIMAL-SPAN (see [`rename_callee_and_drop_deps`]): rename the callee `useEffect` → `effect` and
+/// delete the trailing `, deps` argument, leaving the `fn` body's bytes untouched so pass 2's
+/// rewrites inside the body compose without overlap.
+fn lower_effect_call(expr: &Expression, _source: &str, edits: &mut Vec<Edit>) {
     let Some((hook, call)) = hook_call(expr) else {
         return;
     };
     if hook != "useEffect" {
         return;
     }
-    let Some(fn_text) = first_arg_text(call, source) else {
-        return;
-    };
-    let span = expr.span();
-    edits.push(Edit {
-        start: span.start as usize,
-        end: span.end as usize,
-        text: format!("effect({fn_text})"),
-    });
+    rename_callee_and_drop_deps(call, "effect", edits);
 }
 
 // ---------------------------------------------------------------------------
@@ -724,6 +765,277 @@ fn rewrite_setter_call(
 }
 
 // ---------------------------------------------------------------------------
+// Body auto-call (react mode): rewrite signal reads `count` → `count()`.
+// ---------------------------------------------------------------------------
+
+/// Walk a statement collecting body auto-call edits for signal reads.
+fn autocall_statement(stmt: &Statement, signals: &HashSet<String>, edits: &mut Vec<Edit>) {
+    match stmt {
+        Statement::ExpressionStatement(s) => autocall_expression(&s.expression, signals, edits),
+        Statement::VariableDeclaration(decl) => {
+            // Only the INIT expression is a read site — the declared name (the `id` pattern) is a
+            // binding, never auto-called. So a `const count = signal(0)` LHS is left alone, while a
+            // `const doubled = computed(() => count * 2)` init has its inner `count` read called.
+            for d in &decl.declarations {
+                if let Some(init) = &d.init {
+                    autocall_expression(init, signals, edits);
+                }
+            }
+        }
+        Statement::ReturnStatement(s) => {
+            if let Some(arg) = &s.argument {
+                autocall_expression(arg, signals, edits);
+            }
+        }
+        Statement::BlockStatement(b) => {
+            for s in &b.body {
+                autocall_statement(s, signals, edits);
+            }
+        }
+        Statement::IfStatement(s) => {
+            autocall_expression(&s.test, signals, edits);
+            autocall_statement(&s.consequent, signals, edits);
+            if let Some(alt) = &s.alternate {
+                autocall_statement(alt, signals, edits);
+            }
+        }
+        Statement::ForStatement(s) => {
+            if let Some(test) = &s.test {
+                autocall_expression(test, signals, edits);
+            }
+            if let Some(update) = &s.update {
+                autocall_expression(update, signals, edits);
+            }
+            autocall_statement(&s.body, signals, edits);
+        }
+        Statement::ForOfStatement(s) => {
+            autocall_expression(&s.right, signals, edits);
+            autocall_statement(&s.body, signals, edits);
+        }
+        Statement::ForInStatement(s) => {
+            autocall_expression(&s.right, signals, edits);
+            autocall_statement(&s.body, signals, edits);
+        }
+        Statement::WhileStatement(s) => {
+            autocall_expression(&s.test, signals, edits);
+            autocall_statement(&s.body, signals, edits);
+        }
+        Statement::DoWhileStatement(s) => {
+            autocall_statement(&s.body, signals, edits);
+            autocall_expression(&s.test, signals, edits);
+        }
+        Statement::SwitchStatement(s) => {
+            autocall_expression(&s.discriminant, signals, edits);
+            for case in &s.cases {
+                if let Some(test) = &case.test {
+                    autocall_expression(test, signals, edits);
+                }
+                for s in &case.consequent {
+                    autocall_statement(s, signals, edits);
+                }
+            }
+        }
+        Statement::ThrowStatement(s) => autocall_expression(&s.argument, signals, edits),
+        Statement::TryStatement(s) => {
+            for s in &s.block.body {
+                autocall_statement(s, signals, edits);
+            }
+            if let Some(handler) = &s.handler {
+                for s in &handler.body.body {
+                    autocall_statement(s, signals, edits);
+                }
+            }
+            if let Some(finalizer) = &s.finalizer {
+                for s in &finalizer.body {
+                    autocall_statement(s, signals, edits);
+                }
+            }
+        }
+        Statement::LabeledStatement(s) => autocall_statement(&s.body, signals, edits),
+        Statement::FunctionDeclaration(func) => {
+            if let Some(body) = &func.body {
+                for s in &body.statements {
+                    autocall_statement(s, signals, edits);
+                }
+            }
+        }
+        Statement::ExportDefaultDeclaration(export) => match &export.declaration {
+            ExportDefaultDeclarationKind::FunctionDeclaration(func) => {
+                if let Some(body) = &func.body {
+                    for s in &body.statements {
+                        autocall_statement(s, signals, edits);
+                    }
+                }
+            }
+            ExportDefaultDeclarationKind::ArrowFunctionExpression(arrow) => {
+                for s in &arrow.body.statements {
+                    autocall_statement(s, signals, edits);
+                }
+            }
+            _ => {}
+        },
+        Statement::ExportNamedDeclaration(export) => {
+            if let Some(decl) = &export.declaration {
+                match decl {
+                    Declaration::FunctionDeclaration(func) => {
+                        if let Some(body) = &func.body {
+                            for s in &body.statements {
+                                autocall_statement(s, signals, edits);
+                            }
+                        }
+                    }
+                    Declaration::VariableDeclaration(var) => {
+                        for d in &var.declarations {
+                            if let Some(init) = &d.init {
+                                autocall_expression(init, signals, edits);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Walk an expression collecting body auto-call edits. The single READ site that gets a `()` appended
+/// is a bare [`Expression::Identifier`] naming a signal that is NOT in an excluded position; every
+/// other arm just recurses into the sub-expressions that can hold reads. The excluded positions are
+/// handled by NOT routing the identifier through [`autocall_read`]:
+///   * a CALL callee — `count(...)` is already a call (handled in the `CallExpression` arm);
+///   * a member PROPERTY — `obj.count` keys are never visited (only the member `object` is);
+///   * a `.set` / `.update` mutation RECEIVER — `count.set(…)` must stay (handled in the member arm);
+///   * a declaration LHS — the `id` pattern is never visited (see [`autocall_statement`]).
+fn autocall_expression(expr: &Expression, signals: &HashSet<String>, edits: &mut Vec<Edit>) {
+    match expr {
+        // A bare identifier read: this is the one place a `()` is appended.
+        Expression::Identifier(_) => autocall_read(expr, signals, edits),
+        Expression::CallExpression(call) => {
+            // The callee is NOT a read-to-call site: a bare `count(...)` is already calling. Recurse
+            // into the callee only when it is a member/other expression (so `a.b().c` inner reads are
+            // still covered), but never append `()` to a bare-identifier callee.
+            if !matches!(&call.callee, Expression::Identifier(_)) {
+                autocall_expression(&call.callee, signals, edits);
+            }
+            for arg in &call.arguments {
+                if let Argument::SpreadElement(s) = arg {
+                    autocall_expression(&s.argument, signals, edits);
+                } else if let Some(e) = arg.as_expression() {
+                    autocall_expression(e, signals, edits);
+                }
+            }
+        }
+        Expression::StaticMemberExpression(member) => {
+            // `signal.set(…)` / `signal.update(…)` is the mutation API — the receiver must NOT be
+            // called (it is not a value read). Any other property access on a signal reads its value
+            // and IS called: `user.name` → `user().name`. Non-signal objects recurse normally so a
+            // deeper read is still found.
+            let prop = member.property.name.as_str();
+            let is_mutation = prop == "set" || prop == "update";
+            if is_mutation {
+                if let Expression::Identifier(id) = &member.object {
+                    if signals.contains(id.name.as_str()) {
+                        // Leave `count.set(...)` / `count.update(...)` receiver untouched.
+                        return;
+                    }
+                }
+            }
+            autocall_expression(&member.object, signals, edits);
+        }
+        Expression::ComputedMemberExpression(member) => {
+            autocall_expression(&member.object, signals, edits);
+            autocall_expression(&member.expression, signals, edits);
+        }
+        Expression::ParenthesizedExpression(p) => {
+            autocall_expression(&p.expression, signals, edits)
+        }
+        Expression::SequenceExpression(seq) => {
+            for e in &seq.expressions {
+                autocall_expression(e, signals, edits);
+            }
+        }
+        Expression::AssignmentExpression(assign) => {
+            // The LHS target is a write; only the RHS is a read site here.
+            autocall_expression(&assign.right, signals, edits)
+        }
+        Expression::ConditionalExpression(cond) => {
+            autocall_expression(&cond.test, signals, edits);
+            autocall_expression(&cond.consequent, signals, edits);
+            autocall_expression(&cond.alternate, signals, edits);
+        }
+        Expression::LogicalExpression(logical) => {
+            autocall_expression(&logical.left, signals, edits);
+            autocall_expression(&logical.right, signals, edits);
+        }
+        Expression::BinaryExpression(bin) => {
+            autocall_expression(&bin.left, signals, edits);
+            autocall_expression(&bin.right, signals, edits);
+        }
+        Expression::UnaryExpression(u) => autocall_expression(&u.argument, signals, edits),
+        Expression::AwaitExpression(a) => autocall_expression(&a.argument, signals, edits),
+        Expression::ArrowFunctionExpression(arrow) => {
+            for s in &arrow.body.statements {
+                autocall_statement(s, signals, edits);
+            }
+        }
+        Expression::FunctionExpression(func) => {
+            if let Some(body) = &func.body {
+                for s in &body.statements {
+                    autocall_statement(s, signals, edits);
+                }
+            }
+        }
+        Expression::ObjectExpression(obj) => {
+            for prop in &obj.properties {
+                if let oxc_ast::ast::ObjectPropertyKind::ObjectProperty(p) = prop {
+                    // The property VALUE is a read; the key is not. A computed key `[count]` is a read.
+                    autocall_expression(&p.value, signals, edits);
+                    if p.computed {
+                        if let Some(k) = p.key.as_expression() {
+                            autocall_expression(k, signals, edits);
+                        }
+                    }
+                }
+            }
+        }
+        Expression::ArrayExpression(arr) => {
+            for el in &arr.elements {
+                if let Some(e) = el.as_expression() {
+                    autocall_expression(e, signals, edits);
+                }
+            }
+        }
+        Expression::TemplateLiteral(t) => {
+            for e in &t.expressions {
+                autocall_expression(e, signals, edits);
+            }
+        }
+        Expression::TSAsExpression(e) => autocall_expression(&e.expression, signals, edits),
+        Expression::TSNonNullExpression(e) => autocall_expression(&e.expression, signals, edits),
+        Expression::TSSatisfiesExpression(e) => autocall_expression(&e.expression, signals, edits),
+        _ => {}
+    }
+}
+
+/// Append `()` to a bare identifier read when it names a signal. The identifier must be in a READ
+/// position (the caller guarantees it is not a callee / property key / mutation receiver / LHS).
+fn autocall_read(expr: &Expression, signals: &HashSet<String>, edits: &mut Vec<Edit>) {
+    let Expression::Identifier(id) = expr else {
+        return;
+    };
+    if !signals.contains(id.name.as_str()) {
+        return;
+    }
+    let end = id.span.end as usize;
+    edits.push(Edit {
+        start: end,
+        end,
+        text: "()".to_string(),
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Small helpers.
 // ---------------------------------------------------------------------------
 
@@ -769,6 +1081,84 @@ fn replace_init(init: &Expression, text: &str, edits: &mut Vec<Edit>) {
         end: span.end as usize,
         text: text.to_string(),
     });
+}
+
+/// Rewrite a hook call `hookName(fn, deps?)` to `newName(fn)` with MINIMAL-SPAN edits:
+///   1. replace just the **callee identifier** span with `new_name` (`useMemo` → `computed`,
+///      `useEffect` → `effect`), and
+///   2. delete the **trailing `, deps` argument(s)** — the byte range from the end of the first
+///      argument to just before the call's closing `)`.
+///
+/// The first argument (the hook's function body) is left byte-for-byte, so a `setX(...)` /
+/// `ref.current` / body-read auto-call edit that pass 2 queues *inside* that body never overlaps
+/// these edits — the two passes compose. (The previous whole-init replacement produced an edit that
+/// fully contained pass 2's inner edits, which `apply_edits` then applied with a stale end offset →
+/// the `range end index out of range` panic.)
+///
+/// Returns `true` when the rewrite was applied (the call had a first argument), so the caller can
+/// record the binding as a signal only on success.
+fn rename_callee_and_drop_deps(
+    call: &oxc_ast::ast::CallExpression,
+    new_name: &str,
+    edits: &mut Vec<Edit>,
+) -> bool {
+    let Some(first) = call.arguments.first().and_then(|a| a.as_expression()) else {
+        return false;
+    };
+
+    // 1. Rename the callee identifier in place.
+    let callee_span = call.callee.span();
+    edits.push(Edit {
+        start: callee_span.start as usize,
+        end: callee_span.end as usize,
+        text: new_name.to_string(),
+    });
+
+    // 2. Delete the trailing `, deps` (everything after the first argument up to the closing `)`).
+    //    `call.span.end` is one past the closing `)`, so the deps span is `[first.end, end - 1)`.
+    let first_end = first.span().end as usize;
+    let call_end = call.span.end as usize;
+    let drop_end = call_end.saturating_sub(1); // before the `)`
+    if drop_end > first_end {
+        edits.push(Edit {
+            start: first_end,
+            end: drop_end,
+            text: String::new(),
+        });
+    }
+    true
+}
+
+/// Unwrap `useCallback(fn, deps?)` to just `fn` with MINIMAL-SPAN edits: delete the `useCallback(`
+/// prefix (the callee through the call's opening `(`) and the trailing `, deps)` suffix (everything
+/// after the first argument through the closing `)`). The function expression's own bytes — including
+/// any parentheses that are part of its span (e.g. arrow params `(e) => …`) — are left untouched, so
+/// no paren is stripped or left dangling and pass 2's inner rewrites compose without overlap.
+fn unwrap_callback(call: &oxc_ast::ast::CallExpression, edits: &mut Vec<Edit>) {
+    let Some(first) = call.arguments.first().and_then(|a| a.as_expression()) else {
+        return;
+    };
+    let call_start = call.span.start as usize;
+    let call_end = call.span.end as usize;
+    let first_start = first.span().start as usize;
+    let first_end = first.span().end as usize;
+
+    // Delete the `useCallback(` prefix: from the start of the call to the start of the first argument.
+    if first_start > call_start {
+        edits.push(Edit {
+            start: call_start,
+            end: first_start,
+            text: String::new(),
+        });
+    }
+    // Delete the trailing `, deps)` suffix: from the end of the first argument to the end of the call.
+    if call_end > first_end {
+        edits.push(Edit {
+            start: first_end,
+            end: call_end,
+            text: String::new(),
+        });
+    }
 }
 
 /// Apply byte-range `edits` to `source`, right-to-left so earlier edits never shift later spans.
@@ -988,5 +1378,103 @@ mod tests {
         assert!(out.javascript.contains("a.set(2)"));
         assert!(out.javascript.contains("b.set('y')"));
         assert!(out.signals.contains("a") && out.signals.contains("b"));
+    }
+
+    // --- adversarial regression repros ---------------------------------------
+
+    /// Parse `js` as a TS body and assert it has no syntax errors (the lowered body must be valid JS,
+    /// not a corrupt fragment with a stray paren / out-of-range edit).
+    fn assert_parses(js: &str) {
+        let allocator = Allocator::default();
+        let ret = JsParser::new(&allocator, js, SourceType::default().with_typescript(true)).parse();
+        assert!(ret.errors.is_empty(), "lowered body did not parse: {:?}\n--- js ---\n{js}", ret.errors);
+    }
+
+    #[test]
+    fn repro1_use_ref_in_use_memo_does_not_panic_and_composes() {
+        // BUG 1: pass 1 replaced the WHOLE useMemo init span while pass 2 queued an OVERLAPPING edit
+        // rewriting `r.current` INSIDE it → `apply_edits` panicked `range end index out of range`.
+        // Minimal-span hook edits now compose: callee `useMemo`→`computed`, deps dropped, and the
+        // `r.current`→`r()` read rewritten inside the untouched body.
+        let out = transform("const r = useRef(0);\nconst m = useMemo(() => r.current + 1, []);");
+        assert_eq!(
+            out.javascript,
+            "const r = signal(0);\nconst m = computed(() => r() + 1);",
+            "useRef-in-useMemo did not compose; got: {}",
+            out.javascript
+        );
+        assert_parses(&out.javascript);
+        // No leaked hook callees, and the deps array was dropped.
+        assert!(!out.javascript.contains("useMemo") && !out.javascript.contains(", [])"));
+    }
+
+    #[test]
+    fn repro2_use_callback_setter_unwraps_cleanly_and_rewrites_setter() {
+        // BUG 2: useCallback unwrap replaced the whole init AND pass 2's inner `setVal(...)` overlapped
+        // → emitted `const onInput = (e) => setVal(e.target.value));` (stray trailing `)`, and the
+        // inner setter never rewritten). Minimal-span unwrap (delete `useCallback(` prefix + `, deps)`
+        // suffix) leaves the function body for pass 2, which rewrites the setter.
+        let out = transform(
+            "const [val, setVal] = useState('');\nconst onInput = useCallback((e) => setVal(e.target.value), []);",
+        );
+        assert_eq!(
+            out.javascript,
+            "const val = signal('');\nconst onInput = (e) => val.set(e.target.value);",
+            "useCallback+setter not lowered cleanly; got: {}",
+            out.javascript
+        );
+        assert_parses(&out.javascript);
+        // No stray trailing paren, no leaked callee, the inner setter became `.set`.
+        assert!(!out.javascript.contains("useCallback"));
+        assert!(!out.javascript.contains("value));"), "stray trailing paren; got: {}", out.javascript);
+        assert!(out.javascript.contains("val.set(e.target.value)"));
+    }
+
+    #[test]
+    fn repro3_body_reads_of_signals_are_auto_called() {
+        // BUG 3: a useState/useMemo signal read INSIDE a hook body is a read of a signal *function* —
+        // `count * 2` was `NaN`, `console.log(count)` logged the function and the effect never re-ran.
+        // `auto_call_body` (react mode) rewrites the body reads to calls.
+        let rt = transform(
+            "const [count, setCount] = useState(0);\nconst doubled = useMemo(() => count * 2, [count]);\nuseEffect(() => console.log(count));",
+        );
+        let body = auto_call_body(&rt.javascript, &rt.signals);
+        assert_eq!(
+            body,
+            "const count = signal(0);\nconst doubled = computed(() => count() * 2);\neffect(() => console.log(count()));",
+            "body reads not auto-called; got: {body}"
+        );
+        assert_parses(&body);
+        // Reads inside BOTH the computed and the effect are called.
+        assert!(body.contains("count() * 2"), "computed body read not called; got: {body}");
+        assert!(body.contains("console.log(count())"), "effect body read not called; got: {body}");
+    }
+
+    #[test]
+    fn body_autocall_does_not_touch_mutation_receiver_or_property_key() {
+        // The signal-mutation receiver `count.set` / `count.update` must NOT be called, a property key
+        // `obj.count` must NOT be called, and an already-called `count()` must NOT be double-called;
+        // a plain member-access object IS called (`user.name` → `user().name`).
+        let signals: HashSet<String> =
+            ["count", "user"].into_iter().map(String::from).collect();
+        let body = auto_call_body(
+            "function f() {\n  count.set(1);\n  count.update(p => p + 1);\n  const a = obj.count;\n  const b = count();\n  const c = user.name;\n  const d = count + 1;\n}",
+            &signals,
+        );
+        assert!(body.contains("count.set(1)"), "mutation receiver wrongly called; got: {body}");
+        assert!(body.contains("count.update(p => p + 1)"), "update receiver wrongly called; got: {body}");
+        assert!(body.contains("const a = obj.count;"), "property key wrongly called; got: {body}");
+        assert!(body.contains("const b = count();"), "already-called read double-called; got: {body}");
+        assert!(body.contains("const c = user().name;"), "member object not called; got: {body}");
+        assert!(body.contains("const d = count() + 1;"), "plain read not called; got: {body}");
+        assert_parses(&body);
+    }
+
+    #[test]
+    fn body_autocall_is_a_noop_with_no_signals() {
+        // No signals → the body is returned byte-identically (so a non-react / signal-free body is
+        // never disturbed).
+        let body = "const x = compute(1) + go();";
+        assert_eq!(auto_call_body(body, &HashSet::new()), body);
     }
 }
