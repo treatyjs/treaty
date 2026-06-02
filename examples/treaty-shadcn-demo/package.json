@@ -11,12 +11,14 @@
     "build:e2e": "node full-build.e2e.mjs"
   },
   "peerDependencies": {
-    "@angular/core": "^21.0.0",
-    "@angular/platform-browser": "^21.0.0",
+    "@angular/core": "22.0.0-rc.3",
+    "@angular/platform-browser": "22.0.0-rc.3",
     "vite": "^5.0.0 || ^6.0.0 || ^7.0.0"
   },
   "peerDependenciesMeta": {
-    "vite": { "optional": true }
+    "vite": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@treaty/compiler": "*",

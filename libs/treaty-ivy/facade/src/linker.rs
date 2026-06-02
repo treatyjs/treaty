@@ -31,9 +31,9 @@ use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType};
 
 use crate::factory::{
-    compile_factory_function, compile_injectable, FactoryDeps, FactoryTarget, ForwardRefHandling,
-    MaybeForwardRef, R3ConstructorFactoryMetadata, R3DependencyMetadata, R3FactoryMetadata,
-    R3InjectableMetadata,
+    compile_factory_function, compile_injectable, compile_service, FactoryDeps, FactoryTarget,
+    ForwardRefHandling, MaybeForwardRef, R3ConstructorFactoryMetadata, R3DependencyMetadata,
+    R3FactoryMetadata, R3InjectableMetadata, R3ServiceMetadata,
 };
 use crate::compile::RealTemplateBuilder;
 use crate::output::emitter::{emit_expression, emit_statements};
@@ -685,6 +685,10 @@ fn parse_factory_target(expr: &Expression) -> Result<FactoryTarget, String> {
         "Injectable" => Ok(FactoryTarget::Injectable),
         "Pipe" => Ok(FactoryTarget::Pipe),
         "NgModule" => Ok(FactoryTarget::NgModule),
+        // Angular 22's `@Service` DI primitive. The factory shape is identical to
+        // `Injectable` (constructor factory, no special inject flags); only the def
+        // call differs (`ɵɵdefineService` — see `link_service`).
+        "Service" => Ok(FactoryTarget::Service),
         other => Err(format!("unsupported ɵɵFactoryTarget.{other}")),
     }
 }
@@ -749,6 +753,7 @@ fn forward_ref_array(expr: &Expression) -> Vec<R3Reference> {
 enum DeclareKind {
     Factory,
     Injectable,
+    Service,
     Injector,
     NgModule,
     Pipe,
@@ -770,6 +775,7 @@ impl DeclareKind {
         match name {
             "\u{0275}\u{0275}ngDeclareFactory" => Some(DeclareKind::Factory),
             "\u{0275}\u{0275}ngDeclareInjectable" => Some(DeclareKind::Injectable),
+            "\u{0275}\u{0275}ngDeclareService" => Some(DeclareKind::Service),
             "\u{0275}\u{0275}ngDeclareInjector" => Some(DeclareKind::Injector),
             "\u{0275}\u{0275}ngDeclareNgModule" => Some(DeclareKind::NgModule),
             "\u{0275}\u{0275}ngDeclarePipe" => Some(DeclareKind::Pipe),
@@ -857,6 +863,44 @@ fn link_injectable(obj: &ObjectExpression) -> Result<String, String> {
         deps,
     };
     let compiled = compile_injectable(&meta, false);
+    Ok(emit_def_text(&compiled.expression))
+}
+
+/// `toR3ServiceMeta` + `compileService(meta, false)` → the `ɵɵdefineService({…})` text.
+///
+/// Angular 22's `@Service` primitive declares `static ɵprov = i0.ɵɵngDeclareService({...})`
+/// (paired with a `ɵfac = ɵɵngDeclareFactory({target: ɵɵFactoryTarget.Service})`). The declare
+/// object is minimal — `type`, plus optional `autoProvided` / `factory` — so the mapping is a
+/// pure syntactic transform like the rest of the DI family.
+/// Reference: `compiler-cli/.../partial_linkers/partial_service_linker_1.ts` → `toR3ServiceMeta`.
+fn link_service(obj: &ObjectExpression) -> Result<String, String> {
+    let type_expr =
+        find_prop(obj, "type").ok_or_else(|| "ɵɵngDeclareService missing `type`".to_string())?;
+    let name = symbol_name(type_expr)
+        .ok_or_else(|| "ɵɵngDeclareService `type` has no symbol name".to_string())?;
+
+    // `autoProvided: false` is the only value worth carrying through (`true`/absent → omitted).
+    let auto_provided = match find_prop(obj, "autoProvided") {
+        Some(Expression::BooleanLiteral(b)) => Some(b.value),
+        Some(_) => return Err("unsupported `autoProvided` expression".to_string()),
+        None => None,
+    };
+    // The `@Service({factory})` override, if present.
+    let factory = match find_prop(obj, "factory") {
+        Some(e) => {
+            Some(convert_expr(e).ok_or_else(|| "unsupported `factory` expression".to_string())?)
+        }
+        None => None,
+    };
+
+    let meta = R3ServiceMetadata {
+        name,
+        ty: class_ref_from(type_expr)?,
+        type_argument_count: 0,
+        auto_provided,
+        factory,
+    };
+    let compiled = compile_service(&meta, false);
     Ok(emit_def_text(&compiled.expression))
 }
 
@@ -1914,6 +1958,7 @@ fn link_one(kind: DeclareKind, obj_src: &str) -> Result<LinkedDef, String> {
     match kind {
         DeclareKind::Factory => link_factory(obj).map(plain),
         DeclareKind::Injectable => link_injectable(obj).map(plain),
+        DeclareKind::Service => link_service(obj).map(plain),
         DeclareKind::Injector => link_injector(obj).map(plain),
         DeclareKind::Pipe => link_pipe(obj).map(plain),
         DeclareKind::NgModule => link_ng_module(obj),
@@ -2061,6 +2106,31 @@ mod tests {
         );
         assert_no_declare(&out.code);
         assert_reparses(&out.code);
+    }
+
+    #[test]
+    fn links_service_declaration() {
+        // Angular 22's `@Service` primitive — real shape from @angular/common (LCPImageObserver):
+        // `ɵfac` with target Service + `ɵprov = ɵɵngDeclareService({...})`.
+        let src = r#"export class Svc {
+  static ɵfac = i0.ɵɵngDeclareFactory({ minVersion: "12.0.0", version: "22.0.0-rc.3", ngImport: i0, type: Svc, deps: [], target: i0.ɵɵFactoryTarget.Service });
+  static ɵprov = i0.ɵɵngDeclareService({ minVersion: "22.0.0", version: "22.0.0-rc.3", ngImport: i0, type: Svc });
+}
+"#;
+        let out = link_partial(src, "common.mjs");
+        assert!(out.errors.is_empty(), "errors: {:?}", out.errors);
+        assert!(
+            out.code.contains("\u{0275}\u{0275}defineService"),
+            "expected ɵɵdefineService, got: {}",
+            out.code
+        );
+        // Both partial declarations are fully de-partialled — no residual marker survives.
+        assert!(
+            !out.code.contains("\u{0275}\u{0275}ngDeclareService")
+                && !out.code.contains("\u{0275}\u{0275}ngDeclareFactory"),
+            "residual partial marker survived: {}",
+            out.code
+        );
     }
 
     #[test]

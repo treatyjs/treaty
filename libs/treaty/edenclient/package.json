@@ -4,8 +4,8 @@
   "author": "Jordan Hall",
   "license": "IDGAF-1.0",
   "peerDependencies": {
-    "@angular/common": "^21.2.15",
-    "@angular/core": "^21.2.15",
+    "@angular/common": "22.0.0-rc.3",
+    "@angular/core": "22.0.0-rc.3",
     "elysia": ">=1"
   },
   "peerDependenciesMeta": {
