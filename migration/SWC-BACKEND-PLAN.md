@@ -378,4 +378,32 @@ Touched:
 Unchanged (the point of the design):
 - `libs/treaty-ivy/core/src/output_ast.rs` — the neutral IR.
 - `libs/treaty-ivy/core/src/output/source_map.rs` — engine-neutral (byte offsets / UTF-16 columns).
+
+## 8. Host integration — exposing the swc backend to swc-based build systems + packagr
+
+The swc backend is not just an internal toggle. Many Rust-accelerated JS toolchains **already
+load swc in-process** (Next.js / Turbopack, Rspack's built-in swc loader, Nx executors on
+`@swc-node/register`, `@swc/jest`). For those hosts the win is twofold: Treaty plugs into the
+parser/printer the host has **already loaded** (no second engine dragged into the process → lower
+memory, one parse pass) and the integration is **native** to that build (a transform in the host's
+existing swc pipeline rather than a bolt-on). That is the "hook into their current build + faster
+compiler" goal.
+
+Surfaces to expose once the swc backend (phases 1–3) lands — each gated by `tools/backend-parity`
+so the output is byte-identical to the oxc path:
+
+- **`@treaty/swc`** — a swc transform usable two ways: (a) as an `@swc/core` JS-side transform/plugin
+  for `@swc-node` / `@swc/jest` / Nx-swc hosts, and (b) via the swc Wasm plugin ABI for
+  Next/Turbopack-style stacks. It runs the swc-backed Treaty lowering in the host's own swc pass.
+- **Rspack** — `@treaty/rspack` already exists (oxc); add a swc-backed loader variant so apps whose
+  Rspack build is swc-driven stay on one engine.
+- **treaty-packagr** — `libs/packagr` gains a swc backend option (`package_library_at(dir,
+  { backend: "swc" })`) so libraries built inside an swc toolchain are packaged through the same
+  engine the host uses, end to end.
+
+In every case the **backend-parity harness is the gate**: the swc-host output must match the oxc
+output byte-for-byte (and, per §3.3, the React-emit target is matched the same way). Relative
+performance of each of these paths is measured by the benchmark suite (`tools/treaty-bench`):
+Angular's own compiler vs Treaty-oxc vs Treaty-swc, across the rs family (rspack/rsbuild/rslib),
+vite, and rolldown.
 - The entire `R3*Metadata → output_ast` core in `treaty_ivy`.
