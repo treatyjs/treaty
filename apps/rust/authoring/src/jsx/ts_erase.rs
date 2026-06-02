@@ -89,7 +89,7 @@ pub(crate) fn erase_expression(expression: &Expression, source: &str) -> String 
 /// Re-parse `verbatim` (a standalone expression's source text), run the TS-erasing [`VisitMut`]
 /// pass, and re-emit JS-only text. Returns `None` if the slice does not re-parse cleanly as a single
 /// expression, in which case the caller falls back to the verbatim slice.
-fn erase_via_reparse(verbatim: &str) -> Option<String> {
+pub(crate) fn erase_via_reparse(verbatim: &str) -> Option<String> {
     let wrapped = format!("({verbatim});");
     let allocator = Allocator::default();
     // The slice is TypeScript (it reached the slow path *because* it carries TS syntax), so parse as

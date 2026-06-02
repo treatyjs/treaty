@@ -747,7 +747,15 @@ fn lower_props(params: &oxc_ast::ast::FormalParameters, source: &str) -> Lowered
                     // A `b = 5` default lives on the property value's `AssignmentPattern` right side.
                     let default = binding_pattern_default(&prop.value, source);
                     match default {
-                        Some(d) => decls.push(format!("const {local} = input({d});")),
+                        // The default expression may carry TS (`'info' as AlertType`, `x satisfies T`,
+                        // `f<T>()`) — it is spliced into runtime `input(<default>)`, so any TS syntax
+                        // must be erased or the emitted `.mjs` is invalid JavaScript (the bare `as`
+                        // breaks esbuild/Node). Erase via the shared AST pass; fall back to verbatim if
+                        // the slice carries no TS (the common case re-parses to itself).
+                        Some(d) => {
+                            let d = ts_erase::erase_via_reparse(&d).unwrap_or(d);
+                            decls.push(format!("const {local} = input({d});"));
+                        }
                         None => decls.push(format!("const {local} = input();")),
                     }
                     names.push(local);
@@ -1000,6 +1008,22 @@ export default function Alert({ kind }: Props) {\n  const [open, setOpen] = useS
         assert!(!code.contains("interface Props"), "top-level `interface` leaked: {code}");
         assert!(!code.contains("export type Alias"), "`export type` leaked: {code}");
         // The emitted client module must parse as valid JS/TS (no bare `type`/`interface` statement).
+        assert_well_formed_module(code);
+    }
+
+    #[test]
+    fn prop_default_with_a_type_cast_is_erased() {
+        // Regression: a React/JSX prop default carrying TS (`type = 'info' as AlertType`) is spliced
+        // into runtime `input(<default>)`; the `as`/generic/satisfies syntax must be erased or the
+        // emitted `.mjs` is invalid JS (esbuild "Expected ;"). The Alert showcase component used
+        // `'info' as AlertType` and failed to load. Must emit `input('info')`.
+        let source = "type AlertType = 'info' | 'warn';\n\
+export default function Alert({ kind = 'info' as AlertType, n = 0 }) {\n  return <div className={kind}>{n}</div>;\n}\n";
+        let out = compile(source, "alert.tsx");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+        assert!(!code.contains(" as AlertType"), "prop-default `as` cast leaked: {code}");
+        assert!(code.contains("input('info')") || code.contains("input(\"info\")"), "default not erased to input('info'); got: {code}");
         assert_well_formed_module(code);
     }
 
