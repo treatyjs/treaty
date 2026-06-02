@@ -1,0 +1,56 @@
+{
+  "benchmark": "compiler-ivy-lowering",
+  "generatedAt": "2026-06-02T17:59:43.001Z",
+  "corpus": {
+    "source": "libs/treaty-ivy/facade/parity/parity.mjs#FIXTURES",
+    "totalFixtures": 29
+  },
+  "env": {
+    "node": "v24.7.0",
+    "platform": "win32",
+    "arch": "x64",
+    "cpu": "AMD Ryzen 7 PRO 5850U with Radeon Graphics"
+  },
+  "config": {
+    "warmupIters": 200,
+    "measureIters": 2000,
+    "bestOf": 3
+  },
+  "angularCompilerVersionNote": "angular-compiler row measured with the @angular/compiler resolved at repo node_modules",
+  "results": [
+    {
+      "compiler": "angular-compiler",
+      "status": "measured",
+      "fixtures": 27,
+      "components": 54000,
+      "iterations": 2000,
+      "warmup": 200,
+      "totalMs": 14971.728,
+      "msPerComponent": 0.277254,
+      "opsPerSec": 3606.8,
+      "skipped": [
+        "i18n-static",
+        "i18n-interp"
+      ],
+      "note": "27 shared fixtures timed (intersection both compilers can lower); this compiler also cannot render: i18n-static, i18n-interp"
+    },
+    {
+      "compiler": "treaty-oxc",
+      "status": "measured",
+      "fixtures": 27,
+      "components": 54000,
+      "iterations": 2000,
+      "warmup": 200,
+      "totalMs": 6174.895,
+      "msPerComponent": 0.11435,
+      "opsPerSec": 8745.1,
+      "skipped": [],
+      "note": "27 shared fixtures timed (intersection both compilers can lower)"
+    },
+    {
+      "compiler": "treaty-swc",
+      "status": "pending",
+      "note": "swc backend NOT YET IMPLEMENTED — see migration/SWC-BACKEND-PLAN.md (Cargo feature `swc` + libs/treaty-ivy/core/src/output/emitter_swc.rs, phase 2). Will be measured once the swc feature lands and @treaty/authoring-node exposes the swc-backed compile path."
+    }
+  ]
+}
