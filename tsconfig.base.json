@@ -25,6 +25,7 @@
       "@treaty/lsp/plugins": ["./libs/treaty/lsp/src/plugins.ts"],
       "@treaty/compiler": ["./libs/treaty/compiler/src/index.ts"],
       "@treaty/vite": ["./libs/treaty/vite/src/index.ts"],
+      "@treaty/rolldown": ["./libs/treaty/rolldown/src/index.ts"],
       "@treaty/rslib": ["./libs/treaty/rslib/src/index.ts"],
       "@treaty/rspack": ["./libs/treaty/rspack/src/index.ts"],
       "@treaty/rspack/loader": ["./libs/treaty/rspack/src/loader.ts"],

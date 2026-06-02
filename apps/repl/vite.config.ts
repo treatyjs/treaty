@@ -2,9 +2,14 @@
 import { join } from 'node:path';
 import { defineConfig } from 'vite';
 
-import { treatySFC } from './src/tools/treaty-sfc/compiler'
 import { angular } from './src/tools/angular'
 import { treatyGallery } from './src/tools/gallery-plugin'
+// The REAL Treaty bundler plugin — the SAME oxc-based integration consumed by
+// @treaty/rspack/@treaty/rsbuild etc. It lowers EVERY Treaty/Angular authoring
+// surface to Ivy via the Rust addon (compile of .treaty/.tsx/normal Angular .ts of
+// every decorator kind) AND links published @angular/* partials to AOT in Rust,
+// excluding @angular/compiler — no JIT. The REPL uses our compiler, and ONLY ours.
+import treaty from '@treaty/vite'
 
 
 export default defineConfig({
@@ -28,7 +33,8 @@ export default defineConfig({
 
   plugins: [
     treatyGallery(join(__dirname, 'src/gallery/samples')),
-    treatySFC(),
+    // THE Treaty compiler is the sole compile path (oxc addon: compile + linkPartial).
+    ...treaty(),
     angular(),
   ],
 
