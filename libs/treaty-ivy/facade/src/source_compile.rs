@@ -3429,6 +3429,37 @@ fn compile_component_meta(
 mod tests {
     use super::*;
 
+    /// DI codegen byte-identity gate — the plan's Phase-1c "DI codegen snapshot
+    /// identical pre/post OXC bump". The DI factory (`ɵfac` via `ɵɵinject` +
+    /// `InjectFlags`) and provider (`ɵprov = ɵɵdefineInjectable`) emit is the one
+    /// piece the original Rust skeleton already produced; this locks its EXACT
+    /// output (whitespace-normalised) for a canonical `@Injectable` with
+    /// constructor DI and an `@Optional` dependency (→ inject flag `8`), so any
+    /// future OXC/emitter change that perturbs DI codegen fails loudly here.
+    #[test]
+    fn di_codegen_byte_identity_snapshot() {
+        let src = "@Injectable({ providedIn: 'root' })\nexport class AuthService { constructor(http: HttpClient, @Optional() config: Config) {} }";
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+
+        // Golden: `ɵfac` (constructor factory, `ɵɵinject` + the `@Optional` flag 8)
+        // + `ɵprov` (`ɵɵdefineInjectable` with token/factory/providedIn).
+        let golden = "\
+AuthService.\u{0275}fac = function AuthService_Factory(__ngFactoryType__) {
+	return new (__ngFactoryType__ || AuthService)(i0.\u{0275}\u{0275}inject(HttpClient), i0.\u{0275}\u{0275}inject(Config, 8));
+};
+AuthService.\u{0275}prov = i0.\u{0275}\u{0275}defineInjectable({
+	token: AuthService,
+	factory: AuthService.\u{0275}fac,
+	providedIn: \"root\"
+});";
+        assert!(
+            flat(&out.code).contains(&flat(golden)),
+            "DI codegen drifted from the byte-identity golden.\n--- golden ---\n{golden}\n--- got ---\n{}",
+            out.code
+        );
+    }
+
     const ZWS: &str = "\u{0275}\u{0275}defineComponent";
 
     /// Collapse all runs of ASCII whitespace (incl. the emitter's tabs/newlines used to
