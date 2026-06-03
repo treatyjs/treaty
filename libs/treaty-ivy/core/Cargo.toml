@@ -10,16 +10,21 @@ edition = "2024"
 
 [features]
 # `oxc` (default) is the reference emit backend: lower output_ast -> oxc_ast -> oxc_codegen.
+# It is the ONLY feature that pulls the `oxc_*` crates in — they are `optional` below and
+# activated solely by this feature, so `oxc_*` AST types are confined to the `#[cfg(feature = "oxc")]`
+# `Lowerer` in `output/emitter.rs`.
 # `swc` swaps the four public emit functions to the engine-neutral printer in `output/emitter_swc.rs`
-# (see migration/SWC-BACKEND-PLAN.md §3.3 / phase 2). It is additive: the oxc lowering stays compiled
-# (the public dispatch just routes to the neutral printer), so the default build is byte-for-byte
-# unchanged. The two backends are gated 1:1 by `tools/backend-parity`.
+# (see migration/SWC-BACKEND-PLAN.md §3.3 / phase 2). It is additive: with BOTH features on (the
+# `--features swc` gate build keeps `oxc` from `default`) the oxc lowering stays compiled and the
+# public dispatch routes to the neutral printer, so the default build is byte-for-byte unchanged and
+# both backends remain drivable side-by-side. Built `--no-default-features --features swc` the crate
+# pulls in ZERO oxc crates. The two backends are gated 1:1 by `tools/backend-parity`.
 default = ["oxc"]
-oxc = []
+oxc = ["dep:oxc_allocator", "dep:oxc_ast", "dep:oxc_codegen", "dep:oxc_span"]
 swc = []
 
 [dependencies]
-oxc_allocator = "0.133.0"
-oxc_ast = "0.133.0"
-oxc_codegen = "0.133.0"
-oxc_span = "0.133.0"
+oxc_allocator = { version = "0.133.0", optional = true }
+oxc_ast = { version = "0.133.0", optional = true }
+oxc_codegen = { version = "0.133.0", optional = true }
+oxc_span = { version = "0.133.0", optional = true }

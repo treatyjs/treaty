@@ -25,12 +25,12 @@ edition = "2024"
 # backend here is that port's parser half + its parity gate; the alias below stays on oxc until the
 # walk is neutralized so the default + swc builds both compile.
 default = ["oxc"]
-oxc = ["treaty_ivy_core/oxc"]
-swc = ["treaty_ivy_core/swc", "dep:swc_common", "dep:swc_ecma_ast", "dep:swc_ecma_parser", "dep:swc_atoms"]
+oxc = ["treaty_ivy_core/oxc", "treaty_ivy_template/oxc"]
+swc = ["treaty_ivy_core/swc", "treaty_ivy_template/swc", "dep:swc_common", "dep:swc_ecma_ast", "dep:swc_ecma_parser", "dep:swc_atoms"]
 
 [dependencies]
 treaty_ivy_core = { path = "../core", default-features = false }
-treaty_ivy_template = { path = "../template" }
+treaty_ivy_template = { path = "../template", default-features = false }
 treaty_ivy_decorators = { path = "../decorators" }
 oxc_allocator = "0.133.0"
 oxc_ast = "0.133.0"

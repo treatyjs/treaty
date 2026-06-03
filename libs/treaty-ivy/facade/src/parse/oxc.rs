@@ -24,8 +24,8 @@ use oxc_span::{GetSpan, SourceType};
 
 use super::{
     ClassWithDecorators, DecoratorInfo, ImportInfo, LitValue, MemberInfo, MemberKind, NArg,
-    NArrayElement, NArrowBody, NCtorParam, NExpr, NObjectProp, NParam, NStmt, NVarDeclarator,
-    NgDeclareCall, ObjLit, ParseBackend, ParseOutput, SourceKind, TreatySpan,
+    NArrayElement, NArrowBody, NAssignment, NCtorParam, NExpr, NObjectProp, NParam, NStmt, NTopStmt,
+    NVarDeclarator, NgDeclareCall, ObjLit, ParseBackend, ParseOutput, SourceKind, TreatySpan,
 };
 
 /// The oxc parse backend. Zero-sized; the parse arena is created per [`Self::parse_module`] call so
@@ -80,6 +80,7 @@ impl ParseBackend for OxcParseBackend {
                 classes: Vec::new(),
                 ng_declare_calls: Vec::new(),
                 imports: Vec::new(),
+                top_level: Vec::new(),
                 errors: ret.errors.iter().map(|e| e.to_string()).collect(),
             }
         };
@@ -131,11 +132,12 @@ fn lower_program(program: &Program, source: &str) -> ParseOutput {
     let mut classes = Vec::new();
     let mut ng_declare_calls = Vec::new();
     let mut imports = Vec::new();
+    let mut top_level = Vec::new();
 
     for stmt in &program.body {
         if let Some(class) = statement_class(stmt) {
             if !class.decorators.is_empty() {
-                classes.push(lower_class(class));
+                classes.push(lower_class(class, span_of(stmt)));
             }
             collect_ng_declares_in_class(class, &mut ng_declare_calls);
         }
@@ -144,6 +146,8 @@ fn lower_program(program: &Program, source: &str) -> ParseOutput {
         collect_ng_declares_in_stmt(stmt, &mut ng_declare_calls);
         // Top-level `import` bindings (foreign-import / imported-name surface).
         collect_imports_in_stmt(stmt, &mut imports);
+        // The neutral top-level statement surface the AOT→partial emitter walks.
+        top_level.push(lower_top_stmt(stmt));
     }
 
     let _ = source; // span_text recovers source text on demand; not needed during lowering.
@@ -151,8 +155,68 @@ fn lower_program(program: &Program, source: &str) -> ParseOutput {
         classes,
         ng_declare_calls,
         imports,
+        top_level,
         errors: Vec::new(),
     }
+}
+
+/// Lower one TOP-LEVEL statement to the neutral [`NTopStmt`] — the surface the AOT→partial emitter
+/// (`partial_emit::collect_rewrites`) walks. An `X.member = rhs;` assignment expression statement
+/// becomes [`NTopStmt::Assignment`] (the definition scaffold); a bare expression statement becomes
+/// [`NTopStmt::ExprStmt`] (the `ɵɵsetNgModuleScope` side effect); a `var`/`let`/`const` becomes
+/// [`NTopStmt::VarDecl`]; everything else carries its span as [`NTopStmt::Other`].
+fn lower_top_stmt(stmt: &Statement) -> NTopStmt {
+    match stmt {
+        Statement::ExpressionStatement(es) => {
+            if let Expression::AssignmentExpression(assign) = &es.expression {
+                let (target_object, target_member) = assignment_member(assign);
+                return NTopStmt::Assignment(NAssignment {
+                    target_object,
+                    target_member,
+                    value: lower_expr(&assign.right),
+                    value_span: span_of(&assign.right),
+                    span: span_of(stmt),
+                });
+            }
+            NTopStmt::ExprStmt {
+                expr: lower_expr(&es.expression),
+                span: span_of(stmt),
+            }
+        }
+        Statement::VariableDeclaration(decl) => {
+            let is_const = matches!(decl.kind, oxc_ast::ast::VariableDeclarationKind::Const);
+            let decls = decl
+                .declarations
+                .iter()
+                .map(|d| NVarDeclarator {
+                    name: d.id.get_binding_identifier().map(|id| id.name.to_string()),
+                    init: d.init.as_ref().map(lower_expr),
+                })
+                .collect();
+            NTopStmt::VarDecl {
+                is_const,
+                decls,
+                span: span_of(stmt),
+            }
+        }
+        _ => NTopStmt::Other(span_of(stmt)),
+    }
+}
+
+/// The `<Ident>.<member>` LHS parts of an assignment target (`X.ɵfac = …` → `(Some("X"),
+/// Some("ɵfac"))`), or `(None, None)` when the target is not a static-member-on-identifier. Mirrors
+/// `partial_emit::assignment_member`.
+fn assignment_member(assign: &oxc_ast::ast::AssignmentExpression) -> (Option<String>, Option<String>) {
+    use oxc_ast::ast::AssignmentTarget;
+    if let AssignmentTarget::StaticMemberExpression(member) = &assign.left {
+        if let Expression::Identifier(obj) = &member.object {
+            return (
+                Some(obj.name.to_string()),
+                Some(member.property.name.to_string()),
+            );
+        }
+    }
+    (None, None)
 }
 
 /// Collect the local binding names of a top-level `import` declaration (skipping whole-declaration and
@@ -206,7 +270,7 @@ fn statement_class<'a>(stmt: &'a Statement<'a>) -> Option<&'a Class<'a>> {
 /// `treaty_ivy_decorators::ClassMeta` fields from the SAME live oxc class it walks, without re-deriving
 /// the pre-lowering (and so the neutral fields it hands a plugin are byte-identical to the parse
 /// backend's `ParseOutput` ones).
-pub(crate) fn lower_class(class: &Class) -> ClassWithDecorators {
+pub(crate) fn lower_class(class: &Class, stmt_span: TreatySpan) -> ClassWithDecorators {
     let name = class.id.as_ref().map(|id| id.name.to_string());
     let decorators = class.decorators.iter().map(lower_decorator).collect();
     let members = class
@@ -219,6 +283,8 @@ pub(crate) fn lower_class(class: &Class) -> ClassWithDecorators {
         name,
         decorators,
         members,
+        span: span_of(class),
+        stmt_span,
     }
 }
 
@@ -234,6 +300,7 @@ fn lower_member(element: &ClassElement) -> MemberInfo {
             is_static: p.r#static,
             params: Vec::new(),
             initializer: p.value.as_ref().map(lower_expr),
+            span: span_of(element),
         },
         ClassElement::MethodDefinition(m) => {
             let (kind, is_ctor) = match m.kind {
@@ -250,6 +317,7 @@ fn lower_member(element: &ClassElement) -> MemberInfo {
                 is_static: m.r#static,
                 params: lower_ctor_params(&m.value.params),
                 initializer: None,
+                span: span_of(element),
             }
         }
         ClassElement::AccessorProperty(a) => MemberInfo {
@@ -259,10 +327,12 @@ fn lower_member(element: &ClassElement) -> MemberInfo {
             is_static: a.r#static,
             params: Vec::new(),
             initializer: a.value.as_ref().map(lower_expr),
+            span: span_of(element),
         },
         // Static block / TS index signature / etc.: oxc still surfaces a (nameless) class element.
         _ => MemberInfo {
             kind: MemberKind::Other,
+            span: span_of(element),
             ..MemberInfo::default()
         },
     }
@@ -309,6 +379,7 @@ pub(crate) fn lower_decorator(dec: &Decorator) -> DecoratorInfo {
         name,
         object,
         arguments,
+        span: span_of(dec),
     }
 }
 
@@ -371,7 +442,31 @@ pub(crate) fn lower_object(obj: &oxc_ast::ast::ObjectExpression) -> ObjLit {
     ObjLit {
         props,
         span: span_of(obj),
+        // The lossless full-expression view of the SAME literal (every property, full `NExpr` values).
+        nprops: lower_object_props(obj),
     }
+}
+
+/// Lower an oxc `ObjectExpression`'s properties to the LOSSLESS [`NObjectProp`] list (every property
+/// in source order, key/value as full `NExpr`, spreads + computed keys preserved). Shared by
+/// [`lower_object`] (the `ObjLit::nprops` channel) and the `NExpr::Object` arm of [`lower_expr`].
+fn lower_object_props(obj: &oxc_ast::ast::ObjectExpression) -> Vec<NObjectProp> {
+    obj.properties
+        .iter()
+        .map(|p| match p {
+            ObjectPropertyKind::ObjectProperty(op) => match key_name(&op.key) {
+                Some(key) => NObjectProp::KeyValue {
+                    key: key.to_string(),
+                    value: lower_expr(&op.value),
+                    quoted: !is_safe_object_key(key),
+                    computed: op.computed,
+                    value_span: span_of(&op.value),
+                },
+                None => NObjectProp::Other(span_of(&op.key)),
+            },
+            ObjectPropertyKind::SpreadProperty(sp) => NObjectProp::Spread(lower_expr(&sp.argument)),
+        })
+        .collect()
 }
 
 /// Lower an oxc `Expression` to the neutral [`LitValue`]. Faithful to `string_value` /
@@ -504,27 +599,7 @@ fn lower_expr(expr: &Expression) -> NExpr {
                 .collect();
             NExpr::Array(elems)
         }
-        Expression::ObjectExpression(obj) => {
-            let props = obj
-                .properties
-                .iter()
-                .map(|p| match p {
-                    ObjectPropertyKind::ObjectProperty(op) => match key_name(&op.key) {
-                        Some(key) => NObjectProp::KeyValue {
-                            key: key.to_string(),
-                            value: lower_expr(&op.value),
-                            quoted: !is_safe_object_key(key),
-                            computed: op.computed,
-                        },
-                        None => NObjectProp::Other(span_of(&op.key)),
-                    },
-                    ObjectPropertyKind::SpreadProperty(sp) => {
-                        NObjectProp::Spread(lower_expr(&sp.argument))
-                    }
-                })
-                .collect();
-            NExpr::Object(props)
-        }
+        Expression::ObjectExpression(obj) => NExpr::Object(lower_object_props(obj)),
         Expression::ArrowFunctionExpression(arrow) => NExpr::Arrow {
             params: lower_params(&arrow.params),
             body: Box::new(lower_arrow_body(arrow)),
@@ -557,10 +632,14 @@ fn is_safe_object_key(key: &str) -> bool {
 fn lower_args(args: &oxc_allocator::Vec<Argument>) -> Vec<NArg> {
     args.iter()
         .map(|a| match a {
-            Argument::SpreadElement(s) => NArg::Spread(lower_expr(&s.argument)),
+            Argument::SpreadElement(s) => {
+                NArg::Spread(lower_expr(&s.argument), span_of(&s.argument))
+            }
             other => match other.as_expression() {
-                Some(inner) => NArg::Expr(lower_expr(inner)),
-                None => NArg::Expr(NExpr::Other(other.span().into_treaty())),
+                Some(inner) => NArg::Expr(lower_expr(inner), span_of(inner)),
+                None => {
+                    NArg::Expr(NExpr::Other(other.span().into_treaty()), other.span().into_treaty())
+                }
             },
         })
         .collect()
@@ -679,22 +758,35 @@ fn collect_ng_declares_in_stmt(stmt: &Statement, out: &mut Vec<NgDeclareCall>) {
     }
 }
 
-/// If `expr` is a `ɵɵngDeclare*({…})` call with an object-literal argument, push its neutral form.
+/// If `expr` is a `ɵɵngDeclare*({…})` call with an object-literal argument, push its neutral form;
+/// otherwise recurse through the wrappers a declaration call inhabits — the RHS of an assignment
+/// (`X.ɵprov = <call>`), a parenthesized group, and a comma sequence — mirroring the linker's
+/// `collect_in_expression` so the assignment-statement / member form is captured identically.
 fn push_if_ng_declare(expr: &Expression, out: &mut Vec<NgDeclareCall>) {
-    let Expression::CallExpression(call) = expr else {
-        return;
-    };
-    let Some(kind) = declare_callee_kind(&call.callee) else {
-        return;
-    };
-    for arg in &call.arguments {
-        if let Argument::ObjectExpression(obj) = arg {
-            out.push(NgDeclareCall {
-                kind,
-                object: lower_object(obj),
-            });
-            return;
+    match expr {
+        Expression::CallExpression(call) => {
+            let Some(kind) = declare_callee_kind(&call.callee) else {
+                return;
+            };
+            for arg in &call.arguments {
+                if let Argument::ObjectExpression(obj) = arg {
+                    out.push(NgDeclareCall {
+                        kind,
+                        object: lower_object(obj),
+                        call_span: span_of(call.as_ref()),
+                    });
+                    return;
+                }
+            }
         }
+        Expression::AssignmentExpression(assign) => push_if_ng_declare(&assign.right, out),
+        Expression::ParenthesizedExpression(p) => push_if_ng_declare(&p.expression, out),
+        Expression::SequenceExpression(seq) => {
+            for part in &seq.expressions {
+                push_if_ng_declare(part, out);
+            }
+        }
+        _ => {}
     }
 }
 

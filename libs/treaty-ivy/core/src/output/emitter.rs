@@ -34,10 +34,27 @@
 //! with no `output_ast`-level payload to lower); it emits a clearly-named
 //! `__unsupported_WrappedNode` identifier so emission never aborts.
 
+// At least one emit backend must be selected. `oxc` (default) compiles the `Lowerer` below
+// (the only `oxc_*`-AST consumer in this crate); `swc` routes the public functions to the
+// engine-neutral printer in `emitter_swc.rs`. Both may be on at once (the `--features swc`
+// gate build keeps `oxc` from `default`); the public dispatch then prefers the neutral printer.
+#[cfg(not(any(feature = "oxc", feature = "swc")))]
+compile_error!(
+    "treaty_ivy_core needs an emit backend feature: `oxc` (default) or `swc` (see SWC-BACKEND-PLAN)"
+);
+
+// --- oxc emit backend imports ------------------------------------------------
+// Compiled ONLY for the oxc emit path (`oxc` on, `swc` off). Under `--no-default-features
+// --features swc` none of these crates are in the dependency graph, so the whole `Lowerer`
+// and its helpers below are absent and this crate names no `oxc_*` type.
+#[cfg(all(feature = "oxc", not(feature = "swc")))]
 use std::cell::RefCell;
 
+#[cfg(all(feature = "oxc", not(feature = "swc")))]
 use oxc_allocator::{Allocator, Box as ArenaBox, Vec as ArenaVec};
+#[cfg(all(feature = "oxc", not(feature = "swc")))]
 use oxc_ast::AstBuilder;
+#[cfg(all(feature = "oxc", not(feature = "swc")))]
 use oxc_ast::ast::{
     Argument, ArrayExpressionElement, AssignmentOperator, AssignmentTarget, BinaryOperator as OxBin,
     BindingPattern, Declaration, Expression, FormalParameterKind, FunctionBody, FunctionType,
@@ -45,13 +62,22 @@ use oxc_ast::ast::{
     RegExp, RegExpFlags, RegExpPattern, SimpleAssignmentTarget, Statement, TemplateElement,
     TemplateElementValue, TemplateLiteral, UnaryOperator as OxUn, VariableDeclarationKind,
 };
+#[cfg(all(feature = "oxc", not(feature = "swc")))]
 use oxc_codegen::Codegen;
+#[cfg(all(feature = "oxc", not(feature = "swc")))]
 use oxc_span::{SourceType, SPAN};
 
+#[cfg(all(feature = "oxc", not(feature = "swc")))]
 use crate::output::source_map::{byte_offset_to_line_col, utf16_columns, SourceMapBuilder};
+
+// `o::Stmt` / `o::Expr` appear in EVERY public function signature (both the oxc and the swc
+// dispatch variants), so the neutral IR alias is always in scope; the rest of the IR surface
+// is only named by the oxc `Lowerer`.
+use crate::output_ast as o;
+#[cfg(all(feature = "oxc", not(feature = "swc")))]
 use crate::output_ast::{
-    self as o, ArrowBody, BinaryOperator, ExprKind, FnParam, ImportUrl, LiteralMapEntry,
-    LiteralValue, ParseSourceSpan, StmtKind, StmtModifier, UnaryOperator,
+    ArrowBody, BinaryOperator, ExprKind, FnParam, ImportUrl, LiteralMapEntry, LiteralValue,
+    ParseSourceSpan, StmtKind, StmtModifier, UnaryOperator,
 };
 
 // ---------------------------------------------------------------------------
@@ -77,7 +103,7 @@ pub fn emit_statements(stmts: &[o::Stmt]) -> String {
 ///
 /// Allocates its own arena, lowers each statement, wraps them in a [`Program`],
 /// and codegens to a [`String`].
-#[cfg(not(feature = "swc"))]
+#[cfg(all(feature = "oxc", not(feature = "swc")))]
 pub fn emit_statements(stmts: &[o::Stmt]) -> String {
     let allocator = Allocator::default();
     let lowerer = Lowerer::new(&allocator);
@@ -112,7 +138,7 @@ pub fn emit_expression(expr: &o::Expr) -> String {
 /// The expression is wrapped in an expression statement so codegen has a complete
 /// program to print (the trailing `;` codegen adds is left intact, matching
 /// Angular's `visitExpressionStmt`).
-#[cfg(not(feature = "swc"))]
+#[cfg(all(feature = "oxc", not(feature = "swc")))]
 pub fn emit_expression(expr: &o::Expr) -> String {
     let allocator = Allocator::default();
     let lowerer = Lowerer::new(&allocator);
@@ -133,6 +159,7 @@ pub fn emit_expression(expr: &o::Expr) -> String {
 /// `token` is the literal text we know the node will print (e.g. a `ReadVar`'s name).
 /// After codegen, [`build_segments`] locates each token in the final code — in
 /// lowering order — and emits a `generated -> original` source-map segment using `span`.
+#[cfg(all(feature = "oxc", not(feature = "swc")))]
 #[derive(Debug, Clone)]
 struct EmittedAnchor {
     /// Byte-offset span into the ORIGINAL authoring source (not the generated code).
@@ -149,6 +176,7 @@ struct EmittedAnchor {
 /// [`emit_with_anchors_expr`] wraps the input as an expression statement (matching
 /// `emit_expression`); [`emit_with_anchors_stmts`] lowers a statement list (matching
 /// `emit_statements`). Both produce code byte-identical to their plain counterpart.
+#[cfg(all(feature = "oxc", not(feature = "swc")))]
 fn emit_with_anchors_expr(expr: &o::Expr) -> (String, Vec<EmittedAnchor>) {
     let allocator = Allocator::default();
     let lowerer = Lowerer::with_anchor_tracking(&allocator);
@@ -163,6 +191,7 @@ fn emit_with_anchors_expr(expr: &o::Expr) -> (String, Vec<EmittedAnchor>) {
     (code, lowerer.take_anchors())
 }
 
+#[cfg(all(feature = "oxc", not(feature = "swc")))]
 fn emit_with_anchors_stmts(stmts: &[o::Stmt]) -> (String, Vec<EmittedAnchor>) {
     let allocator = Allocator::default();
     let lowerer = Lowerer::with_anchor_tracking(&allocator);
@@ -189,6 +218,7 @@ fn emit_with_anchors_stmts(stmts: &[o::Stmt]) -> (String, Vec<EmittedAnchor>) {
 /// `code` (scanning forward from the previous match so order is respected) and a segment is
 /// emitted from that generated position to the anchor's original position. Anchors whose
 /// token cannot be found are skipped (honest coverage — no fabricated mapping).
+#[cfg(all(feature = "oxc", not(feature = "swc")))]
 fn build_source_map(
     file_name: &str,
     source_name: &str,
@@ -221,6 +251,7 @@ fn build_source_map(
 }
 
 /// Convert a byte offset in the GENERATED code into a (line, UTF-16 column) position.
+#[cfg(all(feature = "oxc", not(feature = "swc")))]
 fn generated_byte_to_line_col(
     code: &str,
     byte_offset: usize,
@@ -244,7 +275,7 @@ fn generated_byte_to_line_col(
 /// Emit `(code, source_map_json)` for a slice of statements, where `code` is BYTE-IDENTICAL
 /// to [`emit_statements`]. The v3 source map maps span-carrying nodes back into
 /// `source_content` (named `source_name`); the generated file is `file_name`.
-#[cfg(not(feature = "swc"))]
+#[cfg(all(feature = "oxc", not(feature = "swc")))]
 pub fn emit_statements_with_map(
     stmts: &[o::Stmt],
     file_name: &str,
@@ -293,7 +324,7 @@ pub fn build_definition_map(
     )
 }
 
-#[cfg(not(feature = "swc"))]
+#[cfg(all(feature = "oxc", not(feature = "swc")))]
 pub fn build_definition_map(
     file_name: &str,
     source_name: &str,
@@ -326,7 +357,7 @@ pub fn build_definition_map(
 
 /// Emit `(code, source_map_json)` for a single expression, where `code` is BYTE-IDENTICAL
 /// to [`emit_expression`].
-#[cfg(not(feature = "swc"))]
+#[cfg(all(feature = "oxc", not(feature = "swc")))]
 pub fn emit_expression_with_map(
     expr: &o::Expr,
     file_name: &str,
@@ -350,13 +381,20 @@ pub fn emit_expression_with_map(
 }
 
 // ---------------------------------------------------------------------------
-// Lowerer
+// Lowerer  (oxc emit backend — the ONLY `oxc_*`-AST consumer in this crate)
 // ---------------------------------------------------------------------------
+//
+// Everything from here to the test module is the oxc lowering, gated
+// `all(feature = "oxc", not(feature = "swc"))` item-by-item (the `OXC_EMIT_GATE` marker
+// flags each). A `--no-default-features --features swc` build of `treaty_ivy_core` compiles
+// NONE of it and names no `oxc_*` type; the gated public dispatch functions above reach these
+// helpers directly because they share the same crate module + identical cfg.
 
 /// Owns the [`AstBuilder`] used to allocate every lowered node into the arena, plus
 /// an [`ImportManager`] that assigns each distinct external module a stable namespace
 /// alias (`i0`, `i1`, ...) so runtime references emit as `i0.ɵɵfoo` instead of an
 /// invalid dotted module path (`@angular/core.ɵɵfoo`).
+#[cfg(all(feature = "oxc", not(feature = "swc")))]
 struct Lowerer<'a> {
     ast: AstBuilder<'a>,
     imports: RefCell<ImportManager>,
@@ -368,6 +406,7 @@ struct Lowerer<'a> {
 /// Maps module specifiers (`@angular/core`, ...) to stable namespace import aliases
 /// in first-seen order. Mirrors the behaviour of Angular's ngtsc `ImportManager`,
 /// which emits `import * as iN from "<module>"` and references symbols as `iN.symbol`.
+#[cfg(all(feature = "oxc", not(feature = "swc")))]
 #[derive(Default)]
 struct ImportManager {
     /// `(module_specifier, alias)` pairs, in insertion order. A `Vec` keeps emission
@@ -375,6 +414,7 @@ struct ImportManager {
     modules: Vec<(String, String)>,
 }
 
+#[cfg(all(feature = "oxc", not(feature = "swc")))]
 impl ImportManager {
     /// Return the stable alias for `module`, allocating a fresh `iN` on first sight.
     fn alias_for(&mut self, module: &str) -> String {
@@ -387,6 +427,7 @@ impl ImportManager {
     }
 }
 
+#[cfg(all(feature = "oxc", not(feature = "swc")))]
 impl<'a> Lowerer<'a> {
     fn new(allocator: &'a Allocator) -> Self {
         Lowerer {
@@ -1238,6 +1279,7 @@ impl<'a> Lowerer<'a> {
 /// literals fall in the fixed range, so Rust's default `{}` formatting matches JS
 /// exactly there. We special-case the extreme magnitudes to stay faithful for the
 /// rare large/small values.
+#[cfg(all(feature = "oxc", not(feature = "swc")))]
 fn format_number(n: f64) -> String {
     if !n.is_finite() {
         // NaN / Infinity are not valid numeric literals; fall back to a
@@ -1266,6 +1308,7 @@ fn format_number(n: f64) -> String {
 /// Is `b` a byte that can be the FIRST character of a numeric-literal token? Only a
 /// leading decimal digit; the `.5` lead-dot form is handled by the caller (it must look
 /// ahead one byte to confirm a following digit).
+#[cfg(all(feature = "oxc", not(feature = "swc")))]
 fn is_number_start(b: u8) -> bool {
     b.is_ascii_digit()
 }
@@ -1273,6 +1316,7 @@ fn is_number_start(b: u8) -> bool {
 /// Is `b` a byte that may appear inside a numeric-literal token after the first? Covers
 /// decimal digits, the decimal point, exponent marker (`e`/`E`), hex digits, the
 /// `0x`/`0b`/`0o` radix letters, the `_` numeric separator and the BigInt `n` suffix.
+#[cfg(all(feature = "oxc", not(feature = "swc")))]
 fn is_number_continue(b: u8) -> bool {
     b.is_ascii_hexdigit()
         || matches!(b, b'.' | b'e' | b'E' | b'x' | b'X' | b'b' | b'B' | b'o' | b'O' | b'_' | b'n')
@@ -1281,6 +1325,7 @@ fn is_number_continue(b: u8) -> bool {
 /// Parse a JS numeric-literal token (decimal, scientific, hex/oct/bin) into its `f64`
 /// value. Returns `None` for BigInt (`…n`), separator-bearing, or otherwise non-trivially
 /// reparseable tokens so the caller leaves them untouched.
+#[cfg(all(feature = "oxc", not(feature = "swc")))]
 fn parse_js_number(tok: &str) -> Option<f64> {
     if tok.is_empty() || tok.contains('_') || tok.ends_with('n') {
         return None;
@@ -1304,6 +1349,7 @@ fn parse_js_number(tok: &str) -> Option<f64> {
 /// positions are considered, and only rewrites a token when it is preceded by a non-
 /// identifier, non-`.` byte (so member chains like `i0.x` and identifiers like `_r1`
 /// are never touched) and reparses losslessly.
+#[cfg(all(feature = "oxc", not(feature = "swc")))]
 fn normalize_numeric_literals(code: &str) -> String {
     let bytes = code.as_bytes();
     let n = bytes.len();
@@ -1461,6 +1507,7 @@ fn normalize_numeric_literals(code: &str) -> String {
 /// byte cannot terminate an operand (so the `/` is not a division operator). Standard
 /// lexer heuristic; conservative — a wrong guess only changes whether a span is scanned
 /// as regex vs. code, and numbers inside either are handled correctly regardless.
+#[cfg(all(feature = "oxc", not(feature = "swc")))]
 fn regex_can_follow(prev: u8) -> bool {
     match prev {
         0 => true, // start of input
@@ -1484,6 +1531,7 @@ fn regex_can_follow(prev: u8) -> bool {
 /// Is `b` a byte that may appear in a JS identifier? (ASCII fast-path plus any
 /// non-ASCII byte, since identifiers may contain Unicode letters and our emitted
 /// runtime names use the `ɵ` prefix.)
+#[cfg(all(feature = "oxc", not(feature = "swc")))]
 fn is_ident_byte(b: u8) -> bool {
     b == b'_' || b == b'$' || b.is_ascii_alphanumeric() || b >= 0x80
 }
@@ -1493,6 +1541,7 @@ fn is_ident_byte(b: u8) -> bool {
 /// spans, so only real code is considered. Any param list that is not exactly one
 /// simple identifier (commas, defaults, destructuring, rest, annotations) keeps its
 /// parens because the inner scan would hit a non-identifier byte before the `)`.
+#[cfg(all(feature = "oxc", not(feature = "swc")))]
 fn drop_single_param_arrow_parens(code: &str) -> String {
     let bytes = code.as_bytes();
     let n = bytes.len();
@@ -1586,6 +1635,7 @@ fn drop_single_param_arrow_parens(code: &str) -> String {
 /// list — `(ident) =>` — return `(ident_start, ident_end, index_after_close_paren)`.
 /// Returns `None` for anything else (empty parens, multiple params, defaults,
 /// destructuring, rest, type annotations, or a non-arrow `(...)` group).
+#[cfg(all(feature = "oxc", not(feature = "swc")))]
 fn try_single_param_arrow(bytes: &[u8], open: usize) -> Option<(usize, usize, usize)> {
     let n = bytes.len();
     debug_assert_eq!(bytes[open], b'(');
@@ -1630,6 +1680,7 @@ fn try_single_param_arrow(bytes: &[u8], open: usize) -> Option<(usize, usize, us
 // ---------------------------------------------------------------------------
 
 /// Logical operators (`&&`, `||`, `??`) → oxc `LogicalOperator`, or `None` if not logical.
+#[cfg(all(feature = "oxc", not(feature = "swc")))]
 fn logical_op(op: BinaryOperator) -> Option<LogicalOperator> {
     match op {
         BinaryOperator::And => Some(LogicalOperator::And),
@@ -1641,6 +1692,7 @@ fn logical_op(op: BinaryOperator) -> Option<LogicalOperator> {
 
 /// Assignment operators (`=` + compounds) → oxc `AssignmentOperator`.
 /// Only called when [`BinaryOperator::is_assignment`] is true.
+#[cfg(all(feature = "oxc", not(feature = "swc")))]
 fn assignment_op(op: BinaryOperator) -> AssignmentOperator {
     match op {
         BinaryOperator::Assign => AssignmentOperator::Assign,
@@ -1660,6 +1712,7 @@ fn assignment_op(op: BinaryOperator) -> AssignmentOperator {
 
 /// Plain binary operators → oxc `BinaryOperator`. Only called for non-logical,
 /// non-assignment ops.
+#[cfg(all(feature = "oxc", not(feature = "swc")))]
 fn binary_op(op: BinaryOperator) -> OxBin {
     match op {
         BinaryOperator::Equals => OxBin::Equality,
@@ -1691,6 +1744,7 @@ fn binary_op(op: BinaryOperator) -> OxBin {
 
 /// Parse a JS regex flag string (`"gi"`, `"sm"`, ...) into oxc [`RegExpFlags`].
 /// Unknown chars are ignored (oxc only models the standard `gimsuydv` set).
+#[cfg(all(feature = "oxc", not(feature = "swc")))]
 fn parse_regexp_flags(flags: &str) -> RegExpFlags {
     let mut out = RegExpFlags::empty();
     for c in flags.chars() {
@@ -1714,13 +1768,18 @@ fn parse_regexp_flags(flags: &str) -> RegExpFlags {
 // `serializeI18nHead` / `serializeI18nTemplatePart` / `createCookedRawString`).
 // ---------------------------------------------------------------------------
 
+#[cfg(all(feature = "oxc", not(feature = "swc")))]
 const MEANING_SEPARATOR: &str = "|";
+#[cfg(all(feature = "oxc", not(feature = "swc")))]
 const ID_SEPARATOR: &str = "@@";
+#[cfg(all(feature = "oxc", not(feature = "swc")))]
 const LEGACY_ID_INDICATOR: &str = "\u{241f}";
 
+#[cfg(all(feature = "oxc", not(feature = "swc")))]
 fn escape_slashes(s: &str) -> String {
     s.replace('\\', "\\\\")
 }
+#[cfg(all(feature = "oxc", not(feature = "swc")))]
 fn escape_starting_colon(s: &str) -> String {
     if let Some(rest) = s.strip_prefix(':') {
         format!("\\:{rest}")
@@ -1728,14 +1787,17 @@ fn escape_starting_colon(s: &str) -> String {
         s.to_string()
     }
 }
+#[cfg(all(feature = "oxc", not(feature = "swc")))]
 fn escape_colons(s: &str) -> String {
     s.replace(':', "\\:")
 }
+#[cfg(all(feature = "oxc", not(feature = "swc")))]
 fn escape_for_template_literal(s: &str) -> String {
     s.replace('`', "\\`").replace("${", "$\\{")
 }
 
 /// `createCookedRawString(metaBlock, messagePart)` -> `(cooked, raw)`.
+#[cfg(all(feature = "oxc", not(feature = "swc")))]
 fn create_cooked_raw_string(meta_block: &str, message_part: &str) -> (String, String) {
     if meta_block.is_empty() {
         let cooked = message_part.to_string();
@@ -1755,6 +1817,7 @@ fn create_cooked_raw_string(meta_block: &str, message_part: &str) -> (String, St
 /// `LocalizedString.serializeI18nHead()` -> `(cooked, raw)` for message part 0.
 /// The meta block is `meaning|description@@customId␟legacyId...` (each segment
 /// present only when set), per `parseI18nMeta`'s format.
+#[cfg(all(feature = "oxc", not(feature = "swc")))]
 fn serialize_i18n_head(meta: &o::I18nMeta, first_part: &str) -> (String, String) {
     let mut meta_block = meta.description.clone().unwrap_or_default();
     if let Some(meaning) = meta.meaning.as_deref().filter(|m| !m.is_empty()) {
@@ -1772,6 +1835,7 @@ fn serialize_i18n_head(meta: &o::I18nMeta, first_part: &str) -> (String, String)
 /// `LocalizedString.serializeI18nTemplatePart(i)` -> `(cooked, raw)`. The meta
 /// block is `<placeholder-name>[@@<associated-id>]`, where the associated id is the
 /// computed message id of the associated (ICU) message when it has no legacy ids.
+#[cfg(all(feature = "oxc", not(feature = "swc")))]
 fn serialize_i18n_template_part(
     placeholder: &o::PlaceholderPiece,
     message_part: &str,
@@ -1797,9 +1861,12 @@ fn serialize_i18n_template_part(
 mod tests {
     use super::*;
     use crate::identifiers::R3;
+    // These IR types are also imported (gated) at module scope for the oxc `Lowerer`, but the
+    // tests drive the public `emit_*` API under EITHER backend, so import them here directly
+    // rather than via the oxc-only `use super::*` re-export (keeps the suite backend-agnostic).
     use crate::output_ast::{
-        import_expr, literal, variable, ExprKind, LiteralValue, Stmt, StmtKind, StmtModifier,
-        UnaryOperator,
+        import_expr, literal, variable, ArrowBody, ExprKind, FnParam, LiteralValue,
+        ParseSourceSpan, Stmt, StmtKind, StmtModifier, UnaryOperator,
     };
 
     fn num(n: f64) -> o::Expr {

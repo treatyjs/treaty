@@ -42,6 +42,15 @@ pub struct ObjLit {
     pub props: Vec<(String, LitValue)>,
     /// The byte span of the whole `{ … }` literal.
     pub span: TreatySpan,
+    /// The LOSSLESS full-expression view of the SAME object literal: EVERY property in source order —
+    /// `key: value` (value as a full [`NExpr`], not the lossy [`LitValue`]), spreads, computed keys —
+    /// element-for-element with the AST (see [`NObjectProp`]). This is the surface the partial-link
+    /// walk needs: `linker::link_partial_walk`'s `first_object_expression` + `convert_expr` lower
+    /// ARBITRARY `ɵɵngDeclare` object values (`providers`, `useFactory` arrows, `transform` fns) into
+    /// full `o::Expr`, which the lossy `props` (an `NExpr::Arrow`/`Call` degrades to `LitValue::Other`)
+    /// cannot carry. `props` stays the metadata-subset fast path; `nprops` is the complete one. Filled
+    /// identically by both backends, in source order.
+    pub nprops: Vec<NObjectProp>,
 }
 
 impl ObjLit {
@@ -278,12 +287,16 @@ pub enum NArrayElement {
 #[derive(Debug, Clone, PartialEq)]
 pub enum NObjectProp {
     /// `key: value`. `quoted` is set when the key is not a bare-identifier-safe name; `computed` is
-    /// set when the source wrote a computed key (`['k']: v`).
+    /// set when the source wrote a computed key (`['k']: v`). `value_span` is the byte span of the
+    /// VALUE expression — the verbatim-source surface `partial_emit::prop_source` reads (it slices the
+    /// trimmed source of `providedIn`/`providers`/`useFactory`/… to round-trip an opaque value byte
+    /// for byte). Filled identically by both backends.
     KeyValue {
         key: String,
         value: NExpr,
         quoted: bool,
         computed: bool,
+        value_span: TreatySpan,
     },
     /// `...expr`.
     Spread(NExpr),
@@ -291,13 +304,90 @@ pub enum NObjectProp {
     Other(TreatySpan),
 }
 
-/// A call/new ARGUMENT: a plain expression or a `...spread`.
+/// A call/new ARGUMENT: a plain expression or a `...spread`, each carrying the byte span of its
+/// argument expression. The span is the verbatim-source surface the partial emit's factory-body
+/// decompile reads — `partial_emit::dep_entry_from_inject` / `arg_source` slice the trimmed source of
+/// each `ɵɵinject(Token, …)` argument to round-trip an opaque DI token byte for byte. Filled
+/// identically by both backends.
 #[derive(Debug, Clone, PartialEq)]
 pub enum NArg {
-    /// `expr`.
-    Expr(NExpr),
-    /// `...expr`.
-    Spread(NExpr),
+    /// `expr` (with its byte span).
+    Expr(NExpr, TreatySpan),
+    /// `...expr` (the span covers the inner expression).
+    Spread(NExpr, TreatySpan),
+}
+
+impl NArg {
+    /// The argument's expression, regardless of spread-ness.
+    pub fn expr(&self) -> &NExpr {
+        match self {
+            NArg::Expr(e, _) | NArg::Spread(e, _) => e,
+        }
+    }
+
+    /// The argument expression's byte span.
+    pub fn span(&self) -> TreatySpan {
+        match self {
+            NArg::Expr(_, s) | NArg::Spread(_, s) => *s,
+        }
+    }
+}
+
+// ===========================================================================
+// Neutral TOP-LEVEL PROGRAM surface (the AOT→partial emitter's walk surface).
+//
+// `partial_emit::collect_rewrites` walks the AOT module's TOP-LEVEL statements: each is an
+// `X.ɵfac = function …` / `X.ɵprov = i0.ɵɵdefineInjectable({…})` ASSIGNMENT (rewritten to its
+// `ɵɵngDeclare*` form, the RHS span overwritten), a `ɵɵsetNgModuleScope(X, {…})` side-effect CALL
+// (read for an NgModule's declarations/imports/exports), or some other statement (left verbatim).
+// The nodes below model exactly that surface — a top-level statement list with spans + `NExpr`
+// values — so the emitter's walk can run neutrally. They are ADDITIVE: this phase fills them in
+// SOURCE order from BOTH backends and gates them at parity; the emitter still walks the live oxc AST.
+// ===========================================================================
+
+/// One TOP-LEVEL program statement, in source order — the surface
+/// [`partial_emit::collect_rewrites`] walks. Only the shapes that walk distinguishes are modelled
+/// richly (an `X.member = rhs` assignment statement, a bare call statement, a `var`/`let`/`const`
+/// declaration whose initializer the `ɵɵngDeclare*` scan reads); every other statement is
+/// [`NTopStmt::Other`], carrying its span so nothing is dropped.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NTopStmt {
+    /// An `X.member = rhs;` assignment expression statement (the `ɵfac`/`ɵprov`/`ɵpipe`/`ɵmod`/`ɵinj`/
+    /// `ɵcmp`/`ɵdir` definition scaffold the AOT emit produces).
+    Assignment(NAssignment),
+    /// A bare expression statement whose expression is a call (`ɵɵsetNgModuleScope(X, {…})`, possibly
+    /// wrapped in a `typeof ngJitMode … && …` guard). Carries the call as an [`NExpr`] + the statement
+    /// span.
+    ExprStmt { expr: NExpr, span: TreatySpan },
+    /// A `var`/`let`/`const name = init;` declaration (its declarators mirror [`NStmt::VarDecl`]) —
+    /// the linker also surfaces `ɵɵngDeclare*` initializers here. Carries the statement span.
+    VarDecl {
+        is_const: bool,
+        decls: Vec<NVarDeclarator>,
+        span: TreatySpan,
+    },
+    /// Any other top-level statement (import, class declaration, …) — span only.
+    Other(TreatySpan),
+}
+
+/// A top-level `X.member = rhs;` assignment — the definition-scaffold shape
+/// [`partial_emit::collect_rewrites`] rewrites. Carries the LHS's `<Ident>.<member>` parts (the
+/// `assignment_member` read), the RHS as a full [`NExpr`] (so the factory-body decompile — `new`
+/// args, inject calls, `ɵɵgetInheritedFactory`/`ɵɵinvalidFactory` references — is reachable
+/// neutrally), and the byte spans the surgical rewrite needs (the RHS span is overwritten with the
+/// `ɵɵngDeclare*` text).
+#[derive(Debug, Clone, PartialEq)]
+pub struct NAssignment {
+    /// The LHS object identifier (`X` in `X.ɵfac = …`), when the target is `<Ident>.<member>`.
+    pub target_object: Option<String>,
+    /// The LHS member name (`ɵfac`/`ɵprov`/…), when the target is `<Ident>.<member>`.
+    pub target_member: Option<String>,
+    /// The right-hand side, as a full neutral expression.
+    pub value: NExpr,
+    /// The byte span of the right-hand side (the bytes the surgical rewrite overwrites).
+    pub value_span: TreatySpan,
+    /// The byte span of the whole assignment statement.
+    pub span: TreatySpan,
 }
 
 /// A pre-lowered Angular DECORATOR on a class: its callee name and (when called with an object
@@ -313,6 +403,13 @@ pub struct DecoratorInfo {
     /// bare `@Foo`. Captures the args the structural `object` does not — e.g. `@HostListener('click',
     /// ['$event'])`'s event name + arg-binding array, and `@Inject(TOKEN)`'s token.
     pub arguments: Vec<NArg>,
+    /// The byte span of the WHOLE decorator node (`@Foo({…})`, leading `@` included). Load-bearing for
+    /// the AOT front-end's surgical decorator EXCISION: `source_compile::recognized_decorator_strip_span`
+    /// spans first..last recognized class decorator (`@Component`+`@Injectable`) to cut the exact bytes
+    /// for the kept `export class X {…}`, and `member_decorator_strip_spans` cuts each inert member
+    /// decorator (`@Input`/`@HostBinding`/…) off the kept class-body slice. Filled identically by both
+    /// backends (oxc `Decorator::span` / swc `Decorator.span`, rebased).
+    pub span: TreatySpan,
 }
 
 /// The kind of a class member, mirroring the `oxc_ast::ClassElement` discriminants the walk
@@ -359,6 +456,10 @@ pub struct MemberInfo {
     pub params: Vec<NCtorParam>,
     /// The property/accessor initializer expression (`x = input(0)` → the `input(0)` call), if any.
     pub initializer: Option<NExpr>,
+    /// The byte span of the whole member node. Carried so a consumer can recover the member's source
+    /// slice (the kept class-body emit excises inert member decorators from within this range). Filled
+    /// identically by both backends.
+    pub span: TreatySpan,
 }
 
 /// A constructor / method PARAMETER carrying its own decorators — the shape constructor-dependency
@@ -385,4 +486,16 @@ pub struct ClassWithDecorators {
     pub decorators: Vec<DecoratorInfo>,
     /// The class's members in source order.
     pub members: Vec<MemberInfo>,
+    /// The byte span of the CLASS node itself (the `class X {…}`/`@Dec class X {…}` declaration). Its
+    /// `span.start` is the forward-reference anchor: `source_compile` keys `class_decl_positions` on it
+    /// (`isExpressionForwardReference`: a dependency declared LATER — `context.pos < node.pos` — forces
+    /// the `dependencies` array into a `() => [...]` closure, `DeclarationListEmitMode::Closure`). Both
+    /// backends fill the class node's own span (decorators included, as oxc's `Class::span` does).
+    pub span: TreatySpan,
+    /// The byte span of the ENCLOSING top-level statement that declares this class — its leading
+    /// decorator, or the `export`/`class` keyword when undecorated. `source_compile::decorated_stmt_start`
+    /// uses `stmt_span.start` as the assembly key when re-stitching the kept class declarations around
+    /// the emitted Ivy statics. Equals [`Self::span`] for a bare `class X {}`, and starts at the
+    /// `export`/decorator for an exported / decorated class. Filled identically by both backends.
+    pub stmt_span: TreatySpan,
 }

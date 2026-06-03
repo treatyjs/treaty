@@ -22,18 +22,17 @@
 //! (`toR3FactoryMeta`, `toR3InjectableMeta`, `toR3InjectorMeta`, `toR3NgModuleMeta`,
 //! `toR3PipeMeta`, plus the shared `util.ts` `getDependency`/`extractForwardRef`/`wrapReference`).
 
-// PARSE is driven through the engine-neutral `crate::parse::ParsingBackend` (the two top-level entry
-// points + the per-declaration re-parse no longer name `oxc_parser`/`oxc_allocator`/
-// `oxc_span::SourceType`). The remaining `oxc_ast` references below are the linker's WALK reading the
-// live declaration-object AST (the `link_*`/`convert_expr` family) handed back by the backend; that
-// recursive object walk stays on the live AST so the linked output is byte-identical.
-use oxc_ast::ast::{
-    ArrayExpressionElement, Argument, CallExpression, Expression, ObjectExpression,
-    ObjectPropertyKind, PropertyKey, Statement,
+// PARSE and WALK are now BOTH driven through the engine-neutral `crate::parse` surface: this module
+// names ZERO live oxc nodes. `link_partial` parses through `ParsingBackend`, then drives the
+// per-declaration `link_*`/`convert_expr` family off the pre-lowered neutral object literals — each
+// `ɵɵngDeclare*` call surfaces as a [`NgDeclareCall`] (its `call_span` is the surgical-rewrite range,
+// its `object.nprops` the LOSSLESS full-`NExpr` property list the walk lowers to `output_ast`). The
+// recursive object walk reads `NExpr`/`NObjectProp`/`NArg` structurally; no source slicing is needed
+// (the conversion is purely structural), so the linked output stays byte-identical.
+use crate::parse::{
+    NArg, NArrayElement, NArrowBody, NExpr, NObjectProp, NParam, NStmt, ParseBackend, ParsingBackend,
+    SourceKind,
 };
-use oxc_span::GetSpan;
-
-use crate::parse::{ParseBackend, ParsingBackend, SourceKind};
 
 use crate::factory::{
     compile_factory_function, compile_injectable, compile_service, FactoryDeps, FactoryTarget,
@@ -101,49 +100,48 @@ fn strip_leading_i0_import(block: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// oxc-AST helpers (the common-case readers the declaration objects need). These mirror the
-// equivalents in `source_compile` but are kept local so the linker is self-contained.
+// Neutral object-literal readers (the common-case readers the declaration objects need). These mirror
+// the equivalents in `source_compile` but read the neutral [`NObjectProp`] / [`NExpr`] surface.
 // ---------------------------------------------------------------------------
 
-/// The static-identifier / string name of a property key (`type`, `providedIn`, …).
-fn key_name<'a>(key: &'a PropertyKey<'a>) -> Option<&'a str> {
-    match key {
-        PropertyKey::StaticIdentifier(id) => Some(id.name.as_str()),
-        PropertyKey::StringLiteral(s) => Some(s.value.as_str()),
-        _ => None,
-    }
-}
+/// A declaration object literal's properties (the lossless `ObjLit::nprops` view).
+type Props<'a> = &'a [NObjectProp];
 
-/// Look up an object-literal property value by name.
-fn find_prop<'a>(obj: &'a ObjectExpression<'a>, name: &str) -> Option<&'a Expression<'a>> {
-    obj.properties.iter().find_map(|p| match p {
-        ObjectPropertyKind::ObjectProperty(op) if key_name(&op.key) == Some(name) => Some(&op.value),
+/// Look up an object-literal property value by name (first static-key match in source order).
+fn find_prop<'a>(props: Props<'a>, name: &str) -> Option<&'a NExpr> {
+    props.iter().find_map(|p| match p {
+        NObjectProp::KeyValue { key, value, .. } if key == name => Some(value),
         _ => None,
     })
 }
 
-/// Read a string-literal value (`selector`, the pipe `name`, …).
-fn string_value(expr: &Expression) -> Option<String> {
+/// The properties of a nested object-literal value, if `expr` is an object.
+fn object_props(expr: &NExpr) -> Option<&[NObjectProp]> {
     match expr {
-        Expression::StringLiteral(s) => Some(s.value.to_string()),
-        Expression::TemplateLiteral(t) if t.expressions.is_empty() && t.quasis.len() == 1 => {
-            t.quasis[0].value.cooked.as_ref().map(|c| c.to_string())
-        }
+        NExpr::Object(props) => Some(props),
+        _ => None,
+    }
+}
+
+/// Read a string-literal value (`selector`, the pipe `name`, …).
+fn string_value(expr: &NExpr) -> Option<String> {
+    match expr {
+        NExpr::String(s) => Some(s.clone()),
         _ => None,
     }
 }
 
 /// Read a `true`/`false` literal value.
-fn bool_value(expr: &Expression) -> Option<bool> {
+fn bool_value(expr: &NExpr) -> Option<bool> {
     match expr {
-        Expression::BooleanLiteral(b) => Some(b.value),
+        NExpr::Boolean(b) => Some(*b),
         _ => None,
     }
 }
 
 /// `depObj.getBoolean(name)` — a property whose value is the boolean literal `true`.
-fn prop_is_true(obj: &ObjectExpression, name: &str) -> bool {
-    matches!(find_prop(obj, name), Some(e) if bool_value(e) == Some(true))
+fn prop_is_true(props: Props, name: &str) -> bool {
+    matches!(find_prop(props, name), Some(e) if bool_value(e) == Some(true))
 }
 
 /// A class self-reference (`{value: Foo, ty: Foo}`) — the linker's `wrapReference`, where the
@@ -157,7 +155,7 @@ fn class_ref(name: &str) -> R3Reference {
 
 /// Build a class [`R3Reference`] from a `type` expression, carrying the exact `value`/`ty`
 /// expression (`ns.Foo` is preserved verbatim) rather than only its symbol name.
-fn class_ref_from(type_expr: &Expression) -> Result<R3Reference, String> {
+fn class_ref_from(type_expr: &NExpr) -> Result<R3Reference, String> {
     let value =
         convert_expr(type_expr).ok_or_else(|| "unsupported `type` expression".to_string())?;
     let ty = value.clone();
@@ -167,73 +165,57 @@ fn class_ref_from(type_expr: &Expression) -> Result<R3Reference, String> {
 /// The "symbol name" of a `type`/token expression — its bare identifier (`Foo`) or, for `ns.Foo`,
 /// the final property name. Mirrors `AstValue.getSymbolName()` for the cases that appear as a
 /// partial-declaration `type`.
-fn symbol_name(expr: &Expression) -> Option<String> {
+fn symbol_name(expr: &NExpr) -> Option<String> {
     match expr {
-        Expression::Identifier(id) => Some(id.name.to_string()),
-        Expression::StaticMemberExpression(m) => Some(m.property.name.to_string()),
-        Expression::ParenthesizedExpression(p) => symbol_name(&p.expression),
+        NExpr::Identifier(name) => Some(name.clone()),
+        NExpr::Member { property, .. } => Some(property.clone()),
+        NExpr::Parenthesized(p) => symbol_name(p),
         _ => None,
     }
 }
 
-/// Best-effort conversion of an oxc `Expression` into an `output_ast` [`Expr`], faithful enough to
+/// Best-effort conversion of a neutral [`NExpr`] into an `output_ast` [`Expr`], faithful enough to
 /// carry opaque declaration values through verbatim (tokens, `providers`/`imports` arrays,
 /// `useFactory`/`useValue` expressions — the linker's `getOpaque()`). Handles the literal +
 /// reference subset that appears in `ɵɵngDeclare*` objects.
-fn convert_expr(expr: &Expression) -> Option<Expr> {
+fn convert_expr(expr: &NExpr) -> Option<Expr> {
     match expr {
-        Expression::StringLiteral(s) => {
-            Some(o::literal(LiteralValue::String(s.value.to_string()), None))
-        }
-        Expression::TemplateLiteral(t) if t.expressions.is_empty() && t.quasis.len() == 1 => t
-            .quasis[0]
-            .value
-            .cooked
-            .as_ref()
-            .map(|c| o::literal(LiteralValue::String(c.to_string()), None)),
-        Expression::NumericLiteral(n) => Some(o::literal(LiteralValue::Number(n.value), None)),
-        Expression::BooleanLiteral(b) => Some(o::literal(LiteralValue::Bool(b.value), None)),
-        Expression::NullLiteral(_) => Some(o::literal(LiteralValue::Null, None)),
-        Expression::Identifier(id) => Some(o::variable(id.name.to_string(), None)),
-        Expression::ArrayExpression(arr) => {
-            let mut elems = Vec::with_capacity(arr.elements.len());
-            for el in &arr.elements {
+        NExpr::String(s) => Some(o::literal(LiteralValue::String(s.clone()), None)),
+        NExpr::Number(n) => Some(o::literal(LiteralValue::Number(*n), None)),
+        NExpr::Boolean(b) => Some(o::literal(LiteralValue::Bool(*b), None)),
+        NExpr::Null => Some(o::literal(LiteralValue::Null, None)),
+        NExpr::Identifier(name) => Some(o::variable(name.clone(), None)),
+        NExpr::Array(elems) => {
+            let mut out = Vec::with_capacity(elems.len());
+            for el in elems {
                 match el {
                     // `[...providers]` — a spread element carries its argument through as
                     // `...expr` (opaque providers/imports arrays are passed verbatim).
-                    ArrayExpressionElement::SpreadElement(s) => {
-                        elems.push(o::spread(convert_expr(&s.argument)?));
-                    }
+                    NArrayElement::Spread(e) => out.push(o::spread(convert_expr(e)?)),
                     // Holes (`[, x]`) are not part of any partial declaration we link.
-                    ArrayExpressionElement::Elision(_) => return None,
-                    other => {
-                        let inner = other.as_expression()?;
-                        elems.push(convert_expr(inner)?);
-                    }
+                    NArrayElement::Hole => return None,
+                    NArrayElement::Expr(e) => out.push(convert_expr(e)?),
                 }
             }
-            Some(o::literal_arr(elems, None))
+            Some(o::literal_arr(out, None))
         }
-        Expression::ObjectExpression(obj) => {
-            let mut entries = Vec::with_capacity(obj.properties.len());
-            for p in &obj.properties {
+        NExpr::Object(props) => {
+            let mut entries = Vec::with_capacity(props.len());
+            for p in props {
                 match p {
-                    ObjectPropertyKind::ObjectProperty(op) => {
-                        let key = key_name(&op.key)?;
-                        let quoted = !is_safe_object_key(key);
+                    NObjectProp::KeyValue { key, value, quoted, .. } => {
                         entries.push(LiteralMapEntry::Property {
-                            key: key.to_string(),
-                            value: convert_expr(&op.value)?,
-                            quoted,
+                            key: key.clone(),
+                            value: convert_expr(value)?,
+                            quoted: *quoted,
                         });
                     }
-                    // `{...defaults}` — an object spread carries its argument through as
-                    // `...expr`.
-                    ObjectPropertyKind::SpreadProperty(sp) => {
-                        entries.push(LiteralMapEntry::Spread {
-                            expression: convert_expr(&sp.argument)?,
-                        });
-                    }
+                    // `{...defaults}` — an object spread carries its argument through as `...expr`.
+                    NObjectProp::Spread(e) => entries.push(LiteralMapEntry::Spread {
+                        expression: convert_expr(e)?,
+                    }),
+                    // A shorthand / method / getter-setter property has no opaque-value mapping.
+                    NObjectProp::Other(_) => return None,
                 }
             }
             Some(Expr::bare(ExprKind::LiteralMap {
@@ -241,78 +223,64 @@ fn convert_expr(expr: &Expression) -> Option<Expr> {
                 value_type: None,
             }))
         }
-        Expression::StaticMemberExpression(m) => {
-            let object = convert_expr(&m.object)?;
-            Some(object.prop(m.property.name.as_str()))
+        NExpr::Member { object, property } => {
+            let object = convert_expr(object)?;
+            Some(object.prop(property.as_str()))
         }
-        Expression::CallExpression(call) => {
-            let callee = convert_expr(&call.callee)?;
-            let mut args = Vec::with_capacity(call.arguments.len());
-            for a in &call.arguments {
-                let inner = a.as_expression()?;
-                args.push(convert_expr(inner)?);
+        NExpr::Call { callee, args } => {
+            let callee = convert_expr(callee)?;
+            let mut out = Vec::with_capacity(args.len());
+            for a in args {
+                // The live walk declined a spread argument (`a.as_expression()` is `None` for a
+                // spread); mirror that — only plain expression args convert.
+                let NArg::Expr(inner, _) = a else { return None };
+                out.push(convert_expr(inner)?);
             }
-            Some(callee.call_fn(args, false))
+            Some(callee.call_fn(out, false))
         }
-        Expression::NewExpression(new_expr) => {
-            let callee = convert_expr(&new_expr.callee)?;
-            let mut args: Vec<Expr> = Vec::with_capacity(new_expr.arguments.len());
-            for a in &new_expr.arguments {
-                let inner = a.as_expression()?;
-                args.push(convert_expr(inner)?);
+        NExpr::New { callee, args } => {
+            let callee = convert_expr(callee)?;
+            let mut out: Vec<Expr> = Vec::with_capacity(args.len());
+            for a in args {
+                let NArg::Expr(inner, _) = a else { return None };
+                out.push(convert_expr(inner)?);
             }
             // `new callee(...args)` via the `Expr::instantiate` builder.
-            Some(callee.instantiate(args))
+            Some(callee.instantiate(out))
         }
-        Expression::ParenthesizedExpression(p) => {
+        NExpr::Parenthesized(inner) => {
             // Preserve the explicit grouping so emitted precedence matches the source
             // (`(a || b) && c`); the inner expression carries through.
-            convert_expr(&p.expression).map(|inner| Expr::bare(ExprKind::Parenthesized(Box::new(inner))))
+            convert_expr(inner).map(|inner| Expr::bare(ExprKind::Parenthesized(Box::new(inner))))
         }
         // `cond ? a : b` — input transform functions are routinely written as a guarded
         // ternary (`value => value == null ? undefined : numberAttribute(value)`), so the
         // declaration's opaque `transformFunction` must carry the conditional through verbatim.
-        Expression::ConditionalExpression(cond) => {
-            let condition = convert_expr(&cond.test)?;
-            let true_case = convert_expr(&cond.consequent)?;
-            let false_case = convert_expr(&cond.alternate)?;
+        NExpr::Conditional { test, consequent, alternate } => {
+            let condition = convert_expr(test)?;
+            let true_case = convert_expr(consequent)?;
+            let false_case = convert_expr(alternate)?;
             Some(condition.conditional(true_case, Some(false_case)))
         }
-        // `a && b`, `a || b`, `a ?? b` — logical operators inside transform/factory bodies.
-        Expression::LogicalExpression(logical) => {
-            let op = match logical.operator {
-                oxc_ast::ast::LogicalOperator::And => BinaryOperator::And,
-                oxc_ast::ast::LogicalOperator::Or => BinaryOperator::Or,
-                oxc_ast::ast::LogicalOperator::Coalesce => BinaryOperator::NullishCoalesce,
-            };
-            let lhs = convert_expr(&logical.left)?;
-            let rhs = convert_expr(&logical.right)?;
-            Some(binary_expr(op, lhs, rhs))
-        }
-        // Comparison / arithmetic binary operators (`value == null`, `x + 1`, …). Operators with
-        // no IR equivalent (bitwise shift / XOR) fall through to `None` → an explicit link error
-        // rather than a silent mis-emit.
-        Expression::BinaryExpression(bin) => {
-            let op = map_binary_operator(bin.operator)?;
-            let lhs = convert_expr(&bin.left)?;
-            let rhs = convert_expr(&bin.right)?;
+        // Binary / logical operators (`value == null`, `x + 1`, `a && b`, `a ?? b`). oxc's
+        // `BinaryExpression` + `LogicalExpression` are unified here as `NExpr::Binary` with the
+        // operator's SOURCE SPELLING; operators with no IR equivalent (bitwise shift / XOR / `in` /
+        // `instanceof`) fall through to `None` → an explicit link error rather than a silent mis-emit.
+        NExpr::Binary { op, left, right } => {
+            let op = map_binary_operator(op)?;
+            let lhs = convert_expr(left)?;
+            let rhs = convert_expr(right)?;
             Some(binary_expr(op, lhs, rhs))
         }
         // `!x`, `+x`, `-x`, `typeof x`, `void x`. `delete`/`~` have no IR form → `None`.
-        Expression::UnaryExpression(un) => {
-            let inner = convert_expr(&un.argument)?;
-            match un.operator {
-                oxc_ast::ast::UnaryOperator::LogicalNot => Some(o::not(inner)),
-                oxc_ast::ast::UnaryOperator::UnaryPlus => {
-                    Some(o::unary(UnaryOperator::Plus, inner, None))
-                }
-                oxc_ast::ast::UnaryOperator::UnaryNegation => {
-                    Some(o::unary(UnaryOperator::Minus, inner, None))
-                }
-                oxc_ast::ast::UnaryOperator::Typeof => Some(o::typeof_expr(inner)),
-                oxc_ast::ast::UnaryOperator::Void => {
-                    Some(Expr::bare(ExprKind::Void(Box::new(inner))))
-                }
+        NExpr::Unary { op, argument } => {
+            let inner = convert_expr(argument)?;
+            match op.as_str() {
+                "!" => Some(o::not(inner)),
+                "+" => Some(o::unary(UnaryOperator::Plus, inner, None)),
+                "-" => Some(o::unary(UnaryOperator::Minus, inner, None)),
+                "typeof" => Some(o::typeof_expr(inner)),
+                "void" => Some(Expr::bare(ExprKind::Void(Box::new(inner)))),
                 _ => None,
             }
         }
@@ -320,21 +288,21 @@ fn convert_expr(expr: &Expression) -> Option<Expr> {
         // expression-bodied (or single-`return`) arrows are faithfully convertible
         // to the output IR; multi-statement bodies are left unconverted (→ `None`,
         // surfaced as an explicit link error rather than wrong code).
-        Expression::ArrowFunctionExpression(arrow) => {
-            let params = convert_params(&arrow.params)?;
-            let body = convert_arrow_body(arrow)?;
+        NExpr::Arrow { params, body } => {
+            let params = convert_params(params)?;
+            let body = convert_arrow_body(body)?;
             Some(o::arrow_fn(params, body, None))
         }
         // `function (…) { … }` factory functions convert to a FunctionExpr. The body is converted
         // statement-by-statement (const/let, expression, `if`, `return`) so multi-statement
         // factories (`useFactory: function(){ const p = inject(...); return p || new X(); }`) carry
         // through verbatim, not just the single-`return` shape.
-        Expression::FunctionExpression(func) => {
-            let params = convert_params(&func.params)?;
-            let body_block = func.body.as_ref()?;
-            let body = convert_statements(&body_block.statements)?;
+        NExpr::Function { params, body } => {
+            let params = convert_params(params)?;
+            let body = convert_statements(body)?;
             Some(o::fn_(params, body, None, None))
         }
+        // Computed member access / unmodelled shapes — the live walk's `_ => None` arm.
         _ => None,
     }
 }
@@ -384,48 +352,50 @@ fn binary_expr(op: BinaryOperator, lhs: Expr, rhs: Expr) -> Expr {
     }
 }
 
-/// Map an oxc [`oxc_syntax::operator::BinaryOperator`] to the IR [`BinaryOperator`], or `None` for
-/// operators with no IR representation (bitwise shifts / XOR / `in` / `instanceof`) — an
-/// unconvertible operator surfaces as a link error rather than emitting wrong code.
-fn map_binary_operator(op: oxc_ast::ast::BinaryOperator) -> Option<BinaryOperator> {
-    use oxc_ast::ast::BinaryOperator as Ox;
+/// Map a binary/logical operator's SOURCE SPELLING (the neutral [`NExpr::Binary`] `op`) to the IR
+/// [`BinaryOperator`], or `None` for operators with no IR representation (bitwise shifts / XOR / `in`
+/// / `instanceof`) — an unconvertible operator surfaces as a link error rather than emitting wrong
+/// code. The spellings are oxc's `BinaryOperator::as_str()` / `LogicalOperator::as_str()` forms (which
+/// swc reproduces identically), so this mapping is engine-neutral.
+fn map_binary_operator(op: &str) -> Option<BinaryOperator> {
     Some(match op {
-        Ox::Equality => BinaryOperator::Equals,
-        Ox::Inequality => BinaryOperator::NotEquals,
-        Ox::StrictEquality => BinaryOperator::Identical,
-        Ox::StrictInequality => BinaryOperator::NotIdentical,
-        Ox::LessThan => BinaryOperator::Lower,
-        Ox::LessEqualThan => BinaryOperator::LowerEquals,
-        Ox::GreaterThan => BinaryOperator::Bigger,
-        Ox::GreaterEqualThan => BinaryOperator::BiggerEquals,
-        Ox::Addition => BinaryOperator::Plus,
-        Ox::Subtraction => BinaryOperator::Minus,
-        Ox::Multiplication => BinaryOperator::Multiply,
-        Ox::Division => BinaryOperator::Divide,
-        Ox::Remainder => BinaryOperator::Modulo,
-        Ox::Exponential => BinaryOperator::Exponentiation,
-        Ox::BitwiseOR => BinaryOperator::BitwiseOr,
-        Ox::BitwiseAnd => BinaryOperator::BitwiseAnd,
+        "==" => BinaryOperator::Equals,
+        "!=" => BinaryOperator::NotEquals,
+        "===" => BinaryOperator::Identical,
+        "!==" => BinaryOperator::NotIdentical,
+        "<" => BinaryOperator::Lower,
+        "<=" => BinaryOperator::LowerEquals,
+        ">" => BinaryOperator::Bigger,
+        ">=" => BinaryOperator::BiggerEquals,
+        "+" => BinaryOperator::Plus,
+        "-" => BinaryOperator::Minus,
+        "*" => BinaryOperator::Multiply,
+        "/" => BinaryOperator::Divide,
+        "%" => BinaryOperator::Modulo,
+        "**" => BinaryOperator::Exponentiation,
+        "|" => BinaryOperator::BitwiseOr,
+        "&" => BinaryOperator::BitwiseAnd,
+        // Logical operators (oxc's separate `LogicalExpression`, unified into `NExpr::Binary`).
+        "&&" => BinaryOperator::And,
+        "||" => BinaryOperator::Or,
+        "??" => BinaryOperator::NullishCoalesce,
         // No IR equivalent: `<<` `>>` `>>>` `^` `in` `instanceof`.
-        Ox::ShiftLeft
-        | Ox::ShiftRight
-        | Ox::ShiftRightZeroFill
-        | Ox::BitwiseXOR
-        | Ox::In
-        | Ox::Instanceof => return None,
+        _ => return None,
     })
 }
 
 /// Convert a parameter list to [`o::FnParam`]s. Only plain identifier bindings are
 /// supported (no destructuring / defaults / rest); anything else → `None`.
-fn convert_params(params: &oxc_ast::ast::FormalParameters) -> Option<Vec<o::FnParam>> {
-    if params.rest.is_some() {
-        return None;
-    }
-    let mut out = Vec::with_capacity(params.items.len());
-    for item in &params.items {
-        let id = item.pattern.get_binding_identifier()?;
-        out.push(o::FnParam::new(id.name.to_string(), None));
+fn convert_params(params: &[NParam]) -> Option<Vec<o::FnParam>> {
+    let mut out = Vec::with_capacity(params.len());
+    for p in params {
+        // A `...rest` parameter (oxc declined the whole signature) or a non-identifier binding
+        // (`name: None`) is unconvertible.
+        if p.is_rest {
+            return None;
+        }
+        let name = p.name.clone()?;
+        out.push(o::FnParam::new(name, None));
     }
     Some(out)
 }
@@ -434,19 +404,18 @@ fn convert_params(params: &oxc_ast::ast::FormalParameters) -> Option<Vec<o::FnPa
 /// single-`return` block (`() => { return expr; }`) folds to the same expression form (matching how
 /// the emitter would print it); any richer block (`() => { const x = …; return …; }`) maps to a
 /// full [`ArrowBody::Block`] via [`convert_statements`]. An unconvertible body → `None`.
-fn convert_arrow_body(arrow: &oxc_ast::ast::ArrowFunctionExpression) -> Option<o::ArrowBody> {
-    if arrow.expression {
-        if let Some(Statement::ExpressionStatement(stmt)) = arrow.body.statements.first() {
-            return Some(o::ArrowBody::Expr(Box::new(convert_expr(&stmt.expression)?)));
+fn convert_arrow_body(body: &NArrowBody) -> Option<o::ArrowBody> {
+    match body {
+        NArrowBody::Expr(e) => Some(o::ArrowBody::Expr(Box::new(convert_expr(e)?))),
+        NArrowBody::Block(stmts) => {
+            // A single-`return` block collapses to the expression form (the emitter prints it
+            // identically).
+            if let [NStmt::Return(Some(arg))] = stmts.as_slice() {
+                return Some(o::ArrowBody::Expr(Box::new(convert_expr(arg)?)));
+            }
+            Some(o::ArrowBody::Block(convert_statements(stmts)?))
         }
-        return None;
     }
-    // A single-`return` block collapses to the expression form (the emitter prints it identically).
-    if let [Statement::ReturnStatement(ret)] = arrow.body.statements.as_slice() {
-        let expr = convert_expr(ret.argument.as_ref()?)?;
-        return Some(o::ArrowBody::Expr(Box::new(expr)));
-    }
-    Some(o::ArrowBody::Block(convert_statements(&arrow.body.statements)?))
 }
 
 /// Convert a block body's statements to IR [`o::Stmt`]s. Supports the statement forms that appear
@@ -454,7 +423,7 @@ fn convert_arrow_body(arrow: &oxc_ast::ast::ArrowFunctionExpression) -> Option<o
 /// binding with an initializer), expression statements, `if`/`else`, and `return`. Any other
 /// statement (loops, try/catch, destructuring binding, …) → `None`, surfaced as an explicit link
 /// error rather than a silent mis-emit.
-fn convert_statements(statements: &[Statement]) -> Option<Vec<o::Stmt>> {
+fn convert_statements(statements: &[NStmt]) -> Option<Vec<o::Stmt>> {
     let mut out = Vec::with_capacity(statements.len());
     for stmt in statements {
         out.push(convert_statement(stmt)?);
@@ -463,22 +432,21 @@ fn convert_statements(statements: &[Statement]) -> Option<Vec<o::Stmt>> {
 }
 
 /// Convert one block statement to an IR [`o::Stmt`].
-fn convert_statement(stmt: &Statement) -> Option<o::Stmt> {
+fn convert_statement(stmt: &NStmt) -> Option<o::Stmt> {
     match stmt {
-        Statement::VariableDeclaration(decl) => {
-            // Only a single plain-identifier declarator with an initializer is modelled (the
-            // factory-body shape `const parent = inject(...)`). `const` → FINAL modifier (the
-            // emitter prints `const`), `let`/`var` → no modifier (prints `let`).
-            let [declarator] = decl.declarations.as_slice() else {
+        NStmt::VarDecl { is_const, decls } => {
+            // Only a single plain-identifier declarator is modelled (the factory-body shape
+            // `const parent = inject(...)`). `const` → FINAL modifier (the emitter prints `const`),
+            // `let`/`var` → no modifier (prints `let`).
+            let [declarator] = decls.as_slice() else {
                 return None;
             };
-            let name = declarator.id.get_binding_identifier()?.name.to_string();
+            let name = declarator.name.clone()?;
             let value = match &declarator.init {
                 Some(e) => Some(convert_expr(e)?),
                 None => None,
             };
-            let is_const = matches!(decl.kind, oxc_ast::ast::VariableDeclarationKind::Const);
-            let modifiers = if is_const {
+            let modifiers = if *is_const {
                 o::StmtModifier::FINAL
             } else {
                 o::StmtModifier::NONE
@@ -492,104 +460,81 @@ fn convert_statement(stmt: &Statement) -> Option<o::Stmt> {
                 modifiers,
             ))
         }
-        Statement::ExpressionStatement(es) => {
-            Some(o::Stmt::bare(o::StmtKind::Expression(convert_expr(&es.expression)?)))
-        }
-        Statement::ReturnStatement(ret) => {
-            let expr = convert_expr(ret.argument.as_ref()?)?;
+        NStmt::Expr(e) => Some(o::Stmt::bare(o::StmtKind::Expression(convert_expr(e)?))),
+        NStmt::Return(arg) => {
+            let expr = convert_expr(arg.as_ref()?)?;
             Some(o::Stmt::bare(o::StmtKind::Return(expr)))
         }
-        Statement::IfStatement(if_stmt) => {
-            let condition = convert_expr(&if_stmt.test)?;
-            let true_case = convert_branch(&if_stmt.consequent)?;
-            let false_case = match &if_stmt.alternate {
-                Some(alt) => convert_branch(alt)?,
-                None => Vec::new(),
-            };
+        NStmt::If { test, consequent, alternate } => {
+            let condition = convert_expr(test)?;
+            let true_case = convert_statements(consequent)?;
+            let false_case = convert_statements(alternate)?;
             Some(o::Stmt::bare(o::StmtKind::If {
                 condition,
                 true_case,
                 false_case,
             }))
         }
-        _ => None,
-    }
-}
-
-/// Convert an `if`/`else` branch — either a `{ … }` block (its statements) or a single bare
-/// statement (wrapped in a one-element block).
-fn convert_branch(stmt: &Statement) -> Option<Vec<o::Stmt>> {
-    match stmt {
-        Statement::BlockStatement(block) => convert_statements(&block.body),
-        other => Some(vec![convert_statement(other)?]),
-    }
-}
-
-/// Whether `key` is a valid bare JS identifier (so an object key can be emitted unquoted).
-fn is_safe_object_key(key: &str) -> bool {
-    let mut chars = key.chars();
-    match chars.next() {
-        Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '$' => {
-            chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+        // A bare `{ … }` block (the neutral tree keeps it explicitly) lowers to its statements; the
+        // live walk handled it only inside an `if` branch via `convert_branch`, which folded a block
+        // to its statements — equivalent here for the only positions a block appears.
+        NStmt::Block(body) => {
+            // A block statement is not directly representable as one `o::Stmt`; it only ever appears
+            // as an `if` branch, where `convert_statements` already flattens it. Outside that it is
+            // unconvertible (the live walk's `_ => None`).
+            let _ = body;
+            None
         }
-        _ => false,
+        NStmt::Other(_) => None,
     }
 }
 
 /// Resolve a `forwardRef(() => X)` call's returned identifier, or `None` if `expr` is not such a
 /// call. Mirrors `extractForwardRef`'s `forwardRef`-recognition (`util.ts`).
-fn forward_ref_target(expr: &Expression) -> Option<Expr> {
-    let call = match expr {
-        Expression::CallExpression(c) => c,
-        Expression::ParenthesizedExpression(p) => return forward_ref_target(&p.expression),
+fn forward_ref_target(expr: &NExpr) -> Option<Expr> {
+    let (callee, args) = match expr {
+        NExpr::Call { callee, args } => (callee, args),
+        NExpr::Parenthesized(p) => return forward_ref_target(p),
         _ => return None,
     };
-    let is_forward_ref =
-        matches!(&call.callee, Expression::Identifier(id) if id.name == "forwardRef");
+    let is_forward_ref = matches!(&**callee, NExpr::Identifier(name) if name == "forwardRef");
     if !is_forward_ref {
         return None;
     }
-    let arg = call.arguments.first().and_then(|a| a.as_expression())?;
+    let arg = match args.first() {
+        Some(NArg::Expr(e, _)) => e,
+        _ => return None,
+    };
     arrow_or_fn_return(arg)
 }
 
 /// The expression returned by a `() => X` arrow (or `function(){ return X; }`).
-fn arrow_or_fn_return(expr: &Expression) -> Option<Expr> {
+fn arrow_or_fn_return(expr: &NExpr) -> Option<Expr> {
     match expr {
-        Expression::ArrowFunctionExpression(arrow) => {
-            if arrow.expression {
-                if let Some(Statement::ExpressionStatement(stmt)) = arrow.body.statements.first() {
-                    return convert_expr(&stmt.expression);
-                }
-            }
-            for stmt in &arrow.body.statements {
-                if let Statement::ReturnStatement(ret) = stmt {
-                    if let Some(arg) = &ret.argument {
-                        return convert_expr(arg);
-                    }
-                }
-            }
-            None
-        }
-        Expression::FunctionExpression(func) => {
-            let body = func.body.as_ref()?;
-            for stmt in &body.statements {
-                if let Statement::ReturnStatement(ret) = stmt {
-                    if let Some(arg) = &ret.argument {
-                        return convert_expr(arg);
-                    }
-                }
-            }
-            None
-        }
+        NExpr::Arrow { body, .. } => match body.as_ref() {
+            NArrowBody::Expr(e) => convert_expr(e),
+            NArrowBody::Block(stmts) => return_value(stmts),
+        },
+        NExpr::Function { body, .. } => return_value(body),
         _ => None,
     }
+}
+
+/// The converted value of the first `return <expr>;` in a statement list (the `() => { return X; }`
+/// arrow / factory body shape).
+fn return_value(stmts: &[NStmt]) -> Option<Expr> {
+    for stmt in stmts {
+        if let NStmt::Return(Some(arg)) = stmt {
+            return convert_expr(arg);
+        }
+    }
+    None
 }
 
 /// `extractForwardRef(expr)` — a `forwardRef(() => X)` unwraps to `X` with
 /// [`ForwardRefHandling::Unwrapped`] (re-wrapped on emit); any other expression is carried as-is
 /// with [`ForwardRefHandling::None`].
-fn extract_forward_ref(expr: &Expression) -> Option<MaybeForwardRef> {
+fn extract_forward_ref(expr: &NExpr) -> Option<MaybeForwardRef> {
     if let Some(target) = forward_ref_target(expr) {
         return Some(MaybeForwardRef {
             expression: target,
@@ -602,9 +547,9 @@ fn extract_forward_ref(expr: &Expression) -> Option<MaybeForwardRef> {
 /// `getDependency(depObj)` (`util.ts`) — one `deps` entry → [`R3DependencyMetadata`]. An
 /// `attribute: true` dep sets `attribute_name_type = "unknown"` (the link-time marker) and routes
 /// to `ɵɵinjectAttribute`; the qualifier booleans (`host`/`optional`/`self`/`skipSelf`) carry over.
-fn get_dependency(obj: &ObjectExpression) -> Result<R3DependencyMetadata, String> {
-    let is_attribute = prop_is_true(obj, "attribute");
-    let token = find_prop(obj, "token")
+fn get_dependency(props: Props) -> Result<R3DependencyMetadata, String> {
+    let is_attribute = prop_is_true(props, "attribute");
+    let token = find_prop(props, "token")
         .and_then(convert_expr)
         .ok_or_else(|| "dependency missing usable `token`".to_string())?;
     let attribute_name_type = if is_attribute {
@@ -615,10 +560,10 @@ fn get_dependency(obj: &ObjectExpression) -> Result<R3DependencyMetadata, String
     Ok(R3DependencyMetadata {
         token: Some(token),
         attribute_name_type,
-        host: prop_is_true(obj, "host"),
-        optional: prop_is_true(obj, "optional"),
-        self_: prop_is_true(obj, "self"),
-        skip_self: prop_is_true(obj, "skipSelf"),
+        host: prop_is_true(props, "host"),
+        optional: prop_is_true(props, "optional"),
+        self_: prop_is_true(props, "self"),
+        skip_self: prop_is_true(props, "skipSelf"),
     })
 }
 
@@ -634,27 +579,28 @@ fn get_dependency(obj: &ObjectExpression) -> Result<R3DependencyMetadata, String
 /// `HistoryStateManager extends StateManager`) emits `deps: null`, which means "no own constructor
 /// deps — inherit the base factory". Treating that `null` as `Invalid` mis-emits `ɵɵinvalidFactory`
 /// (the runtime NG0204 "constructor was not compatible with Dependency Injection"); it must inherit.
-fn get_dependencies(obj: &ObjectExpression) -> Result<FactoryDeps, String> {
-    let Some(deps) = find_prop(obj, "deps") else {
+fn get_dependencies(props: Props) -> Result<FactoryDeps, String> {
+    let Some(deps) = find_prop(props, "deps") else {
         return Ok(FactoryDeps::Inherit);
     };
     match deps {
-        Expression::ArrayExpression(arr) => {
-            let mut out = Vec::with_capacity(arr.elements.len());
-            for el in &arr.elements {
-                let inner = el
-                    .as_expression()
-                    .ok_or_else(|| "unsupported `deps` array element".to_string())?;
-                let Expression::ObjectExpression(dep_obj) = inner else {
+        NExpr::Array(elems) => {
+            let mut out = Vec::with_capacity(elems.len());
+            for el in elems {
+                let inner = match el {
+                    NArrayElement::Expr(e) => e,
+                    _ => return Err("unsupported `deps` array element".to_string()),
+                };
+                let Some(dep_props) = object_props(inner) else {
                     return Err("`deps` array element must be an object".to_string());
                 };
-                out.push(get_dependency(dep_obj)?);
+                out.push(get_dependency(dep_props)?);
             }
             Ok(FactoryDeps::Deps(out))
         }
         // `deps: "invalid"` — at least one dep was unresolvable at partial-compile time. ONLY a
         // string maps to invalid (reference `deps.isString()`).
-        Expression::StringLiteral(_) | Expression::TemplateLiteral(_) => Ok(FactoryDeps::Invalid),
+        NExpr::String(_) => Ok(FactoryDeps::Invalid),
         // Any other value — notably `deps: null` for an inheriting class — means "inherit the base
         // class factory" (reference falls through to `return null`).
         _ => Ok(FactoryDeps::Inherit),
@@ -663,26 +609,27 @@ fn get_dependencies(obj: &ObjectExpression) -> Result<FactoryDeps, String> {
 
 /// Parse an `@Injectable`-style `deps: [...]` array into [`R3DependencyMetadata`] (a present-but
 /// empty array is distinct from absent). Each element is a `{token, ...flags}` object.
-fn parse_injectable_deps(expr: &Expression) -> Result<Vec<R3DependencyMetadata>, String> {
-    let Expression::ArrayExpression(arr) = expr else {
+fn parse_injectable_deps(expr: &NExpr) -> Result<Vec<R3DependencyMetadata>, String> {
+    let NExpr::Array(elems) = expr else {
         return Err("injectable `deps` must be an array".to_string());
     };
-    let mut out = Vec::with_capacity(arr.elements.len());
-    for el in &arr.elements {
-        let inner = el
-            .as_expression()
-            .ok_or_else(|| "unsupported injectable `deps` element".to_string())?;
-        let Expression::ObjectExpression(dep_obj) = inner else {
+    let mut out = Vec::with_capacity(elems.len());
+    for el in elems {
+        let inner = match el {
+            NArrayElement::Expr(e) => e,
+            _ => return Err("unsupported injectable `deps` element".to_string()),
+        };
+        let Some(dep_props) = object_props(inner) else {
             return Err("injectable `deps` element must be an object".to_string());
         };
-        out.push(get_dependency(dep_obj)?);
+        out.push(get_dependency(dep_props)?);
     }
     Ok(out)
 }
 
 /// `parseEnum(target, FactoryTarget)` — map `ɵɵFactoryTarget.X` (or a bare `X`) onto
 /// [`FactoryTarget`].
-fn parse_factory_target(expr: &Expression) -> Result<FactoryTarget, String> {
+fn parse_factory_target(expr: &NExpr) -> Result<FactoryTarget, String> {
     let name = symbol_name(expr).ok_or_else(|| "`target` has no symbol name".to_string())?;
     match name.as_str() {
         "Directive" => Ok(FactoryTarget::Directive),
@@ -701,19 +648,18 @@ fn parse_factory_target(expr: &Expression) -> Result<FactoryTarget, String> {
 /// Resolve an array literal of class references into [`R3Reference`]s. A `() => [...]` forward-decl
 /// wrapper is unwrapped (the elements come from the returned array). Non-identifier elements whose
 /// symbol name cannot be recovered are skipped.
-fn refs_of(expr: &Expression) -> Vec<R3Reference> {
-    let arr = match expr {
-        Expression::ArrayExpression(arr) => arr,
+fn refs_of(expr: &NExpr) -> Vec<R3Reference> {
+    let elems = match expr {
+        NExpr::Array(elems) => elems,
         // `() => [A, B]` forward-declaration wrapper.
-        Expression::ArrowFunctionExpression(_) | Expression::FunctionExpression(_) => {
-            return forward_ref_array(expr);
-        }
-        Expression::ParenthesizedExpression(p) => return refs_of(&p.expression),
+        NExpr::Arrow { .. } | NExpr::Function { .. } => return forward_ref_array(expr),
+        NExpr::Parenthesized(p) => return refs_of(p),
         _ => return Vec::new(),
     };
     let mut out = Vec::new();
-    for el in &arr.elements {
-        if let Some(inner) = el.as_expression() {
+    for el in elems {
+        // `el.as_expression()` skipped spread/hole; mirror that — only plain expression elements.
+        if let NArrayElement::Expr(inner) = el {
             if let Some(name) = symbol_name(inner) {
                 out.push(class_ref(&name));
             }
@@ -723,27 +669,18 @@ fn refs_of(expr: &Expression) -> Vec<R3Reference> {
 }
 
 /// Unwrap a `() => [A, B]` (or `function(){ return [A, B]; }`) wrapper into its element references.
-fn forward_ref_array(expr: &Expression) -> Vec<R3Reference> {
+fn forward_ref_array(expr: &NExpr) -> Vec<R3Reference> {
     let stmts = match expr {
-        Expression::ArrowFunctionExpression(arrow) => {
-            if arrow.expression {
-                if let Some(Statement::ExpressionStatement(stmt)) = arrow.body.statements.first() {
-                    return refs_of(&stmt.expression);
-                }
-            }
-            &arrow.body.statements
-        }
-        Expression::FunctionExpression(func) => match func.body.as_ref() {
-            Some(b) => &b.statements,
-            None => return Vec::new(),
+        NExpr::Arrow { body, .. } => match body.as_ref() {
+            NArrowBody::Expr(e) => return refs_of(e),
+            NArrowBody::Block(stmts) => stmts.as_slice(),
         },
+        NExpr::Function { body, .. } => body.as_slice(),
         _ => return Vec::new(),
     };
     for stmt in stmts {
-        if let Statement::ReturnStatement(ret) = stmt {
-            if let Some(arg) = &ret.argument {
-                return refs_of(arg);
-            }
+        if let NStmt::Return(Some(arg)) = stmt {
+            return refs_of(arg);
         }
     }
     Vec::new()
@@ -775,19 +712,20 @@ enum DeclareKind {
 }
 
 impl DeclareKind {
-    /// Map a `ɵɵngDeclare*` callee identifier name to its kind.
-    fn from_callee(name: &str) -> Option<DeclareKind> {
-        match name {
-            "\u{0275}\u{0275}ngDeclareFactory" => Some(DeclareKind::Factory),
-            "\u{0275}\u{0275}ngDeclareInjectable" => Some(DeclareKind::Injectable),
-            "\u{0275}\u{0275}ngDeclareService" => Some(DeclareKind::Service),
-            "\u{0275}\u{0275}ngDeclareInjector" => Some(DeclareKind::Injector),
-            "\u{0275}\u{0275}ngDeclareNgModule" => Some(DeclareKind::NgModule),
-            "\u{0275}\u{0275}ngDeclarePipe" => Some(DeclareKind::Pipe),
-            "\u{0275}\u{0275}ngDeclareDirective" => Some(DeclareKind::Directive),
-            "\u{0275}\u{0275}ngDeclareComponent" => Some(DeclareKind::Component),
-            "\u{0275}\u{0275}ngDeclareClassMetadata" => Some(DeclareKind::ClassMetadata),
-            "\u{0275}\u{0275}ngDeclareClassMetadataAsync" => Some(DeclareKind::ClassMetadataAsync),
+    /// Map a `ɵɵngDeclare*` callee SUFFIX (the neutral [`NgDeclareCall::kind`], i.e. the name with the
+    /// `ɵɵngDeclare` prefix stripped) to its kind.
+    fn from_suffix(suffix: &str) -> Option<DeclareKind> {
+        match suffix {
+            "Factory" => Some(DeclareKind::Factory),
+            "Injectable" => Some(DeclareKind::Injectable),
+            "Service" => Some(DeclareKind::Service),
+            "Injector" => Some(DeclareKind::Injector),
+            "NgModule" => Some(DeclareKind::NgModule),
+            "Pipe" => Some(DeclareKind::Pipe),
+            "Directive" => Some(DeclareKind::Directive),
+            "Component" => Some(DeclareKind::Component),
+            "ClassMetadata" => Some(DeclareKind::ClassMetadata),
+            "ClassMetadataAsync" => Some(DeclareKind::ClassMetadataAsync),
             _ => None,
         }
     }
@@ -809,7 +747,7 @@ fn plain(expr_text: String) -> LinkedDef {
 }
 
 /// `toR3FactoryMeta` + `compileFactoryFunction` → the `function X_Factory(t){…}` expression text.
-fn link_factory(obj: &ObjectExpression) -> Result<String, String> {
+fn link_factory(obj: Props) -> Result<String, String> {
     let type_expr =
         find_prop(obj, "type").ok_or_else(|| "ɵɵngDeclareFactory missing `type`".to_string())?;
     let name = symbol_name(type_expr)
@@ -830,7 +768,7 @@ fn link_factory(obj: &ObjectExpression) -> Result<String, String> {
 }
 
 /// `toR3InjectableMeta` + `compileInjectable(meta, false)` → the `ɵɵdefineInjectable({…})` text.
-fn link_injectable(obj: &ObjectExpression) -> Result<String, String> {
+fn link_injectable(obj: Props) -> Result<String, String> {
     let type_expr =
         find_prop(obj, "type").ok_or_else(|| "ɵɵngDeclareInjectable missing `type`".to_string())?;
     let name = symbol_name(type_expr)
@@ -878,7 +816,7 @@ fn link_injectable(obj: &ObjectExpression) -> Result<String, String> {
 /// object is minimal — `type`, plus optional `autoProvided` / `factory` — so the mapping is a
 /// pure syntactic transform like the rest of the DI family.
 /// Reference: `compiler-cli/.../partial_linkers/partial_service_linker_1.ts` → `toR3ServiceMeta`.
-fn link_service(obj: &ObjectExpression) -> Result<String, String> {
+fn link_service(obj: Props) -> Result<String, String> {
     let type_expr =
         find_prop(obj, "type").ok_or_else(|| "ɵɵngDeclareService missing `type`".to_string())?;
     let name = symbol_name(type_expr)
@@ -886,7 +824,7 @@ fn link_service(obj: &ObjectExpression) -> Result<String, String> {
 
     // `autoProvided: false` is the only value worth carrying through (`true`/absent → omitted).
     let auto_provided = match find_prop(obj, "autoProvided") {
-        Some(Expression::BooleanLiteral(b)) => Some(b.value),
+        Some(NExpr::Boolean(b)) => Some(*b),
         Some(_) => return Err("unsupported `autoProvided` expression".to_string()),
         None => None,
     };
@@ -910,7 +848,7 @@ fn link_service(obj: &ObjectExpression) -> Result<String, String> {
 }
 
 /// Read a `useClass`/`useExisting`/`useValue` option into a [`MaybeForwardRef`] (absent → `None`).
-fn forward_ref_option(obj: &ObjectExpression, key: &str) -> Result<Option<MaybeForwardRef>, String> {
+fn forward_ref_option(obj: Props, key: &str) -> Result<Option<MaybeForwardRef>, String> {
     match find_prop(obj, key) {
         None => Ok(None),
         Some(e) => extract_forward_ref(e)
@@ -920,7 +858,7 @@ fn forward_ref_option(obj: &ObjectExpression, key: &str) -> Result<Option<MaybeF
 }
 
 /// `toR3InjectorMeta` + `compileInjector` → the `ɵɵdefineInjector({…})` text.
-fn link_injector(obj: &ObjectExpression) -> Result<String, String> {
+fn link_injector(obj: Props) -> Result<String, String> {
     let type_expr =
         find_prop(obj, "type").ok_or_else(|| "ɵɵngDeclareInjector missing `type`".to_string())?;
     let name = symbol_name(type_expr)
@@ -933,26 +871,23 @@ fn link_injector(obj: &ObjectExpression) -> Result<String, String> {
         None => None,
     };
     let imports = match find_prop(obj, "imports") {
-        Some(Expression::ArrayExpression(arr)) => {
-            let mut out = Vec::with_capacity(arr.elements.len());
-            for el in &arr.elements {
+        Some(NExpr::Array(elems)) => {
+            let mut out = Vec::with_capacity(elems.len());
+            for el in elems {
                 // Injector `imports` are opaque (carried verbatim), so a spread element
                 // (`imports: [...A_IMPORTS]`) passes through as `...expr` rather than
                 // being rejected.
                 match el {
-                    ArrayExpressionElement::SpreadElement(s) => {
-                        let arg = convert_expr(&s.argument).ok_or_else(|| {
+                    NArrayElement::Spread(e) => {
+                        let arg = convert_expr(e).ok_or_else(|| {
                             "unsupported injector `imports` spread expression".to_string()
                         })?;
                         out.push(o::spread(arg));
                     }
-                    ArrayExpressionElement::Elision(_) => {
+                    NArrayElement::Hole => {
                         return Err("unsupported injector `imports` element".to_string());
                     }
-                    other => {
-                        let inner = other
-                            .as_expression()
-                            .ok_or_else(|| "unsupported injector `imports` element".to_string())?;
+                    NArrayElement::Expr(inner) => {
                         out.push(convert_expr(inner).ok_or_else(|| {
                             "unsupported injector `imports` element expression".to_string()
                         })?);
@@ -978,7 +913,7 @@ fn link_injector(obj: &ObjectExpression) -> Result<String, String> {
 /// `toR3NgModuleMeta` + `compileNgModule` → the `ɵɵdefineNgModule({…})` text PLUS any
 /// `ɵɵsetNgModuleScope` / `ɵɵregisterNgModuleType` side-effect statements (returned as a trailing
 /// suffix so they can be spliced after the rewritten call's statement).
-fn link_ng_module(obj: &ObjectExpression) -> Result<LinkedDef, String> {
+fn link_ng_module(obj: Props) -> Result<LinkedDef, String> {
     let type_expr =
         find_prop(obj, "type").ok_or_else(|| "ɵɵngDeclareNgModule missing `type`".to_string())?;
 
@@ -1024,7 +959,7 @@ fn link_ng_module(obj: &ObjectExpression) -> Result<LinkedDef, String> {
 }
 
 /// `toR3PipeMeta` + `compilePipeFromMetadata` → the `ɵɵdefinePipe({…})` text.
-fn link_pipe(obj: &ObjectExpression) -> Result<String, String> {
+fn link_pipe(obj: Props) -> Result<String, String> {
     let type_expr =
         find_prop(obj, "type").ok_or_else(|| "ɵɵngDeclarePipe missing `type`".to_string())?;
     let name = symbol_name(type_expr)
@@ -1070,7 +1005,7 @@ fn link_pipe(obj: &ObjectExpression) -> Result<String, String> {
 /// (`"21.2.15"`, `"14.0.0"`, the local placeholder `"0.0.0-PLACEHOLDER"`). The major number gates
 /// the v22 defaults (`hasOnPushByDefault`, `legacyOptionalChaining`); an unparsable version is
 /// treated as the placeholder (major 0).
-fn version_major(obj: &ObjectExpression) -> u32 {
+fn version_major(obj: Props) -> u32 {
     find_prop(obj, "version")
         .and_then(string_value)
         .and_then(|v| v.split('.').next().and_then(|m| m.parse::<u32>().ok()))
@@ -1080,7 +1015,7 @@ fn version_major(obj: &ObjectExpression) -> u32 {
 /// Whether a declaration's `version` is the local placeholder Angular stamps for first-party
 /// (in-repo) compilation (`getDefaultStandaloneValue` / the `legacyOptionalChaining` guard treat it
 /// specially: placeholder → newest behaviour). Any `0.0.0-…` prerelease counts.
-fn is_placeholder_version(obj: &ObjectExpression) -> bool {
+fn is_placeholder_version(obj: Props) -> bool {
     find_prop(obj, "version")
         .and_then(string_value)
         .map(|v| v.starts_with("0.0.0"))
@@ -1089,7 +1024,7 @@ fn is_placeholder_version(obj: &ObjectExpression) -> bool {
 
 /// `getDefaultStandaloneValue(version)` — standalone defaults to `true` for v19+ (and the
 /// placeholder); these are v21+ libraries, so absent `isStandalone` means standalone.
-fn read_is_standalone(obj: &ObjectExpression) -> bool {
+fn read_is_standalone(obj: Props) -> bool {
     match find_prop(obj, "isStandalone") {
         Some(e) => bool_value(e).unwrap_or(true),
         None => true,
@@ -1097,7 +1032,7 @@ fn read_is_standalone(obj: &ObjectExpression) -> bool {
 }
 
 /// `metaObj.getBoolean(name)` with the given default when the key is absent.
-fn read_bool(obj: &ObjectExpression, name: &str, default: bool) -> bool {
+fn read_bool(obj: Props, name: &str, default: bool) -> bool {
     match find_prop(obj, name) {
         Some(e) => bool_value(e).unwrap_or(default),
         None => default,
@@ -1108,10 +1043,10 @@ fn read_bool(obj: &ObjectExpression, name: &str, default: bool) -> bool {
 /// (`{classPropertyName, publicName, isSignal, isRequired, transformFunction}`) or the LEGACY form
 /// (a bare `"publicName"` string, or a `["publicName", "classPropertyName"(, transformFn)]` array).
 /// `key` is the object property key (the class property name for the legacy string form).
-fn to_input_mapping(key: &str, value: &Expression) -> Result<R3InputMetadata, String> {
+fn to_input_mapping(key: &str, value: &NExpr) -> Result<R3InputMetadata, String> {
     match value {
         // Rich object form.
-        Expression::ObjectExpression(obj) => {
+        NExpr::Object(obj) => {
             let class_property_name = find_prop(obj, "classPropertyName")
                 .and_then(string_value)
                 .ok_or_else(|| format!("input `{key}` missing `classPropertyName`"))?;
@@ -1119,7 +1054,7 @@ fn to_input_mapping(key: &str, value: &Expression) -> Result<R3InputMetadata, St
                 .and_then(string_value)
                 .ok_or_else(|| format!("input `{key}` missing `publicName`"))?;
             let transform_function = match find_prop(obj, "transformFunction") {
-                Some(Expression::NullLiteral(_)) | None => None,
+                Some(NExpr::Null) | None => None,
                 Some(e) => Some(
                     convert_expr(e)
                         .ok_or_else(|| format!("input `{key}` has unsupported transformFunction"))?,
@@ -1134,7 +1069,7 @@ fn to_input_mapping(key: &str, value: &Expression) -> Result<R3InputMetadata, St
             })
         }
         // Legacy string form: `"pub"` — the KEY is the class property name.
-        Expression::StringLiteral(_) | Expression::TemplateLiteral(_) => {
+        NExpr::String(_) => {
             let public = string_value(value)
                 .ok_or_else(|| format!("input `{key}` legacy string is not a string literal"))?;
             Ok(R3InputMetadata {
@@ -1146,13 +1081,16 @@ fn to_input_mapping(key: &str, value: &Expression) -> Result<R3InputMetadata, St
             })
         }
         // Legacy array form: `["pub", "cls"]` or `["pub", "cls", transformFn]`.
-        Expression::ArrayExpression(arr) => {
-            if arr.elements.len() != 2 && arr.elements.len() != 3 {
+        NExpr::Array(elems) => {
+            if elems.len() != 2 && elems.len() != 3 {
                 return Err(format!(
                     "input `{key}` legacy array must have 2 or 3 elements"
                 ));
             }
-            let elem = |i: usize| arr.elements.get(i).and_then(|e| e.as_expression());
+            let elem = |i: usize| match elems.get(i) {
+                Some(NArrayElement::Expr(e)) => Some(e),
+                _ => None,
+            };
             let binding_property_name = elem(0)
                 .and_then(string_value)
                 .ok_or_else(|| format!("input `{key}` legacy array[0] is not a string"))?;
@@ -1178,84 +1116,88 @@ fn to_input_mapping(key: &str, value: &Expression) -> Result<R3InputMetadata, St
     }
 }
 
+/// Iterate an object literal's `KeyValue` properties (key + value), erroring on a spread / shorthand /
+/// method / getter-setter property — the strict-map readers' `unsupported spread/shorthand` arm. The
+/// `key`/`value` are handed to `f` in source order. (A computed-but-static-string key — `['x']` — is
+/// captured as a `KeyValue` and accepted, exactly as the live `key_name` accepted it.)
+fn for_each_key_value<F>(props: Props, kind: &str, mut f: F) -> Result<(), String>
+where
+    F: FnMut(&str, &NExpr) -> Result<(), String>,
+{
+    for p in props {
+        let NObjectProp::KeyValue { key, value, .. } = p else {
+            return Err(format!("unsupported `{kind}` spread/shorthand"));
+        };
+        f(key, value)?;
+    }
+    Ok(())
+}
+
 /// Read the `inputs` object map into the ordered [`R3InputMetadata`] map (insertion order = source
 /// property order, which feeds the emitted inputs literal).
-fn read_inputs(obj: &ObjectExpression) -> Result<OrderedMap<String, R3InputMetadata>, String> {
+fn read_inputs(obj: Props) -> Result<OrderedMap<String, R3InputMetadata>, String> {
     let mut out: OrderedMap<String, R3InputMetadata> = OrderedMap::new();
-    let Some(Expression::ObjectExpression(inputs_obj)) = find_prop(obj, "inputs") else {
+    let Some(NExpr::Object(inputs_obj)) = find_prop(obj, "inputs") else {
         return Ok(out);
     };
-    for p in &inputs_obj.properties {
-        let ObjectPropertyKind::ObjectProperty(op) = p else {
-            return Err("unsupported `inputs` spread/shorthand".to_string());
-        };
-        let key = key_name(&op.key).ok_or_else(|| "unsupported `inputs` computed key".to_string())?;
-        out.insert(key.to_string(), to_input_mapping(key, &op.value)?);
-    }
+    for_each_key_value(inputs_obj, "inputs", |key, value| {
+        out.insert(key.to_string(), to_input_mapping(key, value)?);
+        Ok(())
+    })?;
     Ok(out)
 }
 
 /// Read the `outputs` object map (`{classProperty: "publicName"}`) — keyed on the property name,
 /// value the public-name string.
-fn read_outputs(obj: &ObjectExpression) -> Result<OrderedMap<String, String>, String> {
+fn read_outputs(obj: Props) -> Result<OrderedMap<String, String>, String> {
     let mut out: OrderedMap<String, String> = OrderedMap::new();
-    let Some(Expression::ObjectExpression(outputs_obj)) = find_prop(obj, "outputs") else {
+    let Some(NExpr::Object(outputs_obj)) = find_prop(obj, "outputs") else {
         return Ok(out);
     };
-    for p in &outputs_obj.properties {
-        let ObjectPropertyKind::ObjectProperty(op) = p else {
-            return Err("unsupported `outputs` spread/shorthand".to_string());
-        };
-        let key =
-            key_name(&op.key).ok_or_else(|| "unsupported `outputs` computed key".to_string())?;
-        let value = string_value(&op.value)
+    for_each_key_value(outputs_obj, "outputs", |key, value| {
+        let value = string_value(value)
             .ok_or_else(|| format!("output `{key}` value is not a string"))?;
         out.insert(key.to_string(), value);
-    }
+        Ok(())
+    })?;
     Ok(out)
 }
 
 /// A string-keyed → string-valued object map (`host.listeners` / `host.properties`).
-fn read_string_map(value: &Expression) -> Result<OrderedMap<String, String>, String> {
+fn read_string_map(value: &NExpr) -> Result<OrderedMap<String, String>, String> {
     let mut out: OrderedMap<String, String> = OrderedMap::new();
-    let Expression::ObjectExpression(map_obj) = value else {
+    let NExpr::Object(map_obj) = value else {
         return Err("expected a string→string object map".to_string());
     };
-    for p in &map_obj.properties {
-        let ObjectPropertyKind::ObjectProperty(op) = p else {
-            return Err("unsupported map spread/shorthand".to_string());
-        };
-        let key = key_name(&op.key).ok_or_else(|| "unsupported map computed key".to_string())?;
-        let v = string_value(&op.value)
+    for_each_key_value(map_obj, "map", |key, value| {
+        let v = string_value(value)
             .ok_or_else(|| format!("map value for `{key}` is not a string"))?;
         out.insert(key.to_string(), v);
-    }
+        Ok(())
+    })?;
     Ok(out)
 }
 
 /// A string-keyed → opaque-expression object map (`host.attributes`).
-fn read_expr_map(value: &Expression) -> Result<OrderedMap<String, Expr>, String> {
+fn read_expr_map(value: &NExpr) -> Result<OrderedMap<String, Expr>, String> {
     let mut out: OrderedMap<String, Expr> = OrderedMap::new();
-    let Expression::ObjectExpression(map_obj) = value else {
+    let NExpr::Object(map_obj) = value else {
         return Err("expected an object map".to_string());
     };
-    for p in &map_obj.properties {
-        let ObjectPropertyKind::ObjectProperty(op) = p else {
-            return Err("unsupported map spread/shorthand".to_string());
-        };
-        let key = key_name(&op.key).ok_or_else(|| "unsupported map computed key".to_string())?;
-        let v = convert_expr(&op.value)
+    for_each_key_value(map_obj, "map", |key, value| {
+        let v = convert_expr(value)
             .ok_or_else(|| format!("map value for `{key}` is unsupported"))?;
         out.insert(key.to_string(), v);
-    }
+        Ok(())
+    })?;
     Ok(out)
 }
 
 /// `toHostMetadata` — the declaration `host` object is ALREADY SPLIT into `attributes`/`listeners`/
 /// `properties`/`styleAttribute`/`classAttribute`, so map each sub-field directly (NOT through
 /// `parse_host_bindings`, which is for the unsplit source decorator-object form).
-fn read_host(obj: &ObjectExpression) -> Result<R3HostMetadata, String> {
-    let Some(Expression::ObjectExpression(host_obj)) = find_prop(obj, "host") else {
+fn read_host(obj: Props) -> Result<R3HostMetadata, String> {
+    let Some(NExpr::Object(host_obj)) = find_prop(obj, "host") else {
         return Ok(R3HostMetadata::default());
     };
     let attributes = match find_prop(host_obj, "attributes") {
@@ -1286,8 +1228,8 @@ fn read_host(obj: &ObjectExpression) -> Result<R3HostMetadata, String> {
 /// is either a string-array selector list or a (possibly `forwardRef`-wrapped) class-reference
 /// expression. Forward-ref wrapping is resolved upstream of the emit metadata, so a `forwardRef(() =>
 /// X)` predicate becomes the bare `X` expression.
-fn to_query_metadata(value: &Expression) -> Result<R3QueryMetadata, String> {
-    let Expression::ObjectExpression(q) = value else {
+fn to_query_metadata(value: &NExpr) -> Result<R3QueryMetadata, String> {
+    let NExpr::Object(q) = value else {
         return Err("query entry must be an object".to_string());
     };
     let property_name = find_prop(q, "propertyName")
@@ -1297,13 +1239,14 @@ fn to_query_metadata(value: &Expression) -> Result<R3QueryMetadata, String> {
     let predicate_expr =
         find_prop(q, "predicate").ok_or_else(|| "query missing `predicate`".to_string())?;
     let predicate = match predicate_expr {
-        Expression::ArrayExpression(arr) => {
-            let mut selectors = Vec::with_capacity(arr.elements.len());
-            for el in &arr.elements {
-                let s = el
-                    .as_expression()
-                    .and_then(string_value)
-                    .ok_or_else(|| "query predicate array element is not a string".to_string())?;
+        NExpr::Array(elems) => {
+            let mut selectors = Vec::with_capacity(elems.len());
+            for el in elems {
+                let s = match el {
+                    NArrayElement::Expr(e) => string_value(e),
+                    _ => None,
+                }
+                .ok_or_else(|| "query predicate array element is not a string".to_string())?;
                 selectors.push(s);
             }
             QueryPredicate::Selectors(selectors)
@@ -1336,15 +1279,15 @@ fn to_query_metadata(value: &Expression) -> Result<R3QueryMetadata, String> {
 }
 
 /// Read a `queries` / `viewQueries` array into [`R3QueryMetadata`]s.
-fn read_queries(obj: &ObjectExpression, key: &str) -> Result<Vec<R3QueryMetadata>, String> {
-    let Some(Expression::ArrayExpression(arr)) = find_prop(obj, key) else {
+fn read_queries(obj: Props, key: &str) -> Result<Vec<R3QueryMetadata>, String> {
+    let Some(NExpr::Array(elems)) = find_prop(obj, key) else {
         return Ok(Vec::new());
     };
-    let mut out = Vec::with_capacity(arr.elements.len());
-    for el in &arr.elements {
-        let inner = el
-            .as_expression()
-            .ok_or_else(|| format!("unsupported `{key}` array element"))?;
+    let mut out = Vec::with_capacity(elems.len());
+    for el in elems {
+        let NArrayElement::Expr(inner) = el else {
+            return Err(format!("unsupported `{key}` array element"));
+        };
         out.push(to_query_metadata(inner)?);
     }
     Ok(out)
@@ -1352,23 +1295,24 @@ fn read_queries(obj: &ObjectExpression, key: &str) -> Result<Vec<R3QueryMetadata
 
 /// `getHostDirectiveBindingMapping` — a flat `[publicName, alias, publicName, alias, …]` string
 /// array → an ordered `{publicName: alias}` map (or `None` when absent).
-fn read_host_directive_mapping(value: &Expression) -> Result<Option<OrderedMap<String, String>>, String> {
-    let Expression::ArrayExpression(arr) = value else {
+fn read_host_directive_mapping(value: &NExpr) -> Result<Option<OrderedMap<String, String>>, String> {
+    let NExpr::Array(elems) = value else {
         return Err("hostDirective inputs/outputs must be an array".to_string());
     };
-    if arr.elements.is_empty() {
+    if elems.is_empty() {
         return Ok(None);
     }
+    // `arr.elements[i].as_expression()` declined a spread/hole element; mirror that.
+    let elem_str = |i: usize| match elems.get(i) {
+        Some(NArrayElement::Expr(e)) => string_value(e),
+        _ => None,
+    };
     let mut out: OrderedMap<String, String> = OrderedMap::new();
     let mut i = 1;
-    while i < arr.elements.len() {
-        let public = arr.elements[i - 1]
-            .as_expression()
-            .and_then(string_value)
+    while i < elems.len() {
+        let public = elem_str(i - 1)
             .ok_or_else(|| "hostDirective mapping element is not a string".to_string())?;
-        let alias = arr.elements[i]
-            .as_expression()
-            .and_then(string_value)
+        let alias = elem_str(i)
             .ok_or_else(|| "hostDirective mapping element is not a string".to_string())?;
         out.insert(public, alias);
         i += 2;
@@ -1379,16 +1323,16 @@ fn read_host_directive_mapping(value: &Expression) -> Result<Option<OrderedMap<S
 /// `toHostDirectivesMetadata` — the `hostDirectives` array → [`R3HostDirectiveMetadata`]. Each entry
 /// carries a `directive` reference (possibly `forwardRef`-wrapped) plus optional `inputs`/`outputs`
 /// public-name→alias mappings.
-fn read_host_directives(obj: &ObjectExpression) -> Result<Option<Vec<R3HostDirectiveMetadata>>, String> {
-    let Some(Expression::ArrayExpression(arr)) = find_prop(obj, "hostDirectives") else {
+fn read_host_directives(obj: Props) -> Result<Option<Vec<R3HostDirectiveMetadata>>, String> {
+    let Some(NExpr::Array(elems)) = find_prop(obj, "hostDirectives") else {
         return Ok(None);
     };
-    let mut out: Vec<R3HostDirectiveMetadata> = Vec::with_capacity(arr.elements.len());
-    for el in &arr.elements {
-        let inner = el
-            .as_expression()
-            .ok_or_else(|| "unsupported `hostDirectives` element".to_string())?;
-        let Expression::ObjectExpression(entry) = inner else {
+    let mut out: Vec<R3HostDirectiveMetadata> = Vec::with_capacity(elems.len());
+    for el in elems {
+        let NArrayElement::Expr(inner) = el else {
+            return Err("unsupported `hostDirectives` element".to_string());
+        };
+        let Some(entry) = object_props(inner) else {
             return Err("`hostDirectives` element must be an object".to_string());
         };
         let directive_expr = find_prop(entry, "directive")
@@ -1422,7 +1366,7 @@ fn read_host_directives(obj: &ObjectExpression) -> Result<Option<Vec<R3HostDirec
 /// `toR3DirectiveMeta` — the SHARED directive base both `ɵɵngDeclareDirective` and
 /// `ɵɵngDeclareComponent` build. Maps the declaration object field-by-field onto
 /// [`R3DirectiveMetadata`].
-fn to_r3_directive_meta(obj: &ObjectExpression) -> Result<R3DirectiveMetadata, String> {
+fn to_r3_directive_meta(obj: Props) -> Result<R3DirectiveMetadata, String> {
     let type_expr =
         find_prop(obj, "type").ok_or_else(|| "declaration missing `type`".to_string())?;
     let name = symbol_name(type_expr)
@@ -1433,10 +1377,12 @@ fn to_r3_directive_meta(obj: &ObjectExpression) -> Result<R3DirectiveMetadata, S
 
     let export_as = find_prop(obj, "exportAs").map(|e| match e {
         // `exportAs` is an array of strings in the declaration form.
-        Expression::ArrayExpression(arr) => arr
-            .elements
+        NExpr::Array(elems) => elems
             .iter()
-            .filter_map(|el| el.as_expression().and_then(string_value))
+            .filter_map(|el| match el {
+                NArrayElement::Expr(e) => string_value(e),
+                _ => None,
+            })
             .collect::<Vec<_>>(),
         // Defensive: a bare string also reads as a single export name.
         other => string_value(other).into_iter().collect::<Vec<_>>(),
@@ -1476,7 +1422,7 @@ fn to_r3_directive_meta(obj: &ObjectExpression) -> Result<R3DirectiveMetadata, S
 /// `PartialDirectiveLinkerVersion1` — `toR3DirectiveMeta` + `compileDirectiveFromMetadata` → the
 /// `ɵɵdefineDirective({…})` text (plus any hoisted query-predicate `const _cN = […]` statements as a
 /// trailing suffix, mirroring the source front-end's directive emit).
-fn link_directive(obj: &ObjectExpression) -> Result<LinkedDef, String> {
+fn link_directive(obj: Props) -> Result<LinkedDef, String> {
     let base = to_r3_directive_meta(obj)?;
     let mut host_builder = DefaultHostBindingsBuilder;
     let compiled = compile_directive_from_metadata(&base, &mut host_builder);
@@ -1491,7 +1437,7 @@ fn link_directive(obj: &ObjectExpression) -> Result<LinkedDef, String> {
 /// carry a `name`. The `type` is resolved through `extractForwardRef`. Returns `None` for an unknown
 /// `kind` (skipped, matching the reference `default: continue`).
 fn dependency_from_object(
-    dep: &ObjectExpression,
+    dep: Props,
     forced_kind: Option<R3TemplateDependencyKind>,
 ) -> Result<Option<R3TemplateDependencyMetadata>, String> {
     let type_expr =
@@ -1517,17 +1463,17 @@ fn dependency_from_object(
 /// Collect every template dependency from a component declaration, unifying the OLD-style
 /// (`components`/`directives` arrays + `pipes` object) and NEW-style (`dependencies` array) forms,
 /// exactly as `toR3ComponentMeta` does. Order: components, directives, pipes, then `dependencies`.
-fn read_declarations(obj: &ObjectExpression) -> Result<Vec<R3TemplateDependencyMetadata>, String> {
+fn read_declarations(obj: Props) -> Result<Vec<R3TemplateDependencyMetadata>, String> {
     let mut out: Vec<R3TemplateDependencyMetadata> = Vec::new();
 
     // Old-style `components` / `directives` arrays (each entry is a directive-dependency object).
     for key in ["components", "directives"] {
-        if let Some(Expression::ArrayExpression(arr)) = find_prop(obj, key) {
-            for el in &arr.elements {
-                let inner = el
-                    .as_expression()
-                    .ok_or_else(|| format!("unsupported `{key}` element"))?;
-                let Expression::ObjectExpression(dep) = inner else {
+        if let Some(NExpr::Array(elems)) = find_prop(obj, key) {
+            for el in elems {
+                let NArrayElement::Expr(inner) = el else {
+                    return Err(format!("unsupported `{key}` element"));
+                };
+                let Some(dep) = object_props(inner) else {
                     return Err(format!("`{key}` element must be an object"));
                 };
                 if let Some(meta) =
@@ -1540,15 +1486,13 @@ fn read_declarations(obj: &ObjectExpression) -> Result<Vec<R3TemplateDependencyM
     }
 
     // Old-style `pipes` object map (`{name: TypeRef}`).
-    if let Some(Expression::ObjectExpression(pipes)) = find_prop(obj, "pipes") {
-        for p in &pipes.properties {
-            let ObjectPropertyKind::ObjectProperty(op) = p else {
+    if let Some(NExpr::Object(pipes)) = find_prop(obj, "pipes") {
+        for p in pipes {
+            let NObjectProp::KeyValue { value, .. } = p else {
                 return Err("unsupported `pipes` spread/shorthand".to_string());
             };
-            let _name =
-                key_name(&op.key).ok_or_else(|| "unsupported `pipes` key".to_string())?;
-            let ty = forward_ref_target(&op.value)
-                .or_else(|| convert_expr(&op.value))
+            let ty = forward_ref_target(value)
+                .or_else(|| convert_expr(value))
                 .ok_or_else(|| "unsupported `pipes` type expression".to_string())?;
             out.push(R3TemplateDependencyMetadata {
                 kind: R3TemplateDependencyKind::Pipe,
@@ -1558,12 +1502,12 @@ fn read_declarations(obj: &ObjectExpression) -> Result<Vec<R3TemplateDependencyM
     }
 
     // New-style unified `dependencies` array.
-    if let Some(Expression::ArrayExpression(arr)) = find_prop(obj, "dependencies") {
-        for el in &arr.elements {
-            let inner = el
-                .as_expression()
-                .ok_or_else(|| "unsupported `dependencies` element".to_string())?;
-            let Expression::ObjectExpression(dep) = inner else {
+    if let Some(NExpr::Array(elems)) = find_prop(obj, "dependencies") {
+        for el in elems {
+            let NArrayElement::Expr(inner) = el else {
+                return Err("unsupported `dependencies` element".to_string());
+            };
+            let Some(dep) = object_props(inner) else {
                 return Err("`dependencies` element must be an object".to_string());
             };
             if let Some(meta) = dependency_from_object(dep, None)? {
@@ -1576,13 +1520,13 @@ fn read_declarations(obj: &ObjectExpression) -> Result<Vec<R3TemplateDependencyM
 }
 
 /// `parseEncapsulation` — `ViewEncapsulation.X` member (or bare `X`) → the enum (default Emulated).
-fn read_encapsulation(obj: &ObjectExpression) -> ViewEncapsulation {
+fn read_encapsulation(obj: Props) -> ViewEncapsulation {
     let Some(expr) = find_prop(obj, "encapsulation") else {
         return ViewEncapsulation::Emulated;
     };
     let name = match expr {
-        Expression::StaticMemberExpression(m) => m.property.name.as_str(),
-        Expression::Identifier(id) => id.name.as_str(),
+        NExpr::Member { property, .. } => property.as_str(),
+        NExpr::Identifier(id) => id.as_str(),
         _ => return ViewEncapsulation::Emulated,
     };
     match name {
@@ -1594,11 +1538,11 @@ fn read_encapsulation(obj: &ObjectExpression) -> ViewEncapsulation {
 
 /// `parseChangeDetectionStrategy` — `ChangeDetectionStrategy.X` member → the strategy. `Eager`
 /// aliases `Default` (both `= 1`). Absent → v22 default OnPush (else Eager/Default).
-fn read_change_detection(obj: &ObjectExpression, major: u32, placeholder: bool) -> ChangeDetection {
+fn read_change_detection(obj: Props, major: u32, placeholder: bool) -> ChangeDetection {
     if let Some(expr) = find_prop(obj, "changeDetection") {
         let name = match expr {
-            Expression::StaticMemberExpression(m) => Some(m.property.name.as_str()),
-            Expression::Identifier(id) => Some(id.name.as_str()),
+            NExpr::Member { property, .. } => Some(property.as_str()),
+            NExpr::Identifier(id) => Some(id.as_str()),
             _ => None,
         };
         let strategy = match name {
@@ -1621,7 +1565,7 @@ fn read_change_detection(obj: &ObjectExpression, major: u32, placeholder: bool) 
 /// `ɵɵdefineComponent({…})` text plus the hoisted `ConstantPool.statements` (nested-view functions,
 /// query-predicate / `ngContentSelectors` consts) as a leading prefix, exactly as the source
 /// front-end emits them (the definition references those names, so they print first).
-fn link_component(obj: &ObjectExpression) -> Result<LinkedDef, String> {
+fn link_component(obj: Props) -> Result<LinkedDef, String> {
     let base = to_r3_directive_meta(obj)?;
     let major = version_major(obj);
     let placeholder = is_placeholder_version(obj);
@@ -1664,10 +1608,13 @@ fn link_component(obj: &ObjectExpression) -> Result<LinkedDef, String> {
     };
     let styles = find_prop(obj, "styles")
         .and_then(|e| match e {
-            Expression::ArrayExpression(arr) => Some(
-                arr.elements
+            NExpr::Array(elems) => Some(
+                elems
                     .iter()
-                    .filter_map(|el| el.as_expression().and_then(string_value))
+                    .filter_map(|el| match el {
+                        NArrayElement::Expr(e) => string_value(e),
+                        _ => None,
+                    })
                     .collect::<Vec<_>>(),
             ),
             _ => None,
@@ -1745,115 +1692,8 @@ fn suffix_from_statements(statements: &[o::Stmt]) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Module walk + surgical span rewrite.
+// Module walk + surgical span rewrite (driven off the neutral `ParseOutput::ng_declare_calls`).
 // ---------------------------------------------------------------------------
-
-/// One `ɵɵngDeclare*(...)` call located in the source: its kind, the call's byte span, and the byte
-/// span of its single object-literal argument (for re-parsing the arg in isolation).
-struct DeclareCall {
-    kind: DeclareKind,
-    start: u32,
-    end: u32,
-    obj_start: u32,
-    obj_end: u32,
-}
-
-/// Collect every `ɵɵngDeclare*` call in the program. They appear as class static-member
-/// initializers (`static ɵfac = i0.ɵɵngDeclareFactory({...})`), as the RHS of an assignment
-/// statement (`X.ɵprov = i0.ɵɵngDeclareInjectable({...})`), and as top-level expression statements
-/// (`i0.ɵɵngDeclareClassMetadata({...})`). A focused recursive walk over those positions finds them
-/// all without pulling in the `oxc_ast_visit` dependency.
-fn collect_declares(program: &oxc_ast::ast::Program) -> Vec<DeclareCall> {
-    let mut calls: Vec<DeclareCall> = Vec::new();
-    for stmt in &program.body {
-        collect_in_statement(stmt, &mut calls);
-    }
-    calls
-}
-
-/// Walk a statement for `ɵɵngDeclare*` calls.
-fn collect_in_statement(stmt: &Statement, calls: &mut Vec<DeclareCall>) {
-    match stmt {
-        Statement::ExpressionStatement(es) => collect_in_expression(&es.expression, calls),
-        Statement::ClassDeclaration(class) => collect_in_class(class, calls),
-        Statement::ExportNamedDeclaration(export) => {
-            if let Some(oxc_ast::ast::Declaration::ClassDeclaration(class)) = &export.declaration {
-                collect_in_class(class, calls);
-            }
-        }
-        Statement::ExportDefaultDeclaration(export) => {
-            if let oxc_ast::ast::ExportDefaultDeclarationKind::ClassDeclaration(class) =
-                &export.declaration
-            {
-                collect_in_class(class, calls);
-            }
-        }
-        Statement::VariableDeclaration(decl) => {
-            for d in &decl.declarations {
-                if let Some(init) = &d.init {
-                    collect_in_expression(init, calls);
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Walk a class body's static property initializers for `ɵɵngDeclare*` calls.
-fn collect_in_class(class: &oxc_ast::ast::Class, calls: &mut Vec<DeclareCall>) {
-    for element in &class.body.body {
-        if let oxc_ast::ast::ClassElement::PropertyDefinition(prop) = element {
-            if let Some(value) = &prop.value {
-                collect_in_expression(value, calls);
-            }
-        }
-    }
-}
-
-/// Record `expr` if it is a `ɵɵngDeclare*` call, recursing through the wrappers a declaration call
-/// inhabits: the RHS of an assignment (`X.ɵprov = <call>`) and parenthesized/sequence forms.
-fn collect_in_expression(expr: &Expression, calls: &mut Vec<DeclareCall>) {
-    match expr {
-        Expression::CallExpression(call) => record_declare_call(call, calls),
-        Expression::AssignmentExpression(assign) => collect_in_expression(&assign.right, calls),
-        Expression::ParenthesizedExpression(p) => collect_in_expression(&p.expression, calls),
-        Expression::SequenceExpression(seq) => {
-            for part in &seq.expressions {
-                collect_in_expression(part, calls);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Push a [`DeclareCall`] when `call` is a recognized `ɵɵngDeclare*(...)` with one object argument.
-fn record_declare_call(call: &CallExpression, calls: &mut Vec<DeclareCall>) {
-    if let Some(kind) = declare_callee_kind(&call.callee) {
-        if call.arguments.len() == 1 {
-            if let Some(Argument::ObjectExpression(obj)) = call.arguments.first() {
-                let span = call.span();
-                let obj_span = obj.span();
-                calls.push(DeclareCall {
-                    kind,
-                    start: span.start,
-                    end: span.end,
-                    obj_start: obj_span.start,
-                    obj_end: obj_span.end,
-                });
-            }
-        }
-    }
-}
-
-/// Classify a call's callee as a `ɵɵngDeclare*` kind, accepting both the bare identifier form
-/// (`ɵɵngDeclareX(...)`) and the namespaced member form (`i0.ɵɵngDeclareX(...)`).
-fn declare_callee_kind(callee: &Expression) -> Option<DeclareKind> {
-    match callee {
-        Expression::Identifier(id) => DeclareKind::from_callee(id.name.as_str()),
-        Expression::StaticMemberExpression(m) => DeclareKind::from_callee(m.property.name.as_str()),
-        _ => None,
-    }
-}
 
 /// Link a partial-declaration module: rewrite every supported `ɵɵngDeclare*({...})` call into its
 /// `ɵɵdefine*({...})` equivalent, leaving all other bytes untouched.
@@ -1862,21 +1702,22 @@ fn declare_callee_kind(callee: &Expression) -> Option<DeclareKind> {
 /// error the original `code` is returned unchanged with the error recorded.
 pub fn link_partial(code: &str, filename: &str) -> LinkResult {
     ParsingBackend::default().parse_module(code, SourceKind::ByFilename(filename), |module| {
-        if !module.summary().errors.is_empty() {
+        let summary = module.summary();
+        if !summary.errors.is_empty() {
             return LinkResult {
                 code: code.to_string(),
-                errors: vec![format!("parse error: {}", module.summary().errors.join("; "))],
+                errors: vec![format!("parse error: {}", summary.errors.join("; "))],
             };
         }
-        link_partial_walk(code, module.program())
+        link_partial_walk(code, &summary.ng_declare_calls)
     })
 }
 
-/// The metadata WALK half of [`link_partial`]: collect every `ɵɵngDeclare*` call in the parsed
-/// program, link each to its `ɵɵdefine*` replacement, and apply the surgical span rewrites. Split out
-/// so the parse seam stays a thin wrapper around [`ParsingBackend`].
-fn link_partial_walk(code: &str, program: &oxc_ast::ast::Program) -> LinkResult {
-    let declares = collect_declares(program);
+/// The metadata WALK half of [`link_partial`]: walk every neutral `ɵɵngDeclare*` call the parse
+/// backend pre-lowered (in source order), link each to its `ɵɵdefine*` replacement (reading the
+/// LOSSLESS `object.nprops` directly — no per-declaration re-parse), and apply the surgical span
+/// rewrites over the call spans.
+fn link_partial_walk(code: &str, declares: &[crate::parse::NgDeclareCall]) -> LinkResult {
     let mut errors: Vec<String> = Vec::new();
 
     /// A single resolved span rewrite.
@@ -1889,26 +1730,31 @@ fn link_partial_walk(code: &str, program: &oxc_ast::ast::Program) -> LinkResult 
     }
     let mut replacements: Vec<Replacement> = Vec::new();
 
-    for call in &declares {
+    for call in declares {
+        let Some(kind) = DeclareKind::from_suffix(&call.kind) else {
+            continue;
+        };
+        let start = call.call_span.start as usize;
+        let end = call.call_span.end as usize;
+
         // `ɵɵngDeclareClassMetadata(...)` / `ɵɵngDeclareClassMetadataAsync(...)` are the dev-only
         // `setClassMetadata`/`setClassMetadataAsync` reflection calls; the AOT linker's output is
         // `ngDevMode`-guarded and tree-shaken in production, so both are dropped. Replace the call
         // with `void 0` so the surrounding statement stays syntactically valid.
-        if matches!(call.kind, DeclareKind::ClassMetadata | DeclareKind::ClassMetadataAsync) {
+        if matches!(kind, DeclareKind::ClassMetadata | DeclareKind::ClassMetadataAsync) {
             replacements.push(Replacement {
-                start: call.start as usize,
-                end: call.end as usize,
+                start,
+                end,
                 text: "void 0".to_string(),
                 suffix: String::new(),
             });
             continue;
         }
 
-        let obj_src = &code[call.obj_start as usize..call.obj_end as usize];
-        match link_one(call.kind, obj_src) {
+        match link_one(kind, &call.object.nprops) {
             Ok(def) => replacements.push(Replacement {
-                start: call.start as usize,
-                end: call.end as usize,
+                start,
+                end,
                 text: def.expr_text,
                 suffix: def.suffix,
             }),
@@ -1946,54 +1792,22 @@ fn link_partial_walk(code: &str, program: &oxc_ast::ast::Program) -> LinkResult 
     LinkResult { code: out, errors }
 }
 
-/// Link a single declaration object (re-parsed from its source slice) to its replacement def.
-fn link_one(kind: DeclareKind, obj_src: &str) -> Result<LinkedDef, String> {
-    // Re-parse the object literal in unambiguous expression position. A bare `({...})` program is
-    // parsed by oxc as a BLOCK statement (the leading `{` wins), so anchor it as the initializer of
-    // a variable declaration instead, then recover the `ObjectExpression` from that.
-    let wrapped = format!("const __ngLinkDecl__ = {obj_src};");
-    ParsingBackend::default().parse_module(&wrapped, SourceKind::TypeScriptModule, |module| {
-        if !module.summary().errors.is_empty() {
-            return Err(format!(
-                "could not re-parse declaration object for {kind:?}: {}",
-                module.summary().errors.join("; ")
-            ));
+/// Link a single pre-lowered declaration object (its lossless [`NObjectProp`] list) to its
+/// replacement def. No re-parse is needed — the parse backend already lowered the `{…}` argument into
+/// the neutral `nprops` channel, which carries every property's full `NExpr` value.
+fn link_one(kind: DeclareKind, props: Props) -> Result<LinkedDef, String> {
+    match kind {
+        DeclareKind::Factory => link_factory(props).map(plain),
+        DeclareKind::Injectable => link_injectable(props).map(plain),
+        DeclareKind::Service => link_service(props).map(plain),
+        DeclareKind::Injector => link_injector(props).map(plain),
+        DeclareKind::Pipe => link_pipe(props).map(plain),
+        DeclareKind::NgModule => link_ng_module(props),
+        DeclareKind::Directive => link_directive(props),
+        DeclareKind::Component => link_component(props),
+        DeclareKind::ClassMetadata | DeclareKind::ClassMetadataAsync => {
+            unreachable!("ClassMetadata(Async) handled before link_one")
         }
-        let obj = first_object_expression(module.program())
-            .ok_or_else(|| format!("declaration argument for {kind:?} is not an object literal"))?;
-
-        match kind {
-            DeclareKind::Factory => link_factory(obj).map(plain),
-            DeclareKind::Injectable => link_injectable(obj).map(plain),
-            DeclareKind::Service => link_service(obj).map(plain),
-            DeclareKind::Injector => link_injector(obj).map(plain),
-            DeclareKind::Pipe => link_pipe(obj).map(plain),
-            DeclareKind::NgModule => link_ng_module(obj),
-            DeclareKind::Directive => link_directive(obj),
-            DeclareKind::Component => link_component(obj),
-            DeclareKind::ClassMetadata | DeclareKind::ClassMetadataAsync => {
-                unreachable!("ClassMetadata(Async) handled before link_one")
-            }
-        }
-    })
-}
-
-/// The `ObjectExpression` initializer of the `const __ngLinkDecl__ = {...};` wrapper program.
-fn first_object_expression<'a>(
-    program: &'a oxc_ast::ast::Program<'a>,
-) -> Option<&'a ObjectExpression<'a>> {
-    let stmt = program.body.first()?;
-    let Statement::VariableDeclaration(decl) = stmt else {
-        return None;
-    };
-    let init = decl.declarations.first()?.init.as_ref()?;
-    match init {
-        Expression::ObjectExpression(obj) => Some(obj),
-        Expression::ParenthesizedExpression(p) => match &p.expression {
-            Expression::ObjectExpression(obj) => Some(obj),
-            _ => None,
-        },
-        _ => None,
     }
 }
 
@@ -2252,25 +2066,26 @@ mod tests {
         assert_reparses(&out.code);
     }
 
-    /// Parse a single expression, run `convert_expr`, and emit the result back to text.
-    /// The allocator is local, so parse + convert + emit all happen before it is dropped.
+    /// Parse a single expression, run `convert_expr` over its NEUTRAL form, and emit the result back
+    /// to text. Reads the `const __x = (…)` initializer off the engine-neutral top-level surface
+    /// (`ParseOutput::top_level`), so the test drives the SAME neutral walk the linker does.
     fn convert_and_emit(expr_src: &str) -> String {
+        use crate::parse::NTopStmt;
         let wrapped = format!("const __x = ({expr_src});");
         ParsingBackend::default().parse_module(&wrapped, SourceKind::TypeScriptEsModule, |module| {
+            let summary = module.summary();
             assert!(
-                module.summary().errors.is_empty(),
+                summary.errors.is_empty(),
                 "test expression did not parse: {:?}",
-                module.summary().errors
+                summary.errors
             );
             let mut found: Option<String> = None;
-            for stmt in &module.program().body {
-                if let Statement::VariableDeclaration(decl) = stmt {
-                    if let Some(d) = decl.declarations.first() {
-                        if let Some(init) = &d.init {
-                            let converted = convert_expr(init)
-                                .expect("expression should convert via convert_expr");
-                            found = Some(emit_def_text(&converted));
-                        }
+            for stmt in &summary.top_level {
+                if let NTopStmt::VarDecl { decls, .. } = stmt {
+                    if let Some(init) = decls.first().and_then(|d| d.init.as_ref()) {
+                        let converted = convert_expr(init)
+                            .expect("expression should convert via convert_expr");
+                        found = Some(emit_def_text(&converted));
                     }
                 }
             }

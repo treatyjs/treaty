@@ -47,8 +47,8 @@ use swc_ecma_parser::{parse_file_as_program, Syntax, TsSyntax};
 
 use super::{
     ClassWithDecorators, DecoratorInfo, ImportInfo, LitValue, MemberInfo, MemberKind, NArg,
-    NArrayElement, NArrowBody, NCtorParam, NExpr, NObjectProp, NParam, NStmt, NVarDeclarator,
-    NgDeclareCall, ObjLit, ParseBackend, ParseOutput, SourceKind, TreatySpan,
+    NArrayElement, NArrowBody, NAssignment, NCtorParam, NExpr, NObjectProp, NParam, NStmt, NTopStmt,
+    NVarDeclarator, NgDeclareCall, ObjLit, ParseBackend, ParseOutput, SourceKind, TreatySpan,
 };
 
 /// The swc parse backend. Zero-sized; a fresh `GLOBALS` scope + `SourceMap` is created per
@@ -121,6 +121,7 @@ impl ParseBackend for SwcParseBackend {
                         classes: Vec::new(),
                         ng_declare_calls: Vec::new(),
                         imports: Vec::new(),
+                        top_level: Vec::new(),
                         errors: errors.iter().map(|e| format!("{:?}", e.kind())).collect(),
                     },
                 },
@@ -134,6 +135,7 @@ impl ParseBackend for SwcParseBackend {
                         classes: Vec::new(),
                         ng_declare_calls: Vec::new(),
                         imports: Vec::new(),
+                        top_level: Vec::new(),
                         errors: vec![format!("{:?}", e.kind())],
                     },
                 },
@@ -212,16 +214,25 @@ fn lower_program(program: &Program, base: u32) -> ParseOutput {
     let mut classes = Vec::new();
     let mut ng_declare_calls = Vec::new();
     let mut imports = Vec::new();
+    let mut top_level = Vec::new();
 
     match program {
         Program::Module(module) => {
             for item in &module.body {
-                lower_top_level_item(item, base, &mut classes, &mut ng_declare_calls, &mut imports);
+                lower_top_level_item(
+                    item,
+                    base,
+                    &mut classes,
+                    &mut ng_declare_calls,
+                    &mut imports,
+                    &mut top_level,
+                );
             }
         }
         Program::Script(script) => {
             for stmt in &script.body {
                 lower_top_level_stmt(stmt, base, &mut classes, &mut ng_declare_calls);
+                top_level.push(lower_top_stmt(stmt, base));
             }
         }
     }
@@ -230,23 +241,36 @@ fn lower_program(program: &Program, base: u32) -> ParseOutput {
         classes,
         ng_declare_calls,
         imports,
+        top_level,
         errors: Vec::new(),
     }
 }
 
 /// Handle a module-level item: a statement, an `export`/`export default` wrapping a class, or an
-/// `import` declaration (whose bindings feed the neutral import surface).
+/// `import` declaration (whose bindings feed the neutral import surface). The enclosing item's span
+/// is threaded so a decorated class records its `stmt_span` (the whole `export class …` / `@Dec class
+/// …` statement), matching the oxc backend's `span_of(stmt)`.
 fn lower_top_level_item(
     item: &ModuleItem,
     base: u32,
     classes: &mut Vec<ClassWithDecorators>,
     ng_declares: &mut Vec<NgDeclareCall>,
     imports: &mut Vec<ImportInfo>,
+    top_level: &mut Vec<NTopStmt>,
 ) {
+    let item_span = span_of(item.span(), base);
     match item {
-        ModuleItem::Stmt(stmt) => lower_top_level_stmt(stmt, base, classes, ng_declares),
+        ModuleItem::Stmt(stmt) => {
+            lower_top_level_stmt_spanned(stmt, base, item_span, false, classes, ng_declares);
+            top_level.push(lower_top_stmt(stmt, base));
+        }
         ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(export)) => {
-            lower_top_level_decl(&export.decl, base, classes, ng_declares);
+            lower_top_level_decl(&export.decl, base, item_span, true, classes, ng_declares);
+            // An exported declaration is neither an assignment, a bare-call expression statement, nor
+            // a top-level `var`/`let`/`const` scanned by the AOT emitter — record it as `Other` with
+            // the whole `export …` statement span (matching the oxc backend, where `export class X {}`
+            // is a single `ExportNamedDeclaration` statement that `lower_top_stmt` maps to `Other`).
+            top_level.push(NTopStmt::Other(item_span));
         }
         ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultDecl(export)) => {
             if let DefaultDecl::Class(class_expr) = &export.decl {
@@ -254,19 +278,24 @@ fn lower_top_level_item(
                     class_expr.ident.as_ref().map(|id| id.sym.to_string()),
                     &class_expr.class,
                     base,
+                    item_span,
+                    true,
                     classes,
                     ng_declares,
                 );
             }
+            top_level.push(NTopStmt::Other(item_span));
         }
         ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultExpr(export)) => {
             // `export default ɵɵngDeclare*({...})` as a free expression.
             push_if_ng_declare(&export.expr, base, ng_declares);
+            top_level.push(NTopStmt::Other(item_span));
         }
         ModuleItem::ModuleDecl(ModuleDecl::Import(import)) => {
             collect_import(import, imports);
+            top_level.push(NTopStmt::Other(item_span));
         }
-        _ => {}
+        _ => top_level.push(NTopStmt::Other(item_span)),
     }
 }
 
@@ -287,15 +316,34 @@ fn collect_import(import: &swc_ecma_ast::ImportDecl, out: &mut Vec<ImportInfo>) 
     }
 }
 
-/// Handle a top-level statement (class decl / expr stmt / var decl carrying a `ɵɵngDeclare*`).
+/// Handle a top-level statement (class decl / expr stmt / var decl carrying a `ɵɵngDeclare*`). The
+/// statement's own span is used as the enclosing `stmt_span` for any class it declares.
 fn lower_top_level_stmt(
     stmt: &Stmt,
     base: u32,
     classes: &mut Vec<ClassWithDecorators>,
     ng_declares: &mut Vec<NgDeclareCall>,
 ) {
+    let stmt_span = span_of(stmt.span(), base);
+    lower_top_level_stmt_spanned(stmt, base, stmt_span, false, classes, ng_declares);
+}
+
+/// As [`lower_top_level_stmt`] but with the enclosing statement span supplied (the module-item span
+/// for a bare statement; equal to the statement's own span for a `Program::Script` body statement).
+/// `exported` is `true` when the declaration is wrapped in an `export …` (so a decorated class anchors
+/// its span at the `class` keyword, not the decorators — see [`lower_class`]).
+fn lower_top_level_stmt_spanned(
+    stmt: &Stmt,
+    base: u32,
+    stmt_span: TreatySpan,
+    exported: bool,
+    classes: &mut Vec<ClassWithDecorators>,
+    ng_declares: &mut Vec<NgDeclareCall>,
+) {
     match stmt {
-        Stmt::Decl(decl) => lower_top_level_decl(decl, base, classes, ng_declares),
+        Stmt::Decl(decl) => {
+            lower_top_level_decl(decl, base, stmt_span, exported, classes, ng_declares)
+        }
         Stmt::Expr(es) => push_if_ng_declare(&es.expr, base, ng_declares),
         _ => {}
     }
@@ -306,6 +354,8 @@ fn lower_top_level_stmt(
 fn lower_top_level_decl(
     decl: &Decl,
     base: u32,
+    stmt_span: TreatySpan,
+    exported: bool,
     classes: &mut Vec<ClassWithDecorators>,
     ng_declares: &mut Vec<NgDeclareCall>,
 ) {
@@ -315,6 +365,8 @@ fn lower_top_level_decl(
                 Some(class_decl.ident.sym.to_string()),
                 &class_decl.class,
                 base,
+                stmt_span,
+                exported,
                 classes,
                 ng_declares,
             );
@@ -336,18 +388,38 @@ fn push_class(
     name: Option<String>,
     class: &swc_ecma_ast::Class,
     base: u32,
+    stmt_span: TreatySpan,
+    exported: bool,
     classes: &mut Vec<ClassWithDecorators>,
     ng_declares: &mut Vec<NgDeclareCall>,
 ) {
     if !class.decorators.is_empty() {
-        classes.push(lower_class(name, class, base));
+        classes.push(lower_class(name, class, base, stmt_span, exported));
     }
     collect_ng_declares_in_class(class, base, ng_declares);
 }
 
 /// Lower a class to the neutral [`ClassWithDecorators`] (name + decorators + members, source order).
-fn lower_class(name: Option<String>, class: &swc_ecma_ast::Class, base: u32) -> ClassWithDecorators {
-    let decorators = class
+///
+/// The class node's own `span` must match the oxc backend's `Class::span`, and the enclosing
+/// `stmt_span` must match oxc's declaring-statement span. The two engines agree EXCEPT for a
+/// NON-exported, decorated, ABSTRACT class: oxc anchors both the class span and the statement span at
+/// the first decorator (oxc's start span "points at the start of all decorators and class keyword"),
+/// while swc's raw `Class.span` / item span start at the `abstract` keyword. (For a non-exported
+/// NON-abstract class swc already starts at the decorator; for any EXPORTED class oxc anchors the
+/// class span at the `class` keyword — decorators ride on the enclosing `export …` statement — and
+/// swc already matches.) So when the class is non-exported and decorated, pull both `span.start` and
+/// `stmt_span.start` back to the earliest decorator start, which is a no-op for the already-matching
+/// forms and the exact fix for the abstract case. Verified against oxc by the parity probe + the real
+/// corpus (`useclass_forwardref.ts`).
+fn lower_class(
+    name: Option<String>,
+    class: &swc_ecma_ast::Class,
+    base: u32,
+    stmt_span: TreatySpan,
+    exported: bool,
+) -> ClassWithDecorators {
+    let decorators: Vec<DecoratorInfo> = class
         .decorators
         .iter()
         .map(|d| lower_decorator(d, base))
@@ -357,11 +429,97 @@ fn lower_class(name: Option<String>, class: &swc_ecma_ast::Class, base: u32) -> 
         .iter()
         .filter_map(|m| lower_member(m, base))
         .collect::<Vec<_>>();
+    let mut span = span_of(class.span, base);
+    let mut stmt_span = stmt_span;
+    if !exported {
+        if let Some(first_dec) = decorators.iter().map(|d| d.span.start).min() {
+            span.start = span.start.min(first_dec);
+            stmt_span.start = stmt_span.start.min(first_dec);
+        }
+    }
     ClassWithDecorators {
         name,
         decorators,
         members,
+        span,
+        stmt_span,
     }
+}
+
+/// Lower one TOP-LEVEL statement to the neutral [`NTopStmt`] — the surface the AOT→partial emitter
+/// (`partial_emit::collect_rewrites`) walks. Mirrors the oxc backend's `lower_top_stmt`: an
+/// `X.member = rhs;` assignment expression statement becomes [`NTopStmt::Assignment`]; a bare
+/// expression statement becomes [`NTopStmt::ExprStmt`]; a `var`/`let`/`const` becomes
+/// [`NTopStmt::VarDecl`]; everything else carries its span as [`NTopStmt::Other`].
+fn lower_top_stmt(stmt: &Stmt, base: u32) -> NTopStmt {
+    match stmt {
+        Stmt::Expr(es) => {
+            if let Expr::Assign(assign) = &*es.expr {
+                let (target_object, target_member) = assignment_member(assign);
+                return NTopStmt::Assignment(NAssignment {
+                    target_object,
+                    target_member,
+                    value: lower_expr(&assign.right, base),
+                    value_span: span_of(assign.right.span(), base),
+                    span: span_of(stmt.span(), base),
+                });
+            }
+            NTopStmt::ExprStmt {
+                expr: lower_expr(&es.expr, base),
+                span: span_of(stmt.span(), base),
+            }
+        }
+        Stmt::Decl(Decl::Var(decl)) => {
+            let is_const = matches!(decl.kind, VarDeclKind::Const);
+            let decls = decl
+                .decls
+                .iter()
+                .map(|d| NVarDeclarator {
+                    name: pat_binding_name(&d.name),
+                    init: d.init.as_deref().map(|e| lower_expr(e, base)),
+                })
+                .collect();
+            NTopStmt::VarDecl {
+                is_const,
+                decls,
+                span: span_of(stmt.span(), base),
+            }
+        }
+        // A bare (non-exported) decorated class DECLARATION statement: oxc's statement span includes
+        // the leading decorators (its class-declaration span starts at the first decorator), but swc's
+        // `Stmt::Decl` span starts at the `class`/`abstract` keyword. Pull the `Other` span start back
+        // to the earliest decorator so the top-level surface stays byte-identical (the same
+        // reconciliation `lower_class` applies to the class span). No-op for an undecorated class.
+        Stmt::Decl(Decl::Class(class_decl)) => {
+            let mut span = span_of(stmt.span(), base);
+            if let Some(first_dec) = class_decl
+                .class
+                .decorators
+                .iter()
+                .map(|d| span_of(d.span, base).start)
+                .min()
+            {
+                span.start = span.start.min(first_dec);
+            }
+            NTopStmt::Other(span)
+        }
+        _ => NTopStmt::Other(span_of(stmt.span(), base)),
+    }
+}
+
+/// The `<Ident>.<member>` LHS parts of an swc assignment target (`X.ɵfac = …` → `(Some("X"),
+/// Some("ɵfac"))`), or `(None, None)` when the target is not a static-member-on-identifier. Mirrors
+/// the oxc backend's `assignment_member` + `partial_emit::assignment_member`.
+fn assignment_member(assign: &swc_ecma_ast::AssignExpr) -> (Option<String>, Option<String>) {
+    use swc_ecma_ast::{AssignTarget, SimpleAssignTarget};
+    if let AssignTarget::Simple(SimpleAssignTarget::Member(member)) = &assign.left {
+        if let Expr::Ident(obj) = &*member.obj {
+            if let MemberProp::Ident(prop) = &member.prop {
+                return (Some(obj.sym.to_string()), Some(prop.sym.to_string()));
+            }
+        }
+    }
+    (None, None)
 }
 
 /// Lower a class member (property / method / getter / setter / constructor / accessor) to the neutral
@@ -390,6 +548,7 @@ fn lower_member(member: &ClassMember, base: u32) -> Option<MemberInfo> {
             is_static: p.is_static,
             params: Vec::new(),
             initializer: p.value.as_deref().map(|e| lower_expr(e, base)),
+            span: span_of(p.span, base),
         }),
         ClassMember::Method(m) => Some(MemberInfo {
             name: prop_name_str(&m.key),
@@ -407,6 +566,7 @@ fn lower_member(member: &ClassMember, base: u32) -> Option<MemberInfo> {
             is_static: m.is_static,
             params: lower_fn_ctor_params(&m.function.params, base),
             initializer: None,
+            span: span_of(m.span, base),
         }),
         ClassMember::Constructor(c) => Some(MemberInfo {
             name: prop_name_str(&c.key),
@@ -415,6 +575,7 @@ fn lower_member(member: &ClassMember, base: u32) -> Option<MemberInfo> {
             is_static: false,
             params: lower_constructor_params(&c.params, base),
             initializer: None,
+            span: span_of(c.span, base),
         }),
         ClassMember::AutoAccessor(a) => Some(MemberInfo {
             name: key_str(&a.key),
@@ -423,6 +584,7 @@ fn lower_member(member: &ClassMember, base: u32) -> Option<MemberInfo> {
             is_static: a.is_static,
             params: Vec::new(),
             initializer: a.value.as_deref().map(|e| lower_expr(e, base)),
+            span: span_of(a.span, base),
         }),
         // A stray `;` (`constructor() {};`) is parsed by swc as an `Empty` member but DISCARDED by oxc
         // — drop it so the neutral member list is element-for-element identical.
@@ -431,6 +593,7 @@ fn lower_member(member: &ClassMember, base: u32) -> Option<MemberInfo> {
         // class element for these, so emit an un-named member to keep the counts aligned.
         _ => Some(MemberInfo {
             kind: MemberKind::Other,
+            span: span_of(member.span(), base),
             ..MemberInfo::default()
         }),
     }
@@ -511,6 +674,7 @@ fn lower_decorator(dec: &Decorator, base: u32) -> DecoratorInfo {
         name,
         object,
         arguments,
+        span: span_of(dec.span, base),
     }
 }
 
@@ -595,7 +759,43 @@ fn lower_object(obj: &swc_ecma_ast::ObjectLit, base: u32) -> ObjLit {
     ObjLit {
         props,
         span: span_of(obj.span, base),
+        // The lossless full-expression view of the SAME literal (every property, full `NExpr` values).
+        nprops: lower_object_props(obj, base),
     }
+}
+
+/// Lower an swc `ObjectLit`'s properties to the LOSSLESS [`NObjectProp`] list (every property in
+/// source order, key/value as full `NExpr`, spreads + computed keys preserved). Shared by
+/// [`lower_object`] (the `ObjLit::nprops` channel) and the `NExpr::Object` arm of [`lower_expr`]. A
+/// shorthand `{ child }` is mirrored as the oxc backend does: a `KeyValue` with the identifier as both
+/// key and value (oxc models shorthand that way), keeping the two backends byte-identical.
+fn lower_object_props(obj: &swc_ecma_ast::ObjectLit, base: u32) -> Vec<NObjectProp> {
+    obj.props
+        .iter()
+        .map(|p| match p {
+            PropOrSpread::Spread(sp) => NObjectProp::Spread(lower_expr(&sp.expr, base)),
+            PropOrSpread::Prop(prop) => match &**prop {
+                Prop::KeyValue(kv) => match prop_name_str(&kv.key) {
+                    Some(key) => NObjectProp::KeyValue {
+                        key: key.clone(),
+                        value: lower_expr(&kv.value, base),
+                        quoted: !is_safe_object_key(&key),
+                        computed: matches!(&kv.key, PropName::Computed(_)),
+                        value_span: span_of(kv.value.span(), base),
+                    },
+                    None => NObjectProp::Other(span_of(prop_span(prop), base)),
+                },
+                Prop::Shorthand(id) => NObjectProp::KeyValue {
+                    key: id.sym.to_string(),
+                    value: NExpr::Identifier(id.sym.to_string()),
+                    quoted: !is_safe_object_key(&id.sym),
+                    computed: false,
+                    value_span: span_of(id.span, base),
+                },
+                _ => NObjectProp::Other(span_of(prop_span(prop), base)),
+            },
+        })
+        .collect()
 }
 
 /// Lower an swc `Expr` to the neutral [`LitValue`] — the same literal subset the oxc backend
@@ -723,42 +923,7 @@ fn lower_expr(expr: &Expr, base: u32) -> NExpr {
                 .collect();
             NExpr::Array(elems)
         }
-        Expr::Object(obj) => {
-            let props = obj
-                .props
-                .iter()
-                .map(|p| match p {
-                    PropOrSpread::Spread(sp) => NObjectProp::Spread(lower_expr(&sp.expr, base)),
-                    PropOrSpread::Prop(prop) => match &**prop {
-                        Prop::KeyValue(kv) => match prop_name_str(&kv.key) {
-                            Some(key) => NObjectProp::KeyValue {
-                                key: key.clone(),
-                                value: lower_expr(&kv.value, base),
-                                quoted: !is_safe_object_key(&key),
-                                // A computed key whose expression is a string literal is captured by
-                                // `prop_name_str` (matching oxc) and FLAGGED computed, exactly as the
-                                // oxc backend flags `op.computed` for `{ ['k']: v }`.
-                                computed: matches!(&kv.key, PropName::Computed(_)),
-                            },
-                            None => NObjectProp::Other(span_of(prop_span(prop), base)),
-                        },
-                        // Shorthand `{ child }` — oxc models this as an `ObjectProperty` whose key AND
-                        // value are the identifier (its `convert_expr` lowers it to `{child: child}`),
-                        // so mirror that: a KeyValue with the identifier name as key + an identifier
-                        // value (NOT `Other`), keeping the two backends byte-identical.
-                        Prop::Shorthand(id) => NObjectProp::KeyValue {
-                            key: id.sym.to_string(),
-                            value: NExpr::Identifier(id.sym.to_string()),
-                            quoted: !is_safe_object_key(&id.sym),
-                            computed: false,
-                        },
-                        // Method / getter / setter / assign — not a static key/value pair.
-                        _ => NObjectProp::Other(span_of(prop_span(prop), base)),
-                    },
-                })
-                .collect();
-            NExpr::Object(props)
-        }
+        Expr::Object(obj) => NExpr::Object(lower_object_props(obj, base)),
         Expr::Arrow(arrow) => NExpr::Arrow {
             params: lower_arrow_params(&arrow.params),
             body: Box::new(lower_arrow_body(arrow, base)),
@@ -797,10 +962,11 @@ fn is_safe_object_key(key: &str) -> bool {
 fn lower_args(args: &[ExprOrSpread], base: u32) -> Vec<NArg> {
     args.iter()
         .map(|a| {
+            let span = span_of(a.expr.span(), base);
             if a.spread.is_some() {
-                NArg::Spread(lower_expr(&a.expr, base))
+                NArg::Spread(lower_expr(&a.expr, base), span)
             } else {
-                NArg::Expr(lower_expr(&a.expr, base))
+                NArg::Expr(lower_expr(&a.expr, base), span)
             }
         })
         .collect()
@@ -906,22 +1072,36 @@ fn collect_ng_declares_in_class(
 
 /// If `expr` is a `ɵɵngDeclare*({…})` call with an object-literal argument, push its neutral form.
 fn push_if_ng_declare(expr: &Expr, base: u32, out: &mut Vec<NgDeclareCall>) {
-    let Expr::Call(call) = expr else {
-        return;
-    };
-    let Some(kind) = declare_callee_kind(&call.callee) else {
-        return;
-    };
-    for arg in &call.args {
-        if arg.spread.is_none() {
-            if let Expr::Object(obj) = &*arg.expr {
-                out.push(NgDeclareCall {
-                    kind,
-                    object: lower_object(obj, base),
-                });
+    match expr {
+        Expr::Call(call) => {
+            let Some(kind) = declare_callee_kind(&call.callee) else {
                 return;
+            };
+            for arg in &call.args {
+                if arg.spread.is_none() {
+                    if let Expr::Object(obj) = &*arg.expr {
+                        out.push(NgDeclareCall {
+                            kind,
+                            object: lower_object(obj, base),
+                            call_span: span_of(call.span(), base),
+                        });
+                        return;
+                    }
+                }
             }
         }
+        // Recurse through the wrappers a declaration call inhabits — the RHS of an assignment
+        // (`X.ɵprov = <call>`), a parenthesized group, and a comma sequence — mirroring the linker's
+        // `collect_in_expression` (and the oxc backend) so the assignment / member form is captured
+        // identically across engines.
+        Expr::Assign(assign) => push_if_ng_declare(&assign.right, base, out),
+        Expr::Paren(p) => push_if_ng_declare(&p.expr, base, out),
+        Expr::Seq(seq) => {
+            for part in &seq.exprs {
+                push_if_ng_declare(part, base, out);
+            }
+        }
+        _ => {}
     }
 }
 

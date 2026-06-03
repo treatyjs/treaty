@@ -2921,7 +2921,14 @@ fn compile_decorated_class(
     // the parse backend's `ParseOutput` (same `lower_*` helpers), so flipping the plugins to read the
     // neutral fields later is a no-behaviour-change switch.
     let live_object = decorator_object(dec);
-    let neutral_class = crate::parse::oxc::lower_class(class);
+    // The neutral `ClassWithDecorators::stmt_span` (the enclosing top-level statement) is not consulted
+    // by the transitional ClassMeta walk (the plugins read the live oxc nodes through `ClassMeta::live`),
+    // so anchor it to the class node's own span here — the parse-backend `ParseOutput` path is the one
+    // gated at parity, and it fills `stmt_span` from the real enclosing statement.
+    let neutral_class = crate::parse::oxc::lower_class(
+        class,
+        crate::parse::TreatySpan::new(class.span().start, class.span().end),
+    );
     let neutral_decorator = crate::parse::oxc::lower_decorator(dec);
     let neutral_object = live_object.map(crate::parse::oxc::lower_object);
     let live = OxcLive {

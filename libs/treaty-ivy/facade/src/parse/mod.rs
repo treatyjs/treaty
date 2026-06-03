@@ -71,7 +71,8 @@ pub enum SourceKind<'a> {
 /// decorator surface.
 pub use treaty_ivy_core::neutral::{
     ClassWithDecorators, DecoratorInfo, LitValue, MemberInfo, MemberKind, NArg, NArrayElement,
-    NArrowBody, NCtorParam, NExpr, NObjectProp, NParam, NStmt, NVarDeclarator, ObjLit, TreatySpan,
+    NArrowBody, NAssignment, NCtorParam, NExpr, NObjectProp, NParam, NStmt, NTopStmt, NVarDeclarator,
+    ObjLit, TreatySpan,
 };
 
 /// A top-level (or inline) IMPORT binding the foreign-import / imported-name collection reads: the
@@ -91,8 +92,13 @@ pub struct ImportInfo {
 pub struct NgDeclareCall {
     /// The `ɵɵngDeclare*` callee suffix (`Component`, `Directive`, `Factory`, `Injectable`, …).
     pub kind: String,
-    /// The declaration object argument, pre-lowered.
+    /// The declaration object argument, pre-lowered (its `nprops` carry the lossless full-`NExpr`
+    /// values the partial-link walk lowers).
     pub object: ObjLit,
+    /// The byte span of the WHOLE `ɵɵngDeclare*(...)` call expression — the bytes the partial-link
+    /// surgical rewrite overwrites with the emitted `ɵɵdefine*(...)` text. (`object.span` covers only
+    /// the `{...}` argument.) Filled identically by both backends.
+    pub call_span: TreatySpan,
 }
 
 /// The engine-neutral SUMMARY of a parsed module — the pre-lowered, structurally-walkable surface.
@@ -108,6 +114,14 @@ pub struct ParseOutput {
     pub ng_declare_calls: Vec<NgDeclareCall>,
     /// Top-level `import` bindings (foreign-import / imported-name surface), in source order.
     pub imports: Vec<ImportInfo>,
+    /// The TOP-LEVEL program statement surface, in source order — every top-level statement as an
+    /// [`NTopStmt`] (definition-scaffold assignments, side-effect call statements, var declarations,
+    /// everything else as `Other`). This is the engine-neutral surface the AOT→partial emitter
+    /// (`partial_emit::collect_rewrites`) walks: the `X.ɵfac =`/`X.ɵprov = ɵɵdefineInjectable(…)`
+    /// assignments it rewrites, the `ɵɵsetNgModuleScope(X, {…})` call it reads, and the factory-body
+    /// decompile (all reachable through the assignments' `NExpr` values). Filled identically by both
+    /// backends. (Additive this phase — the emitter still walks the live oxc AST.)
+    pub top_level: Vec<NTopStmt>,
     /// Parse diagnostics; non-empty means the parse failed and `classes`/`ng_declare_calls` are empty.
     pub errors: Vec<String>,
 }
@@ -180,7 +194,9 @@ pub type ParsingBackend = oxc::OxcParseBackend;
 mod parse_parity {
     use super::oxc::OxcParseBackend;
     use super::swc::SwcParseBackend;
-    use super::{ParseBackend, ParseOutput, SourceKind};
+    use super::{
+        LitValue, NAssignment, NExpr, NObjectProp, NTopStmt, ParseBackend, ParseOutput, SourceKind,
+    };
 
     /// The neutral summary each backend extracts for `source` under `kind`.
     fn oxc_summary(source: &str, kind: SourceKind<'_>) -> ParseOutput {
@@ -293,6 +309,42 @@ export class SigComponent {
         r#"class W { static ɵcmp = i0.ɵɵngDeclareComponent({ type: W, selector: "app-w", template: "<p></p>" }); }"#,
     ];
 
+    /// The representative AOT-module corpus the AOT→partial emitter (`partial_emit::collect_rewrites`)
+    /// walks: the `X.ɵfac = function …` / `X.ɵprov = i0.ɵɵdefineInjectable({…})` definition-scaffold
+    /// ASSIGNMENT statements (with a real constructor-DI factory body — `new`, `ɵɵinject(Token, flags)`,
+    /// `ɵɵinjectAttribute`, the `ɵɵgetInheritedFactory`/`ɵɵinvalidFactory` shapes), a tree-shakeable
+    /// `ɵɵsetNgModuleScope(X, {…})` side-effect CALL statement, and an opaque `providedIn`/`useFactory`
+    /// value to round-trip. This exercises the neutral TOP-LEVEL surface (`ParseOutput::top_level`):
+    /// the assignment LHS/RHS spans, the factory-body `NExpr` tree, and the `NObjectProp::value_span` /
+    /// `NArg` span surface — all of which must be byte-identical across the two backends.
+    const PARTIAL_AOT_CORPUS: &[&str] = &[
+        // Injectable with a constructor-DI factory + a `ɵɵdefineInjectable` with an opaque `useFactory`.
+        r#"
+export class Svc {}
+Svc.ɵfac = function Svc_Factory(t) { return new (t || Svc)(i0.ɵɵinject(Dep), i0.ɵɵinject(Other, 8), i0.ɵɵinjectAttribute("name")); };
+Svc.ɵprov = i0.ɵɵdefineInjectable({ token: Svc, factory: Svc.ɵfac, providedIn: "root" });
+"#,
+        // Pipe + an inherited-factory shape (`ɵɵgetInheritedFactory`).
+        r#"
+export class P {}
+P.ɵfac = (function () { let ɵP_BaseFactory; return function P_Factory(t) { return (ɵP_BaseFactory || (ɵP_BaseFactory = i0.ɵɵgetInheritedFactory(P)))(t || P); }; })();
+P.ɵpipe = i0.ɵɵdefinePipe({ name: "p", type: P, pure: false });
+"#,
+        // NgModule with a `ɵɵsetNgModuleScope` side-effect call (declarations/imports/exports).
+        r#"
+export class M {}
+M.ɵmod = i0.ɵɵdefineNgModule({ type: M });
+M.ɵinj = i0.ɵɵdefineInjector({ imports: [CommonModule] });
+(typeof ngJitMode === "undefined" || ngJitMode) && i0.ɵɵsetNgModuleScope(M, { declarations: [A, B], imports: [CommonModule], exports: [A] });
+"#,
+        // Invalid-factory shape (`ɵɵinvalidFactory`) + a `useFactory` arrow on the provider.
+        r#"
+export class Q {}
+Q.ɵfac = function Q_Factory(t) { i0.ɵɵinvalidFactory(); };
+Q.ɵprov = i0.ɵɵdefineInjectable({ token: Q, factory: () => new Q(), providedIn: SomeMod });
+"#,
+    ];
+
     #[test]
     fn parse_parity_source_corpus() {
         for src in SOURCE_CORPUS {
@@ -303,6 +355,17 @@ export class SigComponent {
     #[test]
     fn parse_parity_ng_declare_corpus() {
         for src in NG_DECLARE_CORPUS {
+            assert_parity(src, SourceKind::TypeScriptEsModule);
+        }
+    }
+
+    /// The AOT-module TOP-LEVEL surface (`ParseOutput::top_level`) the partial emitter walks is
+    /// byte-identical across the two backends for the whole partial-AOT corpus (the assignment LHS/RHS
+    /// spans, the factory-body `NExpr` trees, the `NObjectProp::value_span` / `NArg` spans). The whole
+    /// `ParseOutput` derives `PartialEq`, so `assert_parity` covers it.
+    #[test]
+    fn parse_parity_partial_aot_corpus() {
+        for src in PARTIAL_AOT_CORPUS {
             assert_parity(src, SourceKind::TypeScriptEsModule);
         }
     }
@@ -468,7 +531,7 @@ export class DiComponent {
         assert_eq!(dec_names, vec!["Inject", "Optional"], "param decorators");
         // `@Inject(TOKEN)` argument captured as an identifier expression.
         match &ctor.params[1].decorators[0].arguments[..] {
-            [NArg::Expr(NExpr::Identifier(tok))] => assert_eq!(tok, "TOKEN"),
+            [NArg::Expr(NExpr::Identifier(tok), _)] => assert_eq!(tok, "TOKEN"),
             other => panic!("unexpected @Inject args: {other:?}"),
         }
 
@@ -499,7 +562,7 @@ export class SigComponent {
         match init("count") {
             NExpr::Call { callee, args } => {
                 assert!(matches!(&**callee, NExpr::Identifier(n) if n == "input"));
-                assert!(matches!(args.as_slice(), [NArg::Expr(NExpr::Number(_))]));
+                assert!(matches!(args.as_slice(), [NArg::Expr(NExpr::Number(_), _)]));
             }
             other => panic!("count init: {other:?}"),
         }
@@ -546,7 +609,7 @@ export class SigComponent {
             .decorators[0]
             .arguments;
         match &value_args[..] {
-            [NArg::Expr(NExpr::Object(props))] => {
+            [NArg::Expr(NExpr::Object(props), _)] => {
                 let transform = props.iter().find_map(|p| match p {
                     NObjectProp::KeyValue { key, value, .. } if key == "transform" => Some(value),
                     _ => None,
@@ -564,7 +627,7 @@ export class SigComponent {
             .decorators[0]
             .arguments;
         match &other_args[..] {
-            [NArg::Expr(NExpr::Object(props))] => {
+            [NArg::Expr(NExpr::Object(props), _)] => {
                 let transform = props.iter().find_map(|p| match p {
                     NObjectProp::KeyValue { key, value, .. } if key == "transform" => Some(value),
                     _ => None,
@@ -579,6 +642,106 @@ export class SigComponent {
             }
             other => panic!("@Input other args: {other:?}"),
         }
+    }
+
+    /// The THREE new surfaces this phase adds are FILLED (not silently empty on one side) and
+    /// byte-identical across the two backends, with the spans recovering the exact source slices:
+    ///   * GAP1 SPANS — `ClassWithDecorators::{span, stmt_span}` / `DecoratorInfo::span` /
+    ///     `MemberInfo::span` carry the decorator-strip + forward-ref anchor ranges;
+    ///   * GAP2 TOP-LEVEL — `ParseOutput::top_level` carries the `X.ɵfac = …` / `X.ɵprov =
+    ///     ɵɵdefineInjectable(…)` assignments + the `ɵɵsetNgModuleScope` call + the factory-body
+    ///     `NExpr` tree (with `NArg` spans);
+    ///   * GAP3 NGDECLARE VALUES — `ObjLit::nprops` carries each property's FULL `NExpr` value (the
+    ///     lossless channel the linker walk needs) where `props` degrades a rich value to `LitValue::
+    ///     Other`.
+    #[test]
+    fn parse_parity_phase_surfaces_filled() {
+        // ---- GAP1: spans on the decorated class + its decorator + its members. ----
+        let src = r#"@Component({ selector: "a", template: "" }) export class S {
+  @Input() title = "hi";
+  constructor(private a: A) {}
+}"#;
+        let o = oxc_summary(src, SourceKind::TypeScriptModule);
+        let s = swc_summary(src, SourceKind::TypeScriptModule);
+        assert_eq!(o, s, "GAP1 span parity");
+        let class = &o.classes[0];
+        // The decorator span recovers the exact `@Component({...})` decorator text.
+        let dec_text = OxcParseBackend.span_text(src, class.decorators[0].span);
+        assert_eq!(SwcParseBackend.span_text(src, class.decorators[0].span), dec_text);
+        assert!(dec_text.starts_with("@Component(") && dec_text.ends_with(')'), "dec: {dec_text}");
+        // The class span (exported → starts at `class`) and the enclosing statement span (`export …`)
+        // are distinct + both non-empty.
+        assert!(class.span.start > class.stmt_span.start, "exported class span starts after `export`");
+        assert!(OxcParseBackend.span_text(src, class.span).starts_with("class S"));
+        assert!(OxcParseBackend.span_text(src, class.stmt_span).starts_with("export class S"));
+        // The member span recovers the `@Input() title = "hi";` member slice (decorator included).
+        let title = class.members.iter().find(|m| m.name.as_deref() == Some("title")).unwrap();
+        assert!(OxcParseBackend.span_text(src, title.span).starts_with("@Input() title"));
+        assert_eq!(SwcParseBackend.span_text(src, title.span), OxcParseBackend.span_text(src, title.span));
+
+        // ---- GAP2: the top-level assignment + setNgModuleScope surface. ----
+        let aot = r#"
+export class M {}
+M.ɵfac = function M_Factory(t) { return new (t || M)(i0.ɵɵinject(Dep)); };
+M.ɵprov = i0.ɵɵdefineInjectable({ token: M, factory: M.ɵfac, providedIn: "root" });
+(typeof ngJitMode === "undefined" || ngJitMode) && i0.ɵɵsetNgModuleScope(M, { declarations: [A] });
+"#;
+        let o = oxc_summary(aot, SourceKind::TypeScriptEsModule);
+        let s = swc_summary(aot, SourceKind::TypeScriptEsModule);
+        assert_eq!(o, s, "GAP2 top-level parity");
+        // The two `X.member = …` definition scaffolds are surfaced as assignments with their parts.
+        let assigns: Vec<&NAssignment> = o
+            .top_level
+            .iter()
+            .filter_map(|t| match t {
+                NTopStmt::Assignment(a) => Some(a),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(assigns.len(), 2, "two definition-scaffold assignments");
+        assert_eq!(assigns[0].target_object.as_deref(), Some("M"));
+        assert_eq!(assigns[0].target_member.as_deref(), Some("\u{0275}fac"));
+        // The factory RHS is a function whose body new-expr arg is the `ɵɵinject(Dep)` call.
+        match &assigns[0].value {
+            NExpr::Function { body, .. } => {
+                let has_inject = format!("{body:?}").contains("\u{0275}\u{0275}inject");
+                assert!(has_inject, "factory body carries the ɵɵinject call");
+            }
+            other => panic!("ɵfac value: {other:?}"),
+        }
+        // The `ɵprov` RHS span recovers the verbatim `i0.ɵɵdefineInjectable({...})` source.
+        let prov_text = OxcParseBackend.span_text(aot, assigns[1].value_span);
+        assert_eq!(SwcParseBackend.span_text(aot, assigns[1].value_span), prov_text);
+        assert!(prov_text.starts_with("i0.\u{0275}\u{0275}defineInjectable("), "prov: {prov_text}");
+        // The `ɵɵsetNgModuleScope` side-effect call is surfaced as a top-level expression statement.
+        let has_set_scope = o.top_level.iter().any(|t| {
+            matches!(t, NTopStmt::ExprStmt { expr, .. }
+                if format!("{expr:?}").contains("setNgModuleScope"))
+        });
+        assert!(has_set_scope, "ɵɵsetNgModuleScope surfaced as a top-level ExprStmt");
+
+        // ---- GAP3: ObjLit::nprops carries a rich (arrow) value losslessly. ----
+        let decl = r#"i0.ɵɵngDeclareInjectable({ type: X, providedIn: "root", useFactory: () => new X(dep), deps: [{ token: Dep }] });"#;
+        let o = oxc_summary(decl, SourceKind::TypeScriptEsModule);
+        let s = swc_summary(decl, SourceKind::TypeScriptEsModule);
+        assert_eq!(o, s, "GAP3 ngDeclare value parity");
+        let obj = &o.ng_declare_calls[0].object;
+        // The lossy `props` channel degrades the `useFactory` arrow to `LitValue::Other`...
+        let lossy = obj.props.iter().find(|(k, _)| k == "useFactory").map(|(_, v)| v);
+        assert!(matches!(lossy, Some(LitValue::Other(_))), "props loses the arrow");
+        // ...while the lossless `nprops` channel carries the real `NExpr::Arrow`.
+        let rich = obj.nprops.iter().find_map(|p| match p {
+            NObjectProp::KeyValue { key, value, value_span, .. } if key == "useFactory" => {
+                Some((value, *value_span))
+            }
+            _ => None,
+        });
+        let (rich_value, value_span) = rich.expect("nprops carries useFactory");
+        assert!(matches!(rich_value, NExpr::Arrow { .. }), "nprops keeps the arrow: {rich_value:?}");
+        // The value span recovers the verbatim arrow source on both backends.
+        let arrow_text = OxcParseBackend.span_text(decl, value_span);
+        assert_eq!(SwcParseBackend.span_text(decl, value_span), arrow_text);
+        assert_eq!(arrow_text, "() => new X(dep)");
     }
 
     /// `span_text` recovers the IDENTICAL source slice on both backends for a captured object span.
