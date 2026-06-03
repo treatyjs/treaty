@@ -240,6 +240,7 @@ pub fn build_default_registry() -> PluginRegistry {
         vec![
             SubcommandSpec::new("build", "Produce a federation-ready production build"),
             SubcommandSpec::new("dev", "Start a development session"),
+            SubcommandSpec::new("serve", "Start the native Rust dev server"),
         ],
     )))
     .expect("built-in bundle plugin");

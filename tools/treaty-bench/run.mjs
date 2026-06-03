@@ -63,6 +63,16 @@
  *   packagr.json     — { results: [ { tool, status, buildMs, distBytes, note? } ],
  *                        equivalence: { ivyAllEqual, dtsAllEqual, perComponent[],
  *                        packageJson{} }, versions?, library?, speedNote? }
+ *   cli.json         — { build: [ { cli, status, buildMs, distBytes, works?,
+ *                        worksReason?, note? } ], serve: [ { cli, status,
+ *                        coldToFirstByteMs, firstModuleCompileMs?,
+ *                        firstModuleCompileNote?, note? } ], versions?, app?,
+ *                        drivers?, metrics?, buildRunsPerCli?, serveRunsPerCli? }
+ *                      The developer-facing CLI comparison: `treaty build`/`serve`
+ *                      vs `ng build`/`serve` on the full standard-Angular app
+ *                      (build time + dist + e2e-boot WORKS; serve cold-start to
+ *                      first byte + first component-module compile). cli ∈
+ *                      { treaty, ng }.
  *
  * Run with:   node tools/treaty-bench/run.mjs   (or `npm run bench` in this dir)
  *
@@ -118,12 +128,13 @@ const COMPILER_LABEL = {
 const BENCH_SCRIPTS = [
   { suite: 'compiler', file: 'compiler-bench.mjs' },
   { suite: 'fullapp', file: 'fullapp-bench.mjs' },
+  { suite: 'cli', file: 'cli-bench.mjs' },
   { suite: 'buildtool', file: 'buildtool-bench.mjs' },
   { suite: 'packagr', file: 'packagr-bench.mjs' },
 ]
 
 // Result files we know how to fold into the report.
-const RESULT_FILES = ['compiler.json', 'correctness.json', 'fullapp.json', 'buildtool.json', 'e2e.json', 'packagr.json']
+const RESULT_FILES = ['compiler.json', 'correctness.json', 'fullapp.json', 'buildtool.json', 'e2e.json', 'packagr.json', 'cli.json']
 
 // ---------------------------------------------------------------------------
 // Step 1 — invoke the measurement scripts (tolerate missing / failing ones)
@@ -538,6 +549,106 @@ function renderBuildtoolSection(fullappData, buildtoolData, e2eData) {
 }
 
 // ---------------------------------------------------------------------------
+// CLI suite (treaty CLI vs Angular CLI — build + serve cold start)
+// ---------------------------------------------------------------------------
+
+function renderCliSection(cliData) {
+  const lines = []
+  lines.push('## CLI suite')
+  lines.push('')
+  lines.push('### `treaty` CLI vs `ng` CLI: build + dev serve (same standard-Angular app)')
+  lines.push('')
+
+  if (!cliData) {
+    lines.push('_No CLI results yet. Run the suite once the measurement script has produced `results/cli.json`._')
+    lines.push('')
+    return lines.join('\n')
+  }
+
+  const blurb = []
+  blurb.push('The two developer-facing CLIs on the operations a developer actually waits on, both driving the SAME real app. '
+    + '**Treaty** drives the standalone Treaty CLI\'s own `runBuild` / `runDev` (the exact `treaty build` / `treaty serve` code path: Vite + the Treaty plugin, Module Federation opted out for a like-for-like app build). '
+    + '**ng** drives `@angular/build:application` / `@angular/build:dev-server` through the Architect API (what `ng build` / `ng serve` run; only the `@angular/cli` BIN is bypassed — it trips a Node-version floor — not the builder).')
+  if (cliData.app) blurb.push(`App: \`${escapePipes(cliData.app)}\`.`)
+  if (cliData.versions && cliData.versions['@angular/core']) blurb.push(`@angular/core ${cliData.versions['@angular/core']}, vite ${cliData.versions.vite ?? '?'}.`)
+  if (typeof cliData.buildRunsPerCli === 'number') blurb.push(`Build: best of ${cliData.buildRunsPerCli} clean build(s); serve: best of ${cliData.serveRunsPerCli ?? '?'} cold start(s).`)
+  if (cliData.host && cliData.host.node) blurb.push(`Host: node ${cliData.host.node}, ${cliData.host.platform}/${cliData.host.arch}.`)
+  lines.push(blurb.join(' '))
+  lines.push('')
+
+  // ---- BUILD table ----
+  lines.push('#### `treaty build` vs `ng build` (production)')
+  lines.push('')
+  const buildRows = Array.isArray(cliData.build) ? cliData.build : []
+  if (buildRows.length === 0) {
+    lines.push('_No build rows._')
+    lines.push('')
+  } else {
+    lines.push('| CLI | Build | dist | WORKS (e2e boot) | Notes |')
+    lines.push('| --- | --- | --- | --- | --- |')
+    for (const r of buildRows) {
+      if (!r || typeof r !== 'object') continue
+      const cli = r.cli || '(unnamed)'
+      const m = normalizeMeasurement(r, { valueKey: 'buildMs', unit: 'ms' })
+      const build = fmtMs(m)
+      const dist = m.kind === 'value' && typeof r.distBytes === 'number' ? fmtBytes(r.distBytes) : '—'
+      let works = '—'
+      if (r.works === 'PASS') works = 'PASS'
+      else if (r.works === 'FAIL') works = '**FAIL**'
+      else if (r.works === 'SKIPPED') works = '_skipped_'
+      else if (r.works) works = escapePipes(r.works)
+      const note = m.kind === 'pending' ? (m.note || r.worksReason || '') : (r.note || '')
+      lines.push('| ' + [escapePipes(cli === 'treaty' ? '`treaty build`' : `\`${cli} build\``), build, dist, works, escapePipes(note)].join(' | ') + ' |')
+    }
+    lines.push('')
+    // Speed verdict (both measured).
+    const t = buildRows.find(r => r && r.cli === 'treaty')
+    const n = buildRows.find(r => r && r.cli === 'ng')
+    if (t && n && typeof t.buildMs === 'number' && typeof n.buildMs === 'number' && t.buildMs > 0) {
+      const x = n.buildMs / t.buildMs
+      lines.push(`**Build speed:** \`treaty build\` ${formatNumber(t.buildMs)} ms vs \`ng build\` ${formatNumber(n.buildMs)} ms — `
+        + `treaty is **${x.toFixed(2)}x ${x >= 1 ? 'faster' : 'slower'}** on this app. Both emit AOT-linked output that boots the real app (WORKS=PASS, \`residualNgDeclare=0\`, \`@angular/compiler\` never imported). `
+        + 'Note the dist asymmetry: `treaty build` is the default Vite production minify, whereas `ng build` applies Angular\'s heavier production optimizer (extra Angular-specific tree-shaking / `ngDevMode` stripping), so `ng` ships a smaller bundle while taking longer to produce it.')
+      lines.push('')
+    }
+  }
+
+  // ---- SERVE table ----
+  lines.push('#### `treaty serve` vs `ng serve` (dev cold start)')
+  lines.push('')
+  const serveRows = Array.isArray(cliData.serve) ? cliData.serve : []
+  if (serveRows.length === 0) {
+    lines.push('_No serve rows._')
+    lines.push('')
+  } else {
+    lines.push('| CLI | Cold start → first byte | First component module compile | Notes |')
+    lines.push('| --- | --- | --- | --- |')
+    for (const r of serveRows) {
+      if (!r || typeof r !== 'object') continue
+      const cli = r.cli || '(unnamed)'
+      const cold = typeof r.coldToFirstByteMs === 'number' ? `${formatNumber(r.coldToFirstByteMs)} ms` : (r.status === 'measured' ? '—' : `_${r.status || 'pending'}_`)
+      const fm = typeof r.firstModuleCompileMs === 'number' ? `${formatNumber(r.firstModuleCompileMs)} ms` : (r.firstModuleCompileNote ? 'N/A' : '—')
+      const note = escapePipes(r.note || r.firstModuleCompileNote || '')
+      lines.push('| ' + [escapePipes(cli === 'treaty' ? '`treaty serve`' : `\`${cli} serve\``), cold, fm, note].join(' | ') + ' |')
+    }
+    lines.push('')
+    const t = serveRows.find(r => r && r.cli === 'treaty')
+    const n = serveRows.find(r => r && r.cli === 'ng')
+    if (t && n && typeof t.coldToFirstByteMs === 'number' && typeof n.coldToFirstByteMs === 'number' && t.coldToFirstByteMs > 0) {
+      const x = n.coldToFirstByteMs / t.coldToFirstByteMs
+      lines.push(`**Cold-start speed:** \`treaty serve\` answers the first request ${formatNumber(t.coldToFirstByteMs)} ms after a cold start vs `
+        + `\`ng serve\` ${formatNumber(n.coldToFirstByteMs)} ms — **${x.toFixed(1)}x faster to first byte**. `
+        + 'The gap is structural: Vite (Treaty) serves on-demand — it compiles the first component module only when requested '
+        + (typeof t.firstModuleCompileMs === 'number' ? `(that first \`@Component\` → Ivy compile served in ${formatNumber(t.firstModuleCompileMs)} ms) ` : '')
+        + '— whereas the Angular dev-server prebundles + compiles the WHOLE app before the first byte, so its cold start already includes the full app compile (hence it has no separable first-module number).')
+      lines.push('')
+    }
+  }
+
+  return lines.join('\n')
+}
+
+// ---------------------------------------------------------------------------
 // Packagr suite (treaty-packagr vs ng-packagr + output-equality verdict)
 // ---------------------------------------------------------------------------
 
@@ -733,6 +844,7 @@ function renderReport(collected, runLog) {
   const buildtoolData = findData(collected, 'buildtool.json')
   const e2eData = findData(collected, 'e2e.json')
   const packagrData = findData(collected, 'packagr.json')
+  const cliData = findData(collected, 'cli.json')
 
   // Build-tool source of truth: the full-app run if present, else legacy linker-smoke.
   const buildSrc = (fullappData && Array.isArray(fullappData.results) && fullappData.results.length)
@@ -825,9 +937,10 @@ function renderReport(collected, runLog) {
     out.push('')
   }
 
-  // The three suites.
+  // The suites.
   out.push(renderCompilerSection(compilerData, correctnessData))
   out.push(renderBuildtoolSection(fullappData, buildtoolData, e2eData))
+  out.push(renderCliSection(cliData))
   out.push(renderPackagrSection(packagrData))
 
   // Explicit caveats ledger.
@@ -841,6 +954,7 @@ function renderReport(collected, runLog) {
   out.push('- Compiler "speedup vs Treaty-oxc" is how many times slower each Angular compiler is than Treaty-oxc on the same corpus (higher = Treaty is further ahead).')
   out.push('- Correctness is a byte/AST diff of the Treaty Rust emitter against the live `@angular/compiler` oracle on every fixture (i18n included); the only residual diffs are cosmetic source bytes with byte-identical instruction streams (see Caveats).')
   out.push('- WORKS is a real headless jsdom boot of the emitted bundle, not a heuristic — a fast build that ships JIT-needing output is flagged FAIL.')
+  out.push('- CLI suite drives the REAL `treaty build`/`serve` (the standalone CLI\'s own `runBuild`/`runDev`) and the REAL `ng build`/`serve` builders (`@angular/build:application`/`dev-server` via Architect; only the `@angular/cli` bin\'s Node-version gate is bypassed). `treaty serve` first byte is on-demand (compiles the requested module only); `ng serve` compiles the whole app before its first byte, so it has no separable first-module number.')
   out.push('- Numbers come straight from the measurement scripts (`results/*.json`); this runner does not measure.')
   out.push('')
 

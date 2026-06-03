@@ -20,6 +20,7 @@ _Generated from result files dated 2026-06-02T21:51:10.468Z._
 | --- | --- | --- |
 | `compiler-bench.mjs` | no | --no-run |
 | `fullapp-bench.mjs` | no | --no-run |
+| `cli-bench.mjs` | no | --no-run |
 | `buildtool-bench.mjs` | no | --no-run |
 | `packagr-bench.mjs` | no | --no-run |
 
@@ -30,7 +31,7 @@ _Generated from result files dated 2026-06-02T21:51:10.468Z._
 - **Build tools:** all 6 tools (vite / rspack / rsbuild / rslib / rolldown / ng) are **measured AND booted** on the full app `examples/ng-bench-app` — 6/6 WORKS=PASS, zero pending, zero skipped.
 - **Packagr:** treaty-packagr and ng-packagr both **ran cleanly** on the same library; emitted-Ivy equality was diffed.
 
-Result files collected: 6 (compiler.json, correctness.json, fullapp.json, buildtool.json, e2e.json, packagr.json). Timing cells — measured: 11, pending: 1, missing: 0.
+Result files collected: 7 (compiler.json, correctness.json, fullapp.json, buildtool.json, e2e.json, packagr.json, cli.json). Timing cells — measured: 11, pending: 1, missing: 0.
 
 > **Treaty-swc is roadmap, not a gap in coverage.** It is a planned SECOND parser/codegen engine
 > kept byte-identical to OXC, so its column shows `pending`; the default shipping backend
@@ -90,6 +91,30 @@ Treaty's build-tool plugins (vite / rspack / rsbuild / rslib / rolldown) vs Angu
 
 > The WORKS layer is a real headless jsdom boot of each emitted bundle, not a heuristic: it fails on any JIT / `@angular/compiler not available` error, so a fast-but-broken build is flagged FAIL rather than rubber-stamped.
 
+## CLI suite
+
+### `treaty` CLI vs `ng` CLI: build + dev serve (same standard-Angular app)
+
+The two developer-facing CLIs on the operations a developer actually waits on, both driving the SAME real app. **Treaty** drives the standalone Treaty CLI's own `runBuild` / `runDev` (the exact `treaty build` / `treaty serve` code path: Vite + the Treaty plugin, Module Federation opted out for a like-for-like app build). **ng** drives `@angular/build:application` / `@angular/build:dev-server` through the Architect API (what `ng build` / `ng serve` run; only the `@angular/cli` BIN is bypassed — it trips a Node-version floor — not the builder). App: `examples/ng-bench-app`. @angular/core 22.0.0-rc.3, vite 7.3.3. Build: best of 3 clean build(s); serve: best of 3 cold start(s). Host: node v24.7.0, win32/x64.
+
+#### `treaty build` vs `ng build` (production)
+
+| CLI | Build | dist | WORKS (e2e boot) | Notes |
+| --- | --- | --- | --- | --- |
+| `treaty build` | 2436 ms | 569.7 KiB | PASS | best of 3 clean build(s); times(ms)=[4497, 2658, 2436]; jsFiles=4 residualNgDeclare=0 importsCompiler=false linkedOk=true |
+| `ng build` | 4731 ms | 247.6 KiB | PASS | best of 3 clean build(s); times(ms)=[8126, 4934, 4731]; jsFiles=4 residualNgDeclare=0 importsCompiler=false linkedOk=true |
+
+**Build speed:** `treaty build` 2436 ms vs `ng build` 4731 ms — treaty is **1.94x faster** on this app. Both emit AOT-linked output that boots the real app (WORKS=PASS, `residualNgDeclare=0`, `@angular/compiler` never imported). Note the dist asymmetry: `treaty build` is the default Vite production minify, whereas `ng build` applies Angular's heavier production optimizer (extra Angular-specific tree-shaking / `ngDevMode` stripping), so `ng` ships a smaller bundle while taking longer to produce it.
+
+#### `treaty serve` vs `ng serve` (dev cold start)
+
+| CLI | Cold start → first byte | First component module compile | Notes |
+| --- | --- | --- | --- |
+| `treaty serve` | 80.0 ms | 185 ms | best of 3 cold start(s); coldToFirstByte(ms)=[141, 120, 80]; firstModuleCompile(ms)=[194, 225, 185]; GET / -> 200; GET src/app/features/dashboard/dashboard.ts -> 200 (14523B, compiled=true) |
+| `ng serve` | 4703 ms | N/A | best of 3 cold start(s); coldToFirstByte(ms)=[7305, 5346, 4703]; GET / -> 200 |
+
+**Cold-start speed:** `treaty serve` answers the first request 80.0 ms after a cold start vs `ng serve` 4703 ms — **58.8x faster to first byte**. The gap is structural: Vite (Treaty) serves on-demand — it compiles the first component module only when requested (that first `@Component` → Ivy compile served in 185 ms) — whereas the Angular dev-server prebundles + compiles the WHOLE app before the first byte, so its cold start already includes the full app compile (hence it has no separable first-module number).
+
 ## Packagr suite
 
 ### Library build: treaty-packagr vs ng-packagr (same standard-Angular lib)
@@ -134,5 +159,6 @@ Everything below is disclosed in full. Each item is tagged **[environmental]** (
 - Compiler "speedup vs Treaty-oxc" is how many times slower each Angular compiler is than Treaty-oxc on the same corpus (higher = Treaty is further ahead).
 - Correctness is a byte/AST diff of the Treaty Rust emitter against the live `@angular/compiler` oracle on every fixture (i18n included); the only residual diffs are cosmetic source bytes with byte-identical instruction streams (see Caveats).
 - WORKS is a real headless jsdom boot of the emitted bundle, not a heuristic — a fast build that ships JIT-needing output is flagged FAIL.
+- CLI suite drives the REAL `treaty build`/`serve` (the standalone CLI's own `runBuild`/`runDev`) and the REAL `ng build`/`serve` builders (`@angular/build:application`/`dev-server` via Architect; only the `@angular/cli` bin's Node-version gate is bypassed). `treaty serve` first byte is on-demand (compiles the requested module only); `ng serve` compiles the whole app before its first byte, so it has no separable first-module number.
 - Numbers come straight from the measurement scripts (`results/*.json`); this runner does not measure.
 

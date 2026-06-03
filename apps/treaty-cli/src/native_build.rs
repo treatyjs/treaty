@@ -1,0 +1,346 @@
+//! `treaty build` — a Rust-native production build.
+//!
+//! A real module-graph bundler, in Rust, with no Node and no external bundler in
+//! the hot path:
+//!
+//!   1. Crawl the static import graph from the entry (`oxc_resolver`), in process.
+//!   2. Compile every first-party `.ts`/`.treaty`/`.tsx` to Ivy ESM via
+//!      [`crate::transform::lower`] (Ivy lowering + oxc type-strip).
+//!   3. Link every *partial* `@angular/*` library it pulls in to AOT via the
+//!      shared Rust linker ([`treaty_ivy::link_partial`]) — so the dist needs NO
+//!      JIT and NO `@angular/compiler`, the exact guarantee the bundler plugins
+//!      give.
+//!   4. Emit a self-contained dist: one ESM file per graph module under
+//!      `dist/_treaty/`, every import rewritten to its sibling dist file, plus an
+//!      `index.html` that boots the entry.
+//!
+//! The output is a directory of native ES modules the browser loads directly (no
+//! concatenation needed — modern browsers load ESM graphs natively, which is also
+//! what makes the dist bootable in jsdom). This is deliberately the *correctness*
+//! bundler: it produces output that RUNS. Minification, tree-shaking, and
+//! single-file concatenation are the noted follow-ups; for those, the same crawl
+//! feeds the `--bundler rolldown`/`vite` external path (which the CLI already
+//! wires) unchanged.
+
+use std::collections::{BTreeMap, VecDeque};
+use std::path::{Path, PathBuf};
+
+use crate::resolve::{is_under_node_modules, ModuleResolver};
+use crate::transform::{lower, rewrite_imports};
+
+/// The result of a native build.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeBuildOutput {
+    /// Files written, absolute paths (the index.html first, then modules).
+    pub written: Vec<PathBuf>,
+    /// Human-readable notes (module count, residual-partial count, etc.).
+    pub notes: Vec<String>,
+}
+
+/// Options for a native build.
+#[derive(Debug, Clone)]
+pub struct NativeBuildOptions {
+    /// App root (where `index.html` lives).
+    pub root: PathBuf,
+    /// Absolute entry module path.
+    pub entry: PathBuf,
+    /// Output directory.
+    pub out_dir: PathBuf,
+}
+
+/// A processed graph module: its emitted code and the imports to rewrite.
+struct GraphModule {
+    /// Absolute source path (the cache/identity key).
+    abs: PathBuf,
+    /// Emitted ESM (Ivy-lowered + linked), imports NOT yet rewritten.
+    code: String,
+    /// Resolved (specifier -> absolute path) for each import in `code`.
+    edges: BTreeMap<String, PathBuf>,
+}
+
+/// A stable, filesystem-safe output file name for an absolute module path.
+///
+/// We mirror nothing of the source tree (avoids `..`/drive-letter headaches);
+/// instead each module gets `<stem>-<hash>.js`, unique by absolute path. The hash
+/// is a cheap FNV-1a of the absolute path so two files with the same stem never
+/// collide.
+fn output_name(abs: &Path) -> String {
+    let stem = abs
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "module".to_string());
+    // Sanitise the stem to an identifier-ish token.
+    let safe: String = stem
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in abs.to_string_lossy().replace('\\', "/").bytes() {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{safe}-{hash:016x}.js")
+}
+
+/// Crawl + compile + link the whole graph reachable from the entry.
+///
+/// Returns the processed modules keyed by absolute path. First-party sources are
+/// Ivy-lowered + type-stripped; published partial Angular libs are linked to AOT;
+/// other published ESM passes through. Every module's static import edges are
+/// resolved so the emit step can rewrite them to sibling dist files.
+fn build_graph(
+    resolver: &ModuleResolver,
+    entry: &Path,
+) -> Result<BTreeMap<PathBuf, GraphModule>, String> {
+    let mut graph: BTreeMap<PathBuf, GraphModule> = BTreeMap::new();
+    let mut queue: VecDeque<PathBuf> = VecDeque::new();
+    queue.push_back(entry.to_path_buf());
+
+    while let Some(abs) = queue.pop_front() {
+        if graph.contains_key(&abs) {
+            continue;
+        }
+        let source = std::fs::read_to_string(&abs)
+            .map_err(|e| format!("read {}: {e}", abs.display()))?;
+        let importer_dir = abs.parent().unwrap_or(entry).to_path_buf();
+
+        // Lower/link to emit-ready code.
+        let code = if is_authoring(&abs) {
+            let lowered = lower(&source, &abs.to_string_lossy());
+            if !lowered.errors.is_empty() {
+                return Err(format!(
+                    "{}: {}",
+                    abs.display(),
+                    lowered.errors.join("; ")
+                ));
+            }
+            lowered.code
+        } else if is_under_node_modules(&abs) && source.contains("ɵɵngDeclare") {
+            treaty_ivy::link_partial(&source, &abs.to_string_lossy()).code
+        } else {
+            source
+        };
+
+        // Resolve every import edge so emit can rewrite + the crawl can follow it.
+        let mut edges = BTreeMap::new();
+        let mut to_enqueue: Vec<PathBuf> = Vec::new();
+        let _ = rewrite_imports(&code, |spec| {
+            if let Some(resolved) = resolver.resolve(&importer_dir, spec) {
+                edges.insert(spec.to_string(), resolved.clone());
+                to_enqueue.push(resolved);
+            }
+            // We do not actually mutate here; rewrite happens in emit. Returning
+            // None keeps the scan side-effect-only.
+            None
+        });
+        for dep in to_enqueue {
+            if !graph.contains_key(&dep) {
+                queue.push_back(dep);
+            }
+        }
+
+        graph.insert(
+            abs.clone(),
+            GraphModule { abs, code, edges },
+        );
+    }
+    Ok(graph)
+}
+
+/// Count residual partial-declaration CALLS (`ɵɵngDeclareComponent(` etc.). A
+/// call is an Ivy partial that did NOT get linked — the load-bearing "needs JIT"
+/// signal. Bare identifiers (the names of core's own `ɵɵngDeclare*` exports) are
+/// not calls and are ignored, mirroring the bench's `ɵɵngDeclare[A-Za-z]+\s*\(`.
+fn count_ngdeclare_calls(code: &str) -> usize {
+    let mut count = 0;
+    let bytes = code.as_bytes();
+    let needle = "ɵɵngDeclare";
+    let mut from = 0;
+    while let Some(pos) = code[from..].find(needle) {
+        let start = from + pos;
+        // Advance past the identifier (`ɵɵngDeclare` + following ident chars).
+        let mut i = start + needle.len();
+        while i < bytes.len() {
+            let c = bytes[i] as char;
+            if c.is_ascii_alphanumeric() || c == '_' {
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        // Skip whitespace, then check for a `(` (a call).
+        let mut j = i;
+        while j < bytes.len() && (bytes[j] as char).is_whitespace() {
+            j += 1;
+        }
+        if j < bytes.len() && bytes[j] == b'(' {
+            count += 1;
+        }
+        from = i.max(start + needle.len());
+    }
+    count
+}
+
+/// Whether `code` actually IMPORTS `@angular/compiler` (a real JIT dependency),
+/// as opposed to merely mentioning it inside a diagnostic string.
+fn imports_angular_compiler(code: &str) -> bool {
+    code.contains("from '@angular/compiler'")
+        || code.contains("from \"@angular/compiler\"")
+        || code.contains("import('@angular/compiler')")
+        || code.contains("import(\"@angular/compiler\")")
+}
+
+fn is_authoring(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("ts") | Some("tsx") | Some("tjsx") | Some("treaty")
+    )
+}
+
+/// Run a native build, writing a bootable dist to `out_dir`.
+pub fn build(opts: &NativeBuildOptions) -> Result<NativeBuildOutput, String> {
+    let resolver = ModuleResolver::new();
+    let entry = opts.entry.clone();
+    if !entry.exists() {
+        return Err(format!("entry not found: {}", entry.display()));
+    }
+
+    let graph = build_graph(&resolver, &entry)?;
+
+    let modules_dir = opts.out_dir.join("_treaty");
+    std::fs::create_dir_all(&modules_dir).map_err(|e| format!("mkdir dist: {e}"))?;
+
+    // Precompute every module's output file name.
+    let mut names: BTreeMap<PathBuf, String> = BTreeMap::new();
+    for abs in graph.keys() {
+        names.insert(abs.clone(), output_name(abs));
+    }
+
+    let mut written = Vec::new();
+    let mut residual_partials = 0usize;
+    let mut imports_compiler = false;
+
+    // Emit each module, rewriting its import edges to sibling dist files.
+    for module in graph.values() {
+        let body = rewrite_imports(&module.code, |spec| {
+            module
+                .edges
+                .get(spec)
+                .and_then(|dep| names.get(dep))
+                .map(|name| format!("./{name}"))
+        });
+
+        // AOT health signals folded into the notes — using the SAME precise
+        // patterns the bench's `inspectBundle` uses, so the note matches the boot
+        // verdict: a residual partial is a `ɵɵngDeclare*(` CALL (not the identifier
+        // that names the core export), and a compiler dependency is an actual
+        // `from '@angular/compiler'` / `import('@angular/compiler')` (not the
+        // identifier inside core's JIT-failure error-message string).
+        residual_partials += count_ngdeclare_calls(&body);
+        if imports_angular_compiler(&body) {
+            imports_compiler = true;
+        }
+
+        let out_path = modules_dir.join(names.get(&module.abs).unwrap());
+        std::fs::write(&out_path, &body).map_err(|e| format!("write module: {e}"))?;
+        written.push(out_path);
+    }
+
+    // Emit index.html that boots the entry (its dist module).
+    let entry_name = names
+        .get(&entry)
+        .ok_or_else(|| "entry was not in the build graph".to_string())?;
+    let index_html = render_index(&opts.root, &format!("./_treaty/{entry_name}"));
+    let index_path = opts.out_dir.join("index.html");
+    std::fs::write(&index_path, index_html).map_err(|e| format!("write index.html: {e}"))?;
+    // index.html first in the written list (convention).
+    let mut all = vec![index_path];
+    all.append(&mut written);
+
+    let notes = vec![
+        format!("native build: {} module(s) emitted", graph.len()),
+        format!(
+            "AOT health: residualNgDeclare={residual_partials} importsCompiler={imports_compiler} (both 0/false = no JIT needed)"
+        ),
+        "tree-shaking + minify + single-file concat are follow-ups (use --bundler rolldown for those)".to_string(),
+    ];
+
+    Ok(NativeBuildOutput { written: all, notes })
+}
+
+/// Render the dist `index.html`: reuse the app's own shell when present (so the
+/// `<app-root>` / `<base href>` match), pointing its module script at the entry.
+fn render_index(root: &Path, entry_rel: &str) -> String {
+    let raw = std::fs::read_to_string(root.join("index.html")).unwrap_or_else(|_| {
+        "<!doctype html><html><head><base href=\"/\"></head><body><app-root></app-root></body></html>".to_string()
+    });
+    let script = format!("\n<script type=\"module\" src=\"{entry_rel}\"></script>\n");
+    if let Some(idx) = raw.rfind("</body>") {
+        let mut out = String::with_capacity(raw.len() + script.len());
+        out.push_str(&raw[..idx]);
+        out.push_str(&script);
+        out.push_str(&raw[idx..]);
+        out
+    } else {
+        format!("{raw}{script}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn output_name_is_stable_and_unique() {
+        let a = output_name(Path::new("/app/src/app.ts"));
+        let b = output_name(Path::new("/app/src/app.ts"));
+        let c = output_name(Path::new("/app/other/app.ts"));
+        assert_eq!(a, b, "name not stable for same path");
+        assert_ne!(a, c, "same stem different dir must differ");
+        assert!(a.ends_with(".js"));
+        assert!(a.starts_with("app-"));
+    }
+
+    #[test]
+    fn builds_a_two_module_graph_to_bootable_esm() {
+        let dir = std::env::temp_dir().join(format!("treaty-nb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // dep.ts <- entry main.ts
+        std::fs::write(dir.join("dep.ts"), "export const dep = 41;").unwrap();
+        std::fs::write(
+            dir.join("main.ts"),
+            "import { dep } from './dep';\nexport const answer = dep + 1;",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("index.html"),
+            "<!doctype html><html><body><app-root></app-root></body></html>",
+        )
+        .unwrap();
+
+        let out = build(&NativeBuildOptions {
+            root: dir.clone(),
+            entry: dir.join("main.ts"),
+            out_dir: dir.join("dist"),
+        })
+        .expect("build ok");
+
+        // index.html + 2 modules.
+        assert!(out.written.len() >= 3, "too few outputs: {:?}", out.written);
+        let index = std::fs::read_to_string(dir.join("dist").join("index.html")).unwrap();
+        assert!(index.contains("./_treaty/main-"), "index does not boot entry: {index}");
+
+        // The entry's emitted module imports the dep by its sibling dist name.
+        let modules_dir = dir.join("dist").join("_treaty");
+        let entry_file = std::fs::read_dir(&modules_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| e.file_name().to_string_lossy().starts_with("main-"))
+            .map(|e| e.path())
+            .unwrap();
+        let entry_code = std::fs::read_to_string(&entry_file).unwrap();
+        assert!(entry_code.contains("./dep-"), "edge not rewritten to sibling: {entry_code}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

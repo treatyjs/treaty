@@ -24,4 +24,8 @@ pub mod config;
 pub mod core;
 pub mod deploy;
 pub mod generate;
+pub mod native_build;
 pub mod plugin;
+pub mod resolve;
+pub mod serve;
+pub mod transform;

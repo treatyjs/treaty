@@ -6,7 +6,7 @@
 //! [`bundler::BundlerBackend`]. Commands are themselves [`plugin::CliPlugin`]s
 //! registered in a [`plugin::PluginRegistry`], so the surface is extensible.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -24,6 +24,8 @@ use treaty_cli::deploy::{
 use treaty_cli::generate::{run_generate, GenerateKind, GenerateOptions};
 use treaty_cli::plugin::build_default_registry;
 use treaty_cli::compile;
+use treaty_cli::native_build;
+use treaty_cli::serve;
 
 #[derive(Parser)]
 #[command(name = "treaty", version, about = "Treaty's Rust-native Angular compiler CLI")]
@@ -119,6 +121,24 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Start a FULLY NATIVE Rust dev server (tokio + axum) for an app dir.
+    ///
+    /// Compiles `.ts`/`.treaty`/`.tsx` to Ivy ESM in-process (oxc), links
+    /// `@angular/*` partials to AOT, serves the index that boots the app, and
+    /// live-reloads on file change — no Node, no external bundler, no NAPI.
+    Serve {
+        /// App dir (where `index.html` + `src/` live). Defaults to cwd.
+        dir: Option<PathBuf>,
+        /// Entry module relative to the app dir. Defaults to `src/main.ts`.
+        #[arg(long)]
+        entry: Option<PathBuf>,
+        /// Host to bind. Defaults to config / `localhost`.
+        #[arg(long)]
+        host: Option<String>,
+        /// Port to bind. Defaults to config / `4200`.
+        #[arg(long)]
+        port: Option<u16>,
+    },
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -175,6 +195,7 @@ fn main() -> ExitCode {
             run_affected(&graph, &changed, strict, deploy_plan, &deploy_with, &version)
         }
         Command::Compile { input, json } => run_compile(&input, json),
+        Command::Serve { dir, entry, host, port } => run_serve(dir, entry, host, port),
     }
 }
 
@@ -261,6 +282,14 @@ fn run_build(
         }
     };
 
+    // The Rust-native bundler does a full module-graph crawl + per-module Ivy
+    // compile + `@angular/*` partial linking + ESM emit, producing a BOOTABLE
+    // dist with no JIT. (The external rspack/rsbuild/vite path below stays the
+    // single-entry "compile then hand to the JS bundler" flow.)
+    if cfg.bundler == Bundler::Native {
+        return run_native_build(&cfg.root, &entries, &cfg.out_dir);
+    }
+
     let inputs = match compile_entries(&entries) {
         Ok(i) => i,
         Err(()) => {
@@ -286,6 +315,106 @@ fn run_build(
         }
         Err(e) => {
             eprintln!("treaty: bundle failed: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The Rust-native production build: crawl the entry's import graph, compile +
+/// link every module in-process, and emit a bootable ESM dist.
+fn run_native_build(root: &Path, entries: &[PathBuf], out_dir: &Path) -> ExitCode {
+    // The native build is whole-app: it crawls from a single entry. Use the first
+    // entry (the conventional `src/main.ts`); additional entries are uncommon for
+    // a standalone bootstrap and are ignored with a note.
+    let Some(entry) = entries.first() else {
+        eprintln!("treaty: native build needs an entry");
+        return ExitCode::FAILURE;
+    };
+    if entries.len() > 1 {
+        eprintln!("treaty: native build uses the first entry ({}); others ignored", entry.display());
+    }
+    // The entry may be given absolute, relative-to-cwd (as typed on the command
+    // line), or relative-to-root. Prefer the form that exists on disk.
+    let entry_abs = if entry.is_absolute() {
+        entry.clone()
+    } else if entry.exists() {
+        // Relative to the current working directory (the literal arg).
+        std::fs::canonicalize(entry).unwrap_or_else(|_| entry.clone())
+    } else {
+        root.join(entry)
+    };
+    let opts = native_build::NativeBuildOptions {
+        root: root.to_path_buf(),
+        entry: entry_abs,
+        out_dir: out_dir.to_path_buf(),
+    };
+    eprintln!("treaty: building with native (Rust module-graph bundler)");
+    match native_build::build(&opts) {
+        Ok(out) => {
+            for note in &out.notes {
+                eprintln!("treaty [native]: {note}");
+            }
+            for path in &out.written {
+                println!("{}", path.display());
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("treaty: native build failed: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Start the fully-native Rust dev server for an app dir.
+fn run_serve(
+    dir: Option<PathBuf>,
+    entry: Option<PathBuf>,
+    host: Option<String>,
+    port: Option<u16>,
+) -> ExitCode {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let root = match &dir {
+        Some(d) if d.is_absolute() => d.clone(),
+        Some(d) => cwd.join(d),
+        None => cwd.clone(),
+    };
+    // Resolve host/port/entry through the config resolver (so a treaty.config.json
+    // in the app dir is honored), with CLI flags taking precedence.
+    let cfg = match resolve_config(
+        &root,
+        &ConfigOverrides {
+            host: host.clone(),
+            port,
+            ..Default::default()
+        },
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("treaty: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let entry_path = match entry {
+        Some(e) if e.is_absolute() => e,
+        Some(e) => root.join(e),
+        None => cfg.entry.clone(),
+    };
+    if !entry_path.exists() {
+        eprintln!("treaty: serve entry not found: {}", entry_path.display());
+        return ExitCode::FAILURE;
+    }
+
+    let opts = serve::ServeOptions {
+        root: cfg.root.clone(),
+        entry: entry_path,
+        host: cfg.host.clone(),
+        port: cfg.port,
+    };
+    match serve::serve_blocking(opts) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("treaty: serve failed: {e}");
             ExitCode::FAILURE
         }
     }
@@ -481,7 +610,7 @@ mod tests {
     #[test]
     fn default_registry_owns_the_builtin_commands() {
         let reg = build_default_registry();
-        for cmd in ["generate", "build", "dev", "affected", "compile"] {
+        for cmd in ["generate", "build", "dev", "serve", "affected", "compile"] {
             assert!(reg.has(cmd), "registry missing {cmd}");
         }
     }

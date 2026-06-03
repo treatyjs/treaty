@@ -22,3 +22,28 @@ rust_authoring = { path = "../rust/authoring" }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# Native TS->JS lowering for the server/build path: after `treaty_ivy` strips the
+# `@Component` decorator and appends the Ivy definitions, the module is still
+# TypeScript (type annotations, parameter properties, type-only imports). These
+# oxc crates — pinned to the SAME 0.133 the compiler uses — type-strip that to
+# browser-runnable ESM, and `oxc_resolver` resolves bare/relative imports so the
+# dev server can rewrite them to served URLs and link `@angular/*` partials.
+oxc_allocator = "0.133.0"
+oxc_ast = "0.133.0"
+oxc_parser = "0.133.0"
+oxc_codegen = "0.133.0"
+oxc_span = "0.133.0"
+oxc_semantic = "0.133.0"
+oxc_transformer = "0.133.0"
+oxc_resolver = "11.20.0"
+
+# The fully-native `treaty serve` dev server: tokio + axum HTTP, notify file-watch,
+# and a tokio-tungstenite live-reload websocket.
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "time", "fs", "signal"] }
+axum = { version = "0.8", features = ["ws"] }
+notify = "8"
+futures-util = "0.3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
