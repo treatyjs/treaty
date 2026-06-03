@@ -238,7 +238,10 @@ async function buildVite(outDir) {
 		root: appDir,
 		logLevel: 'silent',
 		configFile: false,
-		plugins: [treaty({ sourceMap: false })],
+		// `selectorRoot: true` scans the app's first-party `.ts` ONCE at buildStart so the conventional
+		// non-folding child selector (`class StatCard` ↔ `app-stat-card`) resolves cross-file — the
+		// Dashboard then instantiates 3 real <app-stat-card> children instead of 3 empty hosts.
+		plugins: [treaty({ sourceMap: false, selectorRoot: true })],
 		build: {
 			outDir,
 			target: 'es2022',
@@ -255,7 +258,9 @@ async function buildRolldown(outDir) {
 	await rolldownBuild({
 		input: appMain,
 		cwd: appDir,
-		plugins: [treaty({ sourceMap: false, functionChunking: false })],
+		// `selectorRoot` scans the app's `.ts` so the conventional non-folding child selector
+		// (`class StatCard` ↔ `app-stat-card`) resolves cross-file (see the Vite build note).
+		plugins: [treaty({ sourceMap: false, functionChunking: false, selectorRoot: appDir })],
 		output: { dir: outDir, format: 'es', minify: true },
 	})
 }
@@ -758,7 +763,7 @@ async function main() {
 		generatedAt: new Date().toISOString(),
 		app: 'examples/ng-bench-app',
 		appNote:
-			'Realistic standard-Angular application (6 components, a service layer, a pure pipe, an attribute directive, an eager route + 3 lazy routes). Pure @Component/@Directive/@Pipe .ts — zero Treaty-only features — so it builds with BOTH the Angular CLI (@angular/build:application) and every Treaty bundler plugin, exercising the FULL Treaty compile path (decorator lowering + template codegen), not just the linker. Component selectors and the directive selector are class-name-convention-aligned (e.g. class StatCard ↔ selector "stat-card", class ThemeToggle ↔ "[themeToggle]") so the Treaty compiler resolves every cross-file template dependency by its class-name↔selector convention.',
+			'Realistic standard-Angular application (6 components, a service layer, a pure pipe, an attribute directive, an eager route + 3 lazy routes). Pure @Component/@Directive/@Pipe .ts — zero Treaty-only features — so it builds with BOTH the Angular CLI (@angular/build:application) and every Treaty bundler plugin, exercising the FULL Treaty compile path (decorator lowering + template codegen), not just the linker. StatCard uses the CONVENTIONAL Angular-CLI selector (class StatCard ↔ selector "app-stat-card", used as <app-stat-card>), which does NOT fold to the class name — so the Dashboard resolves its three cross-file StatCard children ONLY through the project SELECTOR REGISTRY (each Treaty plugin scans the app .ts at buildStart via selectorRoot and threads the per-file importName→selector map into the compiler). The attribute directive (class ThemeToggle ↔ "[themeToggle]") resolves the same way.',
 		matchedOptimization:
 			'Every tool builds in PRODUCTION mode with minify + tree-shake ON, so dist sizes are apples-to-apples — EXCEPT rslib, which is a LIBRARY builder that externalizes @angular/* by design (its dist excludes the Angular runtime; flagged on its row).',
 		host: { platform: process.platform, arch: process.arch, node: process.version },

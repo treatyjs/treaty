@@ -20,6 +20,9 @@
  */
 
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import { TreatyCompiler, PURE_ANNOTATION } from '../dist/index.js'
 
 let failures = 0
@@ -173,6 +176,86 @@ check('transformMany batch-transforms a mixed file set', () => {
 	const hitsBefore = batchCompiler.stats().hits
 	batchCompiler.transform('a.tsx', 'export default () => <span>a</span>\n')
 	assert.equal(batchCompiler.stats().hits, hitsBefore + 1, 'batch result is cached for transform()')
+})
+
+// 11. cross-module selector registry: an IMPORTED child used by its conventional
+//     non-folding selector (<app-stat-card> for class StatCard) resolves only via
+//     the explicit per-file registry; absent it, the fold path leaves an empty host.
+check('explicit registry resolves a conventional cross-module selector', () => {
+	const dash =
+		"import { Component } from '@angular/core';\n" +
+		"import { StatCard } from './stat-card';\n" +
+		"@Component({\n" +
+		"  selector: 'app-dashboard',\n" +
+		"  imports: [StatCard],\n" +
+		"  template: '<app-stat-card></app-stat-card><app-stat-card></app-stat-card><app-stat-card></app-stat-card>',\n" +
+		'})\n' +
+		'export class Dashboard {}\n'
+
+	// WITHOUT a registry: the class-name fold cannot match <app-stat-card> -> StatCard.
+	const c1 = new TreatyCompiler({ cache: false })
+	const without = c1.transform('dashboard.ts', dash)
+	assert.ok(without, 'dashboard must compile')
+	assert.ok(
+		!without.code.includes('dependencies: [StatCard'),
+		'fold-only path must NOT resolve <app-stat-card> to StatCard'
+	)
+
+	// WITH an explicit per-file registry: StatCard resolves and 3 element instructions emit.
+	const c2 = new TreatyCompiler({ cache: false })
+	const withReg = c2.transform('dashboard.ts', dash, { StatCard: 'app-stat-card' })
+	assert.ok(withReg, 'dashboard must compile with registry')
+	assert.ok(
+		withReg.code.includes('dependencies: [StatCard'),
+		'registry must resolve StatCard into dependencies'
+	)
+	const tags = (withReg.code.match(/"app-stat-card"/g) || []).length
+	assert.equal(tags, 3, 'expected 3 app-stat-card element instructions (statCards=3)')
+	results.push(`INFO registry dashboard emitted ${withReg.code.length} bytes`)
+})
+
+// 12. prewarmSelectorRegistry scans a real on-disk project and auto-derives the
+//     per-file registry for the importer (no explicit registry passed to transform).
+check('prewarmSelectorRegistry auto-resolves cross-module selectors', () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'treaty-compiler-selreg-'))
+	const stat =
+		"import { Component, input } from '@angular/core';\n" +
+		"@Component({ selector: 'app-stat-card', template: '<p>{{label()}}</p>' })\n" +
+		"export class StatCard { readonly label = input(''); }\n"
+	const dash =
+		"import { Component } from '@angular/core';\n" +
+		"import { StatCard } from './stat-card';\n" +
+		"@Component({ selector: 'app-dashboard', imports: [StatCard], template: '<app-stat-card></app-stat-card>' })\n" +
+		'export class Dashboard {}\n'
+	fs.writeFileSync(path.join(dir, 'stat-card.ts'), stat)
+	fs.writeFileSync(path.join(dir, 'dashboard.ts'), dash)
+
+	const c = new TreatyCompiler({ cache: false })
+	const count = c.prewarmSelectorRegistry(dir)
+	assert.ok(count >= 1, `prewarm must discover the StatCard selector (got ${count})`)
+	assert.equal(c.hasSelectorRegistry(), true, 'registry must be present after prewarm')
+
+	// transform WITHOUT an explicit registry now auto-derives it from the prewarmed map.
+	const out = c.transform('dashboard.ts', dash)
+	assert.ok(out, 'dashboard must compile')
+	assert.ok(
+		out.code.includes('dependencies: [StatCard'),
+		'prewarmed registry must auto-resolve StatCard into dependencies'
+	)
+	fs.rmSync(dir, { recursive: true, force: true })
+})
+
+// 13. ADDITIVE GUARANTEE: with no registry prewarmed, transform output is identical
+//     to before — a plain non-importing @Component is byte-unchanged.
+check('no registry => output unchanged (additive)', () => {
+	const src =
+		"import { Component } from '@angular/core';\n" +
+		"@Component({ selector: 'app-solo', template: '<div>solo</div>' })\n" +
+		'export class Solo {}\n'
+	const noReg = new TreatyCompiler({ cache: false }).transform('solo.ts', src)
+	const emptyReg = new TreatyCompiler({ cache: false }).transform('solo.ts', src, {})
+	assert.ok(noReg && emptyReg, 'both compile')
+	assert.equal(noReg.code, emptyReg.code, 'empty registry must be byte-identical to no registry')
 })
 
 for (const line of results) console.log(line)

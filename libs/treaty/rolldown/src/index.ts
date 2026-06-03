@@ -32,6 +32,7 @@
  */
 
 import { readFile } from 'node:fs/promises'
+import { isAbsolute, resolve as resolvePath } from 'node:path'
 import {
 	createTreatyCompiler,
 	classify,
@@ -76,6 +77,25 @@ export interface PluginOptions extends TreatyCompilerOptions {
 	 * plugin uses per-file `transform` only.
 	 */
 	readonly prewarm?: readonly string[]
+	/**
+	 * CROSS-MODULE SELECTOR RESOLUTION. The project root whose first-party `.ts`
+	 * sources are scanned ONCE at `buildStart` (via the Rust selector scanner) to
+	 * resolve a parent component's template tags to an IMPORTED child used by its
+	 * REAL `@Component` selector — the conventional Angular-CLI shape (`class StatCard`
+	 * with `selector: 'app-stat-card'`, used as `<app-stat-card>`) that the class-name
+	 * ↔ tag fold cannot match and which otherwise renders as an empty host.
+	 *
+	 *   - a string: the absolute (or cwd-relative) directory to scan.
+	 *   - `true`: scan the current working directory.
+	 *   - omitted / `false`: no cross-module scan; every file uses the byte-identical
+	 *     class-name fold (the prior behaviour — strictly ADDITIVE).
+	 *
+	 * The scan is one pass over `.ts` files (skipping `node_modules`/dot-dirs); the
+	 * resulting `className -> selector` map is held for the build and each owned
+	 * `.ts`'s per-file `{ importName -> selector }` registry is derived from it inside
+	 * the compiler. A file whose imports resolve to NO known selector folds as before.
+	 */
+	readonly selectorRoot?: string | boolean
 	/**
 	 * Function chunking. When `true` (the default), each server function the
 	 * compiler extracts from an authoring file is emitted as its OWN
@@ -199,6 +219,18 @@ export default function treaty(options: PluginOptions = {}): Plugin[] {
 
 	const compiler: TreatyCompiler = (options.compilerFactory ?? createTreatyCompiler)(options)
 
+	// Resolve the configured `selectorRoot` to the absolute directory to scan, or
+	// `null` when cross-module selector resolution is off. `true` ⇒ cwd; a relative
+	// string ⇒ resolved against cwd; an absolute string ⇒ as-is.
+	const selectorRootOption = options.selectorRoot
+	function resolveSelectorRoot(): string | null {
+		if (selectorRootOption === undefined || selectorRootOption === false) return null
+		if (selectorRootOption === true) return process.cwd()
+		return isAbsolute(selectorRootOption)
+			? selectorRootOption
+			: resolvePath(process.cwd(), selectorRootOption)
+	}
+
 	// Server-fn registries, populated during `transform` and read by the virtual
 	// `load`/`resolveId` hooks and the manifest emit:
 	//   serverBodies  — virtual server-body module id -> chunk code (server side)
@@ -241,6 +273,13 @@ export default function treaty(options: PluginOptions = {}): Plugin[] {
 		 * No-op when nothing is listed.
 		 */
 		async buildStart() {
+			// CROSS-MODULE SELECTOR PREWARM. Scan the project's `.ts` once so every
+			// subsequent `transform` auto-resolves an imported child used by its real
+			// `@Component` selector. No-op when `selectorRoot` is not configured; the
+			// scan is tolerant (a missing root yields an empty map and every file folds).
+			const selectorRoot = resolveSelectorRoot()
+			if (selectorRoot !== null) compiler.prewarmSelectorRegistry(selectorRoot)
+
 			if (prewarmFiles.length === 0) return
 			const inputs: TransformInput[] = []
 			for (const file of prewarmFiles) {
@@ -253,6 +292,8 @@ export default function treaty(options: PluginOptions = {}): Plugin[] {
 					// (or Rolldown's own resolver) will surface any real error.
 				}
 			}
+			// The batch auto-derives each file's per-file registry from the prewarmed
+			// project map, so prewarmed files resolve cross-module selectors identically.
 			if (inputs.length > 0) compiler.transformMany(inputs)
 		},
 

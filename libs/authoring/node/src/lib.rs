@@ -1,6 +1,10 @@
 #[macro_use]
 extern crate napi_derive;
 
+use std::collections::HashMap;
+
+use treaty_ivy::source_compile::SelectorRegistry;
+
 use treaty_file_routing::{
     emit_ts as r3_emit_routes_ts, generate_routing as r3_generate_routing, referenced_files as r3_referenced_files,
     FileRoutingConfig, PartialFileRoutingConfig, RealFsDirTree,
@@ -205,6 +209,99 @@ pub fn compile(source: String, file_name: String) -> CompiledAuthoring {
     }
 }
 
+/// The project-wide `className -> selector` map produced by [`build_selector_registry`] and consumed
+/// by [`build_imported_selectors`]. Crosses the NAPI boundary as a plain JS object
+/// (`Record<string, string>`); the bundler plugin holds onto it for the lifetime of the build (one
+/// scan per cold build, reused across every transform).
+pub type ProjectSelectors = HashMap<String, String>;
+
+/// A per-file `{ localImportName -> selector }` map: for the file being compiled, the LOCAL binding
+/// name of each imported `@Component`/`@Directive` resolved to its real `@Component` `selector`. The
+/// compiler consumes this (instead of its class-name↔tag fold) so an IMPORTED child used by its
+/// conventional selector (`<app-stat-card>` for `class StatCard`) resolves as a real dependency.
+/// Crosses the NAPI boundary as `Record<string, string>`; `null`/absent means "no cross-module
+/// selectors for this file", which routes to the byte-identical fold path.
+pub type ImportedSelectorMap = HashMap<String, String>;
+
+/// Lower a NAPI `ImportedSelectorMap` into the compiler's [`SelectorRegistry`]. An empty map yields
+/// `None` so the caller takes the fold path (byte-identical to the no-registry `compile`).
+fn to_selector_registry(map: Option<ImportedSelectorMap>) -> Option<SelectorRegistry> {
+    let map = map?;
+    if map.is_empty() {
+        return None;
+    }
+    let mut registry = SelectorRegistry::new();
+    for (local_name, selector) in map {
+        registry.insert(local_name, selector);
+    }
+    Some(registry)
+}
+
+/// Unified per-file authoring compile WITH the project's cross-module selector registry — the
+/// registry-aware sibling of [`compile`].
+///
+/// Identical to [`compile`] except `imported_selectors` carries the per-file
+/// `{ localImportName -> selector }` map the host (a `@treaty/vite` / `@treaty/rolldown` build)
+/// pre-resolved by scanning the project's `.ts` sources. It is threaded into
+/// [`rust_authoring::authoring::compile_file_with_registry`], which honours it ONLY on the
+/// base-Angular `.ts` cross-module-import path (every other front-end, and `.ts` with no registry,
+/// routes through the SAME plugin path as [`compile`]).
+///
+/// ADDITIVE GUARANTEE: when `imported_selectors` is `undefined`/`null`/empty, this entry is
+/// byte-for-byte identical to [`compile`] — the registry is opt-in, so matchGolden / swc parity stay
+/// unchanged.
+#[napi]
+pub fn compile_with_registry(
+    source: String,
+    file_name: String,
+    imported_selectors: Option<ImportedSelectorMap>,
+) -> CompiledAuthoring {
+    let registry = to_selector_registry(imported_selectors);
+    let result = rust_authoring::authoring::compile_file_with_registry(
+        &source,
+        &file_name,
+        registry.as_ref(),
+    );
+    CompiledAuthoring {
+        code: result.code,
+        server_module: result.server_module,
+        errors: result.errors,
+        map: result.map,
+    }
+}
+
+/// Scan every first-party `.ts` source under `root_dir` and return the project-wide
+/// `className -> selector` map ([`ProjectSelectors`]).
+///
+/// This is the bundler-plugin's COLD-BUILD PREWARM entry: the plugin calls it once in `buildStart`
+/// and holds the result for the build, then derives each file's [`ImportedSelectorMap`] from it via
+/// [`build_imported_selectors`]. It drives the SAME shared scanner the native `treaty build` graph
+/// crawl uses ([`rust_authoring::selectors::scan_dir`]), so a `@treaty/vite` build resolves
+/// cross-module selectors identically to a native build. `node_modules` and dot-directories are
+/// skipped (only first-party authoring sources own a conventional selector); a missing `root_dir`
+/// yields an empty map (no error).
+#[napi]
+pub fn build_selector_registry(root_dir: String) -> ProjectSelectors {
+    rust_authoring::selectors::scan_dir(std::path::Path::new(&root_dir))
+}
+
+/// Build the per-file [`ImportedSelectorMap`] for `source` from the project-wide `project_selectors`
+/// map produced by [`build_selector_registry`].
+///
+/// Routes to [`rust_authoring::selectors::registry_for_source`]: for each value import in `source`
+/// whose exported name is a known `@Component`/`@Directive` class, the LOCAL binding name is mapped to
+/// that class's real selector. Returns `undefined` when no import resolves to a known selector — the
+/// plugin then calls [`compile`] (or passes `null` to [`compile_with_registry`]) and the file folds
+/// byte-identically. Type-only imports are excluded.
+#[napi]
+pub fn build_imported_selectors(
+    source: String,
+    project_selectors: ProjectSelectors,
+) -> Option<ImportedSelectorMap> {
+    let registry = rust_authoring::selectors::registry_for_source(&source, &project_selectors)?;
+    Some(registry.into_iter().collect())
+}
+
 /// One file to compile in a [`compile_many`] batch.
 #[napi(object)]
 pub struct AuthoringFile {
@@ -255,6 +352,61 @@ pub fn compile_many(files: Vec<AuthoringFile>) -> Vec<CompiledAuthoringEntry> {
         .into_par_iter()
         .map(|file| {
             let result = rust_authoring::authoring::compile_file(&file.code, &file.id);
+            CompiledAuthoringEntry {
+                id: file.id,
+                code: result.code,
+                server_module: result.server_module,
+                errors: result.errors,
+                map: result.map,
+            }
+        })
+        .collect()
+}
+
+/// Compile many authoring files IN PARALLEL with per-file cross-module selector registries — the
+/// registry-aware sibling of [`compile_many`], for a bundler's cold-build batch prewarm.
+///
+/// `registries` is matched POSITIONALLY to `files` (entry `i` is the [`ImportedSelectorMap`] for
+/// `files[i]`). A shorter `registries` (or an absent / `null` entry) means "no registry for that
+/// file", which routes that file through the byte-identical fold path — so a batch with an all-empty
+/// `registries` is byte-for-byte identical to [`compile_many`] (ADDITIVE GUARANTEE). Each file is
+/// compiled by [`rust_authoring::authoring::compile_file_with_registry`] exactly as the single-file
+/// [`compile_with_registry`] entry does, fanned out with `rayon` (every compile is CPU-bound, fully
+/// synchronous, and self-contained). Results are returned in INPUT ORDER, each tagged with its input
+/// `id`.
+#[napi]
+pub fn compile_many_with_registry(
+    files: Vec<AuthoringFile>,
+    registries: Option<Vec<Option<ImportedSelectorMap>>>,
+) -> Vec<CompiledAuthoringEntry> {
+    use rayon::prelude::*;
+
+    // Pair each file with its positional registry (None past the end of `registries`, or when the
+    // caller omitted the argument entirely). The pairing happens up front so the rayon closure owns a
+    // single self-contained `(file, registry)` and shares no index state across threads.
+    let mut registries = registries.unwrap_or_default();
+    let paired: Vec<(AuthoringFile, Option<ImportedSelectorMap>)> = files
+        .into_iter()
+        .enumerate()
+        .map(|(i, file)| {
+            let registry = if i < registries.len() {
+                registries[i].take()
+            } else {
+                None
+            };
+            (file, registry)
+        })
+        .collect();
+
+    paired
+        .into_par_iter()
+        .map(|(file, imported)| {
+            let registry = to_selector_registry(imported);
+            let result = rust_authoring::authoring::compile_file_with_registry(
+                &file.code,
+                &file.id,
+                registry.as_ref(),
+            );
             CompiledAuthoringEntry {
                 id: file.id,
                 code: result.code,
@@ -447,6 +599,129 @@ mod tests {
     #[test]
     fn compile_many_empty_input_returns_empty() {
         assert!(compile_many(Vec::new()).is_empty());
+    }
+
+    // --- Cross-module selector registry NAPI shims ---------------------------------------------
+
+    const STAT_CARD: &str = "import { Component, input } from '@angular/core';\n\
+@Component({ selector: 'app-stat-card', template: '<p>{{label()}}</p>' })\n\
+export class StatCard { readonly label = input(''); }\n";
+
+    const DASHBOARD: &str = "import { Component } from '@angular/core';\n\
+import { StatCard } from './stat-card';\n\
+@Component({\n\
+  selector: 'app-dashboard',\n\
+  imports: [StatCard],\n\
+  template: '<app-stat-card label=\"a\"></app-stat-card><app-stat-card label=\"b\"></app-stat-card><app-stat-card label=\"c\"></app-stat-card>',\n\
+})\n\
+export class Dashboard {}\n";
+
+    #[test]
+    fn compile_with_registry_absent_matches_plain_compile_byte_for_byte() {
+        // ADDITIVE GUARANTEE: with no registry, compile_with_registry == compile for every shape.
+        for (src, name) in [
+            (STAT_CARD, "stat-card.ts"),
+            (DASHBOARD, "dashboard.ts"),
+            ("export const x = 1;\n", "util.ts"),
+            ("const name = 'World';\n<div>{{ name }}</div>", "g.treaty"),
+            (
+                "export default function App() { return <div>hi</div>; }\n",
+                "App.tsx",
+            ),
+        ] {
+            let plain = compile(src.to_string(), name.to_string());
+            let none = compile_with_registry(src.to_string(), name.to_string(), None);
+            let empty = compile_with_registry(
+                src.to_string(),
+                name.to_string(),
+                Some(ImportedSelectorMap::new()),
+            );
+            assert_eq!(plain.code, none.code, "None registry diverged for {name}");
+            assert_eq!(plain.code, empty.code, "empty registry diverged for {name}");
+            assert_eq!(plain.map, none.map, "None map diverged for {name}");
+        }
+    }
+
+    #[test]
+    fn build_selector_registry_then_imported_resolves_conventional_selector() {
+        // Scan a temp project, derive the per-file map, and prove the conventional non-folding
+        // selector now resolves the imported child as a real dependency.
+        let tmp = std::env::temp_dir().join(format!("treaty-napi-selreg-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("stat-card.ts"), STAT_CARD).unwrap();
+        std::fs::write(tmp.join("dashboard.ts"), DASHBOARD).unwrap();
+
+        let project = build_selector_registry(tmp.to_string_lossy().to_string());
+        assert_eq!(project.get("StatCard").map(String::as_str), Some("app-stat-card"));
+
+        let imported = build_imported_selectors(DASHBOARD.to_string(), project.clone())
+            .expect("dashboard resolves a cross-module selector");
+        assert_eq!(imported.get("StatCard").map(String::as_str), Some("app-stat-card"));
+
+        // WITHOUT the registry the fold convention cannot match <app-stat-card> -> StatCard.
+        let without = compile(DASHBOARD.to_string(), "dashboard.ts".to_string());
+        assert!(
+            !without.code.contains("dependencies: [StatCard"),
+            "fold-only must not resolve; got: {}",
+            without.code
+        );
+
+        // WITH the registry StatCard lands in dependencies and the 3 tags emit (statCards=3).
+        let with = compile_with_registry(
+            DASHBOARD.to_string(),
+            "dashboard.ts".to_string(),
+            Some(imported),
+        );
+        assert!(with.errors.is_empty(), "errors: {:?}", with.errors);
+        assert!(
+            with.code.contains("dependencies: [StatCard"),
+            "registry must resolve StatCard; got: {}",
+            with.code
+        );
+        assert_eq!(with.code.matches("\"app-stat-card\"").count(), 3, "expected 3 element instructions");
+
+        // A file with no resolvable cross-module selector yields no per-file map.
+        assert!(build_imported_selectors(STAT_CARD.to_string(), project).is_none());
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn compile_many_with_registry_matches_compile_many_when_registries_absent() {
+        let make = || {
+            vec![
+                AuthoringFile { id: "stat-card.ts".to_string(), code: STAT_CARD.to_string() },
+                AuthoringFile { id: "util.ts".to_string(), code: "export const x = 1;\n".to_string() },
+            ]
+        };
+        let plain = compile_many(make());
+        let none = compile_many_with_registry(make(), None);
+        let empty = compile_many_with_registry(make(), Some(vec![None, None]));
+        for i in 0..plain.len() {
+            assert_eq!(plain[i].code, none[i].code, "None batch diverged at {i}");
+            assert_eq!(plain[i].code, empty[i].code, "empty batch diverged at {i}");
+        }
+    }
+
+    #[test]
+    fn compile_many_with_registry_applies_per_file_registry_in_order() {
+        let project: ProjectSelectors =
+            [("StatCard".to_string(), "app-stat-card".to_string())].into_iter().collect();
+        let dash_reg = build_imported_selectors(DASHBOARD.to_string(), project).expect("registry");
+        let files = vec![
+            AuthoringFile { id: "stat-card.ts".to_string(), code: STAT_CARD.to_string() },
+            AuthoringFile { id: "dashboard.ts".to_string(), code: DASHBOARD.to_string() },
+        ];
+        // First file gets no registry; the dashboard (second) gets its per-file map.
+        let out = compile_many_with_registry(files, Some(vec![None, Some(dash_reg)]));
+        assert_eq!(out[0].id, "stat-card.ts");
+        assert_eq!(out[1].id, "dashboard.ts");
+        assert!(
+            out[1].code.contains("dependencies: [StatCard"),
+            "dashboard must resolve via its registry; got: {}",
+            out[1].code
+        );
+        assert_eq!(out[1].code.matches("\"app-stat-card\"").count(), 3);
     }
 
     #[test]

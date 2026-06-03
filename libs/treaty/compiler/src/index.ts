@@ -13,6 +13,8 @@
 export { TreatyCompiler, createTreatyCompiler, TreatyCompileError, classify } from './compiler.js'
 
 export type {
+	ImportedSelectorMap,
+	ProjectSelectors,
 	ServerFnChunk,
 	TransformInput,
 	TransformResult,
@@ -56,4 +58,6 @@ export {
 	compileUnifiedSource,
 	compileMany,
 	compileTemplate,
+	buildSelectorRegistry,
+	buildImportedSelectors,
 } from './addon.js'

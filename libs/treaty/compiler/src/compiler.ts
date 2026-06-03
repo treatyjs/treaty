@@ -23,6 +23,8 @@
  */
 
 import {
+	buildImportedSelectors,
+	buildSelectorRegistry,
 	compileMany,
 	compileSource,
 	compileTreaty,
@@ -40,6 +42,8 @@ import {
 	type SideEffectsDescriptor,
 } from './treeshake.js'
 import type {
+	ImportedSelectorMap,
+	ProjectSelectors,
 	TransformInput,
 	TransformResult,
 	TreatyCompilerOptions,
@@ -147,12 +151,63 @@ export class TreatyCompiler {
 	private readonly cache: IncrementalCache
 	/** Reverse index: imported id -> set of importer ids that referenced it. */
 	private readonly dependents = new Map<string, Set<string>>()
+	/**
+	 * The project-wide `className -> selector` map for CROSS-MODULE selector
+	 * resolution, scanned once via {@link prewarmSelectorRegistry}. `undefined`
+	 * until a plugin prewarms it; while unset, every transform takes the
+	 * byte-identical fold path (so the registry is strictly opt-in).
+	 */
+	private projectSelectors: ProjectSelectors | undefined
 
 	constructor(options: TreatyCompilerOptions = {}) {
 		this.cacheEnabled = options.cache ?? true
 		this.annotatePure = options.annotatePure ?? true
 		this.dropServerFns = options.dropUnusedServerFns ?? true
 		this.cache = new IncrementalCache()
+	}
+
+	/**
+	 * COLD-BUILD PREWARM for cross-module selector resolution. Scan every
+	 * first-party `.ts` under `rootDir` (via the Rust selector scanner) into the
+	 * project-wide `className -> selector` map and hold it for the build. A bundler
+	 * plugin calls this ONCE in `buildStart`; afterwards {@link transform} /
+	 * {@link transformMany} derive each file's per-file {@link ImportedSelectorMap}
+	 * from it so an IMPORTED component used by its conventional `@Component` selector
+	 * (e.g. `<app-stat-card>` for `class StatCard`) resolves as a real dependency.
+	 *
+	 * Returns the number of selectors discovered (0 ⇒ nothing first-party owns a
+	 * selector, so every transform stays on the fold path). Re-callable: the latest
+	 * scan replaces the previous map.
+	 */
+	prewarmSelectorRegistry(rootDir: string): number {
+		const project = buildSelectorRegistry(rootDir)
+		this.projectSelectors = project
+		let count = 0
+		for (const _ in project) count++
+		return count
+	}
+
+	/** Whether a project-wide selector registry has been prewarmed (and is non-empty). */
+	hasSelectorRegistry(): boolean {
+		if (this.projectSelectors === undefined) return false
+		for (const _ in this.projectSelectors) return true
+		return false
+	}
+
+	/**
+	 * The per-file {@link ImportedSelectorMap} for `code`, derived from the
+	 * prewarmed project map — or `undefined` when no registry was prewarmed, or no
+	 * import in `code` resolves to a known selector (the fold path). Only computed
+	 * for the base-Angular `'component'` kind: `.treaty`/JSX front-ends key on the
+	 * filename convention, not cross-module imports, so the registry would never
+	 * apply there (and the Rust entry ignores it for them).
+	 */
+	private importedSelectorsFor(
+		kind: TreatyFileKind,
+		code: string
+	): ImportedSelectorMap | undefined {
+		if (kind !== 'component' || this.projectSelectors === undefined) return undefined
+		return buildImportedSelectors(code, this.projectSelectors)
 	}
 
 	/** The `sideEffects` descriptor bundlers should use for emitted modules. */
@@ -176,9 +231,20 @@ export class TreatyCompiler {
 	 * compiler does not own. Identical content for the same id is served from the
 	 * incremental cache.
 	 *
+	 * `importedSelectors` is the OPTIONAL per-file cross-module selector registry
+	 * ({@link ImportedSelectorMap}). When omitted, it is derived from the prewarmed
+	 * project map (see {@link prewarmSelectorRegistry}); pass one explicitly to
+	 * override (or `undefined` with no prewarm to force the fold path). It only
+	 * affects the base-Angular `'component'` kind; for every other kind, and absent a
+	 * registry, the output is byte-for-byte identical to the no-registry path.
+	 *
 	 * @throws {TreatyCompileError} when the Rust compiler reports diagnostics.
 	 */
-	transform(id: string, code: string): TransformResult | null {
+	transform(
+		id: string,
+		code: string,
+		importedSelectors?: ImportedSelectorMap
+	): TransformResult | null {
 		const kind = classify(id)
 		if (kind === null) return null
 		if (kind === 'component' && !isTreatyComponentSource(code)) return null
@@ -189,7 +255,8 @@ export class TreatyCompiler {
 			if (cached !== undefined) return cached
 		}
 
-		const compiled = this.lower(id, kind, code)
+		const registry = importedSelectors ?? this.importedSelectorsFor(kind, code)
+		const compiled = this.lower(id, kind, code, registry)
 		if (compiled.errors.length > 0) {
 			throw new TreatyCompileError(id, compiled.errors)
 		}
@@ -217,11 +284,16 @@ export class TreatyCompiler {
 	 * @throws {TreatyCompileError} for the first file the Rust compiler reports
 	 *   diagnostics on (matching {@link transform}'s fail-fast contract).
 	 */
-	transformMany(files: readonly TransformInput[]): (TransformResult | null)[] {
+	transformMany(
+		files: readonly TransformInput[],
+		registries: readonly (ImportedSelectorMap | undefined)[] = []
+	): (TransformResult | null)[] {
 		const out: (TransformResult | null)[] = new Array(files.length).fill(null)
 		// Files to lower through the unified parallel batch, with their slot index.
 		const batch: { index: number; id: string; code: string; hash: string }[] = []
 		const sources: AuthoringFile[] = []
+		// Per-batched-file cross-module registry, positionally aligned with `sources`.
+		const batchRegistries: (ImportedSelectorMap | undefined)[] = []
 
 		for (let i = 0; i < files.length; i++) {
 			const { id, code } = files[i]!
@@ -239,10 +311,16 @@ export class TreatyCompiler {
 				}
 			}
 
+			// The per-file registry: an explicit one (positionally matched to `files`)
+			// takes precedence; otherwise derive from the prewarmed project map. Only
+			// the base-Angular `'component'` kind consumes it.
+			const registry = registries[i] ?? this.importedSelectorsFor(kind, code)
+
 			if (kind === 'treaty') {
 				// `.treaty` is not part of the unified source batch; lower in place
-				// so routing matches the single-file path.
-				const compiled = this.lower(id, kind, code)
+				// so routing matches the single-file path. (No cross-module registry
+				// applies to `.treaty`, which keys on the filename convention.)
+				const compiled = this.lower(id, kind, code, registry)
 				if (compiled.errors.length > 0) {
 					throw new TreatyCompileError(id, compiled.errors)
 				}
@@ -252,10 +330,11 @@ export class TreatyCompiler {
 
 			batch.push({ index: i, id, code, hash })
 			sources.push({ id, code })
+			batchRegistries.push(registry)
 		}
 
 		if (sources.length > 0) {
-			const compiled: CompiledAuthoringEntry[] = compileMany(sources)
+			const compiled: CompiledAuthoringEntry[] = compileMany(sources, batchRegistries)
 			for (let b = 0; b < batch.length; b++) {
 				const slot = batch[b]!
 				let entry: CompiledAuthoring = compiled[b]!
@@ -296,8 +375,18 @@ export class TreatyCompiler {
 		return result
 	}
 
-	/** Route to the correct addon entry point for the file kind. */
-	private lower(id: string, kind: TreatyFileKind, code: string): CompiledAuthoring {
+	/**
+	 * Route to the correct addon entry point for the file kind, threading the
+	 * OPTIONAL per-file cross-module selector registry. The registry only affects
+	 * the base-Angular `'component'` path (the cross-module-import case it exists
+	 * for); for `.treaty`/JSX it is `undefined` and the output is unchanged.
+	 */
+	private lower(
+		id: string,
+		kind: TreatyFileKind,
+		code: string,
+		importedSelectors?: ImportedSelectorMap
+	): CompiledAuthoring {
 		switch (kind) {
 			case 'treaty':
 				return compileTreaty(code, id)
@@ -306,11 +395,12 @@ export class TreatyCompiler {
 				// JSX) lowers to Ivy. A `.tsx`/`.tjsx` that is actually a classic
 				// `@Component` class (string template, no JSX) is not a JSX module —
 				// fall back to the `@Component`-source path so it still compiles.
-				return this.lowerJsx(id, code)
+				return this.lowerJsx(id, code, importedSelectors)
 			case 'component':
 				// `.ts` `@Component`: the unified front-end routes by extension to the
-				// `@Component` path, so this handles it directly.
-				return compileUnifiedSource(code, id)
+				// `@Component` path, so this handles it directly — with the per-file
+				// cross-module selector registry when one resolved.
+				return compileUnifiedSource(code, id, importedSelectors)
 		}
 	}
 
@@ -321,8 +411,12 @@ export class TreatyCompiler {
 	 * `@Component`-source entry point (which lowers every Angular decorator kind).
 	 * Any other diagnostic is returned as-is for the caller to throw.
 	 */
-	private lowerJsx(id: string, code: string): CompiledAuthoring {
-		const jsx = compileUnifiedSource(code, id)
+	private lowerJsx(
+		id: string,
+		code: string,
+		importedSelectors?: ImportedSelectorMap
+	): CompiledAuthoring {
+		const jsx = compileUnifiedSource(code, id, importedSelectors)
 		if (
 			jsx.errors.length > 0 &&
 			isMissingJsxComponentError(jsx.errors) &&

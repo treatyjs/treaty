@@ -125,6 +125,45 @@ export interface CompiledAuthoring {
  *   * any other extension → passed through unchanged.
  */
 export declare function compile(source: string, fileName: string): CompiledAuthoring
+/**
+ * The project-wide `className -> selector` map produced by [`build_selector_registry`] and consumed
+ * by [`build_imported_selectors`]. Crosses the NAPI boundary as a plain JS object
+ * (`Record<string, string>`); the bundler plugin holds onto it for the lifetime of the build (one
+ * scan per cold build, reused across every transform).
+ */
+export type ProjectSelectors = Record<string, string>
+/**
+ * A per-file `{ localImportName -> selector }` map: for the file being compiled, the LOCAL binding
+ * name of each imported `@Component`/`@Directive` resolved to its real `@Component` `selector`.
+ * `null`/absent means "no cross-module selectors for this file", which routes to the byte-identical
+ * fold path.
+ */
+export type ImportedSelectorMap = Record<string, string>
+/**
+ * Unified per-file authoring compile WITH the project's cross-module selector registry — the
+ * registry-aware sibling of [`compile`].
+ *
+ * Identical to [`compile`] except `importedSelectors` carries the per-file
+ * `{ localImportName -> selector }` map the host (a `@treaty/vite` / `@treaty/rolldown` build)
+ * pre-resolved by scanning the project's `.ts` sources. ADDITIVE GUARANTEE: when `importedSelectors`
+ * is `undefined`/`null`/empty, this entry is byte-for-byte identical to [`compile`].
+ */
+export declare function compileWithRegistry(source: string, fileName: string, importedSelectors?: ImportedSelectorMap | undefined | null): CompiledAuthoring
+/**
+ * Scan every first-party `.ts` source under `rootDir` and return the project-wide
+ * `className -> selector` map ([`ProjectSelectors`]).
+ *
+ * The bundler-plugin's COLD-BUILD PREWARM entry: call once in `buildStart`, hold the result for the
+ * build, then derive each file's [`ImportedSelectorMap`] from it via [`buildImportedSelectors`].
+ * `node_modules` and dot-directories are skipped; a missing `rootDir` yields an empty map (no error).
+ */
+export declare function buildSelectorRegistry(rootDir: string): ProjectSelectors
+/**
+ * Build the per-file [`ImportedSelectorMap`] for `source` from the project-wide `projectSelectors`
+ * map produced by [`buildSelectorRegistry`]. Returns `undefined` when no import resolves to a known
+ * selector (the file then folds byte-identically). Type-only imports are excluded.
+ */
+export declare function buildImportedSelectors(source: string, projectSelectors: ProjectSelectors): ImportedSelectorMap | null
 /** One file to compile in a [`compile_many`] batch. */
 export interface AuthoringFile {
   /**
@@ -174,6 +213,16 @@ export interface CompiledAuthoringEntry {
  * `id`.
  */
 export declare function compileMany(files: Array<AuthoringFile>): Array<CompiledAuthoringEntry>
+/**
+ * Compile many authoring files IN PARALLEL with per-file cross-module selector registries — the
+ * registry-aware sibling of [`compileMany`], for a bundler's cold-build batch prewarm.
+ *
+ * `registries` is matched POSITIONALLY to `files` (entry `i` is the [`ImportedSelectorMap`] for
+ * `files[i]`). A shorter `registries` (or an absent / `null` entry) routes that file through the
+ * byte-identical fold path — so a batch with an all-empty `registries` is byte-for-byte identical to
+ * [`compileMany`] (ADDITIVE GUARANTEE). Results are returned in INPUT ORDER, each tagged with its `id`.
+ */
+export declare function compileManyWithRegistry(files: Array<AuthoringFile>, registries?: Array<ImportedSelectorMap | undefined | null> | undefined | null): Array<CompiledAuthoringEntry>
 /**
  * The generated file-routing **virtual module** plus its watch dependency set.
  *

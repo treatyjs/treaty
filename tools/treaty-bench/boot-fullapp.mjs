@@ -15,8 +15,10 @@
 //   reason:       human-readable explanation
 //   jitError:     bootstrap hit a JIT / "@angular/compiler not available" error
 //   rendered:     the routed Dashboard's <h2> rendered
-//   statCards:    how many <app-stat-card> host elements the Dashboard projected (component-resolution
-//                 completeness signal — a standard cross-file kebab-selector component dependency)
+//   statCards:    how many <app-stat-card> children the Dashboard INSTANTIATED (component-resolution
+//                 completeness signal — a cross-file child used by its CONVENTIONAL @Component selector
+//                 `app-stat-card`, which does NOT fold to the class name `StatCard` and so resolves only
+//                 through the project selector registry the @treaty build threads into the compiler)
 //
 // Usage (internal):  node boot-fullapp.mjs <tool> <entryJsAbsPath> <nodeModulesDir>
 // Always exits 0 (the verdict is in the JSON; a non-zero exit would mean the probe itself crashed).
@@ -122,11 +124,14 @@ async function main() {
 	const renderedDashboard = headings.some((t) => /Inventory dashboard/i.test(t))
 	const renderedAnything = rootHtml.length > 0
 
-	// (c) Component-resolution completeness: the Dashboard template instantiates three <stat-card>
-	//     children (a cross-file component dependency resolved by the class-name↔selector convention).
-	//     Count the ones the StatCard component actually INSTANTIATED — proven by its inner "Refresh"
-	//     button — so the verdict distinguishes a fully-resolved render from an empty host element.
-	const statCards = window.document.querySelectorAll('stat-card button').length
+	// (c) Component-resolution completeness: the Dashboard template instantiates three <app-stat-card>
+	//     children. StatCard uses the CONVENTIONAL Angular-CLI selector (`class StatCard` ↔ selector
+	//     "app-stat-card"), which does NOT fold to the class name — so it resolves as a cross-file
+	//     dependency ONLY through the project SELECTOR REGISTRY (the @treaty/vite build scans the
+	//     project's `.ts` and threads each importer's per-file registry into the compiler). Count the
+	//     children StatCard actually INSTANTIATED — proven by its inner "Refresh" button — so the
+	//     verdict distinguishes a fully-resolved render (statCards=3) from three empty hosts (=0).
+	const statCards = window.document.querySelectorAll('app-stat-card button').length
 	// Also count the router nav links the App shell renders (proves the App component + RouterLink).
 	const navLinks = window.document.querySelectorAll('nav a').length
 

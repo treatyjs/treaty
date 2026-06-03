@@ -10,6 +10,7 @@ pub mod angular_source;
 pub mod authoring;
 pub mod jsx;
 pub mod plugin;
+pub mod selectors;
 pub mod sfc;
 pub mod source_map;
 pub mod treaty;

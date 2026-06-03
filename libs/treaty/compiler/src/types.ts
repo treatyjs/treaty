@@ -9,6 +9,22 @@
 export type TreatyFileKind = 'treaty' | 'jsx' | 'component'
 
 /**
+ * The project-wide `className -> selector` map: every first-party
+ * `@Component`/`@Directive` class's real `selector`, keyed by class name. Built
+ * ONCE per build by the Rust selector scanner and reused to derive each file's
+ * {@link ImportedSelectorMap}.
+ */
+export type ProjectSelectors = Record<string, string>
+
+/**
+ * A per-file `{ localImportName -> selector }` map: for one file, each imported
+ * `@Component`/`@Directive`'s LOCAL binding name resolved to its real selector. The
+ * compiler consumes this (instead of its class-name↔tag fold) so an IMPORTED child
+ * used by its conventional selector resolves as a real dependency.
+ */
+export type ImportedSelectorMap = Record<string, string>
+
+/**
  * One extracted server function, exposed as its OWN chunk unit so a bundler can
  * code-split it into a separately-loadable chunk. The function BODY lives only
  * in {@link ServerFnChunk.code} (the server-side module) and never in the client

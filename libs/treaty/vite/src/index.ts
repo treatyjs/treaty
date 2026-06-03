@@ -14,6 +14,7 @@
  */
 
 import { readFile } from 'node:fs/promises'
+import { isAbsolute, resolve as resolvePath } from 'node:path'
 import {
 	createTreatyCompiler,
 	classify,
@@ -112,6 +113,26 @@ export interface PluginOptions extends TreatyCompilerOptions {
 	 * dev rebuilds regardless of this option).
 	 */
 	readonly prewarm?: readonly string[]
+	/**
+	 * CROSS-MODULE SELECTOR RESOLUTION. The project root whose first-party `.ts`
+	 * sources are scanned ONCE at `buildStart` (via the Rust selector scanner) to
+	 * resolve a parent component's template tags to an IMPORTED child used by its
+	 * REAL `@Component` selector — the conventional Angular-CLI shape (`class StatCard`
+	 * with `selector: 'app-stat-card'`, used as `<app-stat-card>`) that the class-name
+	 * ↔ tag fold cannot match and which otherwise renders as an empty host.
+	 *
+	 *   - a string: the absolute (or build-root-relative) directory to scan.
+	 *   - `true`: scan the Vite build `root` (the common case — `<root>/src` and below).
+	 *   - omitted / `false`: no cross-module scan; every file uses the byte-identical
+	 *     class-name fold (the prior behaviour — strictly ADDITIVE).
+	 *
+	 * The scan is one pass over `.ts` files (skipping `node_modules`/dot-dirs); the
+	 * resulting `className -> selector` map is held for the build and each owned
+	 * `.ts`'s per-file `{ importName -> selector }` registry is derived from it inside
+	 * the compiler. A file whose imports resolve to NO known selector folds exactly as
+	 * before.
+	 */
+	readonly selectorRoot?: string | boolean
 	/**
 	 * Automatic Module Federation. Every Treaty app is a Module Federation host
 	 * by default — Treaty generates the federation config from these options so
@@ -487,6 +508,36 @@ export default function treaty(options: PluginOptions = {}): Plugin[] {
 	const compiler: TreatyCompiler = (options.compilerFactory ?? createTreatyCompiler)(options)
 	// Set by configResolved; gates the cold-build-only prewarm in buildStart.
 	let isColdBuild = false
+	// The resolved Vite build root, captured in configResolved; used as the base for
+	// a relative `selectorRoot` and as the default scan root when `selectorRoot: true`.
+	let buildRoot: string | undefined
+	const selectorRootOption = options.selectorRoot
+
+	/**
+	 * Resolve the configured {@link PluginOptions.selectorRoot} to the absolute
+	 * directory to scan, or `null` when cross-module selector resolution is off.
+	 * `true` ⇒ the build root; a relative string ⇒ resolved against the build root;
+	 * an absolute string ⇒ used as-is; `false`/omitted ⇒ `null`.
+	 */
+	function resolveSelectorRoot(): string | null {
+		if (selectorRootOption === undefined || selectorRootOption === false) return null
+		const root = buildRoot ?? process.cwd()
+		if (selectorRootOption === true) return root
+		return isAbsolute(selectorRootOption) ? selectorRootOption : resolvePath(root, selectorRootOption)
+	}
+
+	// Prewarm the project-wide selector map exactly once (idempotent across the
+	// dev-server `buildStart` re-entries / SSR + client passes a single build runs).
+	let selectorsPrewarmed = false
+	function prewarmSelectors(): void {
+		if (selectorsPrewarmed) return
+		const root = resolveSelectorRoot()
+		if (root === null) return
+		selectorsPrewarmed = true
+		// The scan is tolerant: a missing root yields an empty map and every file
+		// folds as before, so this never fails the build.
+		compiler.prewarmSelectorRegistry(root)
+	}
 
 	// Server-fn registries, populated during `transform` and read by the virtual
 	// `load`/`resolveId` hooks and the manifest emit:
@@ -615,6 +666,8 @@ export default function treaty(options: PluginOptions = {}): Plugin[] {
 			// that this is a cold build so `buildStart` may batch-prewarm.
 			isColdBuild = resolved.command === 'build'
 			if (isColdBuild) compiler.clearCache()
+			// Capture the build root as the base for `selectorRoot` resolution.
+			buildRoot = resolved.root
 		},
 
 		/**
@@ -671,6 +724,13 @@ export default function treaty(options: PluginOptions = {}): Plugin[] {
 		 * incremental rebuilds always use per-file `transform`.
 		 */
 		async buildStart() {
+			// CROSS-MODULE SELECTOR PREWARM. Scan the project's `.ts` once so every
+			// subsequent `transform` auto-resolves an imported child used by its real
+			// `@Component` selector. Runs in BOTH dev and build (cross-module resolution
+			// is needed whenever an app uses the conventional non-folding selector), is
+			// idempotent, and is a no-op when `selectorRoot` is not configured.
+			prewarmSelectors()
+
 			if (!isColdBuild || prewarmFiles.length === 0) return
 			const inputs: TransformInput[] = []
 			for (const file of prewarmFiles) {
@@ -683,6 +743,9 @@ export default function treaty(options: PluginOptions = {}): Plugin[] {
 					// transform (or Vite's own resolver) will surface any real error.
 				}
 			}
+			// The batch path auto-derives each file's per-file registry from the
+			// prewarmed project map (passing no explicit registries), so prewarmed
+			// files resolve cross-module selectors identically to the per-file path.
 			if (inputs.length > 0) compiler.transformMany(inputs)
 		},
 
