@@ -48,8 +48,14 @@ pub struct PartialDependency {
 /// The component-specific inputs to [`emit_ng_declare_component`] (everything beyond the shared
 /// directive base): the ORIGINAL inline template HTML string and the declarative view metadata.
 pub struct PartialComponentInputs<'a> {
-    /// The original inline template HTML, carried VERBATIM as a string literal (`isInline: true`).
+    /// The template HTML, carried VERBATIM as a string literal. For an INLINE `template:` this is the
+    /// source string and [`Self::is_inline`] is `true`; for an external `templateUrl` this is the
+    /// HOST-RESOLVED file content and [`Self::is_inline`] is `false` (ng-packagr inlines the resolved
+    /// template into the partial declaration and OMITS `isInline`).
     pub template_html: &'a str,
+    /// Whether `template_html` came from an INLINE `template:` (`isInline: true`) rather than an
+    /// external `templateUrl` (the resolved content, no `isInline` field — matching ng-packagr).
+    pub is_inline: bool,
     pub change_detection: ChangeDetectionStrategy,
     pub encapsulation: ViewEncapsulation,
     /// Inline component style strings — RAW (unscoped); scoping happens at link time.
@@ -409,9 +415,15 @@ pub fn emit_ng_declare_component(
     // exactly as Angular's `createComponentDefinitionMap` places it.
     fields.push(ng_import_field());
 
-    // template (inline string) + isInline.
+    // template + isInline. `isInline: true` is emitted ONLY for an inline `template:` string; an
+    // external `templateUrl` inlines its RESOLVED content as the `template` string and OMITS
+    // `isInline` (exactly as ng-packagr's partial emitter does — see `GOLDEN_PARTIAL` external
+    // resource case). The linker reads an absent `isInline` as "external", which is inert here
+    // because the resolved string is already carried verbatim.
     fields.push(field("template", str_lit(inputs.template_html)));
-    fields.push(field("isInline", bool_lit(true)));
+    if inputs.is_inline {
+        fields.push(field("isInline", bool_lit(true)));
+    }
 
     if !inputs.styles.is_empty() {
         let styles = inputs.styles.iter().map(|s| str_lit(s)).collect();

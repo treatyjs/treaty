@@ -117,13 +117,17 @@ fn collect_rewrites(
         };
 
         match member.as_str() {
-            // `X.ɵfac = function X_Factory(t){ return new (t||X)(); }` → ngDeclareFactory.
+            // `X.ɵfac = function X_Factory(t){ return new (t||X)(<inject calls>); }` →
+            // ngDeclareFactory. The `deps` array is DECOMPILED from the AOT factory body's
+            // `ɵɵinject`/`ɵɵdirectiveInject`/`ɵɵinjectAttribute`/`ɵɵinvalidFactoryDep` calls (see
+            // `factory_deps_from_body`) so a constructor WITH DI publishes its real `deps:[{token,…}]`.
             "\u{0275}fac" => {
                 // Determine this class's factory TARGET from a sibling definition member in the
                 // module (ɵcmp→Component, ɵdir→Directive, ɵpipe→Pipe, ɵprov→Injectable, ɵmod→
                 // NgModule). Default to Injectable when none is found (a bare `@Injectable`).
                 let target = factory_target_for(program, &type_name);
-                if let Some(text) = ng_declare_factory(&type_name, target) {
+                let deps = factory_deps_from_body(&assign.right, source);
+                if let Some(text) = ng_declare_factory(&type_name, target, &deps) {
                     rewrites.push(Rewrite {
                         start: assign.right.span().start,
                         end: assign.right.span().end,
@@ -309,15 +313,239 @@ fn declare_prelude() -> String {
     declare_prelude_min(MIN_VERSION)
 }
 
-/// `ɵɵngDeclareFactory({...})` for `type_name` with the given factory `target` and an EMPTY `deps`
-/// array (a no-arg constructor factory — the dominant published-library shape). An empty `deps: []`
-/// is what makes the linker emit the simple `function X_Factory(t){ return new (t||X)(); }` back
-/// (an ABSENT `deps` would instead inherit the base-class factory).
-fn ng_declare_factory(type_name: &str, target: &str) -> Option<String> {
+/// The decompiled `deps` tri-state of an AOT factory body — the inverse of the factory codegen's
+/// `FactoryDeps`, recovered from the emitted factory function (see [`factory_deps_from_body`]).
+enum DecompiledDeps {
+    /// `deps: [ <entry source>, … ]` — a constructor factory's resolved dependency list (may be the
+    /// empty array for a parameterless constructor). Each entry is the rendered `{ token, …flags }`
+    /// object-literal SOURCE.
+    Deps(Vec<String>),
+    /// `deps: null` — no own constructor; the factory inherits the base-class factory
+    /// (`ɵɵgetInheritedFactory`). Round-trips to `FactoryDeps::Inherit`.
+    Inherit,
+    /// `deps: "invalid"` — at least one dep was unresolvable (`ɵɵinvalidFactory`/`ɵɵinvalidFactoryDep`).
+    Invalid,
+}
+
+/// `ɵɵngDeclareFactory({...})` for `type_name` with the given factory `target` and the `deps`
+/// recovered from the AOT factory body. The `deps` field round-trips through the linker's
+/// `get_dependencies`:
+///   * [`DecompiledDeps::Deps`] → `deps: [ … ]` (the resolved list; empty `[]` is the dominant
+///     no-arg shape that re-emits `function X_Factory(t){ return new (t||X)(); }`);
+///   * [`DecompiledDeps::Inherit`] → `deps: null` (inherit the base-class factory);
+///   * [`DecompiledDeps::Invalid`] → `deps: "invalid"` (re-emit `ɵɵinvalidFactory()`).
+fn ng_declare_factory(type_name: &str, target: &str, deps: &DecompiledDeps) -> Option<String> {
+    let deps_field = match deps {
+        DecompiledDeps::Deps(entries) => format!("[{}]", entries.join(", ")),
+        DecompiledDeps::Inherit => "null".to_string(),
+        DecompiledDeps::Invalid => "\"invalid\"".to_string(),
+    };
     Some(format!(
-        "i0.\u{0275}\u{0275}ngDeclareFactory({{ {}, type: {type_name}, deps: [], target: i0.\u{0275}\u{0275}FactoryTarget.{target} }})",
+        "i0.\u{0275}\u{0275}ngDeclareFactory({{ {}, type: {type_name}, deps: {deps_field}, target: i0.\u{0275}\u{0275}FactoryTarget.{target} }})",
         declare_prelude()
     ))
+}
+
+/// Decompile an AOT factory function's body back into its [`DecompiledDeps`] — the inverse of the
+/// factory codegen (`treaty_ivy_core::factory`). The recognised shapes:
+///
+///   * `function X_Factory(t){ return new (t || X)(<inject calls>); }` — a constructor factory:
+///     each constructor argument is an inject call we map back to a `{ token, …flags }` entry.
+///     A zero-arg `new (t||X)()` yields the empty `deps: []`.
+///   * a body that calls `ɵɵgetInheritedFactory(X)` (the base-factory IIFE/memoized form) — no own
+///     constructor → [`DecompiledDeps::Inherit`] (`deps: null`).
+///   * a body whose constructor expression is `ɵɵinvalidFactory()`, or any argument is
+///     `ɵɵinvalidFactoryDep(i)` — [`DecompiledDeps::Invalid`] (`deps: "invalid"`).
+///
+/// Any other (unrecognised) shape conservatively yields the empty `deps: []` — the prior behaviour,
+/// so nothing regresses; only the recognised constructor-DI shape now publishes real deps.
+fn factory_deps_from_body(rhs: &Expression, source: &str) -> DecompiledDeps {
+    // The factory RHS is `function X_Factory(t){ … }`, possibly wrapped in a base-factory IIFE
+    // `(() => { let ɵX_BaseFactory; return function X_Factory(t){ … }; })()`. Unwrap to the inner
+    // function body and scan it.
+    let Some(body_stmts) = factory_function_body(rhs) else {
+        return DecompiledDeps::Deps(Vec::new());
+    };
+
+    // An inherited-factory body memoizes via `ɵɵgetInheritedFactory` — the whole module body (and
+    // the wrapper IIFE) reference it. If any statement mentions that call, this class inherits.
+    if statements_reference_callee(body_stmts, source, "\u{0275}\u{0275}getInheritedFactory") {
+        return DecompiledDeps::Inherit;
+    }
+
+    // Find the constructor `new (t || X)(<args>)` expression anywhere in the body (it is the
+    // `return new …` or the conditional `r = new …`). The args are the inject calls.
+    let Some(args) = find_ctor_call_args(body_stmts) else {
+        // No `new` constructor expression: either an invalid factory (`ɵɵinvalidFactory()`) or an
+        // unrecognised shape. Treat an explicit `ɵɵinvalidFactory` as Invalid; else empty deps.
+        if statements_reference_callee(body_stmts, source, "\u{0275}\u{0275}invalidFactory") {
+            return DecompiledDeps::Invalid;
+        }
+        return DecompiledDeps::Deps(Vec::new());
+    };
+
+    let mut entries: Vec<String> = Vec::with_capacity(args.len());
+    for arg in args {
+        match dep_entry_from_inject(arg, source) {
+            Some(entry) => entries.push(entry),
+            // An `ɵɵinvalidFactoryDep(i)` (or an arg we cannot map) makes the whole factory invalid —
+            // matching the codegen, where an unresolvable token poisons the dep list.
+            None => return DecompiledDeps::Invalid,
+        }
+    }
+    DecompiledDeps::Deps(entries)
+}
+
+/// The statement body of an AOT factory function, unwrapping the base-factory IIFE wrapper
+/// `(() => { … return function …(){ … }; })()` to the INNER `function …_Factory(t){ … }` body.
+fn factory_function_body<'a>(rhs: &'a Expression<'a>) -> Option<&'a [Statement<'a>]> {
+    match rhs {
+        Expression::FunctionExpression(f) => f.body.as_ref().map(|b| b.statements.as_slice()),
+        // `(() => { let ɵX_BaseFactory; return function X_Factory(t){…}; })()` — the wrapper IIFE.
+        Expression::CallExpression(call) => {
+            let inner = call.callee.get_inner_expression();
+            let arrow_body = match inner {
+                Expression::ArrowFunctionExpression(a) => &a.body.statements,
+                Expression::FunctionExpression(f) => &f.body.as_ref()?.statements,
+                _ => return None,
+            };
+            for stmt in arrow_body {
+                if let Statement::ReturnStatement(ret) = stmt {
+                    if let Some(arg) = &ret.argument {
+                        if let Expression::FunctionExpression(f) = arg.get_inner_expression() {
+                            return f.body.as_ref().map(|b| b.statements.as_slice());
+                        }
+                    }
+                }
+            }
+            None
+        }
+        Expression::ParenthesizedExpression(p) => factory_function_body(&p.expression),
+        _ => None,
+    }
+}
+
+/// Whether any statement's source slice mentions `callee` as a `.<callee>(` call — a cheap
+/// structural probe over the small factory body (the body is tiny and the callee names are unique
+/// `ɵɵ`-prefixed runtime symbols, so a source-slice contains-check is exact, not a heuristic regex).
+fn statements_reference_callee(stmts: &[Statement], source: &str, callee: &str) -> bool {
+    let needle = format!("{callee}(");
+    stmts.iter().any(|s| {
+        let span = s.span();
+        source[span.start as usize..span.end as usize].contains(&needle)
+    })
+}
+
+/// Find the constructor `new (t || X)(<args>)` (or `new t(<args>)` in a delegated factory) call's
+/// argument expressions within a factory body. Scans the `return`/assignment statements for a
+/// `NewExpression`.
+fn find_ctor_call_args<'a>(stmts: &'a [Statement<'a>]) -> Option<&'a [Argument<'a>]> {
+    for stmt in stmts {
+        if let Some(args) = ctor_args_in_statement(stmt) {
+            return Some(args);
+        }
+    }
+    None
+}
+
+/// Locate a `new …(<args>)` expression inside one factory-body statement (a `return new …`, or a
+/// conditional `r = new …`), returning its arguments.
+fn ctor_args_in_statement<'a>(stmt: &'a Statement<'a>) -> Option<&'a [Argument<'a>]> {
+    match stmt {
+        Statement::ReturnStatement(ret) => ret.argument.as_ref().and_then(new_expr_args),
+        Statement::ExpressionStatement(es) => new_expr_args(&es.expression),
+        Statement::IfStatement(if_stmt) => {
+            // The conditional factory's then/else branches assign `r = new …` / `r = <nonCtor>`.
+            ctor_args_in_statement(&if_stmt.consequent)
+                .or_else(|| if_stmt.alternate.as_ref().and_then(ctor_args_in_statement))
+        }
+        Statement::BlockStatement(b) => find_ctor_call_args(&b.body),
+        _ => None,
+    }
+}
+
+/// The arguments of a `new …(<args>)` expression, unwrapping an `r = new …` assignment.
+fn new_expr_args<'a>(expr: &'a Expression<'a>) -> Option<&'a [Argument<'a>]> {
+    match expr.get_inner_expression() {
+        Expression::NewExpression(new) => Some(new.arguments.as_slice()),
+        Expression::AssignmentExpression(assign) => new_expr_args(&assign.right),
+        _ => None,
+    }
+}
+
+/// Map ONE constructor-argument inject call back to its `{ token, …flags }` declaration entry SOURCE:
+///   * `i0.ɵɵinject(Token[, flags])` / `i0.ɵɵdirectiveInject(Token[, flags])` →
+///     `{ token: <Token src>[, host: true][, self: true][, skipSelf: true][, optional: true] }`
+///     (the flags are decoded from the numeric `InjectFlags` 2nd arg: HOST=1, SELF=2, SKIP_SELF=4,
+///     OPTIONAL=8; the FOR_PIPE=16 bit is a codegen marker, dropped from the declaration);
+///   * `i0.ɵɵinjectAttribute("name")` → `{ token: "name", attribute: true }`;
+///   * `i0.ɵɵinvalidFactoryDep(i)` (or anything else) → `None` (poisons the factory to `"invalid"`).
+fn dep_entry_from_inject(arg: &Argument, source: &str) -> Option<String> {
+    let expr = arg.as_expression()?;
+    let Expression::CallExpression(call) = expr.get_inner_expression() else {
+        return None;
+    };
+    let callee = call_callee_name(call)?;
+    let args = &call.arguments;
+    match callee {
+        "\u{0275}\u{0275}inject" | "\u{0275}\u{0275}directiveInject" => {
+            let token = arg_source(args.first()?, source)?;
+            let mut entry = format!("{{ token: {token}");
+            if let Some(flags_arg) = args.get(1) {
+                if let Some(flags) = flags_arg.as_expression().and_then(numeric_literal_value) {
+                    let bits = flags as u8;
+                    // InjectFlags bit order on emit is host, self, skipSelf, optional (the codegen's
+                    // `create_ctor_dep_type` order); match it for byte parity with ng-packagr.
+                    if bits & 0b0_0001 != 0 {
+                        entry.push_str(", host: true");
+                    }
+                    if bits & 0b0_0010 != 0 {
+                        entry.push_str(", self: true");
+                    }
+                    if bits & 0b0_0100 != 0 {
+                        entry.push_str(", skipSelf: true");
+                    }
+                    if bits & 0b0_1000 != 0 {
+                        entry.push_str(", optional: true");
+                    }
+                }
+            }
+            entry.push_str(" }");
+            Some(entry)
+        }
+        "\u{0275}\u{0275}injectAttribute" => {
+            let token = arg_source(args.first()?, source)?;
+            Some(format!("{{ token: {token}, attribute: true }}"))
+        }
+        // `ɵɵinvalidFactoryDep(i)` or any unknown call — the dep is unresolvable.
+        _ => None,
+    }
+}
+
+/// The (bare or `i0.`-namespaced) callee name of a call expression.
+fn call_callee_name<'a>(call: &'a oxc_ast::ast::CallExpression<'a>) -> Option<&'a str> {
+    match &call.callee {
+        Expression::Identifier(id) => Some(id.name.as_str()),
+        Expression::StaticMemberExpression(m) => Some(m.property.name.as_str()),
+        _ => None,
+    }
+}
+
+/// The trimmed source slice of a call argument expression (the injection TOKEN), preserving an
+/// opaque token expression (`MyService`, `'name'`, `dynamicAttrName()`, `i0.ChangeDetectorRef`)
+/// verbatim so it round-trips.
+fn arg_source<'a>(arg: &Argument, source: &'a str) -> Option<&'a str> {
+    let expr = arg.as_expression()?;
+    let span = expr.span();
+    Some(source[span.start as usize..span.end as usize].trim())
+}
+
+/// The numeric value of a (possibly negated) number literal — the `InjectFlags` 2nd inject arg.
+fn numeric_literal_value(expr: &Expression) -> Option<f64> {
+    match expr {
+        Expression::NumericLiteral(n) => Some(n.value),
+        _ => None,
+    }
 }
 
 /// `ɵɵngDeclareInjectable({...})` from an `ɵɵdefineInjectable({ token, factory, providedIn })`.
@@ -473,19 +701,27 @@ mod tests {
 
     /// Canonicalize a module to compare a partial→linked round-trip against the original AOT,
     /// ignoring cosmetic differences that are semantically inert: ALL whitespace is removed, the
-    /// linker's `(function …);` factory-wrapper parens are stripped, and redundant `;` runs are
-    /// collapsed. What remains is the exact token stream of the definitions.
+    /// linker's `(function …);` factory-wrapper parens are stripped, the dropped dev-only
+    /// `ɵɵngDeclareClassMetadata` (which the linker replaces with a `void 0;` expression statement)
+    /// is removed, and redundant `;` runs are collapsed. What remains is the exact token stream of
+    /// the definitions.
     fn norm(code: &str) -> String {
         // Drop all ASCII whitespace.
         let mut s: String = code.chars().filter(|c| !c.is_whitespace()).collect();
         // The linker wraps a regenerated constructor factory as `ɵfac=(function …(){ … });` — strip
-        // the wrapping `(` after `ɵfac=` and the matching `)` before its terminating `;` so it
-        // matches the AOT `ɵfac=function …(){ … };`. Both forms reduce to the same body.
+        // the wrapping `(` after `ɵfac=`, then drop the single matching wrapper-closing `)` that
+        // precedes the factory's terminating `;`. The factory body always ends `…);}` (the `new …(…)`
+        // expression's `)`, then the return `;`, then the function `}`); the wrapper adds one more
+        // `)`, yielding `…);})`. Strip THAT trailing wrapper `)` so it matches the AOT `…);}`.
         s = s.replace("ɵfac=(function", "ɵfac=function");
-        // The constructor factory body ends `...)();}` (its closing brace). The linker then closes
-        // its `(function …)` wrapper with `)` before the terminating `;`, yielding `();})`. Drop that
-        // single wrapper-closing `)` so it matches the AOT's bare `();}`.
-        s = s.replace("();})", "();}");
+        // No-arg ctor: body ends `();}` → wrapped `();})`. With ctor args it ends `…));}` → `…));})`.
+        // Either way the wrapper close is the `)` immediately after the function's closing `}`,
+        // i.e. the substring `;})`. Collapse it to `;}` (the AOT bare form).
+        s = s.replace(";})", ";}");
+        // The dropped `ɵɵngDeclareClassMetadata` links to a bare `void 0;` expression statement (a
+        // dev-only reflection aid Treaty's classic AOT emit never produced). It is semantically inert
+        // and absent from the direct AOT, so remove it for the round-trip token comparison.
+        s = s.replace("void0;", "");
         // Collapse redundant `;` runs the linker leaves between rewritten statements.
         while s.contains(";;") {
             s = s.replace(";;", ";");
@@ -774,5 +1010,229 @@ mod tests {
             "residual ngDeclare* after link; got:\n{}",
             code
         );
+    }
+
+    // ----------------------------------------------------------------------
+    // GAP 2 — ɵɵngDeclareFactory NON-EMPTY deps (decompiled from the AOT factory).
+    // ----------------------------------------------------------------------
+
+    /// Flatten a code string to single spaces for field-shape comparison.
+    fn flat(code: &str) -> String {
+        code.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    #[test]
+    fn factory_deps_decompiled_for_constructor_di() {
+        // A `@Injectable` with two ctor deps (one `@Optional`) must publish its REAL `deps:[{token},
+        // {token, optional:true}]` (the prior emit dropped them to `deps:[]`). Matches the
+        // `r3_view_compiler_di` golden's `ctor_overload` factory shape.
+        let aot = compile_component_source(
+            "import { Injectable, Optional } from '@angular/core';\n\
+             class Dep {}\n class OptDep {}\n\
+             @Injectable()\n\
+             export class Svc { constructor(d: Dep, @Optional() o: OptDep) {} }",
+        );
+        let partial = emit_partial(&aot.code);
+        let f = flat(&partial.code);
+        assert!(
+            f.contains("deps: [{ token: Dep }, { token: OptDep, optional: true }]"),
+            "ctor DI deps not decompiled into the factory declaration; got:\n{}",
+            f
+        );
+        // Round-trips back to the SAME AOT factory.
+        let relinked = link_partial(&partial.code, "svc.ts");
+        assert!(relinked.errors.is_empty(), "relink errors: {:?}", relinked.errors);
+        assert_eq!(
+            norm(&relinked.code),
+            norm(&aot.code),
+            "ctor-DI factory round-trip diverged\n--- AOT ---\n{}\n--- RELINKED ---\n{}",
+            aot.code,
+            relinked.code
+        );
+        assert_no_residual_declare(&relinked.code);
+    }
+
+    #[test]
+    fn factory_deps_decode_all_inject_flags_and_attribute() {
+        // Every `@Inject`/`@Host`/`@Self`/`@SkipSelf`/`@Optional`/`@Attribute` qualifier must decode
+        // from the AOT inject-flag 2nd arg back into the declaration `{token, …flags}` — matching the
+        // `r3_view_compiler_di` `component_factory` golden's deps array.
+        let aot = compile_component_source(
+            "import { Component, Inject, Host, Self, SkipSelf, Optional, Attribute } from '@angular/core';\n\
+             class S {}\n\
+             @Component({ selector: 'c', template: '' })\n\
+             export class C { constructor(\
+               @Attribute('name') a: string, s: S, @Host() h: S, @Self() se: S, \
+               @SkipSelf() sk: S, @Optional() o: S) {} }",
+        );
+        let partial = emit_partial(&aot.code);
+        let f = flat(&partial.code);
+        // The AOT factory's `ɵɵinjectAttribute` token literal is the codegen-normalized double-quoted
+        // form; the decompiler carries it verbatim (matching the golden's `attribute: true` entry).
+        assert!(f.contains("{ token: \"name\", attribute: true }"), "attribute dep lost; got:\n{}", f);
+        assert!(f.contains("{ token: S }"), "plain token dep lost; got:\n{}", f);
+        assert!(f.contains("{ token: S, host: true }"), "host flag lost; got:\n{}", f);
+        assert!(f.contains("{ token: S, self: true }"), "self flag lost; got:\n{}", f);
+        assert!(f.contains("{ token: S, skipSelf: true }"), "skipSelf flag lost; got:\n{}", f);
+        assert!(f.contains("{ token: S, optional: true }"), "optional flag lost; got:\n{}", f);
+        let relinked = link_partial(&partial.code, "c.ts");
+        assert!(relinked.errors.is_empty(), "relink errors: {:?}", relinked.errors);
+        assert_eq!(norm(&relinked.code), norm(&aot.code), "flagged-deps round-trip diverged");
+        assert_no_residual_declare(&relinked.code);
+    }
+
+    #[test]
+    fn factory_deps_empty_for_no_arg_constructor() {
+        // The dominant no-arg shape still publishes the empty `deps: []` (NOT `null`), so the linker
+        // re-emits `function X_Factory(t){ return new (t||X)(); }` rather than inheriting a base.
+        let aot = compile_component_source(
+            "import { Injectable } from '@angular/core';\n@Injectable()\nexport class Svc {}",
+        );
+        let partial = emit_partial(&aot.code);
+        assert!(flat(&partial.code).contains("deps: []"), "no-arg ctor must emit deps:[]; got:\n{}", partial.code);
+        let relinked = link_partial(&partial.code, "svc.ts");
+        assert!(relinked.errors.is_empty(), "relink errors: {:?}", relinked.errors);
+        assert_eq!(norm(&relinked.code), norm(&aot.code), "empty-deps round-trip diverged");
+    }
+
+    // ----------------------------------------------------------------------
+    // GAP 3 — ɵɵngDeclareClassMetadata companion statement.
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn class_metadata_emitted_in_partial_mode() {
+        // A partial-mode component publishes the dev-only `ɵɵngDeclareClassMetadata` carrying the
+        // ORIGINAL `@Component` decorator (with verbatim args) and ctor params — like ng-packagr.
+        let src = "import { Component, Optional } from '@angular/core';\n\
+                   class Dep {}\n\
+                   @Component({ selector: 'app-x', template: '<div>{{x}}</div>' })\n\
+                   export class X { x = 1; constructor(d: Dep, @Optional() o: Dep) {} }";
+        let partial = partial_pipeline(src);
+        let f = flat(&partial.code);
+        assert!(f.contains("\u{0275}\u{0275}ngDeclareClassMetadata("), "no class metadata; got:\n{}", f);
+        // Decorator reproduced with verbatim args.
+        assert!(
+            f.contains("decorators: [{ type: Component, args: [{ selector: 'app-x', template: '<div>{{x}}</div>' }] }]"),
+            "class-metadata decorator shape diverged; got:\n{}",
+            f
+        );
+        // ctorParameters reproduce the param types + @Optional decorator.
+        assert!(
+            f.contains("ctorParameters: () => [{ type: Dep }, { type: Dep, decorators: [{ type: Optional }] }]"),
+            "ctorParameters shape diverged; got:\n{}",
+            f
+        );
+        // It round-trips: the linker DROPS class metadata to `void 0`, no residual.
+        let relinked = link_partial(&partial.code, "x.ts");
+        assert!(relinked.errors.is_empty(), "relink errors: {:?}", relinked.errors);
+        assert!(relinked.code.contains("\u{0275}\u{0275}defineComponent"), "no defineComponent after link");
+        assert_no_residual_declare(&relinked.code);
+    }
+
+    #[test]
+    fn class_metadata_prop_decorators() {
+        // A directive with `@Input`/`@Output`/`@HostListener` members publishes a `propDecorators` map.
+        let src = "import { Directive, Input, Output, EventEmitter } from '@angular/core';\n\
+                   @Directive({ selector: '[d]' })\n\
+                   export class D { @Input() foo = ''; @Output() bar = new EventEmitter(); }";
+        let partial = partial_pipeline(src);
+        let f = flat(&partial.code);
+        assert!(
+            f.contains("propDecorators: { foo: [{ type: Input }], bar: [{ type: Output }] }"),
+            "propDecorators shape diverged; got:\n{}",
+            f
+        );
+        let relinked = link_partial(&partial.code, "d.ts");
+        assert!(relinked.errors.is_empty(), "relink errors: {:?}", relinked.errors);
+        assert_no_residual_declare(&relinked.code);
+    }
+
+    // ----------------------------------------------------------------------
+    // GAP 1 — external `templateUrl` partial (resolved content channel).
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn external_template_partial_omits_is_inline() {
+        use crate::source_compile::{
+            compile_component_source_with_options_and_resolved, CompileOptions,
+            ResolvedComponentContent, ResolvedContentMap,
+        };
+        // A `templateUrl` + `styleUrls` component, compiled in partial mode WITH host-resolved
+        // content, must inline the resolved template (NO `isInline`) and the resolved styles.
+        let src = "import { Component } from '@angular/core';\n\
+                   @Component({ selector: 'app-ext', templateUrl: './x.html', styleUrls: ['./x.css'] })\n\
+                   export class Ext {}";
+        let mut resolved: ResolvedContentMap = ResolvedContentMap::new();
+        resolved.insert(
+            "Ext".to_string(),
+            ResolvedComponentContent {
+                template: Some("<span>resolved</span>".to_string()),
+                styles: vec![".a{color:red}".to_string()],
+            },
+        );
+        let opts = CompileOptions { emit_partial_component: true, ..Default::default() };
+        let compiled = compile_component_source_with_options_and_resolved(src, opts, &resolved);
+        assert!(compiled.errors.is_empty(), "compile errors: {:?}", compiled.errors);
+        let partial = emit_partial(&compiled.code);
+        let f = flat(&partial.code);
+        assert!(f.contains("\u{0275}\u{0275}ngDeclareComponent"), "no ngDeclareComponent; got:\n{}", f);
+        // Resolved template inlined as the `template` string.
+        assert!(f.contains("template: \"<span>resolved</span>\""), "resolved template not inlined; got:\n{}", f);
+        // External template → NO `isInline` field (matching ng-packagr).
+        assert!(!f.contains("isInline"), "external template must omit isInline; got:\n{}", f);
+        // Resolved style inlined.
+        assert!(f.contains("styles: [\".a{color:red}\"]"), "resolved style not inlined; got:\n{}", f);
+        // Round-trips to a valid AOT component def.
+        let relinked = link_partial(&partial.code, "ext.ts");
+        assert!(relinked.errors.is_empty(), "relink errors: {:?}", relinked.errors);
+        assert!(relinked.code.contains("\u{0275}\u{0275}defineComponent"), "no defineComponent after link");
+        assert_no_residual_declare(&relinked.code);
+    }
+
+    #[test]
+    fn fields_match_real_ng_packagr_di_golden() {
+        // GATE: compile the REAL vendored compliance corpus input
+        // `r3_view_compiler_di/di/injectable_factory.ts` through the partial pipeline and diff the
+        // emitted `ɵɵngDeclareFactory` deps + `ɵɵngDeclareClassMetadata` ctorParameters against the
+        // SAME case's real ng-packagr partial GOLDEN (`di/GOLDEN_PARTIAL.js`, the `injectable_factory`
+        // section), field-for-field. The golden's MyService is:
+        //   ɵfac = ɵɵngDeclareFactory({ …, type: MyService, deps: [{ token: MyDependency }],
+        //                               target: i0.ɵɵFactoryTarget.Injectable });
+        //   ɵprov = ɵɵngDeclareInjectable({ …, type: MyService });
+        //   ɵɵngDeclareClassMetadata({ …, type: MyService, decorators: [{ type: Injectable }],
+        //                              ctorParameters: () => [{ type: MyDependency }] });
+        let src = "import {Injectable} from '@angular/core';\n\
+                   class MyDependency {}\n\
+                   @Injectable()\n\
+                   export class MyService { constructor(dep: MyDependency) {} }";
+        let partial = partial_pipeline(src);
+        let f = flat(&partial.code);
+        // GAP 2 — factory deps decompiled to the golden's exact `[{ token: MyDependency }]`.
+        assert!(
+            f.contains("deps: [{ token: MyDependency }], target: i0.\u{0275}\u{0275}FactoryTarget.Injectable"),
+            "factory deps diverge from ng-packagr di golden; got:\n{}",
+            f
+        );
+        // GAP 3 — class metadata decorators + ctorParameters match the golden field-for-field.
+        assert!(
+            f.contains("type: MyService, decorators: [{ type: Injectable }], ctorParameters: () => [{ type: MyDependency }] }"),
+            "class metadata diverges from ng-packagr di golden; got:\n{}",
+            f
+        );
+        // And the whole thing round-trips back to AOT with no residual partial calls.
+        let relinked = link_partial(&partial.code, "injectable_factory.ts");
+        assert!(relinked.errors.is_empty(), "relink errors: {:?}", relinked.errors);
+        assert!(relinked.code.contains("\u{0275}\u{0275}defineInjectable"), "no defineInjectable after link");
+        assert_no_residual_declare(&relinked.code);
+    }
+
+    #[test]
+    fn inline_template_still_carries_is_inline() {
+        // The inline-template path is unchanged: it still emits `isInline: true`.
+        let src = "import { Component } from '@angular/core';\n\
+                   @Component({ selector: 'app-x', template: '<div></div>' })\n\
+                   export class X {}";
+        let partial = partial_pipeline(src);
+        assert!(flat(&partial.code).contains("isInline: true"), "inline template lost isInline; got:\n{}", partial.code);
     }
 }

@@ -1483,6 +1483,41 @@ pub fn compile_component_source_with_resolved(
     )
 }
 
+/// Like [`compile_component_source_with_resolved`] but ALSO honouring per-file [`CompileOptions`] —
+/// the entry a library-publish (`compilationMode: "partial"`) build uses for a component whose
+/// `templateUrl`/`styleUrls` were host-resolved. With [`CompileOptions::emit_partial_component`] set,
+/// the component emits its `ɵɵngDeclareComponent` PARTIAL declaration carrying the RESOLVED external
+/// template inline as the `template` string (no `isInline` field) and the resolved `styleUrls` content
+/// in `styles`. With [`CompileOptions::default`] the emit is byte-identical to
+/// [`compile_component_source_with_resolved`].
+pub fn compile_component_source_with_options_and_resolved(
+    ts_source: &str,
+    options: CompileOptions,
+    resolved: &ResolvedContentMap,
+) -> CompiledComponent {
+    let allocator = Allocator::default();
+    let source_type = SourceType::default().with_typescript(true);
+    let ret = Parser::new(&allocator, ts_source, source_type).parse();
+
+    if !ret.errors.is_empty() {
+        let msgs: Vec<String> = ret.errors.iter().map(|e| e.to_string()).collect();
+        return err(format!("parse error: {}", msgs.join("; ")));
+    }
+
+    compile_program_with_source(
+        &ret.program,
+        Some(ts_source),
+        None,
+        Some(resolved),
+        None,
+        options.legacy_optional_chaining,
+        options.modernize,
+        options.jit_mode,
+        None,
+        options.emit_partial_component,
+    )
+}
+
 /// Context for additive source-map emission: the original authoring source text plus the
 /// names used in the emitted v3 map (`file` for the generated artifact, `source_name` for
 /// the original). Threaded into the compile pipeline so the emitter can map span-carrying
@@ -1992,6 +2027,7 @@ fn assemble_module(
     source: &str,
     program: &Program,
     mut class_emits: std::collections::HashMap<usize, (ClassEmit, u32, u32)>,
+    emit_partial_component: bool,
 ) -> String {
     // Locate the byte position after the last original import declaration, so the synthetic
     // `import * as i0` line sits with the other imports (ngtsc groups it there). When there are no
@@ -2048,6 +2084,22 @@ fn assemble_module(
             }
             out.push_str(block.trim_end_matches('\n'));
             out.push('\n');
+            // PARTIAL mode: emit the dev-only `i0.ɵɵngDeclareClassMetadata({…})` companion statement
+            // AFTER the class statics (matching ng-packagr). Built from the ORIGINAL class AST +
+            // source so the decorator args / ctor-param decorators are carried verbatim. The Full emit
+            // path never reaches this (`emit_partial_component` is `false`), so it is byte-unchanged.
+            if emit_partial_component {
+                if let Some(class) = statement_class(stmt) {
+                    if let Some(name) = class.id.as_ref().map(|id| id.name.to_string()) {
+                        if let Some(meta) =
+                            crate::partial_class_metadata::emit_class_metadata(class, &name, source)
+                        {
+                            out.push_str(&meta);
+                            out.push('\n');
+                        }
+                    }
+                }
+            }
         } else {
             // A non-Angular statement (or a non-decorated class): copy through verbatim.
             out.push_str(&source[stmt_start..stmt_end]);
@@ -2254,7 +2306,7 @@ fn compile_program_with_source(
         None
     };
 
-    let code = assemble_module(source, program, emits);
+    let code = assemble_module(source, program, emits, emit_partial_component);
 
     if let Some((ctx, map_out)) = map {
         if let Some((def_expr, member)) = single_def {
@@ -2919,6 +2971,9 @@ fn compile_component_or_directive(
     let inline_template = obj
         .and_then(|o| find_prop(o, "template"))
         .and_then(string_value);
+    // Whether the template is an INLINE `template:` string (vs an external `templateUrl` whose
+    // resolved content backs `template_html`). Used by the partial emit to decide `isInline`.
+    let inline_template_is_some = inline_template.is_some();
     let template_html = match inline_template {
         Some(t) => Some(t),
         None if has_template_url => match resolved.and_then(|r| r.template.clone()) {
@@ -3133,6 +3188,10 @@ fn compile_component_or_directive(
                 return compile_component_meta_partial(
                     base,
                     &template_html.unwrap_or_default(),
+                    // `isInline` is true for an inline `template:` string; an external `templateUrl`
+                    // (whose RESOLVED content backs `template_html`) emits no `isInline` field —
+                    // matching ng-packagr's partial declaration for an external resource.
+                    inline_template_is_some,
                     change_detection,
                     encapsulation,
                     auto_import_candidates,
@@ -3926,6 +3985,7 @@ fn compile_component_meta(
 fn compile_component_meta_partial(
     base: R3DirectiveMetadata,
     template_html: &str,
+    is_inline: bool,
     change_detection: ChangeDetectionStrategy,
     encapsulation: ViewEncapsulation,
     imported_names: &[String],
@@ -4007,6 +4067,7 @@ fn compile_component_meta_partial(
 
     let inputs = PartialComponentInputs {
         template_html,
+        is_inline,
         change_detection,
         encapsulation,
         styles: &styles,

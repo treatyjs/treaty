@@ -147,3 +147,11 @@ pub use partial_emit::{emit_partial, PartialEmit};
 /// [`source_compile::CompileOptions::emit_partial_component`]; the default Full emit is untouched. The
 /// output round-trips back to AOT through [`linker::link_partial`].
 pub mod partial_component_emit;
+
+/// The PARTIAL-mode **dev-only class-metadata emitter** — emits the companion
+/// `i0.ɵɵngDeclareClassMetadata({ … })` statement (original decorators / ctor params / prop
+/// decorators) ng-packagr publishes next to each definition. Emitted ONLY in partial mode (the
+/// classic Full emit omits the `ngDevMode`-guarded `setClassMetadata`), so the default emit is
+/// untouched. The linker DROPS it to `void 0`, so it round-trips inertly. See
+/// [`source_compile::CompileOptions::emit_partial_component`].
+pub mod partial_class_metadata;

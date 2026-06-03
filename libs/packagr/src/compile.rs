@@ -80,9 +80,11 @@ pub fn compile_entry_at(source: &str, source_path: &Path) -> EsmOutput {
 /// inverted by the caller's `treaty_ivy::emit_partial` span-rewrite pass. When `partial` is `false`
 /// the emit is byte-identical to [`compile_entry`] — the default Full/AOT path.
 ///
-/// NOTE: the partial flag is honoured on the plain-TS inline-style front-end only. The
-/// external-`styleUrls` resolution path and the authoring (`.treaty`/`.tsx`) front-ends still emit
-/// AOT (their partial support is a follow-up); the caller's `emit_partial` pass then partials their
+/// NOTE: the partial flag is honoured on the plain-TS front-ends — BOTH the inline-style path AND
+/// the external-`styleUrls`/`styleUrl` resolution path (whose resolved style content is inlined into
+/// the `ɵɵngDeclareComponent`'s `styles`, and whose resolved `templateUrl` content is inlined as the
+/// `template` string without `isInline`). The authoring (`.treaty`/`.tsx`) front-ends still emit AOT
+/// (their partial support is a follow-up); the caller's `emit_partial` pass then partials their
 /// DI/pipe family, leaving any component/directive def as AOT (a valid, loadable mix).
 pub fn compile_entry_at_mode(source: &str, source_path: &Path, partial: bool) -> EsmOutput {
     let file_name = source_path
@@ -104,6 +106,23 @@ pub fn compile_entry_at_mode(source: &str, source_path: &Path, partial: bool) ->
         // stylesheet rather than aborting, matching packagr's lenient asset/style handling. They
         // are intentionally not surfaced as compile `errors` (which would fail the entry).
         let (resolved, _style_diags) = stylesheet::resolve_component_styles(source, source_dir);
+        // PARTIAL mode with external `templateUrl`/`styleUrls`: emit the `ɵɵngDeclareComponent`
+        // PARTIAL declaration carrying the RESOLVED external template inline (no `isInline`) and the
+        // resolved style content in `styles` — exactly as ng-packagr publishes an external-resource
+        // component. The Full (`partial == false`) path below is byte-identical to before.
+        if partial {
+            let opts = treaty_ivy::source_compile::CompileOptions {
+                emit_partial_component: true,
+                ..Default::default()
+            };
+            let compiled = treaty_ivy::source_compile::compile_component_source_with_options_and_resolved(
+                source, opts, &resolved,
+            );
+            return EsmOutput {
+                code: compiled.code,
+                errors: compiled.errors,
+            };
+        }
         let compiled =
             rust_authoring::angular_source::compile_angular_source_with_resolved(source, file_name, &resolved);
         return EsmOutput {
