@@ -18,13 +18,22 @@
 //! by class name. A `templateUrl` component WITHOUT a supplied resolved template is a clear error,
 //! never a silent empty template.
 
-use oxc_allocator::Allocator;
+// NOTE on `oxc_` usage in this module: the PARSE is now driven through the engine-neutral
+// [`crate::parse::ParsingBackend`] (the nine source front-end parse call sites no longer name
+// `oxc_parser`/`oxc_allocator`/`oxc_span::SourceType` directly — that is confined to
+// `crate::parse::oxc`). The remaining `oxc_ast` references below are the metadata WALK reading the
+// live AST handed back by the backend: arbitrary `Expression` → `output_ast` conversion, ctor-dep
+// extraction, host-binding/query/signal extraction and span anchoring. Re-shaping that recursive
+// walk into the flat neutral `ObjLit`/`LitValue` surface would be a full re-implementation (not a
+// behaviour-preserving refactor) and would jeopardise the byte-identical golden gate, so the walk
+// stays on the live AST — exactly as the SWC-BACKEND-PLAN Approach-B note permits.
 use oxc_ast::ast::{
     Argument, Class, ClassElement, Decorator, Expression, MethodDefinitionKind, ObjectPropertyKind,
     Program, PropertyDefinition, PropertyKey, Statement, TSType, TSTypeName,
 };
-use oxc_parser::Parser;
-use oxc_span::{GetSpan, SourceType};
+use oxc_span::GetSpan;
+
+use crate::parse::{ParseBackend, ParsingBackend, SourceKind};
 
 use crate::compile::{CompiledComponent, RealTemplateBuilder};
 use crate::decorators::registry::{
@@ -642,8 +651,9 @@ fn signal_call<'a>(expr: &'a Expression<'a>) -> Option<(&'a str, bool)> {
     }
 }
 
-/// The arguments of a call expression, if `expr` is one.
-fn call_args<'a>(expr: &'a Expression<'a>) -> Option<&'a oxc_allocator::Vec<'a, Argument<'a>>> {
+/// The arguments of a call expression, if `expr` is one. Returned as a plain slice (the arena-backed
+/// `oxc_allocator::Vec` derefs transparently) so this module's walk does not name an arena type.
+fn call_args<'a>(expr: &'a Expression<'a>) -> Option<&'a [Argument<'a>]> {
     if let Expression::CallExpression(call) = expr {
         Some(&call.arguments)
     } else {
@@ -1437,27 +1447,23 @@ fn build_host_metadata(
 /// expression. On any unsupported / un-extractable shape, `code` is empty and `errors` carries a
 /// single descriptive message.
 pub fn compile_component_source(ts_source: &str) -> CompiledComponent {
-    let allocator = Allocator::default();
-    let source_type = SourceType::default().with_typescript(true);
-    let ret = Parser::new(&allocator, ts_source, source_type).parse();
-
-    if !ret.errors.is_empty() {
-        let msgs: Vec<String> = ret.errors.iter().map(|e| e.to_string()).collect();
-        return err(format!("parse error: {}", msgs.join("; ")));
-    }
-
-    compile_program_with_source(
-        &ret.program,
-        Some(ts_source),
-        None,
-        None,
-        None,
-        false,
-        ModernizeOptions::default(),
-        false,
-        None,
-        false,
-    )
+    ParsingBackend::default().parse_module(ts_source, SourceKind::TypeScriptModule, |module| {
+        if !module.summary().errors.is_empty() {
+            return err(format!("parse error: {}", module.summary().errors.join("; ")));
+        }
+        compile_program_with_source(
+            module.program(),
+            Some(ts_source),
+            None,
+            None,
+            None,
+            false,
+            ModernizeOptions::default(),
+            false,
+            None,
+            false,
+        )
+    })
 }
 
 /// Per-file Angular compiler options that influence the emit but are NOT expressible in the source.
@@ -1501,27 +1507,23 @@ pub fn compile_component_source_with_options(
     ts_source: &str,
     options: CompileOptions,
 ) -> CompiledComponent {
-    let allocator = Allocator::default();
-    let source_type = SourceType::default().with_typescript(true);
-    let ret = Parser::new(&allocator, ts_source, source_type).parse();
-
-    if !ret.errors.is_empty() {
-        let msgs: Vec<String> = ret.errors.iter().map(|e| e.to_string()).collect();
-        return err(format!("parse error: {}", msgs.join("; ")));
-    }
-
-    compile_program_with_source(
-        &ret.program,
-        Some(ts_source),
-        None,
-        None,
-        None,
-        options.legacy_optional_chaining,
-        options.modernize,
-        options.jit_mode,
-        None,
-        options.emit_partial_component,
-    )
+    ParsingBackend::default().parse_module(ts_source, SourceKind::TypeScriptModule, |module| {
+        if !module.summary().errors.is_empty() {
+            return err(format!("parse error: {}", module.summary().errors.join("; ")));
+        }
+        compile_program_with_source(
+            module.program(),
+            Some(ts_source),
+            None,
+            None,
+            None,
+            options.legacy_optional_chaining,
+            options.modernize,
+            options.jit_mode,
+            None,
+            options.emit_partial_component,
+        )
+    })
 }
 
 /// Compile a TypeScript source string, supplying host-resolved external `templateUrl`/`styleUrls`
@@ -1536,27 +1538,23 @@ pub fn compile_component_source_with_resolved(
     ts_source: &str,
     resolved: &ResolvedContentMap,
 ) -> CompiledComponent {
-    let allocator = Allocator::default();
-    let source_type = SourceType::default().with_typescript(true);
-    let ret = Parser::new(&allocator, ts_source, source_type).parse();
-
-    if !ret.errors.is_empty() {
-        let msgs: Vec<String> = ret.errors.iter().map(|e| e.to_string()).collect();
-        return err(format!("parse error: {}", msgs.join("; ")));
-    }
-
-    compile_program_with_source(
-        &ret.program,
-        Some(ts_source),
-        None,
-        Some(resolved),
-        None,
-        false,
-        ModernizeOptions::default(),
-        false,
-        None,
-        false,
-    )
+    ParsingBackend::default().parse_module(ts_source, SourceKind::TypeScriptModule, |module| {
+        if !module.summary().errors.is_empty() {
+            return err(format!("parse error: {}", module.summary().errors.join("; ")));
+        }
+        compile_program_with_source(
+            module.program(),
+            Some(ts_source),
+            None,
+            Some(resolved),
+            None,
+            false,
+            ModernizeOptions::default(),
+            false,
+            None,
+            false,
+        )
+    })
 }
 
 /// Like [`compile_component_source_with_resolved`] but ALSO honouring per-file [`CompileOptions`] —
@@ -1571,27 +1569,23 @@ pub fn compile_component_source_with_options_and_resolved(
     options: CompileOptions,
     resolved: &ResolvedContentMap,
 ) -> CompiledComponent {
-    let allocator = Allocator::default();
-    let source_type = SourceType::default().with_typescript(true);
-    let ret = Parser::new(&allocator, ts_source, source_type).parse();
-
-    if !ret.errors.is_empty() {
-        let msgs: Vec<String> = ret.errors.iter().map(|e| e.to_string()).collect();
-        return err(format!("parse error: {}", msgs.join("; ")));
-    }
-
-    compile_program_with_source(
-        &ret.program,
-        Some(ts_source),
-        None,
-        Some(resolved),
-        None,
-        options.legacy_optional_chaining,
-        options.modernize,
-        options.jit_mode,
-        None,
-        options.emit_partial_component,
-    )
+    ParsingBackend::default().parse_module(ts_source, SourceKind::TypeScriptModule, |module| {
+        if !module.summary().errors.is_empty() {
+            return err(format!("parse error: {}", module.summary().errors.join("; ")));
+        }
+        compile_program_with_source(
+            module.program(),
+            Some(ts_source),
+            None,
+            Some(resolved),
+            None,
+            options.legacy_optional_chaining,
+            options.modernize,
+            options.jit_mode,
+            None,
+            options.emit_partial_component,
+        )
+    })
 }
 
 /// Context for additive source-map emission: the original authoring source text plus the
@@ -1720,43 +1714,40 @@ fn compile_component_source_full(
     resolved: Option<&ResolvedContentMap>,
     selector_registry: Option<&SelectorRegistry>,
 ) -> CompiledComponentWithMap {
-    let allocator = Allocator::default();
-    let source_type = SourceType::default().with_typescript(true);
-    let ret = Parser::new(&allocator, ts_source, source_type).parse();
+    ParsingBackend::default().parse_module(ts_source, SourceKind::TypeScriptModule, |module| {
+        if !module.summary().errors.is_empty() {
+            let e = err(format!("parse error: {}", module.summary().errors.join("; ")));
+            return CompiledComponentWithMap {
+                code: e.code,
+                map: String::new(),
+                errors: e.errors,
+            };
+        }
 
-    if !ret.errors.is_empty() {
-        let msgs: Vec<String> = ret.errors.iter().map(|e| e.to_string()).collect();
-        let e = err(format!("parse error: {}", msgs.join("; ")));
-        return CompiledComponentWithMap {
-            code: e.code,
-            map: String::new(),
-            errors: e.errors,
+        let ctx = MapContext {
+            file_name,
+            source_name,
+            source_content: ts_source,
         };
-    }
-
-    let ctx = MapContext {
-        file_name,
-        source_name,
-        source_content: ts_source,
-    };
-    let mut map_out = String::new();
-    let compiled = compile_program_with_source(
-        &ret.program,
-        Some(ts_source),
-        Some((&ctx, &mut map_out)),
-        resolved,
-        default_selector,
-        false,
-        ModernizeOptions::default(),
-        false,
-        selector_registry,
-        false,
-    );
-    CompiledComponentWithMap {
-        code: compiled.code,
-        map: map_out,
-        errors: compiled.errors,
-    }
+        let mut map_out = String::new();
+        let compiled = compile_program_with_source(
+            module.program(),
+            Some(ts_source),
+            Some((&ctx, &mut map_out)),
+            resolved,
+            default_selector,
+            false,
+            ModernizeOptions::default(),
+            false,
+            selector_registry,
+            false,
+        );
+        CompiledComponentWithMap {
+            code: compiled.code,
+            map: map_out,
+            errors: compiled.errors,
+        }
+    })
 }
 
 /// Collect the file's imported identifier names — the auto-import candidate set. Mirrors
@@ -5779,13 +5770,14 @@ export class AppRoot {}
 
     /// Assert the emitted module is syntactically valid TypeScript (parses with zero errors).
     fn assert_parses(code: &str) {
-        let allocator = Allocator::default();
-        let source_type = SourceType::default().with_typescript(true);
-        let ret = Parser::new(&allocator, code, source_type).parse();
+        let errors = ParsingBackend::default().parse_module(
+            code,
+            crate::parse::SourceKind::TypeScriptModule,
+            |module| module.summary().errors.clone(),
+        );
         assert!(
-            ret.errors.is_empty(),
-            "emitted module is not valid TS: {:?}\n--- module ---\n{code}",
-            ret.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+            errors.is_empty(),
+            "emitted module is not valid TS: {errors:?}\n--- module ---\n{code}"
         );
     }
 

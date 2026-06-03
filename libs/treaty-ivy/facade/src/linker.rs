@@ -22,13 +22,18 @@
 //! (`toR3FactoryMeta`, `toR3InjectableMeta`, `toR3InjectorMeta`, `toR3NgModuleMeta`,
 //! `toR3PipeMeta`, plus the shared `util.ts` `getDependency`/`extractForwardRef`/`wrapReference`).
 
-use oxc_allocator::Allocator;
+// PARSE is driven through the engine-neutral `crate::parse::ParsingBackend` (the two top-level entry
+// points + the per-declaration re-parse no longer name `oxc_parser`/`oxc_allocator`/
+// `oxc_span::SourceType`). The remaining `oxc_ast` references below are the linker's WALK reading the
+// live declaration-object AST (the `link_*`/`convert_expr` family) handed back by the backend; that
+// recursive object walk stays on the live AST so the linked output is byte-identical.
 use oxc_ast::ast::{
     ArrayExpressionElement, Argument, CallExpression, Expression, ObjectExpression,
     ObjectPropertyKind, PropertyKey, Statement,
 };
-use oxc_parser::Parser;
-use oxc_span::{GetSpan, SourceType};
+use oxc_span::GetSpan;
+
+use crate::parse::{ParseBackend, ParsingBackend, SourceKind};
 
 use crate::factory::{
     compile_factory_function, compile_injectable, compile_service, FactoryDeps, FactoryTarget,
@@ -1856,18 +1861,22 @@ fn declare_callee_kind(callee: &Expression) -> Option<DeclareKind> {
 /// `filename` selects the parse `SourceType` (`.mjs`/`.js`/`.ts` all parse as a module). On a parse
 /// error the original `code` is returned unchanged with the error recorded.
 pub fn link_partial(code: &str, filename: &str) -> LinkResult {
-    let allocator = Allocator::default();
-    let source_type = source_type_for(filename);
-    let ret = Parser::new(&allocator, code, source_type).parse();
-    if !ret.errors.is_empty() {
-        let msgs: Vec<String> = ret.errors.iter().map(|e| e.to_string()).collect();
-        return LinkResult {
-            code: code.to_string(),
-            errors: vec![format!("parse error: {}", msgs.join("; "))],
-        };
-    }
+    ParsingBackend::default().parse_module(code, SourceKind::ByFilename(filename), |module| {
+        if !module.summary().errors.is_empty() {
+            return LinkResult {
+                code: code.to_string(),
+                errors: vec![format!("parse error: {}", module.summary().errors.join("; "))],
+            };
+        }
+        link_partial_walk(code, module.program())
+    })
+}
 
-    let declares = collect_declares(&ret.program);
+/// The metadata WALK half of [`link_partial`]: collect every `ɵɵngDeclare*` call in the parsed
+/// program, link each to its `ɵɵdefine*` replacement, and apply the surgical span rewrites. Split out
+/// so the parse seam stays a thin wrapper around [`ParsingBackend`].
+fn link_partial_walk(code: &str, program: &oxc_ast::ast::Program) -> LinkResult {
+    let declares = collect_declares(program);
     let mut errors: Vec<String> = Vec::new();
 
     /// A single resolved span rewrite.
@@ -1939,35 +1948,34 @@ pub fn link_partial(code: &str, filename: &str) -> LinkResult {
 
 /// Link a single declaration object (re-parsed from its source slice) to its replacement def.
 fn link_one(kind: DeclareKind, obj_src: &str) -> Result<LinkedDef, String> {
-    let allocator = Allocator::default();
     // Re-parse the object literal in unambiguous expression position. A bare `({...})` program is
     // parsed by oxc as a BLOCK statement (the leading `{` wins), so anchor it as the initializer of
     // a variable declaration instead, then recover the `ObjectExpression` from that.
     let wrapped = format!("const __ngLinkDecl__ = {obj_src};");
-    let ret = Parser::new(&allocator, &wrapped, SourceType::default().with_typescript(true)).parse();
-    if !ret.errors.is_empty() {
-        let msgs: Vec<String> = ret.errors.iter().map(|e| e.to_string()).collect();
-        return Err(format!(
-            "could not re-parse declaration object for {kind:?}: {}",
-            msgs.join("; ")
-        ));
-    }
-    let obj = first_object_expression(&ret.program)
-        .ok_or_else(|| format!("declaration argument for {kind:?} is not an object literal"))?;
-
-    match kind {
-        DeclareKind::Factory => link_factory(obj).map(plain),
-        DeclareKind::Injectable => link_injectable(obj).map(plain),
-        DeclareKind::Service => link_service(obj).map(plain),
-        DeclareKind::Injector => link_injector(obj).map(plain),
-        DeclareKind::Pipe => link_pipe(obj).map(plain),
-        DeclareKind::NgModule => link_ng_module(obj),
-        DeclareKind::Directive => link_directive(obj),
-        DeclareKind::Component => link_component(obj),
-        DeclareKind::ClassMetadata | DeclareKind::ClassMetadataAsync => {
-            unreachable!("ClassMetadata(Async) handled before link_one")
+    ParsingBackend::default().parse_module(&wrapped, SourceKind::TypeScriptModule, |module| {
+        if !module.summary().errors.is_empty() {
+            return Err(format!(
+                "could not re-parse declaration object for {kind:?}: {}",
+                module.summary().errors.join("; ")
+            ));
         }
-    }
+        let obj = first_object_expression(module.program())
+            .ok_or_else(|| format!("declaration argument for {kind:?} is not an object literal"))?;
+
+        match kind {
+            DeclareKind::Factory => link_factory(obj).map(plain),
+            DeclareKind::Injectable => link_injectable(obj).map(plain),
+            DeclareKind::Service => link_service(obj).map(plain),
+            DeclareKind::Injector => link_injector(obj).map(plain),
+            DeclareKind::Pipe => link_pipe(obj).map(plain),
+            DeclareKind::NgModule => link_ng_module(obj),
+            DeclareKind::Directive => link_directive(obj),
+            DeclareKind::Component => link_component(obj),
+            DeclareKind::ClassMetadata | DeclareKind::ClassMetadataAsync => {
+                unreachable!("ClassMetadata(Async) handled before link_one")
+            }
+        }
+    })
 }
 
 /// The `ObjectExpression` initializer of the `const __ngLinkDecl__ = {...};` wrapper program.
@@ -1989,15 +1997,8 @@ fn first_object_expression<'a>(
     }
 }
 
-/// Pick the parse `SourceType` for a filename (always a module; TS for `.ts`/`.mts`/`.cts`/`.tsx`).
-fn source_type_for(filename: &str) -> SourceType {
-    let lower = filename.to_ascii_lowercase();
-    let ts = lower.ends_with(".ts")
-        || lower.ends_with(".mts")
-        || lower.ends_with(".cts")
-        || lower.ends_with(".tsx");
-    SourceType::default().with_typescript(ts).with_module(true)
-}
+// The parse `SourceType` for a filename (always a module; TS for `.ts`/`.mts`/`.cts`/`.tsx`) is now
+// chosen by the parse backend from `SourceKind::ByFilename` — see `crate::parse::oxc::source_type_for`.
 
 // ---------------------------------------------------------------------------
 // Tests.
@@ -2017,13 +2018,14 @@ mod tests {
     /// real emitted bytes are unchanged).
     fn assert_reparses(code: &str) {
         let folded = code.replace('\u{0275}', "Z");
-        let allocator = Allocator::default();
-        let source_type = SourceType::default().with_typescript(true).with_module(true);
-        let ret = Parser::new(&allocator, &folded, source_type).parse();
+        let errors = ParsingBackend::default().parse_module(
+            &folded,
+            SourceKind::TypeScriptEsModule,
+            |module| module.summary().errors.clone(),
+        );
         assert!(
-            ret.errors.is_empty(),
-            "linked output did not re-parse: {:?}\n---\n{code}",
-            ret.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+            errors.is_empty(),
+            "linked output did not re-parse: {errors:?}\n---\n{code}"
         );
     }
 
@@ -2254,27 +2256,26 @@ mod tests {
     /// The allocator is local, so parse + convert + emit all happen before it is dropped.
     fn convert_and_emit(expr_src: &str) -> String {
         let wrapped = format!("const __x = ({expr_src});");
-        let allocator = Allocator::default();
-        let source_type = SourceType::default().with_typescript(true).with_module(true);
-        let ret = Parser::new(&allocator, &wrapped, source_type).parse();
-        assert!(
-            ret.errors.is_empty(),
-            "test expression did not parse: {:?}",
-            ret.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
-        );
-        let mut found: Option<String> = None;
-        for stmt in &ret.program.body {
-            if let Statement::VariableDeclaration(decl) = stmt {
-                if let Some(d) = decl.declarations.first() {
-                    if let Some(init) = &d.init {
-                        let converted =
-                            convert_expr(init).expect("expression should convert via convert_expr");
-                        found = Some(emit_def_text(&converted));
+        ParsingBackend::default().parse_module(&wrapped, SourceKind::TypeScriptEsModule, |module| {
+            assert!(
+                module.summary().errors.is_empty(),
+                "test expression did not parse: {:?}",
+                module.summary().errors
+            );
+            let mut found: Option<String> = None;
+            for stmt in &module.program().body {
+                if let Statement::VariableDeclaration(decl) = stmt {
+                    if let Some(d) = decl.declarations.first() {
+                        if let Some(init) = &d.init {
+                            let converted = convert_expr(init)
+                                .expect("expression should convert via convert_expr");
+                            found = Some(emit_def_text(&converted));
+                        }
                     }
                 }
             }
-        }
-        found.expect("no variable initializer found in test source")
+            found.expect("no variable initializer found in test source")
+        })
     }
 
     /// Collapse the emitter's pretty-printing (newlines/tabs/trailing `;`) to a single-space

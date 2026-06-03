@@ -28,12 +28,17 @@
 //! Because this is a SEPARATE entry the caller invokes only for `compilationMode: "partial"`, the
 //! default AOT compile path is byte-for-byte untouched.
 
-use oxc_allocator::Allocator;
+// PARSE is driven through the engine-neutral `crate::parse::ParsingBackend` (the single
+// `emit_partial` entry point no longer names `oxc_parser`/`oxc_allocator`/`oxc_span::SourceType`).
+// The remaining `oxc_ast` references below are the AOT→partial WALK reading the live program AST to
+// locate each `ɵɵdefine*` definition for surgical span rewrite; that walk stays on the live AST so
+// the rewritten output is byte-identical.
 use oxc_ast::ast::{
     Argument, Expression, ObjectExpression, ObjectPropertyKind, Program, PropertyKey, Statement,
 };
-use oxc_parser::Parser;
-use oxc_span::{GetSpan, SourceType};
+use oxc_span::GetSpan;
+
+use crate::parse::{ParseBackend, ParsingBackend, SourceKind};
 
 /// The Angular version a partial declaration is stamped with. A published library stamps its own
 /// compiler version; this is the in-repo placeholder value the linker (and ngcc) treat as "newest
@@ -62,31 +67,30 @@ pub struct PartialEmit {
 /// AOT and reported in `notes`. The transform is a surgical span rewrite, so the surrounding module
 /// is preserved verbatim. On a parse failure the input is returned unchanged with a note.
 pub fn emit_partial(aot_code: &str) -> PartialEmit {
-    let allocator = Allocator::default();
-    let source_type = SourceType::default().with_typescript(true).with_module(true);
-    let parsed = Parser::new(&allocator, aot_code, source_type).parse();
-    if !parsed.errors.is_empty() {
-        return PartialEmit {
-            code: aot_code.to_string(),
-            notes: vec![format!(
-                "partial emit: input did not parse ({} error(s)); left as AOT",
-                parsed.errors.len()
-            )],
-        };
-    }
+    ParsingBackend::default().parse_module(aot_code, SourceKind::TypeScriptEsModule, |module| {
+        if !module.summary().errors.is_empty() {
+            return PartialEmit {
+                code: aot_code.to_string(),
+                notes: vec![format!(
+                    "partial emit: input did not parse ({} error(s)); left as AOT",
+                    module.summary().errors.len()
+                )],
+            };
+        }
 
-    let mut rewrites: Vec<Rewrite> = Vec::new();
-    let mut notes: Vec<String> = Vec::new();
-    collect_rewrites(&parsed.program, aot_code, &mut rewrites, &mut notes);
+        let mut rewrites: Vec<Rewrite> = Vec::new();
+        let mut notes: Vec<String> = Vec::new();
+        collect_rewrites(module.program(), aot_code, &mut rewrites, &mut notes);
 
-    // Apply rewrites back-to-front so earlier byte offsets stay valid.
-    rewrites.sort_by_key(|r| std::cmp::Reverse(r.start));
-    let mut code = aot_code.to_string();
-    for r in &rewrites {
-        code.replace_range(r.start as usize..r.end as usize, &r.text);
-    }
+        // Apply rewrites back-to-front so earlier byte offsets stay valid.
+        rewrites.sort_by_key(|r| std::cmp::Reverse(r.start));
+        let mut code = aot_code.to_string();
+        for r in &rewrites {
+            code.replace_range(r.start as usize..r.end as usize, &r.text);
+        }
 
-    PartialEmit { code, notes }
+        PartialEmit { code, notes }
+    })
 }
 
 /// One span replacement: the byte range to overwrite and the replacement text.

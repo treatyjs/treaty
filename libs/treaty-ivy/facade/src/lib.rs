@@ -115,6 +115,13 @@ pub mod view {
 // emitted code is byte-identical. See `migration/RENDER3-SPLIT-PLAN.md`.
 // ---------------------------------------------------------------------------
 
+/// The engine-neutral PARSE front-end seam (Approach B). The single chokepoint the source front-ends
+/// (`source_compile` / `linker` / `partial_emit`) go through to parse a TypeScript/JS source string —
+/// mirroring the EMIT chokepoint in `treaty_ivy_core::output::emitter`. The `oxc` backend
+/// (`parse::oxc`) is the only facade file permitted to `use oxc_`. Feature-gated [`parse::ParsingBackend`]
+/// selects the active backend; the default `oxc` build is byte-for-byte unchanged.
+pub mod parse;
+
 /// The template-only end-to-end helper plus the shared `RealTemplateBuilder` glue and the
 /// selectorless auto-import resolution the source front-end reuses. Joins the lower layers via the
 /// [`decorators::registry::DecoratorRegistry`]. Depends on `core`, `template`, and `decorators`.

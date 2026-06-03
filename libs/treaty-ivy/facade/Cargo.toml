@@ -7,13 +7,24 @@ edition = "2024"
 # See migration/PORT-ARCHITECTURE.md and migration/render3-specs/.
 
 [features]
-# `oxc` (default) is the reference backend. `swc` flips the emit chokepoint to the engine-neutral
-# printer (`treaty_ivy_core/swc`); the SOURCE/parse front-end stays on oxc_parser (plan §3.2 / phase 3
-# is not in scope here). The default build is byte-for-byte unchanged. Gated 1:1 by
-# `tools/backend-parity` (SWC-BACKEND-PLAN.md §3.3 / §4).
+# `oxc` (default) is the reference backend: oxc_parser front-end + oxc_codegen emit.
+# `swc` additionally compiles in the engine-neutral emit printer (`treaty_ivy_core/swc`) AND the
+# SWC PARSE backend (`src/parse/swc.rs`, `SwcParseBackend`), gated 1:1 by `tools/backend-parity`
+# (SWC-BACKEND-PLAN.md §3.2 / §4). The SWC parse backend fills the SAME engine-neutral
+# `crate::parse::ParseOutput`/`ObjLit`/`LitValue` the oxc backend does, in SOURCE order, and exposes
+# `span_text` via `SourceMap::span_to_snippet`. The two parse backends are proven to emit the
+# byte-identical neutral summary by the parse-parity test in `src/parse/mod.rs`.
+#
+# NOTE (honest scope): the facade's source/linker/partial-emit WALK still reaches the live oxc
+# `Program` through `OxcModule::program()` (the `compile_program_with_source` AOT walk + the
+# decorators-crate `ClassMeta<'a>` API are oxc-typed). Fully removing oxc from the `--features swc`
+# dep graph therefore additionally requires neutralizing that walk + the shared `treaty_ivy_core` /
+# `treaty_ivy_decorators` / `treaty_ivy_template` oxc deps (SWC-BACKEND-PLAN.md §3.2 phase 3, the
+# wide port). The SWC PARSE backend here is that port's parser half + its parity gate; the alias
+# below stays on oxc until the walk is neutralized so the default + swc builds both compile.
 default = ["oxc"]
 oxc = ["treaty_ivy_core/oxc"]
-swc = ["treaty_ivy_core/swc"]
+swc = ["treaty_ivy_core/swc", "dep:swc_common", "dep:swc_ecma_ast", "dep:swc_ecma_parser", "dep:swc_atoms"]
 
 [dependencies]
 treaty_ivy_core = { path = "../core", default-features = false }
@@ -24,3 +35,16 @@ oxc_ast = "0.133.0"
 oxc_parser = "0.133.0"
 oxc_codegen = "0.133.0"
 oxc_span = "0.133.0"
+
+# SWC PARSE backend — compiled ONLY under `--features swc` (off by default; default users never
+# build these heavy crates). `SwcParseBackend` parses with `swc_ecma_parser::parse_file_as_program`
+# inside its own `GLOBALS`/`SourceMap` scope and walks `swc_ecma_ast` to fill the engine-neutral
+# `crate::parse` structs identically to the oxc backend.
+# Versions pinned to the SAME generation `swc_ecma_parser` resolves (parser 26 → ast 17 / common 16),
+# so the `Program` the parser returns is OUR `swc_ecma_ast::Program` (no cross-version type mismatch).
+swc_common = { version = "16", optional = true }
+swc_ecma_ast = { version = "17", optional = true }
+swc_ecma_parser = { version = "26", optional = true }
+# `swc_atoms` 8 is the version `swc_ecma_ast` 17 re-exports; named directly so the `Wtf8Atom` string
+# value of a string literal / template `cooked` can be converted to a Rust `String`.
+swc_atoms = { version = "8", optional = true }
