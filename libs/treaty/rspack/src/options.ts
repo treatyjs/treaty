@@ -13,12 +13,35 @@ import type { RoutesVirtualModuleOptions } from '@treaty/ts-vite'
 /**
  * Options understood by both the Treaty Rspack loader and plugin. These are the
  * {@link TreatyCompilerOptions} (cache, pure annotation, server-fn dropping)
- * exposed through Rspack's `loader.options` / plugin constructor.
+ * exposed through Rspack's `loader.options` / plugin constructor, plus the
+ * loader-only {@link TreatyLoaderOptions.selectorRoot} below.
  */
-export type TreatyLoaderOptions = TreatyCompilerOptions
+export interface TreatyLoaderOptions extends TreatyCompilerOptions {
+	/**
+	 * CROSS-MODULE SELECTOR RESOLUTION. The project root whose first-party `.ts`
+	 * sources are scanned ONCE (via the Rust selector scanner) to resolve a parent
+	 * component's template tags to an IMPORTED child used by its REAL `@Component`
+	 * selector — the conventional Angular-CLI shape (`class StatCard` with
+	 * `selector: 'app-stat-card'`, used as `<app-stat-card>`) that the class-name↔tag
+	 * fold cannot match and which otherwise renders as an empty host.
+	 *
+	 *   - a string: the absolute (or cwd-relative) directory to scan.
+	 *   - `true`: scan the current working directory.
+	 *   - omitted / `false`: no cross-module scan; every file uses the byte-identical
+	 *     class-name fold (the prior behaviour — strictly ADDITIVE).
+	 *
+	 * Rspack/webpack is a pull pipeline with no cold-build hook that hands a plugin
+	 * the full owned-file set up front, so — mirroring `@treaty/vite`'s `buildStart`
+	 * prewarm — the loader scans the root ONCE (idempotent, on the shared compiler
+	 * instance) the first time it sees this option, then each per-file `transform`
+	 * derives that file's `{ importName -> selector }` registry from the project map.
+	 * A file whose imports resolve to NO known selector folds exactly as before.
+	 */
+	readonly selectorRoot?: string | boolean
+}
 
 /** Options accepted by {@link TreatyRspackPlugin}. */
-export interface TreatyPluginOptions extends TreatyCompilerOptions {
+export interface TreatyPluginOptions extends TreatyLoaderOptions {
 	/**
 	 * Authoring extensions to add to `resolve.extensions` so bare imports of
 	 * Treaty modules resolve. Defaults to `['.treaty', '.tsx', '.tjsx']`.

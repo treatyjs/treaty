@@ -14,6 +14,7 @@
  */
 
 import { fileURLToPath } from 'node:url'
+import { isAbsolute, resolve as resolvePath } from 'node:path'
 import {
 	createTreatyCompiler,
 	type TransformResult,
@@ -81,26 +82,85 @@ export type TreatyLoader = (
 /**
  * Cache one {@link TreatyCompiler} per distinct option set. Loaders are plain
  * functions re-entered for every module, so without this the incremental cache
- * would be thrown away on each call. The key is the serialized options.
+ * would be thrown away on each call. The key is the serialized COMPILER options
+ * (the loader-only {@link TreatyLoaderOptions.selectorRoot} is excluded from the
+ * key so the loader and the plugin — which forwards the same options — share ONE
+ * compiler instance whether or not `selectorRoot` is set, and so the project
+ * selector registry the loader prewarms on that instance is the very one every
+ * per-file `transform` reads).
  */
 const compilers = new Map<string, TreatyCompiler>()
+
+/**
+ * Tracks, per shared compiler instance, the absolute selector-scan root that has
+ * already been prewarmed — so the one-time project scan runs at most ONCE per root
+ * across the thousands of per-file loader invocations a build makes (mirroring the
+ * idempotent `buildStart` prewarm `@treaty/vite`/`@treaty/rolldown` run). A
+ * `WeakMap` so a discarded compiler (and its remembered root) is collectable.
+ */
+const prewarmedRoots = new WeakMap<TreatyCompiler, string>()
 
 function compilerFor(options: TreatyLoaderOptions): TreatyCompiler {
 	const key = stableKey(options)
 	let compiler = compilers.get(key)
 	if (compiler === undefined) {
-		compiler = createTreatyCompiler(options)
+		compiler = createTreatyCompiler(compilerOptions(options))
 		compilers.set(key, compiler)
 	}
 	return compiler
 }
 
+/**
+ * The {@link TreatyCompilerOptions} subset to pass to the compiler factory — the
+ * loader-only {@link TreatyLoaderOptions.selectorRoot} stripped out so it neither
+ * reaches `createTreatyCompiler` (which does not understand it) nor perturbs the
+ * shared-compiler key.
+ */
+function compilerOptions(options: TreatyLoaderOptions): TreatyLoaderOptions {
+	const { selectorRoot: _selectorRoot, ...rest } = options
+	return rest
+}
+
 /** Deterministic key for an options object (sorted keys, stable across calls). */
 function stableKey(options: TreatyLoaderOptions): string {
-	const entries = Object.entries(options as Record<string, unknown>)
+	const entries = Object.entries(compilerOptions(options) as Record<string, unknown>)
 		.filter(([, v]) => v !== undefined)
 		.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
 	return JSON.stringify(entries)
+}
+
+/**
+ * Resolve the configured {@link TreatyLoaderOptions.selectorRoot} to the absolute
+ * directory to scan, or `null` when cross-module selector resolution is off.
+ * `true` ⇒ the current working directory; a relative string ⇒ resolved against
+ * the cwd; an absolute string ⇒ used as-is; `false`/omitted ⇒ `null`. Mirrors the
+ * `@treaty/rolldown` resolution (cwd-relative — the loader has no Vite build root).
+ */
+function resolveSelectorRoot(selectorRoot: string | boolean | undefined): string | null {
+	if (selectorRoot === undefined || selectorRoot === false) return null
+	if (selectorRoot === true) return process.cwd()
+	return isAbsolute(selectorRoot) ? selectorRoot : resolvePath(process.cwd(), selectorRoot)
+}
+
+/**
+ * CROSS-MODULE SELECTOR PREWARM. Scan the configured project root's first-party
+ * `.ts` ONCE into the shared compiler's project-wide `className -> selector` map,
+ * so every subsequent per-file `transform` auto-derives that file's
+ * `{ importName -> selector }` registry and resolves an IMPORTED child used by its
+ * conventional `@Component` selector (`<app-stat-card>` for `class StatCard`).
+ *
+ * Idempotent and tolerant — exactly the contract of the `@treaty/vite`/`@treaty/rolldown`
+ * `buildStart` prewarm, but driven from the loader because Rspack/webpack is a pull
+ * pipeline with no cold-build hook: the scan runs at most once per (compiler, root),
+ * and a missing/empty root yields an empty map so every file folds as before. No-op
+ * when `selectorRoot` is not configured (strictly ADDITIVE).
+ */
+function prewarmSelectors(compiler: TreatyCompiler, options: TreatyLoaderOptions): void {
+	const root = resolveSelectorRoot(options.selectorRoot)
+	if (root === null) return
+	if (prewarmedRoots.get(compiler) === root) return
+	prewarmedRoots.set(compiler, root)
+	compiler.prewarmSelectorRegistry(root)
 }
 
 /** A parsed source map, when the compiler produced one. */
@@ -126,9 +186,19 @@ export const treatyLoader: TreatyLoader = function treatyLoader(
 	const options = typeof this.getOptions === 'function' ? this.getOptions() : {}
 	const id = this.resource ?? this.resourcePath
 	const compiler = compilerFor(options)
+	// CROSS-MODULE SELECTOR PREWARM (idempotent). Scan the project's `.ts` ONCE on
+	// the shared compiler so this — and every later — per-file transform resolves an
+	// imported child used by its real `@Component` selector. Mirrors the `@treaty/vite`
+	// `buildStart` prewarm; here it rides the first owned-file loader call instead,
+	// since Rspack has no cold-build hook. No-op when `selectorRoot` is unset.
+	prewarmSelectors(compiler, options)
 
 	let result: TransformResult | null
 	try {
+		// `transform` derives THIS file's `{ importName -> selector }` registry from the
+		// prewarmed project map (passing no explicit registry takes the auto-derive path),
+		// so an imported child used by its conventional selector resolves cross-file. With
+		// no prewarm the derive yields nothing and the output is byte-identical to before.
 		result = compiler.transform(id, source)
 	} catch (error) {
 		return report(this, error instanceof Error ? error : new Error(String(error)))

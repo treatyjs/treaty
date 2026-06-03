@@ -165,14 +165,20 @@ export function treatyRule(options: TreatyPluginOptions = {}): ModuleRule {
 		extensions: _extensions,
 		test,
 		moduleFederation: _moduleFederation,
-		...compilerOptions
+		// Plugin-only key — wired separately (alias + routesRule), never a loader option.
+		fileRoutes: _fileRoutes,
+		...loaderOptions
 	} = options
+	// `loaderOptions` carries the {@link TreatyCompilerOptions} PLUS the loader-only
+	// `selectorRoot`: forwarding it here is what threads CROSS-MODULE selector resolution
+	// into the per-file loader, which prewarms the project scan once and derives each
+	// file's registry (mirroring the `@treaty/vite` `selectorRoot` wiring).
 	return {
 		test: test ?? DEFAULT_TEST,
 		use: [
 			{
 				loader: loaderPath,
-				options: compilerOptions,
+				options: loaderOptions,
 			},
 		],
 	}
