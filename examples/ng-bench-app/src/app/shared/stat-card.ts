@@ -14,7 +14,10 @@ export type Trend = 'up' | 'down' | 'flat';
  * a computed() derived value.
  */
 @Component({
-  selector: 'stat-card',
+  // Conventional Angular-CLI selector: the element tag (`app-stat-card`) does NOT fold to the class
+  // name (`StatCard`), so the parent can only resolve this child by reading its REAL selector through
+  // the cross-module selector registry — proving real selector resolution (not the name↔tag fold).
+  selector: 'app-stat-card',
   changeDetection: ChangeDetectionStrategy.OnPush,
   template: `
     <article class="panel">

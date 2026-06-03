@@ -23,19 +23,19 @@ import { StatCard, type Trend } from '../../shared/stat-card';
       <h2>Inventory dashboard</h2>
 
       <div class="cards">
-        <stat-card
+        <app-stat-card
           label="Products"
           [value]="products().length"
           trend="up"
           (refresh)="onRefresh($event)"
         />
-        <stat-card
+        <app-stat-card
           label="In stock"
           [value]="inStockCount()"
           [trend]="stockTrend()"
           (refresh)="onRefresh($event)"
         />
-        <stat-card
+        <app-stat-card
           label="Catalogue value (cents)"
           [value]="totalValueCents()"
           trend="flat"

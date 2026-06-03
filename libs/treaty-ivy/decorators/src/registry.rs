@@ -61,6 +61,26 @@ pub struct ResolvedComponentContent {
 /// name so multi-class files resolve each component independently.
 pub type ResolvedContentMap = std::collections::HashMap<String, ResolvedComponentContent>;
 
+/// CROSS-MODULE SELECTOR REGISTRY: a per-file map from an imported symbol's LOCAL name (the name as
+/// it is bound in THIS file's `import { Foo } from '...'` statement) to the real `@Component` /
+/// `@Directive` `selector` string of the class that symbol resolves to in ANOTHER module.
+///
+/// File I/O, module-path resolution, re-export / barrel unwrapping and symlink following are
+/// HOST/bundler concerns (the rust-core / ts-shim boundary): the bundler plugin (or the native CLI
+/// build) scans the project's `.ts` files ONCE, records every `@Component`/`@Directive` class's
+/// `selector`, then — per file the compiler will transform — resolves each import specifier to the
+/// class it names and supplies `{ localName -> selector }` here. The compiler stays "dumb": it never
+/// reads another file; it only consumes this already-resolved name→selector mapping.
+///
+/// The mapping is purely ADDITIVE. When it is absent (or an imported name has no entry), the compiler
+/// falls back to the existing class-name ↔ tag FOLDING convention — so every selector-convention-
+/// aligned input (the entire golden corpus + the backend-parity fixtures) compiles BYTE-IDENTICALLY.
+/// When present, an imported component used by its REAL element selector (e.g. `<app-stat-card>` for
+/// `class StatCard` with `selector: "app-stat-card"`) resolves through the SAME proven CSS-selector
+/// matcher the same-file sibling path already uses, so the parent lists the child in `dependencies`
+/// and renders it.
+pub type SelectorRegistry = std::collections::HashMap<String, String>;
+
 /// OPT-IN compile-time modernizer flags. Every flag defaults to `false`, so
 /// [`ModernizeOptions::default`] (the value carried on every default compile path) leaves the emit
 /// byte-identical to the classic, un-modernized output.

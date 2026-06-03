@@ -28,10 +28,28 @@ pub fn frontend_for(file_name: &str) -> Frontend {
 
 /// Compile a single in-memory source through the appropriate real front-end.
 pub fn compile_source(source: &str, file_name: &str) -> CompileOutput {
+    compile_source_with_registry(source, file_name, None)
+}
+
+/// Like [`compile_source`] but threading the project's CROSS-MODULE selector registry
+/// (`{ importName -> selector }`) the host pre-resolved for THIS file, so an imported component used
+/// by its real `@Component` selector resolves its dependency through the compiler's CSS-selector
+/// matcher instead of the class-name↔tag fold convention.
+///
+/// ADDITIVE: with `registry == None` the routing + emit are byte-identical to [`compile_source`].
+/// The registry is honoured only on the Authoring `.ts` (base-Angular) front-end — the
+/// cross-module-import case it exists for; the bare-`@Component` `Component` front-end carries no
+/// import scope, so it is unaffected.
+pub fn compile_source_with_registry(
+    source: &str,
+    file_name: &str,
+    registry: Option<&treaty_ivy::source_compile::SelectorRegistry>,
+) -> CompileOutput {
     let input = Path::new(file_name).to_path_buf();
     match frontend_for(file_name) {
         Frontend::Authoring => {
-            let compiled = rust_authoring::authoring::compile_file(source, file_name);
+            let compiled =
+                rust_authoring::authoring::compile_file_with_registry(source, file_name, registry);
             CompileOutput {
                 input,
                 code: compiled.code,

@@ -11,7 +11,9 @@ use oxc_parser::Parser;
 use oxc_span::SourceType;
 use treaty_ivy::source_compile::{
     compile_component_source_with_map_and_selector,
-    compile_component_source_with_map_selector_and_resolved, ResolvedContentMap,
+    compile_component_source_with_map_selector_and_resolved,
+    compile_component_source_with_map_selector_resolved_and_registry, ResolvedContentMap,
+    SelectorRegistry,
 };
 
 use crate::plugin::{extract_server_block, rewrite_call_sites, PluginRegistry};
@@ -324,6 +326,59 @@ pub fn compile_angular_source(source: &str, file_name: &str) -> CompiledAuthorin
         server_module: None,
         errors: Vec::new(),
         map: None,
+    }
+}
+
+/// Like [`compile_angular_source`] but threading the CROSS-MODULE [`SelectorRegistry`] the host
+/// (the native `treaty build` graph crawl) pre-resolved for THIS file's imports.
+///
+/// This is the project-aware `.ts` entry: an IMPORTED component used by its REAL `@Component`
+/// selector (e.g. `<app-stat-card>` for an imported `class StatCard` with `selector:
+/// "app-stat-card"`) now resolves the dependency through the compiler's CSS-selector matcher rather
+/// than relying on the class-name↔tag folding convention. The registry is ADDITIVE: with `registry`
+/// empty / `None`, this routes identically to [`compile_angular_source`] (byte-unchanged), so every
+/// selector-convention-aligned file is unaffected.
+///
+/// The registry is threaded ONLY through the common no-`server {…}`-block `@Component`/`@Directive`
+/// path (the cross-module-import case the registry exists for). A `@Component` colocating a
+/// `server {…}` block, or a plain/server-only `.ts`, falls back to [`compile_angular_source`]
+/// unchanged — those shapes do not participate in cross-module selector resolution.
+pub fn compile_angular_source_with_registry(
+    source: &str,
+    file_name: &str,
+    selector_registry: Option<&SelectorRegistry>,
+) -> CompiledAuthoring {
+    // No registry to apply → identical to the standard router (byte-unchanged).
+    let Some(registry) = selector_registry else {
+        return compile_angular_source(source, file_name);
+    };
+    if registry.is_empty() {
+        return compile_angular_source(source, file_name);
+    }
+
+    let extraction = extract_server_block(source);
+    let kinds = detect_angular_decorators(&extraction.client_source);
+
+    // Only the no-server-block component/directive path threads the registry; everything else routes
+    // through the standard (registry-free) router, which is exactly the established behaviour.
+    if kinds.is_empty() || !extraction.server_fns.is_empty() {
+        return compile_angular_source(source, file_name);
+    }
+
+    let default_selector = to_multi_selector(file_name);
+    let compiled = compile_component_source_with_map_selector_resolved_and_registry(
+        source,
+        GENERATED_NAME,
+        SOURCE_NAME,
+        Some(&default_selector),
+        None,
+        Some(registry),
+    );
+    CompiledAuthoring {
+        code: compiled.code,
+        server_module: None,
+        errors: compiled.errors,
+        map: map_or_none(compiled.map),
     }
 }
 

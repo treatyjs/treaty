@@ -26,7 +26,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 
 use crate::resolve::{is_under_node_modules, ModuleResolver};
-use crate::transform::{lower, rewrite_imports};
+use crate::selectors::{self, ProjectSelectors};
+use crate::transform::{lower_with_registry, rewrite_imports};
 
 /// The result of a native build.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +57,10 @@ struct GraphModule {
     code: String,
     /// Resolved (specifier -> absolute path) for each import in `code`.
     edges: BTreeMap<String, PathBuf>,
+    /// The RAW first-party source (an authoring `.ts`/`.treaty`/`.tsx`), retained so a second pass
+    /// can re-lower it with the project's cross-module selector registry. `None` for published /
+    /// pass-through modules (which carry no `@Component` template to resolve).
+    raw_source: Option<String>,
 }
 
 /// A stable, filesystem-safe output file name for an absolute module path.
@@ -96,6 +101,13 @@ fn build_graph(
     let mut queue: VecDeque<PathBuf> = VecDeque::new();
     queue.push_back(entry.to_path_buf());
 
+    // PROJECT SELECTOR SCAN (cross-module selector resolution). Accumulate every first-party `.ts`
+    // class's `@Component`/`@Directive` selector as the crawl reads it, so by the end of the crawl we
+    // hold the whole-project `className -> selector` map. File I/O / module resolution is the host's
+    // job — the compiler never reads another file; it consumes the per-file `{ importName -> selector }`
+    // registry we derive from this scan in the second pass below.
+    let mut project_selectors: ProjectSelectors = ProjectSelectors::new();
+
     while let Some(abs) = queue.pop_front() {
         if graph.contains_key(&abs) {
             continue;
@@ -104,9 +116,21 @@ fn build_graph(
             .map_err(|e| format!("read {}: {e}", abs.display()))?;
         let importer_dir = abs.parent().unwrap_or(entry).to_path_buf();
 
-        // Lower/link to emit-ready code.
+        // Scan a first-party `.ts` for its component/directive selectors (keyed by class name).
+        if is_authoring(&abs) && selectors::is_scannable_ts(&abs) {
+            selectors::scan_source_into(&source, &mut project_selectors);
+        }
+
+        // Lower/link to emit-ready code. First pass uses NO registry — the registry is not yet
+        // complete (the crawl is still discovering files), and edges do not depend on it (a resolved
+        // dependency is an already-imported symbol). The second pass re-lowers with the registry.
+        let raw_source = if is_authoring(&abs) {
+            Some(source.clone())
+        } else {
+            None
+        };
         let code = if is_authoring(&abs) {
-            let lowered = lower(&source, &abs.to_string_lossy());
+            let lowered = lower_with_registry(&source, &abs.to_string_lossy(), None);
             if !lowered.errors.is_empty() {
                 return Err(format!(
                     "{}: {}",
@@ -133,6 +157,24 @@ fn build_graph(
             // None keeps the scan side-effect-only.
             None
         });
+        // CROSS-MODULE DISCOVERY: also enqueue every import target named in the RAW (pre-lowering)
+        // source. Ivy lowering + type-strip ELIDES an import that the FIRST pass (no registry) judged
+        // unused — exactly a child component the parent references by its real selector (`<app-stat-
+        // card>` for an imported `StatCard`), whose `dependencies[]` entry only appears once the
+        // registry is applied. Following the lowered edges alone would therefore never reach that
+        // child's file, so the selector scan would miss its `@Component.selector` and the registry
+        // would be empty for the parent. Crawling the raw specifiers guarantees every first-party
+        // module is read + scanned. (Discovery only — the EMIT still rewrites the lowered `edges`.)
+        if let Some(raw) = raw_source.as_deref() {
+            for spec in raw_import_specifiers(raw) {
+                if let Some(resolved) = resolver.resolve(&importer_dir, &spec) {
+                    if !graph.contains_key(&resolved) {
+                        queue.push_back(resolved);
+                    }
+                }
+            }
+        }
+
         for dep in to_enqueue {
             if !graph.contains_key(&dep) {
                 queue.push_back(dep);
@@ -141,9 +183,52 @@ fn build_graph(
 
         graph.insert(
             abs.clone(),
-            GraphModule { abs, code, edges },
+            GraphModule { abs, code, edges, raw_source },
         );
     }
+
+    // SECOND PASS: now that `project_selectors` covers the WHOLE graph, re-lower each first-party
+    // authoring module with its per-file `{ importName -> selector }` registry. A module whose
+    // imports resolve to NO known selector gets `None` and is byte-identical to the first pass — so
+    // this only changes the emit of a file that imports a component used by its REAL selector (the
+    // cross-module case the registry exists for).
+    //
+    // The re-lowered code may RE-INTRODUCE an import the first (registry-free) pass elided as unused
+    // (the child component now referenced in `dependencies[]`), so its import EDGES must be recomputed
+    // from the new code — otherwise the emit's import rewrite would leave that import pointing at the
+    // original source specifier instead of the sibling dist file. The newly-resolved target is already
+    // in the graph (raw-source discovery enqueued it during the crawl).
+    if !project_selectors.is_empty() {
+        for module in graph.values_mut() {
+            let Some(raw) = module.raw_source.as_deref() else {
+                continue;
+            };
+            let Some(registry) = selectors::registry_for_source(raw, &project_selectors) else {
+                continue;
+            };
+            let lowered =
+                lower_with_registry(raw, &module.abs.to_string_lossy(), Some(&registry));
+            if lowered.errors.is_empty() && !lowered.code.is_empty() {
+                module.code = lowered.code;
+                // Recompute edges from the re-lowered code so a re-introduced import rewrites to its
+                // sibling dist file.
+                let importer_dir = module
+                    .abs
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| module.abs.clone());
+                let mut edges = BTreeMap::new();
+                let _ = rewrite_imports(&module.code, |spec| {
+                    if let Some(resolved) = resolver.resolve(&importer_dir, spec) {
+                        edges.insert(spec.to_string(), resolved);
+                    }
+                    None
+                });
+                module.edges = edges;
+            }
+        }
+    }
+
     Ok(graph)
 }
 
@@ -195,6 +280,39 @@ fn is_authoring(path: &Path) -> bool {
         path.extension().and_then(|e| e.to_str()),
         Some("ts") | Some("tsx") | Some("tjsx") | Some("treaty")
     )
+}
+
+/// Collect every STATIC import/export module specifier in a RAW TypeScript source (`from '…'`),
+/// INCLUDING type-only imports — discovery must see a child even if its only reference is one the
+/// lowering would later elide. Parse failures yield no specifiers (the file simply contributes no
+/// extra discovery edges). Used only to widen the crawl so every first-party module is read + scanned
+/// for selectors; it does not affect the emitted import rewrite (that still follows the lowered code).
+fn raw_import_specifiers(source: &str) -> Vec<String> {
+    use oxc_allocator::Allocator;
+    use oxc_ast::ast::Statement;
+    use oxc_parser::Parser;
+    use oxc_span::SourceType;
+
+    let allocator = Allocator::default();
+    let source_type = SourceType::default().with_typescript(true);
+    let ret = Parser::new(&allocator, source, source_type).parse();
+    if !ret.errors.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for stmt in &ret.program.body {
+        match stmt {
+            Statement::ImportDeclaration(decl) => out.push(decl.source.value.to_string()),
+            Statement::ExportNamedDeclaration(decl) => {
+                if let Some(src) = &decl.source {
+                    out.push(src.value.to_string());
+                }
+            }
+            Statement::ExportAllDeclaration(decl) => out.push(decl.source.value.to_string()),
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Run a native build, writing a bootable dist to `out_dir`.
@@ -341,6 +459,72 @@ mod tests {
             .unwrap();
         let entry_code = std::fs::read_to_string(&entry_file).unwrap();
         assert!(entry_code.contains("./dep-"), "edge not rewritten to sibling: {entry_code}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// CROSS-MODULE SELECTOR RESOLUTION end-to-end through the native build: a PARENT imports a CHILD
+    /// component and uses it by the child's REAL `@Component` selector (`<app-stat-card>`), which does
+    /// NOT fold to the imported class name (`StatCard`). The build must scan the child's selector, map
+    /// the parent's import to it, resolve `StatCard` into the parent's `dependencies[]`, and rewrite
+    /// the (re-introduced) import to the child's sibling dist file — so the parent renders the child
+    /// rather than an empty host.
+    #[test]
+    fn native_build_resolves_imported_real_selector_dependency() {
+        let dir = std::env::temp_dir().join(format!("treaty-nb-sel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Child: conventional Angular-CLI selector that does NOT fold to its class name.
+        std::fs::write(
+            dir.join("stat-card.ts"),
+            "import { Component } from '@angular/core';\n\
+             @Component({ selector: 'app-stat-card', template: '<p>card</p>' })\n\
+             export class StatCard {}\n",
+        )
+        .unwrap();
+        // Parent (the entry): imports the child by class name, uses it by its real selector.
+        std::fs::write(
+            dir.join("main.ts"),
+            "import { Component } from '@angular/core';\n\
+             import { StatCard } from './stat-card';\n\
+             @Component({ selector: 'app-root', imports: [StatCard], template: '<app-stat-card></app-stat-card>' })\n\
+             export class App {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("index.html"),
+            "<!doctype html><html><body><app-root></app-root></body></html>",
+        )
+        .unwrap();
+
+        let out = build(&NativeBuildOptions {
+            root: dir.clone(),
+            entry: dir.join("main.ts"),
+            out_dir: dir.join("dist"),
+        })
+        .expect("build ok");
+        assert!(!out.written.is_empty());
+
+        let modules_dir = dir.join("dist").join("_treaty");
+        let entry_file = std::fs::read_dir(&modules_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| e.file_name().to_string_lossy().starts_with("main-"))
+            .map(|e| e.path())
+            .expect("entry module emitted");
+        let entry_code = std::fs::read_to_string(&entry_file).unwrap();
+
+        // The imported child resolved into the parent's runtime dependencies via its REAL selector.
+        assert!(
+            entry_code.contains("dependencies: [StatCard]"),
+            "imported <app-stat-card> did not resolve StatCard via the registry; got:\n{entry_code}"
+        );
+        // The re-introduced import was rewritten to the child's sibling dist file (not left dangling
+        // at the original specifier).
+        assert!(
+            entry_code.contains("./stat_card-") && !entry_code.contains("'./stat-card'"),
+            "child import not rewritten to its sibling dist module; got:\n{entry_code}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

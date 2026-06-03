@@ -72,7 +72,7 @@ fn err(msg: impl Into<String>) -> CompiledComponent {
 /// it would an inline `styles:[...]` entry. Defined in the `decorators` crate (it rides on
 /// [`CompileCtx`]) and re-exported here as the public surface.
 pub use crate::decorators::registry::{
-    ModernizeOptions, ResolvedComponentContent, ResolvedContentMap,
+    ModernizeOptions, ResolvedComponentContent, ResolvedContentMap, SelectorRegistry,
 };
 
 /// Build the class self-reference (`value`/`ty`), stamping the original-source `span` of
@@ -1379,6 +1379,7 @@ pub fn compile_component_source(ts_source: &str) -> CompiledComponent {
         false,
         ModernizeOptions::default(),
         false,
+        None,
     )
 }
 
@@ -1431,6 +1432,7 @@ pub fn compile_component_source_with_options(
         options.legacy_optional_chaining,
         options.modernize,
         options.jit_mode,
+        None,
     )
 }
 
@@ -1464,6 +1466,7 @@ pub fn compile_component_source_with_resolved(
         false,
         ModernizeOptions::default(),
         false,
+        None,
     )
 }
 
@@ -1522,7 +1525,7 @@ pub fn compile_component_source_with_map_and_selector(
     source_name: &str,
     default_selector: Option<&str>,
 ) -> CompiledComponentWithMap {
-    compile_component_source_full(ts_source, file_name, source_name, default_selector, None)
+    compile_component_source_full(ts_source, file_name, source_name, default_selector, None, None)
 }
 
 /// Like [`compile_component_source_with_map_and_selector`] but ALSO supplying the
@@ -1543,17 +1546,55 @@ pub fn compile_component_source_with_map_selector_and_resolved(
     default_selector: Option<&str>,
     resolved: Option<&ResolvedContentMap>,
 ) -> CompiledComponentWithMap {
-    compile_component_source_full(ts_source, file_name, source_name, default_selector, resolved)
+    compile_component_source_full(
+        ts_source,
+        file_name,
+        source_name,
+        default_selector,
+        resolved,
+        None,
+    )
+}
+
+/// Like [`compile_component_source_with_map_selector_and_resolved`] but ALSO supplying the
+/// cross-module [`SelectorRegistry`] (`{ importName -> selector }`) the host (bundler plugin / native
+/// CLI build) pre-resolved for THIS file's imports.
+///
+/// This is the entry the project-aware build path uses so an imported component used by its REAL
+/// `@Component.selector` — e.g. `<app-stat-card>` for an imported `class StatCard` with
+/// `selector: "app-stat-card"` — resolves the dependency through the CSS-selector matcher instead of
+/// relying on the class-name↔tag folding convention. The registry is purely ADDITIVE: with
+/// `registry == None` (or no entry for a given import) the emit is BYTE-IDENTICAL to
+/// [`compile_component_source_with_map_selector_and_resolved`], so every selector-convention-aligned
+/// input (the whole golden corpus + the existing apps) is unaffected.
+pub fn compile_component_source_with_map_selector_resolved_and_registry(
+    ts_source: &str,
+    file_name: &str,
+    source_name: &str,
+    default_selector: Option<&str>,
+    resolved: Option<&ResolvedContentMap>,
+    selector_registry: Option<&SelectorRegistry>,
+) -> CompiledComponentWithMap {
+    compile_component_source_full(
+        ts_source,
+        file_name,
+        source_name,
+        default_selector,
+        resolved,
+        selector_registry,
+    )
 }
 
 /// The shared body of the map-emitting source compile entries: parse, thread the
-/// optional default selector + host-resolved content, and emit with an additive v3 map.
+/// optional default selector + host-resolved content + cross-module selector registry, and emit
+/// with an additive v3 map.
 fn compile_component_source_full(
     ts_source: &str,
     file_name: &str,
     source_name: &str,
     default_selector: Option<&str>,
     resolved: Option<&ResolvedContentMap>,
+    selector_registry: Option<&SelectorRegistry>,
 ) -> CompiledComponentWithMap {
     let allocator = Allocator::default();
     let source_type = SourceType::default().with_typescript(true);
@@ -1584,6 +1625,7 @@ fn compile_component_source_full(
         false,
         ModernizeOptions::default(),
         false,
+        selector_registry,
     );
     CompiledComponentWithMap {
         code: compiled.code,
@@ -2049,6 +2091,7 @@ fn compile_program_with_source(
     legacy_optional_chaining: bool,
     modernize: ModernizeOptions,
     jit_mode: bool,
+    selector_registry: Option<&SelectorRegistry>,
 ) -> CompiledComponent {
     let imported_names = collect_imported_names(program);
 
@@ -2088,7 +2131,16 @@ fn compile_program_with_source(
     // isComponent)` so [`crate::binder::resolve_selector_dependencies`] can match them against the
     // bound template and add the matches to the component's `dependencies` (see
     // `compile_component_meta`).
-    let sibling_directives = collect_sibling_directives(&decorated);
+    let mut sibling_directives = collect_sibling_directives(&decorated);
+
+    // CROSS-MODULE SELECTOR REGISTRY (additive). When the host supplied a `{ importName -> selector }`
+    // registry, fold each entry into the SAME `SelectorDirective` candidate set the same-file sibling
+    // path uses, so an IMPORTED component/directive used by its REAL `@Component.selector`
+    // (e.g. `<app-stat-card>` for `class StatCard` with `selector: "app-stat-card"`) resolves through
+    // the proven CSS-selector matcher — not the class-name↔tag fold. A registry entry for a name a
+    // sibling ALREADY declares is ignored (a same-file declaration is authoritative). Absent a
+    // registry, this adds nothing and the emit is byte-identical to the fold-only path.
+    merge_registry_directives(&mut sibling_directives, &imported_names, selector_registry);
 
     // Source-start offset of every decorated class, keyed by class name. A component whose emitted
     // `dependencies` array references a class declared LATER in this file (a forward reference) must
@@ -2263,6 +2315,53 @@ fn collect_sibling_directives(decorated: &[TopStmt]) -> Vec<crate::binder::Selec
         }
     }
     out
+}
+
+/// Fold the cross-module [`SelectorRegistry`] (`{ importName -> selector }`) into the per-file
+/// `SelectorDirective` candidate set, so an IMPORTED component/directive resolves by its REAL
+/// `@Component`/`@Directive` selector through the same CSS-selector matcher the same-file sibling
+/// path uses (`resolve_selector_dependencies`). Only names this file actually imports are considered
+/// (the registry is pre-resolved per file, but guarding on `imported_names` keeps a stale/global
+/// registry from injecting selectors for symbols this file never references). A registry entry whose
+/// name a SIBLING already declares is skipped — a same-file declaration is authoritative and was
+/// already collected with its own selector. With `registry == None` (every default/golden path) this
+/// is a no-op, so the emit stays byte-identical to the class-name↔tag fold convention.
+fn merge_registry_directives(
+    sibling_directives: &mut Vec<crate::binder::SelectorDirective>,
+    imported_names: &[String],
+    registry: Option<&SelectorRegistry>,
+) {
+    let Some(registry) = registry else { return };
+    if registry.is_empty() {
+        return;
+    }
+    // Names a sibling already owns (its own selector takes precedence over any registry entry).
+    let sibling_names: std::collections::HashSet<&str> =
+        sibling_directives.iter().map(|d| d.name.as_str()).collect();
+    // Dedup imported names while preserving first-seen order (deterministic candidate order).
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut added: Vec<crate::binder::SelectorDirective> = Vec::new();
+    for name in imported_names {
+        if !seen.insert(name.as_str()) {
+            continue;
+        }
+        if sibling_names.contains(name.as_str()) {
+            continue;
+        }
+        let Some(selector) = registry.get(name) else { continue };
+        if selector.trim().is_empty() {
+            continue;
+        }
+        // The match kernel (`resolve_selector_dependencies`) keys purely on the selector string; the
+        // `is_component` flag rides along for parity with sibling entries but does not influence the
+        // CSS match, and every matched dependency is emitted with `kind: Directive` regardless.
+        added.push(crate::binder::SelectorDirective::new(
+            name.clone(),
+            selector.clone(),
+            true,
+        ));
+    }
+    sibling_directives.extend(added);
 }
 
 /// The recognized decorator kind of a top-level class, as the [`DecoratorRegistry`] keys on it.
@@ -5798,6 +5897,131 @@ export class BCmp {}
         assert!(
             flat.contains("changeDetection: 0"),
             "explicit OnPush must emit changeDetection: 0 even with modernizer OFF; got: {flat}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // CROSS-MODULE SELECTOR REGISTRY: an IMPORTED component used by its real
+    // `@Component.selector` (NOT the class-name↔tag fold) resolves the dependency
+    // only when the host supplies a `{ importName -> selector }` registry. Absent
+    // it, the convention-aligned tag still resolves via folding (byte-unchanged).
+    // -----------------------------------------------------------------------
+
+    /// The parent component source for the registry tests: imports `StatCard` from another module
+    /// and uses it by the CONVENTIONAL Angular-CLI element selector `<app-stat-card>`. The class
+    /// name `StatCard` does NOT fold to the tag `app-stat-card`, so without the registry the only
+    /// way this could resolve is the (absent) cross-module selector knowledge.
+    const PARENT_WITH_REAL_SELECTOR: &str = r#"
+        import { Component } from '@angular/core';
+        import { StatCard } from './stat-card';
+        @Component({
+            selector: 'app-dashboard',
+            standalone: true,
+            imports: [StatCard],
+            template: '<app-stat-card label="x"></app-stat-card>',
+        })
+        export class Dashboard {}
+    "#;
+
+    #[test]
+    fn imported_real_selector_unresolved_without_registry() {
+        // WITHOUT a registry: `<app-stat-card>` cannot fold to the imported `StatCard` class name,
+        // so the dependency is NOT discovered — `StatCard` is absent from `dependencies`. This is the
+        // documented bug the registry fixes; asserting it here pins the additive contract (the
+        // fold-only path is untouched).
+        let out = compile_component_source(PARENT_WITH_REAL_SELECTOR);
+        assert!(out.errors.is_empty(), "errors: {:?}", out.errors);
+        assert!(
+            !out.code.contains("dependencies"),
+            "without a registry, <app-stat-card> must NOT resolve StatCard; got: {}",
+            out.code
+        );
+    }
+
+    #[test]
+    fn imported_real_selector_resolves_with_registry() {
+        // WITH a registry mapping the imported symbol `StatCard` to its real selector
+        // `app-stat-card`, the CSS-selector matcher matches `<app-stat-card>` and `StatCard` lands in
+        // the component's `dependencies` — the parent now declares + renders the child.
+        let mut registry = super::SelectorRegistry::new();
+        registry.insert("StatCard".to_string(), "app-stat-card".to_string());
+        let out = super::compile_component_source_with_map_selector_resolved_and_registry(
+            PARENT_WITH_REAL_SELECTOR,
+            "dashboard.js",
+            "dashboard.ts",
+            None,
+            None,
+            Some(&registry),
+        );
+        assert!(out.errors.is_empty(), "errors: {:?}", out.errors);
+        assert!(
+            out.code.contains("dependencies: [StatCard]"),
+            "registry-resolved import must appear in dependencies; got: {}",
+            out.code
+        );
+    }
+
+    #[test]
+    fn registry_none_is_byte_identical_to_fold_only() {
+        // ADDITIVE CONTRACT: passing `registry == None` through the new entry reproduces the existing
+        // map-emitting path byte-for-byte, for a CONVENTION-ALIGNED input (class name folds to the
+        // tag) — so supplying the registry channel never perturbs the established emit.
+        let src = r#"
+            import { Component } from '@angular/core';
+            import { StatCard } from './stat-card';
+            @Component({
+                selector: 'app-dashboard',
+                standalone: true,
+                imports: [StatCard],
+                template: '<stat-card label="x"></stat-card>',
+            })
+            export class Dashboard {}
+        "#;
+        let base = super::compile_component_source_with_map_selector_and_resolved(
+            src, "d.js", "d.ts", None, None,
+        );
+        let via_registry = super::compile_component_source_with_map_selector_resolved_and_registry(
+            src, "d.js", "d.ts", None, None, None,
+        );
+        assert_eq!(
+            base.code, via_registry.code,
+            "registry=None diverged from the fold-only map path"
+        );
+        // The convention-aligned `<stat-card>` still folds to `StatCard` and resolves with no registry.
+        assert!(
+            base.code.contains("dependencies: [StatCard]"),
+            "convention-aligned <stat-card> must still resolve via folding; got: {}",
+            base.code
+        );
+    }
+
+    #[test]
+    fn sibling_selector_takes_precedence_over_registry() {
+        // A class DECLARED in this file with its own selector is authoritative: a registry entry for
+        // the same name must not shadow it. The sibling `StatCard` (selector `stat-card`) resolves
+        // `<stat-card>` even though a registry maps `StatCard` to a DIFFERENT selector.
+        let src = r#"
+            import { Component } from '@angular/core';
+            @Component({ selector: 'stat-card', standalone: true, template: '<i></i>' })
+            export class StatCard {}
+            @Component({
+                selector: 'app-dashboard',
+                standalone: true,
+                imports: [StatCard],
+                template: '<stat-card></stat-card>',
+            })
+            export class Dashboard {}
+        "#;
+        let mut registry = super::SelectorRegistry::new();
+        registry.insert("StatCard".to_string(), "totally-different".to_string());
+        let out = super::compile_component_source_with_map_selector_resolved_and_registry(
+            src, "d.js", "d.ts", None, None, Some(&registry),
+        );
+        assert!(out.errors.is_empty(), "errors: {:?}", out.errors);
+        assert!(
+            out.code.contains("dependencies: [StatCard]"),
+            "sibling's own selector must resolve <stat-card>; got: {}",
+            out.code
         );
     }
 }

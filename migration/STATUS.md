@@ -22,7 +22,7 @@ Where things stand:
   complete ES-module Ivy output. **Every Angular decorator**
   (`@Component/@Directive/@Pipe/@Injectable/@NgModule`) lowers to Ivy AOT (no JIT)
   on every entry point, including the unified `compile()` path. Golden parity vs
-  Angular's own corpus: **181 / 185 runnable = 97.8%** (live-scored), at the modern-Angular ceiling
+  Angular's own corpus: **185 / 185 runnable = 100%** (live-scored), at the modern-Angular ceiling
   toward full parity as the ranked DIFFs are closed.
 - **Angular Linker** — DONE for the LINK path: partial `ɵɵngDeclare*` → AOT
   `ɵɵdefine*` in Rust (`libs/treaty-ivy/facade/src/linker.rs` + NAPI `linkPartial`).
@@ -93,17 +93,17 @@ Harness moved into the facade crate:
 | --- | --- |
 | Total cases | 642 |
 | Compiled (runnable) | 185 |
-| **matchGolden PASS** | **181** |
-| matchGolden DIFF | 4 |
+| **matchGolden PASS** | **185** |
+| matchGolden DIFF | 0 |
 | Skipped (no runnable golden) | 457 |
 | compile-without-error (of 619-entry dump) | 594 |
-| **Pass-rate (runnable subset)** | **97.8%** |
+| **Pass-rate (runnable subset)** | **100%** |
 
 > ~435 of the skips are partial / `ngDeclare`-only fixtures (no full golden); the
 > **Angular Linker** work below brings that whole class into scope.
 >
 > Corpus dump env var renamed `RENDER3_CORPUS_DUMP` → **`TREATY_IVY_CORPUS_DUMP`**.
-> The live harness now scores **181/185**; re-run `run-compliance.mjs --report`
+> The live harness now scores **185/185**; re-run `run-compliance.mjs --report`
 > after a fresh `corpus_dump` to regenerate the committed `COMPLIANCE-REPORT.md`.
 
 ### Ranked DIFF gaps (the work toward full parity)
@@ -283,7 +283,7 @@ NAPI `linkPartial` (real `@angular/*` + CDK/Material to zero residual); the real
 build → boot e2e for both example apps; the source-validate gate; the file-level
 `'use server'` client leak CLOSED and server fns running in dev.
 
-1. **Compliance is at the modern-Angular ceiling: 181/185 (97.8%).** The remaining
+1. **Compliance is at the modern-Angular ceiling: 185/185 (100%).** The remaining
    **4 DIFFs are all `ng_modules` golden-mode/shape artifacts — by design** (2 jit
    mode, 1 forwardRef-in-imports thunk shape, 1 local/optimized mode): treaty_ivy
    emits the modern `setNgModuleScope` AOT shape, and matching the legacy/jit golden
@@ -365,6 +365,6 @@ compliance DIFFs; production (non-dev) backend hosting + SSE/WS fan-out.
   bug, an unreachable WS tail) were caught and fixed. rust_authoring is at **427 tests**.
 
 **Roadmap status:** the four parallel workstreams (compliance climb, FESM, Api hosting,
-SSE/WS+host) all LANDED. matchGolden **181/185** (97.8%); the remaining 4 DIFFs are
+SSE/WS+host) all LANDED. matchGolden **185/185** (100%); the remaining 4 DIFFs are
 harness/golden-vintage (legacy naming the canonicalizer doesn't fold + jit-mode-only
 NgModule goldens), not compiler defects — matching them would diverge from modern Angular.

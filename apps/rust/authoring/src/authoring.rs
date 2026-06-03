@@ -181,6 +181,32 @@ pub fn compile_file(source: &str, file_name: &str) -> CompiledAuthoring {
     }
 }
 
+/// Like [`compile_file`], but threading the project's CROSS-MODULE
+/// [`SelectorRegistry`](treaty_ivy::source_compile::SelectorRegistry) — the per-file
+/// `{ importName -> selector }` map the host (the native `treaty build` graph crawl) pre-resolved so
+/// an IMPORTED component used by its REAL `@Component` selector resolves the dependency.
+///
+/// The registry is ADDITIVE and front-end-scoped: it is honoured only on the base-Angular `.ts`
+/// path (the cross-module-import case it exists for), via
+/// [`crate::angular_source::compile_angular_source_with_registry`]. Every other extension
+/// (`.treaty` / `.tsx` / `.tjsx`) — and `.ts` with `registry == None` — routes through the SAME
+/// [`compile_file`] plugin path BYTE-FOR-BYTE, so the change is opt-in and non-disruptive.
+pub fn compile_file_with_registry(
+    source: &str,
+    file_name: &str,
+    selector_registry: Option<&treaty_ivy::source_compile::SelectorRegistry>,
+) -> CompiledAuthoring {
+    let is_angular_ts = extension_of(file_name).as_deref() == Some("ts");
+    if is_angular_ts && selector_registry.is_some() {
+        return crate::angular_source::compile_angular_source_with_registry(
+            source,
+            file_name,
+            selector_registry,
+        );
+    }
+    compile_file(source, file_name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

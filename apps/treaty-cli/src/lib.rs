@@ -27,5 +27,6 @@ pub mod generate;
 pub mod native_build;
 pub mod plugin;
 pub mod resolve;
+pub mod selectors;
 pub mod serve;
 pub mod transform;

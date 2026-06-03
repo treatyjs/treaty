@@ -63,6 +63,18 @@ pub fn compile_to_ivy_ts(source: &str, file_name: &str) -> CompileOutput {
     compile::compile_source(source, file_name)
 }
 
+/// Like [`compile_to_ivy_ts`] but threading the project's CROSS-MODULE selector registry
+/// (`{ importName -> selector }`) the host pre-resolved for THIS file, so an imported component used
+/// by its real `@Component` selector resolves the dependency. ADDITIVE: `registry == None` is
+/// identical to [`compile_to_ivy_ts`].
+pub fn compile_to_ivy_ts_with_registry(
+    source: &str,
+    file_name: &str,
+    registry: Option<&treaty_ivy::source_compile::SelectorRegistry>,
+) -> CompileOutput {
+    compile::compile_source_with_registry(source, file_name, registry)
+}
+
 /// Whether a file name carries a TypeScript/JSX-ish extension the type-stripper
 /// should treat as TypeScript (so `oxc` parses TS syntax and the transformer
 /// removes it). Plain `.js`/`.mjs` are returned as-is.
@@ -224,7 +236,18 @@ pub fn strip_types(ivy_ts: &str, file_name: &str) -> (String, Vec<String>, Vec<S
 /// dev server and the native build. Import rewriting is left to the caller (it
 /// needs the resolver + the URL/path scheme), via [`rewrite_imports`].
 pub fn lower(source: &str, file_name: &str) -> LoweredModule {
-    let compiled = compile_to_ivy_ts(source, file_name);
+    lower_with_registry(source, file_name, None)
+}
+
+/// Like [`lower`] but threading the project's CROSS-MODULE selector registry for THIS file, so an
+/// imported component used by its real `@Component` selector resolves its dependency. ADDITIVE:
+/// `registry == None` is byte-identical to [`lower`].
+pub fn lower_with_registry(
+    source: &str,
+    file_name: &str,
+    registry: Option<&treaty_ivy::source_compile::SelectorRegistry>,
+) -> LoweredModule {
+    let compiled = compile_to_ivy_ts_with_registry(source, file_name, registry);
     if !compiled.is_ok() {
         return LoweredModule {
             code: String::new(),
