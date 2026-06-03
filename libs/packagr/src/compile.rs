@@ -69,6 +69,22 @@ pub fn compile_entry(source: &str, file_name: &str) -> EsmOutput {
 /// resulting CSS through the compiler's host-resolution channel, so the emitted
 /// (scoped) `styles: [...]` matches ng-packagr's.
 pub fn compile_entry_at(source: &str, source_path: &Path) -> EsmOutput {
+    compile_entry_at_mode(source, source_path, false)
+}
+
+/// Like [`compile_entry_at`], but with the `compilationMode: "partial"` flag.
+///
+/// When `partial` is `true`, a plain-TypeScript `@Component`/`@Directive` entry is compiled to its
+/// `ɵɵngDeclareComponent`/`ɵɵngDeclareDirective` PARTIAL declaration (the source front-end emits it
+/// from the metadata + the original template string). The DI/pipe family stays AOT here and is
+/// inverted by the caller's `treaty_ivy::emit_partial` span-rewrite pass. When `partial` is `false`
+/// the emit is byte-identical to [`compile_entry`] — the default Full/AOT path.
+///
+/// NOTE: the partial flag is honoured on the plain-TS inline-style front-end only. The
+/// external-`styleUrls` resolution path and the authoring (`.treaty`/`.tsx`) front-ends still emit
+/// AOT (their partial support is a follow-up); the caller's `emit_partial` pass then partials their
+/// DI/pipe family, leaving any component/directive def as AOT (a valid, loadable mix).
+pub fn compile_entry_at_mode(source: &str, source_path: &Path, partial: bool) -> EsmOutput {
     let file_name = source_path
         .file_name()
         .and_then(|n| n.to_str())
@@ -96,8 +112,25 @@ pub fn compile_entry_at(source: &str, source_path: &Path) -> EsmOutput {
         };
     }
 
-    // Authoring sources, and any `.ts`/`.treaty`/`.tsx`/`.tjsx` entry with no external styles,
-    // take the identical front-end call `compile_entry` uses.
+    // PARTIAL mode, plain-TS inline-style `@Component`/`@Directive` (the dominant library-publish
+    // shape, and the one the partial component/directive declaration emit targets): route through
+    // the option-carrying front-end so it emits `ɵɵngDeclareComponent`/`ɵɵngDeclareDirective`. The
+    // Full (`partial == false`) path below is left COMPLETELY unchanged — byte-identical to before.
+    if partial && is_plain_ts {
+        let opts = treaty_ivy::source_compile::CompileOptions {
+            emit_partial_component: true,
+            ..Default::default()
+        };
+        let compiled =
+            treaty_ivy::source_compile::compile_component_source_with_options(source, opts);
+        return EsmOutput {
+            code: compiled.code,
+            errors: compiled.errors,
+        };
+    }
+
+    // Authoring sources (and, in Full mode, plain `.ts`), take the identical front-end call
+    // `compile_entry` uses.
     if is_authoring(file_name) {
         let compiled = rust_authoring::authoring::compile_file(source, file_name);
         return EsmOutput {

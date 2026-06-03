@@ -175,13 +175,25 @@ fn collect_rewrites(
                     });
                 }
             }
-            // Component / directive: left as AOT (template decompilation out of scope).
-            "\u{0275}cmp" => notes.push(format!(
-                "{type_name}: ɵcmp (component) left as AOT — ɵɵngDeclareComponent requires template decompilation"
-            )),
-            "\u{0275}dir" => notes.push(format!(
-                "{type_name}: ɵdir (directive) left as AOT — ɵɵngDeclareDirective partial emit not implemented"
-            )),
+            // Component / directive. When the source front-end already emitted the partial
+            // declaration (`compilationMode: "partial"` in `source_compile`), the RHS is a
+            // `ɵɵngDeclareComponent`/`ɵɵngDeclareDirective` call — leave it untouched and add no note.
+            // Otherwise it is an AOT `ɵɵdefine*` whose template is a lowered instruction stream;
+            // inverting that needs a template decompiler (out of scope), so report it.
+            "\u{0275}cmp" => {
+                if !is_call_named(&assign.right, "\u{0275}\u{0275}ngDeclareComponent") {
+                    notes.push(format!(
+                        "{type_name}: ɵcmp (component) left as AOT — ɵɵngDeclareComponent requires template decompilation"
+                    ));
+                }
+            }
+            "\u{0275}dir" => {
+                if !is_call_named(&assign.right, "\u{0275}\u{0275}ngDeclareDirective") {
+                    notes.push(format!(
+                        "{type_name}: ɵdir (directive) left as AOT — ɵɵngDeclareDirective partial emit not implemented"
+                    ));
+                }
+            }
             _ => {}
         }
     }
@@ -215,6 +227,20 @@ fn define_call_object<'a>(expr: &'a Expression<'a>, callee: &str) -> Option<&'a 
     match call.arguments.first() {
         Some(Argument::ObjectExpression(obj)) => Some(obj),
         _ => None,
+    }
+}
+
+/// Whether `expr` is a call `<ns?>.<callee>(…)` whose callee is `callee` (bare or `i0.<callee>`).
+/// Used to detect a component/directive RHS that the source front-end already emitted in partial
+/// (`ɵɵngDeclareComponent`/`ɵɵngDeclareDirective`) form.
+fn is_call_named(expr: &Expression, callee: &str) -> bool {
+    let Expression::CallExpression(call) = expr else {
+        return false;
+    };
+    match &call.callee {
+        Expression::Identifier(id) => id.name == callee,
+        Expression::StaticMemberExpression(m) => m.property.name == callee,
+        _ => false,
     }
 }
 
@@ -532,6 +558,221 @@ mod tests {
             partial.notes.iter().any(|n| n.contains("component")),
             "expected a note about the component left as AOT; got: {:?}",
             partial.notes
+        );
+    }
+
+    // ----------------------------------------------------------------------
+    // PARTIAL component / directive declaration emit (source-side) + round-trip.
+    // ----------------------------------------------------------------------
+
+    use crate::source_compile::{compile_component_source_with_options, CompileOptions};
+
+    /// Compile in partial mode and run the `emit_partial` pass over the result (the packagr flow):
+    /// the source front-end emits `ɵɵngDeclareComponent`/`ɵɵngDeclareDirective`; `emit_partial` then
+    /// inverts the DI-family `ɵfac` to `ɵɵngDeclareFactory` and leaves the already-partial def alone.
+    fn partial_pipeline(src: &str) -> PartialEmit {
+        let opts = CompileOptions {
+            emit_partial_component: true,
+            ..CompileOptions::default()
+        };
+        let compiled = compile_component_source_with_options(src, opts);
+        assert!(compiled.errors.is_empty(), "compile errors: {:?}", compiled.errors);
+        emit_partial(&compiled.code)
+    }
+
+    #[test]
+    fn component_partial_emits_ng_declare_and_round_trips() {
+        let src = "import { Component } from '@angular/core';\n@Component({ selector: 'app-x', template: '<div>{{x}}</div>' })\nexport class X { x = 1; }";
+        let partial = partial_pipeline(src);
+        // Partial form: ɵɵngDeclareComponent (NOT the AOT ɵɵdefineComponent), plus the ɵfac inverted
+        // to ɵɵngDeclareFactory; no "left as AOT" note.
+        assert!(
+            partial.code.contains("\u{0275}\u{0275}ngDeclareComponent"),
+            "no ngDeclareComponent; got:\n{}",
+            partial.code
+        );
+        assert!(
+            !partial.code.contains("\u{0275}\u{0275}defineComponent"),
+            "AOT defineComponent survived; got:\n{}",
+            partial.code
+        );
+        assert!(
+            partial.code.contains("\u{0275}\u{0275}ngDeclareFactory"),
+            "component ɵfac not inverted to ngDeclareFactory; got:\n{}",
+            partial.code
+        );
+        assert!(
+            partial.code.contains("template: \"<div>{{x}}</div>\""),
+            "inline template string not carried; got:\n{}",
+            partial.code
+        );
+        assert!(
+            !partial.notes.iter().any(|n| n.contains("component")),
+            "component should NOT be reported as left-as-AOT; got: {:?}",
+            partial.notes
+        );
+
+        // ROUND-TRIP: the partial declaration links back to a valid AOT ɵɵdefineComponent.
+        let relinked = link_partial(&partial.code, "x.mjs");
+        assert!(relinked.errors.is_empty(), "relink errors: {:?}", relinked.errors);
+        assert!(
+            relinked.code.contains("\u{0275}\u{0275}defineComponent"),
+            "linker did not restore ɵɵdefineComponent; got:\n{}",
+            relinked.code
+        );
+        // The real template instruction function + bound expression are regenerated.
+        assert!(relinked.code.contains("X_Template"), "no template fn; got:\n{}", relinked.code);
+        assert!(relinked.code.contains("ctx.x"), "template binding lost; got:\n{}", relinked.code);
+        assert_no_residual_declare(&relinked.code);
+    }
+
+    #[test]
+    fn directive_partial_emits_ng_declare_and_round_trips() {
+        let src = "import { Directive, Input } from '@angular/core';\n@Directive({ selector: '[appHi]', exportAs: 'hi' })\nexport class HiDir { @Input() value = ''; }";
+        let partial = partial_pipeline(src);
+        assert!(
+            partial.code.contains("\u{0275}\u{0275}ngDeclareDirective"),
+            "no ngDeclareDirective; got:\n{}",
+            partial.code
+        );
+        assert!(
+            !partial.code.contains("\u{0275}\u{0275}defineDirective"),
+            "AOT defineDirective survived; got:\n{}",
+            partial.code
+        );
+        // The declarative directive base is carried (selector, exportAs array, inputs map).
+        assert!(partial.code.contains("selector: \"[appHi]\""), "selector lost; got:\n{}", partial.code);
+        assert!(partial.code.contains("exportAs: [\"hi\"]"), "exportAs lost; got:\n{}", partial.code);
+        assert!(partial.code.contains("inputs:"), "inputs lost; got:\n{}", partial.code);
+
+        let relinked = link_partial(&partial.code, "x.mjs");
+        assert!(relinked.errors.is_empty(), "relink errors: {:?}", relinked.errors);
+        assert!(
+            relinked.code.contains("\u{0275}\u{0275}defineDirective"),
+            "linker did not restore ɵɵdefineDirective; got:\n{}",
+            relinked.code
+        );
+        assert_no_residual_declare(&relinked.code);
+    }
+
+    #[test]
+    fn component_partial_round_trips_byte_equal_modulo_cosmetic_to_direct_aot() {
+        // The partial→linked output should match the DIRECT AOT emit (modulo the cosmetic factory
+        // paren-wrap `norm` already canonicalizes), proving the parallel partial emit carries the
+        // same metadata the AOT path does.
+        let src = "import { Component, Input } from '@angular/core';\n@Component({ selector: 'app-y', template: '<span>{{label}}</span>' })\nexport class Y { @Input() label = ''; }";
+        let direct_aot = compile_component_source(src);
+        assert!(direct_aot.errors.is_empty(), "direct AOT errors: {:?}", direct_aot.errors);
+
+        let partial = partial_pipeline(src);
+        let relinked = link_partial(&partial.code, "y.mjs");
+        assert!(relinked.errors.is_empty(), "relink errors: {:?}", relinked.errors);
+
+        assert_eq!(
+            norm(&relinked.code),
+            norm(&direct_aot.code),
+            "component partial round-trip diverged from direct AOT\n--- DIRECT AOT ---\n{}\n--- RELINKED ---\n{}",
+            direct_aot.code,
+            relinked.code
+        );
+    }
+
+    #[test]
+    fn directive_partial_field_shape_matches_real_ng_packagr_golden() {
+        // GATE #4: compare the emitted `ɵɵngDeclareDirective` fields to a REAL Angular partial build
+        // of the SAME `model()`-input directive (corpus `model_inputs/model_directive_definition.ts`,
+        // golden `model_inputs/GOLDEN_PARTIAL.js`). The reference golden's declaration is:
+        //   ɵɵngDeclareDirective({ minVersion: "17.1.0", version: "0.0.0-PLACEHOLDER", type: TestDir,
+        //     isStandalone: true,
+        //     inputs: { counter: { classPropertyName: "counter", publicName: "counter",
+        //       isSignal: true, isRequired: false, transformFunction: null }, name: { … } },
+        //     outputs: { counter: "counterChange", name: "nameChange" }, ngImport: i0 });
+        //
+        // We match the field SHAPE byte-for-byte for the `inputs`/`outputs` maps (rich object form,
+        // UNQUOTED identifier keys) and the `type`/`isStandalone`/`ngImport` placement. Two honest,
+        // documented differences remain (see notes), neither a round-trip break:
+        //   * `minVersion`: Angular bumps it to "17.1.0" for model() inputs; we stamp the family-wide
+        //     "14.0.0" (the linker accepts both — `is_placeholder_version` keys on the version).
+        //   * top-level `isSignal: true`: this compiler derives `base.is_signal` from signal inputs,
+        //     so it emits `isSignal` (and the AOT define emits `signals: true`) where real Angular —
+        //     which sets the directive-level signal flag only for signal-based components — omits it.
+        //     It is round-trip-consistent (relinked AOT == direct AOT).
+        let src = "import { Directive, model } from '@angular/core';\n\
+                   @Directive({})\n\
+                   export class TestDir { counter = model(0); name = model.required<string>(); }";
+        let partial = partial_pipeline(src);
+        // Collapse the emitter's pretty-print whitespace to single spaces so the comparison is over
+        // the field STRUCTURE (the real golden is single-line; our emit is multi-line — same tokens).
+        let esm = partial.code.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        // The exact rich-input shape the real golden carries (UNQUOTED keys, insertion order).
+        assert!(
+            esm.contains(
+                "inputs: { counter: { classPropertyName: \"counter\", publicName: \"counter\", isSignal: true, isRequired: false, transformFunction: null }, \
+                 name: { classPropertyName: \"name\", publicName: \"name\", isSignal: true, isRequired: true, transformFunction: null } }"
+            ),
+            "inputs map field shape diverges from the real ng-packagr golden; got:\n{}",
+            esm
+        );
+        // The `model()` two-way output (`<name>Change`) shape, exactly as Angular emits it.
+        assert!(
+            esm.contains("outputs: { counter: \"counterChange\", name: \"nameChange\" }"),
+            "outputs map field shape diverges from the real golden; got:\n{}",
+            esm
+        );
+        // `type`/`isStandalone` lead the base, `ngImport` is the trailing field — the reference order.
+        assert!(esm.contains("type: TestDir, isStandalone: true, inputs:"), "base field order diverged; got:\n{}", esm);
+        assert!(esm.contains(", ngImport: i0 }"), "ngImport must be the trailing directive field; got:\n{}", esm);
+        // And it still round-trips to a valid AOT directive.
+        let relinked = link_partial(&esm, "x.ts");
+        assert!(relinked.errors.is_empty(), "relink errors: {:?}", relinked.errors);
+        assert!(relinked.code.contains("\u{0275}\u{0275}defineDirective"), "no defineDirective; got:\n{}", relinked.code);
+    }
+
+    #[test]
+    fn component_partial_with_host_query_and_dependency_round_trips() {
+        // A richer single-file component: a host listener (non-identifier key → quoted), a view query,
+        // an output, and a same-file directive dependency matched by SELECTOR. The partial declaration
+        // must carry all of it and round-trip to the SAME AOT define as the direct Full emit.
+        let src = "import { Component, Directive, Output, EventEmitter, ViewChild, ElementRef, HostListener } from '@angular/core';\n\
+                   @Directive({ selector: '[hl]' })\n\
+                   export class HlDir {}\n\
+                   @Component({ selector: 'app-z', template: '<div hl #r></div>' })\n\
+                   export class Z {\n\
+                     @Output() done = new EventEmitter<void>();\n\
+                     @ViewChild('r') r!: ElementRef;\n\
+                     @HostListener('click') onClick() {}\n\
+                   }";
+        let partial = partial_pipeline(src);
+        let esm = &partial.code;
+        assert!(esm.contains("\u{0275}\u{0275}ngDeclareComponent"), "no ngDeclareComponent; got:\n{}", esm);
+        assert!(esm.contains("\u{0275}\u{0275}ngDeclareDirective"), "no ngDeclareDirective; got:\n{}", esm);
+        // The host listener key is a valid identifier here (`click`) so it stays unquoted; the
+        // dependency carries kind/type/selector.
+        let flat = esm.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(flat.contains("listeners: { click:"), "host listener lost; got:\n{}", flat);
+        assert!(
+            flat.contains("dependencies: [{ kind: \"directive\", type: HlDir, selector: \"[hl]\" }]"),
+            "dependency entry shape diverged; got:\n{}",
+            flat
+        );
+
+        // Round-trip the WHOLE module: both declarations must restore to AOT defines, no residual.
+        let relinked = link_partial(esm, "z.ts");
+        assert!(relinked.errors.is_empty(), "relink errors: {:?}", relinked.errors);
+        assert!(relinked.code.contains("\u{0275}\u{0275}defineComponent"), "no defineComponent; got:\n{}", relinked.code);
+        assert!(relinked.code.contains("\u{0275}\u{0275}defineDirective"), "no defineDirective; got:\n{}", relinked.code);
+        assert!(relinked.code.contains("\u{0275}\u{0275}listener"), "host listener instruction lost; got:\n{}", relinked.code);
+        assert!(relinked.code.contains("\u{0275}\u{0275}viewQuery"), "view query instruction lost; got:\n{}", relinked.code);
+        assert_no_residual_declare(&relinked.code);
+    }
+
+    /// No residual `ɵɵngDeclare*` partial call survives a link.
+    fn assert_no_residual_declare(code: &str) {
+        assert!(
+            !code.contains("\u{0275}\u{0275}ngDeclare"),
+            "residual ngDeclare* after link; got:\n{}",
+            code
         );
     }
 }

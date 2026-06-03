@@ -161,6 +161,13 @@ pub struct CompileCtx<'a> {
     /// entry that is such a factory CALL is lowered to the bare `ngModule` type on the module def's
     /// inline `imports`, matching Angular's partial compiler. Empty on every path that supplies none.
     pub module_with_providers: &'a std::collections::HashMap<String, String>,
+    /// The `compilationMode: "partial"` flag. `false` (Full / AOT) on every default compile path, so
+    /// the default emit is byte-identical to the classic full/local output. When `true`, a
+    /// `@Component`/`@Directive` emits its `ɵɵngDeclareComponent`/`ɵɵngDeclareDirective` PARTIAL
+    /// declaration (from the source front-end's metadata + the original template string) instead of
+    /// the AOT `ɵɵdefineComponent`/`ɵɵdefineDirective`. The DI/pipe family is left as AOT here and
+    /// inverted by the existing span-rewrite `partial_emit` pass the caller runs afterwards.
+    pub emit_partial_component: bool,
 }
 
 /// The Ivy emit of ONE decorated class, decomposed so the original module can be re-assembled

@@ -1380,6 +1380,7 @@ pub fn compile_component_source(ts_source: &str) -> CompiledComponent {
         ModernizeOptions::default(),
         false,
         None,
+        false,
     )
 }
 
@@ -1406,6 +1407,16 @@ pub struct CompileOptions {
     /// `supportJit=true`). Only the option-carrying entry point — and the compliance corpus dump, which
     /// reads `angularCompilerOptions.linkerJitMode` per case — sets it.
     pub jit_mode: bool,
+    /// The `compilationMode: "partial"` flag. `false` (Full / AOT) by default, so the default emit is
+    /// byte-identical to [`compile_component_source`]. When `true`, a `@Component`/`@Directive` emits
+    /// its `ɵɵngDeclareComponent`/`ɵɵngDeclareDirective` PARTIAL declaration (carrying the original
+    /// template as an inline string + the declarative inputs/outputs/host/queries/styles/dependencies/
+    /// encapsulation/changeDetection) instead of the AOT `ɵɵdefineComponent`/`ɵɵdefineDirective` — the
+    /// library-publish format. The DI/pipe family (`ɵfac`/`ɵprov`/`ɵpipe`/…) is left as AOT here; the
+    /// caller (e.g. `treaty_packagr`) runs the existing span-rewrite [`crate::emit_partial`] pass
+    /// afterwards to invert those (and to convert the component/directive `ɵfac` to
+    /// `ɵɵngDeclareFactory`). Threaded from `compilationMode` by `treaty_packagr`.
+    pub emit_partial_component: bool,
 }
 
 /// Like [`compile_component_source`] but honouring per-file [`CompileOptions`]. With
@@ -1433,6 +1444,7 @@ pub fn compile_component_source_with_options(
         options.modernize,
         options.jit_mode,
         None,
+        options.emit_partial_component,
     )
 }
 
@@ -1467,6 +1479,7 @@ pub fn compile_component_source_with_resolved(
         ModernizeOptions::default(),
         false,
         None,
+        false,
     )
 }
 
@@ -1626,6 +1639,7 @@ fn compile_component_source_full(
         ModernizeOptions::default(),
         false,
         selector_registry,
+        false,
     );
     CompiledComponentWithMap {
         code: compiled.code,
@@ -2092,6 +2106,7 @@ fn compile_program_with_source(
     modernize: ModernizeOptions,
     jit_mode: bool,
     selector_registry: Option<&SelectorRegistry>,
+    emit_partial_component: bool,
 ) -> CompiledComponent {
     let imported_names = collect_imported_names(program);
 
@@ -2182,6 +2197,7 @@ fn compile_program_with_source(
             &class_decl_positions,
             jit_mode,
             &module_with_providers,
+            emit_partial_component,
         ) {
             Ok(emit) => {
                 errors.extend(emit.errors.clone());
@@ -2410,6 +2426,7 @@ impl DecoratorCompiler for ComponentCompiler {
             ctx.legacy_optional_chaining,
             ctx.modernize,
             ctx.class_decl_positions,
+            ctx.emit_partial_component,
         )
     }
 }
@@ -2437,6 +2454,7 @@ impl DecoratorCompiler for DirectiveCompiler {
             ctx.legacy_optional_chaining,
             ctx.modernize,
             ctx.class_decl_positions,
+            ctx.emit_partial_component,
         )
     }
 }
@@ -2735,6 +2753,7 @@ fn compile_decorated_class(
     class_decl_positions: &std::collections::HashMap<String, u32>,
     jit_mode: bool,
     module_with_providers: &std::collections::HashMap<String, String>,
+    emit_partial_component: bool,
 ) -> Result<ClassEmit, String> {
     let (class_name, class_name_span) = match &class.id {
         Some(id) => (
@@ -2761,6 +2780,7 @@ fn compile_decorated_class(
         class_decl_positions,
         jit_mode,
         module_with_providers,
+        emit_partial_component,
     };
 
     // MULTI-DECORATOR dispatch: ngtsc compiles EVERY recognized trait on a class, not only the
@@ -2853,6 +2873,7 @@ fn compile_component_or_directive(
     legacy_optional_chaining: bool,
     modernize: ModernizeOptions,
     class_decl_positions: &std::collections::HashMap<String, u32>,
+    emit_partial_component: bool,
 ) -> Result<ClassEmit, String> {
     // The host-resolved external content for THIS class (keyed by class name), if the caller wired
     // the resolution channel and supplied an entry. Used to back `templateUrl`/`styleUrls`.
@@ -3099,6 +3120,30 @@ fn compile_component_or_directive(
                 .cloned()
                 .collect();
             let factory = class_factory(class, &class_name, FactoryTarget::Component);
+            // PARTIAL mode: emit `ɵɵngDeclareComponent` from the metadata + the ORIGINAL template
+            // string (no instruction lowering / decompilation). The DI-family `ɵfac` is still emitted
+            // as AOT here and inverted to `ɵɵngDeclareFactory` by the caller's `emit_partial` pass.
+            if emit_partial_component {
+                let preserve_whitespaces = obj
+                    .and_then(|o| find_prop(o, "preserveWhitespaces"))
+                    .and_then(|e| match e {
+                        Expression::BooleanLiteral(b) => Some(b.value),
+                        _ => None,
+                    });
+                return compile_component_meta_partial(
+                    base,
+                    &template_html.unwrap_or_default(),
+                    change_detection,
+                    encapsulation,
+                    auto_import_candidates,
+                    &selector_candidates,
+                    styles,
+                    animations,
+                    view_providers,
+                    preserve_whitespaces,
+                    factory,
+                );
+            }
             // Closure-wrap inputs: a literal `forwardRef(() => …)` in this standalone component's
             // `imports:` array, and the component's own source position (used to detect a dependency
             // class declared LATER in the file). See `compile_component_meta` for the decision.
@@ -3135,6 +3180,19 @@ fn compile_component_or_directive(
                 view_providers,
             );
             let factory = class_factory(class, &class_name, FactoryTarget::Directive);
+            // PARTIAL mode: emit `ɵɵngDeclareDirective` from the directive base (no template / view
+            // metadata). The `ɵfac` is inverted to `ɵɵngDeclareFactory` by the caller's `emit_partial`.
+            if emit_partial_component {
+                return Ok(ClassEmit {
+                    class_name: base.name.clone(),
+                    static_member: "\u{0275}dir",
+                    def_expression: crate::partial_component_emit::emit_ng_declare_directive(&base),
+                    extra_statements: Vec::new(),
+                    extra_after_def: false,
+                    factory: Some(factory),
+                    errors: Vec::new(),
+                });
+            }
             compile_directive_meta(base, factory)
         }
         _ => unreachable!("compile_component_or_directive only handles Component/Directive"),
@@ -3849,6 +3907,121 @@ fn compile_component_meta(
         static_member: "\u{0275}cmp",
         def_expression: compiled.expression,
         extra_statements: pool_statements,
+        extra_after_def: false,
+        factory: Some(factory),
+        errors,
+    })
+}
+
+/// PARTIAL emit of a `@Component`: build `ɵɵngDeclareComponent` from the directive base + the
+/// ORIGINAL template string + the resolved template dependencies, WITHOUT lowering the template to
+/// instructions. This is the source-side parallel of [`compile_component_meta`] that produces the
+/// library-publish (`compilationMode: "partial"`) form.
+///
+/// Dependency resolution reuses the SAME selectorless + CSS-selector matching the AOT path runs, so a
+/// partial declaration lists exactly the directives/pipes the AOT `dependencies` array would — each
+/// with its `kind`/`type`/`selector` (the linker re-derives template matching from these). The
+/// emitted declaration round-trips back to the AOT `ɵɵdefineComponent` through `link_partial`.
+#[allow(clippy::too_many_arguments)]
+fn compile_component_meta_partial(
+    base: R3DirectiveMetadata,
+    template_html: &str,
+    change_detection: ChangeDetectionStrategy,
+    encapsulation: ViewEncapsulation,
+    imported_names: &[String],
+    selector_candidates: &[crate::binder::SelectorDirective],
+    styles: Vec<String>,
+    animations: Option<Expr>,
+    view_providers: Option<Expr>,
+    preserve_whitespaces: Option<bool>,
+    factory: R3FactoryMetadata,
+) -> Result<ClassEmit, String> {
+    use crate::partial_component_emit::{
+        emit_ng_declare_component, PartialComponentInputs, PartialDependency,
+    };
+    let class_name = base.name.clone();
+    let mut errors: Vec<String> = Vec::new();
+
+    // Parse the template once to drive both the selectorless auto-import resolution and the CSS-
+    // selector binder match (the same two passes `compile_component_meta` runs).
+    let parse_result = crate::ml_parser::parse(template_html, "template.html");
+    for e in &parse_result.errors {
+        errors.push(e.msg.clone());
+    }
+    let mut binding_parser = BindingParser::new();
+    let r3 = html_ast_to_render3_ast(
+        &parse_result.root_nodes,
+        &mut binding_parser,
+        Render3ParseOptions::default(),
+    );
+    for e in &r3.errors {
+        errors.push(e.msg.clone());
+    }
+
+    // 1. Selectorless auto-import: directives/pipes referenced by class NAME (`<Foo>` / `@Foo`) or by
+    //    a pipe name in the template.
+    let candidates: Vec<String> = imported_names.to_vec();
+    let selectorless_nodes = crate::compile::parse_template_selectorless(template_html);
+    let resolved = crate::compile::resolve_template_dependencies(&candidates, &selectorless_nodes);
+
+    // Build the partial `dependencies` entries, attaching each matched directive/component's CSS
+    // selector from the candidate set (when known). The `kind` of a resolved dependency is recovered
+    // from its `R3TemplateDependencyMetadata`.
+    let mut dependencies: Vec<PartialDependency> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let selector_of = |name: &str| -> Option<String> {
+        selector_candidates
+            .iter()
+            .find(|d| d.name == name && !d.selector.is_empty())
+            .map(|d| d.selector.clone())
+    };
+    for dep in &resolved {
+        let name = match &dep.ty.kind {
+            crate::output_ast::ExprKind::ReadVar { name } => name.clone(),
+            _ => continue,
+        };
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        dependencies.push(PartialDependency {
+            kind: dep.kind,
+            ty: dep.ty.clone(),
+            selector: selector_of(&name),
+        });
+    }
+
+    // 2. CSS-selector directive matching: sibling/imported directives matched by an attribute/
+    //    property/output binding or as a structural directive over the bound template.
+    if !selector_candidates.is_empty() {
+        let matched = crate::binder::resolve_selector_dependencies(&r3.nodes, selector_candidates);
+        for name in matched {
+            if seen.insert(name.clone()) {
+                dependencies.push(PartialDependency {
+                    kind: crate::view::compiler::R3TemplateDependencyKind::Directive,
+                    ty: o::variable(&name, None),
+                    selector: selector_of(&name),
+                });
+            }
+        }
+    }
+
+    let inputs = PartialComponentInputs {
+        template_html,
+        change_detection,
+        encapsulation,
+        styles: &styles,
+        animations: animations.as_ref(),
+        view_providers: view_providers.as_ref(),
+        preserve_whitespaces,
+        dependencies: &dependencies,
+    };
+    let def_expression = emit_ng_declare_component(&base, &inputs);
+
+    Ok(ClassEmit {
+        class_name,
+        static_member: "\u{0275}cmp",
+        def_expression,
+        extra_statements: Vec::new(),
         extra_after_def: false,
         factory: Some(factory),
         errors,
@@ -5665,6 +5838,7 @@ export class BCmp {}
                 legacy_optional_chaining: false,
                 modernize,
                 jit_mode: false,
+                emit_partial_component: false,
             },
         )
     }
@@ -6212,6 +6386,9 @@ mod corpus_dump {
                         // JIT-linker NgModule def shape (inline declarations/imports/exports). Off by
                         // default, so every other case's emit is byte-unchanged.
                         jit_mode,
+                        // The compliance corpus is the FULL/local AOT scoring set; partial component
+                        // emit is never exercised here, so the default AOT emit is byte-unchanged.
+                        emit_partial_component: false,
                     },
                 );
                 if !first {

@@ -139,3 +139,11 @@ pub use linker::link_partial;
 pub mod partial_emit;
 
 pub use partial_emit::{emit_partial, PartialEmit};
+
+/// The source-side **partial component / directive declaration emitter** — emits
+/// `ɵɵngDeclareComponent` / `ɵɵngDeclareDirective` DIRECTLY from the source front-end's
+/// [`view::compiler::R3DirectiveMetadata`] + the ORIGINAL template string, avoiding the AOT-to-HTML
+/// decompiler that a span-rewrite [`partial_emit`] of a component would require. Mode-gated through
+/// [`source_compile::CompileOptions::emit_partial_component`]; the default Full emit is untouched. The
+/// output round-trips back to AOT through [`linker::link_partial`].
+pub mod partial_component_emit;

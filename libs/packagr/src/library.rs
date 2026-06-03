@@ -79,14 +79,30 @@ fn build_entry(
     // (SCSS/Sass) and folded into its scoped `styles: [...]` — exactly ng-packagr's
     // pre-`ngc` step. For authoring sources and inline-only-style entries this is
     // byte-identical to `compile_entry`.
-    let esm = compile::compile_entry_at(&source, &entry.source_path);
-    if !esm.errors.is_empty() {
-        return Err(PackagrError::Compile(esm.errors));
+    // The AOT compile drives the `.d.ts` reconstruction (the declared type surface does not change
+    // between Full and partial emit, and the `.d.ts` emitter reads the AOT `ɵɵdefine*` def to
+    // recover the component's input/output/query types). It is ALSO the ESM output in Full mode.
+    let aot = compile::compile_entry_at(&source, &entry.source_path);
+    if !aot.errors.is_empty() {
+        return Err(PackagrError::Compile(aot.errors));
     }
+    // The ESM source for THIS entry. In Full mode this is the AOT compile; in partial mode the
+    // plain-TS `@Component`/`@Directive` front-end emits the `ɵɵngDeclareComponent`/
+    // `ɵɵngDeclareDirective` declaration directly (the DI/pipe family is inverted later by
+    // `emit_partial`).
+    let esm = if mode == CompilationMode::Partial {
+        let partial = compile::compile_entry_at_mode(&source, &entry.source_path, true);
+        if !partial.errors.is_empty() {
+            return Err(PackagrError::Compile(partial.errors));
+        }
+        partial
+    } else {
+        aot.clone()
+    };
     // The `.d.ts` is derived from the AOT compile and is IDENTICAL regardless of
     // compilation mode (the declared type surface does not change between full and
-    // partial emit), so it is always derived from the AOT `esm.code`.
-    let entry_dts = dts::emit_dts_for_entry(&source, &esm.code, file_name)?;
+    // partial emit), so it is always derived from the AOT `aot.code`.
+    let entry_dts = dts::emit_dts_for_entry(&source, &aot.code, file_name)?;
     // Flatten a re-export BARREL declaration into a self-contained `index.d.ts`:
     // resolve each `export * from './lib/x'` / `export { X } from '…'` on disk,
     // inline the re-exported type declarations, and emit one aggregated `export
@@ -587,6 +603,82 @@ mod tests {
         assert!(
             relinked.code.contains("\u{0275}\u{0275}definePipe"),
             "linker must restore ɵɵdefinePipe from the partial form; got:\n{}",
+            relinked.code
+        );
+        assert!(
+            !relinked.code.contains("\u{0275}\u{0275}ngDeclare"),
+            "no ɵɵngDeclare may survive linking; got:\n{}",
+            relinked.code
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn partial_compilation_mode_emits_ng_declare_component_and_round_trips() {
+        // A partial build of a COMPONENT library now produces a TRUE partial component declaration
+        // (ɵɵngDeclareComponent carrying the inline template + declarative metadata), not an AOT
+        // ɵɵdefineComponent. It round-trips back through the linker to a valid ɵɵdefineComponent.
+        let root = scratch("partial_component_mode");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("treaty-package.json"),
+            r#"{ "name": "@acme/widgets", "version": "1.0.0", "dest": "dist",
+                 "compilationMode": "partial",
+                 "lib": { "entryFile": "src/public-api.ts" } }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/public-api.ts"),
+            "import { Component, Input } from '@angular/core';\n\
+             @Component({ selector: 'acme-greet', template: '<h1>{{name}}</h1>' })\n\
+             export class GreetComponent { @Input() name = 'world'; }\n",
+        )
+        .unwrap();
+
+        let cfg = PackageConfig::from_json(
+            &std::fs::read_to_string(root.join("treaty-package.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cfg.compilation_mode(), CompilationMode::Partial);
+
+        let dist = package_library(&root, &cfg).expect("partial component build should succeed");
+        let primary = &dist.entries[0];
+
+        // PARTIAL format: ɵɵngDeclareComponent (+ inverted ɵfac), no AOT ɵɵdefineComponent.
+        assert!(
+            primary.esm.contains("\u{0275}\u{0275}ngDeclareComponent"),
+            "partial mode must emit ɵɵngDeclareComponent; got:\n{}",
+            primary.esm
+        );
+        assert!(
+            primary.esm.contains("\u{0275}\u{0275}ngDeclareFactory"),
+            "partial mode must invert the component ɵfac to ɵɵngDeclareFactory; got:\n{}",
+            primary.esm
+        );
+        assert!(
+            !primary.esm.contains("\u{0275}\u{0275}defineComponent"),
+            "partial mode must NOT emit AOT ɵɵdefineComponent; got:\n{}",
+            primary.esm
+        );
+        // The original template survives as an inline string.
+        assert!(
+            primary.esm.contains("template: \"<h1>{{name}}</h1>\""),
+            "inline template string not carried into the declaration; got:\n{}",
+            primary.esm
+        );
+
+        // ROUND-TRIP: link back to a valid AOT ɵɵdefineComponent (real template fn + binding).
+        let relinked = treaty_ivy::link_partial(&primary.esm, "index.ts");
+        assert!(relinked.errors.is_empty(), "relink errors: {:?}", relinked.errors);
+        assert!(
+            relinked.code.contains("\u{0275}\u{0275}defineComponent"),
+            "linker must restore ɵɵdefineComponent; got:\n{}",
+            relinked.code
+        );
+        assert!(
+            relinked.code.contains("GreetComponent_Template"),
+            "linker must regenerate the template fn; got:\n{}",
             relinked.code
         );
         assert!(
