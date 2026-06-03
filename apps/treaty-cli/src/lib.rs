@@ -29,4 +29,5 @@ pub mod plugin;
 pub mod resolve;
 pub mod selectors;
 pub mod serve;
+pub mod source_map;
 pub mod transform;

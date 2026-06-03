@@ -28,6 +28,14 @@ pub struct CompileOutput {
     /// Diagnostics produced while compiling. A non-empty list means the
     /// compile did not produce usable `code`.
     pub errors: Vec<String>,
+    /// The compiler's ADDITIVE Source Map v3 JSON (`Ivy-TS -> original authoring
+    /// source`), consumed verbatim from the front-end's `{code, map}` entry, or
+    /// `None` when the front-end emitted no map (a pass-through module). The dev
+    /// server composes this with its type-strip Codegen map to serve a
+    /// browser-facing `stripped-ESM -> .ts/.treaty` map. Code is byte-identical
+    /// whether or not the map is requested, so this field is purely additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub map: Option<String>,
 }
 
 impl CompileOutput {

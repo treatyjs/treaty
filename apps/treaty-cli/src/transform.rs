@@ -53,6 +53,13 @@ pub struct LoweredModule {
     /// The bare/relative module specifiers this module imports (after Ivy
     /// lowering, before any rewrite). The dev server resolves + rewrites these.
     pub imports: Vec<String>,
+    /// The composed dev Source Map v3 JSON for `code`: `browser-ESM ->
+    /// original .ts/.treaty`, formed by threading the type-strip Codegen map
+    /// (`stripped -> Ivy-TS`) through the compiler's additive facade map
+    /// (`Ivy-TS -> original`). `None` when the compiler emitted no facade map
+    /// (a pass-through module) or when maps were not requested. ADDITIVE: `code`
+    /// is identical whether or not the map is built.
+    pub map: Option<String>,
 }
 
 /// Run the appropriate Treaty front-end on `source`, producing Ivy-lowered TS.
@@ -169,6 +176,34 @@ fn strip_class_decorators(class: &mut oxc_ast::ast::Class<'_>) {
 /// Returns the stripped code plus the static import specifiers it references.
 /// Errors are returned as a non-empty diagnostics list with empty code.
 pub fn strip_types(ivy_ts: &str, file_name: &str) -> (String, Vec<String>, Vec<String>) {
+    let (code, imports, errors, _map) = strip_types_inner(ivy_ts, file_name, false);
+    (code, imports, errors)
+}
+
+/// Like [`strip_types`] but ALSO returning the `oxc_codegen` Source Map for the
+/// type-strip (`stripped-ESM -> Ivy-TS`), so the dev server can compose it with
+/// the compiler's facade map into a browser-facing `stripped -> original` map.
+///
+/// The returned `code` is BYTE-IDENTICAL to [`strip_types`]: enabling the Codegen
+/// source map changes only the additional `map` artifact, never the emitted code
+/// (it adds span tracking, not different output). `map` is `None` only when the
+/// stripped program produced no tokens (an empty module).
+pub fn strip_types_with_map(
+    ivy_ts: &str,
+    file_name: &str,
+) -> (String, Vec<String>, Vec<String>, Option<oxc_sourcemap::SourceMap>) {
+    strip_types_inner(ivy_ts, file_name, true)
+}
+
+/// The shared type-strip core. With `want_map == false` the codegen is exactly the
+/// previous `Codegen::new().build(...)` (no source map), so all existing callers
+/// are byte-for-byte unchanged. With `want_map == true` the codegen additionally
+/// emits a `stripped -> Ivy-TS` source map (same emitted code).
+fn strip_types_inner(
+    ivy_ts: &str,
+    file_name: &str,
+    want_map: bool,
+) -> (String, Vec<String>, Vec<String>, Option<oxc_sourcemap::SourceMap>) {
     let allocator = Allocator::default();
     let source_type = source_type_for(file_name);
     let path = Path::new(file_name);
@@ -180,7 +215,7 @@ pub fn strip_types(ivy_ts: &str, file_name: &str) -> (String, Vec<String>, Vec<S
             .iter()
             .map(|e| format!("parse error in lowered module: {e}"))
             .collect();
-        return (String::new(), Vec::new(), errs);
+        return (String::new(), Vec::new(), errs, None);
     }
     let mut program = parsed.program;
 
@@ -212,8 +247,21 @@ pub fn strip_types(ivy_ts: &str, file_name: &str) -> (String, Vec<String>, Vec<S
         .map(|e| format!("transform error: {e}"))
         .collect();
 
-    let printed = Codegen::new().build(&program);
+    // Codegen. When a map is wanted, point `source_map_path` at the Ivy-TS source
+    // name (the map's `source`); the emitted CODE is identical either way.
+    let codegen = if want_map {
+        Codegen::new()
+            .with_options(oxc_codegen::CodegenOptions {
+                source_map_path: Some(path.to_path_buf()),
+                ..Default::default()
+            })
+            .with_source_text(ivy_ts)
+    } else {
+        Codegen::new()
+    };
+    let printed = codegen.build(&program);
     let code = printed.code;
+    let map = if want_map { printed.map } else { None };
 
     // Re-collect the specifiers from the STRIPPED output: type-only imports are
     // gone, so this is the true runtime import graph.
@@ -227,7 +275,7 @@ pub fn strip_types(ivy_ts: &str, file_name: &str) -> (String, Vec<String>, Vec<S
         Vec::new()
     };
 
-    (code, imports, errors)
+    (code, imports, errors, map)
 }
 
 /// Compile + type-strip one source to browser ESM, reporting its import graph.
@@ -235,8 +283,20 @@ pub fn strip_types(ivy_ts: &str, file_name: &str) -> (String, Vec<String>, Vec<S
 /// This is the end-to-end "one Treaty source file -> runnable ESM" used by the
 /// dev server and the native build. Import rewriting is left to the caller (it
 /// needs the resolver + the URL/path scheme), via [`rewrite_imports`].
+///
+/// No source map is built (the `map` field is `None`) — this is the fast path for
+/// the build/native paths and for dev with maps disabled. Use [`lower_with_map`]
+/// to additionally emit the composed dev source map.
 pub fn lower(source: &str, file_name: &str) -> LoweredModule {
-    lower_with_registry(source, file_name, None)
+    lower_full(source, file_name, None, false)
+}
+
+/// Like [`lower`] but ALSO building the composed dev Source Map v3
+/// (`browser-ESM -> original .ts/.treaty`) into the returned `map` field.
+///
+/// The emitted `code` is byte-identical to [`lower`]; only `map` is added.
+pub fn lower_with_map(source: &str, file_name: &str) -> LoweredModule {
+    lower_full(source, file_name, None, true)
 }
 
 /// Like [`lower`] but threading the project's CROSS-MODULE selector registry for THIS file, so an
@@ -247,6 +307,18 @@ pub fn lower_with_registry(
     file_name: &str,
     registry: Option<&treaty_ivy::source_compile::SelectorRegistry>,
 ) -> LoweredModule {
+    lower_full(source, file_name, registry, false)
+}
+
+/// The shared lowering core: Ivy-lower (optionally with a selector registry),
+/// type-strip, and — when `want_map` — compose the type-strip Codegen map with
+/// the compiler's facade map into a `browser-ESM -> original` dev source map.
+pub fn lower_full(
+    source: &str,
+    file_name: &str,
+    registry: Option<&treaty_ivy::source_compile::SelectorRegistry>,
+    want_map: bool,
+) -> LoweredModule {
     let compiled = compile_to_ivy_ts_with_registry(source, file_name, registry);
     if !compiled.is_ok() {
         return LoweredModule {
@@ -254,14 +326,32 @@ pub fn lower_with_registry(
             server_module: compiled.server_module,
             errors: compiled.errors,
             imports: Vec::new(),
+            map: None,
         };
     }
-    let (code, imports, errors) = strip_types(&compiled.code, file_name);
+
+    if !want_map {
+        let (code, imports, errors) = strip_types(&compiled.code, file_name);
+        return LoweredModule {
+            code,
+            server_module: compiled.server_module,
+            errors,
+            imports,
+            map: None,
+        };
+    }
+
+    // Maps wanted: type-strip WITH a Codegen map (`stripped -> Ivy-TS`), then
+    // compose it with the compiler's facade map (`Ivy-TS -> original`) so the
+    // served map points DevTools at the authoring `.ts`/`.treaty`.
+    let (code, imports, errors, codegen_map) = strip_types_with_map(&compiled.code, file_name);
+    let map = crate::source_map::compose(codegen_map, compiled.map.as_deref(), file_name);
     LoweredModule {
         code,
         server_module: compiled.server_module,
         errors,
         imports,
+        map,
     }
 }
 

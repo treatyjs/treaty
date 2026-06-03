@@ -12,7 +12,7 @@ use std::net::TcpStream;
 use std::path::PathBuf;
 
 use treaty_cli::native_build::{build as native_build, NativeBuildOptions};
-use treaty_cli::serve::{build_app, ServeOptions};
+use treaty_cli::serve::{build_app, build_app_with_watch, HmrMessage, ServeOptions};
 
 /// Make a fresh temp app dir with an index.html, a component entry, and a sibling.
 fn fixture(tag: &str) -> PathBuf {
@@ -61,12 +61,12 @@ fn http_get(port: u16, path: &str) -> String {
 #[test]
 fn serve_compiles_and_serves_ivy_esm_and_bootable_index() {
     let dir = fixture("serve");
-    let opts = ServeOptions {
-        root: dir.clone(),
-        entry: dir.join("src").join("main.ts"),
-        host: "127.0.0.1".into(),
-        port: 0,
-    };
+    let opts = ServeOptions::new(
+        dir.clone(),
+        dir.join("src").join("main.ts"),
+        "127.0.0.1".into(),
+        0,
+    );
     let (app, _reload_tx, _entry) = build_app(&opts);
 
     // Stand the app up on an ephemeral port in a background runtime thread.
@@ -112,6 +112,205 @@ fn serve_compiles_and_serves_ivy_esm_and_bootable_index() {
 
     handle.abort();
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Standard-base64 decode (test-only) for inspecting an inline data-URL map.
+fn b64_decode(s: &str) -> Vec<u8> {
+    const TBL: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let val = |c: u8| TBL.iter().position(|&t| t == c).map(|p| p as u32);
+    let mut out = Vec::new();
+    let (mut buf, mut bits) = (0u32, 0u32);
+    for &c in s.as_bytes() {
+        if c == b'=' {
+            break;
+        }
+        if let Some(v) = val(c) {
+            buf = (buf << 6) | v;
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                out.push((buf >> bits) as u8);
+            }
+        }
+    }
+    out
+}
+
+fn fs_url_for(abs: &std::path::Path) -> String {
+    format!(
+        "/@fs/{}",
+        abs.to_string_lossy().replace('\\', "/").trim_start_matches('/')
+    )
+}
+
+/// Stand the app up on an ephemeral port in a background runtime; returns the
+/// runtime, the join handle, and the bound port.
+fn spawn_server(
+    app: axum::Router,
+) -> (tokio::runtime::Runtime, tokio::task::JoinHandle<()>, u16) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (port_tx, port_rx) = std::sync::mpsc::channel();
+    let handle = rt.spawn(async move {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        port_tx.send(port).unwrap();
+        axum::serve(listener, app).await.unwrap();
+    });
+    let port = port_rx.recv().unwrap();
+    (rt, handle, port)
+}
+
+#[test]
+fn serve_with_source_maps_on_attaches_inline_map_pointing_at_original() {
+    let dir = fixture("serve-maps-on");
+    // Maps ON (the serve default).
+    let opts = ServeOptions::new(
+        dir.clone(),
+        dir.join("src").join("main.ts"),
+        "127.0.0.1".into(),
+        0,
+    );
+    let (app, _tx, _entry) = build_app(&opts);
+    let (_rt, handle, port) = spawn_server(app);
+
+    let main_abs = dir.join("src").join("main.ts");
+    let module = http_get(port, &fs_url_for(&main_abs));
+    assert!(module.contains("ɵɵdefineComponent"), "no Ivy def: {module}");
+    // The served module carries an inline sourceMappingURL whose decoded sources
+    // include the ORIGINAL main.ts.
+    let marker = "//# sourceMappingURL=";
+    let idx = module.rfind(marker).unwrap_or_else(|| panic!("no inline map: {module}"));
+    let url = module[idx + marker.len()..].trim();
+    assert!(url.starts_with("data:application/json"), "not an inline data url: {url}");
+    let b64 = url.rsplit("base64,").next().unwrap();
+    let json = String::from_utf8(b64_decode(b64)).unwrap();
+    assert!(json.contains("\"version\":3"), "not v3: {json}");
+    assert!(
+        json.replace('\\', "/").contains("main.ts"),
+        "decoded map sources do not include original main.ts: {json}"
+    );
+
+    handle.abort();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn serve_with_source_maps_off_omits_the_map() {
+    let dir = fixture("serve-maps-off");
+    let mut opts = ServeOptions::new(
+        dir.clone(),
+        dir.join("src").join("main.ts"),
+        "127.0.0.1".into(),
+        0,
+    );
+    opts.source_maps = false;
+    let (app, _tx, _entry) = build_app(&opts);
+    let (_rt, handle, port) = spawn_server(app);
+
+    let main_abs = dir.join("src").join("main.ts");
+    let module = http_get(port, &fs_url_for(&main_abs));
+    assert!(module.contains("ɵɵdefineComponent"), "no Ivy def: {module}");
+    assert!(
+        !module.contains("sourceMappingURL"),
+        "maps-off served module still has a sourceMappingURL: {module}"
+    );
+
+    handle.abort();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn serve_hmr_broadcasts_module_update_not_full_reload_on_a_component_change() {
+    let dir = fixture("serve-hmr");
+    // A non-entry component the entry imports — this is the hot-swappable module.
+    std::fs::write(
+        dir.join("src").join("widget.ts"),
+        "import { Component } from '@angular/core';\n\
+         @Component({ selector: 'app-widget', template: '<p>{{n}}</p>' })\n\
+         export class Widget { n: number = 1; }\n",
+    )
+    .unwrap();
+
+    let opts = ServeOptions::new(
+        dir.clone(),
+        dir.join("src").join("main.ts"),
+        "127.0.0.1".into(),
+        0,
+    );
+    // Spawn the REAL watcher so a genuine on-disk edit flows through the real
+    // recompile-and-broadcast path.
+    let (app, reload_tx, _entry, _watch) = build_app_with_watch(&opts);
+    let mut rx = reload_tx.subscribe();
+    let (_rt, handle, port) = spawn_server(app);
+
+    // Prime the server's cache for widget.ts (so the watcher compares against a
+    // known prior build and detects the change).
+    let widget_abs = dir.join("src").join("widget.ts");
+    let _ = http_get(port, &fs_url_for(&widget_abs));
+
+    // Edit the component (changes the emitted output -> a real HMR update).
+    std::fs::write(
+        &widget_abs,
+        "import { Component } from '@angular/core';\n\
+         @Component({ selector: 'app-widget', template: '<p>{{n}}!!</p>' })\n\
+         export class Widget { n: number = 42; }\n",
+    )
+    .unwrap();
+
+    // Wait (bounded) for the watcher to broadcast a message.
+    let msg = recv_within(&mut rx, std::time::Duration::from_secs(10))
+        .expect("an HMR broadcast arrived");
+    match &msg {
+        HmrMessage::Update { url, .. } => {
+            assert!(
+                url.replace('\\', "/").ends_with("src/widget.ts"),
+                "update targeted the wrong module: {url}"
+            );
+            let wire = msg.to_wire();
+            assert!(wire.contains("\"type\":\"update\""), "not an update wire: {wire}");
+            assert!(!wire.contains("full-reload"), "update leaked a full reload: {wire}");
+        }
+        HmrMessage::FullReload => panic!("component change should hot-update, got full-reload"),
+    }
+
+    handle.abort();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Block (off a tiny dedicated runtime) until an HMR message arrives or the
+/// deadline passes. Drains intermediate messages, returning the first `Update`
+/// if present, else the last message seen.
+fn recv_within(
+    rx: &mut tokio::sync::broadcast::Receiver<HmrMessage>,
+    timeout: std::time::Duration,
+) -> Option<HmrMessage> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    rt.block_on(async move {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut last: Option<HmrMessage> = None;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return last;
+            }
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Ok(m)) => {
+                    if matches!(m, HmrMessage::Update { .. }) {
+                        return Some(m);
+                    }
+                    last = Some(m);
+                }
+                Ok(Err(_)) => return last, // channel closed
+                Err(_) => return last,     // timed out
+            }
+        }
+    })
 }
 
 #[test]

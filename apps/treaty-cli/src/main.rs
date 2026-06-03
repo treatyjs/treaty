@@ -138,6 +138,14 @@ enum Command {
         /// Port to bind. Defaults to config / `4200`.
         #[arg(long)]
         port: Option<u16>,
+        /// Disable dev source maps (no inline `sourceMappingURL`). Maps are ON by
+        /// default so DevTools shows the original `.ts`/`.treaty`.
+        #[arg(long = "no-source-map")]
+        no_source_map: bool,
+        /// Disable true module HMR; fall back to a full page reload on any change.
+        /// HMR is ON by default.
+        #[arg(long = "no-hmr")]
+        no_hmr: bool,
     },
 }
 
@@ -195,7 +203,9 @@ fn main() -> ExitCode {
             run_affected(&graph, &changed, strict, deploy_plan, &deploy_with, &version)
         }
         Command::Compile { input, json } => run_compile(&input, json),
-        Command::Serve { dir, entry, host, port } => run_serve(dir, entry, host, port),
+        Command::Serve { dir, entry, host, port, no_source_map, no_hmr } => {
+            run_serve(dir, entry, host, port, !no_source_map, !no_hmr)
+        }
     }
 }
 
@@ -372,6 +382,8 @@ fn run_serve(
     entry: Option<PathBuf>,
     host: Option<String>,
     port: Option<u16>,
+    source_maps: bool,
+    hmr: bool,
 ) -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let root = match &dir {
@@ -410,6 +422,8 @@ fn run_serve(
         entry: entry_path,
         host: cfg.host.clone(),
         port: cfg.port,
+        source_maps,
+        hmr,
     };
     match serve::serve_blocking(opts) {
         Ok(()) => ExitCode::SUCCESS,

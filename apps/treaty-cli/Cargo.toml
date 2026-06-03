@@ -37,6 +37,10 @@ oxc_span = "0.133.0"
 oxc_semantic = "0.133.0"
 oxc_transformer = "0.133.0"
 oxc_resolver = "11.20.0"
+# Source-map type + VLQ codec (the SAME version oxc_codegen 0.133 emits): used to
+# COMPOSE the type-strip Codegen map (stripped-ESM -> Ivy-TS) with the compiler's
+# additive facade map (Ivy-TS -> original .ts/.treaty) into one dev source map.
+oxc_sourcemap = "6.1.1"
 
 # The fully-native `treaty serve` dev server: tokio + axum HTTP, notify file-watch,
 # and a tokio-tungstenite live-reload websocket.

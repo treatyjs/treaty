@@ -26,6 +26,16 @@ pub fn frontend_for(file_name: &str) -> Frontend {
     }
 }
 
+/// The generated-artifact name for a source file: the same stem with a `.js`
+/// extension. Used as the map's `file` (the original name is kept as the map's
+/// `sources[0]`). A name without an extension is returned with `.js` appended.
+fn ivy_artifact_name(file_name: &str) -> String {
+    match file_name.rsplit_once('.') {
+        Some((stem, _ext)) => format!("{stem}.js"),
+        None => format!("{file_name}.js"),
+    }
+}
+
 /// Compile a single in-memory source through the appropriate real front-end.
 pub fn compile_source(source: &str, file_name: &str) -> CompileOutput {
     compile_source_with_registry(source, file_name, None)
@@ -55,15 +65,34 @@ pub fn compile_source_with_registry(
                 code: compiled.code,
                 server_module: compiled.server_module,
                 errors: compiled.errors,
+                // The authoring front-end already returns its additive
+                // `Ivy-TS -> original` map (server-fn bodies redacted from
+                // `sourcesContent` for client privacy); consume it verbatim.
+                map: compiled.map,
             }
         }
         Frontend::Component => {
-            let compiled = treaty_ivy::source_compile::compile_component_source(source);
+            // Use the map-bearing entry: `code` is BYTE-IDENTICAL to
+            // `compile_component_source` (the facade guarantees this), and `map`
+            // is the additive `Ivy-TS -> original` v3 JSON. The generated artifact
+            // name is the file with a `.js` extension; the original is `file_name`.
+            let source_name = file_name;
+            let artifact_name = ivy_artifact_name(file_name);
+            let compiled = treaty_ivy::source_compile::compile_component_source_with_map(
+                source,
+                &artifact_name,
+                source_name,
+            );
             CompileOutput {
                 input,
                 code: compiled.code,
                 server_module: None,
                 errors: compiled.errors,
+                map: if compiled.map.is_empty() {
+                    None
+                } else {
+                    Some(compiled.map)
+                },
             }
         }
     }
