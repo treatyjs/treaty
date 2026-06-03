@@ -23,7 +23,9 @@ use crate::compile;
 use crate::config::{self, CompilationMode, PackageConfig, ResolvedEntry};
 use crate::core::{DistEntry, DistManifest, PackagrError};
 use crate::dts;
+use crate::dts_flatten;
 use crate::fesm;
+use crate::stylesheet;
 
 /// Read the published name/version, preferring the descriptor's own fields and
 /// otherwise falling back to a sibling `package.json`.
@@ -84,11 +86,30 @@ fn build_entry(
     // The `.d.ts` is derived from the AOT compile and is IDENTICAL regardless of
     // compilation mode (the declared type surface does not change between full and
     // partial emit), so it is always derived from the AOT `esm.code`.
-    let declarations = dts::emit_dts_for_entry(&source, &esm.code, file_name)?;
+    let entry_dts = dts::emit_dts_for_entry(&source, &esm.code, file_name)?;
+    // Flatten a re-export BARREL declaration into a self-contained `index.d.ts`:
+    // resolve each `export * from './lib/x'` / `export { X } from '…'` on disk,
+    // inline the re-exported type declarations, and emit one aggregated `export
+    // { … }` (the `.d.ts` analogue of the FESM flatten — see [`crate::dts_flatten`]).
+    // A non-barrel entry is returned unchanged.
+    let declarations = dts_flatten::flatten_entry_dts(
+        &source,
+        &entry_dts,
+        &entry.source_path,
+        entry_source_set,
+    );
 
     // Flatten the entry's own internal modules into one FESM module. For a
     // single-file entry this is a byte-for-byte identity.
     let flat_esm = fesm::flatten_entry_esm(&esm.code, &entry.source_path, entry_source_set);
+
+    // esbuild-equivalent CSS value minification over every emitted `styles: [...]`
+    // string (the pre-`ngc` esbuild `minify: true` pass ng-packagr runs): `color:
+    // blue` → `#00f`, `0px` → `0`, whitespace collapse — while preserving the
+    // `_ngcontent-%COMP%` scoping placeholders. Run over the FLATTENED module so it
+    // covers both the entry's own styles AND those of any inlined private component
+    // module; a module with no styles is returned byte-for-byte unchanged.
+    let flat_esm = stylesheet::optimize_compiled_styles(&flat_esm);
 
     // PARTIAL compilation mode: rewrite the flattened AOT module's DI/pipe-family
     // `ɵɵdefine*` definitions to their `ɵɵngDeclare*` partial form (the Angular-CLI

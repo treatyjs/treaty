@@ -17,15 +17,27 @@
 //! `styleUrls` component emit a `styles: [...]` array — already preprocessed and
 //! (for Emulated) scoped by the SAME `ShadowCss` port ngc uses. The Emulated
 //! SCOPING (`_ngcontent-%COMP%` placement, descendant combinators) is byte-identical
-//! to ng-packagr's. NOTE — not yet fully output-equal: ng-packagr additionally runs
-//! esbuild's CSS-value optimizer (e.g. `color: blue` → `#00f`, `bold` → `700`),
-//! which packagr does not (a follow-up); the *values* therefore differ even though
-//! the scoping matches. Inline `styles: ['...']` need no resolution channel: they
-//! are read straight from the decorator object by the compiler.
+//! to ng-packagr's.
+//!
+//! ## esbuild value minification
+//!
+//! ng-packagr additionally runs esbuild's CSS-value optimizer over every stylesheet
+//! (`color: blue` → `#00f`, `bold` → `700`, hex shortening, `0px` → `0`, whitespace
+//! collapse). packagr reproduces the **common, context-free** subset of that via
+//! [`optimize_compiled_styles`], which post-processes every `styles: [...]` string
+//! in the COMPILED module — covering both inline `styles` and resolved `styleUrls`
+//! uniformly. Because esbuild's value transforms operate on declaration values and
+//! Angular's scoping rewrites only selectors, optimizing the already-scoped CSS
+//! yields byte-identical values while preserving the `_ngcontent-%COMP%`
+//! placeholders (see [`crate::css_optimizer`] for the fidelity boundary).
 //!
 //! File I/O and preprocessing are the only packagr-side concern; scoping and the
-//! `styles` array shape live in `treaty_ivy`, so the emitted CSS is output-equal
-//! to ng-packagr by construction.
+//! `styles` array shape live in `treaty_ivy`. The emitted CSS matches ng-packagr on
+//! the COMMON case — scoping always, plus the context-free value optimizations
+//! (named-color→hex, `bold`→`700`, hex shortening, `0px`→`0`, whitespace collapse),
+//! byte-verified against a live ng-packagr@21 build. A few esbuild micro-opts remain
+//! the fidelity boundary (shorthand-internal color conversion, transform-fn /
+//! selector-list / at-rule whitespace) — documented in [`crate::css_optimizer`].
 
 use std::path::Path;
 
@@ -47,9 +59,12 @@ enum StyleLang {
     Css,
     /// Sass/SCSS — compiled with the pure-Rust [`grass`] engine.
     Scss,
-    /// Less / Stylus — not yet preprocessed in-process (see module note); the raw
-    /// file is passed through so the build still produces output rather than
-    /// failing, and the gap is reported honestly.
+    /// Less / Stylus — passed through as raw text. There is no mature pure-Rust
+    /// Less or Stylus compiler (both are JS-only ecosystems; ng-packagr shells out
+    /// to the npm `less` package), so packagr does NOT preprocess them in-process.
+    /// The raw file is passed through so the build still produces output rather than
+    /// failing, the variable/mixin syntax is left intact, and the gap is reported
+    /// honestly via a diagnostic. (SCSS/Sass, by contrast, fully compile via grass.)
     Passthrough,
 }
 
@@ -308,9 +323,205 @@ fn program_has_external_styles(program: &Program) -> bool {
     false
 }
 
+/// Apply esbuild-equivalent CSS value minification to every `styles: [...]` string
+/// in a COMPILED Ivy module.
+///
+/// This is the packagr-side reproduction of ng-packagr's esbuild `minify: true`
+/// pass. It parses the compiled module, finds every object-literal `styles:`
+/// property whose value is an array of string literals (the
+/// `ɵɵdefineComponent`/`ɵɵngDeclareComponent` `styles` arrays for both inline
+/// `styles` and resolved `styleUrls`), and rewrites each string element with
+/// [`crate::css_optimizer::optimize`] — collapsing whitespace and minifying values
+/// (`color: blue` → `#00f`, `0px` → `0`, …) while preserving the
+/// `_ngcontent-%COMP%` / `_nghost-%COMP%` scoping placeholders.
+///
+/// Replacement is span-based over the original bytes (applied right-to-left so
+/// earlier spans stay valid), so every other byte of the emitted Ivy module is
+/// preserved verbatim. If the module does not parse, or carries no optimizable
+/// `styles` string, the input is returned unchanged (identity).
+pub fn optimize_compiled_styles(compiled: &str) -> String {
+    let allocator = Allocator::default();
+    let source_type = SourceType::default().with_typescript(true).with_module(true);
+    let parsed = Parser::new(&allocator, compiled, source_type).parse();
+    if !parsed.errors.is_empty() {
+        return compiled.to_string();
+    }
+
+    // (string-literal span, optimized-content) for each styles element to rewrite.
+    let mut edits: Vec<(u32, u32, String)> = Vec::new();
+    collect_styles_edits(&parsed.program, &mut edits);
+    if edits.is_empty() {
+        return compiled.to_string();
+    }
+
+    // Apply right-to-left so earlier byte offsets stay valid.
+    edits.sort_by_key(|(start, _, _)| *start);
+    let mut out = compiled.to_string();
+    for (start, end, replacement) in edits.into_iter().rev() {
+        out.replace_range(start as usize..end as usize, &replacement);
+    }
+    out
+}
+
+/// Walk a compiled program for `styles:` array properties and record a span-edit
+/// per string-literal element (the FULL literal span, so the surrounding quotes are
+/// replaced too — the optimized content is re-quoted with the literal's own quote
+/// style).
+fn collect_styles_edits(program: &Program, edits: &mut Vec<(u32, u32, String)>) {
+    for stmt in &program.body {
+        walk_statement_for_styles(stmt, edits);
+    }
+}
+
+fn walk_statement_for_styles(stmt: &Statement, edits: &mut Vec<(u32, u32, String)>) {
+    use oxc_ast::ast::Declaration;
+    match stmt {
+        Statement::ExpressionStatement(e) => walk_expr_for_styles(&e.expression, edits),
+        Statement::VariableDeclaration(v) => {
+            for d in &v.declarations {
+                if let Some(init) = &d.init {
+                    walk_expr_for_styles(init, edits);
+                }
+            }
+        }
+        Statement::ClassDeclaration(c) => walk_class_for_styles(c, edits),
+        Statement::ExportNamedDeclaration(e) => {
+            if let Some(Declaration::ClassDeclaration(c)) = &e.declaration {
+                walk_class_for_styles(c, edits);
+            }
+            if let Some(Declaration::VariableDeclaration(v)) = &e.declaration {
+                for d in &v.declarations {
+                    if let Some(init) = &d.init {
+                        walk_expr_for_styles(init, edits);
+                    }
+                }
+            }
+        }
+        Statement::ExportDefaultDeclaration(_) => {}
+        _ => {}
+    }
+}
+
+/// A class may carry `static ɵcmp = i0.ɵɵdefineComponent({ styles: [...] })` as a
+/// member (the `class X { static ɵcmp = … }` shape ng-packagr emits) — walk member
+/// initializers too.
+fn walk_class_for_styles(class: &Class, edits: &mut Vec<(u32, u32, String)>) {
+    for member in &class.body.body {
+        if let oxc_ast::ast::ClassElement::PropertyDefinition(p) = member
+            && let Some(value) = &p.value
+        {
+            walk_expr_for_styles(value, edits);
+        }
+    }
+}
+
+fn walk_expr_for_styles(expr: &Expression, edits: &mut Vec<(u32, u32, String)>) {
+    match expr {
+        Expression::CallExpression(call) => {
+            for arg in &call.arguments {
+                if let Some(e) = arg.as_expression() {
+                    walk_expr_for_styles(e, edits);
+                }
+            }
+        }
+        // `BoxComponent.ɵcmp = i0.ɵɵdefineComponent({ styles: [...] })` — the
+        // definition lives on the RHS of a static-field assignment statement.
+        Expression::AssignmentExpression(assign) => {
+            walk_expr_for_styles(&assign.right, edits);
+        }
+        Expression::ObjectExpression(obj) => {
+            for prop in &obj.properties {
+                if let ObjectPropertyKind::ObjectProperty(op) = prop {
+                    if key_name(&op.key) == Some("styles") {
+                        record_styles_array(&op.value, edits);
+                    } else {
+                        // Recurse into nested object/array values (defensive).
+                        walk_expr_for_styles(&op.value, edits);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Record a span-edit for each string-literal element of a `styles:` array value.
+fn record_styles_array(value: &Expression, edits: &mut Vec<(u32, u32, String)>) {
+    use oxc_span::GetSpan;
+    let Expression::ArrayExpression(arr) = value else {
+        return;
+    };
+    for el in &arr.elements {
+        let Some(expr) = el.as_expression() else { continue };
+        match expr {
+            Expression::StringLiteral(lit) => {
+                // No trailing newline: esbuild appends one, but Angular's FULL-mode
+                // scoping (which treaty applies, and which ng-packagr's `full`
+                // compilationMode applies) strips trailing whitespace from the
+                // scoped CSS — so the emitted `styles` literal ends at `}` exactly
+                // as ng-packagr's full-mode FESM does (`".box[…]{…}"`).
+                let optimized = crate::css_optimizer::optimize(&lit.value);
+                let span = lit.span;
+                edits.push((span.start, span.end, quote_css(&optimized)));
+            }
+            Expression::TemplateLiteral(tpl)
+                if tpl.expressions.is_empty() && tpl.quasis.len() == 1 =>
+            {
+                if let Some(cooked) = tpl.quasis[0].value.cooked.as_ref() {
+                    let optimized = crate::css_optimizer::optimize(cooked);
+                    let span = tpl.span();
+                    edits.push((span.start, span.end, quote_css(&optimized)));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Wrap optimized CSS in a double-quoted JS string literal, escaping the
+/// characters that must not appear raw (`"`, `\`, newlines). The optimizer collapses
+/// CSS whitespace so embedded newlines are rare, but escape defensively.
+fn quote_css(css: &str) -> String {
+    let mut out = String::with_capacity(css.len() + 2);
+    out.push('"');
+    for c in css.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn optimize_compiled_styles_minifies_define_component_styles() {
+        // A realistic AOT-compiled component carrying a SCOPED inline style, with
+        // the barred-o `ɵ` member names treaty_ivy emits.
+        let compiled = "import * as i0 from \"@angular/core\";\n\
+            class BoxComponent {}\n\
+            BoxComponent.\u{0275}cmp = i0.\u{0275}\u{0275}defineComponent({\n\
+              type: BoxComponent,\n\
+              selectors: [[\"acme-box\"]],\n\
+              styles: [\".box[_ngcontent-%COMP%] {\\n  color: blue;\\n  margin: 0px;\\n}\"]\n\
+            });\n\
+            export { BoxComponent };\n";
+        let out = optimize_compiled_styles(compiled);
+        assert_ne!(out, compiled, "optimizer must rewrite the styles array");
+        assert!(out.contains("color:#00f"), "color not minified:\n{out}");
+        assert!(out.contains("margin:0"), "zero unit not stripped:\n{out}");
+        assert!(out.contains("[_ngcontent-%COMP%]"), "placeholder lost:\n{out}");
+        // The Ivy structure is otherwise preserved verbatim.
+        assert!(out.contains("\u{0275}\u{0275}defineComponent"), "define lost:\n{out}");
+        assert!(out.contains("export { BoxComponent };"), "export lost:\n{out}");
+    }
 
     #[test]
     fn scss_is_compiled_to_css() {
