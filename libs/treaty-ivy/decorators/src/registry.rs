@@ -9,13 +9,19 @@
 //! The per-FILE driver in `source_compile` (in the facade crate `treaty_ivy`) scans every decorated class and dispatches
 //! each one through [`DecoratorRegistry::for_kind`] → [`DecoratorCompiler::compile`] instead of a
 //! hand-written `match`, so **adding a decorator kind is a registration, not an edit**. The
-//! concrete plugins live next to the oxc metadata extraction they delegate to (in
-//! `source_compile`), exactly as the authoring plugins live next to their format delegations.
+//! concrete plugins live next to the metadata extraction they delegate to (in `source_compile`),
+//! exactly as the authoring plugins live next to their format delegations.
+//!
+//! The plugin-facing surface ([`ClassMeta`]) is the engine-NEUTRAL parse IR
+//! ([`treaty_ivy_core::neutral`]), so this crate's PUBLIC API borrows NO live oxc AST node. The live
+//! AST a plugin's transitional metadata walk still needs travels through [`ClassMeta::live`], an
+//! OPAQUE caller-defined handle this crate never inspects (the facade fixes it to its live-oxc
+//! context). When that walk is fully ported to the neutral IR the handle becomes inert (`L = ()`).
 //!
 //! This is a structural refactor: the emitted definition is byte-identical to the prior
 //! `match kind { … }` dispatch.
 
-use oxc_ast::ast::{Class, Decorator, ObjectExpression};
+use treaty_ivy_core::neutral::{ClassWithDecorators, DecoratorInfo, ObjLit};
 
 use crate::factory::R3FactoryMetadata;
 use crate::output_ast::{self as o, Expr, ParseSourceSpan};
@@ -32,17 +38,29 @@ pub enum AngularDecoratorKind {
     Injectable,
 }
 
-/// One decorated class, as handed to a [`DecoratorCompiler`]. Borrows the oxc nodes (the `class`
-/// declaration and its leading `decorator`), the decorator's options object (`@Foo({...})` →
-/// `Some(obj)`; bare `@Foo` → `None`), and carries the class name + the original-source span of the
-/// class identifier (the anchor the additive source map maps the emitted `type: <ClassName>` back
-/// to).
-pub struct ClassMeta<'a> {
-    pub class: &'a Class<'a>,
-    pub decorator: &'a Decorator<'a>,
-    pub object: Option<&'a ObjectExpression<'a>>,
+/// One decorated class, as handed to a [`DecoratorCompiler`].
+///
+/// The decorator-facing surface is the engine-NEUTRAL parse IR ([`ClassWithDecorators`] /
+/// [`DecoratorInfo`] / [`ObjLit`]) so this crate's PUBLIC API borrows no live oxc AST node: `class`
+/// is the pre-lowered class (name + decorators + members), `decorator` the recognized leading
+/// decorator, and `object` its options object (`@Foo({...})` → `Some(obj)`; bare `@Foo` → `None`).
+/// `class_name` + `class_name_span` carry the class identifier name + its original-source span (the
+/// anchor the additive source map maps the emitted `type: <ClassName>` back to).
+///
+/// `live` is an OPAQUE, caller-defined handle (`L`) this crate never inspects. The facade (the only
+/// consumer) sets it to its own live-oxc context so a [`DecoratorCompiler`] plugin can still run the
+/// byte-identical metadata walk against the live AST during the wide-port transition
+/// (SWC-BACKEND-PLAN.md §3.2 phase 3). Because the type is generic, NO oxc type appears in this
+/// crate's API; when the walk is fully ported to the neutral IR, callers set `L = ()` and the handle
+/// becomes inert.
+pub struct ClassMeta<'a, L: ?Sized = ()> {
+    pub class: &'a ClassWithDecorators,
+    pub decorator: &'a DecoratorInfo,
+    pub object: Option<&'a ObjLit>,
     pub class_name: String,
     pub class_name_span: ParseSourceSpan,
+    /// Opaque caller-defined live-AST handle (see the type note). The decorators crate never reads it.
+    pub live: &'a L,
 }
 
 /// Host-resolved external content for ONE `@Component` class: the template string its `templateUrl`
@@ -202,24 +220,29 @@ pub struct CompiledDef {
 /// decomposed Ivy definition ([`CompiledDef`]). The [`DecoratorRegistry`] dispatches to a plugin by
 /// the [`AngularDecoratorKind`] it claims via [`DecoratorCompiler::kind`]. Mirrors
 /// `apps/rust/authoring::AuthoringPlugin`.
-pub trait DecoratorCompiler {
+///
+/// Generic over the caller's opaque live-AST handle `L` (see [`ClassMeta::live`]): a registry's
+/// plugins share one `L`, fixed by the caller (the facade sets it to its live-oxc context). This crate
+/// never names or inspects `L`, so its public API stays free of engine types.
+pub trait DecoratorCompiler<L: ?Sized = ()> {
     /// The decorator kind this plugin compiles.
     fn kind(&self) -> AngularDecoratorKind;
 
     /// Compile one decorated class into its decomposed Ivy definition, or a fatal diagnostic
     /// (`Err`) when the class carries metadata the front-end cannot model yet.
-    fn compile(&self, class: &ClassMeta, ctx: &CompileCtx) -> Result<CompiledDef, String>;
+    fn compile(&self, class: &ClassMeta<L>, ctx: &CompileCtx) -> Result<CompiledDef, String>;
 }
 
 /// A registry of [`DecoratorCompiler`] plugins, one per [`AngularDecoratorKind`].
 ///
 /// The per-file driver resolves the plugin for each decorated class's kind via [`Self::for_kind`]
-/// and calls [`DecoratorCompiler::compile`]. Mirrors `apps/rust/authoring::AuthoringRegistry`.
-pub struct DecoratorRegistry {
-    plugins: Vec<Box<dyn DecoratorCompiler>>,
+/// and calls [`DecoratorCompiler::compile`]. Mirrors `apps/rust/authoring::AuthoringRegistry`. Generic
+/// over the shared opaque live-AST handle `L` (see [`DecoratorCompiler`]).
+pub struct DecoratorRegistry<L: ?Sized = ()> {
+    plugins: Vec<Box<dyn DecoratorCompiler<L>>>,
 }
 
-impl DecoratorRegistry {
+impl<L: ?Sized> DecoratorRegistry<L> {
     /// An empty registry (no plugins).
     pub fn new() -> Self {
         Self { plugins: Vec::new() }
@@ -228,12 +251,12 @@ impl DecoratorRegistry {
     /// Register a decorator-compiler plugin. The LAST plugin registered for a given kind wins on
     /// [`Self::for_kind`] lookup (registration order otherwise does not matter, since each kind is
     /// dispatched independently).
-    pub fn register(&mut self, plugin: Box<dyn DecoratorCompiler>) {
+    pub fn register(&mut self, plugin: Box<dyn DecoratorCompiler<L>>) {
         self.plugins.push(plugin);
     }
 
     /// Look up the plugin that compiles `kind`, if any is registered.
-    pub fn for_kind(&self, kind: AngularDecoratorKind) -> Option<&dyn DecoratorCompiler> {
+    pub fn for_kind(&self, kind: AngularDecoratorKind) -> Option<&dyn DecoratorCompiler<L>> {
         self.plugins
             .iter()
             .rev()
@@ -242,7 +265,7 @@ impl DecoratorRegistry {
     }
 }
 
-impl Default for DecoratorRegistry {
+impl<L: ?Sized> Default for DecoratorRegistry<L> {
     fn default() -> Self {
         Self::new()
     }
@@ -260,6 +283,7 @@ mod tests {
             self.0
         }
         fn compile(&self, _c: &ClassMeta, _ctx: &CompileCtx) -> Result<CompiledDef, String> {
+            // The default `L = ()` handle keeps the stub free of any live-AST type.
             Err("stub".to_string())
         }
     }
@@ -284,7 +308,9 @@ mod tests {
 
     #[test]
     fn for_kind_unregistered_is_none() {
-        let registry = DecoratorRegistry::new();
+        // No plugin is registered, so the live-handle type cannot be inferred — pin the default
+        // (inert) `L = ()` explicitly.
+        let registry: DecoratorRegistry = DecoratorRegistry::new();
         assert!(registry.for_kind(AngularDecoratorKind::NgModule).is_none());
     }
 

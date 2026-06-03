@@ -62,121 +62,27 @@ pub enum SourceKind<'a> {
     ByFilename(&'a str),
 }
 
-/// An engine-neutral byte range `[start, end)` into the original source. Absolute byte offsets on the
-/// oxc backend; recover the covered text via [`ParseBackend::span_text`] rather than slicing directly
-/// (the swc backend's `BytePos` are `SourceMap`-relative).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct TreatySpan {
-    pub start: u32,
-    pub end: u32,
-}
+/// The engine-neutral PARSE IR types — moved to `treaty_ivy_core::neutral` so the decorator →
+/// definition layer (`treaty_ivy_decorators`) can name them through its public API
+/// (`treaty_ivy_decorators::registry::ClassMeta`) without an oxc dependency. Re-exported from their
+/// historical `crate::parse::*` paths here so every facade call site and the swc backend keep
+/// resolving unchanged. The parse-channel types (`SourceKind`, `ImportInfo`, `NgDeclareCall`,
+/// `ParseOutput`, `ParseBackend`) stay defined in this module — they describe the parse SEAM, not the
+/// decorator surface.
+pub use treaty_ivy_core::neutral::{
+    ClassWithDecorators, DecoratorInfo, LitValue, MemberInfo, MemberKind, NArg, NArrayElement,
+    NArrowBody, NCtorParam, NExpr, NObjectProp, NParam, NStmt, NVarDeclarator, ObjLit, TreatySpan,
+};
 
-impl TreatySpan {
-    pub fn new(start: u32, end: u32) -> Self {
-        Self { start, end }
-    }
-}
-
-/// An engine-neutral object-literal: its properties in SOURCE order plus the literal's own span.
-///
-/// Source order is load-bearing — Angular copies several metadata blobs (`host`, `animations`, …)
-/// through preserving authoring order, so the emit is only byte-identical if the walk preserves it.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct ObjLit {
-    /// `(key, value)` pairs in the order they appear in the source object literal. Only
-    /// object-property entries with a static (identifier / string-literal) key are captured here;
-    /// spreads and computed keys are dropped (they never appear in the metadata the front-end reads).
-    pub props: Vec<(String, LitValue)>,
-    /// The byte span of the whole `{ … }` literal.
-    pub span: TreatySpan,
-}
-
-impl ObjLit {
-    /// The value of the property named `name`, if present (first match in source order).
-    pub fn get(&self, name: &str) -> Option<&LitValue> {
-        self.props
-            .iter()
-            .find(|(k, _)| k == name)
-            .map(|(_, v)| v)
-    }
-}
-
-/// An engine-neutral literal/expression value pre-lowered from the parsed AST. Covers the subset of
-/// expression shapes the facade's object-literal metadata walk reads structurally; richer expression
-/// shapes (arrow/function bodies, member chains, calls) that flow into `output_ast` conversion remain
-/// handled against the live AST in the `oxc` backend.
+/// A top-level (or inline) IMPORT binding the foreign-import / imported-name collection reads: the
+/// local binding name plus whether it is type-only (`import type` / inline `type`), mirroring
+/// `source_compile::collect_imported_names`.
 #[derive(Debug, Clone, PartialEq)]
-pub enum LitValue {
-    /// A string literal or no-substitution template literal.
-    String(String),
-    /// A numeric literal (kept as the parsed `f64`).
-    Number(f64),
-    /// A boolean literal.
-    Boolean(bool),
-    /// `null`.
-    Null,
-    /// A bare identifier / member-expression name (e.g. `ChangeDetectionStrategy.OnPush` keeps the
-    /// trailing property name; consumers that need the full path use the live-AST escape hatch).
-    Identifier(String),
-    /// An array literal, element values in source order.
-    Array(Vec<LitValue>),
-    /// A nested object literal.
-    Object(ObjLit),
-    /// Any expression shape NOT pre-lowered above (arrow, call, conditional, …). Carries its span so
-    /// the consumer can recover the source text or re-walk the live AST. The variant exists so the
-    /// neutral walk never silently drops a property.
-    Other(TreatySpan),
-}
-
-impl LitValue {
-    /// The string payload, if this is a [`LitValue::String`].
-    pub fn as_str(&self) -> Option<&str> {
-        match self {
-            LitValue::String(s) => Some(s.as_str()),
-            _ => None,
-        }
-    }
-
-    /// The identifier/member name, if this is a [`LitValue::Identifier`].
-    pub fn as_identifier(&self) -> Option<&str> {
-        match self {
-            LitValue::Identifier(s) => Some(s.as_str()),
-            _ => None,
-        }
-    }
-}
-
-/// A pre-lowered Angular DECORATOR on a class: its callee name and (when called with an object
-/// literal) the pre-lowered object argument.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct DecoratorInfo {
-    /// The callee identifier — `Component`, `Directive`, `Pipe`, `NgModule`, `Injectable`, … — for
-    /// both the bare `@Foo` and the call `@Foo({…})` forms.
-    pub name: String,
-    /// The first object-literal argument of `@Foo({…})`, pre-lowered. `None` for a bare `@Foo`.
-    pub object: Option<ObjLit>,
-}
-
-/// A pre-lowered class MEMBER (property or accessor) carrying enough shape for the parts of the walk
-/// that read members structurally (member name + its own decorators). The body/initializer detail the
-/// signal/host/query extraction needs is read against the live AST in the `oxc` backend.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct MemberInfo {
-    /// The member's name, when it is a statically-known identifier/string key.
-    pub name: Option<String>,
-    /// The member's own decorators (`@Input()`, `@Output()`, `@HostBinding(...)`, …), pre-lowered.
-    pub decorators: Vec<DecoratorInfo>,
-}
-
-/// A pre-lowered class carrying an Angular decorator: name + its decorators + its members.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct ClassWithDecorators {
-    /// The class identifier, if present.
-    pub name: Option<String>,
-    /// The class's leading decorators in source order.
-    pub decorators: Vec<DecoratorInfo>,
-    /// The class's members in source order.
-    pub members: Vec<MemberInfo>,
+pub struct ImportInfo {
+    /// The local binding name (`import { Foo as Bar }` → `Bar`; default / namespace → its local).
+    pub local_name: String,
+    /// Whether this binding is type-only (whole-declaration `import type` or inline `{ type Foo }`).
+    pub type_only: bool,
 }
 
 /// A pre-lowered `ɵɵngDeclare*({…})` call discovered in a partial-declaration module: which kind of
@@ -200,6 +106,8 @@ pub struct ParseOutput {
     pub classes: Vec<ClassWithDecorators>,
     /// `ɵɵngDeclare*({…})` calls found anywhere in the module, in source order.
     pub ng_declare_calls: Vec<NgDeclareCall>,
+    /// Top-level `import` bindings (foreign-import / imported-name surface), in source order.
+    pub imports: Vec<ImportInfo>,
     /// Parse diagnostics; non-empty means the parse failed and `classes`/`ng_declare_calls` are empty.
     pub errors: Vec<String>,
 }
@@ -243,8 +151,11 @@ pub trait ParseBackend {
 // The `ParsingBackend` alias the front-end imports stays on [`oxc::OxcParseBackend`] for now even
 // under `--features swc`, because the facade's AOT/linker walks still reach the LIVE oxc `Program`
 // through [`oxc::OxcModule::program`] — `compile_program_with_source` (in `crate::source_compile`)
-// and the `treaty_ivy_decorators::ClassMeta<'a>` API are oxc-typed. Flipping the alias to the swc
-// backend is gated on first neutralizing those walks (SWC-BACKEND-PLAN.md §3.2 phase 3 — the wide
+// drives the walk against live oxc nodes. The `treaty_ivy_decorators::ClassMeta` PUBLIC API is now
+// engine-NEUTRAL (it carries `ClassWithDecorators`/`DecoratorInfo`/`ObjLit`, re-exported from
+// `treaty_ivy_core::neutral`); the live oxc nodes the AOT plugins still walk ride through that struct
+// only as an OPAQUE, facade-private `ClassMeta::live` handle. Flipping the alias to the swc backend is
+// gated on porting that walk to consume the neutral IR (SWC-BACKEND-PLAN.md §3.2 phase 3 — the wide
 // port); until then the swc backend is exercised through the parity gate, not the alias, so BOTH the
 // default and the `--features swc` builds compile against the same oxc-driven walk.
 // ---------------------------------------------------------------------------
@@ -329,6 +240,46 @@ class MComponent {
   @HostListener("window:resize") onResize() {}
   @Input() set value(v) {}
   get value() { return 1; }
+}
+"#,
+        // CONSTRUCTOR DEPENDENCIES + parameter decorators: TS parameter properties (`private a: A`)
+        // and explicit `@Inject`/`@Optional` param decorators — the surface ctor-dep extraction reads.
+        // swc models param props as `TsParamProp`, oxc as a `FormalParameter` w/ accessibility; both
+        // must yield the same neutral `NCtorParam` (name + decorators).
+        r#"
+import { Component, Inject } from "@angular/core";
+import type { Foo } from "./foo";
+import Default, { Named as Aliased, type TypeOnly } from "./mixed";
+import * as ns from "./ns";
+@Component({ selector: "app-di", template: "" })
+export class DiComponent {
+  constructor(
+    private a: A,
+    @Inject(TOKEN) @Optional() public b: B,
+    readonly c: C,
+  ) {}
+}
+"#,
+        // MEMBER INITIALIZERS exercising the full neutral expression surface: signal `input()` /
+        // query `viewChild()` calls, `new`, member access, computed member, conditional,
+        // binary + logical + unary, array (with spread), object (with spread + computed key), and an
+        // arrow `@Input({transform})`. Drives signal/query detection off the initializer.
+        r#"
+@Component({ selector: "app-sig", template: "" })
+export class SigComponent {
+  count = input(0);
+  name = input.required<string>();
+  first = viewChild("ref");
+  emitter = new EventEmitter<number>();
+  ref = this.svc.thing;
+  idx = arr[0];
+  flag = (a && b) || !c;
+  sum = x + y * 2 - 1;
+  cond = ready ? 1 : 0;
+  list = [1, ...rest, 2];
+  cfg = { a: 1, ["b-c"]: 2, ...defaults };
+  @Input({ transform: (v) => v == null ? 0 : numberAttribute(v) }) value = 0;
+  @Input({ transform: function (v) { const n = Number(v); return n; } }) other = 0;
 }
 "#,
     ];
@@ -453,6 +404,181 @@ export class C {
 "#,
             SourceKind::TypeScriptModule,
         );
+    }
+
+    /// The NEW full-surface neutral nodes (constructor params + member initializers + decorator
+    /// arguments + the import list + the `NExpr`/`NStmt` trees) are populated BYTE-IDENTICALLY by both
+    /// backends. The whole `ParseOutput` (which now embeds all of them) derives `PartialEq`, so the
+    /// shared `assert_parity` already covers every case in `SOURCE_CORPUS`; this test additionally
+    /// asserts the richer fields are actually FILLED (not silently empty on one side) so the parity is
+    /// meaningful, and pins the cross-engine shapes the later walk-switch depends on.
+    #[test]
+    fn parse_parity_full_surface_nodes() {
+        use super::{MemberKind, NArg, NArrowBody, NExpr, NObjectProp, NStmt};
+
+        // Constructor dependencies + parameter decorators + import bindings.
+        let di = r#"
+import { Component, Inject } from "@angular/core";
+import type { Foo } from "./foo";
+import Default, { Named as Aliased, type TypeOnly } from "./mixed";
+@Component({ selector: "app-di", template: "" })
+export class DiComponent {
+  constructor(private a: A, @Inject(TOKEN) @Optional() public b: B) {}
+}
+"#;
+        let o = oxc_summary(di, SourceKind::TypeScriptModule);
+        let s = swc_summary(di, SourceKind::TypeScriptModule);
+        assert_eq!(o, s, "full-surface DI parity");
+
+        // Imports: 5 bindings, with the `import type` whole-decl + inline `type` flagged.
+        let names: Vec<(&str, bool)> = o
+            .imports
+            .iter()
+            .map(|i| (i.local_name.as_str(), i.type_only))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                ("Component", false),
+                ("Inject", false),
+                ("Foo", true),       // whole `import type`
+                ("Default", false),
+                ("Aliased", false),
+                ("TypeOnly", true),  // inline `type`
+            ],
+            "import bindings + type-only flags"
+        );
+
+        // The constructor member carries both params with their decorators.
+        let class = &o.classes[0];
+        let ctor = class
+            .members
+            .iter()
+            .find(|m| m.kind == MemberKind::Constructor)
+            .expect("constructor member present");
+        assert_eq!(ctor.params.len(), 2, "two ctor params");
+        assert_eq!(ctor.params[0].name.as_deref(), Some("a"));
+        assert!(ctor.params[0].decorators.is_empty());
+        assert_eq!(ctor.params[1].name.as_deref(), Some("b"));
+        let dec_names: Vec<&str> = ctor.params[1]
+            .decorators
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect();
+        assert_eq!(dec_names, vec!["Inject", "Optional"], "param decorators");
+        // `@Inject(TOKEN)` argument captured as an identifier expression.
+        match &ctor.params[1].decorators[0].arguments[..] {
+            [NArg::Expr(NExpr::Identifier(tok))] => assert_eq!(tok, "TOKEN"),
+            other => panic!("unexpected @Inject args: {other:?}"),
+        }
+
+        // Member initializers exercising the full NExpr surface.
+        let sig = r#"
+@Component({ selector: "app-sig", template: "" })
+export class SigComponent {
+  count = input(0);
+  flag = a && b;
+  cond = ready ? 1 : 0;
+  list = [1, ...rest];
+  cfg = { a: 1, ["b-c"]: 2, ...defaults };
+  @Input({ transform: (v) => v == null ? 0 : f(v) }) value = 0;
+  @Input({ transform: function (v) { const n = g(v); return n; } }) other = 0;
+}
+"#;
+        let o = oxc_summary(sig, SourceKind::TypeScriptModule);
+        let s = swc_summary(sig, SourceKind::TypeScriptModule);
+        assert_eq!(o, s, "full-surface initializer parity");
+        let m = &o.classes[0].members;
+        let init = |name: &str| {
+            m.iter()
+                .find(|x| x.name.as_deref() == Some(name))
+                .and_then(|x| x.initializer.as_ref())
+                .unwrap_or_else(|| panic!("initializer for {name}"))
+        };
+        // `input(0)` — a call expression with one numeric arg.
+        match init("count") {
+            NExpr::Call { callee, args } => {
+                assert!(matches!(&**callee, NExpr::Identifier(n) if n == "input"));
+                assert!(matches!(args.as_slice(), [NArg::Expr(NExpr::Number(_))]));
+            }
+            other => panic!("count init: {other:?}"),
+        }
+        // `a && b` — logical operator folds into the unified Binary node with the `&&` spelling.
+        match init("flag") {
+            NExpr::Binary { op, .. } => assert_eq!(op, "&&"),
+            other => panic!("flag init: {other:?}"),
+        }
+        // `ready ? 1 : 0` — conditional.
+        assert!(matches!(init("cond"), NExpr::Conditional { .. }));
+        // `[1, ...rest]` — array with a spread element.
+        match init("list") {
+            NExpr::Array(elems) => {
+                assert!(matches!(elems[0], super::NArrayElement::Expr(NExpr::Number(_))));
+                assert!(matches!(elems[1], super::NArrayElement::Spread(_)));
+            }
+            other => panic!("list init: {other:?}"),
+        }
+        // `{ a: 1, ['b-c']: 2, ...defaults }` — object with a computed string key + spread.
+        match init("cfg") {
+            NExpr::Object(props) => {
+                assert!(matches!(&props[0], NObjectProp::KeyValue { key, computed, .. } if key == "a" && !*computed));
+                assert!(matches!(&props[1], NObjectProp::KeyValue { key, quoted, computed, .. } if key == "b-c" && *quoted && *computed));
+                assert!(matches!(&props[2], NObjectProp::Spread(_)));
+            }
+            other => panic!("cfg init: {other:?}"),
+        }
+        // The `transform` arrow `(v) => v == null ? 0 : f(v)` carried through the decorator's object.
+        let value_dec = m
+            .iter()
+            .find(|x| x.name.as_deref() == Some("value"))
+            .unwrap()
+            .decorators[0]
+            .object
+            .as_ref()
+            .unwrap();
+        // The arrow is a richer-than-literal value; the structural `ObjLit` records it as `Other`, but
+        // the decorator's full `arguments` carry the real `NExpr::Arrow`.
+        let _ = value_dec;
+        let value_args = &m
+            .iter()
+            .find(|x| x.name.as_deref() == Some("value"))
+            .unwrap()
+            .decorators[0]
+            .arguments;
+        match &value_args[..] {
+            [NArg::Expr(NExpr::Object(props))] => {
+                let transform = props.iter().find_map(|p| match p {
+                    NObjectProp::KeyValue { key, value, .. } if key == "transform" => Some(value),
+                    _ => None,
+                });
+                assert!(matches!(transform, Some(NExpr::Arrow { body, .. }) if matches!(&**body, NArrowBody::Expr(_))));
+            }
+            other => panic!("@Input value args: {other:?}"),
+        }
+        // The `function (v) { const n = g(v); return n; }` transform — a function body with a
+        // var-decl statement + a return statement.
+        let other_args = &m
+            .iter()
+            .find(|x| x.name.as_deref() == Some("other"))
+            .unwrap()
+            .decorators[0]
+            .arguments;
+        match &other_args[..] {
+            [NArg::Expr(NExpr::Object(props))] => {
+                let transform = props.iter().find_map(|p| match p {
+                    NObjectProp::KeyValue { key, value, .. } if key == "transform" => Some(value),
+                    _ => None,
+                });
+                match transform {
+                    Some(NExpr::Function { body, .. }) => {
+                        assert!(matches!(body[0], NStmt::VarDecl { is_const: true, .. }));
+                        assert!(matches!(body[1], NStmt::Return(Some(_))));
+                    }
+                    other => panic!("other transform: {other:?}"),
+                }
+            }
+            other => panic!("@Input other args: {other:?}"),
+        }
     }
 
     /// `span_text` recovers the IDENTICAL source slice on both backends for a captured object span.

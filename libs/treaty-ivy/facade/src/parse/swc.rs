@@ -37,16 +37,18 @@
 
 use swc_atoms::Wtf8Atom;
 use swc_common::sync::Lrc;
-use swc_common::{BytePos, FileName, Globals, SourceMap, Span, GLOBALS};
+use swc_common::{BytePos, FileName, Globals, SourceMap, Span, Spanned, GLOBALS};
 use swc_ecma_ast::{
-    ClassMember, Decl, DefaultDecl, Decorator, EsVersion, Expr, Lit, MemberProp, ModuleDecl,
-    ModuleItem, Program, Prop, PropName, PropOrSpread, Stmt,
+    ArrowExpr, BlockStmtOrExpr, Callee, ClassMember, Decl, DefaultDecl, Decorator, EsVersion, Expr,
+    ExprOrSpread, Function, ImportSpecifier, Lit, MemberProp, MethodKind, ModuleDecl, ModuleItem,
+    Param, ParamOrTsParamProp, Pat, Program, Prop, PropName, PropOrSpread, Stmt, VarDeclKind,
 };
 use swc_ecma_parser::{parse_file_as_program, Syntax, TsSyntax};
 
 use super::{
-    ClassWithDecorators, DecoratorInfo, LitValue, MemberInfo, NgDeclareCall, ObjLit, ParseBackend,
-    ParseOutput, SourceKind, TreatySpan,
+    ClassWithDecorators, DecoratorInfo, ImportInfo, LitValue, MemberInfo, MemberKind, NArg,
+    NArrayElement, NArrowBody, NCtorParam, NExpr, NObjectProp, NParam, NStmt, NVarDeclarator,
+    NgDeclareCall, ObjLit, ParseBackend, ParseOutput, SourceKind, TreatySpan,
 };
 
 /// The swc parse backend. Zero-sized; a fresh `GLOBALS` scope + `SourceMap` is created per
@@ -58,10 +60,13 @@ pub struct SwcParseBackend;
 /// The borrowed parsed-module handle the [`ParseBackend::parse_module`] callback receives. Wraps the
 /// owned swc `Program` and the pre-lowered engine-neutral [`ParseOutput`].
 ///
-/// Unlike [`super::oxc::OxcModule`] there is no oxc `Program` to expose — the facade walks that still
-/// need the live AST (the oxc-typed `compile_program_with_source` / `ClassMeta` path) are not yet
-/// neutralized (SWC-BACKEND-PLAN.md §3.2 phase 3), so under this backend they are unreachable. The
-/// neutral [`Self::summary`] is the contract the parity gate checks.
+/// Unlike [`super::oxc::OxcModule`] there is no oxc `Program` to expose — the facade walk that still
+/// needs the live AST (`compile_program_with_source`, and the live-oxc handle the AOT driver threads
+/// opaquely through `treaty_ivy_decorators::ClassMeta::live`) is not yet neutralized
+/// (SWC-BACKEND-PLAN.md §3.2 phase 3), so under this backend it is unreachable. Note the
+/// `ClassMeta` PUBLIC surface is now engine-neutral; what stays oxc-typed is only the facade-private
+/// live handle that rides through it. The neutral [`Self::summary`] is the contract the parity gate
+/// checks.
 pub struct SwcModule {
     /// The owned swc program — the escape hatch for a future neutral walk over swc nodes.
     pub program: Program,
@@ -115,6 +120,7 @@ impl ParseBackend for SwcParseBackend {
                     summary: ParseOutput {
                         classes: Vec::new(),
                         ng_declare_calls: Vec::new(),
+                        imports: Vec::new(),
                         errors: errors.iter().map(|e| format!("{:?}", e.kind())).collect(),
                     },
                 },
@@ -127,6 +133,7 @@ impl ParseBackend for SwcParseBackend {
                     summary: ParseOutput {
                         classes: Vec::new(),
                         ng_declare_calls: Vec::new(),
+                        imports: Vec::new(),
                         errors: vec![format!("{:?}", e.kind())],
                     },
                 },
@@ -204,11 +211,12 @@ fn span_of(span: Span, base: u32) -> TreatySpan {
 fn lower_program(program: &Program, base: u32) -> ParseOutput {
     let mut classes = Vec::new();
     let mut ng_declare_calls = Vec::new();
+    let mut imports = Vec::new();
 
     match program {
         Program::Module(module) => {
             for item in &module.body {
-                lower_top_level_item(item, base, &mut classes, &mut ng_declare_calls);
+                lower_top_level_item(item, base, &mut classes, &mut ng_declare_calls, &mut imports);
             }
         }
         Program::Script(script) => {
@@ -221,16 +229,19 @@ fn lower_program(program: &Program, base: u32) -> ParseOutput {
     ParseOutput {
         classes,
         ng_declare_calls,
+        imports,
         errors: Vec::new(),
     }
 }
 
-/// Handle a module-level item: a statement, or an `export`/`export default` wrapping a class.
+/// Handle a module-level item: a statement, an `export`/`export default` wrapping a class, or an
+/// `import` declaration (whose bindings feed the neutral import surface).
 fn lower_top_level_item(
     item: &ModuleItem,
     base: u32,
     classes: &mut Vec<ClassWithDecorators>,
     ng_declares: &mut Vec<NgDeclareCall>,
+    imports: &mut Vec<ImportInfo>,
 ) {
     match item {
         ModuleItem::Stmt(stmt) => lower_top_level_stmt(stmt, base, classes, ng_declares),
@@ -252,7 +263,27 @@ fn lower_top_level_item(
             // `export default ɵɵngDeclare*({...})` as a free expression.
             push_if_ng_declare(&export.expr, base, ng_declares);
         }
+        ModuleItem::ModuleDecl(ModuleDecl::Import(import)) => {
+            collect_import(import, imports);
+        }
         _ => {}
+    }
+}
+
+/// Collect the local binding names of an `import` declaration (skipping whole-declaration and inline
+/// `type`-only specifiers), mirroring the oxc backend's `collect_imports_in_stmt`.
+fn collect_import(import: &swc_ecma_ast::ImportDecl, out: &mut Vec<ImportInfo>) {
+    let type_only_decl = import.type_only;
+    for spec in &import.specifiers {
+        let (local, inline_type) = match spec {
+            ImportSpecifier::Named(s) => (s.local.sym.to_string(), s.is_type_only),
+            ImportSpecifier::Default(s) => (s.local.sym.to_string(), false),
+            ImportSpecifier::Namespace(s) => (s.local.sym.to_string(), false),
+        };
+        out.push(ImportInfo {
+            local_name: local,
+            type_only: type_only_decl || inline_type,
+        });
     }
 }
 
@@ -351,29 +382,145 @@ fn lower_class(name: Option<String>, class: &swc_ecma_ast::Class, base: u32) -> 
 /// Static blocks / TS index signatures / private members yield an UN-NAMED member (`Some(default)`),
 /// matching oxc, which still produces a class element for them (its `key_name` just returns `None`).
 fn lower_member(member: &ClassMember, base: u32) -> Option<MemberInfo> {
-    let (name, decorators): (Option<String>, &[Decorator]) = match member {
-        ClassMember::ClassProp(p) => (prop_name_str(&p.key), &p.decorators),
-        ClassMember::Method(m) => (prop_name_str(&m.key), &m.function.decorators),
-        ClassMember::Constructor(c) => (prop_name_str(&c.key), &[]),
-        ClassMember::AutoAccessor(a) => (key_str(&a.key), &a.decorators),
+    match member {
+        ClassMember::ClassProp(p) => Some(MemberInfo {
+            name: prop_name_str(&p.key),
+            decorators: p.decorators.iter().map(|d| lower_decorator(d, base)).collect(),
+            kind: MemberKind::Property,
+            is_static: p.is_static,
+            params: Vec::new(),
+            initializer: p.value.as_deref().map(|e| lower_expr(e, base)),
+        }),
+        ClassMember::Method(m) => Some(MemberInfo {
+            name: prop_name_str(&m.key),
+            decorators: m
+                .function
+                .decorators
+                .iter()
+                .map(|d| lower_decorator(d, base))
+                .collect(),
+            kind: match m.kind {
+                MethodKind::Method => MemberKind::Method,
+                MethodKind::Getter => MemberKind::Getter,
+                MethodKind::Setter => MemberKind::Setter,
+            },
+            is_static: m.is_static,
+            params: lower_fn_ctor_params(&m.function.params, base),
+            initializer: None,
+        }),
+        ClassMember::Constructor(c) => Some(MemberInfo {
+            name: prop_name_str(&c.key),
+            decorators: Vec::new(),
+            kind: MemberKind::Constructor,
+            is_static: false,
+            params: lower_constructor_params(&c.params, base),
+            initializer: None,
+        }),
+        ClassMember::AutoAccessor(a) => Some(MemberInfo {
+            name: key_str(&a.key),
+            decorators: a.decorators.iter().map(|d| lower_decorator(d, base)).collect(),
+            kind: MemberKind::Accessor,
+            is_static: a.is_static,
+            params: Vec::new(),
+            initializer: a.value.as_deref().map(|e| lower_expr(e, base)),
+        }),
         // A stray `;` (`constructor() {};`) is parsed by swc as an `Empty` member but DISCARDED by oxc
         // — drop it so the neutral member list is element-for-element identical.
-        ClassMember::Empty(_) => return None,
+        ClassMember::Empty(_) => None,
         // StaticBlock / TsIndexSignature / PrivateMethod / PrivateProp: oxc still emits a (nameless)
         // class element for these, so emit an un-named member to keep the counts aligned.
-        _ => return Some(MemberInfo::default()),
-    };
-    Some(MemberInfo {
-        name,
-        decorators: decorators.iter().map(|d| lower_decorator(d, base)).collect(),
-    })
+        _ => Some(MemberInfo {
+            kind: MemberKind::Other,
+            ..MemberInfo::default()
+        }),
+    }
 }
 
-/// Lower a decorator to the neutral [`DecoratorInfo`] (callee name + first object-literal argument).
+/// Lower a method/function's `Vec<Param>` to neutral [`NCtorParam`]s (name + own decorators + rest
+/// flag). A `...rest` is a `Pat::Rest` here (oxc stores it out of `items`); the [`NCtorParam::is_rest`]
+/// flag + the inner binding name keep the neutral list aligned with the oxc backend.
+fn lower_fn_ctor_params(params: &[Param], base: u32) -> Vec<NCtorParam> {
+    params
+        .iter()
+        .map(|p| {
+            let (name, is_rest) = pat_name_and_rest(&p.pat);
+            NCtorParam {
+                name,
+                decorators: p.decorators.iter().map(|d| lower_decorator(d, base)).collect(),
+                is_rest,
+            }
+        })
+        .collect()
+}
+
+/// Lower a constructor's `Vec<ParamOrTsParamProp>` to neutral [`NCtorParam`]s. A TS parameter property
+/// (`constructor(private dep: Dep)`) is a `TsParamProp` in swc but a plain `FormalParameter` with an
+/// accessibility modifier in oxc; BOTH expose the binding identifier + decorators, so the neutral form
+/// matches.
+fn lower_constructor_params(params: &[ParamOrTsParamProp], base: u32) -> Vec<NCtorParam> {
+    params
+        .iter()
+        .map(|p| match p {
+            ParamOrTsParamProp::Param(param) => {
+                let (name, is_rest) = pat_name_and_rest(&param.pat);
+                NCtorParam {
+                    name,
+                    decorators: param.decorators.iter().map(|d| lower_decorator(d, base)).collect(),
+                    is_rest,
+                }
+            }
+            // A TS parameter property (`private dep: Dep`) is never a rest param.
+            ParamOrTsParamProp::TsParamProp(prop) => NCtorParam {
+                name: match &prop.param {
+                    swc_ecma_ast::TsParamPropParam::Ident(id) => Some(id.id.sym.to_string()),
+                    swc_ecma_ast::TsParamPropParam::Assign(a) => pat_binding_name(&a.left),
+                },
+                decorators: prop.decorators.iter().map(|d| lower_decorator(d, base)).collect(),
+                is_rest: false,
+            },
+        })
+        .collect()
+}
+
+/// The binding-identifier name of a `Pat`, when it is a plain identifier binding (the only shape the
+/// param-name neutral surface models — matching oxc's `get_binding_identifier`).
+fn pat_binding_name(pat: &Pat) -> Option<String> {
+    match pat {
+        Pat::Ident(id) => Some(id.id.sym.to_string()),
+        _ => None,
+    }
+}
+
+/// The binding name + rest flag of a parameter `Pat`. A `...rest` is `Pat::Rest` in swc (oxc stores it
+/// out of `items`); unwrap to its inner binding identifier and flag it, so the neutral param list
+/// matches the oxc backend's appended-rest representation.
+fn pat_name_and_rest(pat: &Pat) -> (Option<String>, bool) {
+    match pat {
+        Pat::Rest(rest) => (pat_binding_name(&rest.arg), true),
+        other => (pat_binding_name(other), false),
+    }
+}
+
+/// Lower a decorator to the neutral [`DecoratorInfo`] (callee name + first object-literal argument +
+/// full neutral argument list).
 fn lower_decorator(dec: &Decorator, base: u32) -> DecoratorInfo {
     let name = decorator_name(dec).unwrap_or_default().to_string();
     let object = decorator_object(dec).map(|obj| lower_object(obj, base));
-    DecoratorInfo { name, object }
+    let arguments = decorator_arguments(dec, base);
+    DecoratorInfo {
+        name,
+        object,
+        arguments,
+    }
+}
+
+/// The full neutral argument list of a decorator call `@Foo(a, b, …)` (empty for a bare `@Foo`).
+fn decorator_arguments(dec: &Decorator, base: u32) -> Vec<NArg> {
+    if let Expr::Call(call) = &*dec.expr {
+        lower_args(&call.args, base)
+    } else {
+        Vec::new()
+    }
 }
 
 /// Returns the callee identifier name of a decorator's expression — bare `@Foo` or call `@Foo({…})`.
@@ -494,8 +641,248 @@ fn lower_value(expr: &Expr, base: u32) -> LitValue {
 /// `GetSpan`-style trait reachable here without `Spanned`, so we read the span of the shapes we
 /// actually reach; anything else degrades to an empty span (the value is `Other` regardless).
 fn expr_span(expr: &Expr) -> Span {
-    use swc_common::Spanned;
     expr.span()
+}
+
+// ---------------------------------------------------------------------------
+// Neutral EXPRESSION / STATEMENT / PARAM lowering (the full walk surface).
+//
+// Shape-for-shape mirror of `oxc.rs::lower_expr` / `lower_stmt`. swc's `Expr::Bin` already unifies the
+// binary + logical operators (oxc splits `LogicalExpression` out), so both collapse to the same
+// neutral `NExpr::Binary { op }` keyed by the operator's source spelling — engine-identical.
+// ---------------------------------------------------------------------------
+
+/// Lower an swc `Expr` to the neutral [`NExpr`], mirroring the `convert_expr` surface.
+fn lower_expr(expr: &Expr, base: u32) -> NExpr {
+    match expr {
+        Expr::Lit(Lit::Str(s)) => NExpr::String(wtf8_to_string(&s.value)),
+        Expr::Tpl(t) if t.exprs.is_empty() && t.quasis.len() == 1 => {
+            match t.quasis[0].cooked.as_ref() {
+                Some(c) => NExpr::String(wtf8_to_string(c)),
+                None => NExpr::Other(span_of(t.span, base)),
+            }
+        }
+        Expr::Lit(Lit::Num(n)) => NExpr::Number(n.value),
+        Expr::Lit(Lit::Bool(b)) => NExpr::Boolean(b.value),
+        Expr::Lit(Lit::Null(_)) => NExpr::Null,
+        Expr::Ident(id) => NExpr::Identifier(id.sym.to_string()),
+        Expr::Member(m) => match &m.prop {
+            MemberProp::Ident(id) => NExpr::Member {
+                object: Box::new(lower_expr(&m.obj, base)),
+                property: id.sym.to_string(),
+            },
+            MemberProp::Computed(c) => NExpr::ComputedMember {
+                object: Box::new(lower_expr(&m.obj, base)),
+                index: Box::new(lower_expr(&c.expr, base)),
+            },
+            // `obj.#priv` — not part of any converted surface; carry its span.
+            MemberProp::PrivateName(_) => NExpr::Other(span_of(m.span, base)),
+        },
+        Expr::Call(call) => match &call.callee {
+            Callee::Expr(callee) => NExpr::Call {
+                callee: Box::new(lower_expr(callee, base)),
+                args: lower_args(&call.args, base),
+            },
+            // `super(...)` / `import(...)` — not a plain callee; carry the call's span.
+            _ => NExpr::Other(span_of(call.span, base)),
+        },
+        Expr::New(new_expr) => NExpr::New {
+            callee: Box::new(lower_expr(&new_expr.callee, base)),
+            args: new_expr
+                .args
+                .as_ref()
+                .map(|a| lower_args(a, base))
+                .unwrap_or_default(),
+        },
+        Expr::Paren(p) => NExpr::Parenthesized(Box::new(lower_expr(&p.expr, base))),
+        Expr::Cond(c) => NExpr::Conditional {
+            test: Box::new(lower_expr(&c.test, base)),
+            consequent: Box::new(lower_expr(&c.cons, base)),
+            alternate: Box::new(lower_expr(&c.alt, base)),
+        },
+        // swc's `Expr::Bin` covers BOTH oxc's `BinaryExpression` and `LogicalExpression` (its
+        // `BinaryOp` includes `&&`/`||`/`??`). The operator's source spelling unifies them.
+        Expr::Bin(b) => NExpr::Binary {
+            op: b.op.as_str().to_string(),
+            left: Box::new(lower_expr(&b.left, base)),
+            right: Box::new(lower_expr(&b.right, base)),
+        },
+        Expr::Unary(u) => NExpr::Unary {
+            op: u.op.as_str().to_string(),
+            argument: Box::new(lower_expr(&u.arg, base)),
+        },
+        Expr::Array(arr) => {
+            let elems = arr
+                .elems
+                .iter()
+                .map(|el| match el {
+                    None => NArrayElement::Hole,
+                    Some(e) if e.spread.is_some() => NArrayElement::Spread(lower_expr(&e.expr, base)),
+                    Some(e) => NArrayElement::Expr(lower_expr(&e.expr, base)),
+                })
+                .collect();
+            NExpr::Array(elems)
+        }
+        Expr::Object(obj) => {
+            let props = obj
+                .props
+                .iter()
+                .map(|p| match p {
+                    PropOrSpread::Spread(sp) => NObjectProp::Spread(lower_expr(&sp.expr, base)),
+                    PropOrSpread::Prop(prop) => match &**prop {
+                        Prop::KeyValue(kv) => match prop_name_str(&kv.key) {
+                            Some(key) => NObjectProp::KeyValue {
+                                key: key.clone(),
+                                value: lower_expr(&kv.value, base),
+                                quoted: !is_safe_object_key(&key),
+                                // A computed key whose expression is a string literal is captured by
+                                // `prop_name_str` (matching oxc) and FLAGGED computed, exactly as the
+                                // oxc backend flags `op.computed` for `{ ['k']: v }`.
+                                computed: matches!(&kv.key, PropName::Computed(_)),
+                            },
+                            None => NObjectProp::Other(span_of(prop_span(prop), base)),
+                        },
+                        // Shorthand `{ child }` — oxc models this as an `ObjectProperty` whose key AND
+                        // value are the identifier (its `convert_expr` lowers it to `{child: child}`),
+                        // so mirror that: a KeyValue with the identifier name as key + an identifier
+                        // value (NOT `Other`), keeping the two backends byte-identical.
+                        Prop::Shorthand(id) => NObjectProp::KeyValue {
+                            key: id.sym.to_string(),
+                            value: NExpr::Identifier(id.sym.to_string()),
+                            quoted: !is_safe_object_key(&id.sym),
+                            computed: false,
+                        },
+                        // Method / getter / setter / assign — not a static key/value pair.
+                        _ => NObjectProp::Other(span_of(prop_span(prop), base)),
+                    },
+                })
+                .collect();
+            NExpr::Object(props)
+        }
+        Expr::Arrow(arrow) => NExpr::Arrow {
+            params: lower_arrow_params(&arrow.params),
+            body: Box::new(lower_arrow_body(arrow, base)),
+        },
+        Expr::Fn(func) => NExpr::Function {
+            params: lower_fn_params(&func.function),
+            body: func
+                .function
+                .body
+                .as_ref()
+                .map(|b| lower_stmts(&b.stmts, base))
+                .unwrap_or_default(),
+        },
+        _ => NExpr::Other(span_of(expr_span(expr), base)),
+    }
+}
+
+/// The span of an object property (for the [`NObjectProp::Other`] fallback).
+fn prop_span(prop: &Prop) -> Span {
+    prop.span()
+}
+
+/// Whether an object key is a valid bare JS identifier (so it can be emitted unquoted). Faithful to
+/// the `is_safe_object_key` helper the `convert_expr` walks use (and the oxc backend's mirror).
+fn is_safe_object_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '$' => {
+            chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+        }
+        _ => false,
+    }
+}
+
+/// Lower a call/new argument list, mapping a spread argument to [`NArg::Spread`].
+fn lower_args(args: &[ExprOrSpread], base: u32) -> Vec<NArg> {
+    args.iter()
+        .map(|a| {
+            if a.spread.is_some() {
+                NArg::Spread(lower_expr(&a.expr, base))
+            } else {
+                NArg::Expr(lower_expr(&a.expr, base))
+            }
+        })
+        .collect()
+}
+
+/// Lower a function's `Vec<Param>` to the simple-binding neutral [`NParam`]s.
+fn lower_fn_params(func: &Function) -> Vec<NParam> {
+    func.params
+        .iter()
+        .map(|p| {
+            let (name, is_rest) = pat_name_and_rest(&p.pat);
+            NParam { name, is_rest }
+        })
+        .collect()
+}
+
+/// Lower an arrow's `Vec<Pat>` params (arrows carry bare `Pat`, not the `Param` wrapper) to the
+/// simple-binding neutral [`NParam`]s.
+fn lower_arrow_params(params: &[Pat]) -> Vec<NParam> {
+    params
+        .iter()
+        .map(|p| {
+            let (name, is_rest) = pat_name_and_rest(p);
+            NParam { name, is_rest }
+        })
+        .collect()
+}
+
+/// Lower an arrow body to a neutral [`NArrowBody`]: an expression body (`x => expr`) or a block body
+/// (`x => { … }`). swc models the two directly via `BlockStmtOrExpr`, matching oxc's `expression`
+/// flag + single-leading-expression-statement read.
+fn lower_arrow_body(arrow: &ArrowExpr, base: u32) -> NArrowBody {
+    match &*arrow.body {
+        BlockStmtOrExpr::Expr(e) => NArrowBody::Expr(Box::new(lower_expr(e, base))),
+        BlockStmtOrExpr::BlockStmt(block) => NArrowBody::Block(lower_stmts(&block.stmts, base)),
+    }
+}
+
+/// Lower a list of statements to neutral [`NStmt`]s, in source order.
+fn lower_stmts(stmts: &[Stmt], base: u32) -> Vec<NStmt> {
+    stmts.iter().map(|s| lower_stmt(s, base)).collect()
+}
+
+/// Lower one statement to the neutral [`NStmt`], mirroring the `convert_statement` subset. A
+/// `var`/`let`/`const` is `Stmt::Decl(Decl::Var)` in swc (vs oxc's `Statement::VariableDeclaration`).
+fn lower_stmt(stmt: &Stmt, base: u32) -> NStmt {
+    match stmt {
+        Stmt::Decl(Decl::Var(decl)) => {
+            let is_const = matches!(decl.kind, VarDeclKind::Const);
+            let decls = decl
+                .decls
+                .iter()
+                .map(|d| NVarDeclarator {
+                    name: pat_binding_name(&d.name),
+                    init: d.init.as_deref().map(|e| lower_expr(e, base)),
+                })
+                .collect();
+            NStmt::VarDecl { is_const, decls }
+        }
+        Stmt::Expr(es) => NStmt::Expr(lower_expr(&es.expr, base)),
+        Stmt::Return(ret) => NStmt::Return(ret.arg.as_deref().map(|e| lower_expr(e, base))),
+        Stmt::If(if_stmt) => NStmt::If {
+            test: lower_expr(&if_stmt.test, base),
+            consequent: lower_branch(&if_stmt.cons, base),
+            alternate: if_stmt
+                .alt
+                .as_deref()
+                .map(|s| lower_branch(s, base))
+                .unwrap_or_default(),
+        },
+        Stmt::Block(block) => NStmt::Block(lower_stmts(&block.stmts, base)),
+        _ => NStmt::Other(span_of(stmt.span(), base)),
+    }
+}
+
+/// Lower an `if`/`else` branch — a `{ … }` block's statements, or a one-element list for a bare
+/// branch statement (mirrors the oxc backend's `lower_branch`).
+fn lower_branch(stmt: &Stmt, base: u32) -> Vec<NStmt> {
+    match stmt {
+        Stmt::Block(block) => lower_stmts(&block.stmts, base),
+        other => vec![lower_stmt(other, base)],
+    }
 }
 
 // ---------------------------------------------------------------------------

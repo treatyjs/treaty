@@ -16,14 +16,16 @@
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, ArrayExpressionElement, Class, ClassElement, Decorator, Expression,
-    ExportDefaultDeclarationKind, ObjectPropertyKind, Program, PropertyKey, Statement,
+    ExportDefaultDeclarationKind, FormalParameters, ImportOrExportKind, MethodDefinitionKind,
+    ObjectPropertyKind, Program, PropertyKey, Statement,
 };
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType};
 
 use super::{
-    ClassWithDecorators, DecoratorInfo, LitValue, MemberInfo, NgDeclareCall, ObjLit, ParseBackend,
-    ParseOutput, SourceKind, TreatySpan,
+    ClassWithDecorators, DecoratorInfo, ImportInfo, LitValue, MemberInfo, MemberKind, NArg,
+    NArrayElement, NArrowBody, NCtorParam, NExpr, NObjectProp, NParam, NStmt, NVarDeclarator,
+    NgDeclareCall, ObjLit, ParseBackend, ParseOutput, SourceKind, TreatySpan,
 };
 
 /// The oxc parse backend. Zero-sized; the parse arena is created per [`Self::parse_module`] call so
@@ -77,6 +79,7 @@ impl ParseBackend for OxcParseBackend {
             ParseOutput {
                 classes: Vec::new(),
                 ng_declare_calls: Vec::new(),
+                imports: Vec::new(),
                 errors: ret.errors.iter().map(|e| e.to_string()).collect(),
             }
         };
@@ -127,6 +130,7 @@ fn span_of<T: GetSpan>(node: &T) -> TreatySpan {
 fn lower_program(program: &Program, source: &str) -> ParseOutput {
     let mut classes = Vec::new();
     let mut ng_declare_calls = Vec::new();
+    let mut imports = Vec::new();
 
     for stmt in &program.body {
         if let Some(class) = statement_class(stmt) {
@@ -138,13 +142,42 @@ fn lower_program(program: &Program, source: &str) -> ParseOutput {
         // `ɵɵngDeclare*` can also sit as a free top-level statement (e.g. a re-parsed slice or a
         // non-class declaration shape); cover the expression-statement form too.
         collect_ng_declares_in_stmt(stmt, &mut ng_declare_calls);
+        // Top-level `import` bindings (foreign-import / imported-name surface).
+        collect_imports_in_stmt(stmt, &mut imports);
     }
 
     let _ = source; // span_text recovers source text on demand; not needed during lowering.
     ParseOutput {
         classes,
         ng_declare_calls,
+        imports,
         errors: Vec::new(),
+    }
+}
+
+/// Collect the local binding names of a top-level `import` declaration (skipping whole-declaration and
+/// inline `type`-only specifiers), mirroring `source_compile::collect_imported_names`.
+fn collect_imports_in_stmt(stmt: &Statement, out: &mut Vec<ImportInfo>) {
+    let Statement::ImportDeclaration(import) = stmt else {
+        return;
+    };
+    let type_only_decl = import.import_kind == ImportOrExportKind::Type;
+    let Some(specifiers) = &import.specifiers else {
+        return;
+    };
+    for spec in specifiers {
+        use oxc_ast::ast::ImportDeclarationSpecifier as Spec;
+        let (local, inline_type) = match spec {
+            Spec::ImportSpecifier(s) => {
+                (s.local.name.to_string(), s.import_kind == ImportOrExportKind::Type)
+            }
+            Spec::ImportDefaultSpecifier(s) => (s.local.name.to_string(), false),
+            Spec::ImportNamespaceSpecifier(s) => (s.local.name.to_string(), false),
+        };
+        out.push(ImportInfo {
+            local_name: local,
+            type_only: type_only_decl || inline_type,
+        });
     }
 }
 
@@ -168,7 +201,12 @@ fn statement_class<'a>(stmt: &'a Statement<'a>) -> Option<&'a Class<'a>> {
 }
 
 /// Lower a class to the neutral [`ClassWithDecorators`] (name + decorators + members, source order).
-fn lower_class(class: &Class) -> ClassWithDecorators {
+///
+/// `pub(crate)` so the AOT driver (`crate::source_compile`) can build the engine-neutral
+/// `treaty_ivy_decorators::ClassMeta` fields from the SAME live oxc class it walks, without re-deriving
+/// the pre-lowering (and so the neutral fields it hands a plugin are byte-identical to the parse
+/// backend's `ParseOutput` ones).
+pub(crate) fn lower_class(class: &Class) -> ClassWithDecorators {
     let name = class.id.as_ref().map(|id| id.name.to_string());
     let decorators = class.decorators.iter().map(lower_decorator).collect();
     let members = class
@@ -184,25 +222,103 @@ fn lower_class(class: &Class) -> ClassWithDecorators {
     }
 }
 
-/// Lower a class member (property / accessor / method) to the neutral [`MemberInfo`].
+/// Lower a class member (property / accessor / method / constructor) to the neutral [`MemberInfo`]
+/// — name + own decorators + kind + static flag + params (for the constructor / methods, with their
+/// own decorators) + initializer (for properties / accessors).
 fn lower_member(element: &ClassElement) -> MemberInfo {
-    let (name, decorators): (Option<String>, &oxc_allocator::Vec<Decorator>) = match element {
-        ClassElement::PropertyDefinition(p) => (key_name(&p.key).map(str::to_string), &p.decorators),
-        ClassElement::MethodDefinition(m) => (key_name(&m.key).map(str::to_string), &m.decorators),
-        ClassElement::AccessorProperty(a) => (key_name(&a.key).map(str::to_string), &a.decorators),
-        _ => return MemberInfo::default(),
-    };
-    MemberInfo {
-        name,
-        decorators: decorators.iter().map(lower_decorator).collect(),
+    match element {
+        ClassElement::PropertyDefinition(p) => MemberInfo {
+            name: key_name(&p.key).map(str::to_string),
+            decorators: p.decorators.iter().map(lower_decorator).collect(),
+            kind: MemberKind::Property,
+            is_static: p.r#static,
+            params: Vec::new(),
+            initializer: p.value.as_ref().map(lower_expr),
+        },
+        ClassElement::MethodDefinition(m) => {
+            let (kind, is_ctor) = match m.kind {
+                MethodDefinitionKind::Constructor => (MemberKind::Constructor, true),
+                MethodDefinitionKind::Get => (MemberKind::Getter, false),
+                MethodDefinitionKind::Set => (MemberKind::Setter, false),
+                MethodDefinitionKind::Method => (MemberKind::Method, false),
+            };
+            let _ = is_ctor;
+            MemberInfo {
+                name: key_name(&m.key).map(str::to_string),
+                decorators: m.decorators.iter().map(lower_decorator).collect(),
+                kind,
+                is_static: m.r#static,
+                params: lower_ctor_params(&m.value.params),
+                initializer: None,
+            }
+        }
+        ClassElement::AccessorProperty(a) => MemberInfo {
+            name: key_name(&a.key).map(str::to_string),
+            decorators: a.decorators.iter().map(lower_decorator).collect(),
+            kind: MemberKind::Accessor,
+            is_static: a.r#static,
+            params: Vec::new(),
+            initializer: a.value.as_ref().map(lower_expr),
+        },
+        // Static block / TS index signature / etc.: oxc still surfaces a (nameless) class element.
+        _ => MemberInfo {
+            kind: MemberKind::Other,
+            ..MemberInfo::default()
+        },
     }
 }
 
-/// Lower a decorator to the neutral [`DecoratorInfo`] (callee name + first object-literal argument).
-fn lower_decorator(dec: &Decorator) -> DecoratorInfo {
+/// Lower formal parameters carrying their own decorators (the constructor / method param surface that
+/// drives constructor-dependency extraction). A `...rest` parameter (which oxc stores OUT of `items`,
+/// in `params.rest`) is appended last with `is_rest: true` so the neutral list matches swc, which
+/// keeps the rest inline as a `Pat::Rest`.
+fn lower_ctor_params(params: &FormalParameters) -> Vec<NCtorParam> {
+    let mut out: Vec<NCtorParam> = params
+        .items
+        .iter()
+        .map(|item| NCtorParam {
+            name: item
+                .pattern
+                .get_binding_identifier()
+                .map(|id| id.name.to_string()),
+            decorators: item.decorators.iter().map(lower_decorator).collect(),
+            is_rest: false,
+        })
+        .collect();
+    if let Some(rest) = &params.rest {
+        out.push(NCtorParam {
+            name: rest
+                .rest
+                .argument
+                .get_binding_identifier()
+                .map(|id| id.name.to_string()),
+            decorators: rest.decorators.iter().map(lower_decorator).collect(),
+            is_rest: true,
+        });
+    }
+    out
+}
+
+/// Lower a decorator to the neutral [`DecoratorInfo`] (callee name + first object-literal argument +
+/// full neutral argument list). `pub(crate)` for the AOT driver (see [`lower_class`]).
+pub(crate) fn lower_decorator(dec: &Decorator) -> DecoratorInfo {
     let name = decorator_name(dec).unwrap_or_default().to_string();
     let object = decorator_object(dec).map(lower_object);
-    DecoratorInfo { name, object }
+    let arguments = decorator_arguments(dec);
+    DecoratorInfo {
+        name,
+        object,
+        arguments,
+    }
+}
+
+/// The full neutral argument list of a decorator call `@Foo(a, b, …)` (empty for a bare `@Foo`).
+fn decorator_arguments(dec: &Decorator) -> Vec<NArg> {
+    if let Expression::CallExpression(call) = &dec.expression {
+        lower_args(&call.arguments)
+    } else {
+        Vec::new()
+    }
 }
 
 /// Returns the callee identifier name of a decorator's expression — bare `@Foo` or call `@Foo({…})`.
@@ -242,8 +358,8 @@ fn key_name<'a>(key: &'a PropertyKey<'a>) -> Option<&'a str> {
 }
 
 /// Lower an oxc `ObjectExpression` to the neutral [`ObjLit`] — static-keyed properties in SOURCE
-/// order.
-fn lower_object(obj: &oxc_ast::ast::ObjectExpression) -> ObjLit {
+/// order. `pub(crate)` for the AOT driver (see [`lower_class`]).
+pub(crate) fn lower_object(obj: &oxc_ast::ast::ObjectExpression) -> ObjLit {
     let mut props = Vec::with_capacity(obj.properties.len());
     for p in &obj.properties {
         if let ObjectPropertyKind::ObjectProperty(op) = p {
@@ -308,6 +424,229 @@ trait IntoTreatySpan {
 impl IntoTreatySpan for oxc_span::Span {
     fn into_treaty(self) -> TreatySpan {
         TreatySpan::new(self.start, self.end)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Neutral EXPRESSION / STATEMENT / PARAM lowering (the full walk surface).
+//
+// Mirrors the union of `source_compile::convert_expr` + `linker::convert_expr` shape-for-shape, but
+// NEVER declines: shapes outside the converted subset become `NExpr::Other` / `NStmt::Other` carrying
+// a span (the additive neutral tree records everything; the live-AST walk still decides what to emit).
+// ---------------------------------------------------------------------------
+
+/// Lower an oxc `Expression` to the neutral [`NExpr`], mirroring the `convert_expr` surface.
+fn lower_expr(expr: &Expression) -> NExpr {
+    match expr {
+        Expression::StringLiteral(s) => NExpr::String(s.value.to_string()),
+        Expression::TemplateLiteral(t) if t.expressions.is_empty() && t.quasis.len() == 1 => {
+            match t.quasis[0].value.cooked.as_ref() {
+                Some(c) => NExpr::String(c.to_string()),
+                None => NExpr::Other(span_of(expr)),
+            }
+        }
+        Expression::NumericLiteral(n) => NExpr::Number(n.value),
+        Expression::BooleanLiteral(b) => NExpr::Boolean(b.value),
+        Expression::NullLiteral(_) => NExpr::Null,
+        Expression::Identifier(id) => NExpr::Identifier(id.name.to_string()),
+        Expression::StaticMemberExpression(m) => NExpr::Member {
+            object: Box::new(lower_expr(&m.object)),
+            property: m.property.name.to_string(),
+        },
+        Expression::ComputedMemberExpression(m) => NExpr::ComputedMember {
+            object: Box::new(lower_expr(&m.object)),
+            index: Box::new(lower_expr(&m.expression)),
+        },
+        Expression::CallExpression(call) => NExpr::Call {
+            callee: Box::new(lower_expr(&call.callee)),
+            args: lower_args(&call.arguments),
+        },
+        Expression::NewExpression(new_expr) => NExpr::New {
+            callee: Box::new(lower_expr(&new_expr.callee)),
+            args: lower_args(&new_expr.arguments),
+        },
+        Expression::ParenthesizedExpression(p) => {
+            NExpr::Parenthesized(Box::new(lower_expr(&p.expression)))
+        }
+        Expression::ConditionalExpression(c) => NExpr::Conditional {
+            test: Box::new(lower_expr(&c.test)),
+            consequent: Box::new(lower_expr(&c.consequent)),
+            alternate: Box::new(lower_expr(&c.alternate)),
+        },
+        Expression::BinaryExpression(b) => NExpr::Binary {
+            op: b.operator.as_str().to_string(),
+            left: Box::new(lower_expr(&b.left)),
+            right: Box::new(lower_expr(&b.right)),
+        },
+        Expression::LogicalExpression(l) => NExpr::Binary {
+            op: l.operator.as_str().to_string(),
+            left: Box::new(lower_expr(&l.left)),
+            right: Box::new(lower_expr(&l.right)),
+        },
+        Expression::UnaryExpression(u) => NExpr::Unary {
+            op: u.operator.as_str().to_string(),
+            argument: Box::new(lower_expr(&u.argument)),
+        },
+        Expression::ArrayExpression(arr) => {
+            let elems = arr
+                .elements
+                .iter()
+                .map(|el| match el {
+                    ArrayExpressionElement::SpreadElement(s) => {
+                        NArrayElement::Spread(lower_expr(&s.argument))
+                    }
+                    ArrayExpressionElement::Elision(_) => NArrayElement::Hole,
+                    other => match other.as_expression() {
+                        Some(inner) => NArrayElement::Expr(lower_expr(inner)),
+                        None => NArrayElement::Expr(NExpr::Other(other.span().into_treaty())),
+                    },
+                })
+                .collect();
+            NExpr::Array(elems)
+        }
+        Expression::ObjectExpression(obj) => {
+            let props = obj
+                .properties
+                .iter()
+                .map(|p| match p {
+                    ObjectPropertyKind::ObjectProperty(op) => match key_name(&op.key) {
+                        Some(key) => NObjectProp::KeyValue {
+                            key: key.to_string(),
+                            value: lower_expr(&op.value),
+                            quoted: !is_safe_object_key(key),
+                            computed: op.computed,
+                        },
+                        None => NObjectProp::Other(span_of(&op.key)),
+                    },
+                    ObjectPropertyKind::SpreadProperty(sp) => {
+                        NObjectProp::Spread(lower_expr(&sp.argument))
+                    }
+                })
+                .collect();
+            NExpr::Object(props)
+        }
+        Expression::ArrowFunctionExpression(arrow) => NExpr::Arrow {
+            params: lower_params(&arrow.params),
+            body: Box::new(lower_arrow_body(arrow)),
+        },
+        Expression::FunctionExpression(func) => NExpr::Function {
+            params: lower_params(&func.params),
+            body: func
+                .body
+                .as_ref()
+                .map(|b| lower_stmts(&b.statements))
+                .unwrap_or_default(),
+        },
+        _ => NExpr::Other(span_of(expr)),
+    }
+}
+
+/// Whether an object key is a valid bare JS identifier (so it can be emitted unquoted). Faithful to
+/// the `is_safe_object_key` helper the `convert_expr` walks use.
+fn is_safe_object_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '$' => {
+            chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+        }
+        _ => false,
+    }
+}
+
+/// Lower a call/new argument list, mapping a spread argument to [`NArg::Spread`].
+fn lower_args(args: &oxc_allocator::Vec<Argument>) -> Vec<NArg> {
+    args.iter()
+        .map(|a| match a {
+            Argument::SpreadElement(s) => NArg::Spread(lower_expr(&s.argument)),
+            other => match other.as_expression() {
+                Some(inner) => NArg::Expr(lower_expr(inner)),
+                None => NArg::Expr(NExpr::Other(other.span().into_treaty())),
+            },
+        })
+        .collect()
+}
+
+/// Lower function/arrow formal parameters to the simple-binding neutral [`NParam`]s (non-identifier
+/// bindings carry `name: None` so the consumer declines exactly as the live-AST walk does).
+fn lower_params(params: &FormalParameters) -> Vec<NParam> {
+    let mut out: Vec<NParam> = params
+        .items
+        .iter()
+        .map(|item| NParam {
+            name: item
+                .pattern
+                .get_binding_identifier()
+                .map(|id| id.name.to_string()),
+            is_rest: false,
+        })
+        .collect();
+    if let Some(rest) = &params.rest {
+        out.push(NParam {
+            name: rest
+                .rest
+                .argument
+                .get_binding_identifier()
+                .map(|id| id.name.to_string()),
+            is_rest: true,
+        });
+    }
+    out
+}
+
+/// Lower an arrow body to a neutral [`NArrowBody`]: an expression body (`x => expr`) when the arrow is
+/// expression-bodied with a single leading expression statement; otherwise a block body.
+fn lower_arrow_body(arrow: &oxc_ast::ast::ArrowFunctionExpression) -> NArrowBody {
+    if arrow.expression {
+        if let Some(Statement::ExpressionStatement(stmt)) = arrow.body.statements.first() {
+            return NArrowBody::Expr(Box::new(lower_expr(&stmt.expression)));
+        }
+    }
+    NArrowBody::Block(lower_stmts(&arrow.body.statements))
+}
+
+/// Lower a list of statements to neutral [`NStmt`]s, in source order.
+fn lower_stmts(stmts: &oxc_allocator::Vec<Statement>) -> Vec<NStmt> {
+    stmts.iter().map(lower_stmt).collect()
+}
+
+/// Lower one statement to the neutral [`NStmt`], mirroring the `convert_statement` subset.
+fn lower_stmt(stmt: &Statement) -> NStmt {
+    match stmt {
+        Statement::VariableDeclaration(decl) => {
+            let is_const =
+                matches!(decl.kind, oxc_ast::ast::VariableDeclarationKind::Const);
+            let decls = decl
+                .declarations
+                .iter()
+                .map(|d| NVarDeclarator {
+                    name: d.id.get_binding_identifier().map(|id| id.name.to_string()),
+                    init: d.init.as_ref().map(lower_expr),
+                })
+                .collect();
+            NStmt::VarDecl { is_const, decls }
+        }
+        Statement::ExpressionStatement(es) => NStmt::Expr(lower_expr(&es.expression)),
+        Statement::ReturnStatement(ret) => NStmt::Return(ret.argument.as_ref().map(lower_expr)),
+        Statement::IfStatement(if_stmt) => NStmt::If {
+            test: lower_expr(&if_stmt.test),
+            consequent: lower_branch(&if_stmt.consequent),
+            alternate: if_stmt
+                .alternate
+                .as_ref()
+                .map(lower_branch)
+                .unwrap_or_default(),
+        },
+        Statement::BlockStatement(block) => NStmt::Block(lower_stmts(&block.body)),
+        _ => NStmt::Other(span_of(stmt)),
+    }
+}
+
+/// Lower an `if`/`else` branch — a `{ … }` block's statements, or a one-element list for a bare
+/// branch statement (mirrors `convert_branch`).
+fn lower_branch(stmt: &Statement) -> Vec<NStmt> {
+    match stmt {
+        Statement::BlockStatement(block) => lower_stmts(&block.body),
+        other => vec![lower_stmt(other)],
     }
 }
 

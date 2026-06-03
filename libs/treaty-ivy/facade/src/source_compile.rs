@@ -2536,20 +2536,32 @@ impl From<TopLevel> for AngularDecoratorKind {
 // `match` called, so the emitted definition is byte-identical.
 // ---------------------------------------------------------------------------
 
+/// The facade's LIVE-oxc handle, carried opaquely through the engine-neutral
+/// [`ClassMeta::live`]. The decorators crate never inspects it; the facade plugins downstream still
+/// run the byte-identical metadata walk against these live nodes during the wide-port transition
+/// (SWC-BACKEND-PLAN.md §3.2 phase 3). `ClassMeta`'s own `class`/`decorator`/`object` fields are the
+/// engine-NEUTRAL pre-lowering of these same nodes, so the public decorator API names no oxc type.
+struct OxcLive<'a> {
+    /// The live class declaration the plugin's metadata walk reads (ctor deps, members, host).
+    class: &'a Class<'a>,
+    /// The live decorator options object (`@Foo({...})` → `Some`; bare `@Foo` → `None`).
+    object: Option<&'a oxc_ast::ast::ObjectExpression<'a>>,
+}
+
 /// `@Component` → `ɵɵdefineComponent`. Extracts the component metadata (selector, inline template,
 /// inputs/outputs, queries, host bindings, `hostDirectives`, providers/viewProviders, styles,
 /// encapsulation, animations, foreignImports) and drives [`compile_component_from_metadata`] via
 /// [`compile_component_or_directive`].
 struct ComponentCompiler;
-impl DecoratorCompiler for ComponentCompiler {
+impl DecoratorCompiler<OxcLive<'_>> for ComponentCompiler {
     fn kind(&self) -> AngularDecoratorKind {
         AngularDecoratorKind::Component
     }
-    fn compile(&self, c: &ClassMeta, ctx: &CompileCtx) -> Result<ClassEmit, String> {
+    fn compile(&self, c: &ClassMeta<OxcLive>, ctx: &CompileCtx) -> Result<ClassEmit, String> {
         compile_component_or_directive(
-            c.class,
+            c.live.class,
             TopLevel::Component,
-            c.object,
+            c.live.object,
             c.class_name.clone(),
             c.class_name_span.clone(),
             ctx.auto_import_candidates,
@@ -2569,15 +2581,15 @@ impl DecoratorCompiler for ComponentCompiler {
 /// extraction with the component path but emits via [`compile_directive_from_metadata`] (no
 /// template; view-only metadata such as `viewProviders` is ignored, as Angular does on a directive).
 struct DirectiveCompiler;
-impl DecoratorCompiler for DirectiveCompiler {
+impl DecoratorCompiler<OxcLive<'_>> for DirectiveCompiler {
     fn kind(&self) -> AngularDecoratorKind {
         AngularDecoratorKind::Directive
     }
-    fn compile(&self, c: &ClassMeta, ctx: &CompileCtx) -> Result<ClassEmit, String> {
+    fn compile(&self, c: &ClassMeta<OxcLive>, ctx: &CompileCtx) -> Result<ClassEmit, String> {
         compile_component_or_directive(
-            c.class,
+            c.live.class,
             TopLevel::Directive,
-            c.object,
+            c.live.object,
             c.class_name.clone(),
             c.class_name_span.clone(),
             ctx.auto_import_candidates,
@@ -2595,26 +2607,26 @@ impl DecoratorCompiler for DirectiveCompiler {
 
 /// `@Pipe` → `ɵɵdefinePipe`. Delegates to [`compile_pipe_class`].
 struct PipeCompiler;
-impl DecoratorCompiler for PipeCompiler {
+impl DecoratorCompiler<OxcLive<'_>> for PipeCompiler {
     fn kind(&self) -> AngularDecoratorKind {
         AngularDecoratorKind::Pipe
     }
-    fn compile(&self, c: &ClassMeta, _ctx: &CompileCtx) -> Result<ClassEmit, String> {
-        compile_pipe_class(c.class, c.object, &c.class_name)
+    fn compile(&self, c: &ClassMeta<OxcLive>, _ctx: &CompileCtx) -> Result<ClassEmit, String> {
+        compile_pipe_class(c.live.class, c.live.object, &c.class_name)
     }
 }
 
 /// `@NgModule` → `ɵɵdefineNgModule` (+ `ɵɵsetNgModuleScope` / `ɵɵregisterNgModuleType` side
 /// effects). Delegates to [`compile_ng_module_class`].
 struct NgModuleCompiler;
-impl DecoratorCompiler for NgModuleCompiler {
+impl DecoratorCompiler<OxcLive<'_>> for NgModuleCompiler {
     fn kind(&self) -> AngularDecoratorKind {
         AngularDecoratorKind::NgModule
     }
-    fn compile(&self, c: &ClassMeta, ctx: &CompileCtx) -> Result<ClassEmit, String> {
+    fn compile(&self, c: &ClassMeta<OxcLive>, ctx: &CompileCtx) -> Result<ClassEmit, String> {
         compile_ng_module_class(
-            c.class,
-            c.object,
+            c.live.class,
+            c.live.object,
             &c.class_name,
             ctx.jit_mode,
             ctx.class_decl_positions,
@@ -2628,12 +2640,12 @@ impl DecoratorCompiler for NgModuleCompiler {
 /// and drives [`compile_injectable`] for the provider definition; the matching `ɵfac` carries the
 /// class's resolved constructor dependencies (target `Injectable` → `ɵɵinject`).
 struct InjectableCompiler;
-impl DecoratorCompiler for InjectableCompiler {
+impl DecoratorCompiler<OxcLive<'_>> for InjectableCompiler {
     fn kind(&self) -> AngularDecoratorKind {
         AngularDecoratorKind::Injectable
     }
-    fn compile(&self, c: &ClassMeta, _ctx: &CompileCtx) -> Result<ClassEmit, String> {
-        compile_injectable_class(c.class, c.object, &c.class_name)
+    fn compile(&self, c: &ClassMeta<OxcLive>, _ctx: &CompileCtx) -> Result<ClassEmit, String> {
+        compile_injectable_class(c.live.class, c.live.object, &c.class_name)
     }
 }
 
@@ -2858,7 +2870,12 @@ fn new_expr_callee_is(new_expr: &oxc_ast::ast::NewExpression, name: &str) -> boo
 
 /// The default decorator-compiler registry: one plugin per recognized kind. Adding support for a
 /// new decorator kind is a `register` here (mirroring `apps/rust/authoring::AuthoringRegistry`).
-fn decorator_registry() -> DecoratorRegistry {
+///
+/// Generic over the live-handle lifetime `'a` so the registry's `OxcLive<'a>` matches the lifetime of
+/// the `ClassMeta` the per-class driver builds from the borrowed AST. Each plugin is zero-sized and
+/// implements `DecoratorCompiler<OxcLive<'a>>` for every `'a`, so one call site instantiates the
+/// registry at exactly the borrow's lifetime.
+fn decorator_registry<'a>() -> DecoratorRegistry<OxcLive<'a>> {
     let mut registry = DecoratorRegistry::new();
     registry.register(Box::new(ComponentCompiler));
     registry.register(Box::new(DirectiveCompiler));
@@ -2897,12 +2914,28 @@ fn compile_decorated_class(
         None => return Err("decorated class has no name".to_string()),
     };
 
-    let meta = ClassMeta {
+    // The decorator's live options object, plus its engine-NEUTRAL pre-lowering. `ClassMeta` carries
+    // the neutral `ClassWithDecorators`/`DecoratorInfo`/`ObjLit` (so the decorators crate's public API
+    // names no oxc type); the same live nodes ride opaquely through `ClassMeta::live` for the
+    // transitional metadata walk the plugins still run. The neutral pre-lowering is byte-identical to
+    // the parse backend's `ParseOutput` (same `lower_*` helpers), so flipping the plugins to read the
+    // neutral fields later is a no-behaviour-change switch.
+    let live_object = decorator_object(dec);
+    let neutral_class = crate::parse::oxc::lower_class(class);
+    let neutral_decorator = crate::parse::oxc::lower_decorator(dec);
+    let neutral_object = live_object.map(crate::parse::oxc::lower_object);
+    let live = OxcLive {
         class,
-        decorator: dec,
-        object: decorator_object(dec),
+        object: live_object,
+    };
+
+    let meta = ClassMeta {
+        class: &neutral_class,
+        decorator: &neutral_decorator,
+        object: neutral_object.as_ref(),
         class_name,
         class_name_span,
+        live: &live,
     };
     let ctx = CompileCtx {
         auto_import_candidates,
@@ -2944,7 +2977,7 @@ fn compile_decorated_class(
 /// assignment is appended to the pipe emit's `extra_statements` with `extra_after_def = true`, so the
 /// emit order is `X.ɵfac = …; X.ɵpipe = …; X.ɵprov = …;` — exactly Angular's "prov definition must be
 /// last so X.fac is defined" ordering, in both decorator orders.
-fn compile_pipe_and_injectable(class: &Class, meta: &ClassMeta) -> Result<ClassEmit, String> {
+fn compile_pipe_and_injectable(class: &Class, meta: &ClassMeta<OxcLive>) -> Result<ClassEmit, String> {
     // Primary definition: the `@Pipe` trait (factory + `ɵpipe`). Its `extra_statements` are pure-pool
     // consts the `ɵpipe` references (emitted BEFORE the assignments).
     let pipe_object = class_decorator(class, "Pipe").and_then(decorator_object);

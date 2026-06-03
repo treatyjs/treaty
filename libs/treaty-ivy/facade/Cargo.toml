@@ -16,12 +16,14 @@ edition = "2024"
 # byte-identical neutral summary by the parse-parity test in `src/parse/mod.rs`.
 #
 # NOTE (honest scope): the facade's source/linker/partial-emit WALK still reaches the live oxc
-# `Program` through `OxcModule::program()` (the `compile_program_with_source` AOT walk + the
-# decorators-crate `ClassMeta<'a>` API are oxc-typed). Fully removing oxc from the `--features swc`
-# dep graph therefore additionally requires neutralizing that walk + the shared `treaty_ivy_core` /
-# `treaty_ivy_decorators` / `treaty_ivy_template` oxc deps (SWC-BACKEND-PLAN.md §3.2 phase 3, the
-# wide port). The SWC PARSE backend here is that port's parser half + its parity gate; the alias
-# below stays on oxc until the walk is neutralized so the default + swc builds both compile.
+# `Program` through `OxcModule::program()` (the `compile_program_with_source` AOT walk is oxc-typed).
+# The `treaty_ivy_decorators` PUBLIC API (`ClassMeta`) is now engine-neutral and that crate no longer
+# depends on oxc at all — the live oxc nodes its plugins still walk ride opaquely through the
+# facade-private `ClassMeta::live` handle. Fully removing oxc from the `--features swc` dep graph
+# therefore additionally requires neutralizing that AOT/linker walk + the shared `treaty_ivy_core` /
+# `treaty_ivy_template` oxc deps (SWC-BACKEND-PLAN.md §3.2 phase 3, the wide port). The SWC PARSE
+# backend here is that port's parser half + its parity gate; the alias below stays on oxc until the
+# walk is neutralized so the default + swc builds both compile.
 default = ["oxc"]
 oxc = ["treaty_ivy_core/oxc"]
 swc = ["treaty_ivy_core/swc", "dep:swc_common", "dep:swc_ecma_ast", "dep:swc_ecma_parser", "dep:swc_atoms"]

@@ -6,6 +6,9 @@
 //! Ported from Angular 22.1's `packages/compiler` (vendored at `tools/angular-ref`).
 //!
 //! Contents:
+//!   - [`neutral`]               — the engine-neutral PARSE IR (`ObjLit`/`LitValue`/`NExpr`/
+//!                                 `ClassWithDecorators`/`DecoratorInfo`/…) the front-end + the
+//!                                 `treaty_ivy_decorators` public API read without naming an oxc type.
 //!   - [`output_ast`]            — the owned expression/statement IR.
 //!   - [`output::emitter`]       — lowers the IR into `oxc_ast` and prints it.
 //!   - [`output::source_map`]    — source-map building for the emitter.
@@ -21,6 +24,7 @@
 //! historical top-level path (e.g. `treaty_ivy::output_ast`) so external call
 //! sites are unchanged; the split is structural — emitted code is byte-identical.
 
+pub mod neutral;
 pub mod output_ast;
 pub mod identifiers;
 pub mod factory;

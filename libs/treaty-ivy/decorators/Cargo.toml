@@ -13,5 +13,4 @@ edition = "2024"
 [dependencies]
 treaty_ivy_core = { path = "../core" }
 treaty_ivy_template = { path = "../template" }
-oxc_ast = "0.133.0"
 regex = "1"
