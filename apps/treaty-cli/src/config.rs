@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::angular::{self, AngularError, ResolvedTarget, Workspace};
+
 /// Which bundler the CLI drives. Mirrors the external tools the
 /// [`crate::bundler::ExternalBundler`] can delegate to, plus the in-process
 /// Rust-native fallback.
@@ -299,6 +301,111 @@ pub fn resolve_config(cwd: &Path, overrides: &ConfigOverrides) -> Result<Resolve
         config_file,
         root,
     })
+}
+
+/// A config resolved FROM an `angular.json` architect target. Unlike
+/// [`ResolvedConfig`] (the convention/`treaty.config.json` path), this carries the
+/// full resolved architect target so the build/serve commands can honor
+/// `outputPath`/`browser`/`index`/`tsConfig`/`styles`/`assets`.
+#[derive(Debug, Clone)]
+pub struct AngularResolvedConfig {
+    /// The parsed workspace.
+    pub workspace: Workspace,
+    /// The resolved architect target (builder + merged options + projected paths).
+    pub target: ResolvedTarget,
+    /// The entry module (`browser`/`main`), absolute. Falls back to
+    /// `<sourceRoot>/main.ts` when the target names none.
+    pub entry: PathBuf,
+    /// The output directory (`outputPath`), absolute. Falls back to `dist/<project>`.
+    pub out_dir: PathBuf,
+    /// The project root (workspace root + project `root`), absolute.
+    pub project_root: PathBuf,
+}
+
+/// The source a build/serve config was resolved from: an `angular.json` architect
+/// target, or the convention/`treaty.config.json` path.
+#[derive(Debug, Clone)]
+pub enum ProjectConfig {
+    /// Resolved from `angular.json`.
+    Angular(Box<AngularResolvedConfig>),
+    /// Resolved from `treaty.config.json` / conventions.
+    Treaty(ResolvedConfig),
+}
+
+/// Errors resolving a project's config.
+#[derive(Debug)]
+pub enum ResolveError {
+    /// An `angular.json` error (parse / project / target resolution).
+    Angular(AngularError),
+    /// A `treaty.config.json` error.
+    Config(ConfigError),
+}
+
+impl std::fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ResolveError::Angular(e) => write!(f, "{e}"),
+            ResolveError::Config(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for ResolveError {}
+
+/// Resolve a build/serve config, preferring `angular.json` when one is present
+/// (walking up from `root`), and falling back to `treaty.config.json` /
+/// conventions otherwise.
+///
+/// `project`/`configuration`/`target` select the architect target on the
+/// angular.json path; they are ignored on the treaty.config path (which is
+/// single-app by convention). `overrides` supply CLI flag overrides for the
+/// fallback path.
+pub fn resolve_project(
+    root: &Path,
+    project: Option<&str>,
+    target: &str,
+    configuration: Option<&str>,
+    overrides: &ConfigOverrides,
+) -> Result<ProjectConfig, ResolveError> {
+    if let Some(ng_path) = angular::find_angular_json(root) {
+        let ws = angular::parse_workspace(&ng_path).map_err(ResolveError::Angular)?;
+        let project_name = ws
+            .resolve_project_name(project)
+            .map_err(ResolveError::Angular)?;
+        let resolved = angular::resolve_architect_target(&ws, &project_name, target, configuration)
+            .map_err(ResolveError::Angular)?;
+
+        let proj = ws.project(&project_name).map_err(ResolveError::Angular)?;
+        let project_root = if proj.root.is_empty() {
+            ws.root.clone()
+        } else {
+            ws.root.join(&proj.root)
+        };
+        let source_root = proj
+            .source_root
+            .clone()
+            .unwrap_or_else(|| "src".to_string());
+
+        let entry = resolved
+            .main
+            .clone()
+            .unwrap_or_else(|| ws.root.join(&source_root).join("main.ts"));
+        let out_dir = resolved
+            .output_path
+            .clone()
+            .unwrap_or_else(|| ws.root.join("dist").join(&project_name));
+
+        return Ok(ProjectConfig::Angular(Box::new(AngularResolvedConfig {
+            workspace: ws,
+            target: resolved,
+            entry,
+            out_dir,
+            project_root,
+        })));
+    }
+
+    let cfg = resolve_config(root, overrides).map_err(ResolveError::Config)?;
+    Ok(ProjectConfig::Treaty(cfg))
 }
 
 #[cfg(test)]

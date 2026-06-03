@@ -18,6 +18,7 @@
 //!   * [`deploy::DeployPlugin`] — the pluggable deploy/rollback layer.
 
 pub mod affected;
+pub mod angular;
 pub mod bundler;
 pub mod compile;
 pub mod config;
@@ -25,6 +26,7 @@ pub mod core;
 pub mod deploy;
 pub mod generate;
 pub mod native_build;
+pub mod node_cmd;
 pub mod plugin;
 pub mod resolve;
 pub mod selectors;
