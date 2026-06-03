@@ -22,8 +22,7 @@ Where things stand:
   complete ES-module Ivy output. **Every Angular decorator**
   (`@Component/@Directive/@Pipe/@Injectable/@NgModule`) lowers to Ivy AOT (no JIT)
   on every entry point, including the unified `compile()` path. Golden parity vs
-  Angular's own corpus: **185 / 185 runnable = 100%** (live-scored), at the modern-Angular ceiling
-  toward full parity as the ranked DIFFs are closed.
+  Angular's own corpus: **185 / 185 runnable = 100%** (live-scored) — all ranked DIFFs closed.
 - **Angular Linker** — DONE for the LINK path: partial `ɵɵngDeclare*` → AOT
   `ɵɵdefine*` in Rust (`libs/treaty-ivy/facade/src/linker.rs` + NAPI `linkPartial`).
   Links real `@angular/*` + CDK/Material to **ZERO residual `ɵɵngDeclare`** (no
@@ -106,23 +105,22 @@ Harness moved into the facade crate:
 > The live harness now scores **185/185**; re-run `run-compliance.mjs --report`
 > after a fresh `corpus_dump` to regenerate the committed `COMPLIANCE-REPORT.md`.
 
-### Ranked DIFF gaps (the work toward full parity)
+### Ranked DIFF gaps — ALL CLOSED (185/185)
 
-The live harness reports **4 matchGolden DIFFs** of the 185 runnable cases. **All
-4 are in the `ng_modules` corpus and are golden-mode/shape artifacts, not compiler
-defects** — they ask for an NgModule output mode the harness can't request:
+The harness reports **0 matchGolden DIFFs** — 185/185. The last 4 (NgModule) were
+closed without regressing the default AOT emit (each mode-gated; matchGolden 185 +
+swc 29/29 byte-parity hold):
 
-- *"…with declarations and bootstrap (**jit mode**)"* and *"…with imports and
-  exports (**jit mode**)"* (2) — authored in Angular's legacy **jit** mode.
-  treaty_ivy emits the modern AOT `setNgModuleScope` shape; matching the jit golden
-  byte-for-byte would *regress* the output away from current Angular.
-- *"…with **forward refs**"* (1) — the golden spells the imports thunk
-  `imports: () => [ForwardModule]` a different way than our emit (a forwardRef-in-
-  imports thunk-shape difference, not a missing feature).
-- *"…all NgModule options in **local and optimized** mode"* (1) — exercises the
-  local/optimized compilation mode the harness has no way to select.
+- the two *jit-mode* goldens (declarations+bootstrap, imports+exports) — a
+  `linkerJitMode`-gated `Inline` NgModule selector-scope that folds declarations/
+  imports/exports/bootstrap directly into `ɵɵdefineNgModule` (Angular's
+  `r3_module_compiler.ts` jit shape — **no JIT runtime calls**); default stays the
+  AOT `ɵɵsetNgModuleScope` side-effect.
+- *forward refs* — NgModule imports with forward refs emit `imports: () => [Mod]`.
+- *all options (local/optimized)* — fixed a genuine bug (wrong module-class ref +
+  dropped `bootstrap`).
 
-The genuine compiler-feature gaps that used to sit here are now **closed**:
+The earlier genuine compiler-feature gaps are also **closed**:
 control / `field` bindings (`ɵɵcontrolCreate`/`ɵɵcontrol`), inline arrows in host
 binding/listener + inline-arrow `@Input` transform (full OXC arrow → output-AST
 conversion in `convert_expr`), host-binding array/object literal →
