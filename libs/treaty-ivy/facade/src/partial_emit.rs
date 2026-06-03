@@ -475,7 +475,8 @@ fn new_expr_args<'a>(expr: &'a Expression<'a>) -> Option<&'a [Argument<'a>]> {
 
 /// Map ONE constructor-argument inject call back to its `{ token, …flags }` declaration entry SOURCE:
 ///   * `i0.ɵɵinject(Token[, flags])` / `i0.ɵɵdirectiveInject(Token[, flags])` →
-///     `{ token: <Token src>[, host: true][, self: true][, skipSelf: true][, optional: true] }`
+///     `{ token: <Token src>[, host: true][, optional: true][, self: true][, skipSelf: true] }`
+///     (Angular `compileDependency` field order: token, attribute, host, optional, self, skipSelf)
 ///     (the flags are decoded from the numeric `InjectFlags` 2nd arg: HOST=1, SELF=2, SKIP_SELF=4,
 ///     OPTIONAL=8; the FOR_PIPE=16 bit is a codegen marker, dropped from the declaration);
 ///   * `i0.ɵɵinjectAttribute("name")` → `{ token: "name", attribute: true }`;
@@ -494,19 +495,21 @@ fn dep_entry_from_inject(arg: &Argument, source: &str) -> Option<String> {
             if let Some(flags_arg) = args.get(1) {
                 if let Some(flags) = flags_arg.as_expression().and_then(numeric_literal_value) {
                     let bits = flags as u8;
-                    // InjectFlags bit order on emit is host, self, skipSelf, optional (the codegen's
-                    // `create_ctor_dep_type` order); match it for byte parity with ng-packagr.
+                    // Field emit order follows Angular's `compileDependency` (compiler.mjs):
+                    // token, attribute, host, optional, self, skipSelf — NOT the InjectFlags bit
+                    // order. (`attribute` rides the separate `ɵɵinjectAttribute` path, never combined
+                    // with these flags.) Match it for byte parity with ng-packagr's GOLDEN_PARTIAL.
                     if bits & 0b0_0001 != 0 {
                         entry.push_str(", host: true");
+                    }
+                    if bits & 0b0_1000 != 0 {
+                        entry.push_str(", optional: true");
                     }
                     if bits & 0b0_0010 != 0 {
                         entry.push_str(", self: true");
                     }
                     if bits & 0b0_0100 != 0 {
                         entry.push_str(", skipSelf: true");
-                    }
-                    if bits & 0b0_1000 != 0 {
-                        entry.push_str(", optional: true");
                     }
                 }
             }
@@ -1078,6 +1081,58 @@ mod tests {
         let relinked = link_partial(&partial.code, "c.ts");
         assert!(relinked.errors.is_empty(), "relink errors: {:?}", relinked.errors);
         assert_eq!(norm(&relinked.code), norm(&aot.code), "flagged-deps round-trip diverged");
+        assert_no_residual_declare(&relinked.code);
+    }
+
+    #[test]
+    fn factory_dep_multi_flag_field_order_matches_compile_dependency() {
+        // A dep carrying 2+ inject flags must emit its fields in Angular `compileDependency` order
+        // (token, attribute, host, optional, self, skipSelf) — NOT InjectFlags bit order. The
+        // `r3_view_compiler_di` GOLDEN_PARTIAL `component_factory` case proves the byte form for an
+        // `@Optional() @Self()` dep: `{ token: MyService, optional: true, self: true }`.
+        let aot = compile_component_source(
+            "import { Component, Optional, Self } from '@angular/core';\n\
+             class MyService {}\n\
+             @Component({ selector: 'c', template: '' })\n\
+             export class C { constructor(@Optional() @Self() s: MyService) {} }",
+        );
+        let partial = emit_partial(&aot.code);
+        let f = flat(&partial.code);
+        assert!(
+            f.contains("{ token: MyService, optional: true, self: true }"),
+            "multi-flag dep field order wrong (want optional before self); got:\n{}",
+            f
+        );
+        let relinked = link_partial(&partial.code, "c.ts");
+        assert!(relinked.errors.is_empty(), "relink errors: {:?}", relinked.errors);
+        assert_eq!(norm(&relinked.code), norm(&aot.code), "multi-flag dep round-trip diverged");
+        assert_no_residual_declare(&relinked.code);
+    }
+
+    #[test]
+    fn factory_deps_use_constructor_implementation_signature() {
+        // TS constructor overloads: only the IMPLEMENTATION (the one WITH a body) is authoritative.
+        // ngtsc reads its full parameter list — the bodiless overload signatures may declare fewer.
+        // The factory deps must reflect ALL implementation params, not the first overload's.
+        let aot = compile_component_source(
+            "import { Injectable } from '@angular/core';\n\
+             class A {}\n class B {}\n\
+             @Injectable()\n\
+             export class S {\n\
+               constructor(a: A);\n\
+               constructor(a: A, b: B) {}\n\
+             }",
+        );
+        let partial = emit_partial(&aot.code);
+        let f = flat(&partial.code);
+        assert!(
+            f.contains("deps: [{ token: A }, { token: B }]"),
+            "ctor-overload deps did not use the implementation signature (expected A and B); got:\n{}",
+            f
+        );
+        let relinked = link_partial(&partial.code, "s.ts");
+        assert!(relinked.errors.is_empty(), "relink errors: {:?}", relinked.errors);
+        assert_eq!(norm(&relinked.code), norm(&aot.code), "ctor-overload round-trip diverged");
         assert_no_residual_declare(&relinked.code);
     }
 

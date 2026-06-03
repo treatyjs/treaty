@@ -4354,6 +4354,10 @@ impl TemplateDefinitionBuilder {
             i18n::I18nConstOpts {
                 bare_name,
                 needs_postprocess,
+                // `fileBasedI18nSuffix` = `relativeContextFilePath.replace(/[^A-Za-z0-9]/g, '_')`
+                // upper-cased + `'_'`. The metadata's context file path is empty in every current
+                // emit path, so the suffix is `"_"` (→ closure prefix `MSG__`), matching the oracle.
+                file_suffix: i18n::file_based_i18n_suffix(""),
             },
         );
         self.const_pool

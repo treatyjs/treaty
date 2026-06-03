@@ -163,6 +163,82 @@ fn recognized_decorator_strip_span(class: &Class, primary: &Decorator) -> (u32, 
     )
 }
 
+/// True for the member-level Angular decorators that the Ivy class definition (`ɵɵdefineDirective` /
+/// `ɵɵdefineComponent`) already encodes into its statics, so leaving them on the lowered class
+/// declaration is redundant — and trips `builtin:swc-loader` configured with `decorators: false`.
+/// ngtsc's class transformer strips ALL of these off the emitted member. (The signal-based `input()`
+/// / `output()` / `viewChild()` forms are plain initializers, not decorators, so they are unaffected.)
+fn is_inert_member_decorator(name: Option<&str>) -> bool {
+    matches!(
+        name,
+        Some(
+            "Input"
+                | "Output"
+                | "HostBinding"
+                | "HostListener"
+                | "ViewChild"
+                | "ViewChildren"
+                | "ContentChild"
+                | "ContentChildren"
+        )
+    )
+}
+
+/// Collect the source spans of every inert member-level Angular decorator on `class` (see
+/// [`is_inert_member_decorator`]). Returned sorted by start offset, so the emitter can excise each
+/// from the kept class-body source slice. The class's own top-level decorator is NOT included here
+/// (that is handled separately by [`recognized_decorator_strip_span`]).
+fn member_decorator_strip_spans(class: &Class) -> Vec<(u32, u32)> {
+    let mut spans = Vec::new();
+    for element in &class.body.body {
+        let decorators = match element {
+            ClassElement::PropertyDefinition(p) => &p.decorators,
+            ClassElement::AccessorProperty(p) => &p.decorators,
+            ClassElement::MethodDefinition(m) => &m.decorators,
+            _ => continue,
+        };
+        for dec in decorators.iter() {
+            if is_inert_member_decorator(decorator_name(dec)) {
+                let s = dec.span();
+                spans.push((s.start, s.end));
+            }
+        }
+    }
+    spans.sort_by_key(|(start, _)| *start);
+    spans
+}
+
+/// Emit `source[range]` with each span in `strip_spans` (absolute source offsets, sorted, assumed
+/// to fall within `range`) excised, also consuming the whitespace run immediately AFTER each removed
+/// decorator up to (but not including) the next non-whitespace byte. This deletes the decorator and
+/// its trailing newline + indentation so the member it annotated does not leave a blank line behind,
+/// matching how ngtsc's emit drops the member decorator entirely.
+fn push_slice_excising_spans(
+    out: &mut String,
+    source: &str,
+    range: std::ops::Range<usize>,
+    strip_spans: &[(u32, u32)],
+) {
+    let bytes = source.as_bytes();
+    let mut cursor = range.start;
+    for &(s, e) in strip_spans {
+        let (s, mut e) = (s as usize, e as usize);
+        if s < cursor || e > range.end {
+            continue;
+        }
+        // Emit up to the decorator start, then skip the decorator span itself.
+        out.push_str(&source[cursor..s]);
+        // Consume trailing whitespace (incl. the newline) after the decorator so its line collapses.
+        while e < range.end && (bytes[e] as char).is_whitespace() {
+            e += 1;
+        }
+        cursor = e;
+    }
+    if cursor < range.end {
+        out.push_str(&source[cursor..range.end]);
+    }
+}
+
 /// Reads the static-identifier name of a property key (the common case: `selector`, `template`).
 fn key_name<'a>(key: &'a PropertyKey<'a>) -> Option<&'a str> {
     match key {
@@ -1860,20 +1936,28 @@ fn class_factory(class: &Class, class_name: &str, target: FactoryTarget) -> R3Fa
 ///   * a parameter whose token cannot be resolved (no usable type, no `@Inject`/`@Attribute`) makes
 ///     the dep token `None`, which the factory codegen lowers to `ɵɵinvalidFactoryDep(index)`.
 ///
-/// Constructor overloads (TS allows several signatures, only the LAST having a body) are folded by
-/// oxc into a single `MethodDefinition`; we read the implementation signature (the one with params)
-/// — the bodiless overload signatures carry no `FormalParameter` items.
+/// Constructor overloads (TS allows several signatures, only the IMPLEMENTATION having a body) are
+/// each kept as a distinct `MethodDefinition` by oxc. ngtsc's `getConstructorDependencies` reads the
+/// IMPLEMENTATION signature (the one with a `body`), whose parameter list is authoritative — the
+/// bodiless overload signatures may declare FEWER (or different) params. We therefore prefer the
+/// body-bearing constructor; only when none exists (ambient/declaration-only classes) do we fall
+/// back to the first constructor that declares parameters.
 fn extract_ctor_deps(class: &Class) -> FactoryDeps {
-    // Find the constructor's implementation signature: the `MethodDefinition` of kind
-    // `Constructor` that actually declares parameters (the bodiless overloads have none).
-    let ctor = class.body.body.iter().find_map(|element| match element {
-        ClassElement::MethodDefinition(m)
-            if m.kind == MethodDefinitionKind::Constructor && !m.value.params.items.is_empty() =>
-        {
-            Some(m)
-        }
-        _ => None,
-    });
+    let constructors = || {
+        class.body.body.iter().filter_map(|element| match element {
+            ClassElement::MethodDefinition(m)
+                if m.kind == MethodDefinitionKind::Constructor =>
+            {
+                Some(m)
+            }
+            _ => None,
+        })
+    };
+    // Implementation signature first (the one that actually has a body); fall back to the first
+    // constructor declaring parameters when there is no implementation (declaration-only classes).
+    let ctor = constructors()
+        .find(|m| m.value.body.is_some())
+        .or_else(|| constructors().find(|m| !m.value.params.items.is_empty()));
 
     let Some(ctor) = ctor else {
         return FactoryDeps::Deps(Vec::new());
@@ -2073,7 +2157,14 @@ fn assemble_module(
             if content_start < dec_start {
                 out.push_str(&source[content_start..dec_start]);
             }
-            out.push_str(&source[dec_end..stmt_end]);
+            // The kept declaration body (`export class X { … }`), with any inert member-level Angular
+            // decorators (`@Input`/`@Output`/`@HostBinding`/`@HostListener`/`@ViewChild`/…) excised —
+            // they are already encoded into the Ivy statics below, are redundant on the lowered class,
+            // and trip `builtin:swc-loader` (`decorators: false`).
+            let member_strips = statement_class(stmt)
+                .map(member_decorator_strip_spans)
+                .unwrap_or_default();
+            push_slice_excising_spans(&mut out, source, dec_end..stmt_end, &member_strips);
             // Statics: emitted via the shared lowering, then spliced in WITHOUT the leading
             // `import * as i0` line (added once at module scope below).
             let statics = class_static_statements(emit);
@@ -5239,6 +5330,41 @@ AuthService.\u{0275}prov = i0.\u{0275}\u{0275}defineInjectable({
             "domProperty(id, ctx.dirId) missing; got: {}",
             out.code
         );
+    }
+
+    #[test]
+    fn member_decorators_stripped_from_lowered_class() {
+        // The kept class declaration must NOT carry inert member decorators
+        // (`@HostBinding`/`@HostListener`/`@Input`/`@Output`/`@ViewChild`…): `ɵɵdefineDirective`
+        // already encodes them, they are redundant, and they trip `builtin:swc-loader`
+        // (`decorators: false`). This mirrors the ng-bench `ThemeToggle` directive.
+        let src = r#"
+            @Directive({ selector: '[themeToggle]' })
+            export class ThemeToggle {
+                private readonly dark = signal(true);
+                @HostBinding('attr.data-theme') get theme() { return this.dark() ? 'dark' : 'light'; }
+                @HostBinding('class.is-dark') get isDark() { return this.dark(); }
+                @HostListener('click') onClick() { this.dark.update((v) => !v); }
+            }
+        "#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        // The Ivy def still ENCODES the host bindings/listeners.
+        assert!(
+            out.code.contains("\u{0275}\u{0275}defineDirective"),
+            "no defineDirective; got: {}",
+            out.code
+        );
+        let f = flat(&out.code);
+        assert!(f.contains("hostBindings"), "hostBindings encoding lost; got: {}", out.code);
+        // But the lowered class declaration carries NO member decorators.
+        for dec in ["@HostBinding", "@HostListener", "@Input", "@Output", "@ViewChild"] {
+            assert!(
+                !out.code.contains(dec),
+                "member decorator {dec} leaked into lowered output; got: {}",
+                out.code
+            );
+        }
     }
 
     #[test]

@@ -480,13 +480,13 @@ impl<'a> Lowerer<'a> {
         //     around a lone simple arrow parameter (`(x) =>` -> `x =>`).
         let code = normalize_numeric_literals(&code);
         let code = drop_single_param_arrow_parens(&code);
-        //  3. `escape_replacement_chars` rewrites every raw U+FFFD code point to the six-character
-        //     `�` escape. The i18n runtime placeholder magic strings (`�0�`, `�#1�`, …) carry
-        //     U+FFFD; TypeScript's printer (which Angular's goldens are produced by) escapes it,
-        //     whereas oxc_codegen emits the raw code point. U+FFFD never appears as legitimate raw
-        //     output outside these string/template-literal placeholders, so the global rewrite is
-        //     value-preserving.
-        escape_replacement_chars(&code)
+        // NOTE: the i18n runtime placeholder magic strings (`�0�`, `�#1�`, …) carry a RAW U+FFFD
+        // code point, which is exactly what `@angular/compiler`'s real emitter (and oxc_codegen)
+        // produce. We deliberately do NOT escape it to `�`: the escaped spelling only ever
+        // appeared in the `String.raw\`�\`` compliance-test MACRO goldens (a test-harness
+        // artifact the compliance suite skips), never in real Ivy output. Emitting the raw code
+        // point makes the i18n parity fixtures byte-identical to the @angular/compiler oracle.
+        code
     }
 
     // -- helpers ----------------------------------------------------------
@@ -1493,18 +1493,6 @@ fn is_ident_byte(b: u8) -> bool {
 /// spans, so only real code is considered. Any param list that is not exactly one
 /// simple identifier (commas, defaults, destructuring, rest, annotations) keeps its
 /// parens because the inner scan would hit a non-identifier byte before the `)`.
-/// Rewrite every raw U+FFFD replacement character to the six-character `�` escape, matching
-/// TypeScript's printer for the i18n placeholder magic strings (`�0�`, `�#1�`,
-/// …). oxc_codegen emits U+FFFD as the raw code point; Angular's goldens escape it. U+FFFD only
-/// ever appears inside the i18n string/template-literal placeholders, so this whole-source rewrite
-/// is value-preserving.
-fn escape_replacement_chars(code: &str) -> String {
-    if !code.contains('\u{FFFD}') {
-        return code.to_string();
-    }
-    code.replace('\u{FFFD}', "\\uFFFD")
-}
-
 fn drop_single_param_arrow_parens(code: &str) -> String {
     let bytes = code.as_bytes();
     let n = bytes.len();
@@ -1822,13 +1810,14 @@ mod tests {
     }
 
     #[test]
-    fn string_literal_escapes_replacement_char() {
-        // The i18n runtime placeholder magic strings carry U+FFFD; TypeScript's printer escapes it
-        // as the six-character `�` sequence. The emitter rewrites the raw code point oxc_codegen
-        // would otherwise print, so the literal text appears verbatim in the output.
+    fn string_literal_emits_raw_replacement_char() {
+        // The i18n runtime placeholder magic strings carry U+FFFD. `@angular/compiler`'s real
+        // emitter (and oxc_codegen) print it as the RAW code point — only the `String.raw`
+        // compliance-test macro goldens spell it `�`. The emitter therefore emits the raw
+        // U+FFFD verbatim so the i18n parity fixtures are byte-identical to the oracle.
         let out = emit_expression(&str_lit("\u{FFFD}0\u{FFFD}"));
-        assert!(out.contains("\\uFFFD0\\uFFFD"), "expected escaped form, got: {out}");
-        assert!(!out.contains('\u{FFFD}'), "raw U+FFFD must not survive, got: {out}");
+        assert!(out.contains('\u{FFFD}'), "expected raw U+FFFD, got: {out}");
+        assert!(!out.contains("\\uFFFD"), "raw U+FFFD must NOT be escaped, got: {out}");
     }
 
     #[test]

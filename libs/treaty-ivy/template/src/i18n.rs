@@ -739,15 +739,34 @@ pub struct I18nConst {
 
 /// Context-dependent emit options for [`build_i18n_const`], mirroring the two ways Angular's own
 /// compiler varies the const-pool form for a single i18n message.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct I18nConstOpts {
-    /// Emit the translation variable as the BARE `i18n_<index>` identifier (the form Angular's
-    /// printer produces — and the goldens spell literally — when the message brackets control-flow
-    /// blocks `@if`/`@switch`/`@for`/`@defer`) rather than the `$i18n_<index>$` placeholder form.
+    /// Retained for source compatibility; the real `@angular/compiler` emitter ALWAYS spells the
+    /// translation variable as the bare `i18n_<index>` const (`TRANSLATION_VAR_PREFIX` +
+    /// `pool.uniqueName` index), so this flag no longer changes the emitted name. (The earlier
+    /// `$i18n_<index>$` placeholder form existed only to match the `__i18nMsg__` macro compliance
+    /// goldens, which the harness skips — never a real Ivy emit.)
     pub bare_name: bool,
     /// Append `i18n_<index> = ɵɵi18nPostprocess(i18n_<index>);` after the closure guard, as Angular
     /// does whenever a placeholder value merges more than one position (`[�…�|�…�]`).
     pub needs_postprocess: bool,
+    /// Angular's `fileBasedI18nSuffix`: `relativeContextFilePath.replace(/[^A-Za-z0-9]/g, '_')`
+    /// upper-cased + `'_'`. The closure const name is `getTranslationConstPrefix(suffix)` =
+    /// `('MSG_' + suffix).toUpperCase()` + `pool.uniqueName` index — e.g. an empty file path yields
+    /// suffix `"_"` → prefix `"MSG__"` → `MSG__0` (matching `@angular/compiler`).
+    pub file_suffix: String,
+}
+
+/// Angular's `fileBasedI18nSuffix` (`render3/view/i18n/util.ts`): take the component's
+/// `relativeContextFilePath`, replace every non-alphanumeric byte with `_`, upper-case, and append a
+/// trailing `_`. Feeds [`I18nConstOpts::file_suffix`] so the closure const name matches the oracle
+/// (`MSG_<SUFFIX>_<index>`; an empty path → suffix `"_"` → `MSG__<index>`).
+pub fn file_based_i18n_suffix(relative_context_file_path: &str) -> String {
+    let sanitized: String = relative_context_file_path
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    format!("{}_", sanitized.to_uppercase())
 }
 
 /// `render3/view/i18n/util.ts` `formatI18nPlaceholderName`. Converts an internal placeholder name
@@ -853,17 +872,18 @@ pub fn build_i18n_const(
     localize_expr: Expr,
     opts: I18nConstOpts,
 ) -> I18nConst {
-    // The main var (`TRANSLATION_VAR_PREFIX` `i18n_`) and the closure const (`MSG_…`). The closure
-    // const is harness-canonicalised via the `$name$` placeholder form. The main var is BARE
-    // `i18n_<index>` for block-bracketing messages (Angular emits the literal const there, so the
-    // golden spells it bare and the harness compares it literally) and `$i18n_<index>$` otherwise
-    // (where the golden uses the `$name$` identifier placeholder the harness collapses).
-    let main_name = if opts.bare_name {
-        format!("i18n_{index}")
-    } else {
-        format!("$i18n_{index}$")
-    };
-    let closure_name = "$MSG_ID_WITH_SUFFIX$".to_string();
+    // The main var (`TRANSLATION_VAR_PREFIX` `i18n_` + `pool.uniqueName` index) and the closure
+    // const (`getTranslationConstPrefix(fileBasedI18nSuffix)` + index). Both are byte-exact with
+    // `@angular/compiler`'s real emitter: `let i18n_0; … const MSG__0 = goog.getMsg(…);`. (The
+    // `$i18n_0$` / `$MSG_ID_WITH_SUFFIX$` placeholder spellings the harness once folded were only
+    // for the `__i18nMsg__` macro goldens — which the compliance harness skips, not a real emit.)
+    let _ = opts.bare_name;
+    let main_name = format!("i18n_{index}");
+    // `getTranslationConstPrefix(suffix)` = `('MSG_' + suffix).toUpperCase()`, then the unique index.
+    let closure_name = format!(
+        "{}{index}",
+        format!("MSG_{}", opts.file_suffix).to_uppercase()
+    );
 
     let main_var = o::variable(main_name.clone(), None);
 

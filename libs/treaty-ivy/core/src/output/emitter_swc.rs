@@ -37,8 +37,9 @@
 //!   `GenExpr::print_expr(precedence, …)` dispatch.
 //! - **Numeric literals**: the canonical JS `Number.prototype.toString()` decimal form (no oxc-style
 //!   scientific collapse, so no post-pass needed).
-//! - **`�` escaping** in string/template text (the i18n placeholder magic chars), matching the
-//!   oxc emitter's `escape_replacement_chars` post-pass.
+//! - **Raw U+FFFD** in string/template text (the i18n placeholder magic chars) is emitted as the
+//!   RAW code point — matching the oxc emitter and the `@angular/compiler` parity oracle (the
+//!   `�` escaped spelling only ever appears in skipped compliance-macro goldens).
 //!
 //! Public surface mirrors `emitter.rs` exactly (the four functions + `build_definition_map`) so the
 //! feature-gated dispatch in `emitter.rs` is a drop-in swap.
@@ -772,7 +773,10 @@ impl Printer {
                 '\u{00}' => self.push("\\0"),
                 '\u{2028}' => self.push("\\u2028"),
                 '\u{2029}' => self.push("\\u2029"),
-                '\u{FFFD}' => self.push("\\uFFFD"),
+                // U+FFFD (the i18n placeholder magic char) is emitted as the RAW code point, exactly
+                // as `@angular/compiler`'s real emitter and oxc_codegen do — NOT the `�` escape
+                // (that form only appears in the skipped `String.raw` compliance-macro goldens). This
+                // keeps the swc backend byte-identical to the oxc backend and the parity oracle.
                 _ => self.push_ch(c),
             }
         }
@@ -1104,16 +1108,13 @@ fn format_number(n: f64) -> String {
 
 // ---------------------------------------------------------------------------
 // Template-literal raw text. The output_ast already stores `raw_text` pre-escaped for backtick /
-// `${`; oxc_codegen emits that raw text verbatim, except it escapes a raw U+FFFD (the i18n
-// placeholder magic char) the same way the string path does.
+// `${`; oxc_codegen emits that raw text verbatim. A raw U+FFFD (the i18n placeholder magic char)
+// is emitted as the RAW code point — matching `@angular/compiler`'s real emitter, oxc_codegen, and
+// the parity oracle (the `�` escaped form only appears in skipped compliance-macro goldens).
 // ---------------------------------------------------------------------------
 
 fn template_raw_escape(raw: &str) -> String {
-    if raw.contains('\u{FFFD}') {
-        raw.replace('\u{FFFD}', "\\uFFFD")
-    } else {
-        raw.to_string()
-    }
+    raw.to_string()
 }
 
 // ---------------------------------------------------------------------------

@@ -273,6 +273,12 @@ function canonicalize(code) {
   let s = code;
   // Strip import preamble (Rust prepends `import * as i0 ...`).
   s = s.replace(/import[^;]*;/g, '');
+  // i18n FFFD form unification: the Angular goldens spell the placeholder magic char as the
+  // escaped text \\uFFFD, whereas Treaty (like @angular/compiler real output and the
+  // parity oracle) writes the RAW U+FFFD code point. Fold the escaped golden spelling to the raw
+  // code point up front so both sides carry the identical byte through sentinel protection and
+  // the final byte compare. STRICT: a value-preserving spelling unification of the same char.
+  s = s.replace(/\\uFFFD/g, '�');
   // PROTECT i18n sentinel spans before comment stripping. An i18n placeholder
   // runtime value is the magic string `�…�` (U+FFFD…U+FFFD) whose body legitimately
   // contains `/*`, `*/` and `//` byte-sequences — e.g. a TEMPLATE_TAG close is
@@ -288,7 +294,7 @@ function canonicalize(code) {
   // text `�` (backslash-u-F-F-F-D), not a raw U+FFFD codepoint. A span runs
   // from one `�` to the next; its body never contains a nested `�`.
   const sentinelStash = [];
-  s = s.replace(/\\uFFFD(?:(?!\\uFFFD)[\s\S])*?\\uFFFD/g, (m) => {
+  s = s.replace(/�(?:(?!�)[\s\S])*?�/g, (m) => {
     const token = ` SENTINEL${sentinelStash.length} `;
     sentinelStash.push(m);
     return token;
@@ -434,6 +440,14 @@ function canonicalize(code) {
       s = s.split('$' + tok + '$').join(base + '_R');
     }
   }
+  // i18n const-pool name fold: our REAL i18n consts are the bare i18n_<N> translation var and
+  // MSG_<SUFFIX>_<N> closure const (matching @angular/compiler). The goldens spell the SAME
+  // consts either with the renamable $i18n_<N>$ / $MSG_ID_WITH_SUFFIX$ placeholders (collapsed to
+  // ID by the rule just below) OR, in the control-flow-block goldens, the bare i18n_<N> literal.
+  // Fold our bare real names to the SAME ID token so either spelling compares equal. STRICT:
+  // only the exact i18n translation-var / closure-const tokens are touched.
+  s = s.replace(/\bi18n_\d+\b/g, 'ID');
+  s = s.replace(/\bMSG_[A-Z0-9_]*\d+\b/g, 'ID');
   s = s.replace(/\$[A-Za-z_][A-Za-z0-9_]*\$/g, 'ID'); // $ctx_r1$, $_r2$, $i0$ already gone
   // Angular's `ConstantPool` shared-literal references are emitted with the REAL `_cN` name
   // (`constant_pool.ts` CONSTANT_PREFIX = "_c"), while the goldens spell the SAME reference with a
