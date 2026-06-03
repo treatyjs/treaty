@@ -1,0 +1,57 @@
+name: 🛡️ Boot gate
+
+# STANDING BOOT GATE — proves every build tool Treaty ships (vite / rolldown / native Rust linker /
+# Angular CLI) emits output that actually BOOTS headlessly (renders, no JIT / no @angular/compiler
+# error), AND that the gate itself is not a rubber stamp: a deliberately broken output (a root
+# component with no ɵcmp def) MUST be flagged FAIL. The gate exits non-zero if any real output fails
+# to boot OR if the negative test does not fail.
+#
+# See tools/treaty-bench/boot-gate.mjs for the full contract.
+
+on:
+  push:
+    branches: ["master", "migration/v22-oxc133"]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: boot-gate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  boot-gate:
+    name: boot gate (vite / rolldown / native / ng)
+    runs-on: ubuntu-latest
+    steps:
+      - name: 🚚 Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      # The native Rust linker path (and the addon the @treaty plugins call) needs the NAPI addon built
+      # from the workspace. rust-toolchain.toml pins the toolchain; rustup honours it on demand.
+      - name: 🦀 Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install dependencies
+        run: bun install
+
+      # Build the NAPI addon (@treaty/authoring-node) — the shared Rust compiler/linker every Treaty
+      # build tool calls, and the artifact the gate's "native" path drives directly. Same invocation the
+      # addon-build workflow uses (native host target).
+      - name: Build NAPI addon
+        run: bun run --cwd libs/authoring/node build
+
+      # The gate's Step 0 rebuilds the @treaty/vite + @treaty/rolldown plugin dists from source itself,
+      # so no separate dist-build step is needed. Run the gate: it builds linker-smoke through every
+      # available tool, headless-boots each output (works=PASS), and runs the negative test (a broken
+      # output MUST boot FAIL). Exits non-zero on any failure.
+      - name: Run boot gate
+        run: node tools/treaty-bench/boot-gate.mjs
