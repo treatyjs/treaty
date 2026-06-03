@@ -12,32 +12,44 @@
 //! `@Component` decorators for `styleUrls` / `styleUrl`, reads the referenced
 //! files relative to the entry source, compiles SCSS/Sass with the pure-Rust
 //! [`grass`] engine (and passes `.css` through verbatim), and returns a
-//! [`ResolvedContentMap`] keyed by component class name. Handing that map to
+//! [`ResolvedContentMap`] keyed by component class name.
+//!
+//! **Less / Stylus** are an HONEST passthrough: no mature pure-Rust Less or Stylus
+//! compiler exists (surveyed — `lightningcss` is a CSS minifier, not a Less/Stylus
+//! preprocessor; the real compilers are JS-only, so ng-packagr shells out to the npm
+//! `less`/`stylus` packages). packagr passes the raw `.less`/`.styl` text through with a
+//! diagnostic rather than failing the build. SCSS/Sass, by contrast, fully compile via
+//! grass — so the supported preprocessor set is **SCSS/Sass + plain CSS**. Handing that map to
 //! [`treaty_ivy::source_compile::compile_component_source_with_resolved`] makes a
 //! `styleUrls` component emit a `styles: [...]` array — already preprocessed and
 //! (for Emulated) scoped by the SAME `ShadowCss` port ngc uses. The Emulated
 //! SCOPING (`_ngcontent-%COMP%` placement, descendant combinators) is byte-identical
 //! to ng-packagr's.
 //!
-//! ## esbuild value minification
+//! ## CSS minification toward the ng-packagr@21 FESM
 //!
-//! ng-packagr additionally runs esbuild's CSS-value optimizer over every stylesheet
-//! (`color: blue` → `#00f`, `bold` → `700`, hex shortening, `0px` → `0`, whitespace
-//! collapse). packagr reproduces the **common, context-free** subset of that via
-//! [`optimize_compiled_styles`], which post-processes every `styles: [...]` string
-//! in the COMPILED module — covering both inline `styles` and resolved `styleUrls`
-//! uniformly. Because esbuild's value transforms operate on declaration values and
-//! Angular's scoping rewrites only selectors, optimizing the already-scoped CSS
-//! yields byte-identical values while preserving the `_ngcontent-%COMP%`
-//! placeholders (see [`crate::css_optimizer`] for the fidelity boundary).
+//! ng-packagr's real pipeline runs esbuild's CSS minifier BEFORE ngc's `ShadowCss`
+//! scoping (`encapsulateStyle(esbuildBundleFile(css))`) and then emits the FESM.
+//! packagr's pipeline is the REVERSE — treaty_ivy's `ShadowCss` port scopes first, then
+//! [`optimize_compiled_styles`] post-processes every `styles: [...]` string in the
+//! COMPILED module (covering both inline `styles` and resolved `styleUrls` uniformly).
+//! The optimizer therefore reproduces exactly those esbuild transforms that SURVIVE
+//! scoping, targeting the ng-packagr@21 **FESM** `styles` bytes as the oracle (NOT a raw
+//! `esbuild.transformSync` — the two differ; e.g. the FESM tightens `@media` preludes
+//! while a bare esbuild transform and `encapsulateStyle(esbuildBundleFile())` both leave
+//! them loose). See [`crate::css_optimizer`] for the full pipeline-order analysis and the
+//! per-construct fidelity boundary.
 //!
 //! File I/O and preprocessing are the only packagr-side concern; scoping and the
-//! `styles` array shape live in `treaty_ivy`. The emitted CSS matches ng-packagr on
-//! the COMMON case — scoping always, plus the context-free value optimizations
-//! (named-color→hex, `bold`→`700`, hex shortening, `0px`→`0`, whitespace collapse),
-//! byte-verified against a live ng-packagr@21 build. A few esbuild micro-opts remain
-//! the fidelity boundary (shorthand-internal color conversion, transform-fn /
-//! selector-list / at-rule whitespace) — documented in [`crate::css_optimizer`].
+//! `styles` array shape live in `treaty_ivy`. The emitted CSS is **byte-identical** to a
+//! live ng-packagr@21 build for the whole css-oracle fixture — scoping, named-color→hex,
+//! `bold`→`700`, hex shortening, `0px`→`0`, whitespace collapse, the selector-list
+//! comma+space, `@media` prelude tightening, `@keyframes` `from`→`0%` /
+//! `rotate(0deg)`→`rotate(0)`, custom-property verbatim, `!important` tightening,
+//! attribute-quote stripping, and legacy `::before`→`:before` (all regression-locked in
+//! [`crate::css_optimizer`]). The remaining fidelity boundary is the deep typed-value
+//! model esbuild only applies inside shorthands (shorthand-internal color conversion,
+//! `rgb()`/`hsl()` function conversion) — deliberately not done, to never over-minify.
 
 use std::path::Path;
 
@@ -59,12 +71,15 @@ enum StyleLang {
     Css,
     /// Sass/SCSS — compiled with the pure-Rust [`grass`] engine.
     Scss,
-    /// Less / Stylus — passed through as raw text. There is no mature pure-Rust
-    /// Less or Stylus compiler (both are JS-only ecosystems; ng-packagr shells out
-    /// to the npm `less` package), so packagr does NOT preprocess them in-process.
-    /// The raw file is passed through so the build still produces output rather than
-    /// failing, the variable/mixin syntax is left intact, and the gap is reported
-    /// honestly via a diagnostic. (SCSS/Sass, by contrast, fully compile via grass.)
+    /// Less / Stylus (and any other non-CSS preprocessor) — passed through as raw text.
+    ///
+    /// There is no mature pure-Rust Less or Stylus compiler (surveyed: `lightningcss` parses/minifies
+    /// CSS but does NOT implement the Less/Stylus *preprocessor* languages — variables, mixins,
+    /// functions; the `less` and `stylus` compilers are JS-only, which is why ng-packagr shells out to
+    /// the npm `less`/`stylus` packages). Adding one would mean porting an entire preprocessor, so
+    /// packagr does NOT preprocess Less/Stylus in-process. The raw file is passed through so the build
+    /// still produces output rather than failing, the variable/mixin syntax is left intact, and the
+    /// gap is reported honestly via a diagnostic. (SCSS/Sass, by contrast, fully compile via grass.)
     Passthrough,
 }
 
@@ -79,9 +94,18 @@ impl StyleLang {
         {
             Some("scss") | Some("sass") => StyleLang::Scss,
             Some("css") => StyleLang::Css,
-            // `.less` / `.styl` have no in-process Rust engine yet.
+            // `.less` / `.styl` have no in-process Rust engine (no pure-Rust Less/Stylus compiler
+            // exists — see `StyleLang::Passthrough`); pass them through with a diagnostic.
             _ => StyleLang::Passthrough,
         }
+    }
+
+    /// A human-readable language name for diagnostics (`less`, `styl`, or the raw extension).
+    fn label(path: &Path) -> String {
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_else(|| "unknown".to_string())
     }
 }
 
@@ -270,8 +294,10 @@ pub fn resolve_component_styles(
                 let lang = StyleLang::from_path(&path);
                 if lang == StyleLang::Passthrough {
                     diagnostics.push(format!(
-                        "stylesheet {} uses an unsupported preprocessor; passed through as raw CSS",
-                        path.display()
+                        "stylesheet {} ({}): no pure-Rust {} compiler exists; passed through as raw CSS (SCSS/Sass compile via grass)",
+                        path.display(),
+                        StyleLang::label(&path),
+                        StyleLang::label(&path),
                     ));
                 }
                 let (css, diag) = compile_stylesheet(&raw, lang, &path);

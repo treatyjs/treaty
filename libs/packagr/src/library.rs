@@ -66,6 +66,7 @@ fn build_entry(
     entry: &ResolvedEntry,
     entry_source_set: &HashSet<PathBuf>,
     mode: CompilationMode,
+    version: &str,
 ) -> Result<DistEntry, PackagrError> {
     let source = std::fs::read_to_string(&entry.source_path).map_err(PackagrError::from)?;
     let file_name = entry
@@ -134,7 +135,16 @@ fn build_entry(
     // form through the Angular linker (verified in `treaty_ivy::partial_emit`).
     let esm_out = match mode {
         CompilationMode::Full => flat_esm,
-        CompilationMode::Partial => treaty_ivy::emit_partial(&flat_esm).code,
+        // Stamp the library's OWN package version into every partial declaration, exactly as
+        // ng-packagr publishes (it records the lib version in each `ɵɵngDeclare*`'s `version:` /
+        // `ɵsetClassMetadata`-partial `version:` field). The treaty_ivy partial emitters stamp the
+        // in-repo `"0.0.0-PLACEHOLDER"` sentinel (it is version-stable for the round-trip linker);
+        // packagr rewrites that sentinel to the resolved package version so the published partial
+        // library carries a real version. Full mode never sees a partial declaration, so it is
+        // untouched (byte-identical to before).
+        CompilationMode::Partial => {
+            stamp_partial_version(&treaty_ivy::emit_partial(&flat_esm).code, version)
+        }
     };
 
     Ok(DistEntry {
@@ -143,6 +153,24 @@ fn build_entry(
         esm: esm_out,
         declarations,
     })
+}
+
+/// The in-repo sentinel every treaty_ivy partial emitter stamps as the declaration `version:`
+/// (`ɵɵngDeclare*` and the partial `ɵsetClassMetadata` form). It is version-stable for the linker
+/// round-trip; packagr replaces it with the published package version before emit.
+const PARTIAL_VERSION_SENTINEL: &str = "version: \"0.0.0-PLACEHOLDER\"";
+
+/// Rewrite the partial-declaration version sentinel to the resolved package `version`.
+///
+/// ng-packagr stamps the LIBRARY's own version into each emitted partial declaration; treaty_ivy's
+/// partial emitters write a fixed `"0.0.0-PLACEHOLDER"` sentinel (kept identical everywhere so the
+/// round-trip linker is version-stable). This replaces that exact `version: "0.0.0-PLACEHOLDER"`
+/// token — the only place the sentinel appears in emitted partial code — with `version: "<v>"`,
+/// leaving the per-kind `minVersion:` floors untouched (they are real Angular version floors, not
+/// the sentinel). A non-partial module never contains the sentinel and is returned unchanged.
+fn stamp_partial_version(esm: &str, version: &str) -> String {
+    let replacement = format!("version: \"{version}\"");
+    esm.replace(PARTIAL_VERSION_SENTINEL, &replacement)
 }
 
 /// One resolved asset to copy into the dist root: its destination path relative
@@ -174,7 +202,7 @@ fn collect_assets(package_dir: &Path, config: &PackageConfig) -> Vec<CollectedAs
     let mut out: Vec<CollectedAsset> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
 
-    let mut push = |rel_path: String, bytes: Vec<u8>, out: &mut Vec<CollectedAsset>, seen: &mut HashSet<String>| {
+    let push = |rel_path: String, bytes: Vec<u8>, out: &mut Vec<CollectedAsset>, seen: &mut HashSet<String>| {
         if seen.insert(rel_path.clone()) {
             out.push(CollectedAsset { rel_path, bytes });
         }
@@ -299,7 +327,7 @@ pub fn package_library(
     let mode = config.compilation_mode();
     let mut entries = Vec::with_capacity(resolved.len());
     for entry in &resolved {
-        entries.push(build_entry(entry, &entry_source_set, mode)?);
+        entries.push(build_entry(entry, &entry_source_set, mode, &version)?);
     }
 
     let sub_paths: Vec<String> = entries.iter().map(|e| e.sub_path.clone()).collect();
@@ -589,6 +617,19 @@ mod tests {
         assert!(
             !primary.esm.contains("\u{0275}\u{0275}definePipe"),
             "partial mode must NOT emit AOT ɵɵdefinePipe; got:\n{}",
+            primary.esm
+        );
+
+        // The published partial declaration carries the LIBRARY's OWN version (1.0.0), NOT the
+        // in-repo `0.0.0-PLACEHOLDER` sentinel — exactly as ng-packagr stamps the lib version.
+        assert!(
+            primary.esm.contains("version: \"1.0.0\""),
+            "partial declaration must carry the real package version; got:\n{}",
+            primary.esm
+        );
+        assert!(
+            !primary.esm.contains("0.0.0-PLACEHOLDER"),
+            "the version sentinel must be replaced by the real package version; got:\n{}",
             primary.esm
         );
 

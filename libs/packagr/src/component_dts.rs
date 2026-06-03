@@ -58,9 +58,10 @@ struct ComponentInput {
     /// Whether the input is required (no default / `input.required`).
     required: bool,
     /// Whether this input is SIGNAL-based (`input()` → `InputSignal<T>` property, `"isSignal": true`)
-    /// vs a CLASSIC `@Input` (a plain `T` property, `"isSignal": false`). Read from the emitted
-    /// `inputs` metadata shape: a signal input carries the `InputFlags.SignalBased` bit (bit 0) in
-    /// its flag-array form; a classic input is a plain string or a flag-array without that bit.
+    /// vs a CLASSIC `@Input` (a plain `T` property, with the `isSignal` key OMITTED from the
+    /// `.d.ts` input tuple — exactly as ngc/ng-packagr emit it). Read from the emitted `inputs`
+    /// metadata shape: a signal input carries the `InputFlags.SignalBased` bit (bit 0) in its
+    /// flag-array form; a classic input is a plain string or a flag-array without that bit.
     is_signal: bool,
 }
 
@@ -609,15 +610,37 @@ fn render_component_dts(model: &ComponentModel) -> String {
             .inputs
             .iter()
             .map(|i| {
-                // `isSignal` MUST reflect the actual compiled metadata: `true` only for a signal
-                // `input()` (`InputSignal<T>`), `false` for a classic `@Input` (a plain property).
-                format!(
-                    "\"{}\": {{ \"alias\": \"{}\"; \"required\": {}; \"isSignal\": {}; }}",
-                    i.name, i.alias, i.required, i.is_signal
-                )
+                // ngc/ng-packagr emit the `isSignal` key ONLY for a signal `input()`
+                // (`"isSignal": true`); for a classic `@Input` they OMIT the key entirely (the
+                // `ComponentDeclaration` input-tuple type defaults `isSignal` to `false`), so a
+                // classic input's `.d.ts` carries just `{ "alias": …; "required": … }`. Mirror
+                // that: emit `isSignal` only when `true`. Verified against a real ng-packagr@21
+                // FULL build (the `HelloComponent` `@Input() name` reference output).
+                if i.is_signal {
+                    format!(
+                        "\"{}\": {{ \"alias\": \"{}\"; \"required\": {}; \"isSignal\": true; }}",
+                        i.name, i.alias, i.required
+                    )
+                } else {
+                    format!(
+                        "\"{}\": {{ \"alias\": \"{}\"; \"required\": {}; }}",
+                        i.name, i.alias, i.required
+                    )
+                }
             })
             .collect();
-        format!("{{ {} }}", entries.join("; "))
+        // ng-packagr terminates EVERY input entry with a `;` — including the LAST — so the inputs
+        // map is `{ "a": {…}; "b": {…}; }` (a trailing `;` before the closing brace). Match that:
+        // append `; ` after each entry rather than joining with it. Verified byte-for-byte against a
+        // real ng-packagr@21 FULL `.d.ts` (`{ "name": { "alias": "name"; "required": false; }; }`).
+        format!(
+            "{{ {} }}",
+            entries
+                .iter()
+                .map(|e| format!("{e}; "))
+                .collect::<String>()
+                .trim_end()
+        )
     };
     let selector_ty = match &model.selector {
         Some(sel) => format!("\"{sel}\""),
@@ -833,8 +856,10 @@ export default Alert;
 
     #[test]
     fn classic_input_string_form_is_not_signal() {
-        // A classic `@Input() foo;` lowers to the BARE-STRING inputs form `{ foo: "foo" }`. The
-        // `.d.ts` must report `isSignal: false` and emit a PLAIN property (not `InputSignal<…>`).
+        // A classic `@Input() foo;` lowers to the BARE-STRING inputs form `{ foo: "foo" }`. ngc /
+        // ng-packagr OMIT the `isSignal` key for a classic input (it is only emitted for a signal
+        // `input()`), so the `.d.ts` carries just `{ "alias": …; "required": … }` and a PLAIN
+        // property (not `InputSignal<…>`). Confirmed against a real ng-packagr@21 FULL build.
         let src = r#"
 import * as i0 from "@angular/core";
 class Widget {}
@@ -848,14 +873,25 @@ Widget.ɵcmp = i0.ɵɵdefineComponent({
 "#;
         let dts = synthesize_component_dts(src).expect("should recognize the component");
         assert!(
-            dts.contains("\"foo\": { \"alias\": \"foo\"; \"required\": false; \"isSignal\": false; }"),
-            "classic @Input must report isSignal:false:\n{dts}"
+            dts.contains("\"foo\": { \"alias\": \"foo\"; \"required\": false; }"),
+            "classic @Input must omit the isSignal key (ngc/ng-packagr emit it only for signal input()):\n{dts}"
+        );
+        // The `isSignal` key must NOT appear for a classic input.
+        assert!(
+            !dts.contains("isSignal"),
+            "classic @Input must NOT emit an isSignal key:\n{dts}"
         );
         // Plain property, NOT an InputSignal.
         assert!(dts.contains("foo: unknown;"), "classic @Input should be a plain property:\n{dts}");
         assert!(
             !dts.contains("foo: import(\"@angular/core\").InputSignal"),
             "classic @Input must NOT be reconstructed as InputSignal:\n{dts}"
+        );
+        // The FULL inputs map carries a trailing `;` after the input object, before the closing
+        // brace — `{ "foo": { … }; }` — byte-matching ng-packagr's `ɵɵComponentDeclaration` form.
+        assert!(
+            dts.contains("never, { \"foo\": { \"alias\": \"foo\"; \"required\": false; }; }, {},"),
+            "inputs map must terminate each entry with `;` (matching ng-packagr's trailing separator):\n{dts}"
         );
     }
 
@@ -875,8 +911,12 @@ Widget.ɵcmp = i0.ɵɵdefineComponent({
 "#;
         let dts = synthesize_component_dts(src).unwrap();
         assert!(
-            dts.contains("\"foo\": { \"alias\": \"pub\"; \"required\": false; \"isSignal\": false; }"),
-            "renamed classic @Input (flags=0) must report isSignal:false:\n{dts}"
+            dts.contains("\"foo\": { \"alias\": \"pub\"; \"required\": false; }"),
+            "renamed classic @Input (flags=0) must OMIT the isSignal key (ngc/ng-packagr emit it only for signal input()):\n{dts}"
+        );
+        assert!(
+            !dts.contains("isSignal"),
+            "renamed classic @Input must NOT emit an isSignal key:\n{dts}"
         );
         assert!(dts.contains("foo: unknown;"), "renamed classic @Input should be a plain property:\n{dts}");
     }
@@ -926,13 +966,15 @@ Widget.ɵcmp = i0.ɵɵdefineComponent({
 });
 "#;
         let dts = synthesize_component_dts(src).unwrap();
+        // The classic input OMITS the isSignal key; the signal input emits `isSignal: true`. The two
+        // forms must stay independent (the bug conflated them to always-true).
         assert!(
-            dts.contains("\"classic\": { \"alias\": \"classic\"; \"required\": false; \"isSignal\": false; }"),
-            "classic input in a mixed component must stay isSignal:false:\n{dts}"
+            dts.contains("\"classic\": { \"alias\": \"classic\"; \"required\": false; }"),
+            "classic input in a mixed component must OMIT the isSignal key:\n{dts}"
         );
         assert!(
             dts.contains("\"sig\": { \"alias\": \"sig\"; \"required\": false; \"isSignal\": true; }"),
-            "signal input in a mixed component must stay isSignal:true:\n{dts}"
+            "signal input in a mixed component must emit isSignal:true:\n{dts}"
         );
         assert!(dts.contains("classic: unknown;"), "classic prop should be plain:\n{dts}");
         assert!(

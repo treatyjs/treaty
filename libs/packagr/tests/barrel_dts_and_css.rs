@@ -240,6 +240,7 @@ fn styled_component_styles_match_esbuild_minification() {
                background: #ffffff;\n\
                margin: 0px;\n\
                padding: 0.500em;\n\
+               transform: translateX(10px);\n\
                border: 1px solid rgb(170, 187, 204);\n\
              }\n\
            `]\n\
@@ -257,10 +258,11 @@ fn styled_component_styles_match_esbuild_minification() {
     let styles = first_styles_value(&mjs).expect("a styles literal must be present");
 
     // The scoped, esbuild-minified value byte-for-byte (full/AOT mode), which is
-    // exactly what a real ng-packagr@21 `compilationMode: full` build emits.
+    // exactly what a real ng-packagr@21 `compilationMode: full` build emits — including
+    // the transform-fn shortening `translateX(10px)` → `translate(10px)`.
     assert_eq!(
         styles,
-        ".box[_ngcontent-%COMP%]{color:#00f;font-weight:700;background:#fff;margin:0;padding:.5em;border:1px solid rgb(170,187,204)}",
+        ".box[_ngcontent-%COMP%]{color:#00f;font-weight:700;background:#fff;margin:0;padding:.5em;transform:translate(10px);border:1px solid rgb(170,187,204)}",
         "styles do not match ng-packagr's esbuild-minified value"
     );
 

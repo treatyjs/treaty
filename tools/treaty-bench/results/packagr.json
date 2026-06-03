@@ -1,6 +1,6 @@
 {
   "benchmark": "packagr-treaty-vs-ngpackagr",
-  "generatedAt": "2026-06-02T18:23:45.966Z",
+  "generatedAt": "2026-06-03T10:23:39.483Z",
   "library": {
     "path": "tools/treaty-bench/sample-lib",
     "note": "Standard-Angular library: 2 plain @Component .ts classes (one @Input, one event listener) + a public-api.ts barrel — authored as standard Angular TS so BOTH packagers can compile it.",
@@ -36,23 +36,23 @@
     {
       "tool": "treaty-packagr",
       "status": "measured",
-      "buildMs": 30.59,
-      "distBytes": 2975,
+      "buildMs": 42.84,
+      "distBytes": 2977,
       "dest": "D:\\dev\\treaty\\tools\\treaty-bench\\sample-lib\\dist",
-      "note": "best of 2 run(s); times(ms)=[35, 31]"
+      "note": "best of 2 run(s); times(ms)=[43, 46]"
     },
     {
       "tool": "ng-packagr",
       "status": "measured",
-      "buildMs": 1527.29,
+      "buildMs": 1147.12,
       "distBytes": 6834,
       "dest": "D:\\dev\\treaty\\tools\\treaty-bench\\sample-lib\\dist-ng-full",
-      "note": "best of 2 run(s); times(ms)=[3159, 1527]"
+      "note": "best of 2 run(s); times(ms)=[2378, 1147]"
     }
   ],
   "equivalence": {
     "ivyAllEqual": true,
-    "dtsAllEqual": false,
+    "dtsAllEqual": true,
     "perComponent": [
       {
         "component": "HelloComponent",
@@ -60,13 +60,9 @@
         "ivyDiff": null,
         "ivyTreatyLen": 298,
         "ivyNgpLen": 298,
-        "dtsEqual": false,
-        "dtsDiff": {
-          "index": 96,
-          "treaty": ":\"name\";\"required\":false;\"isSignal\":true;}},{},never,never,t",
-          "ngp": ":\"name\";\"required\":false;};},{},never,never,true,never>"
-        },
-        "dtsTreaty": "ɵɵComponentDeclaration<HelloComponent,\"tb-hello\",never,{\"name\":{\"alias\":\"name\";\"required\":false;\"isSignal\":true;}},{},never,never,true,never>",
+        "dtsEqual": true,
+        "dtsDiff": null,
+        "dtsTreaty": "ɵɵComponentDeclaration<HelloComponent,\"tb-hello\",never,{\"name\":{\"alias\":\"name\";\"required\":false;};},{},never,never,true,never>",
         "dtsNgp": "ɵɵComponentDeclaration<HelloComponent,\"tb-hello\",never,{\"name\":{\"alias\":\"name\";\"required\":false;};},{},never,never,true,never>"
       },
       {
@@ -109,5 +105,5 @@
       }
     }
   },
-  "speedNote": "treaty-packagr 30.59 ms vs ng-packagr 1527.29 ms — treaty-packagr is 49.9x faster"
+  "speedNote": "treaty-packagr 42.84 ms vs ng-packagr 1147.12 ms — treaty-packagr is 26.8x faster"
 }

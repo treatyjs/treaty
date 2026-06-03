@@ -123,20 +123,20 @@ Both packagers build the **same** standard-Angular library (plain `@Component` `
 
 | Tool | Build | dist | Status | Notes |
 | --- | --- | --- | --- | --- |
-| treaty-packagr | 30.6 ms | 2.9 KiB | measured | best of 2 run(s); times(ms)=[35, 31] |
-| ng-packagr | 1527 ms | 6.7 KiB | measured | best of 2 run(s); times(ms)=[3159, 1527] |
+| treaty-packagr | 41.5 ms | 2.9 KiB | measured | best of 2 run(s); times(ms)=[42, 48] |
+| ng-packagr | 1459 ms | 6.7 KiB | measured | best of 2 run(s); times(ms)=[2843, 1459] |
 
-**Speed:** treaty-packagr 30.6 ms vs ng-packagr 1527 ms — treaty-packagr is **49.9x faster**.
+**Speed:** treaty-packagr 41.5 ms vs ng-packagr 1459 ms — treaty-packagr is **35.1x faster**.
 
 #### Output-equality verdict
 
 - **Emitted Ivy (`ɵɵdefineComponent`): EQUAL across all components** (after normalizing the `i0` alias, `/*@__PURE__*/`, quote style + whitespace; argument order/values preserved).
-- **`.d.ts` `ɵcmp` declaration: one real divergence.**
-  - `HelloComponent`: Ivy EQUAL, `.d.ts` DIFF — treaty-packagr adds `"isSignal":true` to a classic `@Input` that ng-packagr omits (a treaty-packagr `.d.ts` reconstruction bug).
+- **`.d.ts` `ɵcmp` declaration: EQUAL across all components.**
+  - `HelloComponent`: Ivy EQUAL, `.d.ts` EQUAL — treaty-packagr now OMITS the `isSignal` key for a classic `@Input` (ngc/ng-packagr emit it only for a signal `input()`) and terminates each input-map entry with the trailing `;` ng-packagr emits, so the `ɵcmp` input tuple byte-matches.
   - `CounterComponent`: Ivy EQUAL, `.d.ts` EQUAL.
 - **`package.json` APF fields** (name, version, type, sideEffects, hasPrimaryExport): all EQUAL.
 
-> VERDICT: emitted Ivy is EQUAL across all components; only one `.d.ts` `ɵcmp` field differs (the `@Input` `isSignal` bug above).
+> VERDICT: emitted Ivy is EQUAL across all components, AND the `.d.ts` `ɵcmp` declaration is EQUAL across all components. The barrel+styled library is now output-equal to ng-packagr@21 on emitted Ivy, `.d.ts` `ɵcmp`, and APF `package.json` fields.
 
 ## Caveats
 
@@ -146,7 +146,7 @@ Everything below is disclosed in full. Each item is tagged **[environmental]** (
 | --- | --- | --- | --- |
 | 1 | **Treaty-swc column is `pending`** — the optional second (SWC) parser/codegen engine is not built yet. | [roadmap] | The DEFAULT, shipping backend (Treaty-oxc) is fully measured and correct. swc is a planned alternate engine kept byte-identical to oxc (see `migration/SWC-BACKEND-PLAN.md`), not a missing capability. |
 | 2 | **2 i18n fixture(s) (i18n-static, i18n-interp) are not byte-identical** to the oracle. | [Treaty] (cosmetic only) | The instruction streams are byte-identical; the diff is two source-byte choices — the const-pool local names (`$i18n_0$` / literal `$MSG_ID_WITH_SUFFIX$` placeholder pending message-id substitution) and the U+FFFD marker escaped as `\uFFFD`. Semantically-identical JS; **no runtime behaviour difference**. |
-| 3 | **treaty-packagr emits `"isSignal":true` on a classic `@Input` in one `.d.ts`** that ng-packagr omits. | [Treaty] (types only) | Emitted runtime Ivy (`ɵɵdefineComponent`) is EQUAL across all components; this is a `.d.ts` `ɵcmp` reconstruction nit in the packagr (a typings field), not in compiled output. |
+| 3 | ~~treaty-packagr emits `"isSignal":true` on a classic `@Input` in one `.d.ts` that ng-packagr omits.~~ **RESOLVED.** | [Treaty] (fixed) | The packagr `.d.ts` emitter now OMITS the `isSignal` key for a classic `@Input` (emitting it only for a signal `input()`, exactly as ngc/ng-packagr do) and terminates each input-map entry with the trailing `;` ng-packagr emits. The `.d.ts` `ɵcmp` declaration is now **EQUAL across all components** (verified vs a real ng-packagr@21 build). |
 | 4 | **Pinned toolchain floor** — measured on Node `v24.7.0` against `@angular/core 22.0.0-rc.3`. | [environmental] | Absolute ms/bytes track the host + Angular RC; the cross-tool comparisons are apples-to-apples on one machine in one run. Re-run on another host for that host's numbers. |
 | 5 | **rslib dist size (18.0 KiB) is not app-size comparable.** | [environmental] | rslib is a LIBRARY builder that externalizes `@angular/*` by design, so its dist excludes the Angular runtime. Flagged inline on its row; its WORKS boot runs against a co-located AOT-linked Angular, as a real consumer app would. Build TIME is still comparable. |
 
