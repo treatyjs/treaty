@@ -24,9 +24,9 @@
     "serve:remote": "rspack serve -c federation/remote.config.ts"
   },
   "peerDependencies": {
-    "@angular/common": "22.0.0-rc.3",
-    "@angular/core": "22.0.0-rc.3",
-    "@angular/router": "22.0.0-rc.3",
+    "@angular/common": "22.0.0",
+    "@angular/core": "22.0.0",
+    "@angular/router": "22.0.0",
     "@module-federation/enhanced": ">=0.9",
     "@module-federation/vite": ">=1.2",
     "@rsbuild/core": ">=1.0.0",

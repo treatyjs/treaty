@@ -10,10 +10,10 @@
     "e2e": "node e2e.mjs"
   },
   "peerDependencies": {
-    "@angular/common": "22.0.0-rc.3",
-    "@angular/core": "22.0.0-rc.3",
-    "@angular/platform-browser": "22.0.0-rc.3",
-    "@angular/router": "22.0.0-rc.3",
+    "@angular/common": "22.0.0",
+    "@angular/core": "22.0.0",
+    "@angular/platform-browser": "22.0.0",
+    "@angular/router": "22.0.0",
     "vite": "^7.0.0"
   },
   "devDependencies": {

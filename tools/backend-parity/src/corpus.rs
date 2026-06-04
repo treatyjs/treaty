@@ -100,6 +100,8 @@ pub const CORPUS: &[Fixture] = &[
     // --- batch 5: i18n ----------------------------------------------------------------------
     Fixture { id: "i18n-static", template: "<div i18n>Hello</div>", selector: "app-i18n-static", class_name: "I18nStaticComponent" },
     Fixture { id: "i18n-interp", template: "<div i18n>Hello {{name}}</div>", selector: "app-i18n-interp", class_name: "I18nInterpComponent" },
+    // --- batch 6: html comments (22.0.0 drops them; no comment instruction is emitted) -------
+    Fixture { id: "html-comment", template: "<div>before<!-- a comment -->after</div>", selector: "app-comment", class_name: "CommentComponent" },
 ];
 
 #[cfg(test)]
@@ -119,8 +121,9 @@ mod tests {
 
     #[test]
     fn corpus_matches_parity_mjs_count() {
-        // parity.mjs's FIXTURES currently carries 5 + 10 + 8 + 4 + 2 = 29 fixtures. If this trips,
-        // re-sync this corpus with libs/treaty-ivy/facade/parity/parity.mjs (the source of truth).
-        assert_eq!(CORPUS.len(), 29, "corpus drifted from parity.mjs FIXTURES count");
+        // parity.mjs's FIXTURES currently carries 5 + 10 + 8 + 4 + 2 + 1 = 30 fixtures (the last
+        // batch is the single html-comment drop case). If this trips, re-sync this corpus with
+        // libs/treaty-ivy/facade/parity/parity.mjs (the source of truth).
+        assert_eq!(CORPUS.len(), 30, "corpus drifted from parity.mjs FIXTURES count");
     }
 }

@@ -277,6 +277,20 @@ const FIXTURES = [
     selector: 'app-i18n-interp',
     className: 'I18nInterpComponent',
   },
+  // -------------------------------------------------------------------------
+  // batch 6: html comments. 22.0.0's HtmlAstToIvyAst.visitComment returns null
+  // (comments are only collected for i18n extraction when collectCommentNodes is
+  // set), so `<!-- ... -->` is DROPPED — no ɵɵcomment/text instruction is emitted
+  // and the comment splits the surrounding text into two separate text nodes. We
+  // gate that against the real @angular/compiler oracle here so a future change
+  // that started preserving comments would surface as a DIFF.
+  // -------------------------------------------------------------------------
+  {
+    id: 'html-comment',
+    template: '<div>before<!-- a comment -->after</div>',
+    selector: 'app-comment',
+    className: 'CommentComponent',
+  },
 ];
 
 // ---------------------------------------------------------------------------
