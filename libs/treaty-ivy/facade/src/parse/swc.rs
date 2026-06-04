@@ -48,7 +48,8 @@ use swc_ecma_parser::{parse_file_as_program, Syntax, TsSyntax};
 use super::{
     ClassWithDecorators, DecoratorInfo, ImportInfo, LitValue, MemberInfo, MemberKind, NArg,
     NArrayElement, NArrowBody, NAssignment, NCtorParam, NExpr, NObjectProp, NParam, NStmt, NTopStmt,
-    NVarDeclarator, NgDeclareCall, ObjLit, ParseBackend, ParseOutput, SourceKind, TreatySpan,
+    NTypeRef, NVarDeclarator, NgDeclareCall, ObjLit, ParseBackend, ParseOutput, SourceKind,
+    TreatySpan,
 };
 
 /// The swc parse backend. Zero-sized; a fresh `GLOBALS` scope + `SourceMap` is created per
@@ -266,16 +267,27 @@ fn lower_top_level_item(
         }
         ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(export)) => {
             lower_top_level_decl(&export.decl, base, item_span, true, classes, ng_declares);
-            // An exported declaration is neither an assignment, a bare-call expression statement, nor
-            // a top-level `var`/`let`/`const` scanned by the AOT emitter — record it as `Other` with
-            // the whole `export …` statement span (matching the oxc backend, where `export class X {}`
-            // is a single `ExportNamedDeclaration` statement that `lower_top_stmt` maps to `Other`).
-            top_level.push(NTopStmt::Other(item_span));
+            // An exported `function f(): RetType {…}` surfaces as a neutral `FnDecl` (the
+            // module-with-providers return-type surface), exactly like the oxc backend's
+            // `Statement::ExportNamedDeclaration` whose declaration is a function. Every OTHER exported
+            // declaration is neither an assignment, a bare-call expression statement, nor a top-level
+            // `var`/`let`/`const` scanned by the AOT emitter — record it as `Other` with the whole
+            // `export …` statement span (matching the oxc backend, where `export class X {}` is a single
+            // `ExportNamedDeclaration` statement that `lower_top_stmt` maps to `Other`).
+            match &export.decl {
+                Decl::Fn(fn_decl) => top_level.push(lower_fn_decl(fn_decl, item_span)),
+                _ => top_level.push(NTopStmt::Other(item_span)),
+            }
         }
         ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultDecl(export)) => {
             if let DefaultDecl::Class(class_expr) = &export.decl {
                 push_class(
                     class_expr.ident.as_ref().map(|id| id.sym.to_string()),
+                    class_expr
+                        .ident
+                        .as_ref()
+                        .map(|id| span_of(id.span, base))
+                        .unwrap_or_default(),
                     &class_expr.class,
                     base,
                     item_span,
@@ -363,6 +375,7 @@ fn lower_top_level_decl(
         Decl::Class(class_decl) => {
             push_class(
                 Some(class_decl.ident.sym.to_string()),
+                span_of(class_decl.ident.span, base),
                 &class_decl.class,
                 base,
                 stmt_span,
@@ -386,6 +399,7 @@ fn lower_top_level_decl(
 /// always scan its static members for `ɵɵngDeclare*` calls.
 fn push_class(
     name: Option<String>,
+    name_span: TreatySpan,
     class: &swc_ecma_ast::Class,
     base: u32,
     stmt_span: TreatySpan,
@@ -394,7 +408,7 @@ fn push_class(
     ng_declares: &mut Vec<NgDeclareCall>,
 ) {
     if !class.decorators.is_empty() {
-        classes.push(lower_class(name, class, base, stmt_span, exported));
+        classes.push(lower_class(name, name_span, class, base, stmt_span, exported));
     }
     collect_ng_declares_in_class(class, base, ng_declares);
 }
@@ -414,6 +428,7 @@ fn push_class(
 /// corpus (`useclass_forwardref.ts`).
 fn lower_class(
     name: Option<String>,
+    name_span: TreatySpan,
     class: &swc_ecma_ast::Class,
     base: u32,
     stmt_span: TreatySpan,
@@ -439,6 +454,7 @@ fn lower_class(
     }
     ClassWithDecorators {
         name,
+        name_span,
         decorators,
         members,
         span,
@@ -485,6 +501,12 @@ fn lower_top_stmt(stmt: &Stmt, base: u32) -> NTopStmt {
                 span: span_of(stmt.span(), base),
             }
         }
+        // A bare `function f(): RetType {…}` declaration. The exported form (`export function …`) is a
+        // `ModuleDecl::ExportDecl` (handled in `lower_top_level_item`); this arm covers the bare /
+        // `Program::Script` body form, matching the oxc backend's `Statement::FunctionDeclaration`.
+        Stmt::Decl(Decl::Fn(fn_decl)) => {
+            lower_fn_decl(fn_decl, span_of(stmt.span(), base))
+        }
         // A bare (non-exported) decorated class DECLARATION statement: oxc's statement span includes
         // the leading decorators (its class-declaration span starts at the first decorator), but swc's
         // `Stmt::Decl` span starts at the `class`/`abstract` keyword. Pull the `Other` span start back
@@ -504,6 +526,23 @@ fn lower_top_stmt(stmt: &Stmt, base: u32) -> NTopStmt {
             NTopStmt::Other(span)
         }
         _ => NTopStmt::Other(span_of(stmt.span(), base)),
+    }
+}
+
+/// Lower an swc `FnDecl` to the neutral [`NTopStmt::FnDecl`] (name + annotated return type). Shared by
+/// the bare (`Stmt::Decl(Decl::Fn)`) and exported (`ModuleDecl::ExportDecl`) function-declaration
+/// paths so both surface byte-identically, matching the oxc backend's single `statement_function`
+/// extraction. `span` is the enclosing statement span (the whole `export function …` for the exported
+/// form), exactly as the oxc backend uses `span_of(stmt)`.
+fn lower_fn_decl(fn_decl: &swc_ecma_ast::FnDecl, span: TreatySpan) -> NTopStmt {
+    NTopStmt::FnDecl {
+        name: Some(fn_decl.ident.sym.to_string()),
+        return_type: fn_decl
+            .function
+            .return_type
+            .as_deref()
+            .and_then(|ann| lower_type_ref(&ann.type_ann)),
+        span,
     }
 }
 
@@ -548,6 +587,7 @@ fn lower_member(member: &ClassMember, base: u32) -> Option<MemberInfo> {
             is_static: p.is_static,
             params: Vec::new(),
             initializer: p.value.as_deref().map(|e| lower_expr(e, base)),
+            has_body: false,
             span: span_of(p.span, base),
         }),
         ClassMember::Method(m) => Some(MemberInfo {
@@ -566,6 +606,8 @@ fn lower_member(member: &ClassMember, base: u32) -> Option<MemberInfo> {
             is_static: m.is_static,
             params: lower_fn_ctor_params(&m.function.params, base),
             initializer: None,
+            // A bodiless TS method overload signature has `function.body == None`.
+            has_body: m.function.body.is_some(),
             span: span_of(m.span, base),
         }),
         ClassMember::Constructor(c) => Some(MemberInfo {
@@ -575,6 +617,9 @@ fn lower_member(member: &ClassMember, base: u32) -> Option<MemberInfo> {
             is_static: false,
             params: lower_constructor_params(&c.params, base),
             initializer: None,
+            // A bodiless constructor overload signature has `body == None`; the implementation has a
+            // body. Constructor-dependency extraction prefers the body-bearing constructor.
+            has_body: c.body.is_some(),
             span: span_of(c.span, base),
         }),
         ClassMember::AutoAccessor(a) => Some(MemberInfo {
@@ -584,6 +629,7 @@ fn lower_member(member: &ClassMember, base: u32) -> Option<MemberInfo> {
             is_static: a.is_static,
             params: Vec::new(),
             initializer: a.value.as_deref().map(|e| lower_expr(e, base)),
+            has_body: false,
             span: span_of(a.span, base),
         }),
         // A stray `;` (`constructor() {};`) is parsed by swc as an `Empty` member but DISCARDED by oxc
@@ -611,6 +657,9 @@ fn lower_fn_ctor_params(params: &[Param], base: u32) -> Vec<NCtorParam> {
                 name,
                 decorators: p.decorators.iter().map(|d| lower_decorator(d, base)).collect(),
                 is_rest,
+                // A `...rest` carries no DI token (and oxc surfaces no annotation on its rest element),
+                // so leave it `None`; otherwise read the binding's type annotation.
+                type_ref: if is_rest { None } else { pat_type_ref(&p.pat) },
             }
         })
         .collect()
@@ -630,9 +679,12 @@ fn lower_constructor_params(params: &[ParamOrTsParamProp], base: u32) -> Vec<NCt
                     name,
                     decorators: param.decorators.iter().map(|d| lower_decorator(d, base)).collect(),
                     is_rest,
+                    type_ref: if is_rest { None } else { pat_type_ref(&param.pat) },
                 }
             }
-            // A TS parameter property (`private dep: Dep`) is never a rest param.
+            // A TS parameter property (`private dep: Dep`) is never a rest param. Its type annotation
+            // lives on the inner binding identifier (`TsParamPropParam::Ident(BindingIdent).type_ann`),
+            // matching oxc's `FormalParameter.type_annotation` for the same `private a: A` shape.
             ParamOrTsParamProp::TsParamProp(prop) => NCtorParam {
                 name: match &prop.param {
                     swc_ecma_ast::TsParamPropParam::Ident(id) => Some(id.id.sym.to_string()),
@@ -640,6 +692,12 @@ fn lower_constructor_params(params: &[ParamOrTsParamProp], base: u32) -> Vec<NCt
                 },
                 decorators: prop.decorators.iter().map(|d| lower_decorator(d, base)).collect(),
                 is_rest: false,
+                type_ref: match &prop.param {
+                    swc_ecma_ast::TsParamPropParam::Ident(id) => {
+                        id.type_ann.as_deref().and_then(|ann| lower_type_ref(&ann.type_ann))
+                    }
+                    swc_ecma_ast::TsParamPropParam::Assign(a) => pat_type_ref(&a.left),
+                },
             },
         })
         .collect()
@@ -661,6 +719,51 @@ fn pat_name_and_rest(pat: &Pat) -> (Option<String>, bool) {
     match pat {
         Pat::Rest(rest) => (pat_binding_name(&rest.arg), true),
         other => (pat_binding_name(other), false),
+    }
+}
+
+/// The declared TYPE of a parameter `Pat`, when it is an identifier binding carrying a type
+/// annotation (`a: Foo`). swc stores the annotation on `Pat::Ident(BindingIdent).type_ann`, exactly
+/// where oxc keeps `FormalParameter.type_annotation`, so [`lower_type_ref`] yields the byte-identical
+/// neutral [`NTypeRef`]. `None` for an un-annotated binding or a non-identifier pattern.
+fn pat_type_ref(pat: &Pat) -> Option<NTypeRef> {
+    match pat {
+        Pat::Ident(id) => id.type_ann.as_deref().and_then(|ann| lower_type_ref(&ann.type_ann)),
+        _ => None,
+    }
+}
+
+/// Lower an swc `TsType` to the neutral [`NTypeRef`] — `Some` ONLY for a type REFERENCE
+/// (`TsType::TsTypeRef`), `None` for every other type form. Mirrors the oxc backend's `lower_type_ref`
+/// shape-for-shape (and `source_compile::type_token_expr` / `module_with_providers_type_arg`).
+fn lower_type_ref(ty: &swc_ecma_ast::TsType) -> Option<NTypeRef> {
+    let swc_ecma_ast::TsType::TsTypeRef(reference) = ty else {
+        return None;
+    };
+    Some(NTypeRef {
+        name_path: ts_entity_name_path(&reference.type_name),
+        // Keep ONLY type-reference args (a non-reference arg is dropped — matching the oxc backend +
+        // `module_with_providers_type_arg`).
+        type_args: reference
+            .type_params
+            .as_deref()
+            .map(|args| args.params.iter().filter_map(|p| lower_type_ref(p)).collect())
+            .unwrap_or_default(),
+    })
+}
+
+/// The dotted NAME segments of an swc `TsEntityName` (`Foo` → `["Foo"]`; `ns.Foo` →
+/// `["ns", "Foo"]`; `a.b.C` → `["a", "b", "C"]`). swc has no `this`-type entity name (a `this`-type is
+/// a separate `TsType::TsThisType`, which never reaches here — `lower_type_ref` only descends a
+/// `TsTypeRef`), so this always yields a non-empty path, matching the oxc backend's `type_name_path`.
+fn ts_entity_name_path(name: &swc_ecma_ast::TsEntityName) -> Vec<String> {
+    match name {
+        swc_ecma_ast::TsEntityName::Ident(id) => vec![id.sym.to_string()],
+        swc_ecma_ast::TsEntityName::TsQualifiedName(q) => {
+            let mut path = ts_entity_name_path(&q.left);
+            path.push(q.right.sym.to_string());
+            path
+        }
     }
 }
 

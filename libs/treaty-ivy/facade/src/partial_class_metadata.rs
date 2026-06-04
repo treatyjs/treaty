@@ -9,16 +9,17 @@
 //! emits the `ngDevMode`-guarded `setClassMetadata`), so this is emitted ONLY in partial mode, for
 //! byte-parity with a real ng-packagr partial build.
 //!
-//! This module reconstructs the declaration from the class AST + the original source text, carrying
-//! every decorator argument VERBATIM (a source-span slice) so opaque expressions (`forwardRef(() =>
-//! X)`, `dynamicAttrName()`, an `InjectionToken`) round-trip exactly. Because the result links back
+//! This module reconstructs the declaration from the engine-neutral [`ClassWithDecorators`] + the
+//! original source text, carrying every decorator argument VERBATIM (a source-span slice — the
+//! neutral [`DecoratorInfo::arguments`] / [`NArg::span`] surface) so opaque expressions (`forwardRef(()
+//! => X)`, `dynamicAttrName()`, an `InjectionToken`) round-trip exactly. Because the result links back
 //! to `void 0`, the round-trip is inert; this exists purely to match the published bytes.
+//!
+//! NOTE: this module names ZERO live `oxc_` types — it reads the engine-neutral parse IR (the same
+//! surface the swc backend fills byte-identically), with verbatim slices recovered from the neutral
+//! decorator-argument byte spans against the original `source`.
 
-use oxc_ast::ast::{
-    Argument, Class, ClassElement, Decorator, Expression, FormalParameter, MethodDefinitionKind,
-    PropertyKey,
-};
-use oxc_span::GetSpan;
+use crate::parse::{ClassWithDecorators, DecoratorInfo, MemberKind, NArg, NCtorParam};
 
 /// The Angular version a class-metadata declaration is stamped with — the in-repo placeholder the
 /// linker treats as "newest behaviour". Mirrors the rest of the partial family.
@@ -53,7 +54,11 @@ const PARAM_DECORATORS: &[&str] = &[
 ///
 /// Field order matches ng-packagr's `compileClassMetadata`:
 ///   `minVersion, version, ngImport: i0, type, decorators[, ctorParameters][, propDecorators]`.
-pub fn emit_class_metadata(class: &Class, class_name: &str, source: &str) -> Option<String> {
+pub fn emit_class_metadata(
+    class: &ClassWithDecorators,
+    class_name: &str,
+    source: &str,
+) -> Option<String> {
     let decorators = class_decorator_entries(class, source);
     if decorators.is_empty() {
         return None;
@@ -84,7 +89,7 @@ pub fn emit_class_metadata(class: &Class, class_name: &str, source: &str) -> Opt
 
 /// The `decorators` array entries: each recognised Angular CLASS decorator reproduced as
 /// `{ type: <Name> }` (bare `@Foo`) or `{ type: <Name>, args: [<verbatim arg src>, …] }` (`@Foo(...)`).
-fn class_decorator_entries(class: &Class, source: &str) -> Vec<String> {
+fn class_decorator_entries(class: &ClassWithDecorators, source: &str) -> Vec<String> {
     class
         .decorators
         .iter()
@@ -101,7 +106,7 @@ fn class_decorator_entries(class: &Class, source: &str) -> Vec<String> {
 /// One decorator → `{ type: <Name> }` or `{ type: <Name>, args: [<arg src>, …] }`. The args are the
 /// VERBATIM source slices of the call arguments (so an object-literal decorator arg, a `forwardRef`,
 /// etc. round-trip exactly).
-fn decorator_entry(dec: &Decorator, name: &str, source: &str) -> String {
+fn decorator_entry(dec: &DecoratorInfo, name: &str, source: &str) -> String {
     let args = decorator_arg_sources(dec, source);
     if args.is_empty() {
         format!("{{ type: {name} }}")
@@ -111,14 +116,17 @@ fn decorator_entry(dec: &Decorator, name: &str, source: &str) -> String {
 }
 
 /// The verbatim source slices of a decorator call's arguments (`@Foo(a, b)` → `["a src", "b src"]`).
-/// A bare `@Foo` (or `@Foo()`) yields an empty vec.
-fn decorator_arg_sources(dec: &Decorator, source: &str) -> Vec<String> {
-    let Expression::CallExpression(call) = &dec.expression else {
-        return Vec::new();
-    };
-    call.arguments
+/// A bare `@Foo` (or `@Foo()`) yields an empty vec. Each argument's byte span is the neutral
+/// [`NArg::span`] (the span of the argument EXPRESSION), recovered verbatim from `source`.
+fn decorator_arg_sources(dec: &DecoratorInfo, source: &str) -> Vec<String> {
+    dec.arguments
         .iter()
-        .filter_map(|a| arg_source(a, source))
+        // A `...spread` decorator argument had no `arg.as_expression()` and was dropped by the
+        // historical `filter_map`; keep only plain (non-spread) argument expressions.
+        .filter_map(|arg| match arg {
+            NArg::Expr(_, _) => Some(arg_source(arg, source)),
+            NArg::Spread(_, _) => None,
+        })
         .collect()
 }
 
@@ -129,21 +137,20 @@ fn decorator_arg_sources(dec: &Decorator, source: &str) -> Vec<String> {
 ///   * `decorators`: the param's Angular parameter decorators (`@Inject(TOKEN)`, `@Optional()`, …),
 ///     each `{ type: <Name>[, args: [<arg src>] ] }`. A param with a custom (non-Angular) decorator
 ///     still emits a (possibly empty) `decorators: []` — ng-packagr records the slot.
-fn constructor_param_entries(class: &Class, source: &str) -> Option<Vec<String>> {
-    let ctor = class.body.body.iter().find_map(|el| match el {
-        ClassElement::MethodDefinition(m) if m.kind == MethodDefinitionKind::Constructor => Some(m),
-        _ => None,
-    })?;
+fn constructor_param_entries(class: &ClassWithDecorators, source: &str) -> Option<Vec<String>> {
+    let ctor = class
+        .members
+        .iter()
+        .find(|m| m.kind == MemberKind::Constructor)?;
     // Only the IMPLEMENTATION signature (the one with a body) carries parameters; bodiless overloads
-    // have none. ngtsc reflects the implementation params.
-    if ctor.value.params.items.is_empty() {
+    // have none, and the parse backend surfaces only the implementation's params. ngtsc reflects the
+    // implementation params.
+    if ctor.params.is_empty() {
         // An explicit parameterless `constructor() {}` → `() => []`; ng-packagr emits the empty array.
         return Some(Vec::new());
     }
     Some(
-        ctor.value
-            .params
-            .items
+        ctor.params
             .iter()
             .map(|p| ctor_param_entry(p, source))
             .collect(),
@@ -151,7 +158,7 @@ fn constructor_param_entries(class: &Class, source: &str) -> Option<Vec<String>>
 }
 
 /// One constructor parameter → its `ctorParameters` entry.
-fn ctor_param_entry(param: &FormalParameter, source: &str) -> String {
+fn ctor_param_entry(param: &NCtorParam, source: &str) -> String {
     let type_src = param_type_name(param).unwrap_or_else(|| "undefined".to_string());
     let mut entry = format!("{{ type: {type_src}");
 
@@ -178,20 +185,26 @@ fn ctor_param_entry(param: &FormalParameter, source: &str) -> String {
 
 /// The `propDecorators` map source (`prop: [ {type: Input}, … ], …`), or `None` when no member
 /// carries a recognised Angular member decorator.
-fn prop_decorator_entries(class: &Class, source: &str) -> Option<String> {
+fn prop_decorator_entries(class: &ClassWithDecorators, source: &str) -> Option<String> {
     let mut entries: Vec<String> = Vec::new();
-    for el in &class.body.body {
-        let (name, decorators) = match el {
-            ClassElement::PropertyDefinition(p) => {
-                (property_key_name(&p.key), &p.decorators)
+    for member in &class.members {
+        // `propDecorators` reflects property/accessor members and non-constructor methods (the
+        // surface the original `PropertyDefinition` / non-ctor `MethodDefinition` walk covered).
+        let eligible = match member.kind {
+            MemberKind::Property | MemberKind::Accessor | MemberKind::Getter | MemberKind::Setter => {
+                true
             }
-            ClassElement::MethodDefinition(m) if m.kind != MethodDefinitionKind::Constructor => {
-                (property_key_name(&m.key), &m.decorators)
-            }
-            _ => continue,
+            MemberKind::Method => true,
+            MemberKind::Constructor | MemberKind::Other => false,
         };
-        let Some(name) = name else { continue };
-        let decs: Vec<String> = decorators
+        if !eligible {
+            continue;
+        }
+        let Some(name) = member.name.as_deref() else {
+            continue;
+        };
+        let decs: Vec<String> = member
+            .decorators
             .iter()
             .filter_map(|dec| {
                 let dname = decorator_callee_name(dec)?;
@@ -204,8 +217,8 @@ fn prop_decorator_entries(class: &Class, source: &str) -> Option<String> {
         if decs.is_empty() {
             continue;
         }
-        let key = if is_safe_object_key(&name) {
-            name.clone()
+        let key = if is_safe_object_key(name) {
+            name.to_string()
         } else {
             format!("\"{name}\"")
         };
@@ -219,55 +232,34 @@ fn prop_decorator_entries(class: &Class, source: &str) -> Option<String> {
 }
 
 /// The callee identifier of a decorator (`@Foo` / `@Foo(...)` → `"Foo"`), or `None` for a
-/// member-access / computed decorator we do not model.
-fn decorator_callee_name<'a>(dec: &'a Decorator<'a>) -> Option<&'a str> {
-    match &dec.expression {
-        Expression::CallExpression(call) => match &call.callee {
-            Expression::Identifier(id) => Some(id.name.as_str()),
-            _ => None,
-        },
-        Expression::Identifier(id) => Some(id.name.as_str()),
-        _ => None,
+/// member-access / computed decorator we do not model (the neutral [`DecoratorInfo::name`] is empty).
+fn decorator_callee_name(dec: &DecoratorInfo) -> Option<&str> {
+    if dec.name.is_empty() {
+        None
+    } else {
+        Some(dec.name.as_str())
     }
 }
 
 /// The declared TYPE identifier of a constructor parameter (`dep: Foo` → `"Foo"`; `ns.Foo` →
-/// `"ns.Foo"`), or `None` for a non-reference / primitive / absent type.
-fn param_type_name(param: &FormalParameter) -> Option<String> {
-    use oxc_ast::ast::{TSType, TSTypeName};
-    // `FormalParameter` carries the param's declared type annotation directly (mirroring
-    // `extract_ctor_dep`'s `param.type_annotation` read).
-    let ann = param.type_annotation.as_ref()?;
-    let TSType::TSTypeReference(reference) = &ann.type_annotation else {
+/// `"ns.Foo"`), or `None` for a non-reference / primitive / absent type. Reads the neutral
+/// [`NCtorParam::type_ref`] dotted name path (already `None` for a non-reference / `this`-type).
+fn param_type_name(param: &NCtorParam) -> Option<String> {
+    let type_ref = param.type_ref.as_ref()?;
+    if type_ref.name_path.is_empty() {
         return None;
-    };
-    fn name_of(n: &TSTypeName) -> Option<String> {
-        match n {
-            TSTypeName::IdentifierReference(id) => Some(id.name.to_string()),
-            TSTypeName::QualifiedName(q) => {
-                let left = name_of(&q.left)?;
-                Some(format!("{left}.{}", q.right.name))
-            }
-            _ => None,
-        }
     }
-    name_of(&reference.type_name)
+    Some(type_ref.name_path.join("."))
 }
 
-/// The static name of a property/method key (`foo`, `"foo-bar"`), or `None` for a computed key.
-fn property_key_name(key: &PropertyKey) -> Option<String> {
-    match key {
-        PropertyKey::StaticIdentifier(id) => Some(id.name.to_string()),
-        PropertyKey::StringLiteral(s) => Some(s.value.to_string()),
-        _ => None,
-    }
-}
-
-/// The trimmed source slice of a call argument expression (a decorator arg), carried verbatim.
-fn arg_source(arg: &Argument, source: &str) -> Option<String> {
-    let expr = arg.as_expression()?;
-    let span = expr.span();
-    Some(source[span.start as usize..span.end as usize].trim().to_string())
+/// The trimmed source slice of a decorator-call argument's byte span (carried verbatim). The neutral
+/// [`NArg::span`] is the argument EXPRESSION span (absolute byte offsets), so `source[span]` is the
+/// same verbatim slice the live-AST `arg.as_expression().span()` recovered.
+fn arg_source(arg: &NArg, source: &str) -> String {
+    let span = arg.span();
+    source[span.start as usize..span.end as usize]
+        .trim()
+        .to_string()
 }
 
 /// Whether `key` is a valid bare JS identifier (so a `propDecorators` key prints unquoted).

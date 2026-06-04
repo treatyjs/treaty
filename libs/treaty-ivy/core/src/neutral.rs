@@ -366,6 +366,17 @@ pub enum NTopStmt {
         decls: Vec<NVarDeclarator>,
         span: TreatySpan,
     },
+    /// A top-level `function f(…): RetType {…}` declaration (bare or `export function …`) — the surface
+    /// `source_compile::collect_module_with_providers_returns` walks: it records every
+    /// `function f(): ModuleWithProviders<T>` as `f → T` so a jit-mode NgModule's `imports`-referenced
+    /// factory CALL resolves to that ngModule type. Carries the function NAME + its annotated RETURN
+    /// TYPE (as an [`NTypeRef`], `None` for an un-annotated / non-reference return). Both the bare
+    /// `function …` and the `export function …` forms surface here identically on both backends.
+    FnDecl {
+        name: Option<String>,
+        return_type: Option<NTypeRef>,
+        span: TreatySpan,
+    },
     /// Any other top-level statement (import, class declaration, …) — span only.
     Other(TreatySpan),
 }
@@ -456,6 +467,14 @@ pub struct MemberInfo {
     pub params: Vec<NCtorParam>,
     /// The property/accessor initializer expression (`x = input(0)` → the `input(0)` call), if any.
     pub initializer: Option<NExpr>,
+    /// Whether a method / CONSTRUCTOR member has a BODY (`{ … }`). A TS overload SIGNATURE
+    /// (`constructor(a: A);` with no body) is `false`; the IMPLEMENTATION (`constructor(a: A, b: B) {}`)
+    /// is `true`. Constructor-dependency extraction reads the IMPLEMENTATION signature's params (ngtsc's
+    /// `getConstructorDependencies`), so it prefers the body-bearing constructor over the bodiless
+    /// overloads. A property / accessor carries `false` (no method body). Both backends fill it from the
+    /// member's body presence (oxc `MethodDefinition.value.body` / swc `Constructor.body` /
+    /// `Function.body`).
+    pub has_body: bool,
     /// The byte span of the whole member node. Carried so a consumer can recover the member's source
     /// slice (the kept class-body emit excises inert member decorators from within this range). Filled
     /// identically by both backends.
@@ -475,6 +494,44 @@ pub struct NCtorParam {
     pub decorators: Vec<DecoratorInfo>,
     /// Whether this is a `...rest` parameter (see [`NParam::is_rest`]).
     pub is_rest: bool,
+    /// The parameter's declared TYPE, when it is a TS type REFERENCE (`dep: Foo` → `Foo`;
+    /// `dep: ns.Foo` → `ns.Foo`) — the DEFAULT injection token constructor-dependency extraction
+    /// derives (`source_compile::extract_ctor_dep` reads `param.type_annotation` → `type_token_expr`
+    /// → `type_name_expr`, which lowers a `TSTypeReference`'s qualified name to a value-read). `None`
+    /// for an un-annotated parameter OR a non-reference type (primitives, unions, `any`, `this`, …),
+    /// which carry no usable token — exactly the cases `type_token_expr` returns `None` for. The token
+    /// is overridable by an `@Inject`/`@Attribute` param decorator (carried in [`Self::decorators`]),
+    /// so this is only the fallback. Filled identically by both backends (oxc `TSType::TSTypeReference`
+    /// / `TSTypeName`, swc `TsType::TsTypeRef` / `TsEntityName`).
+    pub type_ref: Option<NTypeRef>,
+}
+
+/// An engine-neutral TS TYPE REFERENCE — the name PATH of a type reference plus its type arguments.
+/// The only TS-type surface the AOT source front-end reads structurally:
+///   * a constructor parameter's DEFAULT injection token ([`NCtorParam::type_ref`] — `dep: Foo` /
+///     `dep: ns.Foo`); only the [`Self::name_path`] is consumed there (the args are ignored);
+///   * a `function f(): ModuleWithProviders<T>` RETURN type ([`NTopStmt::FnDecl::return_type`]); the
+///     jit-mode NgModule import resolver unwraps the `ModuleWithProviders<T>` to its `T`
+///     ([`Self::name_path`] == `["ModuleWithProviders"]` and the first [`Self::type_args`] entry's
+///     `name_path` == `["T"]`).
+///
+/// Only the TS *type-reference* shape is modelled; every other type form (keyword / union / literal /
+/// function / array / …) lowers to `None` at the [`NCtorParam`]/[`NTopStmt::FnDecl`] surface (those
+/// carry an `Option<NTypeRef>`), exactly the cases the live-AST walk declines. Filled identically by
+/// both backends.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct NTypeRef {
+    /// The dotted type-NAME segments in source order: a bare reference `Foo` → `["Foo"]`; a qualified
+    /// `ns.Foo` → `["ns", "Foo"]`; `a.b.C` → `["a", "b", "C"]`. EMPTY when the type name is `this`
+    /// (`this`-types carry no injectable token — `type_name_expr` returns `None`); the consumer treats
+    /// an empty path as "no token".
+    pub name_path: Vec<String>,
+    /// The type arguments (`ModuleWithProviders<T>` → one `NTypeRef { name_path: ["T"], … }`), in
+    /// source order. Only type-REFERENCE arguments are captured (a non-reference type argument is
+    /// dropped — the `module_with_providers_type_arg` consumer only matches a bare type-reference
+    /// argument and returns `None` otherwise; mirroring that keeps the args list byte-identical and the
+    /// consumer's match faithful).
+    pub type_args: Vec<NTypeRef>,
 }
 
 /// A pre-lowered class carrying an Angular decorator: name + its decorators + its members.
@@ -482,6 +539,13 @@ pub struct NCtorParam {
 pub struct ClassWithDecorators {
     /// The class identifier, if present.
     pub name: Option<String>,
+    /// The byte span of the class's NAME identifier (`class X` → the `X` token), when the class has a
+    /// name. This is the anchor the additive source map maps the emitted `type: <ClassName>` read back
+    /// to (`source_compile`'s `class_name_span` → `class_ref_spanned`): a value-preserving span that
+    /// never changes emitted bytes, only the map. `Default` (a zero span) for an anonymous class. Both
+    /// backends fill it from the class's binding identifier (oxc `Class::id.span` / swc
+    /// `ClassDecl::ident.span` / `ClassExpr::ident.span`), rebased to absolute byte offsets.
+    pub name_span: TreatySpan,
     /// The class's leading decorators in source order.
     pub decorators: Vec<DecoratorInfo>,
     /// The class's members in source order.

@@ -17,7 +17,7 @@ use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, ArrayExpressionElement, Class, ClassElement, Decorator, Expression,
     ExportDefaultDeclarationKind, FormalParameters, ImportOrExportKind, MethodDefinitionKind,
-    ObjectPropertyKind, Program, PropertyKey, Statement,
+    ObjectPropertyKind, Program, PropertyKey, Statement, TSType, TSTypeName,
 };
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType};
@@ -25,7 +25,8 @@ use oxc_span::{GetSpan, SourceType};
 use super::{
     ClassWithDecorators, DecoratorInfo, ImportInfo, LitValue, MemberInfo, MemberKind, NArg,
     NArrayElement, NArrowBody, NAssignment, NCtorParam, NExpr, NObjectProp, NParam, NStmt, NTopStmt,
-    NVarDeclarator, NgDeclareCall, ObjLit, ParseBackend, ParseOutput, SourceKind, TreatySpan,
+    NTypeRef, NVarDeclarator, NgDeclareCall, ObjLit, ParseBackend, ParseOutput, SourceKind,
+    TreatySpan,
 };
 
 /// The oxc parse backend. Zero-sized; the parse arena is created per [`Self::parse_module`] call so
@@ -199,7 +200,37 @@ fn lower_top_stmt(stmt: &Statement) -> NTopStmt {
                 span: span_of(stmt),
             }
         }
-        _ => NTopStmt::Other(span_of(stmt)),
+        // A top-level `function f(): RetType {…}` declaration — bare or `export function …`. Surfaced
+        // so `collect_module_with_providers_returns` can resolve a `ModuleWithProviders<T>` return type
+        // neutrally. Mirrors that helper's own bare / `ExportNamedDeclaration` function-extraction.
+        _ => {
+            if let Some(func) = statement_function(stmt) {
+                return NTopStmt::FnDecl {
+                    name: func.id.as_ref().map(|id| id.name.to_string()),
+                    return_type: func
+                        .return_type
+                        .as_ref()
+                        .and_then(|ann| lower_type_ref(&ann.type_annotation)),
+                    span: span_of(stmt),
+                };
+            }
+            NTopStmt::Other(span_of(stmt))
+        }
+    }
+}
+
+/// The function declared (directly or via `export`) by a top-level statement, or `None`. Mirrors
+/// `source_compile::collect_module_with_providers_returns`'s bare / `ExportNamedDeclaration`
+/// function-declaration extraction (an `export default function` is intentionally NOT a
+/// module-with-providers factory and stays `Other`, matching that helper).
+fn statement_function<'a>(stmt: &'a Statement<'a>) -> Option<&'a oxc_ast::ast::Function<'a>> {
+    match stmt {
+        Statement::FunctionDeclaration(f) => Some(f.as_ref()),
+        Statement::ExportNamedDeclaration(export) => match &export.declaration {
+            Some(oxc_ast::ast::Declaration::FunctionDeclaration(f)) => Some(f.as_ref()),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -272,6 +303,12 @@ fn statement_class<'a>(stmt: &'a Statement<'a>) -> Option<&'a Class<'a>> {
 /// backend's `ParseOutput` ones).
 pub(crate) fn lower_class(class: &Class, stmt_span: TreatySpan) -> ClassWithDecorators {
     let name = class.id.as_ref().map(|id| id.name.to_string());
+    // The class NAME identifier span (`class X` → the `X` token) — the additive source map's anchor.
+    let name_span = class
+        .id
+        .as_ref()
+        .map(|id| TreatySpan::new(id.span.start, id.span.end))
+        .unwrap_or_default();
     let decorators = class.decorators.iter().map(lower_decorator).collect();
     let members = class
         .body
@@ -281,6 +318,7 @@ pub(crate) fn lower_class(class: &Class, stmt_span: TreatySpan) -> ClassWithDeco
         .collect::<Vec<_>>();
     ClassWithDecorators {
         name,
+        name_span,
         decorators,
         members,
         span: span_of(class),
@@ -300,6 +338,7 @@ fn lower_member(element: &ClassElement) -> MemberInfo {
             is_static: p.r#static,
             params: Vec::new(),
             initializer: p.value.as_ref().map(lower_expr),
+            has_body: false,
             span: span_of(element),
         },
         ClassElement::MethodDefinition(m) => {
@@ -317,6 +356,9 @@ fn lower_member(element: &ClassElement) -> MemberInfo {
                 is_static: m.r#static,
                 params: lower_ctor_params(&m.value.params),
                 initializer: None,
+                // A bodiless TS overload signature has `value.body == None`; the implementation has a
+                // body. Constructor-dependency extraction prefers the body-bearing constructor.
+                has_body: m.value.body.is_some(),
                 span: span_of(element),
             }
         }
@@ -327,6 +369,7 @@ fn lower_member(element: &ClassElement) -> MemberInfo {
             is_static: a.r#static,
             params: Vec::new(),
             initializer: a.value.as_ref().map(lower_expr),
+            has_body: false,
             span: span_of(element),
         },
         // Static block / TS index signature / etc.: oxc still surfaces a (nameless) class element.
@@ -353,6 +396,10 @@ fn lower_ctor_params(params: &FormalParameters) -> Vec<NCtorParam> {
                 .map(|id| id.name.to_string()),
             decorators: item.decorators.iter().map(lower_decorator).collect(),
             is_rest: false,
+            type_ref: item
+                .type_annotation
+                .as_ref()
+                .and_then(|ann| lower_type_ref(&ann.type_annotation)),
         })
         .collect();
     if let Some(rest) = &params.rest {
@@ -364,9 +411,49 @@ fn lower_ctor_params(params: &FormalParameters) -> Vec<NCtorParam> {
                 .map(|id| id.name.to_string()),
             decorators: rest.decorators.iter().map(lower_decorator).collect(),
             is_rest: true,
+            // A `...rest` parameter is never a DI token (ngtsc's `getConstructorDependencies` reads only
+            // the fixed leading params), and oxc 0.133 surfaces no annotation on the
+            // `BindingRestElement` (the annotation rides on the inner pattern, which the rest walk does
+            // not descend). Carry `None` on both backends so the neutral list stays byte-identical.
+            type_ref: None,
         });
     }
     out
+}
+
+/// Lower a TS `TSType` to the neutral [`NTypeRef`] — `Some` ONLY for a type REFERENCE (`Foo` /
+/// `ns.Foo` / `ModuleWithProviders<T>`), `None` for every other type form (keyword / union / literal /
+/// function / array / …). Faithful to `source_compile::type_token_expr` (which only produces a token
+/// for a `TSTypeReference`) and `module_with_providers_type_arg` (which only matches a type reference).
+fn lower_type_ref(ty: &TSType) -> Option<NTypeRef> {
+    let TSType::TSTypeReference(reference) = ty else {
+        return None;
+    };
+    Some(NTypeRef {
+        name_path: type_name_path(&reference.type_name),
+        // The type arguments (`ModuleWithProviders<T>` → its `T`), keeping ONLY type-reference args
+        // (matching `module_with_providers_type_arg`, which drops a non-reference argument).
+        type_args: reference
+            .type_arguments
+            .as_ref()
+            .map(|args| args.params.iter().filter_map(lower_type_ref).collect())
+            .unwrap_or_default(),
+    })
+}
+
+/// The dotted NAME segments of a `TSTypeName` (`Foo` → `["Foo"]`; `ns.Foo` → `["ns", "Foo"]`;
+/// `a.b.C` → `["a", "b", "C"]`). EMPTY for a `this`-type (no injectable token — matches
+/// `type_name_expr`'s `None`). Faithful to `type_name_expr`'s recursive qualified-name walk.
+fn type_name_path(name: &TSTypeName) -> Vec<String> {
+    match name {
+        TSTypeName::IdentifierReference(id) => vec![id.name.to_string()],
+        TSTypeName::QualifiedName(q) => {
+            let mut path = type_name_path(&q.left);
+            path.push(q.right.name.to_string());
+            path
+        }
+        TSTypeName::ThisExpression(_) => Vec::new(),
+    }
 }
 
 /// Lower a decorator to the neutral [`DecoratorInfo`] (callee name + first object-literal argument +

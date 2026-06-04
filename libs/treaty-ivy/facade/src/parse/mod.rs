@@ -33,6 +33,11 @@
 //! `SourceMap`), so callers go through [`ParseBackend::span_text`] rather than slicing the source
 //! directly.
 
+/// The OXC parse backend (the default reference backend) — compiled only under `--features oxc`
+/// (on by default). It is the ONLY facade file permitted to `use oxc_`; gating the module on the
+/// `oxc` feature keeps a pure `--no-default-features --features swc` build free of the oxc crates,
+/// mirroring how `swc` below is gated on `--features swc`.
+#[cfg(feature = "oxc")]
 pub mod oxc;
 
 /// The SWC parse backend — compiled only under `--features swc` (the heavy `swc_*` crates are off by
@@ -71,8 +76,8 @@ pub enum SourceKind<'a> {
 /// decorator surface.
 pub use treaty_ivy_core::neutral::{
     ClassWithDecorators, DecoratorInfo, LitValue, MemberInfo, MemberKind, NArg, NArrayElement,
-    NArrowBody, NAssignment, NCtorParam, NExpr, NObjectProp, NParam, NStmt, NTopStmt, NVarDeclarator,
-    ObjLit, TreatySpan,
+    NArrowBody, NAssignment, NCtorParam, NExpr, NObjectProp, NParam, NStmt, NTopStmt, NTypeRef,
+    NVarDeclarator, ObjLit, TreatySpan,
 };
 
 /// A top-level (or inline) IMPORT binding the foreign-import / imported-name collection reads: the
@@ -162,23 +167,33 @@ pub trait ParseBackend {
 // neutral [`ParseOutput`] — proven byte-identical to oxc by `tools/backend-parity` + the
 // `parse_parity` test below.
 //
-// The `ParsingBackend` alias the front-end imports stays on [`oxc::OxcParseBackend`] for now even
-// under `--features swc`, because the facade's AOT/linker walks still reach the LIVE oxc `Program`
-// through [`oxc::OxcModule::program`] — `compile_program_with_source` (in `crate::source_compile`)
-// drives the walk against live oxc nodes. The `treaty_ivy_decorators::ClassMeta` PUBLIC API is now
-// engine-NEUTRAL (it carries `ClassWithDecorators`/`DecoratorInfo`/`ObjLit`, re-exported from
-// `treaty_ivy_core::neutral`); the live oxc nodes the AOT plugins still walk ride through that struct
-// only as an OPAQUE, facade-private `ClassMeta::live` handle. Flipping the alias to the swc backend is
-// gated on porting that walk to consume the neutral IR (SWC-BACKEND-PLAN.md §3.2 phase 3 — the wide
-// port); until then the swc backend is exercised through the parity gate, not the alias, so BOTH the
-// default and the `--features swc` builds compile against the same oxc-driven walk.
+// The `ParsingBackend` alias the front-end imports now selects PURELY by feature, because the whole
+// facade walk is engine-NEUTRAL: `compile_program_with_source` (in `crate::source_compile`), the
+// linker and the partial emitter read ONLY the pre-lowered [`ParseOutput`] / [`ParseBackend::span_text`]
+// — NO call site reaches a live `Program` (neither `OxcModule::program` nor `SwcModule::program` is
+// referenced by the walk). The `treaty_ivy_decorators::ClassMeta` PUBLIC API is engine-neutral (it
+// carries `ClassWithDecorators`/`DecoratorInfo`/`ObjLit`, re-exported from `treaty_ivy_core::neutral`)
+// and the live-AST handle it threads is an OPAQUE, facade-private generic the walk never inspects.
+// With the walk neutral, the alias resolves to whichever backend's crates are actually compiled:
+//   * `oxc` (the default + preferred backend) → [`oxc::OxcParseBackend`];
+//   * a pure `--no-default-features --features swc` build (NO oxc crates) → [`swc::SwcParseBackend`].
+// Both produce the byte-identical neutral [`ParseOutput`], proven 1:1 by `tools/backend-parity` + the
+// `parse_parity` test below, so the front-end emits byte-identical output under either backend.
 // ---------------------------------------------------------------------------
 
-/// The active parse backend the front-end imports. [`oxc::OxcParseBackend`] today on every build (see
-/// the module note above): the front-end's metadata walk still names the live oxc `Program`, so the
-/// alias cannot point at the swc backend until that walk is neutralized. The swc backend is wired and
-/// gated in parallel via `tools/backend-parity` + [`swc::SwcParseBackend`].
+/// The active parse backend the front-end imports. `oxc` is the DEFAULT and preferred backend, so when
+/// it is compiled the alias is [`oxc::OxcParseBackend`] regardless of whether `swc` is also on (the
+/// `--features oxc,swc` parity build keeps driving the walk through oxc). It falls back to
+/// [`swc::SwcParseBackend`] ONLY in a pure `--no-default-features --features swc` build — the
+/// configuration that pulls in ZERO oxc crates. Both fill the byte-identical neutral [`ParseOutput`].
+#[cfg(feature = "oxc")]
 pub type ParsingBackend = oxc::OxcParseBackend;
+
+/// The swc backend is the active parse backend ONLY when `oxc` is absent (`--no-default-features
+/// --features swc`); see the doc on the `oxc` variant above. Selecting it here is what makes the
+/// whole corpus compile through swc with zero oxc crates in the dependency graph.
+#[cfg(all(feature = "swc", not(feature = "oxc")))]
+pub type ParsingBackend = swc::SwcParseBackend;
 
 // ---------------------------------------------------------------------------
 // Parse-parity gate: the swc backend's neutral ParseOutput == the oxc backend's, byte-for-byte.
@@ -276,6 +291,25 @@ export class DiComponent {
   ) {}
 }
 "#,
+        // CONSTRUCTOR PARAMETER TYPE TOKENS (GAP1 — `NCtorParam::type_ref`): a bare type reference
+        // (`d: ElementRef`), a QUALIFIED type reference (`r: ng.Renderer2` → the dotted name path), a
+        // PRIMITIVE type (`n: string` → no usable token, `type_ref: None`), a `@Inject`-overridden
+        // param, and a generic-typed param (`q: QueryList<X>` → still just the `QueryList` reference).
+        // The DEFAULT injection token the factory derives is this type reference; both backends must
+        // fill the neutral `NCtorParam::type_ref` byte-identically (oxc `FormalParameter.type_annotation`
+        // / swc `BindingIdent.type_ann` + `TsParamProp`).
+        r#"
+@Component({ selector: "app-tok", template: "" })
+export class TokComponent {
+  constructor(
+    d: ElementRef,
+    r: ng.core.Renderer2,
+    n: string,
+    @Inject(TOKEN) v: unknown,
+    q: QueryList<TokComponent>,
+  ) {}
+}
+"#,
         // MEMBER INITIALIZERS exercising the full neutral expression surface: signal `input()` /
         // query `viewChild()` calls, `new`, member access, computed member, conditional,
         // binary + logical + unary, array (with spread), object (with spread + computed key), and an
@@ -345,10 +379,46 @@ Q.ɵprov = i0.ɵɵdefineInjectable({ token: Q, factory: () => new Q(), providedI
 "#,
     ];
 
+    /// The representative MODULE-WITH-PROVIDERS corpus (GAP2 — the fn-return-type surface
+    /// `ParseOutput::top_level` → `NTopStmt::FnDecl`): top-level `function …(): ModuleWithProviders<T>`
+    /// factory declarations in both the bare and `export function …` forms, alongside functions whose
+    /// return type is NOT a module-with-providers (a bare type reference, a primitive, an un-annotated
+    /// return) so the consumer's `None` cases are exercised too. `source_compile::
+    /// collect_module_with_providers_returns` reads each function's NAME + annotated RETURN TYPE; both
+    /// backends must surface the `NTopStmt::FnDecl { name, return_type }` byte-identically.
+    const MODULE_WITH_PROVIDERS_CORPUS: &[&str] = &[
+        // Bare + exported `ModuleWithProviders<T>` factories + non-MWP / un-annotated functions.
+        r#"
+export function forRoot(): ModuleWithProviders<RootModule> {
+  return { ngModule: RootModule, providers: [] };
+}
+function helper(): string { return ""; }
+export function plain() { return 1; }
+function forChild(config: Config): ModuleWithProviders<ChildModule> {
+  return { ngModule: ChildModule, providers: [{ provide: CONFIG, useValue: config }] };
+}
+"#,
+        // A qualified-name MWP type arg + a non-reference (union) type arg (dropped → empty args).
+        r#"
+export function withNs(): core.ModuleWithProviders<lib.Mod> { return null; }
+function withUnion(): ModuleWithProviders<A | B> { return null; }
+"#,
+    ];
+
     #[test]
     fn parse_parity_source_corpus() {
         for src in SOURCE_CORPUS {
             assert_parity(src, SourceKind::TypeScriptModule);
+        }
+    }
+
+    /// The module-with-providers fn-return-type surface (`NTopStmt::FnDecl`) is byte-identical across
+    /// both backends for the whole corpus (`ParseOutput` derives `PartialEq`).
+    #[test]
+    fn parse_parity_module_with_providers_corpus() {
+        for src in MODULE_WITH_PROVIDERS_CORPUS {
+            assert_parity(src, SourceKind::TypeScriptModule);
+            assert_parity(src, SourceKind::TypeScriptEsModule);
         }
     }
 
@@ -742,6 +812,78 @@ M.ɵprov = i0.ɵɵdefineInjectable({ token: M, factory: M.ɵfac, providedIn: "ro
         let arrow_text = OxcParseBackend.span_text(decl, value_span);
         assert_eq!(SwcParseBackend.span_text(decl, value_span), arrow_text);
         assert_eq!(arrow_text, "() => new X(dep)");
+
+        // ---- GAP4: NCtorParam::type_ref — the DEFAULT injection token a ctor param derives. ----
+        use super::MemberKind;
+        let tok = r#"
+@Component({ selector: "app-tok", template: "" })
+export class TokComponent {
+  constructor(d: ElementRef, r: ng.core.Renderer2, n: string, @Inject(TOKEN) v: unknown, q: QueryList<TokComponent>) {}
+}
+"#;
+        let o = oxc_summary(tok, SourceKind::TypeScriptModule);
+        let s = swc_summary(tok, SourceKind::TypeScriptModule);
+        assert_eq!(o, s, "GAP4 ctor type-token parity");
+        let ctor = o.classes[0]
+            .members
+            .iter()
+            .find(|m| m.kind == MemberKind::Constructor)
+            .expect("constructor present");
+        assert_eq!(ctor.params.len(), 5, "five ctor params");
+        // Bare type reference `d: ElementRef` → single-segment name path, no type args.
+        let d = ctor.params[0].type_ref.as_ref().expect("d has a type_ref");
+        assert_eq!(d.name_path, vec!["ElementRef".to_string()]);
+        assert!(d.type_args.is_empty());
+        // QUALIFIED type reference `r: ng.core.Renderer2` → the dotted name path.
+        let r = ctor.params[1].type_ref.as_ref().expect("r has a type_ref");
+        assert_eq!(
+            r.name_path,
+            vec!["ng".to_string(), "core".to_string(), "Renderer2".to_string()]
+        );
+        // PRIMITIVE type `n: string` → no usable injection token.
+        assert!(ctor.params[2].type_ref.is_none(), "primitive carries no type_ref");
+        // `@Inject(TOKEN) v: unknown` → the keyword type yields no `type_ref` (the `@Inject` decorator,
+        // carried separately, is what overrides the token).
+        assert!(ctor.params[3].type_ref.is_none(), "keyword type carries no type_ref");
+        assert_eq!(ctor.params[3].decorators[0].name, "Inject");
+        // GENERIC `q: QueryList<TokComponent>` → the `QueryList` reference + its type arg.
+        let q = ctor.params[4].type_ref.as_ref().expect("q has a type_ref");
+        assert_eq!(q.name_path, vec!["QueryList".to_string()]);
+        assert_eq!(q.type_args.len(), 1, "QueryList<T> carries one type arg");
+        assert_eq!(q.type_args[0].name_path, vec!["TokComponent".to_string()]);
+
+        // ---- GAP5: NTopStmt::FnDecl — the `ModuleWithProviders<T>` fn-return-type surface. ----
+        let mwp = r#"
+export function forRoot(): ModuleWithProviders<RootModule> { return null; }
+function helper(): string { return ""; }
+export function plain() { return 1; }
+"#;
+        let o = oxc_summary(mwp, SourceKind::TypeScriptEsModule);
+        let s = swc_summary(mwp, SourceKind::TypeScriptEsModule);
+        assert_eq!(o, s, "GAP5 fn-return-type parity");
+        let fns: Vec<(&str, Option<&super::NTypeRef>)> = o
+            .top_level
+            .iter()
+            .filter_map(|t| match t {
+                NTopStmt::FnDecl { name, return_type, .. } => {
+                    Some((name.as_deref().unwrap_or(""), return_type.as_ref()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(fns.len(), 3, "three top-level fn declarations surfaced");
+        // `export function forRoot(): ModuleWithProviders<RootModule>` → the MWP reference + its arg.
+        assert_eq!(fns[0].0, "forRoot");
+        let ret = fns[0].1.expect("forRoot has a return type");
+        assert_eq!(ret.name_path, vec!["ModuleWithProviders".to_string()]);
+        assert_eq!(ret.type_args.len(), 1);
+        assert_eq!(ret.type_args[0].name_path, vec!["RootModule".to_string()]);
+        // `function helper(): string` → a primitive return → no neutral type ref.
+        assert_eq!(fns[1].0, "helper");
+        assert!(fns[1].1.is_none(), "primitive return carries no type_ref");
+        // `export function plain()` → no annotation → no return type.
+        assert_eq!(fns[2].0, "plain");
+        assert!(fns[2].1.is_none(), "un-annotated return carries no type_ref");
     }
 
     /// `span_text` recovers the IDENTICAL source slice on both backends for a captured object span.

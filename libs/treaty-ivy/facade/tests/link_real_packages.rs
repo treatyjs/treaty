@@ -2,6 +2,13 @@
 //! ZERO residual `ɵɵngDeclare*` of any kind (the goal: Component + Directive + DI linking lands
 //! entirely in Rust, with no Babel/@angular/compiler fallback).
 //!
+//! This harness uses the `oxc_parser` directly as its valid-ES-module ORACLE (folding the barred-o
+//! `ɵ` to ASCII to sidestep an oxc identifier-char gap), so it is gated on the `oxc` feature — a pure
+//! `--no-default-features --features swc` build (which links the corpus through `SwcParseBackend` and
+//! pulls in ZERO oxc crates) simply skips this oxc-specific oracle; the linker itself is exercised
+//! under both backends by the in-crate tests + `tools/backend-parity`.
+#![cfg(feature = "oxc")]
+//!
 //! Phase 2 sweeps EVERY `.mjs` chunk that a real application bootstraps:
 //! `@angular/{platform-browser, platform-browser-dynamic, core, common (+http), forms, router,
 //! animations}` plus the `@angular/platform-browser/animations` entry point. For each chunk that

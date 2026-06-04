@@ -255,6 +255,57 @@ fn binary_prec(op: BinaryOperator) -> Prec {
     }
 }
 
+/// The logical operator class of an expression: `??`, or `&&`/`||` grouped together. Used to detect
+/// the `??`-with-`&&`/`||` mix the grammar forbids without parentheses. Returns `None` for anything
+/// that is not a top-level logical-binary expression.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LogicalClass {
+    /// `??`
+    Coalesce,
+    /// `&&` or `||`
+    AndOr,
+}
+
+fn logical_class(expr: &o::Expr) -> Option<LogicalClass> {
+    match &expr.kind {
+        ExprKind::Binary { op, .. } => match op {
+            BinaryOperator::NullishCoalesce => Some(LogicalClass::Coalesce),
+            BinaryOperator::And | BinaryOperator::Or => Some(LogicalClass::AndOr),
+            _ => None,
+        },
+        // The printer strips an explicit `Parenthesized`, so a parenthesized logical operand still
+        // forms the forbidden mix and must be re-parenthesized — look through it.
+        ExprKind::Parenthesized(inner) => logical_class(inner),
+        _ => None,
+    }
+}
+
+/// Whether an operand of the binary operator `parent_op` must be FORCE-parenthesized because it would
+/// otherwise form the grammar-forbidden `??`-with-`&&`/`||` mix (`a && b ?? c` is a SyntaxError; it
+/// must be `(a && b) ?? c`). True iff the parent is one logical class and the operand is the OTHER.
+fn nullish_mix_needs_parens(parent_op: BinaryOperator, operand: &o::Expr) -> bool {
+    let parent = match parent_op {
+        BinaryOperator::NullishCoalesce => LogicalClass::Coalesce,
+        BinaryOperator::And | BinaryOperator::Or => LogicalClass::AndOr,
+        _ => return false,
+    };
+    matches!(logical_class(operand), Some(child) if child != parent)
+}
+
+/// Whether the LEFT operand (base) of `**` must be force-parenthesized: a unary-prefixed base
+/// (`-x`, `!x`, `typeof x`, `void x`, `+x`, `~x`) is a SyntaxError as a bare `**` base. Looks through
+/// an explicit `Parenthesized` (the printer strips it) so the wrap is re-derived.
+fn exponent_base_needs_parens(parent_op: BinaryOperator, base: &o::Expr) -> bool {
+    if !matches!(parent_op, BinaryOperator::Exponentiation) {
+        return false;
+    }
+    match &base.kind {
+        ExprKind::Not(_) | ExprKind::Unary { .. } | ExprKind::Typeof(_) | ExprKind::Void(_) => true,
+        ExprKind::Parenthesized(inner) => exponent_base_needs_parens(parent_op, inner),
+        _ => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Printer
 // ---------------------------------------------------------------------------
@@ -518,7 +569,15 @@ impl Printer {
                 optional,
                 ..
             } => {
-                self.print_expr(callee, Prec::Postfix);
+                // A function / arrow callee must be parenthesized — `function(){}()` would parse as a
+                // function DECLARATION followed by `()`, so the IIFE form is `(function(){})()`.
+                // `oxc_codegen` wraps the callee (not the whole call), which also means the enclosing
+                // statement no longer begins with the `function` keyword. Mirror it byte-for-byte.
+                if expr_is_callee_needing_parens(callee) {
+                    self.print_expr_forced(callee);
+                } else {
+                    self.print_expr(callee, Prec::Postfix);
+                }
                 if *optional {
                     self.push("?.");
                 }
@@ -707,11 +766,34 @@ impl Printer {
         } else {
             (prec, prec_step_up(prec))
         };
-        self.print_expr(lhs, left_ctx);
+        // The `??` operator may NOT be combined with `&&` or `||` without explicit parentheses — the
+        // grammar forbids the un-parenthesized mix outright (it is a SyntaxError), so the operand must
+        // be wrapped regardless of numeric precedence. `oxc_codegen` parenthesizes this case; mirror it
+        // so `(a && b) ?? c` / `a ?? (b || c)` survive the neutral printer byte-for-byte.
+        // The base of `**` may NOT be an un-parenthesized unary expression — `-1 ** 3` is a
+        // SyntaxError, so it must read `(-1) ** 3`. `oxc_codegen` parenthesizes a unary `**` base;
+        // mirror it (the precedence model alone leaves them at equal `Unary` precedence → no wrap).
+        if nullish_mix_needs_parens(op, lhs) || exponent_base_needs_parens(op, lhs) {
+            self.print_expr_forced(lhs);
+        } else {
+            self.print_expr(lhs, left_ctx);
+        }
         self.push(" ");
         self.push(binary_op_str(op));
         self.push(" ");
-        self.print_expr(rhs, right_ctx);
+        if nullish_mix_needs_parens(op, rhs) {
+            self.print_expr_forced(rhs);
+        } else {
+            self.print_expr(rhs, right_ctx);
+        }
+    }
+
+    /// Print `expr` ALWAYS wrapped in parentheses — used where the grammar forbids the bare form
+    /// regardless of precedence (the `??`/`&&`/`||` mix).
+    fn print_expr_forced(&mut self, expr: &o::Expr) {
+        self.push("(");
+        self.print_expr_inner(expr);
+        self.push(")");
     }
 
     fn print_arrow(&mut self, params: &[o::FnParam], body: &ArrowBody) {
@@ -760,7 +842,8 @@ impl Printer {
     /// (which prefers double quotes) plus the emitter's `�` escape for i18n placeholders.
     fn print_string_literal(&mut self, s: &str) {
         self.push_ch('"');
-        for c in s.chars() {
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
             match c {
                 '"' => self.push("\\\""),
                 '\\' => self.push("\\\\"),
@@ -770,9 +853,22 @@ impl Printer {
                 '\u{08}' => self.push("\\b"),
                 '\u{0C}' => self.push("\\f"),
                 '\u{0B}' => self.push("\\v"),
-                '\u{00}' => self.push("\\0"),
+                '\u{07}' => self.push("\\x07"),
+                '\u{1B}' => self.push("\\x1B"),
+                // oxc_codegen: a NUL emits `\x00` when the NEXT char is an ASCII digit (so it does not
+                // merge into a longer octal escape), else the short `\0`.
+                '\u{00}' => {
+                    if chars.peek().is_some_and(|n| n.is_ascii_digit()) {
+                        self.push("\\x00");
+                    } else {
+                        self.push("\\0");
+                    }
+                }
                 '\u{2028}' => self.push("\\u2028"),
                 '\u{2029}' => self.push("\\u2029"),
+                // NON-BREAKING SPACE (U+00A0): oxc_codegen escapes it as `\xA0` (its
+                // `print_non_breaking_space`), NOT the raw byte. Mirror it for byte-identity.
+                '\u{A0}' => self.push("\\xA0"),
                 // U+FFFD (the i18n placeholder magic char) is emitted as the RAW code point, exactly
                 // as `@angular/compiler`'s real emitter and oxc_codegen do — NOT the `�` escape
                 // (that form only appears in the skipped `String.raw` compliance-macro goldens). This
@@ -852,10 +948,23 @@ impl Printer {
     fn print_object_entry(&mut self, entry: &LiteralMapEntry) {
         match entry {
             LiteralMapEntry::Property { key, value, quoted } => {
-                if *quoted || !is_valid_ident_name(key) {
-                    self.print_string_literal(key);
-                } else {
+                let ident_key = !*quoted && is_valid_ident_name(key);
+                // SHORTHAND: `{ child }` when an unquoted identifier key equals a same-named variable
+                // value. `oxc_codegen` emits this regardless of the AST `shorthand` flag (it compares
+                // key vs value), so mirror it for byte-identity.
+                if ident_key {
+                    if let ExprKind::ReadVar { name } = &value.kind {
+                        if name == key {
+                            self.record_anchor(&value.meta.span, name);
+                            self.push(key);
+                            return;
+                        }
+                    }
+                }
+                if ident_key {
                     self.push(key);
+                } else {
+                    self.print_string_literal(key);
                 }
                 self.push(": ");
                 self.print_expr(value, Prec::Assign);
@@ -939,8 +1048,13 @@ fn expr_prec(expr: &o::Expr) -> Prec {
         | ExprKind::RegExpLiteral { .. }
         | ExprKind::LocalizedString { .. }
         | ExprKind::WrappedNode(_)
-        | ExprKind::Parenthesized(_)
         | ExprKind::DynamicImport { .. } => Prec::Atom,
+        // The printer STRIPS an explicit `Parenthesized` and re-derives parens by precedence (matching
+        // `oxc_codegen`, which ignores the explicit paren node). So a parenthesized operand binds as
+        // its INNER expression for the purpose of deciding whether the position needs parens — NOT as
+        // an atom (treating it as an atom would wrongly suppress every re-derived paren, e.g. dropping
+        // the required `(a && b) ?? c` / `"x" + (a ?? b)` wraps).
+        ExprKind::Parenthesized(inner) => expr_prec(inner),
         ExprKind::Invoke { .. }
         | ExprKind::ReadProp { .. }
         | ExprKind::ReadKey { .. }
@@ -991,6 +1105,12 @@ fn prec_step_up(p: Prec) -> Prec {
     }
 }
 
+/// Whether a CALL/NEW callee must be parenthesized to read as a call target: a function or arrow
+/// expression (`(function(){})()` / `(() => …)()`). `oxc_codegen` wraps exactly these callee shapes.
+fn expr_is_callee_needing_parens(callee: &o::Expr) -> bool {
+    matches!(&callee.kind, ExprKind::Function { .. } | ExprKind::Arrow { .. })
+}
+
 /// Does the expression begin with `{` (object literal) or the `function` keyword, requiring a
 /// statement-position / arrow-body wrap?
 fn expr_starts_with_brace_or_function(expr: &o::Expr) -> bool {
@@ -1002,6 +1122,10 @@ fn expr_starts_with_brace_or_function(expr: &o::Expr) -> bool {
         ExprKind::Binary { lhs, .. } => expr_starts_with_brace_or_function(lhs),
         ExprKind::ReadProp { receiver, .. } => expr_starts_with_brace_or_function(receiver),
         ExprKind::ReadKey { receiver, .. } => expr_starts_with_brace_or_function(receiver),
+        // A function/arrow callee is wrapped in parens by the `Invoke` printer (the IIFE
+        // `(function(){})()` form), so such a call begins with `(`, NOT the `function` keyword — it
+        // therefore needs no extra statement-position wrap. Any other callee still propagates.
+        ExprKind::Invoke { callee, .. } if expr_is_callee_needing_parens(callee) => false,
         ExprKind::Invoke { callee, .. } => expr_starts_with_brace_or_function(callee),
         ExprKind::Conditional { condition, .. } => expr_starts_with_brace_or_function(condition),
         ExprKind::TaggedTemplate { tag, .. } => expr_starts_with_brace_or_function(tag),

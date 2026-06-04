@@ -10,7 +10,16 @@ edition = "2024"
 # template-definition builder, query generation). Ported from Angular 22.1
 # packages/compiler.
 
+# This crate is ENGINE-NEUTRAL — it names no `oxc_*`/`swc_*` type (its public `ClassMeta` carries the
+# neutral IR from `treaty_ivy_core::neutral`; the live AST rides as an opaque caller-defined handle).
+# Its `oxc`/`swc` features are pure pass-throughs that select the matching backend feature of the two
+# crates it depends on, so a `--no-default-features --features swc` build pulls in ZERO oxc crates.
+[features]
+default = ["oxc"]
+oxc = ["treaty_ivy_core/oxc", "treaty_ivy_template/oxc"]
+swc = ["treaty_ivy_core/swc", "treaty_ivy_template/swc"]
+
 [dependencies]
-treaty_ivy_core = { path = "../core" }
-treaty_ivy_template = { path = "../template" }
+treaty_ivy_core = { path = "../core", default-features = false }
+treaty_ivy_template = { path = "../template", default-features = false }
 regex = "1"

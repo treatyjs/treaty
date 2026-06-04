@@ -1,6 +1,7 @@
 //! `@Component`/`@Directive` SOURCE front-end.
 //!
-//! Parses a TypeScript source string with `oxc_parser`, finds the single class carrying an
+//! Parses a TypeScript source string through the engine-neutral [`crate::parse::ParsingBackend`],
+//! reads the pre-lowered [`crate::parse::ParseOutput`] to find the single class carrying an
 //! `@Component` (or `@Directive`) decorator, extracts the *common-case* metadata
 //! (class name, selector, inline `template`, `standalone`, `changeDetection`, inputs, outputs)
 //! into [`R3ComponentMetadata`], and drives the existing
@@ -18,22 +19,19 @@
 //! by class name. A `templateUrl` component WITHOUT a supplied resolved template is a clear error,
 //! never a silent empty template.
 
-// NOTE on `oxc_` usage in this module: the PARSE is now driven through the engine-neutral
-// [`crate::parse::ParsingBackend`] (the nine source front-end parse call sites no longer name
-// `oxc_parser`/`oxc_allocator`/`oxc_span::SourceType` directly — that is confined to
-// `crate::parse::oxc`). The remaining `oxc_ast` references below are the metadata WALK reading the
-// live AST handed back by the backend: arbitrary `Expression` → `output_ast` conversion, ctor-dep
-// extraction, host-binding/query/signal extraction and span anchoring. Re-shaping that recursive
-// walk into the flat neutral `ObjLit`/`LitValue` surface would be a full re-implementation (not a
-// behaviour-preserving refactor) and would jeopardise the byte-identical golden gate, so the walk
-// stays on the live AST — exactly as the SWC-BACKEND-PLAN Approach-B note permits.
-use oxc_ast::ast::{
-    Argument, Class, ClassElement, Decorator, Expression, MethodDefinitionKind, ObjectPropertyKind,
-    Program, PropertyDefinition, PropertyKey, Statement, TSType, TSTypeName,
-};
-use oxc_span::GetSpan;
+// NOTE: this module names ZERO live `oxc_` types. The PARSE is driven through the engine-neutral
+// [`crate::parse::ParsingBackend`]; the metadata WALK reads the pre-lowered engine-neutral
+// [`crate::parse::ParseOutput`] (`ClassWithDecorators` / `DecoratorInfo` / `ObjLit` / `NExpr` /
+// `MemberInfo` / `NCtorParam` / `NTypeRef`) instead of the live AST, and the byte-exact strip / emit
+// ranges come from neutral `TreatySpan`s recovered through [`ParseBackend::span_text`]. This is the
+// SAME engine-neutral surface the swc backend fills byte-identically (gated by `tools/backend-parity`
+// + the `parse_parity` test), so the AOT front-end is backend-agnostic.
 
-use crate::parse::{ParseBackend, ParsingBackend, SourceKind};
+use crate::parse::{
+    ClassWithDecorators, DecoratorInfo, MemberInfo, MemberKind, NArg, NArrowBody, NCtorParam,
+    NExpr, NObjectProp, NParam, NStmt, NTopStmt, NTypeRef, ObjLit, ParseBackend, ParseOutput,
+    ParsingBackend, SourceKind, TreatySpan,
+};
 
 use crate::compile::{CompiledComponent, RealTemplateBuilder};
 use crate::decorators::registry::{
@@ -109,36 +107,26 @@ enum TopLevel {
     Injectable,
 }
 
-/// Returns the callee identifier name of a decorator's expression, whether it's a bare
-/// `@Foo` (identifier) or a call `@Foo({...})` (call expression). Mirrors the legacy parser's
-/// recognition in `apps/rust/authoring/src/angular/decorators`.
-fn decorator_name<'a>(dec: &'a Decorator<'a>) -> Option<&'a str> {
-    match &dec.expression {
-        Expression::CallExpression(call) => match &call.callee {
-            Expression::Identifier(id) => Some(id.name.as_str()),
-            _ => None,
-        },
-        Expression::Identifier(id) => Some(id.name.as_str()),
-        _ => None,
+/// Returns the callee identifier name of a decorator, whether it's a bare `@Foo` or a call
+/// `@Foo({...})`. Mirrors the legacy parser's recognition; the neutral [`DecoratorInfo::name`]
+/// already carries it (empty string for a member-access / computed decorator the lowering declined).
+fn decorator_name(dec: &DecoratorInfo) -> Option<&str> {
+    if dec.name.is_empty() {
+        None
+    } else {
+        Some(dec.name.as_str())
     }
 }
 
 /// Returns the object literal argument of a decorator call `@Foo({...})`, if present.
-fn decorator_object<'a>(dec: &'a Decorator<'a>) -> Option<&'a oxc_ast::ast::ObjectExpression<'a>> {
-    if let Expression::CallExpression(call) = &dec.expression {
-        for arg in &call.arguments {
-            if let Argument::ObjectExpression(obj) = arg {
-                return Some(obj);
-            }
-        }
-    }
-    None
+fn decorator_object(dec: &DecoratorInfo) -> Option<&ObjLit> {
+    dec.object.as_ref()
 }
 
 /// Find a class's leading decorator whose callee identifier is `name` (`@Injectable`, `@Pipe`, …),
 /// if present. Used to detect the multi-decorator case (a class carrying BOTH `@Pipe` and
 /// `@Injectable`), where ngtsc compiles every recognized trait rather than only the first.
-fn class_decorator<'a>(class: &'a Class<'a>, name: &str) -> Option<&'a Decorator<'a>> {
+fn class_decorator<'a>(class: &'a ClassWithDecorators, name: &str) -> Option<&'a DecoratorInfo> {
     class
         .decorators
         .iter()
@@ -151,7 +139,7 @@ fn class_decorator<'a>(class: &'a Class<'a>, name: &str) -> Option<&'a Decorator
 /// them all (the multi-decorator `@Pipe`+`@Injectable` case). When only the primary decorator is
 /// recognized this collapses to that decorator's own span. `primary` is the fallback span used if the
 /// scan somehow finds none (it always finds at least `primary`).
-fn recognized_decorator_strip_span(class: &Class, primary: &Decorator) -> (u32, u32) {
+fn recognized_decorator_strip_span(class: &ClassWithDecorators, primary: &DecoratorInfo) -> (u32, u32) {
     let mut start: Option<u32> = None;
     let mut end: Option<u32> = None;
     for dec in &class.decorators {
@@ -162,13 +150,13 @@ fn recognized_decorator_strip_span(class: &Class, primary: &Decorator) -> (u32, 
         if !recognized {
             continue;
         }
-        let s = dec.span();
+        let s = dec.span;
         start = Some(start.map_or(s.start, |cur| cur.min(s.start)));
         end = Some(end.map_or(s.end, |cur| cur.max(s.end)));
     }
     (
-        start.unwrap_or(primary.span().start),
-        end.unwrap_or(primary.span().end),
+        start.unwrap_or(primary.span.start),
+        end.unwrap_or(primary.span.end),
     )
 }
 
@@ -197,19 +185,12 @@ fn is_inert_member_decorator(name: Option<&str>) -> bool {
 /// [`is_inert_member_decorator`]). Returned sorted by start offset, so the emitter can excise each
 /// from the kept class-body source slice. The class's own top-level decorator is NOT included here
 /// (that is handled separately by [`recognized_decorator_strip_span`]).
-fn member_decorator_strip_spans(class: &Class) -> Vec<(u32, u32)> {
+fn member_decorator_strip_spans(class: &ClassWithDecorators) -> Vec<(u32, u32)> {
     let mut spans = Vec::new();
-    for element in &class.body.body {
-        let decorators = match element {
-            ClassElement::PropertyDefinition(p) => &p.decorators,
-            ClassElement::AccessorProperty(p) => &p.decorators,
-            ClassElement::MethodDefinition(m) => &m.decorators,
-            _ => continue,
-        };
-        for dec in decorators.iter() {
+    for member in &class.members {
+        for dec in &member.decorators {
             if is_inert_member_decorator(decorator_name(dec)) {
-                let s = dec.span();
-                spans.push((s.start, s.end));
+                spans.push((dec.span.start, dec.span.end));
             }
         }
     }
@@ -248,36 +229,24 @@ fn push_slice_excising_spans(
     }
 }
 
-/// Reads the static-identifier name of a property key (the common case: `selector`, `template`).
-fn key_name<'a>(key: &'a PropertyKey<'a>) -> Option<&'a str> {
-    match key {
-        PropertyKey::StaticIdentifier(id) => Some(id.name.as_str()),
-        PropertyKey::StringLiteral(s) => Some(s.value.as_str()),
-        _ => None,
-    }
-}
-
-/// Reads a string-literal value (used for `selector` / inline `template`).
-fn string_value<'a>(expr: &'a Expression<'a>) -> Option<String> {
+/// Reads a string-literal value (used for `selector` / inline `template`). The neutral [`NExpr`]
+/// already cooks a no-substitution template literal into a [`NExpr::String`].
+fn string_value(expr: &NExpr) -> Option<String> {
     match expr {
-        Expression::StringLiteral(s) => Some(s.value.to_string()),
-        // A no-substitution template literal `` `...` `` (single quasi, no exprs).
-        Expression::TemplateLiteral(t) if t.expressions.is_empty() && t.quasis.len() == 1 => {
-            t.quasis[0].value.cooked.as_ref().map(|c| c.to_string())
-        }
+        NExpr::String(s) => Some(s.clone()),
         _ => None,
     }
 }
 
 /// Reads an array of string literals (used for `styles: [...]`). Returns `None` when the value
 /// is not an array literal; non-string elements are skipped.
-fn string_array_value<'a>(expr: &'a Expression<'a>) -> Option<Vec<String>> {
-    let Expression::ArrayExpression(arr) = expr else {
+fn string_array_value(expr: &NExpr) -> Option<Vec<String>> {
+    let NExpr::Array(elements) = expr else {
         return None;
     };
     let mut out = Vec::new();
-    for el in &arr.elements {
-        if let Some(inner) = el.as_expression() {
+    for el in elements {
+        if let crate::parse::NArrayElement::Expr(inner) = el {
             if let Some(s) = string_value(inner) {
                 out.push(s);
             }
@@ -289,10 +258,10 @@ fn string_array_value<'a>(expr: &'a Expression<'a>) -> Option<Vec<String>> {
 /// Maps a `ViewEncapsulation.X` member expression (or bare `X`) onto the [`ViewEncapsulation`]
 /// enum. Unknown / non-member values yield `None` (caller keeps the Emulated default, matching
 /// Angular's `null → Emulated` normalization).
-fn encapsulation_value<'a>(expr: &'a Expression<'a>) -> Option<ViewEncapsulation> {
+fn encapsulation_value(expr: &NExpr) -> Option<ViewEncapsulation> {
     let name = match expr {
-        Expression::StaticMemberExpression(m) => m.property.name.as_str(),
-        Expression::Identifier(id) => id.name.as_str(),
+        NExpr::Member { property, .. } => property.as_str(),
+        NExpr::Identifier(id) => id.as_str(),
         _ => return None,
     };
     match name {
@@ -322,7 +291,7 @@ fn is_safe_object_key(key: &str) -> bool {
     }
 }
 
-/// Best-effort conversion of an oxc `Expression` into an `output_ast` [`Expr`], faithful enough to
+/// Best-effort conversion of a neutral [`NExpr`] into an `output_ast` [`Expr`], faithful enough to
 /// re-emit metadata blobs Angular copies through verbatim (notably `animations`, whose array of
 /// trigger objects the component definition reproduces under `data: {animation: [...]}`).
 ///
@@ -330,152 +299,151 @@ fn is_safe_object_key(key: &str) -> bool {
 /// array and object literals, identifiers (as variable reads), member access and call
 /// expressions. Anything outside this subset returns `None` so the caller can decline rather than
 /// emit a corrupted blob.
-fn convert_expr<'a>(expr: &'a Expression<'a>) -> Option<Expr> {
+fn convert_expr(expr: &NExpr) -> Option<Expr> {
     match expr {
-        Expression::StringLiteral(s) => {
-            Some(o::literal(LiteralValue::String(s.value.to_string()), None))
-        }
-        Expression::TemplateLiteral(t) if t.expressions.is_empty() && t.quasis.len() == 1 => t
-            .quasis[0]
-            .value
-            .cooked
-            .as_ref()
-            .map(|c| o::literal(LiteralValue::String(c.to_string()), None)),
-        Expression::NumericLiteral(n) => Some(o::literal(LiteralValue::Number(n.value), None)),
-        Expression::BooleanLiteral(b) => Some(o::literal(LiteralValue::Bool(b.value), None)),
-        Expression::NullLiteral(_) => Some(o::literal(LiteralValue::Null, None)),
-        Expression::Identifier(id) => Some(o::variable(id.name.to_string(), None)),
-        Expression::ArrayExpression(arr) => {
-            let mut elems = Vec::with_capacity(arr.elements.len());
-            for el in &arr.elements {
-                let inner = el.as_expression()?;
+        NExpr::String(s) => Some(o::literal(LiteralValue::String(s.clone()), None)),
+        NExpr::Number(n) => Some(o::literal(LiteralValue::Number(*n), None)),
+        NExpr::Boolean(b) => Some(o::literal(LiteralValue::Bool(*b), None)),
+        NExpr::Null => Some(o::literal(LiteralValue::Null, None)),
+        NExpr::Identifier(name) => Some(o::variable(name.clone(), None)),
+        NExpr::Array(elements) => {
+            let mut elems = Vec::with_capacity(elements.len());
+            for el in elements {
+                // ngtsc only copies through plain (non-spread, non-hole) array elements here.
+                let crate::parse::NArrayElement::Expr(inner) = el else {
+                    return None;
+                };
                 elems.push(convert_expr(inner)?);
             }
             Some(o::literal_arr(elems, None))
         }
-        Expression::ObjectExpression(obj) => {
-            let mut entries = Vec::with_capacity(obj.properties.len());
-            for p in &obj.properties {
-                let ObjectPropertyKind::ObjectProperty(op) = p else {
+        NExpr::Object(props) => {
+            let mut entries = Vec::with_capacity(props.len());
+            for p in props {
+                // Only static `key: value` properties convert; a spread / computed / shorthand
+                // property declines (matching the live-AST walk's `ObjectProperty`-only handling).
+                let NObjectProp::KeyValue {
+                    key, value, ..
+                } = p
+                else {
                     return None;
                 };
-                let key = key_name(&op.key)?;
                 let quoted = !is_safe_object_key(key);
-                entries.push((key.to_string(), quoted, convert_expr(&op.value)?));
+                entries.push((key.clone(), quoted, convert_expr(value)?));
             }
             Some(o::literal_map(entries, None))
         }
-        Expression::StaticMemberExpression(m) => {
-            let object = convert_expr(&m.object)?;
-            Some(object.prop(m.property.name.as_str()))
+        NExpr::Member { object, property } => {
+            let object = convert_expr(object)?;
+            Some(object.prop(property.as_str()))
         }
-        Expression::CallExpression(call) => {
-            let callee = convert_expr(&call.callee)?;
-            let mut args = Vec::with_capacity(call.arguments.len());
-            for a in &call.arguments {
-                let inner = a.as_expression()?;
-                args.push(convert_expr(inner)?);
+        NExpr::Call { callee, args } => {
+            let callee = convert_expr(callee)?;
+            let mut out_args = Vec::with_capacity(args.len());
+            for a in args {
+                // A spread call-argument is not part of the copied-through metadata subset.
+                let NArg::Expr(inner, _) = a else {
+                    return None;
+                };
+                out_args.push(convert_expr(inner)?);
             }
-            Some(callee.call_fn(args, false))
+            Some(callee.call_fn(out_args, false))
         }
-        Expression::ParenthesizedExpression(p) => convert_expr(&p.expression),
+        NExpr::Parenthesized(inner) => convert_expr(inner),
         // Conditional `c ? t : f` — appears in transform/host-handler bodies (`v => v ? 1 : 0`).
-        Expression::ConditionalExpression(c) => {
-            let test = convert_expr(&c.test)?;
-            let consequent = convert_expr(&c.consequent)?;
-            let alternate = convert_expr(&c.alternate)?;
+        NExpr::Conditional {
+            test,
+            consequent,
+            alternate,
+        } => {
+            let test = convert_expr(test)?;
+            let consequent = convert_expr(consequent)?;
+            let alternate = convert_expr(alternate)?;
             Some(test.conditional(consequent, Some(alternate)))
         }
-        // Binary `a <op> b` and logical `a && b` / `a || b` / `a ?? b`. The operator is matched on
-        // its source spelling (`.as_str()`) so this converter needs no direct dependency on the
-        // `oxc_syntax` operator crate.
-        Expression::BinaryExpression(b) => {
-            let op = binary_operator_of(b.operator.as_str())?;
-            let lhs = convert_expr(&b.left)?;
-            let rhs = convert_expr(&b.right)?;
-            Some(binary_expr(op, lhs, rhs))
-        }
-        Expression::LogicalExpression(l) => {
-            let op = logical_operator_of(l.operator.as_str())?;
-            let lhs = convert_expr(&l.left)?;
-            let rhs = convert_expr(&l.right)?;
+        // Binary `a <op> b` and logical `a && b` / `a || b` / `a ?? b`. The neutral tree unifies oxc's
+        // separate `Binary`/`Logical` expressions into one `NExpr::Binary`, carrying the operator as its
+        // source spelling — matched here against the binary and the logical operator tables in turn.
+        NExpr::Binary { op, left, right } => {
+            let lhs = convert_expr(left)?;
+            let rhs = convert_expr(right)?;
+            let op = binary_operator_of(op).or_else(|| logical_operator_of(op))?;
             Some(binary_expr(op, lhs, rhs))
         }
         // Unary `!x` / `-x` / `+x` / `typeof x` / `void x`.
-        Expression::UnaryExpression(u) => {
-            let inner = convert_expr(&u.argument)?;
-            unary_expr(u.operator.as_str(), inner)
+        NExpr::Unary { op, argument } => {
+            let inner = convert_expr(argument)?;
+            unary_expr(op, inner)
         }
-        // Computed member `a[k]` — `ComputedMemberExpression` in oxc.
-        Expression::ComputedMemberExpression(m) => {
-            let object = convert_expr(&m.object)?;
-            let index = convert_expr(&m.expression)?;
+        // Computed member `a[k]`.
+        NExpr::ComputedMember { object, index } => {
+            let object = convert_expr(object)?;
+            let index = convert_expr(index)?;
             Some(object.key(index))
         }
         // Inline arrow function — `(v) => v + 1`. Appears as an `@Input({transform})` value and
         // as a host binding/listener handler. Lowered to an output-AST arrow (faithful to ngtsc
         // copying the function node through to the emitted metadata); the body covers both the
         // expression-bodied (`x => expr`) and block (`x => { ... }`) forms.
-        Expression::ArrowFunctionExpression(arrow) => {
-            let params = convert_fn_params(&arrow.params)?;
-            let body = convert_arrow_body(arrow)?;
+        NExpr::Arrow { params, body } => {
+            let params = convert_fn_params(params)?;
+            let body = convert_arrow_body(body)?;
             Some(o::arrow_fn(params, body, None))
         }
-        // Inline function expression — `function (v) { return v + 1; }`. The block body is the
-        // only valid form (a function expression always has a body).
-        Expression::FunctionExpression(func) => {
-            let params = convert_fn_params(&func.params)?;
-            let body = convert_fn_body_stmts(func.body.as_ref()?)?;
+        // Inline function expression — `function (v) { return v + 1; }`.
+        NExpr::Function { params, body } => {
+            let params = convert_fn_params(params)?;
+            let body = convert_fn_body_stmts(body)?;
             Some(o::fn_(params, body, None, None))
         }
         _ => None,
     }
 }
 
-/// Convert OXC formal parameters to output-AST [`FnParam`]s. Returns `None` for any non-simple
-/// binding (destructuring, defaults) we do not model — ngtsc only ever copies through the simple
+/// Convert neutral formal parameters to output-AST [`FnParam`]s. Returns `None` for any non-simple
+/// binding (destructuring, defaults, rest) we do not model — ngtsc only ever copies through the simple
 /// parameter shapes that appear in a `transform`/host-handler function.
-fn convert_fn_params(params: &oxc_ast::ast::FormalParameters) -> Option<Vec<FnParam>> {
-    let mut out = Vec::with_capacity(params.items.len());
-    for item in &params.items {
-        let id = item.pattern.get_binding_identifier()?;
-        out.push(FnParam::new(id.name.to_string(), Some(o::dynamic_type())));
+fn convert_fn_params(params: &[NParam]) -> Option<Vec<FnParam>> {
+    let mut out = Vec::with_capacity(params.len());
+    for item in params {
+        // A `...rest` parameter (or a non-identifier binding, carried as `name: None`) is declined.
+        if item.is_rest {
+            return None;
+        }
+        let name = item.name.as_ref()?;
+        out.push(FnParam::new(name.clone(), Some(o::dynamic_type())));
     }
     Some(out)
 }
 
 /// Build the [`o::ArrowBody`] for an arrow function: an expression body (`x => expr`) becomes
 /// [`o::ArrowBody::Expr`]; a block body (`x => { ... }`) becomes [`o::ArrowBody::Block`].
-fn convert_arrow_body(arrow: &oxc_ast::ast::ArrowFunctionExpression) -> Option<o::ArrowBody> {
-    if arrow.expression {
-        if let Some(Statement::ExpressionStatement(stmt)) = arrow.body.statements.first() {
-            return Some(o::ArrowBody::Expr(Box::new(convert_expr(&stmt.expression)?)));
-        }
+fn convert_arrow_body(body: &NArrowBody) -> Option<o::ArrowBody> {
+    match body {
+        NArrowBody::Expr(expr) => Some(o::ArrowBody::Expr(Box::new(convert_expr(expr)?))),
+        NArrowBody::Block(stmts) => Some(o::ArrowBody::Block(convert_fn_body_stmts(stmts)?)),
     }
-    let stmts = convert_fn_body_stmts(&arrow.body)?;
-    Some(o::ArrowBody::Block(stmts))
 }
 
 /// Convert a function/arrow block body's statements. Supports the small statement subset that
 /// appears in transform/host-handler bodies: `return expr;` and bare expression statements.
-fn convert_fn_body_stmts(body: &oxc_ast::ast::FunctionBody) -> Option<Vec<o::Stmt>> {
-    let mut stmts = Vec::with_capacity(body.statements.len());
-    for stmt in &body.statements {
+fn convert_fn_body_stmts(stmts: &[NStmt]) -> Option<Vec<o::Stmt>> {
+    let mut out = Vec::with_capacity(stmts.len());
+    for stmt in stmts {
         match stmt {
-            Statement::ReturnStatement(ret) => {
-                // `StmtKind::Return` carries the returned expression; a value-less `return;` has
-                // no output-AST representation, so decline it (the metadata is dropped, never
-                // mis-emitted).
-                let value = convert_expr(ret.argument.as_ref()?)?;
-                stmts.push(o::Stmt::bare(o::StmtKind::Return(value)));
+            NStmt::Return(value) => {
+                // A value-less `return;` has no output-AST representation, so decline it (the
+                // metadata is dropped, never mis-emitted).
+                let value = convert_expr(value.as_ref()?)?;
+                out.push(o::Stmt::bare(o::StmtKind::Return(value)));
             }
-            Statement::ExpressionStatement(stmt) => {
-                stmts.push(convert_expr(&stmt.expression)?.to_stmt());
+            NStmt::Expr(expr) => {
+                out.push(convert_expr(expr)?.to_stmt());
             }
             _ => return None,
         }
     }
-    Some(stmts)
+    Some(out)
 }
 
 /// Build a binary `lhs <op> rhs` output expression. (`Expr::binary` is private; the IR node is
@@ -488,10 +456,9 @@ fn binary_expr(op: o::BinaryOperator, lhs: Expr, rhs: Expr) -> Expr {
     })
 }
 
-/// Map an OXC binary operator (by its source spelling) to the output-AST [`o::BinaryOperator`].
+/// Map a binary operator (by its source spelling) to the output-AST [`o::BinaryOperator`].
 /// Returns `None` for the bitwise-shift / bitwise-xor / `instanceof` operators the output IR has no
 /// dedicated variant for (they never appear in the transform/host-handler subset this serves).
-/// Matching on `.as_str()` avoids a direct dependency on the `oxc_syntax` operator crate.
 fn binary_operator_of(op: &str) -> Option<o::BinaryOperator> {
     use o::BinaryOperator as B;
     Some(match op {
@@ -518,7 +485,7 @@ fn binary_operator_of(op: &str) -> Option<o::BinaryOperator> {
     })
 }
 
-/// Map an OXC logical operator (`&&` / `||` / `??`, by source spelling) to the output-AST operator.
+/// Map a logical operator (`&&` / `||` / `??`, by source spelling) to the output-AST operator.
 fn logical_operator_of(op: &str) -> Option<o::BinaryOperator> {
     use o::BinaryOperator as B;
     Some(match op {
@@ -529,7 +496,7 @@ fn logical_operator_of(op: &str) -> Option<o::BinaryOperator> {
     })
 }
 
-/// Lower an OXC unary expression (`!x` / `-x` / `+x` / `typeof x` / `void x`, by source spelling).
+/// Lower a unary expression (`!x` / `-x` / `+x` / `typeof x` / `void x`, by source spelling).
 /// Returns `None` for `delete` / `~` which the output IR has no representation for in this subset.
 fn unary_expr(op: &str, inner: Expr) -> Option<Expr> {
     Some(match op {
@@ -558,23 +525,23 @@ fn unary_expr(op: &str, inner: Expr) -> Option<Expr> {
 ///   * a bare identifier `FancyButton` — `name` and `component` are both that identifier.
 /// Nested arrays are flattened (Angular flattens recursively). Entries we cannot name are
 /// skipped (they would be a resolver diagnostic upstream, never a silent mis-compile).
-fn parse_foreign_imports(expr: &Expression) -> Vec<R3ForeignComponentMetadata> {
+fn parse_foreign_imports(expr: &NExpr) -> Vec<R3ForeignComponentMetadata> {
     let mut out = Vec::new();
     collect_foreign_imports(expr, &mut out);
     out
 }
 
-fn collect_foreign_imports(expr: &Expression, out: &mut Vec<R3ForeignComponentMetadata>) {
-    let Expression::ArrayExpression(arr) = expr else {
+fn collect_foreign_imports(expr: &NExpr, out: &mut Vec<R3ForeignComponentMetadata>) {
+    let NExpr::Array(elements) = expr else {
         return;
     };
-    for el in &arr.elements {
-        let Some(inner) = el.as_expression() else {
+    for el in elements {
+        let crate::parse::NArrayElement::Expr(inner) = el else {
             continue;
         };
         match inner {
             // Nested array — flatten (ngtsc `validateAndFlattenForeignImports` recurses).
-            Expression::ArrayExpression(_) => collect_foreign_imports(inner, out),
+            NExpr::Array(_) => collect_foreign_imports(inner, out),
             _ => {
                 if let Some(meta) = foreign_import_entry(inner) {
                     out.push(meta);
@@ -586,23 +553,22 @@ fn collect_foreign_imports(expr: &Expression, out: &mut Vec<R3ForeignComponentMe
 
 /// One `foreignImports` entry → its `{ name, component }` pair. Returns `None` when the entry's
 /// foreign name cannot be recovered from the surface syntax.
-fn foreign_import_entry(expr: &Expression) -> Option<R3ForeignComponentMetadata> {
+fn foreign_import_entry(expr: &NExpr) -> Option<R3ForeignComponentMetadata> {
     let unwrapped = match expr {
-        Expression::ParenthesizedExpression(p) => &p.expression,
+        NExpr::Parenthesized(inner) => inner.as_ref(),
         other => other,
     };
     let name = match unwrapped {
         // `frameworkImport(FancyButton)` — the resolved declaration is the first identifier arg.
-        Expression::CallExpression(call) => call
-            .arguments
+        NExpr::Call { args, .. } => args
             .iter()
-            .find_map(|a| a.as_expression())
-            .and_then(|a| match a {
-                Expression::Identifier(id) => Some(id.name.to_string()),
+            .map(NArg::expr)
+            .find_map(|a| match a {
+                NExpr::Identifier(id) => Some(id.clone()),
                 _ => None,
             })?,
         // Bare `FancyButton`.
-        Expression::Identifier(id) => id.name.to_string(),
+        NExpr::Identifier(id) => id.clone(),
         _ => return None,
     };
     // `component` is the raw entry expression, copied through verbatim (ngtsc wraps it in an
@@ -611,38 +577,30 @@ fn foreign_import_entry(expr: &Expression) -> Option<R3ForeignComponentMetadata>
     Some(R3ForeignComponentMetadata { name, component })
 }
 
-/// Walks an object literal property by name, returning its value expression.
-fn find_prop<'a>(
-    obj: &'a oxc_ast::ast::ObjectExpression<'a>,
-    name: &str,
-) -> Option<&'a Expression<'a>> {
-    obj.properties.iter().find_map(|p| match p {
-        ObjectPropertyKind::ObjectProperty(op) => {
-            if key_name(&op.key) == Some(name) {
-                Some(&op.value)
-            } else {
-                None
-            }
-        }
+/// Walks an object literal property by name, returning its value expression. Reads the lossless
+/// [`ObjLit::nprops`] channel so a rich value (an arrow `transform`, a `providers` array, …) is
+/// surfaced as a full [`NExpr`] (the lossy `props` channel degrades those to `LitValue::Other`).
+fn find_prop<'a>(obj: &'a ObjLit, name: &str) -> Option<&'a NExpr> {
+    obj.nprops.iter().find_map(|p| match p {
+        NObjectProp::KeyValue { key, value, .. } if key == name => Some(value),
         _ => None,
     })
 }
-
 /// Recognizes a signal-member initializer call: `input()`, `input.required()`, `model()`,
 /// `model.required()`, `output()`, `outputFromObservable()`. Returns the base callee identifier
 /// (`input`/`model`/`output`/`outputFromObservable`) and whether `.required` was used.
-fn signal_call<'a>(expr: &'a Expression<'a>) -> Option<(&'a str, bool)> {
-    let Expression::CallExpression(call) = expr else {
+fn signal_call(expr: &NExpr) -> Option<(&str, bool)> {
+    let NExpr::Call { callee, .. } = expr else {
         return None;
     };
-    match &call.callee {
+    match callee.as_ref() {
         // `input(...)`, `output(...)`, `model(...)`, `outputFromObservable(...)`
-        Expression::Identifier(id) => Some((id.name.as_str(), false)),
+        NExpr::Identifier(name) => Some((name.as_str(), false)),
         // `input.required(...)`, `model.required(...)`
-        Expression::StaticMemberExpression(member) => {
-            if let Expression::Identifier(base) = &member.object {
-                let required = member.property.name.as_str() == "required";
-                Some((base.name.as_str(), required))
+        NExpr::Member { object, property } => {
+            if let NExpr::Identifier(base) = object.as_ref() {
+                let required = property.as_str() == "required";
+                Some((base.as_str(), required))
             } else {
                 None
             }
@@ -651,11 +609,10 @@ fn signal_call<'a>(expr: &'a Expression<'a>) -> Option<(&'a str, bool)> {
     }
 }
 
-/// The arguments of a call expression, if `expr` is one. Returned as a plain slice (the arena-backed
-/// `oxc_allocator::Vec` derefs transparently) so this module's walk does not name an arena type.
-fn call_args<'a>(expr: &'a Expression<'a>) -> Option<&'a [Argument<'a>]> {
-    if let Expression::CallExpression(call) = expr {
-        Some(&call.arguments)
+/// The arguments of a call expression, if `expr` is one.
+fn call_args(expr: &NExpr) -> Option<&[NArg]> {
+    if let NExpr::Call { args, .. } = expr {
+        Some(args.as_slice())
     } else {
         None
     }
@@ -664,27 +621,34 @@ fn call_args<'a>(expr: &'a Expression<'a>) -> Option<&'a [Argument<'a>]> {
 /// The alias from a signal `input`/`model`/`output` options object, i.e. the `alias`
 /// property of the LAST argument when it is an object literal: `input(default, {alias: 'x'})`
 /// / `output({alias: 'x'})`. Returns `None` when no alias option is present.
-fn signal_alias(expr: &Expression) -> Option<String> {
+fn signal_alias(expr: &NExpr) -> Option<String> {
     let args = call_args(expr)?;
     let last = args.last()?;
-    let Argument::ObjectExpression(obj) = last else {
+    let NExpr::Object(props) = last.expr() else {
         return None;
     };
-    let alias_expr = find_prop(obj, "alias")?;
+    let alias_expr = object_props_get(props, "alias")?;
     string_value(alias_expr)
+}
+
+/// Find a `key: value` property's value in a neutral object-property list (the `NExpr::Object` /
+/// decorator-argument-object surface), reading the lossless full-`NExpr` value. Mirrors [`find_prop`]
+/// for a property list that is not wrapped in an [`ObjLit`].
+fn object_props_get<'a>(props: &'a [NObjectProp], name: &str) -> Option<&'a NExpr> {
+    props.iter().find_map(|p| match p {
+        NObjectProp::KeyValue { key, value, .. } if key == name => Some(value),
+        _ => None,
+    })
 }
 
 /// The literal string alias from a property decorator call's first argument:
 /// `@Input('renamedName')` / `@Output('renamedName')`. Returns `None` for the bare `@Input()`.
-fn decorator_string_alias(dec: &Decorator) -> Option<String> {
-    let Expression::CallExpression(call) = &dec.expression else {
-        return None;
-    };
-    let first = call.arguments.first()?;
-    let Argument::StringLiteral(s) = first else {
-        return None;
-    };
-    Some(s.value.to_string())
+fn decorator_string_alias(dec: &DecoratorInfo) -> Option<String> {
+    let first = dec.arguments.first()?;
+    match first.expr() {
+        NExpr::String(s) => Some(s.clone()),
+        _ => None,
+    }
 }
 
 /// Parse an `@Input(...)` decorator's first argument into `(alias, transform)`. ngtsc accepts two
@@ -692,15 +656,12 @@ fn decorator_string_alias(dec: &Decorator) -> Option<String> {
 /// `@Input({alias?: 'publicName', transform?: fn, required?: bool})`. Returns the public-name alias
 /// (when present) and the transform function expression (when present and convertible). A transform
 /// we cannot structurally convert (e.g. an inline arrow body) is dropped rather than mis-emitted.
-fn input_decorator_options(dec: &Decorator) -> (Option<String>, Option<Expr>) {
-    let Expression::CallExpression(call) = &dec.expression else {
-        return (None, None);
-    };
-    match call.arguments.first().and_then(|a| a.as_expression()) {
-        Some(Expression::StringLiteral(s)) => (Some(s.value.to_string()), None),
-        Some(Expression::ObjectExpression(obj)) => {
-            let alias = find_prop(obj, "alias").and_then(string_value);
-            let transform = find_prop(obj, "transform").and_then(convert_expr);
+fn input_decorator_options(dec: &DecoratorInfo) -> (Option<String>, Option<Expr>) {
+    match dec.arguments.first().map(NArg::expr) {
+        Some(NExpr::String(s)) => (Some(s.clone()), None),
+        Some(NExpr::Object(props)) => {
+            let alias = object_props_get(props, "alias").and_then(string_value);
+            let transform = object_props_get(props, "transform").and_then(convert_expr);
             (alias, transform)
         }
         _ => (None, None),
@@ -715,6 +676,12 @@ const UNSUPPORTED_DECORATOR_KEYS: &[&str] = &[
     "queries",
 ];
 
+/// Whether a class member is a (non-static-block) property/accessor — the shape `@Input`/`@Output`
+/// and signal initializers ride on. (`MemberKind::Accessor` is an `accessor x = …;` auto-accessor.)
+fn is_property_like(member: &MemberInfo) -> bool {
+    matches!(member.kind, MemberKind::Property | MemberKind::Accessor)
+}
+
 /// Extract inputs/outputs from the class body and populate the metadata maps.
 ///
 /// Recognizes:
@@ -723,17 +690,18 @@ const UNSUPPORTED_DECORATOR_KEYS: &[&str] = &[
 ///   * `x = input()` / `input.required()` / `model()` → signal input
 ///   * `x = output()` → output
 fn collect_io(
-    class: &Class,
+    class: &ClassWithDecorators,
     inputs: &mut OrderedMap<String, R3InputMetadata>,
     outputs: &mut OrderedMap<String, String>,
     modernize: ModernizeOptions,
 ) -> Result<(), String> {
-    for element in &class.body.body {
-        let ClassElement::PropertyDefinition(prop) = element else {
+    for member in &class.members {
+        // `@Input`/`@Output` + signal initializers ride on a property member (oxc
+        // `PropertyDefinition`); skip methods / the constructor / accessors-with-no-init.
+        if member.kind != MemberKind::Property {
             continue;
-        };
-        let prop: &PropertyDefinition = prop;
-        let Some(member_name) = key_name(&prop.key).map(|s| s.to_string()) else {
+        }
+        let Some(member_name) = member.name.clone() else {
             continue;
         };
 
@@ -744,7 +712,7 @@ fn collect_io(
         let mut decorated_output = false;
         let mut decorator_alias: Option<String> = None;
         let mut decorator_transform: Option<Expr> = None;
-        for dec in &prop.decorators {
+        for dec in &member.decorators {
             if let Some(name) = decorator_name(dec) {
                 match name {
                     "Input" => {
@@ -805,7 +773,7 @@ fn collect_io(
 
         // Signal-based members: `x = input()` / `input.required()` / `model()` / `output()`
         // / `outputFromObservable()`. The alias (if any) comes from the call's options object.
-        if let Some(init) = &prop.value {
+        if let Some(init) = &member.initializer {
             if let Some((base, required)) = signal_call(init) {
                 match base {
                     "input" | "model" => {
@@ -865,10 +833,10 @@ fn signal_query_kind(name: &str) -> Option<(bool /*first*/, bool /*is_content*/)
 
 /// Returns the callee identifier name of a call expression `foo(...)`, if the callee is a bare
 /// identifier. (Signal queries are never `.required`, unlike `input`/`model`.)
-fn call_callee_name<'a>(expr: &'a Expression<'a>) -> Option<&'a str> {
-    if let Expression::CallExpression(call) = expr {
-        if let Expression::Identifier(id) = &call.callee {
-            return Some(id.name.as_str());
+fn call_callee_name(expr: &NExpr) -> Option<&str> {
+    if let NExpr::Call { callee, .. } = expr {
+        if let NExpr::Identifier(id) = callee.as_ref() {
+            return Some(id.as_str());
         }
     }
     None
@@ -877,12 +845,12 @@ fn call_callee_name<'a>(expr: &'a Expression<'a>) -> Option<&'a str> {
 /// Parse the `descendants` boolean from a query options object literal (2nd arg). Faithful to
 /// `parseDescendantsOption`: only `true`/`false` literals are accepted; absence yields the
 /// per-function default. Any other shape is treated as absent (we do not diagnose here).
-fn query_descendants(options: Option<&Expression>, default: bool) -> bool {
-    let Some(Expression::ObjectExpression(obj)) = options else {
+fn query_descendants(options: Option<&NExpr>, default: bool) -> bool {
+    let Some(NExpr::Object(props)) = options else {
         return default;
     };
-    match find_prop(obj, "descendants") {
-        Some(Expression::BooleanLiteral(b)) => b.value,
+    match object_props_get(props, "descendants") {
+        Some(NExpr::Boolean(b)) => *b,
         _ => default,
     }
 }
@@ -890,13 +858,13 @@ fn query_descendants(options: Option<&Expression>, default: bool) -> bool {
 /// Parse the `read` option of a query (2nd-arg options object). Faithful to `parseReadOption`:
 /// only a bare identifier `read: BLA` or a single property access `read: ns.BLA` is supported;
 /// anything else is ignored (returns `None`).
-fn query_read(options: Option<&Expression>) -> Option<Expr> {
-    let Some(Expression::ObjectExpression(obj)) = options else {
+fn query_read(options: Option<&NExpr>) -> Option<Expr> {
+    let Some(NExpr::Object(props)) = options else {
         return None;
     };
-    let value = find_prop(obj, "read")?;
+    let value = object_props_get(props, "read")?;
     match value {
-        Expression::Identifier(_) | Expression::StaticMemberExpression(_) => convert_expr(value),
+        NExpr::Identifier(_) | NExpr::Member { .. } => convert_expr(value),
         _ => None,
     }
 }
@@ -911,32 +879,20 @@ fn query_read(options: Option<&Expression>) -> Option<Expr> {
 /// predicate (`createMayBeForwardRefExpression`, forward-ref resolved upstream → bare `Expr`).
 ///
 /// Returns `(is_content_query, metadata)`, or `None` when the initializer is not a signal query.
-fn parse_signal_query(prop: &PropertyDefinition) -> Option<(bool, R3QueryMetadata)> {
-    let member_name = key_name(&prop.key)?.to_string();
-    let init = prop.value.as_ref()?;
+fn parse_signal_query(member: &MemberInfo) -> Option<(bool, R3QueryMetadata)> {
+    let member_name = member.name.clone()?;
+    let init = member.initializer.as_ref()?;
     let callee = call_callee_name(init)?;
     let (first, is_content) = signal_query_kind(callee)?;
 
     let args = call_args(init)?;
     // arg0 is the locator/predicate. Absent locator is a hard error in Angular; we simply skip
     // (the component still compiles, just without this query) rather than mis-emit.
-    let predicate_node = args.first().and_then(|a| a.as_expression())?;
-    let options_node = args.get(1).and_then(|a| a.as_expression());
+    let predicate_node = args.first().map(NArg::expr)?;
+    let options_node = args.get(1).map(NArg::expr);
 
     let predicate = match predicate_node {
-        Expression::StringLiteral(s) => QueryPredicate::Selectors(vec![s.value.to_string()]),
-        // No-substitution template literal `` `ref` `` also reads as a string locator.
-        Expression::TemplateLiteral(t)
-            if t.expressions.is_empty() && t.quasis.len() == 1 =>
-        {
-            let text = t.quasis[0]
-                .value
-                .cooked
-                .as_ref()
-                .map(|c| c.to_string())
-                .unwrap_or_default();
-            QueryPredicate::Selectors(vec![text])
-        }
+        NExpr::String(s) => QueryPredicate::Selectors(vec![s.clone()]),
         other => query_expr_predicate(other)?,
     };
 
@@ -962,15 +918,15 @@ fn parse_signal_query(prop: &PropertyDefinition) -> Option<(bool, R3QueryMetadat
 /// queries (in declaration order), faithful to `query_functions.ts`. Decorator-based queries
 /// (`@ViewChild` &c.) are collected separately by [`collect_decorator_queries`].
 fn collect_signal_queries(
-    class: &Class,
+    class: &ClassWithDecorators,
     content_queries: &mut Vec<R3QueryMetadata>,
     view_queries: &mut Vec<R3QueryMetadata>,
 ) {
-    for element in &class.body.body {
-        let ClassElement::PropertyDefinition(prop) = element else {
+    for member in &class.members {
+        if member.kind != MemberKind::Property {
             continue;
-        };
-        if let Some((is_content, meta)) = parse_signal_query(prop) {
+        }
+        if let Some((is_content, meta)) = parse_signal_query(member) {
             if is_content {
                 content_queries.push(meta);
             } else {
@@ -1003,11 +959,11 @@ fn decorator_query_kind(name: &str) -> Option<(bool /*first*/, bool /*is_content
 /// The `static` boolean from a query decorator options object (2nd arg). Faithful to ngtsc's
 /// `parseQueryStaticness`: only a `true`/`false` literal counts (default `false`); for multi
 /// queries `static` is always `false`.
-fn decorator_query_static(options: Option<&Expression>) -> bool {
-    let Some(Expression::ObjectExpression(obj)) = options else {
+fn decorator_query_static(options: Option<&NExpr>) -> bool {
+    let Some(NExpr::Object(props)) = options else {
         return false;
     };
-    matches!(find_prop(obj, "static"), Some(Expression::BooleanLiteral(b)) if b.value)
+    matches!(object_props_get(props, "static"), Some(NExpr::Boolean(b)) if *b)
 }
 
 /// Build the [`R3QueryMetadata`] for a single decorator query.
@@ -1019,28 +975,16 @@ fn decorator_query_static(options: Option<&Expression>) -> bool {
 /// queries are always `isSignal: false`, `emitDistinctChangesOnly: true`.
 fn decorator_query_metadata(
     member_name: &str,
-    dec: &Decorator,
+    dec: &DecoratorInfo,
 ) -> Option<(bool /*is_content*/, R3QueryMetadata)> {
     let name = decorator_name(dec)?;
     let (first, is_content) = decorator_query_kind(name)?;
-    let Expression::CallExpression(call) = &dec.expression else {
-        // A bare `@ViewChild` with no arguments has no locator — skip.
-        return None;
-    };
-    let predicate_node = call.arguments.first().and_then(|a| a.as_expression())?;
-    let options_node = call.arguments.get(1).and_then(|a| a.as_expression());
+    // A bare `@ViewChild` with no arguments has no locator — skip.
+    let predicate_node = dec.arguments.first().map(NArg::expr)?;
+    let options_node = dec.arguments.get(1).map(NArg::expr);
 
     let predicate = match predicate_node {
-        Expression::StringLiteral(s) => split_query_selectors(s.value.as_str()),
-        Expression::TemplateLiteral(t) if t.expressions.is_empty() && t.quasis.len() == 1 => {
-            let text = t.quasis[0]
-                .value
-                .cooked
-                .as_ref()
-                .map(|c| c.to_string())
-                .unwrap_or_default();
-            split_query_selectors(&text)
-        }
+        NExpr::String(s) => split_query_selectors(s),
         other => query_expr_predicate(other)?,
     };
 
@@ -1076,20 +1020,19 @@ fn split_query_selectors(text: &str) -> QueryPredicate {
 /// property members (the common case) and accessor/method members carrying the decorator are
 /// considered.
 fn collect_decorator_queries(
-    class: &Class,
+    class: &ClassWithDecorators,
     content_queries: &mut Vec<R3QueryMetadata>,
     view_queries: &mut Vec<R3QueryMetadata>,
 ) {
-    for element in &class.body.body {
-        let (decorators, key) = match element {
-            ClassElement::PropertyDefinition(p) => (&p.decorators, &p.key),
-            ClassElement::AccessorProperty(p) => (&p.decorators, &p.key),
-            _ => continue,
-        };
-        let Some(member_name) = key_name(key) else {
+    for member in &class.members {
+        // `@ViewChild`/`@ContentChild` ride on property/accessor members.
+        if !is_property_like(member) {
+            continue;
+        }
+        let Some(member_name) = member.name.as_deref() else {
             continue;
         };
-        for dec in decorators.iter() {
+        for dec in &member.decorators {
             if let Some((is_content, meta)) = decorator_query_metadata(member_name, dec) {
                 if is_content {
                     content_queries.push(meta);
@@ -1126,7 +1069,6 @@ fn order_queries_for_emit(queries: &mut Vec<R3QueryMetadata>) {
     out.extend(legacy_multi);
     *queries = out;
 }
-
 // ---------------------------------------------------------------------------
 // R2 — host bindings (`host: {...}` object, `@HostBinding`/`@HostListener` members).
 // ---------------------------------------------------------------------------
@@ -1136,21 +1078,24 @@ fn order_queries_for_emit(queries: &mut Vec<R3QueryMetadata>) {
 /// `extractHostBindings`: each property key is the raw host key (`'(click)'`, `'[id]'`, `'class'`,
 /// `'role'`, …) and the value is its string (the binding expression / static attribute value).
 /// Returns `Err` for a non-object `host` or a non-string value (ngtsc diagnoses both).
-fn parse_host_object(expr: &Expression) -> Result<OrderedMap<String, HostValue>, String> {
-    let Expression::ObjectExpression(obj) = expr else {
+fn parse_host_object(expr: &NExpr) -> Result<OrderedMap<String, HostValue>, String> {
+    let NExpr::Object(props) = expr else {
         return Err("`host` must be an object literal".to_string());
     };
     let mut out: OrderedMap<String, HostValue> = OrderedMap::new();
-    for p in &obj.properties {
-        let ObjectPropertyKind::ObjectProperty(op) = p else {
-            return Err("unsupported `host` spread/shorthand".to_string());
+    for p in props {
+        let (key, value) = match p {
+            NObjectProp::KeyValue { key, value, .. } => (key, value),
+            // A non-static key (`[expr()]: v`) lowers to `NObjectProp::Other` — ngtsc diagnoses a
+            // computed `host` key (mirroring the historical `key_name(...) == None` branch).
+            NObjectProp::Other(_) => return Err("unsupported `host` computed key".to_string()),
+            NObjectProp::Spread(_) => {
+                return Err("unsupported `host` spread/shorthand".to_string())
+            }
         };
-        let key = key_name(&op.key)
-            .ok_or_else(|| "unsupported `host` computed key".to_string())?
-            .to_string();
-        let value = string_value(&op.value)
+        let value = string_value(value)
             .ok_or_else(|| format!("`host` value for '{key}' must be a string"))?;
-        out.insert(key, HostValue::Str(value));
+        out.insert(key.clone(), HostValue::Str(value));
     }
     Ok(out)
 }
@@ -1171,17 +1116,20 @@ struct MemberHost {
 ///   * `@HostListener('event', ['$event.target'])` on `method()` → key `(event)`, value
 ///     `method($event.target)` (the listener invokes the handler with the declared args; the bare
 ///     `@HostListener('event')` form invokes `method()`).
-fn collect_member_host_bindings(class: &Class, host: &mut MemberHost) {
-    for element in &class.body.body {
+fn collect_member_host_bindings(class: &ClassWithDecorators, host: &mut MemberHost) {
+    for member in &class.members {
         // `@HostBinding` rides on property/accessor members; `@HostListener` on method members.
-        let (decorators, key) = match element {
-            ClassElement::PropertyDefinition(p) => (&p.decorators, &p.key),
-            ClassElement::AccessorProperty(p) => (&p.decorators, &p.key),
-            ClassElement::MethodDefinition(m) => (&m.decorators, &m.key),
-            _ => continue,
+        let allowed = matches!(
+            member.kind,
+            MemberKind::Property | MemberKind::Accessor | MemberKind::Method
+        );
+        if !allowed {
+            continue;
+        }
+        let Some(member_name) = member.name.as_deref() else {
+            continue;
         };
-        let Some(member_name) = key_name(key) else { continue };
-        for dec in decorators.iter() {
+        for dec in &member.decorators {
             match decorator_name(dec) {
                 Some("HostBinding") => {
                     // `@HostBinding('hostProp')` → bound prop named `hostProp` (or the member
@@ -1224,22 +1172,19 @@ fn collect_member_host_bindings(class: &Class, host: &mut MemberHost) {
 /// The handler text is `member(arg0, arg1, …)` where each arg is the raw source of the string entry
 /// in the (optional) 2nd-argument array (ngtsc's `bindingPropertyName`/`args` handling). Returns
 /// `None` when the event name is missing.
-fn host_listener_entry(dec: &Decorator, member_name: &str) -> Option<(String, String)> {
-    let Expression::CallExpression(call) = &dec.expression else {
-        return None;
-    };
-    let event = match call.arguments.first().and_then(|a| a.as_expression())? {
-        Expression::StringLiteral(s) => s.value.to_string(),
+fn host_listener_entry(dec: &DecoratorInfo, member_name: &str) -> Option<(String, String)> {
+    let event = match dec.arguments.first().map(NArg::expr)? {
+        NExpr::String(s) => s.clone(),
         _ => return None,
     };
     // Optional args array (each entry a string of source-expression text).
     let mut args: Vec<String> = Vec::new();
-    if let Some(Expression::ArrayExpression(arr)) =
-        call.arguments.get(1).and_then(|a| a.as_expression())
-    {
-        for el in &arr.elements {
-            if let Some(s) = el.as_expression().and_then(string_value) {
-                args.push(s);
+    if let Some(NExpr::Array(elements)) = dec.arguments.get(1).map(NArg::expr) {
+        for el in elements {
+            if let crate::parse::NArrayElement::Expr(inner) = el {
+                if let Some(s) = string_value(inner) {
+                    args.push(s);
+                }
             }
         }
     }
@@ -1254,13 +1199,15 @@ fn host_listener_entry(dec: &Decorator, member_name: &str) -> Option<(String, St
 ///     plus parsed input/output public-name → alias maps (`'a'` aliases to itself; `'a: b'`
 ///     maps public `a` to alias `b`).
 /// Entries we cannot name are skipped. Returns `None` when nothing usable is parsed.
-fn parse_host_directives(expr: &Expression) -> Option<Vec<R3HostDirectiveMetadata>> {
-    let Expression::ArrayExpression(arr) = expr else {
+fn parse_host_directives(expr: &NExpr) -> Option<Vec<R3HostDirectiveMetadata>> {
+    let NExpr::Array(elements) = expr else {
         return None;
     };
     let mut out: Vec<R3HostDirectiveMetadata> = Vec::new();
-    for el in &arr.elements {
-        let Some(inner) = el.as_expression() else { continue };
+    for el in elements {
+        let crate::parse::NArrayElement::Expr(inner) = el else {
+            continue;
+        };
         if let Some(meta) = host_directive_entry(inner) {
             out.push(meta);
         }
@@ -1272,19 +1219,19 @@ fn parse_host_directives(expr: &Expression) -> Option<Vec<R3HostDirectiveMetadat
     }
 }
 
-fn host_directive_entry(expr: &Expression) -> Option<R3HostDirectiveMetadata> {
+fn host_directive_entry(expr: &NExpr) -> Option<R3HostDirectiveMetadata> {
     match expr {
-        Expression::Identifier(id) => Some(R3HostDirectiveMetadata {
-            directive: directive_ref(id.name.as_str()),
+        NExpr::Identifier(id) => Some(R3HostDirectiveMetadata {
+            directive: directive_ref(id.as_str()),
             is_forward_reference: false,
             inputs: None,
             outputs: None,
         }),
-        Expression::ObjectExpression(obj) => {
-            let directive_expr = find_prop(obj, "directive")?;
+        NExpr::Object(props) => {
+            let directive_expr = object_props_get(props, "directive")?;
             let (name, is_forward) = directive_name_maybe_forward(directive_expr)?;
-            let inputs = find_prop(obj, "inputs").and_then(host_directive_mapping);
-            let outputs = find_prop(obj, "outputs").and_then(host_directive_mapping);
+            let inputs = object_props_get(props, "inputs").and_then(host_directive_mapping);
+            let outputs = object_props_get(props, "outputs").and_then(host_directive_mapping);
             Some(R3HostDirectiveMetadata {
                 directive: directive_ref(&name),
                 is_forward_reference: is_forward,
@@ -1292,9 +1239,9 @@ fn host_directive_entry(expr: &Expression) -> Option<R3HostDirectiveMetadata> {
                 outputs,
             })
         }
-        Expression::ParenthesizedExpression(p) => host_directive_entry(&p.expression),
+        NExpr::Parenthesized(inner) => host_directive_entry(inner),
         // A bare `forwardRef(() => Dir)` host-directive entry (no input/output mapping).
-        Expression::CallExpression(_) => {
+        NExpr::Call { .. } => {
             let (name, is_forward) = directive_name_maybe_forward(expr)?;
             Some(R3HostDirectiveMetadata {
                 directive: directive_ref(&name),
@@ -1313,7 +1260,7 @@ fn host_directive_entry(expr: &Expression) -> Option<R3HostDirectiveMetadata> {
 /// handling — `ForwardRefHandling::None`), and a bare identifier `X` is used verbatim. So when the
 /// locator resolves to a class name (directly or through a forwardRef), emit `o::variable(name)`;
 /// otherwise fall back to the structural [`convert_expr`] (e.g. a `read`/token member expression).
-fn query_expr_predicate(expr: &Expression) -> Option<QueryPredicate> {
+fn query_expr_predicate(expr: &NExpr) -> Option<QueryPredicate> {
     if let Some((name, _was_forward)) = directive_name_maybe_forward(expr) {
         return Some(QueryPredicate::Expr(o::variable(name, None)));
     }
@@ -1323,18 +1270,18 @@ fn query_expr_predicate(expr: &Expression) -> Option<QueryPredicate> {
 /// Resolve a directive reference expression to its class name plus whether it was wrapped in
 /// `forwardRef(() => X)` (faithful to ngtsc's `forwardRefResolver`). A bare identifier `X` →
 /// `(X, false)`; `forwardRef(() => X)` → `(X, true)`.
-fn directive_name_maybe_forward(expr: &Expression) -> Option<(String, bool)> {
+fn directive_name_maybe_forward(expr: &NExpr) -> Option<(String, bool)> {
     match expr {
-        Expression::Identifier(id) => Some((id.name.to_string(), false)),
-        Expression::ParenthesizedExpression(p) => directive_name_maybe_forward(&p.expression),
-        Expression::CallExpression(call) => {
+        NExpr::Identifier(id) => Some((id.clone(), false)),
+        NExpr::Parenthesized(inner) => directive_name_maybe_forward(inner),
+        NExpr::Call { callee, args } => {
             // `forwardRef(() => X)`: the callee is `forwardRef`; the single arg is an arrow/fn
             // whose returned expression is the target identifier.
-            let is_forward_ref = matches!(&call.callee, Expression::Identifier(id) if id.name == "forwardRef");
+            let is_forward_ref = matches!(callee.as_ref(), NExpr::Identifier(id) if id == "forwardRef");
             if !is_forward_ref {
                 return None;
             }
-            let arg = call.arguments.first().and_then(|a| a.as_expression())?;
+            let arg = args.first().map(NArg::expr)?;
             let name = arrow_returned_identifier(arg)?;
             Some((name, true))
         }
@@ -1344,47 +1291,44 @@ fn directive_name_maybe_forward(expr: &Expression) -> Option<(String, bool)> {
 
 /// The identifier returned by a `() => X` arrow (expression body) or `() => { return X; }` arrow /
 /// function body. Used to unwrap `forwardRef(() => X)`.
-fn arrow_returned_identifier(expr: &Expression) -> Option<String> {
+fn arrow_returned_identifier(expr: &NExpr) -> Option<String> {
     match expr {
-        Expression::ArrowFunctionExpression(arrow) => {
-            // Expression-bodied arrow: the body is a single `ExpressionStatement`.
-            if arrow.expression {
-                if let Some(Statement::ExpressionStatement(stmt)) = arrow.body.statements.first() {
-                    return identifier_of(&stmt.expression);
-                }
-            }
+        NExpr::Arrow { body, .. } => match body.as_ref() {
+            // Expression-bodied arrow: `() => X`.
+            NArrowBody::Expr(inner) => identifier_of(inner),
             // Block-bodied arrow: find the `return X;`.
-            for stmt in &arrow.body.statements {
-                if let Statement::ReturnStatement(ret) = stmt {
-                    if let Some(arg) = &ret.argument {
-                        return identifier_of(arg);
-                    }
-                }
-            }
-            None
-        }
+            NArrowBody::Block(stmts) => stmts.iter().find_map(|stmt| match stmt {
+                NStmt::Return(Some(arg)) => identifier_of(arg),
+                _ => None,
+            }),
+        },
         _ => None,
     }
 }
 
 /// The bare identifier name of an expression (unwrapping parentheses), if it is one.
-fn identifier_of(expr: &Expression) -> Option<String> {
+fn identifier_of(expr: &NExpr) -> Option<String> {
     match expr {
-        Expression::Identifier(id) => Some(id.name.to_string()),
-        Expression::ParenthesizedExpression(p) => identifier_of(&p.expression),
+        NExpr::Identifier(id) => Some(id.clone()),
+        NExpr::Parenthesized(inner) => identifier_of(inner),
         _ => None,
     }
 }
 
 /// Parse a `hostDirectives` `inputs`/`outputs` mapping array (`['a', 'b: c']`) into an ordered
 /// public-name → alias map. `'a'` aliases to itself; `'b: c'` maps public `b` to alias `c`.
-fn host_directive_mapping(expr: &Expression) -> Option<OrderedMap<String, String>> {
-    let Expression::ArrayExpression(arr) = expr else {
+fn host_directive_mapping(expr: &NExpr) -> Option<OrderedMap<String, String>> {
+    let NExpr::Array(elements) = expr else {
         return None;
     };
     let mut map: OrderedMap<String, String> = OrderedMap::new();
-    for el in &arr.elements {
-        let Some(s) = el.as_expression().and_then(string_value) else { continue };
+    for el in elements {
+        let crate::parse::NArrayElement::Expr(inner) = el else {
+            continue;
+        };
+        let Some(s) = string_value(inner) else {
+            continue;
+        };
         let (public_name, alias) = match s.split_once(':') {
             Some((p, a)) => (p.trim().to_string(), a.trim().to_string()),
             None => (s.trim().to_string(), s.trim().to_string()),
@@ -1400,16 +1344,13 @@ fn host_directive_mapping(expr: &Expression) -> Option<OrderedMap<String, String
 
 /// Whether the class declares an `ngOnChanges` lifecycle method (faithful to ngtsc's
 /// `lifecycle.usesOnChanges` detection driving the `NgOnChangesFeature`). Recognizes the method on
-/// a `MethodDefinition` or a property/accessor whose name is `ngOnChanges`.
-fn class_uses_on_changes(class: &Class) -> bool {
-    class.body.body.iter().any(|element| {
-        let key = match element {
-            ClassElement::MethodDefinition(m) => &m.key,
-            ClassElement::PropertyDefinition(p) => &p.key,
-            ClassElement::AccessorProperty(p) => &p.key,
-            _ => return false,
-        };
-        key_name(key) == Some("ngOnChanges")
+/// a method member or a property/accessor whose name is `ngOnChanges`.
+fn class_uses_on_changes(class: &ClassWithDecorators) -> bool {
+    class.members.iter().any(|member| {
+        matches!(
+            member.kind,
+            MemberKind::Method | MemberKind::Property | MemberKind::Accessor
+        ) && member.name.as_deref() == Some("ngOnChanges")
     })
 }
 
@@ -1426,8 +1367,8 @@ fn directive_ref(name: &str) -> DirRef {
 /// member `@HostBinding`/`@HostListener` entries. The decorator-object entries come first (ngtsc
 /// processes the `host` object then folds member bindings on top), preserving source order.
 fn build_host_metadata(
-    host_obj: Option<&Expression>,
-    class: &Class,
+    host_obj: Option<&NExpr>,
+    class: &ClassWithDecorators,
 ) -> Result<R3HostMetadata, String> {
     let mut raw: OrderedMap<String, HostValue> = match host_obj {
         Some(expr) => parse_host_object(expr)?,
@@ -1440,19 +1381,19 @@ fn build_host_metadata(
     }
     parse_host_bindings(raw)
 }
-
 /// Compile a single standalone `@Component`/`@Directive` class from its TypeScript source.
 ///
 /// On success the returned [`CompiledComponent::code`] is the emitted `ɵɵdefineComponent({...})`
 /// expression. On any unsupported / un-extractable shape, `code` is empty and `errors` carries a
 /// single descriptive message.
 pub fn compile_component_source(ts_source: &str) -> CompiledComponent {
-    ParsingBackend::default().parse_module(ts_source, SourceKind::TypeScriptModule, |module| {
+    let backend = ParsingBackend::default();
+    backend.parse_module(ts_source, SourceKind::TypeScriptModule, |module| {
         if !module.summary().errors.is_empty() {
             return err(format!("parse error: {}", module.summary().errors.join("; ")));
         }
         compile_program_with_source(
-            module.program(),
+            module.summary(),
             Some(ts_source),
             None,
             None,
@@ -1507,12 +1448,13 @@ pub fn compile_component_source_with_options(
     ts_source: &str,
     options: CompileOptions,
 ) -> CompiledComponent {
-    ParsingBackend::default().parse_module(ts_source, SourceKind::TypeScriptModule, |module| {
+    let backend = ParsingBackend::default();
+    backend.parse_module(ts_source, SourceKind::TypeScriptModule, |module| {
         if !module.summary().errors.is_empty() {
             return err(format!("parse error: {}", module.summary().errors.join("; ")));
         }
         compile_program_with_source(
-            module.program(),
+            module.summary(),
             Some(ts_source),
             None,
             None,
@@ -1538,12 +1480,13 @@ pub fn compile_component_source_with_resolved(
     ts_source: &str,
     resolved: &ResolvedContentMap,
 ) -> CompiledComponent {
-    ParsingBackend::default().parse_module(ts_source, SourceKind::TypeScriptModule, |module| {
+    let backend = ParsingBackend::default();
+    backend.parse_module(ts_source, SourceKind::TypeScriptModule, |module| {
         if !module.summary().errors.is_empty() {
             return err(format!("parse error: {}", module.summary().errors.join("; ")));
         }
         compile_program_with_source(
-            module.program(),
+            module.summary(),
             Some(ts_source),
             None,
             Some(resolved),
@@ -1569,12 +1512,13 @@ pub fn compile_component_source_with_options_and_resolved(
     options: CompileOptions,
     resolved: &ResolvedContentMap,
 ) -> CompiledComponent {
-    ParsingBackend::default().parse_module(ts_source, SourceKind::TypeScriptModule, |module| {
+    let backend = ParsingBackend::default();
+    backend.parse_module(ts_source, SourceKind::TypeScriptModule, |module| {
         if !module.summary().errors.is_empty() {
             return err(format!("parse error: {}", module.summary().errors.join("; ")));
         }
         compile_program_with_source(
-            module.program(),
+            module.summary(),
             Some(ts_source),
             None,
             Some(resolved),
@@ -1714,7 +1658,8 @@ fn compile_component_source_full(
     resolved: Option<&ResolvedContentMap>,
     selector_registry: Option<&SelectorRegistry>,
 ) -> CompiledComponentWithMap {
-    ParsingBackend::default().parse_module(ts_source, SourceKind::TypeScriptModule, |module| {
+    let backend = ParsingBackend::default();
+    backend.parse_module(ts_source, SourceKind::TypeScriptModule, |module| {
         if !module.summary().errors.is_empty() {
             let e = err(format!("parse error: {}", module.summary().errors.join("; ")));
             return CompiledComponentWithMap {
@@ -1731,7 +1676,7 @@ fn compile_component_source_full(
         };
         let mut map_out = String::new();
         let compiled = compile_program_with_source(
-            module.program(),
+            module.summary(),
             Some(ts_source),
             Some((&ctx, &mut map_out)),
             resolved,
@@ -1751,8 +1696,8 @@ fn compile_component_source_full(
 }
 
 /// Collect the file's imported identifier names — the auto-import candidate set. Mirrors
-/// `extractImportStrings` in the REPL's `treat-to-ivy.ts`, but over the AST: every default,
-/// namespace and named binding introduced by an `import` declaration.
+/// `extractImportStrings` in the REPL's `treat-to-ivy.ts`, but over the neutral import list: every
+/// default, namespace and named binding introduced by an `import` declaration.
 ///
 /// TYPE-ONLY imports are EXCLUDED. A `import type { … }` declaration, or an inline
 /// `import { type Trend }` specifier, introduces a binding that exists only in TypeScript type
@@ -1761,39 +1706,13 @@ fn compile_component_source_full(
 /// onto a same-named type import (`Trend`) and emit it into the runtime `dependencies` array, which
 /// then fails to resolve at bundle time (the export does not exist as a value). Honouring the `type`
 /// qualifier keeps such an import out of the candidate set entirely.
-fn collect_imported_names(program: &Program) -> Vec<String> {
-    use oxc_ast::ast::ImportOrExportKind;
-    let mut names: Vec<String> = Vec::new();
-    for stmt in &program.body {
-        let Statement::ImportDeclaration(import) = stmt else {
-            continue;
-        };
-        // `import type { … } from …` / `import type Foo from …`: every binding is type-only.
-        if import.import_kind == ImportOrExportKind::Type {
-            continue;
-        }
-        let Some(specifiers) = &import.specifiers else {
-            continue;
-        };
-        for spec in specifiers {
-            match spec {
-                oxc_ast::ast::ImportDeclarationSpecifier::ImportSpecifier(s) => {
-                    // Inline `import { type Bar }`: this single specifier is type-only.
-                    if s.import_kind == ImportOrExportKind::Type {
-                        continue;
-                    }
-                    names.push(s.local.name.to_string());
-                }
-                oxc_ast::ast::ImportDeclarationSpecifier::ImportDefaultSpecifier(s) => {
-                    names.push(s.local.name.to_string());
-                }
-                oxc_ast::ast::ImportDeclarationSpecifier::ImportNamespaceSpecifier(s) => {
-                    names.push(s.local.name.to_string());
-                }
-            }
-        }
-    }
-    names
+fn collect_imported_names(summary: &ParseOutput) -> Vec<String> {
+    summary
+        .imports
+        .iter()
+        .filter(|i| !i.type_only)
+        .map(|i| i.local_name.clone())
+        .collect()
 }
 
 /// Collect every top-level `function f(): ModuleWithProviders<T> {...}` as `f -> T`. A jit-mode
@@ -1803,60 +1722,64 @@ fn collect_imported_names(program: &Program) -> Vec<String> {
 /// declarations are scanned; only functions whose annotated return type is exactly `ModuleWithProviders
 /// <T>` with a single type-reference argument `T` are recorded.
 fn collect_module_with_providers_returns(
-    program: &Program,
+    summary: &ParseOutput,
 ) -> std::collections::HashMap<String, String> {
     let mut out = std::collections::HashMap::new();
-    for stmt in &program.body {
-        let func = match stmt {
-            Statement::FunctionDeclaration(f) => Some(&**f),
-            Statement::ExportNamedDeclaration(e) => match &e.declaration {
-                Some(oxc_ast::ast::Declaration::FunctionDeclaration(f)) => Some(&**f),
-                _ => None,
-            },
-            _ => None,
+    for stmt in &summary.top_level {
+        let NTopStmt::FnDecl {
+            name, return_type, ..
+        } = stmt
+        else {
+            continue;
         };
-        let Some(func) = func else { continue };
-        let Some(id) = &func.id else { continue };
-        let Some(ret) = &func.return_type else { continue };
-        if let Some(module_ty) = module_with_providers_type_arg(&ret.type_annotation) {
-            out.insert(id.name.to_string(), module_ty);
+        let Some(name) = name else { continue };
+        let Some(ret) = return_type else { continue };
+        if let Some(module_ty) = module_with_providers_type_arg(ret) {
+            out.insert(name.clone(), module_ty);
         }
     }
     out
 }
 
 /// The `T` of a `ModuleWithProviders<T>` type annotation where `T` is a bare type reference (the
-/// ngModule type). Returns `None` for any other type shape.
-fn module_with_providers_type_arg(ty: &TSType) -> Option<String> {
-    let TSType::TSTypeReference(tref) = ty else {
-        return None;
-    };
-    let TSTypeName::IdentifierReference(name) = &tref.type_name else {
-        return None;
-    };
-    if name.name != "ModuleWithProviders" {
+/// ngModule type). Returns `None` for any other type shape. The neutral [`NTypeRef`] mirrors a TS
+/// type-reference name path + its (reference-only) type arguments.
+fn module_with_providers_type_arg(ty: &NTypeRef) -> Option<String> {
+    // `ModuleWithProviders` must be the bare reference name (a single-segment name path).
+    if ty.name_path.as_slice() != ["ModuleWithProviders"] {
         return None;
     }
-    let args = tref.type_arguments.as_ref()?;
-    let first = args.params.first()?;
-    let TSType::TSTypeReference(arg_ref) = first else {
-        return None;
-    };
-    match &arg_ref.type_name {
-        TSTypeName::IdentifierReference(arg_name) => Some(arg_name.name.to_string()),
+    let first = ty.type_args.first()?;
+    // `T` must itself be a bare type reference (`module_with_providers_type_arg` matched only a
+    // single-segment `IdentifierReference`).
+    match first.name_path.as_slice() {
+        [name] => Some(name.clone()),
         _ => None,
     }
 }
+/// The byte span of a top-level statement, regardless of which [`NTopStmt`] variant it is. The
+/// emitter / assembler keys the source-order re-stitch on these statement spans.
+fn top_stmt_span(stmt: &NTopStmt) -> TreatySpan {
+    match stmt {
+        NTopStmt::Assignment(a) => a.span,
+        NTopStmt::ExprStmt { span, .. } => *span,
+        NTopStmt::VarDecl { span, .. } => *span,
+        NTopStmt::FnDecl { span, .. } => *span,
+        NTopStmt::Other(span) => *span,
+    }
+}
 
-/// A top-level statement classified for source-order re-assembly.
-enum TopStmt<'a> {
-    /// A class carrying a recognized Angular decorator (the class, its kind, the decorator node).
-    Decorated(&'a Class<'a>, TopLevel, &'a Decorator<'a>),
+/// A decorated class plus its recognized top-level Angular decorator kind + that decorator. The
+/// neutral [`ClassWithDecorators`] carries everything the per-class compile reads.
+struct TopStmt<'a> {
+    class: &'a ClassWithDecorators,
+    kind: TopLevel,
+    dec: &'a DecoratorInfo,
 }
 
 /// Recognize a class's top-level Angular decorator kind (the FIRST recognized one wins, mirroring
 /// ngtsc's single-trait-per-class rule). Returns the kind and the decorator node.
-fn class_top_level<'a>(class: &'a Class<'a>) -> Option<(TopLevel, &'a Decorator<'a>)> {
+fn class_top_level(class: &ClassWithDecorators) -> Option<(TopLevel, &DecoratorInfo)> {
     for dec in &class.decorators {
         if let Some(name) = decorator_name(dec) {
             let kind = match name {
@@ -1875,27 +1798,6 @@ fn class_top_level<'a>(class: &'a Class<'a>) -> Option<(TopLevel, &'a Decorator<
     None
 }
 
-/// The class declaration of a top-level statement (plain, `export`, or `export default`).
-fn statement_class<'a>(stmt: &'a Statement<'a>) -> Option<&'a Class<'a>> {
-    match stmt {
-        Statement::ClassDeclaration(c) => Some(c.as_ref()),
-        Statement::ExportNamedDeclaration(export) => match &export.declaration {
-            Some(oxc_ast::ast::Declaration::ClassDeclaration(c)) => Some(c.as_ref()),
-            _ => None,
-        },
-        Statement::ExportDefaultDeclaration(export) => {
-            if let oxc_ast::ast::ExportDefaultDeclarationKind::ClassDeclaration(c) =
-                &export.declaration
-            {
-                Some(c.as_ref())
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
-}
-
 /// The Ivy emit of ONE decorated class, decomposed so the original module can be re-assembled
 /// around it. This is the `decorators` layer's [`CompiledDef`] — every [`DecoratorCompiler`]
 /// plugin produces one, and [`class_static_statements`] lowers it into the appended statics. The
@@ -1908,7 +1810,7 @@ use crate::decorators::registry::CompiledDef as ClassEmit;
 /// `@Attribute` qualifiers) so the emitted `ɵfac` injects each dependency. A class with no
 /// constructor (or a parameterless one) yields the empty-deps form Angular generates for a
 /// parameterless constructor: `function X_Factory(t) { return new (t || X)(); }`.
-fn class_factory(class: &Class, class_name: &str, target: FactoryTarget) -> R3FactoryMetadata {
+fn class_factory(class: &ClassWithDecorators, class_name: &str, target: FactoryTarget) -> R3FactoryMetadata {
     R3FactoryMetadata::Constructor(R3ConstructorFactoryMetadata {
         name: class_name.to_string(),
         ty: directive_ref(class_name),
@@ -1928,51 +1830,39 @@ fn class_factory(class: &Class, class_name: &str, target: FactoryTarget) -> R3Fa
 ///     the dep token `None`, which the factory codegen lowers to `ɵɵinvalidFactoryDep(index)`.
 ///
 /// Constructor overloads (TS allows several signatures, only the IMPLEMENTATION having a body) are
-/// each kept as a distinct `MethodDefinition` by oxc. ngtsc's `getConstructorDependencies` reads the
-/// IMPLEMENTATION signature (the one with a `body`), whose parameter list is authoritative — the
-/// bodiless overload signatures may declare FEWER (or different) params. We therefore prefer the
-/// body-bearing constructor; only when none exists (ambient/declaration-only classes) do we fall
-/// back to the first constructor that declares parameters.
-fn extract_ctor_deps(class: &Class) -> FactoryDeps {
+/// each kept as a distinct `MemberKind::Constructor` member by the parse backend. ngtsc's
+/// `getConstructorDependencies` reads the IMPLEMENTATION signature (the one with a `body`), whose
+/// parameter list is authoritative — the bodiless overload signatures may declare FEWER (or
+/// different) params. We therefore prefer the body-bearing constructor (`MemberInfo::has_body`); only
+/// when none exists (ambient/declaration-only classes) do we fall back to the first constructor that
+/// declares parameters.
+fn extract_ctor_deps(class: &ClassWithDecorators) -> FactoryDeps {
     let constructors = || {
-        class.body.body.iter().filter_map(|element| match element {
-            ClassElement::MethodDefinition(m)
-                if m.kind == MethodDefinitionKind::Constructor =>
-            {
-                Some(m)
-            }
-            _ => None,
-        })
+        class
+            .members
+            .iter()
+            .filter(|m| m.kind == MemberKind::Constructor)
     };
     // Implementation signature first (the one that actually has a body); fall back to the first
     // constructor declaring parameters when there is no implementation (declaration-only classes).
     let ctor = constructors()
-        .find(|m| m.value.body.is_some())
-        .or_else(|| constructors().find(|m| !m.value.params.items.is_empty()));
+        .find(|m| m.has_body)
+        .or_else(|| constructors().find(|m| !m.params.is_empty()));
 
     let Some(ctor) = ctor else {
         return FactoryDeps::Deps(Vec::new());
     };
 
-    let deps = ctor
-        .value
-        .params
-        .items
-        .iter()
-        .map(extract_ctor_dep)
-        .collect();
+    let deps = ctor.params.iter().map(extract_ctor_dep).collect();
     FactoryDeps::Deps(deps)
 }
 
 /// Resolve a single constructor parameter into its [`R3DependencyMetadata`].
-fn extract_ctor_dep(param: &oxc_ast::ast::FormalParameter) -> R3DependencyMetadata {
+fn extract_ctor_dep(param: &NCtorParam) -> R3DependencyMetadata {
     let mut dep = R3DependencyMetadata::default();
 
     // The default token is the parameter's declared type (a type-reference identifier).
-    dep.token = param
-        .type_annotation
-        .as_ref()
-        .and_then(|ann| type_token_expr(&ann.type_annotation));
+    dep.token = param.type_ref.as_ref().and_then(type_token_expr);
 
     // Param decorators refine the dependency: `@Inject(TOKEN)` overrides the token, `@Attribute`
     // switches to attribute injection, and `@Optional`/`@Self`/`@SkipSelf`/`@Host` set qualifiers.
@@ -2004,36 +1894,28 @@ fn extract_ctor_dep(param: &oxc_ast::ast::FormalParameter) -> R3DependencyMetada
 
 /// The injection-token expression for a constructor parameter's declared type. A bare type
 /// reference `Foo` (or qualified `ns.Foo`) becomes a value read of that name (the imported symbol
-/// Angular injects). Non-reference types (primitives, unions, `any`, …) carry no usable token.
-fn type_token_expr(ty: &TSType) -> Option<Expr> {
-    let TSType::TSTypeReference(reference) = ty else {
-        return None;
-    };
-    type_name_expr(&reference.type_name)
+/// Angular injects). Non-reference types (primitives, unions, `any`, …) carry no usable token — the
+/// neutral [`NCtorParam::type_ref`] is already `None` for those, so this only receives references.
+fn type_token_expr(ty: &NTypeRef) -> Option<Expr> {
+    type_name_expr(&ty.name_path)
 }
 
-/// Lower a `TSTypeName` (`Foo` / `ns.Foo` / `a.b.C`) to its value-read expression. `this` types
-/// carry no injectable token.
-fn type_name_expr(name: &TSTypeName) -> Option<Expr> {
-    match name {
-        TSTypeName::IdentifierReference(id) => Some(o::variable(id.name.to_string(), None)),
-        TSTypeName::QualifiedName(q) => {
-            let object = type_name_expr(&q.left)?;
-            Some(object.prop(q.right.name.as_str()))
-        }
-        TSTypeName::ThisExpression(_) => None,
+/// Lower a type NAME path (`Foo` / `ns.Foo` / `a.b.C`) to its value-read expression. An EMPTY path
+/// (`this`-type, which carries no injectable token) yields `None`.
+fn type_name_expr(name_path: &[String]) -> Option<Expr> {
+    let (first, rest) = name_path.split_first()?;
+    let mut expr = o::variable(first.clone(), None);
+    for segment in rest {
+        expr = expr.prop(segment.as_str());
     }
+    Some(expr)
 }
 
 /// The first call-argument of a param decorator `@Foo(arg)` lowered to an [`Expr`]
 /// (`@Inject(TOKEN)` / `@Attribute('name')`). Returns `None` for a bare decorator or an
 /// unconvertible argument.
-fn decorator_first_arg_expr(dec: &Decorator) -> Option<Expr> {
-    let Expression::CallExpression(call) = &dec.expression else {
-        return None;
-    };
-    let arg = call.arguments.first()?.as_expression()?;
-    convert_expr(arg)
+fn decorator_first_arg_expr(dec: &DecoratorInfo) -> Option<Expr> {
+    convert_expr(dec.arguments.first()?.expr())
 }
 
 /// Lower a [`ClassEmit`] into the `output_ast` statements appended AFTER its kept class declaration:
@@ -2095,22 +1977,34 @@ fn class_static_statements(emit: ClassEmit) -> Vec<o::Stmt> {
 ///     `export`/`class X { … }` declaration with ONLY the recognized Angular decorator removed, and
 ///     its `ɵfac`/`ɵcmp`/… statics follow it; every other statement is copied through verbatim.
 ///
-/// `source` is the original authoring TypeScript. `class_emits` maps a class's source start offset
-/// (the decorator's start) to its compiled [`ClassEmit`]. The decorator span is excised from the
-/// kept declaration so the emitted class is plain TS the bundler accepts.
+/// `source` is the original authoring TypeScript. `class_emits` maps a class's source statement start
+/// offset to its compiled [`ClassEmit`] + the recognized-decorator strip span. The decorator span is
+/// excised from the kept declaration so the emitted class is plain TS the bundler accepts.
 fn assemble_module(
     source: &str,
-    program: &Program,
+    summary: &ParseOutput,
     mut class_emits: std::collections::HashMap<usize, (ClassEmit, u32, u32)>,
     emit_partial_component: bool,
 ) -> String {
+    // Map a top-level statement start offset → the decorated class declared there (its `stmt_span`),
+    // so the assembler can recover the class for member-decorator stripping + partial metadata.
+    let class_by_stmt: std::collections::HashMap<usize, &ClassWithDecorators> = summary
+        .classes
+        .iter()
+        .map(|c| (c.stmt_span.start as usize, c))
+        .collect();
+
     // Locate the byte position after the last original import declaration, so the synthetic
     // `import * as i0` line sits with the other imports (ngtsc groups it there). When there are no
-    // imports it goes to the very top.
+    // imports it goes to the very top. The neutral imports surface carries no statement span, so the
+    // last import's END is recovered from the top-level `Other` statement whose span text begins with
+    // `import` — the same source-order scan, on the neutral statement list.
     let mut import_insert_at: usize = 0;
-    for stmt in &program.body {
-        if let Statement::ImportDeclaration(import) = stmt {
-            import_insert_at = import.span().end as usize;
+    for stmt in &summary.top_level {
+        if let NTopStmt::Other(span) = stmt {
+            if is_import_declaration_text(&source[span.start as usize..span.end as usize]) {
+                import_insert_at = span.end as usize;
+            }
         }
     }
 
@@ -2118,18 +2012,18 @@ fn assemble_module(
     let mut cursor: usize = 0;
     let i0_line = "import * as i0 from \"@angular/core\";\n";
 
-    for stmt in &program.body {
-        let span = stmt.span();
+    for stmt in &summary.top_level {
+        let span = top_stmt_span(stmt);
         let stmt_start = span.start as usize;
         let stmt_end = span.end as usize;
 
         let decorated = class_emits.remove(&stmt_start);
 
         // The first byte of THIS statement's source. For a decorated class the recognized Angular
-        // decorator sits BEFORE the class statement span (oxc does not include leading decorators in
-        // the class/statement span), so the content begins at the decorator; otherwise at the
-        // statement start. Flush the inter-statement source (leading whitespace/comments) up to that
-        // point verbatim.
+        // decorator sits BEFORE the class statement span (the parse backend does not include leading
+        // decorators in the class/statement span), so the content begins at the decorator; otherwise
+        // at the statement start. Flush the inter-statement source (leading whitespace/comments) up to
+        // that point verbatim.
         let content_start = match &decorated {
             Some((_, dec_start, _)) => (*dec_start as usize).min(stmt_start),
             None => stmt_start,
@@ -2152,8 +2046,9 @@ fn assemble_module(
             // decorators (`@Input`/`@Output`/`@HostBinding`/`@HostListener`/`@ViewChild`/…) excised —
             // they are already encoded into the Ivy statics below, are redundant on the lowered class,
             // and trip `builtin:swc-loader` (`decorators: false`).
-            let member_strips = statement_class(stmt)
-                .map(member_decorator_strip_spans)
+            let member_strips = class_by_stmt
+                .get(&stmt_start)
+                .map(|class| member_decorator_strip_spans(class))
                 .unwrap_or_default();
             push_slice_excising_spans(&mut out, source, dec_end..stmt_end, &member_strips);
             // Statics: emitted via the shared lowering, then spliced in WITHOUT the leading
@@ -2167,14 +2062,14 @@ fn assemble_module(
             out.push_str(block.trim_end_matches('\n'));
             out.push('\n');
             // PARTIAL mode: emit the dev-only `i0.ɵɵngDeclareClassMetadata({…})` companion statement
-            // AFTER the class statics (matching ng-packagr). Built from the ORIGINAL class AST +
-            // source so the decorator args / ctor-param decorators are carried verbatim. The Full emit
-            // path never reaches this (`emit_partial_component` is `false`), so it is byte-unchanged.
+            // AFTER the class statics (matching ng-packagr). Built from the ORIGINAL class + source so
+            // the decorator args / ctor-param decorators are carried verbatim. The Full emit path never
+            // reaches this (`emit_partial_component` is `false`), so it is byte-unchanged.
             if emit_partial_component {
-                if let Some(class) = statement_class(stmt) {
-                    if let Some(name) = class.id.as_ref().map(|id| id.name.to_string()) {
+                if let Some(class) = class_by_stmt.get(&stmt_start) {
+                    if let Some(name) = class.name.as_deref() {
                         if let Some(meta) =
-                            crate::partial_class_metadata::emit_class_metadata(class, &name, source)
+                            crate::partial_class_metadata::emit_class_metadata(class, name, source)
                         {
                             out.push_str(&meta);
                             out.push('\n');
@@ -2213,6 +2108,26 @@ fn assemble_module(
     out
 }
 
+/// Whether a top-level statement's source text is an `import` DECLARATION (`import …`, incl.
+/// `import type …`) — the neutral analogue of matching an oxc `Statement::ImportDeclaration`. A
+/// statement span starts at its first token (no leading trivia), so an import declaration's text
+/// begins with the `import` keyword followed by a non-identifier byte (whitespace / `*` / `{` / quote).
+/// This excludes an `import(...)` dynamic-import expression statement (which surfaces as
+/// `NTopStmt::ExprStmt`, not `Other`) and any identifier beginning with `import…`.
+fn is_import_declaration_text(text: &str) -> bool {
+    let Some(rest) = text.strip_prefix("import") else {
+        return false;
+    };
+    match rest.chars().next() {
+        // `import foo`, `import * …`, `import {…}`, `import "…"`, `import type …` — the next byte is
+        // never an identifier-continuation char for a declaration (a dynamic `import(` is an
+        // expression statement, never `Other`).
+        Some(c) => !(c.is_ascii_alphanumeric() || c == '_' || c == '$'),
+        // A bare `import` with nothing after is not a valid declaration.
+        None => false,
+    }
+}
+
 /// Strip the single leading `import * as i0 from "@angular/core";` line `emit_statements` prepends,
 /// leaving just the statement bodies (the module-scope import is emitted once by [`assemble_module`]).
 fn strip_i0_import_line(block: &str) -> String {
@@ -2224,14 +2139,18 @@ fn strip_i0_import_line(block: &str) -> String {
     }
     block.to_string()
 }
-
 /// The module-aware compile. When `source` is `Some`, the emitted `code` is the COMPLETE original
 /// ES module augmented with the Ivy statics (the production path, fixing the missing-export bug);
 /// when `None`, the legacy bare-definition emit is produced (used only where the original source
 /// text is unavailable, e.g. internal callers that pre-parsed without retaining the text).
+///
+/// Drives the metadata WALK over the engine-neutral [`ParseOutput`] (every class / decorator /
+/// object-literal / expression read structurally, no live AST). The byte-exact strip / emit RANGES
+/// are the neutral [`TreatySpan`]s; the original `source` is reconstructed against those absolute
+/// offsets (the oxc backend's [`ParseBackend::span_text`] contract — spans are absolute byte ranges).
 #[allow(clippy::too_many_arguments)]
 fn compile_program_with_source(
-    program: &Program,
+    summary: &ParseOutput,
     source: Option<&str>,
     map: Option<(&MapContext, &mut String)>,
     resolved: Option<&ResolvedContentMap>,
@@ -2242,19 +2161,18 @@ fn compile_program_with_source(
     selector_registry: Option<&SelectorRegistry>,
     emit_partial_component: bool,
 ) -> CompiledComponent {
-    let imported_names = collect_imported_names(program);
+    let imported_names = collect_imported_names(summary);
 
-    // Walk every top-level statement, classifying each decorated class in SOURCE ORDER. R1:
-    // collect EVERY decorated class (not just the first) so multi-class files emit each definition.
+    // Walk every decorated class in SOURCE ORDER. R1: collect EVERY decorated class (not just the
+    // first) so multi-class files emit each definition.
     let mut decorated: Vec<TopStmt> = Vec::new();
     let mut sibling_class_names: Vec<String> = Vec::new();
-    for stmt in &program.body {
-        let Some(class) = statement_class(stmt) else { continue };
+    for class in &summary.classes {
         if let Some((kind, dec)) = class_top_level(class) {
-            if let Some(id) = &class.id {
-                sibling_class_names.push(id.name.to_string());
+            if let Some(name) = &class.name {
+                sibling_class_names.push(name.clone());
             }
-            decorated.push(TopStmt::Decorated(class, kind, dec));
+            decorated.push(TopStmt { class, kind, dec });
         }
     }
 
@@ -2295,11 +2213,12 @@ fn compile_program_with_source(
     // `dependencies` array references a class declared LATER in this file (a forward reference) must
     // wrap the array in a `() => [...]` closure (Angular `DeclarationListEmitMode.Closure`,
     // `isExpressionForwardReference`: `context.pos < node.pos`). The per-class compile compares each
-    // dependency's offset against the component's own to decide.
+    // dependency's offset against the component's own to decide. The forward-reference anchor is the
+    // CLASS node's own span start (`ClassWithDecorators::span`).
     let class_decl_positions: std::collections::HashMap<String, u32> = decorated
         .iter()
-        .filter_map(|TopStmt::Decorated(class, _, _)| {
-            class.id.as_ref().map(|id| (id.name.to_string(), class.span().start))
+        .filter_map(|item| {
+            item.class.name.as_ref().map(|name| (name.clone(), item.class.span.start))
         })
         .collect();
 
@@ -2307,21 +2226,21 @@ fn compile_program_with_source(
     // whose `imports` references such a factory CALL (`provideModule()`) resolves the import to that
     // ngModule type (`ForwardModule`) on the inline def, matching Angular's partial compiler. Empty when
     // the file declares no such function; only `@NgModule` jit-mode compilation consults it.
-    let module_with_providers = collect_module_with_providers_returns(program);
+    let module_with_providers = collect_module_with_providers_returns(summary);
 
     // Compile EVERY decorated class to a structured [`ClassEmit`]. The def block render3 produces is
     // unchanged; we only decompose it (def expression + pool/side-effect statements + factory) so the
-    // ORIGINAL module can be re-assembled around the kept class declarations.
+    // ORIGINAL module can be re-assembled around the kept class declarations. Keyed by the enclosing
+    // top-level statement start (`ClassWithDecorators::stmt_span`).
     let mut emits: std::collections::HashMap<usize, (ClassEmit, u32, u32)> =
         std::collections::HashMap::new();
     let mut errors: Vec<String> = Vec::new();
     let mut produced = 0usize;
     for item in &decorated {
-        let TopStmt::Decorated(class, kind, dec) = *item;
         match compile_decorated_class(
-            class,
-            kind,
-            dec,
+            item.class,
+            item.kind,
+            item.dec,
             &auto_import_candidates,
             &sibling_directives,
             resolved,
@@ -2335,13 +2254,13 @@ fn compile_program_with_source(
         ) {
             Ok(emit) => {
                 errors.extend(emit.errors.clone());
-                let stmt_start = decorated_stmt_start(program, class);
+                let stmt_start = item.class.stmt_span.start as usize;
                 // Excise EVERY recognized Angular decorator from the kept class declaration — not
                 // only the primary one. A class with both `@Pipe` and `@Injectable` carries two
                 // recognized decorators; ngtsc strips them all. Span the strip from the first to the
                 // last recognized Angular decorator (they are contiguous on a class), so the kept
                 // `export class X { … }` is plain TS the bundler accepts.
-                let (strip_start, strip_end) = recognized_decorator_strip_span(class, dec);
+                let (strip_start, strip_end) = recognized_decorator_strip_span(item.class, item.dec);
                 emits.insert(stmt_start, (emit, strip_start, strip_end));
                 produced += 1;
             }
@@ -2388,7 +2307,7 @@ fn compile_program_with_source(
         None
     };
 
-    let code = assemble_module(source, program, emits, emit_partial_component);
+    let code = assemble_module(source, summary, emits, emit_partial_component);
 
     if let Some((ctx, map_out)) = map {
         if let Some((def_expr, member)) = single_def {
@@ -2422,42 +2341,26 @@ fn define_marker_for(member: &str) -> &'static str {
     }
 }
 
-/// The byte start of the top-level statement that declares `class` (its decorator, or the
-/// `export`/`class` keyword when no decorator leads). Used as the assembly key. Falls back to the
-/// class node's own span when the declaring statement cannot be located (never expected).
-fn decorated_stmt_start(program: &Program, class: &Class) -> usize {
-    let class_span = class.span();
-    for stmt in &program.body {
-        if let Some(c) = statement_class(stmt) {
-            if c.span() == class_span {
-                return stmt.span().start as usize;
-            }
-        }
-    }
-    class_span.start as usize
-}
-
 /// Collect the `(name, selector, is_component)` of every sibling `@Directive`/`@Component` class
 /// that carries a non-empty `selector`, for cross-class CSS-selector directive matching. A
 /// directive/component without a selector (selectorless / class-name-only) is excluded — it is
 /// resolved through the selectorless candidate set instead.
 fn collect_sibling_directives(decorated: &[TopStmt]) -> Vec<crate::binder::SelectorDirective> {
     let mut out = Vec::new();
-    for TopStmt::Decorated(class, kind, dec) in decorated {
-        let is_component = match kind {
+    for item in decorated {
+        let is_component = match item.kind {
             TopLevel::Component => true,
             TopLevel::Directive => false,
             _ => continue,
         };
-        let Some(id) = &class.id else { continue };
-        let name = id.name.to_string();
-        let selector = decorator_object(dec)
+        let Some(name) = &item.class.name else { continue };
+        let selector = decorator_object(item.dec)
             .and_then(|o| find_prop(o, "selector"))
             .and_then(string_value);
         if let Some(selector) = selector {
             if !selector.trim().is_empty() {
                 out.push(crate::binder::SelectorDirective::new(
-                    name,
+                    name.clone(),
                     selector,
                     is_component,
                 ));
@@ -2527,41 +2430,29 @@ impl From<TopLevel> for AngularDecoratorKind {
         }
     }
 }
-
 // ---------------------------------------------------------------------------
 // Decorator-compiler plugins. Each kind the source front-end emits a definition
 // for is a `DecoratorCompiler` registered in [`decorator_registry`]; the per-class
 // driver dispatches through the registry so adding a kind is a registration, not a
-// `match` arm. Every plugin delegates to the SAME extraction/emit helper the old
-// `match` called, so the emitted definition is byte-identical.
+// `match` arm. Every plugin reads the engine-NEUTRAL `ClassMeta` (`ClassWithDecorators` /
+// `DecoratorInfo` / `ObjLit`), so NO live oxc AST node is named — the emitted definition is
+// byte-identical to the prior live-AST walk (the neutral IR mirrors the AST structurally).
 // ---------------------------------------------------------------------------
-
-/// The facade's LIVE-oxc handle, carried opaquely through the engine-neutral
-/// [`ClassMeta::live`]. The decorators crate never inspects it; the facade plugins downstream still
-/// run the byte-identical metadata walk against these live nodes during the wide-port transition
-/// (SWC-BACKEND-PLAN.md §3.2 phase 3). `ClassMeta`'s own `class`/`decorator`/`object` fields are the
-/// engine-NEUTRAL pre-lowering of these same nodes, so the public decorator API names no oxc type.
-struct OxcLive<'a> {
-    /// The live class declaration the plugin's metadata walk reads (ctor deps, members, host).
-    class: &'a Class<'a>,
-    /// The live decorator options object (`@Foo({...})` → `Some`; bare `@Foo` → `None`).
-    object: Option<&'a oxc_ast::ast::ObjectExpression<'a>>,
-}
 
 /// `@Component` → `ɵɵdefineComponent`. Extracts the component metadata (selector, inline template,
 /// inputs/outputs, queries, host bindings, `hostDirectives`, providers/viewProviders, styles,
 /// encapsulation, animations, foreignImports) and drives [`compile_component_from_metadata`] via
-/// [`compile_component_or_directive`].
+/// [`compile_component_or_directive`]. Reads the engine-neutral [`ClassMeta`] (no live oxc handle).
 struct ComponentCompiler;
-impl DecoratorCompiler<OxcLive<'_>> for ComponentCompiler {
+impl DecoratorCompiler for ComponentCompiler {
     fn kind(&self) -> AngularDecoratorKind {
         AngularDecoratorKind::Component
     }
-    fn compile(&self, c: &ClassMeta<OxcLive>, ctx: &CompileCtx) -> Result<ClassEmit, String> {
+    fn compile(&self, c: &ClassMeta, ctx: &CompileCtx) -> Result<ClassEmit, String> {
         compile_component_or_directive(
-            c.live.class,
+            c.class,
             TopLevel::Component,
-            c.live.object,
+            c.object,
             c.class_name.clone(),
             c.class_name_span.clone(),
             ctx.auto_import_candidates,
@@ -2581,15 +2472,15 @@ impl DecoratorCompiler<OxcLive<'_>> for ComponentCompiler {
 /// extraction with the component path but emits via [`compile_directive_from_metadata`] (no
 /// template; view-only metadata such as `viewProviders` is ignored, as Angular does on a directive).
 struct DirectiveCompiler;
-impl DecoratorCompiler<OxcLive<'_>> for DirectiveCompiler {
+impl DecoratorCompiler for DirectiveCompiler {
     fn kind(&self) -> AngularDecoratorKind {
         AngularDecoratorKind::Directive
     }
-    fn compile(&self, c: &ClassMeta<OxcLive>, ctx: &CompileCtx) -> Result<ClassEmit, String> {
+    fn compile(&self, c: &ClassMeta, ctx: &CompileCtx) -> Result<ClassEmit, String> {
         compile_component_or_directive(
-            c.live.class,
+            c.class,
             TopLevel::Directive,
-            c.live.object,
+            c.object,
             c.class_name.clone(),
             c.class_name_span.clone(),
             ctx.auto_import_candidates,
@@ -2607,26 +2498,26 @@ impl DecoratorCompiler<OxcLive<'_>> for DirectiveCompiler {
 
 /// `@Pipe` → `ɵɵdefinePipe`. Delegates to [`compile_pipe_class`].
 struct PipeCompiler;
-impl DecoratorCompiler<OxcLive<'_>> for PipeCompiler {
+impl DecoratorCompiler for PipeCompiler {
     fn kind(&self) -> AngularDecoratorKind {
         AngularDecoratorKind::Pipe
     }
-    fn compile(&self, c: &ClassMeta<OxcLive>, _ctx: &CompileCtx) -> Result<ClassEmit, String> {
-        compile_pipe_class(c.live.class, c.live.object, &c.class_name)
+    fn compile(&self, c: &ClassMeta, _ctx: &CompileCtx) -> Result<ClassEmit, String> {
+        compile_pipe_class(c.class, c.object, &c.class_name)
     }
 }
 
 /// `@NgModule` → `ɵɵdefineNgModule` (+ `ɵɵsetNgModuleScope` / `ɵɵregisterNgModuleType` side
 /// effects). Delegates to [`compile_ng_module_class`].
 struct NgModuleCompiler;
-impl DecoratorCompiler<OxcLive<'_>> for NgModuleCompiler {
+impl DecoratorCompiler for NgModuleCompiler {
     fn kind(&self) -> AngularDecoratorKind {
         AngularDecoratorKind::NgModule
     }
-    fn compile(&self, c: &ClassMeta<OxcLive>, ctx: &CompileCtx) -> Result<ClassEmit, String> {
+    fn compile(&self, c: &ClassMeta, ctx: &CompileCtx) -> Result<ClassEmit, String> {
         compile_ng_module_class(
-            c.live.class,
-            c.live.object,
+            c.class,
+            c.object,
             &c.class_name,
             ctx.jit_mode,
             ctx.class_decl_positions,
@@ -2640,12 +2531,12 @@ impl DecoratorCompiler<OxcLive<'_>> for NgModuleCompiler {
 /// and drives [`compile_injectable`] for the provider definition; the matching `ɵfac` carries the
 /// class's resolved constructor dependencies (target `Injectable` → `ɵɵinject`).
 struct InjectableCompiler;
-impl DecoratorCompiler<OxcLive<'_>> for InjectableCompiler {
+impl DecoratorCompiler for InjectableCompiler {
     fn kind(&self) -> AngularDecoratorKind {
         AngularDecoratorKind::Injectable
     }
-    fn compile(&self, c: &ClassMeta<OxcLive>, _ctx: &CompileCtx) -> Result<ClassEmit, String> {
-        compile_injectable_class(c.live.class, c.live.object, &c.class_name)
+    fn compile(&self, c: &ClassMeta, _ctx: &CompileCtx) -> Result<ClassEmit, String> {
+        compile_injectable_class(c.class, c.object, &c.class_name)
     }
 }
 
@@ -2658,8 +2549,8 @@ impl DecoratorCompiler<OxcLive<'_>> for InjectableCompiler {
 /// `{token, qualifiers}` entries faithful to ngtsc's `getInjectableMetadata`. The `ɵfac` injects the
 /// CONSTRUCTOR dependencies (independent of the provider `use*` choice).
 fn compile_injectable_class(
-    class: &Class,
-    obj: Option<&oxc_ast::ast::ObjectExpression>,
+    class: &ClassWithDecorators,
+    obj: Option<&ObjLit>,
     class_name: &str,
 ) -> Result<ClassEmit, String> {
     // `providedIn` — a `null`-literal value means "not provided" (guards the key's emission).
@@ -2717,7 +2608,7 @@ fn compile_injectable_class(
 /// Read a `useClass`/`useExisting`/`useValue` option into a [`MaybeForwardRef`] (the value plus
 /// whether it was a `forwardRef(() => …)`). Absent → `None`; unconvertible → `Err`.
 fn injectable_use_option(
-    obj: Option<&oxc_ast::ast::ObjectExpression>,
+    obj: Option<&ObjLit>,
     key: &str,
 ) -> Result<Option<MaybeForwardRef>, String> {
     match obj.and_then(|o| find_prop(o, key)) {
@@ -2732,7 +2623,7 @@ fn injectable_use_option(
 /// [`MaybeForwardRef`]. A `forwardRef(() => X)` is recognised and carried as `Wrapped` (re-emitted
 /// verbatim); any other convertible expression is `None`-wrapped. Returns `None` when the expression
 /// cannot be converted.
-fn injectable_maybe_forward_ref(expr: &Expression) -> Option<MaybeForwardRef> {
+fn injectable_maybe_forward_ref(expr: &NExpr) -> Option<MaybeForwardRef> {
     if is_forward_ref_call(expr) {
         return convert_expr(expr).map(|expression| MaybeForwardRef {
             expression,
@@ -2743,11 +2634,11 @@ fn injectable_maybe_forward_ref(expr: &Expression) -> Option<MaybeForwardRef> {
 }
 
 /// Whether `expr` is a `forwardRef(() => …)` call.
-fn is_forward_ref_call(expr: &Expression) -> bool {
+fn is_forward_ref_call(expr: &NExpr) -> bool {
     match expr {
-        Expression::ParenthesizedExpression(p) => is_forward_ref_call(&p.expression),
-        Expression::CallExpression(call) => {
-            matches!(&call.callee, Expression::Identifier(id) if id.name == "forwardRef")
+        NExpr::Parenthesized(inner) => is_forward_ref_call(inner),
+        NExpr::Call { callee, .. } => {
+            matches!(callee.as_ref(), NExpr::Identifier(id) if id == "forwardRef")
         }
         _ => false,
     }
@@ -2762,17 +2653,19 @@ fn is_forward_ref_call(expr: &Expression) -> bool {
 /// — see component `handler.ts` `standaloneImportMayBeForwardDeclared`. We model the common, exact
 /// case: an `imports:` entry that is a literal `forwardRef(() => …)` call (incl. a flattened nested
 /// array of imports). A non-array `imports` value, or one with no forwardRef entry, returns `false`.
-fn imports_has_forward_ref(obj: Option<&oxc_ast::ast::ObjectExpression>) -> bool {
+fn imports_has_forward_ref(obj: Option<&ObjLit>) -> bool {
     let Some(expr) = obj.and_then(|o| find_prop(o, "imports")) else {
         return false;
     };
-    fn scan(expr: &Expression) -> bool {
+    fn scan(expr: &NExpr) -> bool {
         match expr {
-            Expression::ParenthesizedExpression(p) => scan(&p.expression),
-            Expression::ArrayExpression(arr) => arr
-                .elements
+            NExpr::Parenthesized(inner) => scan(inner),
+            NExpr::Array(elements) => elements
                 .iter()
-                .filter_map(|el| el.as_expression())
+                .filter_map(|el| match el {
+                    crate::parse::NArrayElement::Expr(inner) => Some(inner),
+                    _ => None,
+                })
                 .any(scan),
             other => is_forward_ref_call(other),
         }
@@ -2784,13 +2677,13 @@ fn imports_has_forward_ref(obj: Option<&oxc_ast::ast::ObjectExpression>) -> bool
 /// a bare token (`Dep`) or a `[token, new Optional(), new SkipSelf(), …]` array whose trailing
 /// entries are `new Optional()`/`new Self()`/`new SkipSelf()`/`new Host()` qualifier markers, or a
 /// `new Attribute('name')` token. Faithful to ngtsc's `getDeps`/`getDep`.
-fn parse_injectable_deps(expr: &Expression) -> Result<Vec<R3DependencyMetadata>, String> {
-    let Expression::ArrayExpression(arr) = expr else {
+fn parse_injectable_deps(expr: &NExpr) -> Result<Vec<R3DependencyMetadata>, String> {
+    let NExpr::Array(elements) = expr else {
         return Err("`deps` must be an array literal".to_string());
     };
     let mut out = Vec::new();
-    for el in &arr.elements {
-        let Some(inner) = el.as_expression() else {
+    for el in elements {
+        let crate::parse::NArrayElement::Expr(inner) = el else {
             continue;
         };
         out.push(parse_injectable_dep(inner)?);
@@ -2799,13 +2692,13 @@ fn parse_injectable_deps(expr: &Expression) -> Result<Vec<R3DependencyMetadata>,
 }
 
 /// Parse a single `@Injectable` `deps` entry into [`R3DependencyMetadata`].
-fn parse_injectable_dep(expr: &Expression) -> Result<R3DependencyMetadata, String> {
+fn parse_injectable_dep(expr: &NExpr) -> Result<R3DependencyMetadata, String> {
     // `[token, ...qualifier-markers]`.
-    if let Expression::ArrayExpression(arr) = expr {
+    if let NExpr::Array(elements) = expr {
         let mut dep = R3DependencyMetadata::default();
         let mut first = true;
-        for el in &arr.elements {
-            let Some(inner) = el.as_expression() else {
+        for el in elements {
+            let crate::parse::NArrayElement::Expr(inner) = el else {
                 continue;
             };
             if first {
@@ -2823,13 +2716,12 @@ fn parse_injectable_dep(expr: &Expression) -> Result<R3DependencyMetadata, Strin
 
 /// The token for an `@Injectable` `deps` entry: `new Attribute('name')` → attribute injection;
 /// otherwise the convertible token expression.
-fn injectable_dep_token(expr: &Expression) -> Result<R3DependencyMetadata, String> {
-    if let Expression::NewExpression(new_expr) = expr {
-        if new_expr_callee_is(new_expr, "Attribute") {
-            let name = new_expr
-                .arguments
+fn injectable_dep_token(expr: &NExpr) -> Result<R3DependencyMetadata, String> {
+    if let NExpr::New { callee, args } = expr {
+        if new_callee_is(callee, "Attribute") {
+            let name = args
                 .first()
-                .and_then(|a| a.as_expression())
+                .map(NArg::expr)
                 .and_then(convert_expr);
             return Ok(R3DependencyMetadata {
                 token: name.clone(),
@@ -2848,34 +2740,32 @@ fn injectable_dep_token(expr: &Expression) -> Result<R3DependencyMetadata, Strin
 
 /// Apply a trailing `@Injectable` `deps` qualifier marker (`new Optional()`/`new Self()`/
 /// `new SkipSelf()`/`new Host()`) to the dependency.
-fn apply_injectable_dep_marker(expr: &Expression, dep: &mut R3DependencyMetadata) {
-    let Expression::NewExpression(new_expr) = expr else {
+fn apply_injectable_dep_marker(expr: &NExpr, dep: &mut R3DependencyMetadata) {
+    let NExpr::New { callee, .. } = expr else {
         return;
     };
-    if new_expr_callee_is(new_expr, "Optional") {
+    if new_callee_is(callee, "Optional") {
         dep.optional = true;
-    } else if new_expr_callee_is(new_expr, "Self") {
+    } else if new_callee_is(callee, "Self") {
         dep.self_ = true;
-    } else if new_expr_callee_is(new_expr, "SkipSelf") {
+    } else if new_callee_is(callee, "SkipSelf") {
         dep.skip_self = true;
-    } else if new_expr_callee_is(new_expr, "Host") {
+    } else if new_callee_is(callee, "Host") {
         dep.host = true;
     }
 }
 
 /// Whether a `new X(...)` expression's callee is the bare identifier `name`.
-fn new_expr_callee_is(new_expr: &oxc_ast::ast::NewExpression, name: &str) -> bool {
-    matches!(&new_expr.callee, Expression::Identifier(id) if id.name == name)
+fn new_callee_is(callee: &NExpr, name: &str) -> bool {
+    matches!(callee, NExpr::Identifier(id) if id == name)
 }
 
 /// The default decorator-compiler registry: one plugin per recognized kind. Adding support for a
 /// new decorator kind is a `register` here (mirroring `apps/rust/authoring::AuthoringRegistry`).
 ///
-/// Generic over the live-handle lifetime `'a` so the registry's `OxcLive<'a>` matches the lifetime of
-/// the `ClassMeta` the per-class driver builds from the borrowed AST. Each plugin is zero-sized and
-/// implements `DecoratorCompiler<OxcLive<'a>>` for every `'a`, so one call site instantiates the
-/// registry at exactly the borrow's lifetime.
-fn decorator_registry<'a>() -> DecoratorRegistry<OxcLive<'a>> {
+/// The registry is engine-NEUTRAL (`DecoratorRegistry` with the inert default `L = ()` live handle):
+/// each plugin reads the neutral `ClassMeta` fields, so no oxc type appears.
+fn decorator_registry() -> DecoratorRegistry {
     let mut registry = DecoratorRegistry::new();
     registry.register(Box::new(ComponentCompiler));
     registry.register(Box::new(DirectiveCompiler));
@@ -2889,12 +2779,12 @@ fn decorator_registry<'a>() -> DecoratorRegistry<OxcLive<'a>> {
 /// [`DecoratorRegistry`]. The class is packaged as a [`ClassMeta`] and the cross-class inputs as a
 /// [`CompileCtx`]; the registry resolves the plugin for the class's [`AngularDecoratorKind`] and
 /// calls [`DecoratorCompiler::compile`]. The emitted definition is byte-identical to the prior
-/// per-kind `match` — the plugins delegate to the same extraction/emit helpers.
+/// per-kind `match` — the plugins read the same engine-neutral metadata.
 #[allow(clippy::too_many_arguments)]
 fn compile_decorated_class(
-    class: &Class,
+    class: &ClassWithDecorators,
     kind: TopLevel,
-    dec: &Decorator,
+    dec: &DecoratorInfo,
     auto_import_candidates: &[String],
     sibling_directives: &[crate::binder::SelectorDirective],
     resolved_content: Option<&ResolvedContentMap>,
@@ -2906,43 +2796,29 @@ fn compile_decorated_class(
     module_with_providers: &std::collections::HashMap<String, String>,
     emit_partial_component: bool,
 ) -> Result<ClassEmit, String> {
-    let (class_name, class_name_span) = match &class.id {
-        Some(id) => (
-            id.name.to_string(),
-            ParseSourceSpan::new(id.span.start as usize, id.span.end as usize),
+    let (class_name, class_name_span) = match &class.name {
+        // The neutral `ClassWithDecorators::name_span` is the class NAME identifier's byte span — the
+        // anchor the additive source map maps the emitted `type: <ClassName>` read back to (a
+        // value-preserving span: it never changes emitted bytes, only the map).
+        Some(name) => (
+            name.clone(),
+            ParseSourceSpan::new(
+                class.name_span.start as usize,
+                class.name_span.end as usize,
+            ),
         ),
         None => return Err("decorated class has no name".to_string()),
     };
 
-    // The decorator's live options object, plus its engine-NEUTRAL pre-lowering. `ClassMeta` carries
-    // the neutral `ClassWithDecorators`/`DecoratorInfo`/`ObjLit` (so the decorators crate's public API
-    // names no oxc type); the same live nodes ride opaquely through `ClassMeta::live` for the
-    // transitional metadata walk the plugins still run. The neutral pre-lowering is byte-identical to
-    // the parse backend's `ParseOutput` (same `lower_*` helpers), so flipping the plugins to read the
-    // neutral fields later is a no-behaviour-change switch.
-    let live_object = decorator_object(dec);
-    // The neutral `ClassWithDecorators::stmt_span` (the enclosing top-level statement) is not consulted
-    // by the transitional ClassMeta walk (the plugins read the live oxc nodes through `ClassMeta::live`),
-    // so anchor it to the class node's own span here — the parse-backend `ParseOutput` path is the one
-    // gated at parity, and it fills `stmt_span` from the real enclosing statement.
-    let neutral_class = crate::parse::oxc::lower_class(
-        class,
-        crate::parse::TreatySpan::new(class.span().start, class.span().end),
-    );
-    let neutral_decorator = crate::parse::oxc::lower_decorator(dec);
-    let neutral_object = live_object.map(crate::parse::oxc::lower_object);
-    let live = OxcLive {
-        class,
-        object: live_object,
-    };
-
+    let object = decorator_object(dec);
     let meta = ClassMeta {
-        class: &neutral_class,
-        decorator: &neutral_decorator,
-        object: neutral_object.as_ref(),
+        class,
+        decorator: dec,
+        object,
         class_name,
         class_name_span,
-        live: &live,
+        // The live-AST handle is inert: every plugin reads the engine-neutral `ClassMeta` fields.
+        live: &(),
     };
     let ctx = CompileCtx {
         auto_import_candidates,
@@ -2984,7 +2860,10 @@ fn compile_decorated_class(
 /// assignment is appended to the pipe emit's `extra_statements` with `extra_after_def = true`, so the
 /// emit order is `X.ɵfac = …; X.ɵpipe = …; X.ɵprov = …;` — exactly Angular's "prov definition must be
 /// last so X.fac is defined" ordering, in both decorator orders.
-fn compile_pipe_and_injectable(class: &Class, meta: &ClassMeta<OxcLive>) -> Result<ClassEmit, String> {
+fn compile_pipe_and_injectable(
+    class: &ClassWithDecorators,
+    meta: &ClassMeta,
+) -> Result<ClassEmit, String> {
     // Primary definition: the `@Pipe` trait (factory + `ɵpipe`). Its `extra_statements` are pure-pool
     // consts the `ɵpipe` references (emitted BEFORE the assignments).
     let pipe_object = class_decorator(class, "Pipe").and_then(decorator_object);
@@ -3027,17 +2906,15 @@ fn compile_pipe_and_injectable(class: &Class, meta: &ClassMeta<OxcLive>) -> Resu
         errors: pipe_emit.errors,
     })
 }
-
 /// Compile a `@Component` or `@Directive` class. Shares the common metadata extraction (selector,
 /// inputs/outputs, queries, host bindings, `hostDirectives`, `exportAs`) and then routes to the
 /// component emitter (`compile_component_from_metadata`, with template) or the directive emitter
 /// (`compile_directive_from_metadata`, no template).
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn compile_component_or_directive(
-    class: &Class,
+    class: &ClassWithDecorators,
     kind: TopLevel,
-    obj: Option<&oxc_ast::ast::ObjectExpression>,
+    obj: Option<&ObjLit>,
     class_name: String,
     class_name_span: ParseSourceSpan,
     auto_import_candidates: &[String],
@@ -3120,7 +2997,7 @@ fn compile_component_or_directive(
     // standalone (default true).
     let standalone = obj
         .and_then(|o| find_prop(o, "standalone"))
-        .map(|e| matches!(e, Expression::BooleanLiteral(b) if b.value))
+        .map(|e| matches!(e, NExpr::Boolean(b) if *b))
         .unwrap_or(true);
 
     // changeDetection (OnPush vs Default). Angular's runtime default is `Default`, which is
@@ -3131,7 +3008,7 @@ fn compile_component_or_directive(
     let change_detection = obj
         .and_then(|o| find_prop(o, "changeDetection"))
         .and_then(|e| match e {
-            Expression::StaticMemberExpression(m) => Some(m.property.name.as_str()),
+            NExpr::Member { property, .. } => Some(property.as_str()),
             _ => None,
         })
         .map(|name| match name {
@@ -3252,7 +3129,7 @@ fn compile_component_or_directive(
     // force it on without the decorator flag.
     let explicit_signals = obj
         .and_then(|o| find_prop(o, "signals"))
-        .map(|e| matches!(e, Expression::BooleanLiteral(b) if b.value))
+        .map(|e| matches!(e, NExpr::Boolean(b) if *b))
         .unwrap_or(false);
     let is_signal =
         explicit_signals || inputs.iter().any(|(_, m)| m.is_signal) || has_signal_query;
@@ -3304,7 +3181,7 @@ fn compile_component_or_directive(
                 let preserve_whitespaces = obj
                     .and_then(|o| find_prop(o, "preserveWhitespaces"))
                     .and_then(|e| match e {
-                        Expression::BooleanLiteral(b) => Some(b.value),
+                        NExpr::Boolean(b) => Some(*b),
                         _ => None,
                     });
                 return compile_component_meta_partial(
@@ -3329,7 +3206,7 @@ fn compile_component_or_directive(
             // `imports:` array, and the component's own source position (used to detect a dependency
             // class declared LATER in the file). See `compile_component_meta` for the decision.
             let import_has_forward_ref = imports_has_forward_ref(obj);
-            let own_position = class.span().start;
+            let own_position = class.span.start;
             compile_component_meta(
                 base,
                 &template_html.unwrap_or_default(),
@@ -3404,8 +3281,8 @@ fn compile_directive_meta(
 
 /// R4: emit a `@Pipe({name, pure?, standalone?})` class via [`compile_pipe_from_metadata`].
 fn compile_pipe_class(
-    class: &Class,
-    obj: Option<&oxc_ast::ast::ObjectExpression>,
+    class: &ClassWithDecorators,
+    obj: Option<&ObjLit>,
     class_name: &str,
 ) -> Result<ClassEmit, String> {
     let pipe_name = obj
@@ -3414,12 +3291,12 @@ fn compile_pipe_class(
     // `pure` defaults to `true` (Angular's `@Pipe` default).
     let pure = obj
         .and_then(|o| find_prop(o, "pure"))
-        .map(|e| matches!(e, Expression::BooleanLiteral(b) if b.value))
+        .map(|e| matches!(e, NExpr::Boolean(b) if *b))
         .unwrap_or(true);
     // `standalone` defaults to `true`.
     let is_standalone = obj
         .and_then(|o| find_prop(o, "standalone"))
-        .map(|e| matches!(e, Expression::BooleanLiteral(b) if b.value))
+        .map(|e| matches!(e, NExpr::Boolean(b) if *b))
         .unwrap_or(true);
 
     let meta = crate::pipe_module_injector::R3PipeMetadata {
@@ -3442,7 +3319,6 @@ fn compile_pipe_class(
         errors: Vec::new(),
     })
 }
-
 /// R4: emit an `@NgModule({declarations, imports, exports, bootstrap, id})` class via
 /// [`compile_ng_module`]. Drives the FULL-compilation shape Angular's full/local goldens carry:
 /// the `ɵɵdefineNgModule({...})` call holds ONLY `{type[, bootstrap][, id]}`, the selector scope
@@ -3450,8 +3326,8 @@ fn compile_pipe_class(
 /// (`R3SelectorScopeMode::SideEffect`), and an `@NgModule({id})` additionally drives a trailing
 /// `ɵɵregisterNgModuleType(Type, id)` statement.
 fn compile_ng_module_class(
-    class: &Class,
-    obj: Option<&oxc_ast::ast::ObjectExpression>,
+    class: &ClassWithDecorators,
+    obj: Option<&ObjLit>,
     class_name: &str,
     jit_mode: bool,
     class_decl_positions: &std::collections::HashMap<String, u32>,
@@ -3497,10 +3373,8 @@ fn compile_ng_module_class(
     // recovers this from the local function's `ModuleWithProviders<T>` return-type annotation. The AOT
     // path never inlines `imports` onto the def (they only feed the injector), so this is jit-only.
     if jit_mode {
-        if let Some(Expression::ArrayExpression(arr)) =
-            obj.and_then(|o| find_prop(o, "imports"))
-        {
-            let resolved = resolve_module_with_providers_imports(arr, module_with_providers);
+        if let Some(NExpr::Array(elements)) = obj.and_then(|o| find_prop(o, "imports")) {
+            let resolved = resolve_module_with_providers_imports(elements, module_with_providers);
             if let Some((refs, names)) = resolved {
                 imports = refs;
                 import_names = names;
@@ -3513,7 +3387,7 @@ fn compile_ng_module_class(
     // true, `refsToArray` wraps the affected def arrays in a `() => [...]` thunk so the runtime read is
     // deferred past the forward declaration. Only meaningful for the inline (jit) def shape; the AOT
     // side-effect scope is already deferred inside the guarded IIFE.
-    let module_pos = class.span().start;
+    let module_pos = class.span.start;
     let is_forward = |name: &str| -> bool {
         class_decl_positions
             .get(name)
@@ -3584,9 +3458,11 @@ fn compile_ng_module_class(
     for key in ["imports", "exports"] {
         match obj.and_then(|o| find_prop(o, key)) {
             None => {}
-            Some(Expression::ArrayExpression(arr)) => {
-                for el in &arr.elements {
-                    let Some(inner) = el.as_expression() else { continue };
+            Some(NExpr::Array(elements)) => {
+                for el in elements {
+                    let crate::parse::NArrayElement::Expr(inner) = el else {
+                        continue;
+                    };
                     match convert_expr(inner) {
                         Some(expr) => injector_imports.push(expr),
                         None => {
@@ -3635,22 +3511,24 @@ fn compile_ng_module_class(
 
 /// Resolve an array literal of bare class identifiers into their self-references (`Foo` →
 /// `{value: Foo, ty: Foo}`). Nested arrays are flattened; non-identifier entries are skipped.
-fn identifier_refs(expr: &Expression) -> Vec<DirRef> {
+fn identifier_refs(expr: &NExpr) -> Vec<DirRef> {
     let mut out: Vec<DirRef> = Vec::new();
     collect_identifier_refs(expr, &mut out);
     out
 }
 
-fn collect_identifier_refs(expr: &Expression, out: &mut Vec<DirRef>) {
-    let Expression::ArrayExpression(arr) = expr else {
+fn collect_identifier_refs(expr: &NExpr, out: &mut Vec<DirRef>) {
+    let NExpr::Array(elements) = expr else {
         return;
     };
-    for el in &arr.elements {
-        let Some(inner) = el.as_expression() else { continue };
+    for el in elements {
+        let crate::parse::NArrayElement::Expr(inner) = el else {
+            continue;
+        };
         match inner {
-            Expression::ArrayExpression(_) => collect_identifier_refs(inner, out),
-            Expression::Identifier(id) => out.push(directive_ref(id.name.as_str())),
-            Expression::ParenthesizedExpression(p) => collect_identifier_refs(&p.expression, out),
+            NExpr::Array(_) => collect_identifier_refs(inner, out),
+            NExpr::Identifier(id) => out.push(directive_ref(id.as_str())),
+            NExpr::Parenthesized(p) => collect_identifier_refs(p, out),
             _ => {}
         }
     }
@@ -3664,21 +3542,23 @@ fn collect_identifier_refs(expr: &Expression, out: &mut Vec<DirRef>) {
 /// `MyBootstrap`, exactly as the full/local goldens emit). Nested arrays are flattened; entries that
 /// resolve to no class name (e.g. a `ModuleWithProviders` factory call) are skipped here and handled
 /// by the jit-only `imports` resolver.
-fn resolve_scope_refs(expr: &Expression, names: &mut Vec<String>) -> Vec<DirRef> {
+fn resolve_scope_refs(expr: &NExpr, names: &mut Vec<String>) -> Vec<DirRef> {
     let mut out: Vec<DirRef> = Vec::new();
     collect_scope_refs(expr, &mut out, names);
     out
 }
 
-fn collect_scope_refs(expr: &Expression, out: &mut Vec<DirRef>, names: &mut Vec<String>) {
-    let Expression::ArrayExpression(arr) = expr else {
+fn collect_scope_refs(expr: &NExpr, out: &mut Vec<DirRef>, names: &mut Vec<String>) {
+    let NExpr::Array(elements) = expr else {
         return;
     };
-    for el in &arr.elements {
-        let Some(inner) = el.as_expression() else { continue };
+    for el in elements {
+        let crate::parse::NArrayElement::Expr(inner) = el else {
+            continue;
+        };
         match inner {
-            Expression::ArrayExpression(_) => collect_scope_refs(inner, out, names),
-            Expression::ParenthesizedExpression(p) => collect_scope_refs(&p.expression, out, names),
+            NExpr::Array(_) => collect_scope_refs(inner, out, names),
+            NExpr::Parenthesized(p) => collect_scope_refs(p, out, names),
             // Bare identifier or `forwardRef(() => X)` → the resolved class reference.
             _ => {
                 if let Some((name, _was_forward)) = directive_name_maybe_forward(inner) {
@@ -3699,14 +3579,16 @@ fn collect_scope_refs(expr: &Expression, out: &mut Vec<DirRef>, names: &mut Vec<
 /// or a resolvable `ModuleWithProviders` factory call); otherwise `None`, so the caller keeps the plain
 /// identifier-only resolution (an unresolved factory call is simply omitted from the def's inline imports).
 fn resolve_module_with_providers_imports(
-    arr: &oxc_ast::ast::ArrayExpression,
+    elements: &[crate::parse::NArrayElement],
     mwp_returns: &std::collections::HashMap<String, String>,
 ) -> Option<(Vec<DirRef>, Vec<String>)> {
     let mut refs: Vec<DirRef> = Vec::new();
     let mut names: Vec<String> = Vec::new();
     let mut saw_factory = false;
-    for el in &arr.elements {
-        let Some(inner) = el.as_expression() else { continue };
+    for el in elements {
+        let crate::parse::NArrayElement::Expr(inner) = el else {
+            continue;
+        };
         // A bare class / `forwardRef(() => X)` import resolves directly.
         if let Some((name, _)) = directive_name_maybe_forward(inner) {
             refs.push(directive_ref(&name));
@@ -3714,9 +3596,9 @@ fn resolve_module_with_providers_imports(
             continue;
         }
         // A `provideModule()` factory call → its declared `ModuleWithProviders<T>` ngModule type.
-        if let Expression::CallExpression(call) = inner {
-            if let Expression::Identifier(callee) = &call.callee {
-                if let Some(module_ty) = mwp_returns.get(callee.name.as_str()) {
+        if let NExpr::Call { callee, .. } = inner {
+            if let NExpr::Identifier(callee_name) = callee.as_ref() {
+                if let Some(module_ty) = mwp_returns.get(callee_name.as_str()) {
                     refs.push(directive_ref(module_ty));
                     names.push(module_ty.clone());
                     saw_factory = true;
@@ -3735,7 +3617,6 @@ fn resolve_module_with_providers_imports(
         None
     }
 }
-
 /// A [`TemplateBuilder`] that recognises foreign-component usages and emits a creation-time
 /// `ɵɵforeignComponent` instruction for them, delegating everything else to the classic
 /// [`RealTemplateBuilder`].

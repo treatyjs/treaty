@@ -25,18 +25,41 @@ edition = "2024"
 # backend here is that port's parser half + its parity gate; the alias below stays on oxc until the
 # walk is neutralized so the default + swc builds both compile.
 default = ["oxc"]
-oxc = ["treaty_ivy_core/oxc", "treaty_ivy_template/oxc"]
-swc = ["treaty_ivy_core/swc", "treaty_ivy_template/swc", "dep:swc_common", "dep:swc_ecma_ast", "dep:swc_ecma_parser", "dep:swc_atoms"]
+# `oxc` pulls in the OXC PARSE backend (`src/parse/oxc.rs`, the only facade file that `use`s `oxc_`)
+# + its `oxc_*` parser crates. With the source/linker/partial-emit WALK now reading the engine-neutral
+# `ParseOutput` (no live oxc `Program`), the oxc crates are confined to that one feature-gated module,
+# so a pure `--no-default-features --features swc` build excludes them entirely.
+oxc = [
+    "treaty_ivy_core/oxc",
+    "treaty_ivy_template/oxc",
+    "treaty_ivy_decorators/oxc",
+    "dep:oxc_allocator",
+    "dep:oxc_ast",
+    "dep:oxc_parser",
+    "dep:oxc_codegen",
+    "dep:oxc_span",
+]
+swc = [
+    "treaty_ivy_core/swc",
+    "treaty_ivy_template/swc",
+    "treaty_ivy_decorators/swc",
+    "dep:swc_common",
+    "dep:swc_ecma_ast",
+    "dep:swc_ecma_parser",
+    "dep:swc_atoms",
+]
 
 [dependencies]
 treaty_ivy_core = { path = "../core", default-features = false }
 treaty_ivy_template = { path = "../template", default-features = false }
-treaty_ivy_decorators = { path = "../decorators" }
-oxc_allocator = "0.133.0"
-oxc_ast = "0.133.0"
-oxc_parser = "0.133.0"
-oxc_codegen = "0.133.0"
-oxc_span = "0.133.0"
+treaty_ivy_decorators = { path = "../decorators", default-features = false }
+# OXC PARSE backend crates — compiled ONLY under `--features oxc` (the default). Confined to
+# `src/parse/oxc.rs` now that the AOT/linker/partial-emit walks read the engine-neutral IR.
+oxc_allocator = { version = "0.133.0", optional = true }
+oxc_ast = { version = "0.133.0", optional = true }
+oxc_parser = { version = "0.133.0", optional = true }
+oxc_codegen = { version = "0.133.0", optional = true }
+oxc_span = { version = "0.133.0", optional = true }
 
 # SWC PARSE backend — compiled ONLY under `--features swc` (off by default; default users never
 # build these heavy crates). `SwcParseBackend` parses with `swc_ecma_parser::parse_file_as_program`
