@@ -1,20 +1,35 @@
 {
-  "name": "@treaty/vscode",
+  "name": "treaty-vscode",
   "version": "0.0.1",
   "displayName": "Treaty",
-  "description": "Language support for Treaty (.treaty / .tjsx) and Angular, powered by the Treaty language server.",
+  "description": "Best-in-class language support for Treaty (.treaty / .tjsx) and Angular, powered by the Treaty language server: completion, hover, diagnostics, go-to-definition, references, rename, signature help, semantic tokens and formatting — plus selectorless, signals-aware template intelligence.",
   "publisher": "treaty",
   "license": "IDGAF-1.0",
   "author": "Jordan Hall",
+  "icon": "icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/treatyjs/treaty.git",
+    "directory": "libs/treaty/vscode"
+  },
+  "bugs": {
+    "url": "https://github.com/treatyjs/treaty/issues"
+  },
+  "homepage": "https://github.com/treatyjs/treaty#readme",
   "categories": [
-    "Programming Languages"
+    "Programming Languages",
+    "Formatters",
+    "Snippets",
+    "Linters"
   ],
   "keywords": [
     "treaty",
     "angular",
     "tjsx",
     "jsx",
-    "signals"
+    "signals",
+    "ivy",
+    "language-server"
   ],
   "engines": {
     "vscode": "^1.88.0",
@@ -23,11 +38,15 @@
   },
   "main": "./dist/extension.js",
   "activationEvents": [
-    "onLanguage:treaty",
-    "onLanguage:treaty-jsx",
     "onLanguage:typescript",
     "onLanguage:html"
   ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "The Treaty compiler runs in a child process and resolves a native addon from your workspace; restricted in untrusted workspaces."
+    }
+  },
   "contributes": {
     "languages": [
       {
@@ -38,6 +57,10 @@
         "extensions": [
           ".treaty"
         ],
+        "icon": {
+          "light": "./icon.png",
+          "dark": "./icon.png"
+        },
         "configuration": "./language-configuration.json"
       },
       {
@@ -48,6 +71,10 @@
         "extensions": [
           ".tjsx"
         ],
+        "icon": {
+          "light": "./icon.png",
+          "dark": "./icon.png"
+        },
         "configuration": "./jsx-language-configuration.json"
       }
     ],
@@ -55,14 +82,113 @@
       {
         "language": "treaty",
         "scopeName": "source.treaty",
-        "path": "./syntaxes/treaty.tmLanguage.json"
+        "path": "./syntaxes/treaty.tmLanguage.json",
+        "embeddedLanguages": {
+          "meta.embedded.block.macro.treaty": "typescript",
+          "source.css.embedded.treaty": "css",
+          "meta.embedded.expression.ng": "typescript"
+        }
       },
       {
         "language": "treaty-jsx",
         "scopeName": "source.tjsx",
-        "path": "./syntaxes/treaty-jsx.tmLanguage.json"
+        "path": "./syntaxes/treaty-jsx.tmLanguage.json",
+        "embeddedLanguages": {
+          "meta.embedded.expression.ng": "typescript"
+        }
       }
-    ]
+    ],
+    "snippets": [
+      {
+        "language": "treaty",
+        "path": "./snippets/treaty.code-snippets"
+      },
+      {
+        "language": "treaty-jsx",
+        "path": "./snippets/treaty-jsx.code-snippets"
+      }
+    ],
+    "commands": [
+      {
+        "command": "treaty.compile",
+        "title": "Compile to Ivy",
+        "category": "Treaty"
+      },
+      {
+        "command": "treaty.preview",
+        "title": "Preview Compiled Output",
+        "category": "Treaty"
+      },
+      {
+        "command": "treaty.restartServer",
+        "title": "Restart Language Server",
+        "category": "Treaty"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "treaty.compile",
+          "when": "resourceLangId == treaty || resourceLangId == treaty-jsx"
+        },
+        {
+          "command": "treaty.preview",
+          "when": "resourceLangId == treaty || resourceLangId == treaty-jsx"
+        }
+      ],
+      "editor/title/run": [
+        {
+          "command": "treaty.preview",
+          "when": "resourceLangId == treaty || resourceLangId == treaty-jsx",
+          "group": "treaty"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "treaty.preview",
+          "when": "resourceLangId == treaty || resourceLangId == treaty-jsx",
+          "group": "treaty@1"
+        },
+        {
+          "command": "treaty.compile",
+          "when": "resourceLangId == treaty || resourceLangId == treaty-jsx",
+          "group": "treaty@2"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "treaty.preview",
+        "key": "ctrl+k v",
+        "mac": "cmd+k v",
+        "when": "editorTextFocus && (resourceLangId == treaty || resourceLangId == treaty-jsx)"
+      }
+    ],
+    "configuration": {
+      "title": "Treaty",
+      "properties": {
+        "treaty.format.enable": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable the Treaty document formatter (provided by the language server). When off, Treaty files are not formatted on save or via Format Document."
+        },
+        "treaty.trace.server": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "description": "Trace the communication between VS Code and the Treaty language server."
+        },
+        "treaty.server.path": {
+          "type": "string",
+          "default": "",
+          "description": "Absolute path to a Treaty language server entry (dist/server.mjs) to use instead of the bundled one. For development."
+        }
+      }
+    }
   },
   "scripts": {
     "build": "node scripts/build.mjs",
@@ -75,6 +201,7 @@
     "vscode-languageclient": "^9.0.1"
   },
   "devDependencies": {
+    "@types/node": "^20.19.0",
     "@types/vscode": "^1.88.0",
     "@vscode/vsce": "latest",
     "esbuild": "latest"

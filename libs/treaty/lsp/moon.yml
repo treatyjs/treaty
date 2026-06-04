@@ -37,9 +37,27 @@ tasks:
   smoke:
     command: node
     args:
+    - $projectRoot/test/template-service.smoke.mjs
+    deps:
+    - ~:build
+    inputs:
+    - src/**/*
+    - test/template-service.smoke.mjs
+  smoke-oxlint:
+    command: node
+    args:
     - $projectRoot/test/oxlint-plugin.smoke.mjs
     deps:
     - ~:build
     inputs:
     - src/oxlint-plugin.ts
     - test/oxlint-plugin.smoke.mjs
+  smoke-diagnostics:
+    command: node
+    args:
+    - $projectRoot/test/diagnostics.smoke.mjs
+    deps:
+    - ~:build
+    inputs:
+    - src/**/*
+    - test/diagnostics.smoke.mjs

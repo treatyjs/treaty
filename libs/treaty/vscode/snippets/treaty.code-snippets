@@ -1,0 +1,168 @@
+{
+  "Treaty component scaffold": {
+    "scope": "treaty",
+    "prefix": ["component", "treaty", "scaffold"],
+    "body": [
+      "<style>",
+      "  :host { display: block; }",
+      "</style>",
+      "",
+      "import { input } from '@angular/core'",
+      "",
+      "const ${1:name} = input('${2:world}')",
+      "",
+      "<div class=\"${3:container}\">",
+      "  Hello, {{ ${1:name}() }}!",
+      "  $0",
+      "</div>"
+    ],
+    "description": "A complete .treaty single-file component: <style>, TS body, and a template region."
+  },
+  "Signal": {
+    "scope": "treaty",
+    "prefix": ["signal", "sig"],
+    "body": ["const ${1:count} = signal(${2:0})"],
+    "description": "A writable signal (Treaty variables are signals by default; this is the explicit form)."
+  },
+  "Computed signal": {
+    "scope": "treaty",
+    "prefix": ["computed", "derived"],
+    "body": ["const ${1:doubled} = computed(() => ${2:count}() * 2)"],
+    "description": "A computed (derived) signal."
+  },
+  "Effect": {
+    "scope": "treaty",
+    "prefix": ["effect"],
+    "body": ["effect(() => {", "\t$0", "})"],
+    "description": "A reactive effect that re-runs when its read signals change."
+  },
+  "Input": {
+    "scope": "treaty",
+    "prefix": ["input", "in"],
+    "body": ["const ${1:value} = input${2|,.required|}<${3:string}>(${4})"],
+    "description": "A signal input (component prop)."
+  },
+  "Required input": {
+    "scope": "treaty",
+    "prefix": ["input.required", "requiredInput"],
+    "body": ["const ${1:value} = input.required<${2:string}>()"],
+    "description": "A required signal input."
+  },
+  "Model (two-way)": {
+    "scope": "treaty",
+    "prefix": ["model"],
+    "body": ["const ${1:value} = model${2|,.required|}<${3:string}>(${4})"],
+    "description": "A two-way bindable model signal."
+  },
+  "Output": {
+    "scope": "treaty",
+    "prefix": ["output", "out"],
+    "body": ["const ${1:changed} = output<${2:string}>()"],
+    "description": "A component output (event emitter)."
+  },
+  "viewChild": {
+    "scope": "treaty",
+    "prefix": ["viewChild"],
+    "body": ["const ${1:ref} = viewChild${2|,.required|}<${3:ElementRef}>('${4:ref}')"],
+    "description": "A signal viewChild query."
+  },
+  "@if block": {
+    "scope": "treaty",
+    "prefix": ["@if", "if"],
+    "body": ["@if (${1:condition}) {", "\t$0", "}"],
+    "description": "Angular @if control-flow block."
+  },
+  "@if / @else block": {
+    "scope": "treaty",
+    "prefix": ["@if-else", "ifelse"],
+    "body": ["@if (${1:condition}) {", "\t$2", "} @else {", "\t$0", "}"],
+    "description": "Angular @if / @else control-flow block."
+  },
+  "@for block": {
+    "scope": "treaty",
+    "prefix": ["@for", "for"],
+    "body": [
+      "@for (${1:item} of ${2:items}; track ${3:$index}) {",
+      "\t$0",
+      "} @empty {",
+      "\t",
+      "}"
+    ],
+    "description": "Angular @for repeater (track is required) with an @empty branch."
+  },
+  "@switch block": {
+    "scope": "treaty",
+    "prefix": ["@switch", "switch"],
+    "body": [
+      "@switch (${1:expr}) {",
+      "\t@case (${2:value}) {",
+      "\t\t$0",
+      "\t}",
+      "\t@default {",
+      "\t}",
+      "}"
+    ],
+    "description": "Angular @switch control-flow block."
+  },
+  "@defer block": {
+    "scope": "treaty",
+    "prefix": ["@defer", "defer"],
+    "body": [
+      "@defer (on ${1|idle,viewport,interaction,hover,immediate,timer(2s)|}) {",
+      "\t$0",
+      "} @placeholder {",
+      "\t",
+      "} @loading {",
+      "\t",
+      "}"
+    ],
+    "description": "Angular @defer lazy block with @placeholder and @loading branches."
+  },
+  "@let declaration": {
+    "scope": "treaty",
+    "prefix": ["@let", "let"],
+    "body": ["@let ${1:name} = ${2:expr};"],
+    "description": "Angular @let template variable declaration."
+  },
+  "use: directive": {
+    "scope": "treaty",
+    "prefix": ["use:", "use"],
+    "body": ["use:${1:directive}=\"${2:value}\""],
+    "description": "Apply a selectorless directive with use:."
+  },
+  "host{} spec (directive)": {
+    "scope": "treaty",
+    "prefix": ["host", "hostspec"],
+    "body": [
+      "const host = {",
+      "  '[class.${1:active}]': '${2:isActive}()',",
+      "  '(${3:click})': '${4:onClick}(\\$event)',",
+      "}"
+    ],
+    "description": "A host{} binding/listener spec for a directive authored in .treaty."
+  },
+  "Property binding": {
+    "scope": "treaty",
+    "prefix": ["[]", "bind"],
+    "body": ["[${1:prop}]=\"${2:expr}\""],
+    "description": "An Angular property binding."
+  },
+  "Event binding": {
+    "scope": "treaty",
+    "prefix": ["()", "on"],
+    "body": ["(${1:event})=\"${2:handler}(\\$event)\""],
+    "description": "An Angular event binding."
+  },
+  "Two-way binding": {
+    "scope": "treaty",
+    "prefix": ["[()]", "banana"],
+    "body": ["[(${1:ngModel})]=\"${2:value}\""],
+    "description": "An Angular two-way (banana-in-a-box) binding."
+  },
+  "Interpolation": {
+    "scope": "treaty",
+    "prefix": ["{{", "interp"],
+    "body": ["{{ ${1:expr} }}"],
+    "description": "An Angular interpolation expression."
+  }
+}

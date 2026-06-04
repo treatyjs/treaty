@@ -40,8 +40,35 @@ export { scanTreatyRegions, typeScriptRegions } from './regions.js'
 export type { DiagnosticDocument } from './diagnostics.js'
 export { provideDiagnostics, DIAGNOSTIC_SOURCE } from './diagnostics.js'
 
-export type { CompiledComponent } from './compiler.js'
-export { compileTreaty, compileSource, compileTemplate } from './compiler.js'
+export type { CompiledComponent, ImportedSelectorMap, ProjectSelectors } from './compiler.js'
+export {
+	compileTreaty,
+	compileSource,
+	compileTemplate,
+	compileWithSelectors,
+	scanProjectSelectors,
+	importedSelectorsFor,
+} from './compiler.js'
+
+export type {
+	ComponentEntry,
+	ComponentKind,
+	ComponentOrigin,
+} from './component-registry.js'
+export {
+	ComponentRegistry,
+	scanWorkspaceSelectors,
+	classNameFromFileName,
+	tagFromClassName,
+} from './component-registry.js'
+
+export type {
+	TemplateContext,
+	TemplateCompletionKind,
+} from './template-context.js'
+export { templateContextAt, regionAt } from './template-context.js'
+
+export { createTemplateService, TEMPLATE_DIAGNOSTIC_SOURCE } from './template-service.js'
 
 export type { TreatyLanguageServer } from './server.js'
 export { createServer, start } from './server.js'

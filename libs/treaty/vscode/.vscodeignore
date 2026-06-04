@@ -1,16 +1,24 @@
-# Sources and build inputs (only dist/ ships)
+# Sources and build inputs (only the built dist/ ships)
 src/**
 scripts/**
+tmp/**
+**/*.vsix
 tsconfig.json
 tsconfig.*.json
 moon.yml
 .gitignore
 .vscodeignore
 
-# Dev/test cruft
-node_modules/**
+# Source maps and TypeScript sources are dev-only.
 **/*.map
 **/*.ts
 !dist/**/*.js
+!dist/**/*.mjs
 
-# Keep: dist/, syntaxes/, *language-configuration.json, README.md, package.json
+# Ships in the VSIX:
+#   dist/extension.js          (extension client)
+#   dist/server.mjs            (bundled @treaty/lsp language server)
+#   syntaxes/*.tmLanguage.json (TextMate grammars)
+#   snippets/*.code-snippets   (component / .treaty scaffolds, signals, control flow)
+#   *language-configuration.json
+#   icon.png, README.md, package.json

@@ -5,9 +5,16 @@
  * Runnable entry point for the `treaty-lsp` binary: a volarjs language server
  * that serves every registered Treaty authoring format. It wires the authoring
  * registry into a TypeScript-backed volarjs project so embedded code is
- * type-checked by the real TypeScript language service, and surfaces the Rust
- * authoring compiler's diagnostics on top, forwarding everything over the
- * standard LSP connection.
+ * type-checked by the real TypeScript language service (completion, hover,
+ * definition, references, rename, signature help, semantic tokens and
+ * formatting of the component body and every `{{ … }}` expression), and layers
+ * the Treaty {@link createTemplateService template service} on top for the
+ * selectorless / signals / cross-file intelligence the TS service cannot know:
+ * selectorless component-tag completions with auto-import (no `NgModule`),
+ * `use:` directive and `@if`/`@for`/`@switch`/`@defer` control-flow completions,
+ * hover and go-to-definition on selectorless tags, and registry-aware compiler
+ * diagnostics straight from the Rust authoring compiler. Everything is forwarded
+ * over the standard LSP connection for both `.treaty` and JSX (`.tsx`/`.tjsx`).
  *
  * Importing this module (transitively, via `./language.js` → `./plugins.js`)
  * seeds the default `.treaty` / `.tsx` / `.tjsx` formats; additional formats
@@ -32,6 +39,8 @@ import {
 import { create as createTypeScriptServices } from 'volar-service-typescript'
 import { createTreatyLanguagePlugin } from './language.js'
 import { applyTreatyJsxAutoTypes, resolveTreatyJsxTypesEntry } from './jsx-types.js'
+import { ComponentRegistry } from './component-registry.js'
+import { createTemplateService } from './template-service.js'
 
 const require = createRequire(import.meta.url)
 
@@ -83,6 +92,11 @@ export function createServer(connection: Connection = createConnection()): Treat
 		// See applyTreatyJsxAutoTypes.
 		const jsxTypesEntry = resolveTreatyJsxTypesEntry()
 
+		// A single workspace component view backs BOTH the registry-aware compiles
+		// (cross-module selectors) and the template service's selectorless
+		// completion / hover / definition, so they stay consistent as docs change.
+		const componentRegistry = new ComponentRegistry()
+
 		return server.initialize(
 			params,
 			createTypeScriptProject(typescript, diagnosticMessages, ({ projectHost }) => {
@@ -95,7 +109,17 @@ export function createServer(connection: Connection = createConnection()): Treat
 					],
 				}
 			}),
-			createTypeScriptServices(typescript),
+			[
+				// The TypeScript service covers the embedded TS/JSX projection of
+				// every Treaty region: completion, hover, definition, references,
+				// rename, signature help, semantic tokens and formatting of the body
+				// and every `{{ … }}` expression.
+				...createTypeScriptServices(typescript),
+				// The Treaty service adds the selectorless / signals / template
+				// intelligence on top (it runs after, so it augments rather than
+				// shadows the TS results).
+				createTemplateService(componentRegistry),
+			],
 		)
 	})
 

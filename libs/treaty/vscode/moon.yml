@@ -1,0 +1,52 @@
+id: treaty-vscode
+language: typescript
+platform: node
+type: application
+tags: []
+tasks:
+  build:
+    command: node
+    args:
+    - scripts/build.mjs
+    deps:
+    - treaty-lsp:build
+    inputs:
+    - src/**/*
+    - scripts/build.mjs
+    - tsconfig.json
+    outputs:
+    - dist
+  typecheck:
+    command: tsgo
+    args:
+    - --noEmit
+    - -p
+    - $projectRoot/tsconfig.json
+    inputs:
+    - src/**/*
+    - tsconfig.json
+  lint:
+    command: oxlint
+    args:
+    - -c
+    - $workspaceRoot/.oxlintrc.json
+    - $projectRoot/src
+    inputs:
+    - src/**/*
+    - $workspaceRoot/.oxlintrc.json
+  package:
+    command: vsce
+    args:
+    - package
+    - --no-dependencies
+    deps:
+    - ~:build
+    inputs:
+    - dist/**/*
+    - syntaxes/**/*
+    - snippets/**/*
+    - '*language-configuration.json'
+    - package.json
+    - README.md
+    - icon.png
+    - .vscodeignore

@@ -1,23 +1,36 @@
 # Treaty for VS Code
 
-Language support for [Treaty](https://github.com/treaty) authoring formats and
-Angular, powered by the Treaty language server.
+Best-in-class language support for [Treaty](https://github.com/treatyjs/treaty)
+authoring formats and Angular, powered by the Treaty language server.
 
 ## Features
 
+- **Full language intelligence** for `.treaty`, `.tjsx`, and the plain Angular
+  files (`.ts`, `.html`) in your workspace — all backed by the Treaty language
+  server (`@treaty/lsp`, a [Volar.js](https://volarjs.dev) server):
+  - Completion (with selectorless component / `use:` directive auto-import)
+  - Hover, go-to-definition, find-all-references, rename
+  - Signature help and signals-aware member hints
+  - Semantic tokens
+  - Document & on-type formatting (participates in format-on-save)
+  - Live diagnostics straight from the Rust authoring compiler, registry-aware
+    so cross-module selectors resolve the way a real build would
 - **Syntax highlighting** for Treaty single-file components (`.treaty`) and
-  Treaty JSX (`.tjsx`).
-- **Full language intelligence** — diagnostics, completion, hover, and
-  navigation — for `.treaty`, `.tjsx`, and the plain Angular files (`.ts`,
-  `.html`) in your workspace. Embedded code in each authoring format is
-  projected into a real TypeScript language service, and the Rust authoring
-  compiler's diagnostics are layered on top.
-
-This extension **bundles the Treaty language server** ([`@treaty/lsp`](../lsp)),
-a [Volar.js](https://volarjs.dev)-based server. The server is launched in a
-child process over IPC on activation; the Rust authoring compiler is reached
-through its native NAPI addon, which the server loads at runtime (it is never
-bundled into the extension).
+  Treaty JSX (`.tjsx`), highlighting every embedded region of a `.treaty` file
+  — the top ` ``` ` macro block (TypeScript), the `<style>` block (CSS), the
+  TypeScript-by-default body, and the JSX/HTML template with its `{{ … }}`
+  interpolations, bindings and `@if`/`@for`/`@switch`/`@defer` control flow.
+- **Snippets** for the common Treaty shapes: component / directive scaffolds,
+  `signal`/`computed`/`effect`, `input`/`output`/`model`, the
+  `@if`/`@for`/`@switch`/`@defer`/`@let` control-flow blocks, bindings, `use:`
+  directives, and a directive `host{}` spec.
+- **Commands** that drive the Treaty compiler:
+  - **Treaty: Preview Compiled Output** (`Ctrl/Cmd+K V`) — compile the active
+    `.treaty`/`.tjsx` file and open its Ivy output beside it (plus any extracted
+    server module).
+  - **Treaty: Compile to Ivy** — write the compiled `.ivy.js` (and `.server.js`)
+    next to the source file.
+  - **Treaty: Restart Language Server**.
 
 ## Languages
 
@@ -30,22 +43,31 @@ Plain Angular `.ts` and `.html` files are served by the same language server
 but keep their built-in VS Code language identities — Treaty does not claim the
 `.tsx` extension, so it never overrides VS Code's built-in TypeScript React.
 
-## Install
+## Settings
 
-Install from the VS Code Marketplace, or build and install locally:
+| Setting                | Default | Description                                            |
+| ---------------------- | ------- | ------------------------------------------------------ |
+| `treaty.format.enable` | `true`  | Enable the Treaty document formatter (format-on-save). |
+| `treaty.trace.server`  | `off`   | Trace VS Code ⇄ Treaty language-server traffic.        |
+| `treaty.server.path`   | `""`    | Path to a dev `dist/server.mjs` to use instead.        |
+
+## How it works
+
+The extension **bundles the Treaty language server** as `dist/server.mjs`,
+launched in a child process over IPC on activation. The Rust authoring compiler
+is reached through its native NAPI addon (`@treaty/authoring-node`), which the
+server (and the compile/preview commands) load at runtime — the native binary is
+never bundled into a JS bundle.
+
+## Build & package
 
 ```sh
 # from libs/treaty/vscode
-npm run build        # bundle src/extension.ts -> dist/extension.js (esbuild)
-npm run package      # produce a .vsix via @vscode/vsce
-code --install-extension treaty-*.vsix
+node scripts/build.mjs   # bundle extension + server into dist/ (esbuild)
+vsce package             # produce a .vsix
 ```
 
-During development:
-
-```sh
-npm run watch        # rebuild on change
-```
+During development use `node scripts/build.mjs --watch`.
 
 ## Requirements
 

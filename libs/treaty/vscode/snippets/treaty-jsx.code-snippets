@@ -1,0 +1,140 @@
+{
+  "Treaty JSX component scaffold": {
+    "scope": "treaty-jsx",
+    "prefix": ["component", "tjsx", "scaffold"],
+    "body": [
+      "import { input } from '@angular/core'",
+      "",
+      "export default function ${1:Widget}() {",
+      "  const ${2:name} = input('${3:world}')",
+      "",
+      "  return (",
+      "    <div class=\"${4:container}\">",
+      "      Hello, {${2:name}()}!",
+      "      $0",
+      "    </div>",
+      "  )",
+      "}"
+    ],
+    "description": "A Treaty JSX component: a lowercase-authored function returning JSX (signals by default)."
+  },
+  "Treaty JSX directive scaffold": {
+    "scope": "treaty-jsx",
+    "prefix": ["directive"],
+    "body": [
+      "export default function ${1:highlight}() {",
+      "  const ${2:color} = input('${3:yellow}')",
+      "  return {",
+      "    host: {",
+      "      '[style.background]': '${2:color}()',",
+      "    },",
+      "  }",
+      "}"
+    ],
+    "description": "A Treaty JSX directive: same shape as a component but returns a host spec instead of JSX."
+  },
+  "Signal": {
+    "scope": "treaty-jsx",
+    "prefix": ["signal", "sig"],
+    "body": ["const ${1:count} = signal(${2:0})"],
+    "description": "A writable signal."
+  },
+  "Computed signal": {
+    "scope": "treaty-jsx",
+    "prefix": ["computed", "derived"],
+    "body": ["const ${1:doubled} = computed(() => ${2:count}() * 2)"],
+    "description": "A computed (derived) signal."
+  },
+  "Effect": {
+    "scope": "treaty-jsx",
+    "prefix": ["effect"],
+    "body": ["effect(() => {", "\t$0", "})"],
+    "description": "A reactive effect."
+  },
+  "Input": {
+    "scope": "treaty-jsx",
+    "prefix": ["input", "in"],
+    "body": ["const ${1:value} = input${2|,.required|}<${3:string}>(${4})"],
+    "description": "A signal input (component prop)."
+  },
+  "Output": {
+    "scope": "treaty-jsx",
+    "prefix": ["output", "out"],
+    "body": ["const ${1:changed} = output<${2:string}>()"],
+    "description": "A component output (event emitter)."
+  },
+  "Model (two-way)": {
+    "scope": "treaty-jsx",
+    "prefix": ["model"],
+    "body": ["const ${1:value} = model${2|,.required|}<${3:string}>(${4})"],
+    "description": "A two-way bindable model signal."
+  },
+  "@if block": {
+    "scope": "treaty-jsx",
+    "prefix": ["@if", "if"],
+    "body": ["@if (${1:condition}) {", "\t$0", "}"],
+    "description": "Angular @if control-flow block inside JSX."
+  },
+  "@if / @else block": {
+    "scope": "treaty-jsx",
+    "prefix": ["@if-else", "ifelse"],
+    "body": ["@if (${1:condition}) {", "\t$2", "} @else {", "\t$0", "}"],
+    "description": "Angular @if / @else control-flow block inside JSX."
+  },
+  "@for block": {
+    "scope": "treaty-jsx",
+    "prefix": ["@for", "for"],
+    "body": [
+      "@for (${1:item} of ${2:items}; track ${3:$index}) {",
+      "\t$0",
+      "} @empty {",
+      "\t",
+      "}"
+    ],
+    "description": "Angular @for repeater (track required) with an @empty branch inside JSX."
+  },
+  "JS map -> @for": {
+    "scope": "treaty-jsx",
+    "prefix": ["map", "loop"],
+    "body": ["{${1:items}.map((${2:item}) => (", "\t<${3:div}>{${2:item}}</${3:div}>", "))}"],
+    "description": "A JS .map() loop in JSX (Treaty lowers this to @for)."
+  },
+  "@switch block": {
+    "scope": "treaty-jsx",
+    "prefix": ["@switch", "switch"],
+    "body": [
+      "@switch (${1:expr}) {",
+      "\t@case (${2:value}) {",
+      "\t\t$0",
+      "\t}",
+      "\t@default {",
+      "\t}",
+      "}"
+    ],
+    "description": "Angular @switch control-flow block inside JSX."
+  },
+  "@defer block": {
+    "scope": "treaty-jsx",
+    "prefix": ["@defer", "defer"],
+    "body": [
+      "@defer (on ${1|idle,viewport,interaction,hover,immediate|}) {",
+      "\t$0",
+      "} @placeholder {",
+      "\t",
+      "}"
+    ],
+    "description": "Angular @defer lazy block inside JSX."
+  },
+  "use: directive": {
+    "scope": "treaty-jsx",
+    "prefix": ["use:", "use"],
+    "body": ["use:${1:directive}={${2:value}}"],
+    "description": "Apply a selectorless directive with use: on a JSX element."
+  },
+  "class binding": {
+    "scope": "treaty-jsx",
+    "prefix": ["class"],
+    "body": ["class={${1:expr}}"],
+    "description": "A lowercase class binding (Treaty class binding) on a JSX element."
+  }
+}
