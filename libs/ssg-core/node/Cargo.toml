@@ -6,7 +6,7 @@
 # workspace root, so it is NOT a member of the parent workspace and builds with
 # its OWN `target/` — independent of the in-flight authoring-addon edits a
 # concurrent workflow owns (the main `libs/authoring/node` addon depends on
-# `apps/rust/authoring`, which is dirty). Build with:
+# `libs/authoring/rust`, which is dirty). Build with:
 #   napi build --cargo-cwd libs/ssg-core/node ...   (see package.json / build script)
 # or directly:
 #   cargo build --manifest-path libs/ssg-core/node/Cargo.toml --release

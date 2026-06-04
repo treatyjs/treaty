@@ -2359,11 +2359,11 @@ function toggle() { open.set(!open()); persist(1); }\n\
     }
 
     /// Read an everything-app example `.treaty` file relative to this crate's manifest dir
-    /// (`apps/rust/authoring`), so the gate runs against the REAL authored fixtures the lexer must
+    /// (`libs/authoring/rust`), so the gate runs against the REAL authored fixtures the lexer must
     /// keep working — not a synthetic copy that could drift from the shipped examples.
     fn read_example(rel_from_repo_root: &str) -> String {
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        // `apps/rust/authoring` -> repo root is three levels up.
+        // `libs/authoring/rust` -> repo root is three levels up.
         let repo_root = manifest
             .ancestors()
             .nth(3)

@@ -2645,8 +2645,8 @@ export default function Field() {\n\
 
     // --- the real shadcn example files compile correctly (GAP 1 + GAP 2) -------
 
-    /// Read a `examples/treaty-shadcn/src/<name>` file relative to the repo root (four levels up from
-    /// this crate's `apps/rust/authoring` manifest dir).
+    /// Read a `examples/treaty-shadcn/src/<name>` file relative to the repo root (three levels up from
+    /// this crate's `libs/authoring/rust` manifest dir).
     fn read_shadcn_example(name: &str) -> String {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../../examples/treaty-shadcn/src")

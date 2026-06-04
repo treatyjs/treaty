@@ -7,7 +7,7 @@ members = [
 	'libs/treaty-ivy/template',
 	'libs/treaty-ivy/decorators',
 	'libs/treaty-ivy/facade',
-	'apps/rust/authoring',
+	'libs/authoring/rust',
 	'libs/runtime',
 	'apps/treaty-cli',
 	'libs/packagr',

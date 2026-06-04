@@ -12,7 +12,7 @@ edition = "2024"
 
 [dependencies]
 treaty_ivy = { path = "../treaty-ivy/facade" }
-rust_authoring = { path = "../../apps/rust/authoring" }
+rust_authoring = { path = "../authoring/rust" }
 oxc_allocator = "0.133.0"
 oxc_ast = "0.133.0"
 oxc_parser = "0.133.0"

@@ -6,7 +6,7 @@ use rust_authoring::treaty::parser::Parser;
 use rust_authoring::treaty::token::TokenKind;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let default_path = "apps/rust/authoring/src/test.treaty";
+    let default_path = "libs/authoring/rust/src/test.treaty";
     let file_path = env::args().nth(1).unwrap_or_else(|| default_path.to_string());
 
     let path = PathBuf::from(&file_path);

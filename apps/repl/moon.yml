@@ -6,7 +6,8 @@ type: application
 tasks:
   # Production website build (Vite) for the GitHub Pages deploy. Emits to
   # ../../dist/apps/repl (see vite.config.ts `build.outDir`); the `.treaty` sources
-  # compile through the Rust authoring addon via the treatySFC() Vite plugin.
+  # compile through the Rust authoring addon via the @treaty/vite plugin (the one
+  # Treaty compiler — no TypeScript fallback).
   build:
     command: vite
     args:
