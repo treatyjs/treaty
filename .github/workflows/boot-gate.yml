@@ -49,6 +49,17 @@ jobs:
       - name: Build NAPI addon
         run: bun run --cwd libs/authoring/node build
 
+      # The @treaty/vite + @treaty/rolldown plugins EXTERNALIZE their @treaty/* runtime deps, so those
+      # dists must exist on disk before the gate boots. boot-gate.mjs (Step 0) rebuilds vite + rolldown
+      # but NOT their deps — build the TS lib chain here (tsc, the same emit moon uses) so
+      # `@treaty/compiler/dist/index.js`, `@treaty/module-federation`, and `@treaty/ts-vite` resolve.
+      # (Without this they're unresolvable on a fresh checkout -> vite/rolldown fail "Cannot find module".)
+      - name: Build @treaty TS lib chain
+        run: |
+          ./node_modules/.bin/tsc -p libs/treaty/compiler/tsconfig.lib.json
+          ./node_modules/.bin/tsc -p libs/treaty/module-federation/tsconfig.lib.json
+          ./node_modules/.bin/tsc -p libs/typescript/vite/tsconfig.lib.json --ignoreDeprecations 6.0
+
       # The gate's Step 0 rebuilds the @treaty/vite + @treaty/rolldown plugin dists from source itself,
       # so no separate dist-build step is needed. Run the gate: it builds linker-smoke through every
       # available tool, headless-boots each output (works=PASS), and runs the negative test (a broken

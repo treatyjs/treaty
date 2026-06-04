@@ -17,16 +17,12 @@ jobs:
             target: x86_64-pc-windows-msvc
           - host: macos-latest
             target: aarch64-apple-darwin
-          - host: macos-latest
-            target: x86_64-apple-darwin
-          - host: windows-latest
-            target: i686-pc-windows-msvc
-          # NOTE: the cross-from-ubuntu targets (aarch64-unknown-linux-gnu/musl,
-          # x86_64-unknown-linux-musl, armv7) + aarch64-pc-windows-msvc need a
-          # cross-linker (gcc cross-toolchain / zig) that isn't set up here. They
-          # are intentionally NOT built on every-push CI — they belong in a
-          # release workflow with napi --zig cross-compilation. Push CI verifies
-          # the addon builds on the natively-buildable targets below.
+          # NOTE: only TRUE host-native targets run on every-push CI (each runner
+          # builds its own arch). The cross targets — macos x86_64 (from the arm64
+          # runner; nova_vm fails to cross-compile), windows i686, aarch64-pc-windows,
+          # and all cross-from-ubuntu linux (aarch64-gnu/musl, x86_64-musl, armv7) —
+          # need a cross-linker / zig and belong in a RELEASE workflow with
+          # napi --zig, not the merge-gating PR pipeline.
     runs-on: ${{ matrix.host }}
     steps:
       - uses: actions/checkout@v5
