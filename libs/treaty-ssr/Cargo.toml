@@ -1,0 +1,43 @@
+# `treaty_ssr` — request-time server-side rendering for Treaty.
+#
+# The static SSG core (`treaty_ssg`) discovers routes at BUILD time and bakes
+# each one to a hydration-ready document once. This crate is its REQUEST-time
+# sibling: it renders one route PER HTTP request, injecting that request's data
+# (route params / query / headers / cookies + server-fn results) before
+# interpreting the route's emitted Ivy template to HTML and wrapping it in the
+# same hydration boundary the SSG core emits — so the client runtime hydrates a
+# request-rendered page exactly as it hydrates a prerendered one.
+#
+# It REUSES the done foundations rather than rebuilding them:
+#   * `treaty_ssg` (path dep) supplies the Ivy->HTML interpreter (`ivy_html`),
+#     the head/SEO + document-wrap (`seo`), the hydration-manifest shapes
+#     (`manifest`/`types`), and `RenderData`/`RenderSeam`.
+#   * `treaty_runtime` (path dep) supplies the Nova-based `run_macro`/
+#     `run_server_fn` execution used to resolve a route's server data per
+#     request (the request-time counterpart of the SSG build-time `RenderSeam`).
+#
+# DETACHED CRATE: like `treaty_ssg`, the empty `[workspace]` table makes this its
+# own workspace root so it builds independently of the in-flight ivy/runtime
+# edits, yet the parent workspace lists it as a member (a member with its own
+# `[workspace]` builds standalone AND participates in `cargo build --workspace`).
+# Build standalone with:
+#   cargo build --manifest-path libs/treaty-ssr/Cargo.toml
+[workspace]
+
+[package]
+name = "treaty_ssr"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# The static SSG core: route discovery, the Ivy->HTML interpreter, head/SEO emit,
+# the hydration manifest. The request path reuses these byte-for-byte so a
+# request-rendered document is identical in shape to a prerendered one.
+treaty_ssg = { path = "../ssg-core" }
+
+# The Nova-based JS runtime: executes a route's render-time macro and its server
+# functions per request to produce the `RenderData` the template binds against.
+treaty_runtime = { path = "../runtime" }

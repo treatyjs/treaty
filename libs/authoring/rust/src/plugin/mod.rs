@@ -31,12 +31,17 @@ const USE_WEBSOCKET_DIRECTIVE: &str = "use websocket";
 mod axum_backend;
 mod elysia;
 mod express;
+mod ssr_host;
 mod ts_to_rust;
 pub use axum_backend::{
     emit_production_host, AxumBackendPlugin, DEFAULT_HOST_PORT, DEFAULT_SERVER_MODULE,
 };
 pub use elysia::ElysiaEdenPlugin;
 pub use express::ExpressBackendPlugin;
+pub use ssr_host::{
+    emit_ssr_host, emit_ssr_host_defaults, DEFAULT_CLIENT_DIR, DEFAULT_SSR_ROUTES_MODULE,
+    DEFAULT_STATIC_PREFIX,
+};
 
 // ---------------------------------------------------------------------------
 // Backend-agnostic data model.
