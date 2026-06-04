@@ -15,6 +15,9 @@
  */
 
 import assert from 'node:assert/strict'
+import { mkdtempSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { TextDocument } from 'vscode-languageserver-textdocument'
 // Import the specific dist modules (not ../dist/index.js) so the test does not
 // transitively load server.js — whose `@volar/language-server/node` import only
@@ -191,6 +194,116 @@ test('registry indexes a .ts @Component selector for cross-file tags', () => {
 	assert.ok(entry, 'the .ts component is indexed by its real selector tag')
 	assert.equal(entry.className, 'AppCard', 'class name recorded')
 	assert.equal(entry.origin, 'angular', 'origin is angular')
+})
+
+// 11. Go-to-definition resolves a NON-ZERO target range (the class on a later
+//     line of the real declaring file), not the hard-zeroed file top.
+test('.treaty: definition lands on the class/symbol range, not {0,0}', () => {
+	const dir = mkdtempSync(join(tmpdir(), 'treaty-lsp-def-'))
+	// An Angular-style .ts component whose `class Panel` sits well below the top:
+	// two import lines + the decorator precede it, so a correct range is non-zero.
+	const file = join(dir, 'panel.component.ts')
+	const text =
+		"import { Component } from '@angular/core'\n" +
+		"import { signal } from '@angular/core'\n" +
+		'\n' +
+		"@Component({ selector: 'app-panel', template: '' })\n" +
+		'export class Panel {}\n'
+	writeFileSync(file, text)
+
+	const registry = new ComponentRegistry()
+	registry.setProjectSelectors({ Panel: 'app-panel' })
+	registry.indexFile(file, text)
+	const inst = createTemplateService(registry).create(fakeContext())
+
+	const parent = 'const a = 1\n<app-panel></app-panel>'
+	const doc = docOf('file:///proj/src/Parent.treaty', 'treaty', parent)
+	const offset = parent.indexOf('app-panel') + 2
+	const defs = inst.provideDefinition(doc, doc.positionAt(offset), noToken)
+	assert.ok(Array.isArray(defs) && defs.length === 1, 'one definition link is returned')
+	const link = defs[0]
+	assert.ok(/panel\.component\.ts$/.test(link.targetUri), 'targets the declaring .ts file')
+	const sel = link.targetSelectionRange
+	// `export class Panel` is on line 4 (0-based), char 13 → a real, non-zero range.
+	assert.ok(
+		sel.start.line > 0 || sel.start.character > 0,
+		`selection range must be non-zero, got ${JSON.stringify(sel)}`,
+	)
+	assert.equal(sel.start.line, 4, 'selection lands on the `class Panel` line')
+	assert.ok(sel.start.character > 0, 'selection skips the `export class ` prefix')
+	assert.equal(link.targetRange.start.line, 4, 'target range also lands on the class line')
+})
+
+// 12. JSX gets `use:` directive completions (the selectorless directive set),
+//     same as .treaty — proving the JSX completion-context detects use: too.
+test('.tsx: use: offers selectorless directives in JSX', () => {
+	const { inst } = instance()
+	const text = 'export default function App() {\n  return <div use:h></div>\n}'
+	const doc = docOf('file:///proj/src/App.tsx', 'treaty-jsx', text)
+	const offset = text.indexOf('use:h') + 'use:h'.length
+	const list = inst.provideCompletionItems(doc, doc.positionAt(offset), noCtx, noToken)
+	assert.ok(list, 'a list is returned in JSX use: position')
+	const dir = list.items.find((i) => i.label === 'highlight')
+	assert.ok(dir, 'the highlight directive is offered under use: in JSX')
+	assert.ok(dir.detail.includes('Highlight'), 'detail names the Highlight class')
+})
+
+// 13. JSX gets @-control-flow snippet completions, same as .treaty.
+test('.tsx: @ offers control-flow block snippets in JSX', () => {
+	const { inst } = instance()
+	const text = 'export default function App() {\n  return <div>@i</div>\n}'
+	const doc = docOf('file:///proj/src/App.tsx', 'treaty-jsx', text)
+	const offset = text.indexOf('@i') + 2
+	const list = inst.provideCompletionItems(doc, doc.positionAt(offset), noCtx, noToken)
+	assert.ok(list, 'a list is returned for an @-head in JSX')
+	const ifItem = list.items.find((i) => i.label === '@if')
+	assert.ok(ifItem, '@if is offered in JSX')
+	assert.equal(ifItem.insertTextFormat, 2, '@if is a snippet')
+})
+
+// 14. A template diagnostic anchors on a NON-ZERO range when the embedded TS
+//     region starts below the document top (the rich, anchored path — not the
+//     old fixed whole-document range at offset 0).
+test('.treaty: diagnostics anchor on the embedded-TS region, not {0,0}', () => {
+	const { registry } = instance()
+	// Place the broken interpolation after a leading HTML region so the embedded
+	// TS-by-default region (the `const a` line) begins on a non-zero line.
+	const text = '<div>{{ }}</div>\nconst a = 1\n'
+	const uri = 'file:///proj/src/BrokenAnchored.treaty'
+	const doc = docOf(uri, 'treaty', text)
+
+	// A context whose script-store yields a root virtual code whose embedded TS
+	// code maps from a non-zero source offset (the start of `const a`), so the
+	// anchored fallback lands there rather than at the document top.
+	const tsStart = text.indexOf('const a')
+	const rootVirtualCode = {
+		id: 'root',
+		languageId: 'treaty',
+		embeddedCodes: [
+			{
+				id: 'ts',
+				languageId: 'typescript',
+				mappings: [
+					{ sourceOffsets: [tsStart], generatedOffsets: [0], lengths: [11], data: {} },
+				],
+				embeddedCodes: [],
+			},
+		],
+	}
+	const ctx = {
+		env: { workspaceFolders: [] },
+		language: { scripts: { get: (id) => (String(id) === uri ? { generated: { root: rootVirtualCode } } : undefined) } },
+	}
+	const inst = createTemplateService(registry).create(ctx)
+	const diags = inst.provideDiagnostics(doc, noToken)
+	assert.ok(Array.isArray(diags) && diags.length >= 1, 'at least one diagnostic is returned')
+	const r = diags[0].range
+	assert.ok(
+		r.start.line > 0 || r.start.character > 0,
+		`diagnostic range must be non-zero, got ${JSON.stringify(r)}`,
+	)
+	// The embedded TS region begins on line 1 (the `const a` line).
+	assert.equal(r.start.line, 1, 'diagnostic anchors on the embedded-TS region line')
 })
 
 for (const line of results) console.log(line)

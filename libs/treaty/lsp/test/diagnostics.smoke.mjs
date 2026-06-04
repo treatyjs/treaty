@@ -10,7 +10,7 @@
  */
 
 import assert from 'node:assert/strict'
-import { provideDiagnostics } from '../dist/diagnostics.js'
+import { mapErrorsToDiagnostics, provideDiagnostics } from '../dist/diagnostics.js'
 
 /** Assert a Diagnostic range is well-formed and non-negative. */
 function assertSaneRange(diag, label) {
@@ -83,6 +83,65 @@ try {
 } catch (err) {
 	failures++
 	results.push(`FAIL valid: ${err.message}`)
+}
+
+// Case 4: a `sass:` error with a `./stdin:line:col` locator anchors INSIDE the
+// <style> block on a non-zero line — proving the rich, sass-aware range mapping
+// (not a fixed whole-document range at offset 0).
+try {
+	const styled = '<div>hi</div>\n<style lang="scss">\n  .x { color: $missing; }\n</style>\n'
+	// grass-shaped locator: relative to the CSS body, line 2, col 9.
+	const message = 'sass: Undefined variable.\n  ./stdin:2:9'
+	const diags = mapErrorsToDiagnostics([message], {
+		fileName: 'styled.treaty',
+		languageId: 'treaty',
+		text: styled,
+	})
+	assert.ok(Array.isArray(diags) && diags.length === 1, 'sass: one diagnostic returned')
+	assertSaneRange(diags[0], 'sass')
+	const r = diags[0].range
+	assert.ok(
+		r.start.line > 0 || r.start.character > 0,
+		`sass: range must be non-zero, got ${JSON.stringify(r)}`,
+	)
+	results.push(`PASS sass: anchored range=${JSON.stringify(r)}`)
+} catch (err) {
+	failures++
+	results.push(`FAIL sass: ${err.message}`)
+}
+
+// Case 5: a non-positional error anchors on the embedded-TS region (recovered
+// from the root virtual code's first mapping), not the document top.
+try {
+	const text = '<div>hi</div>\nconst broken = ;\n'
+	const tsStart = text.indexOf('const broken')
+	const rootVirtualCode = {
+		id: 'root',
+		languageId: 'treaty',
+		embeddedCodes: [
+			{
+				id: 'ts',
+				languageId: 'typescript',
+				mappings: [
+					{ sourceOffsets: [tsStart], generatedOffsets: [0], lengths: [12], data: {} },
+				],
+				embeddedCodes: [],
+			},
+		],
+	}
+	const diags = mapErrorsToDiagnostics(
+		['Unexpected token.'],
+		{ fileName: 'anchored.treaty', languageId: 'treaty', text },
+		rootVirtualCode,
+	)
+	assert.ok(Array.isArray(diags) && diags.length === 1, 'anchored: one diagnostic returned')
+	assertSaneRange(diags[0], 'anchored')
+	const r = diags[0].range
+	assert.equal(r.start.line, 1, 'anchored: lands on the embedded-TS region line')
+	results.push(`PASS anchored: embedded-TS range=${JSON.stringify(r)}`)
+} catch (err) {
+	failures++
+	results.push(`FAIL anchored: ${err.message}`)
 }
 
 for (const line of results) console.log(line)

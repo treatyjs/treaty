@@ -38,7 +38,7 @@ export type { TreatyRegion, TreatyRegionKind } from './regions.js'
 export { scanTreatyRegions, typeScriptRegions } from './regions.js'
 
 export type { DiagnosticDocument } from './diagnostics.js'
-export { provideDiagnostics, DIAGNOSTIC_SOURCE } from './diagnostics.js'
+export { provideDiagnostics, mapErrorsToDiagnostics, DIAGNOSTIC_SOURCE } from './diagnostics.js'
 
 export type { CompiledComponent, ImportedSelectorMap, ProjectSelectors } from './compiler.js'
 export {
@@ -66,7 +66,7 @@ export type {
 	TemplateContext,
 	TemplateCompletionKind,
 } from './template-context.js'
-export { templateContextAt, regionAt } from './template-context.js'
+export { templateContextAt, jsxContextAt, regionAt } from './template-context.js'
 
 export { createTemplateService, TEMPLATE_DIAGNOSTIC_SOURCE } from './template-service.js'
 

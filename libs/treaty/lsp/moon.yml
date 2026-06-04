@@ -61,3 +61,21 @@ tasks:
     inputs:
     - src/**/*
     - test/diagnostics.smoke.mjs
+  smoke-angular:
+    command: node
+    args:
+    - $projectRoot/test/angular.smoke.mjs
+    deps:
+    - ~:build
+    inputs:
+    - src/**/*
+    - test/angular.smoke.mjs
+  smoke-jsx-types:
+    command: node
+    args:
+    - $projectRoot/test/jsx-types.smoke.mjs
+    deps:
+    - ~:build
+    inputs:
+    - src/**/*
+    - test/jsx-types.smoke.mjs

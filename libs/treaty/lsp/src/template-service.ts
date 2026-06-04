@@ -31,9 +31,10 @@
  */
 
 import { extname } from 'node:path'
+import { readFileSync } from 'node:fs'
+import { URI } from 'vscode-uri'
 import {
 	CompletionItemKind,
-	DiagnosticSeverity,
 	InsertTextFormat,
 	MarkupKind,
 	type CompletionItem,
@@ -57,7 +58,13 @@ import {
 	type ComponentEntry,
 } from './component-registry.js'
 import { compileWithSelectors } from './compiler.js'
-import { templateContextAt, type TemplateCompletionKind } from './template-context.js'
+import { mapErrorsToDiagnostics, type DiagnosticDocument } from './diagnostics.js'
+import {
+	jsxContextAt,
+	templateContextAt,
+	type TemplateCompletionKind,
+} from './template-context.js'
+import type { VirtualCode } from '@volar/language-core'
 
 /** The volarjs language ids this plugin serves (the Treaty authoring formats). */
 const TREATY_LANGUAGE_IDS = new Set(['treaty', 'treaty-jsx'])
@@ -168,7 +175,7 @@ export function createTemplateService(
 						return undefined
 					}
 					indexDocument(document)
-					return provideTemplateDiagnostics(document, registry)
+					return provideTemplateDiagnostics(document, registry, context)
 				},
 			}
 		},
@@ -188,7 +195,7 @@ function provideCompletions(
 	const source = document.getText()
 	const offset = document.offsetAt(position)
 	const ctx = isJsx(document.languageId)
-		? jsxTemplateContext(source, offset)
+		? jsxContextAt(source, offset)
 		: templateContextAt(source, offset)
 	if (ctx.completion === 'none') {
 		return undefined
@@ -366,18 +373,171 @@ function provideDefinition(
 		return undefined
 	}
 	const targetUri = fileNameToUri(entry.fileName)
-	const zero: Range = { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } }
+	const { targetRange, selectionRange } = resolveTargetRanges(entry)
 	return [
 		{
 			targetUri,
-			targetRange: zero,
-			targetSelectionRange: zero,
+			targetRange,
+			targetSelectionRange: selectionRange,
 			originSelectionRange: {
 				start: document.positionAt(word.start),
 				end: document.positionAt(word.end),
 			},
 		},
 	]
+}
+
+/**
+ * Resolve the real go-to-definition ranges for a registry entry: the full span
+ * of the declaration (`targetRange`) and the identifier to highlight
+ * (`targetSelectionRange`). The declaring file is read and the class/symbol
+ * located so navigation lands on the declaration rather than the file top.
+ *
+ *  - Angular `.ts` and JSX sources that export an explicit `class <Name>` jump
+ *    to that class (selection range over the class name).
+ *  - `.treaty`/JSX selectorless files have no explicit class (the filename is
+ *    the component name); navigation lands on the first meaningful declaration —
+ *    the file's first non-import, non-blank statement — or the file top when the
+ *    source can't be read.
+ */
+function resolveTargetRanges(entry: ComponentEntry): {
+	targetRange: Range
+	selectionRange: Range
+} {
+	const zero: Range = { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } }
+	const source = readTargetSource(entry.fileName)
+	if (source === undefined) {
+		return { targetRange: zero, selectionRange: zero }
+	}
+	const lineIndex = new SourceLineIndex(source)
+	const located = locateSymbol(source, entry.className) ?? locateFirstDeclaration(source)
+	if (!located) {
+		return { targetRange: zero, selectionRange: zero }
+	}
+	const selectionRange: Range = {
+		start: lineIndex.positionAt(located.nameStart),
+		end: lineIndex.positionAt(located.nameEnd),
+	}
+	const targetRange: Range = {
+		start: lineIndex.positionAt(located.declStart),
+		end: lineIndex.positionAt(located.declEnd),
+	}
+	return { targetRange, selectionRange }
+}
+
+/** A located declaration: the statement span plus the identifier span to select. */
+interface LocatedSymbol {
+	readonly declStart: number
+	readonly declEnd: number
+	readonly nameStart: number
+	readonly nameEnd: number
+}
+
+/**
+ * Locate an explicit `class <className>` (optionally `export`/`abstract`/`default`)
+ * declaration in a source, returning the statement start and the class-name span.
+ */
+function locateSymbol(source: string, className: string): LocatedSymbol | undefined {
+	const re = new RegExp(
+		`(?:^|[\\n;])([ \\t]*(?:export\\s+)?(?:default\\s+)?(?:abstract\\s+)?class\\s+)(${escapeRegExp(className)})\\b`,
+	)
+	const m = re.exec(source)
+	if (!m) {
+		return undefined
+	}
+	// m.index points at the leading boundary (newline/`;`/start); skip it so the
+	// declaration start sits on the first modifier/keyword. `m[1]` (the
+	// modifiers + `class `) begins right after that consumed boundary char.
+	const lead = m[0]!.startsWith('\n') || m[0]!.startsWith(';') ? 1 : 0
+	const groupStart = m.index + lead
+	const declStart = groupStart + leadingWhitespace(m[1]!)
+	const nameStart = groupStart + m[1]!.length
+	const nameEnd = nameStart + m[2]!.length
+	return { declStart, declEnd: nameEnd, nameStart, nameEnd }
+}
+
+/**
+ * Locate the first meaningful declaration in a selectorless `.treaty`/JSX source
+ * that has no explicit `class`: the first non-blank line that is not an import,
+ * a comment, or a closing brace — i.e. the component body's first statement.
+ */
+function locateFirstDeclaration(source: string): LocatedSymbol | undefined {
+	const lines = source.split('\n')
+	let offset = 0
+	for (const line of lines) {
+		const trimmed = line.trim()
+		const skip =
+			trimmed.length === 0 ||
+			trimmed.startsWith('import ') ||
+			trimmed.startsWith('//') ||
+			trimmed.startsWith('/*') ||
+			trimmed.startsWith('*') ||
+			trimmed.startsWith('}')
+		if (!skip) {
+			const start = offset + (line.length - line.trimStart().length)
+			const end = offset + line.replace(/\s+$/, '').length
+			return { declStart: start, declEnd: end, nameStart: start, nameEnd: end }
+		}
+		offset += line.length + 1 // +1 for the consumed '\n'
+	}
+	return undefined
+}
+
+/** The count of leading whitespace characters in a string. */
+function leadingWhitespace(text: string): number {
+	return text.length - text.trimStart().length
+}
+
+/**
+ * Read the declaring file's text for symbol resolution. Best-effort: an
+ * unreadable file (deleted, permissions, or a non-file URI) yields `undefined`
+ * so navigation falls back to the file top rather than throwing.
+ */
+function readTargetSource(fileName: string): string | undefined {
+	try {
+		return readFileSync(fileName, 'utf8')
+	} catch {
+		return undefined
+	}
+}
+
+/** Line-start index over a raw source string for offset→{@link Position} mapping. */
+class SourceLineIndex {
+	private readonly lineStarts: number[]
+	private readonly length: number
+
+	constructor(text: string) {
+		this.length = text.length
+		const starts = [0]
+		for (let i = 0; i < text.length; i++) {
+			const ch = text.charCodeAt(i)
+			if (ch === 10 /* \n */) {
+				starts.push(i + 1)
+			} else if (ch === 13 /* \r */) {
+				if (text.charCodeAt(i + 1) === 10) {
+					i++
+				}
+				starts.push(i + 1)
+			}
+		}
+		this.lineStarts = starts
+	}
+
+	/** Convert a clamped character offset into a zero-based LSP {@link Position}. */
+	positionAt(offset: number): Position {
+		const clamped = offset < 0 ? 0 : offset > this.length ? this.length : offset
+		let lo = 0
+		let hi = this.lineStarts.length - 1
+		while (lo < hi) {
+			const mid = (lo + hi + 1) >> 1
+			if (this.lineStarts[mid]! <= clamped) {
+				lo = mid
+			} else {
+				hi = mid - 1
+			}
+		}
+		return { line: lo, character: clamped - this.lineStarts[lo]! }
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -389,48 +549,76 @@ function provideDefinition(
  * imported selectors are resolved from the workspace registry so a cross-module
  * `<app-card>` compiles the way a bundler build would, then the Rust compiler's
  * errors are converted into LSP diagnostics over the source.
+ *
+ * The error→range anchoring is the *single* shared path from {@link
+ * ./diagnostics.js mapErrorsToDiagnostics}: sass errors are pinned inside the
+ * `<style>` block, every other message is anchored to the start of the embedded
+ * TypeScript region (recovered from the document's root virtual code), falling
+ * back to the document start. There is no longer a separate whole-document
+ * range-at-offset-0 path here.
  */
 function provideTemplateDiagnostics(
 	document: TextDocument,
 	registry: ComponentRegistry,
+	context: LanguageServiceContext,
 ): Diagnostic[] {
 	const source = document.getText()
 	const fileName = uriToFileName(document.uri)
 	const imported = registry.importedSelectorsFor(source)
 	const compiled = compileWithSelectors(source, fileName, imported)
-	if (compiled.errors.length === 0) {
-		return []
+	const diagnosticDocument: DiagnosticDocument = {
+		fileName,
+		languageId: document.languageId,
+		text: source,
 	}
-	const fallback: Range = {
-		start: { line: 0, character: 0 },
-		end: document.positionAt(Math.min(1, source.length)),
-	}
-	return compiled.errors.map((message) => ({
-		range: fallback,
-		severity: DiagnosticSeverity.Error,
-		source: TEMPLATE_DIAGNOSTIC_SOURCE,
-		message: message.replace(/\s+$/, ''),
-	}))
+	const rootVirtualCode = rootVirtualCodeOf(context, document.uri)
+	return mapErrorsToDiagnostics(compiled.errors, diagnosticDocument, rootVirtualCode)
 }
 
-// ---------------------------------------------------------------------------
-// JSX template context
-// ---------------------------------------------------------------------------
-
 /**
- * Lightweight JSX completion-context probe: in a `.tsx`/`.tjsx` file a
- * selectorless tag is a lowercase JSX element, so reuse the open-tag detection
- * over the raw source. `use:` and control-flow heads work identically.
+ * Resolve a document's root {@link VirtualCode} from the language context, used
+ * to anchor non-positional diagnostics on the embedded TypeScript region.
+ * Best-effort: returns `undefined` when the script is not (yet) tracked.
  */
-function jsxTemplateContext(
-	source: string,
-	offset: number,
-): ReturnType<typeof templateContextAt> {
-	// The HTML/template scanner is `.treaty`-shaped; for JSX we only need the
-	// open-tag / use: / @-head probe, which `templateContextAt` already performs
-	// for the TS-body region. Treating the whole JSX file as one TS-by-default
-	// region yields exactly that probe.
-	return templateContextAt(source, offset)
+function rootVirtualCodeOf(
+	context: LanguageServiceContext,
+	uri: string,
+): VirtualCode | undefined {
+	const language = context.language as unknown as {
+		scripts?: {
+			get?: (id: unknown) => { generated?: { root?: VirtualCode } } | undefined
+		}
+	}
+	const scripts = language.scripts
+	const get = scripts?.get
+	if (!get) {
+		return undefined
+	}
+	// `scripts.get` keys on the volarjs script id (a `URI` in the server, a string
+	// for in-process callers); try the parsed URI first, then the raw string.
+	for (const id of [parseUri(uri), uri]) {
+		if (id === undefined) {
+			continue
+		}
+		try {
+			const root = get.call(scripts, id)?.generated?.root
+			if (root) {
+				return root
+			}
+		} catch {
+			// Try the next id form.
+		}
+	}
+	return undefined
+}
+
+/** Parse a uri string into a {@link URI}, or `undefined` when it is not parseable. */
+function parseUri(uri: string): URI | undefined {
+	try {
+		return URI.parse(uri)
+	} catch {
+		return undefined
+	}
 }
 
 // ---------------------------------------------------------------------------

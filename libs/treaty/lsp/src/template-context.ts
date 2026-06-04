@@ -126,8 +126,44 @@ export function templateContextAt(source: string, offset: number): TemplateConte
 	return { region, completion: 'none', prefix: '', prefixStart: offset }
 }
 
+/**
+ * Classify the completion context at `offset` in a JSX/`.tsx` authoring source.
+ *
+ * A `.tsx`/`.tjsx` Treaty file is TypeScript + JSX with no `.treaty` region
+ * structure: a selectorless component is a lowercase JSX element (`<panel/>`), a
+ * directive is applied with `use:hi`, and `@if`/`@for`/… control-flow heads are
+ * authored inline. JSX therefore wants the *same* template probes the `.treaty`
+ * HTML region uses — `use:` directive, `@`-control-flow head, then open-tag — run
+ * directly over the source rather than gated behind an HTML region the JSX
+ * scanner never produces. The whole file is treated as one TS-by-default region.
+ */
+export function jsxContextAt(source: string, offset: number): TemplateContext {
+	const region: TreatyRegion = { kind: 'ts', start: 0, end: source.length }
+	const refined = refineTemplateContext(source, offset, region)
+	if (refined.completion !== 'none') {
+		return refined
+	}
+	// Inside a JSX expression container `{ … }` the user is in component scope; the
+	// TS service drives member completion, so the Treaty plugin stays out of the
+	// way (mirrors how `.treaty` interpolations defer member hints to TS).
+	return { region, completion: 'none', prefix: '', prefixStart: offset }
+}
+
 /** Refine the completion context for an offset inside an HTML template region. */
 function refineHtmlContext(
+	source: string,
+	offset: number,
+	region: TreatyRegion,
+): TemplateContext {
+	return refineTemplateContext(source, offset, region)
+}
+
+/**
+ * The shared template-position probe used by both the `.treaty` HTML region and
+ * the JSX whole-file context: detect, in priority order, a `use:` directive
+ * name, an `@`-control-flow head, then an open-tag name; otherwise `none`.
+ */
+function refineTemplateContext(
 	source: string,
 	offset: number,
 	region: TreatyRegion,

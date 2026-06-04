@@ -91,16 +91,32 @@ export function provideDiagnostics(
 	rootVirtualCode?: VirtualCode,
 ): Diagnostic[] {
 	const compiled = compile(document)
-	if (compiled.errors.length === 0) {
+	return mapErrorsToDiagnostics(compiled.errors, document, rootVirtualCode)
+}
+
+/**
+ * Map a set of compiler error messages onto LSP {@link Diagnostic}s over a
+ * document's source — the single range-anchoring path shared by both the
+ * registry-free {@link provideDiagnostics} and the registry-aware template
+ * diagnostics in the language-service plugin.
+ *
+ * Each message is anchored by its embedded locator: a `sass:` error pins inside
+ * the `<style>` block (line/col anchored), and every other message falls back to
+ * the start of the embedded TypeScript region (then the document start). Callers
+ * that already ran a registry-aware compile pass its `errors` straight through,
+ * so cross-module diagnostics use exactly the same anchoring.
+ */
+export function mapErrorsToDiagnostics(
+	errors: readonly string[],
+	document: DiagnosticDocument,
+	rootVirtualCode?: VirtualCode,
+): Diagnostic[] {
+	if (errors.length === 0) {
 		return []
 	}
-
 	const lineIndex = new LineIndex(document.text)
 	const fallback = fallbackRange(document, rootVirtualCode, lineIndex)
-
-	return compiled.errors.map((message) =>
-		toDiagnostic(message, document, lineIndex, fallback),
-	)
+	return errors.map((message) => toDiagnostic(message, document, lineIndex, fallback))
 }
 
 /** Route a document to the right compiler entry point by authoring language id. */
