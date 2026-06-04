@@ -79,3 +79,21 @@ tasks:
     inputs:
     - src/**/*
     - test/jsx-types.smoke.mjs
+  smoke-regions:
+    command: node
+    args:
+    - $projectRoot/test/regions.smoke.mjs
+    deps:
+    - ~:build
+    inputs:
+    - src/**/*
+    - test/regions.smoke.mjs
+  smoke-use-optional:
+    command: node
+    args:
+    - $projectRoot/test/use-optional.smoke.mjs
+    deps:
+    - ~:build
+    inputs:
+    - src/**/*
+    - test/use-optional.smoke.mjs

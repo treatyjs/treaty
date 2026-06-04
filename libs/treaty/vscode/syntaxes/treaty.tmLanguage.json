@@ -4,6 +4,7 @@
   "scopeName": "source.treaty",
   "patterns": [
     { "include": "#macroBlock" },
+    { "include": "#serverBlock" },
     { "include": "#styleBlock" },
     { "include": "#htmlTagRegion" },
     { "include": "#interpolation" },
@@ -11,6 +12,25 @@
     { "include": "source.ts" }
   ],
   "repository": {
+    "serverBlock": {
+      "comment": "Inline `server { … }` / `server:lang { … }` block: server-only code lifted out of the client bundle. The `server` keyword + optional `:lang` tag paint as a server marker; the body embeds TypeScript so it still highlights, scoped under a `server` meta so a theme can tint 'runs on server'.",
+      "begin": "(?<![.$\\w])(server)\\b(?:\\s*(:)\\s*([A-Za-z_][\\w]*))?\\s*(\\{)",
+      "beginCaptures": {
+        "1": { "name": "keyword.control.server.treaty storage.type.server.treaty" },
+        "2": { "name": "punctuation.separator.server-lang.treaty" },
+        "3": { "name": "entity.name.type.server-lang.treaty" },
+        "4": { "name": "punctuation.definition.block.begin.treaty" }
+      },
+      "end": "(\\})",
+      "endCaptures": {
+        "1": { "name": "punctuation.definition.block.end.treaty" }
+      },
+      "name": "meta.block.server.treaty",
+      "contentName": "meta.embedded.block.server.treaty",
+      "patterns": [
+        { "include": "source.ts" }
+      ]
+    },
     "macroBlock": {
       "comment": "Leading ```-fenced compile-time macro block at file top.",
       "begin": "\\A\\s*(`{3,})\\s*([^\\n`]*)$",

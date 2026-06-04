@@ -37,6 +37,7 @@ import {
 	loadTsdkByPath,
 } from '@volar/language-server/node'
 import { create as createTypeScriptServices } from 'volar-service-typescript'
+import { create as createCssService } from 'volar-service-css'
 import { createTreatyLanguagePlugin } from './language.js'
 import { applyTreatyJsxAutoTypes, resolveTreatyJsxTypesEntry } from './jsx-types.js'
 import { ComponentRegistry } from './component-registry.js'
@@ -113,8 +114,13 @@ export function createServer(connection: Connection = createConnection()): Treat
 				// The TypeScript service covers the embedded TS/JSX projection of
 				// every Treaty region: completion, hover, definition, references,
 				// rename, signature help, semantic tokens and formatting of the body
-				// and every `{{ … }}` expression.
+				// and every `{{ … }}` expression (the interpolations are projected
+				// into the same embedded TS code, so they share the body scope).
 				...createTypeScriptServices(typescript),
+				// The CSS service covers every embedded `css` code — the body of each
+				// `<style>` block in a `.treaty` file — so completion, hover and
+				// validation inside a `<style>` block behave like editing CSS.
+				createCssService(),
 				// The Treaty service adds the selectorless / signals / template
 				// intelligence on top (it runs after, so it augments rather than
 				// shadows the TS results).

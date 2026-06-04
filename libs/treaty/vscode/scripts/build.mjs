@@ -68,6 +68,12 @@ const serverOptions = {
 	target: 'node20',
 	sourcemap: true,
 	minify,
+	// Prefer each dependency's ESM (`module`) entry over its CommonJS `main`.
+	// `vscode-css-languageservice` (pulled in by `volar-service-css`) ships a UMD
+	// `main` whose lazy `require('./parser/cssParser')` calls do not survive
+	// bundling into a single ESM file; its `module` ESM entry uses static imports
+	// that bundle cleanly, so the embedded `<style>` CSS service loads at runtime.
+	mainFields: ['module', 'main'],
 	external: [...NATIVE_EXTERNAL],
 	// The server uses `createRequire(import.meta.url)`; preserve a working
 	// `require` in the ESM output for its runtime addon/tsdk resolution.

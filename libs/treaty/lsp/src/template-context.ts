@@ -22,6 +22,12 @@ export type TemplateCompletionKind =
 	| 'tag'
 	/** A `use:` directive name (`use:hi|`): offer directives. */
 	| 'use-directive'
+	/**
+	 * A bare attribute name inside an open tag (`<a rout|`): offer attribute-selector
+	 * directives (built-in like `routerLink`, plus imported `[x]` directives) that
+	 * apply WITHOUT `use:`. The `use:` form stays valid but is optional/redundant.
+	 */
+	| 'attribute'
 	/** An `@`-control-flow head (`@i|`): offer `@if`/`@for`/… blocks. */
 	| 'control-flow'
 	/** Inside a `{{ … }}` interpolation: offer component-scope members. */
@@ -203,6 +209,19 @@ function refineTemplateContext(
 		}
 	}
 
+	// A bare attribute name inside an open tag: `<a rout|` / `<button class="x" rl|`.
+	// Offer attribute-selector directives (routerLink, imported `[x]` directives)
+	// here so they complete + auto-import WITHOUT `use:`.
+	const attr = attributeNameBefore(source, offset)
+	if (attr) {
+		return {
+			region,
+			completion: 'attribute',
+			prefix: attr.text,
+			prefixStart: attr.start,
+		}
+	}
+
 	return { region, completion: 'none', prefix: '', prefixStart: offset }
 }
 
@@ -240,6 +259,58 @@ function openTagBefore(source: string, offset: number): Word | undefined {
 			return { text: source.slice(i, offset), start: i }
 		}
 		return undefined
+	}
+	return undefined
+}
+
+/**
+ * Recover a bare attribute-name prefix when the cursor sits in attribute position
+ * inside an open tag: `<a rou|`, `<button class="x" rl|`, or a fresh `<div |`.
+ *
+ * The cursor is in attribute position when, scanning backward over the current
+ * (attribute-name) word, the char before it is whitespace AND somewhere earlier
+ * on the way back there is an unclosed `<tagname` open tag — i.e. no `>`/`<`/`}`
+ * closes or interrupts the tag, and a `<` followed by a tag-name char is reached.
+ * Returns the partial attribute name (possibly empty for a fresh `<div |`) and
+ * its start offset, or `undefined` when the cursor is not in attribute position.
+ */
+function attributeNameBefore(source: string, offset: number): Word | undefined {
+	const word = wordBefore(source, offset, /[A-Za-z0-9_-]/)
+	let i = word.start
+	// The attribute name must be preceded by whitespace (separating it from the
+	// tag name or a previous attribute); otherwise the cursor is mid-token.
+	if (i === 0 || !/\s/.test(source[i - 1]!)) {
+		return undefined
+	}
+	// Walk backward to confirm we are inside an unclosed open tag. Skip over
+	// attribute values / whitespace; stop on the `<` that opens the tag.
+	let quote: string | undefined
+	while (i > 0) {
+		const ch = source[i - 1]!
+		if (quote) {
+			if (ch === quote) {
+				quote = undefined
+			}
+			i--
+			continue
+		}
+		if (ch === '"' || ch === "'" || ch === '`') {
+			quote = ch
+			i--
+			continue
+		}
+		// A `>` (tag already closed), a `{`/`}` (interpolation / control-flow), or a
+		// `<` that is NOT an open tag-name start means we are not in attribute position.
+		if (ch === '>' || ch === '{' || ch === '}') {
+			return undefined
+		}
+		if (ch === '<') {
+			// `<` immediately followed by a tag-name char is the open tag we want;
+			// `</` (a close tag) or `< ` is not an attribute host.
+			const next = source[i]
+			return next !== undefined && /[A-Za-z]/.test(next) ? word : undefined
+		}
+		i--
 	}
 	return undefined
 }

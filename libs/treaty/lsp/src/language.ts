@@ -26,7 +26,13 @@ import {
 	resolveByExtension,
 	type AuthoringLanguagePlugin,
 } from './plugins.js'
-import { typeScriptRegions } from './regions.js'
+import {
+	findInterpolationsIn,
+	interpolationInner,
+	scanTreatyRegions,
+	styleInner,
+	type TreatyRegion,
+} from './regions.js'
 
 /**
  * Stable id of the embedded TypeScript virtual code carried by every Treaty
@@ -42,6 +48,14 @@ export const EMBEDDED_TS_ID = 'ts'
 export const EMBEDDED_HTML_ID = 'html'
 
 /**
+ * Id prefix of an embedded CSS virtual code carried by a `.treaty` root virtual
+ * code for each `<style>` block, suffixed with the block's index (`style_0`,
+ * `style_1`, …). The CSS language service serves completion/validation over
+ * these so editing inside a `<style>` block behaves like editing CSS.
+ */
+export const EMBEDDED_CSS_ID_PREFIX = 'style_'
+
+/**
  * Full {@link CodeInformation} capability set: the embedded TypeScript is a
  * faithful projection of the source spans, so every language feature
  * (verification, completion, semantic, navigation, structure, format) maps
@@ -54,6 +68,25 @@ const FULL_CODE_INFORMATION: CodeInformation = {
 	navigation: true,
 	structure: true,
 	format: true,
+}
+
+/**
+ * Capabilities for an embedded `{{ … }}` interpolation expression projected into
+ * the TypeScript code. Completion, hover (semantic), navigation and type
+ * verification all map through — so TS completion works INSIDE the interpolation
+ * against the component scope — but `format` and `structure` are off: the
+ * interpolation is a fragment spliced into the body view, so letting the TS
+ * formatter or document-symbol pass reach across the `{{ }}` boundary would
+ * corrupt the source. The same fragment-safety the Angular/Vue template
+ * projections use for interpolation expressions.
+ */
+const EXPRESSION_CODE_INFORMATION: CodeInformation = {
+	verification: true,
+	completion: true,
+	semantic: true,
+	navigation: true,
+	structure: false,
+	format: false,
 }
 
 /** A snapshot over a fixed string, used for generated embedded codes. */
@@ -74,16 +107,29 @@ class StringSnapshot implements IScriptSnapshot {
 }
 
 /**
- * Build the volarjs {@link VirtualCode} for a `.treaty` single-file component.
+ * Build the volarjs {@link VirtualCode} for a `.treaty` single-file component as
+ * a REGION-AWARE projection: each authoring region is projected into the
+ * embedded language that owns it, so completion/hover/validation follow the
+ * cursor.
  *
  * The root code maps the whole source 1:1 (so the document is recognized and
- * formatting/structure features see the original text), and carries a single
- * embedded TypeScript code that concatenates the *TypeScript-by-default*
- * regions (everything outside HTML tags, `<style>` blocks, `{{ … }}`
- * interpolations, `@`-control-flow markers, and a leading macro fence). Each
- * concatenated region carries a {@link CodeMapping} back to its original span,
- * so positions reported by the TS service — and by the Rust compiler — map
- * back to the source faithfully.
+ * formatting/structure features see the original text, and the Treaty template
+ * service can read the raw source for the template region), and carries:
+ *
+ *  - one embedded **TypeScript** code (`id: 'ts'`) that concatenates the
+ *    *TypeScript-by-default* body regions AND the inner expression text of every
+ *    `{{ … }}` interpolation, each with a {@link CodeMapping} back to its span.
+ *    Because the interpolations share this single embedded code with the body,
+ *    an identifier in `{{ count }}` resolves against the `const count` declared
+ *    in the body — so the TypeScript service drives completion/hover INSIDE the
+ *    interpolation, against the component scope; and
+ *  - one embedded **CSS** code per `<style>` block (`id: 'style_<n>'`) covering
+ *    the block's CSS body, so the CSS language service drives completion and
+ *    validation inside the block.
+ *
+ * The HTML/control-flow template regions are intentionally NOT projected: the
+ * Treaty template service serves them (selectorless tags, `use:` directives,
+ * control-flow) directly over the root document, beating a plain HTML service.
  */
 export function createTreatyVirtualCode(
 	languageId: string,
@@ -92,37 +138,114 @@ export function createTreatyVirtualCode(
 	const length = snapshot.getLength()
 	const source = snapshot.getText(0, length)
 
-	const regions = typeScriptRegions(source)
-	let generated = ''
-	const tsMappings: CodeMapping[] = []
-	for (const region of regions) {
-		const chunk = source.slice(region.start, region.end)
-		tsMappings.push({
-			sourceOffsets: [region.start],
-			generatedOffsets: [generated.length],
-			lengths: [chunk.length],
-			data: FULL_CODE_INFORMATION,
-		})
-		// Separate concatenated chunks with a newline so token boundaries from
-		// distinct source regions never fuse into one identifier in the TS view.
-		generated += chunk + '\n'
-	}
-
-	const embedded: VirtualCode = {
-		id: EMBEDDED_TS_ID,
-		languageId: 'typescript',
-		snapshot: new StringSnapshot(generated),
-		mappings: tsMappings,
-		embeddedCodes: [],
-	}
+	const regions = scanTreatyRegions(source)
+	const embeddedCodes: VirtualCode[] = [
+		buildEmbeddedTs(source, regions),
+		...buildEmbeddedStyles(source, regions),
+	]
 
 	return {
 		id: 'root',
 		languageId,
 		snapshot,
 		mappings: [wholeDocumentMapping(length)],
-		embeddedCodes: [embedded],
+		embeddedCodes,
 	}
+}
+
+/**
+ * Build the embedded TypeScript code: the TS-by-default body regions plus the
+ * inner expression text of each `{{ … }}` interpolation, concatenated (each
+ * chunk newline-separated so distinct source spans never fuse into one token)
+ * and each carrying a {@link CodeMapping} back to its source span.
+ */
+function buildEmbeddedTs(source: string, regions: readonly TreatyRegion[]): VirtualCode {
+	let generated = ''
+	const tsMappings: CodeMapping[] = []
+	const push = (start: number, end: number, data: CodeInformation): void => {
+		if (end <= start) {
+			return
+		}
+		tsMappings.push({
+			sourceOffsets: [start],
+			generatedOffsets: [generated.length],
+			lengths: [end - start],
+			data,
+		})
+		generated += source.slice(start, end) + '\n'
+	}
+	for (const region of regions) {
+		if (region.kind === 'ts') {
+			push(region.start, region.end, FULL_CODE_INFORMATION)
+			continue
+		}
+		if (region.kind === 'expression') {
+			// A standalone `{{ … }}` region (rare — an interpolation not inside an
+			// HTML tag): project its inner expression as TypeScript.
+			const inner = interpolationInner(source, region)
+			if (inner) {
+				push(inner.start, inner.end, EXPRESSION_CODE_INFORMATION)
+			}
+			continue
+		}
+		if (region.kind === 'html' || region.kind === 'control-flow') {
+			// Interpolations almost always live INSIDE an HTML region
+			// (`<div>{{ count }}</div>` is one `html` region) or a control-flow head
+			// (`@if (cond)`). Project each `{{ … }}` inner expression as TypeScript so
+			// member completion / hover work inside it, sharing the body scope.
+			for (const inner of findInterpolationsIn(source, region)) {
+				push(inner.start, inner.end, EXPRESSION_CODE_INFORMATION)
+			}
+		}
+	}
+	return {
+		id: EMBEDDED_TS_ID,
+		languageId: 'typescript',
+		snapshot: new StringSnapshot(generated),
+		mappings: tsMappings,
+		embeddedCodes: [],
+	}
+}
+
+/**
+ * Build one embedded CSS code per `<style>` block, each covering the block's CSS
+ * body (between the opening tag's `>` and the closing `</style>`) and mapped 1:1
+ * so positions inside the block round-trip to the source. The CSS language
+ * service serves these.
+ */
+function buildEmbeddedStyles(
+	source: string,
+	regions: readonly TreatyRegion[],
+): VirtualCode[] {
+	const codes: VirtualCode[] = []
+	let index = 0
+	for (const region of regions) {
+		if (region.kind !== 'style') {
+			continue
+		}
+		const inner = styleInner(source, region)
+		if (!inner || inner.end <= inner.start) {
+			index++
+			continue
+		}
+		const body = source.slice(inner.start, inner.end)
+		codes.push({
+			id: `${EMBEDDED_CSS_ID_PREFIX}${index}`,
+			languageId: 'css',
+			snapshot: new StringSnapshot(body),
+			mappings: [
+				{
+					sourceOffsets: [inner.start],
+					generatedOffsets: [0],
+					lengths: [body.length],
+					data: FULL_CODE_INFORMATION,
+				},
+			],
+			embeddedCodes: [],
+		})
+		index++
+	}
+	return codes
 }
 
 /**

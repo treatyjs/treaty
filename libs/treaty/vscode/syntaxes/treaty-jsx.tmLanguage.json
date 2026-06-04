@@ -3,10 +3,30 @@
   "name": "Treaty JSX",
   "scopeName": "source.tjsx",
   "patterns": [
+    { "include": "#serverBlock" },
     { "include": "#controlFlow" },
     { "include": "source.tsx" }
   ],
   "repository": {
+    "serverBlock": {
+      "comment": "Inline `server { … }` / `server:lang { … }` block in JSX: server-only code lifted out of the client bundle. The `server` keyword + optional `:lang` tag paint as a server marker; the body embeds TS+JSX so it still highlights, scoped under a `server` meta so a theme can tint 'runs on server'.",
+      "begin": "(?<![.$\\w])(server)\\b(?:\\s*(:)\\s*([A-Za-z_][\\w]*))?\\s*(\\{)",
+      "beginCaptures": {
+        "1": { "name": "keyword.control.server.tjsx storage.type.server.tjsx" },
+        "2": { "name": "punctuation.separator.server-lang.tjsx" },
+        "3": { "name": "entity.name.type.server-lang.tjsx" },
+        "4": { "name": "punctuation.definition.block.begin.tjsx" }
+      },
+      "end": "(\\})",
+      "endCaptures": {
+        "1": { "name": "punctuation.definition.block.end.tjsx" }
+      },
+      "name": "meta.block.server.tjsx",
+      "contentName": "meta.embedded.block.server.tjsx",
+      "patterns": [
+        { "include": "source.tsx" }
+      ]
+    },
     "controlFlow": {
       "comment": "Angular @-prefixed control-flow blocks appearing inside JSX/TSX.",
       "patterns": [

@@ -214,7 +214,10 @@ const treatyPlugin: AuthoringLanguagePlugin = {
 
 const jsxPlugin: AuthoringLanguagePlugin = {
 	id: 'jsx',
-	extensions: ['.tsx', '.tjsx'],
+	// `.tsx` and `.jsx` are FIRST-CLASS Treaty JSX authoring formats (signals,
+	// selectorless, region completion); `.tjsx` is the historical stopgap alias,
+	// kept for back-compat. All three resolve to the `treaty-jsx` language id.
+	extensions: ['.tsx', '.jsx', '.tjsx'],
 	languageId: 'treaty-jsx',
 	serverLanguages: ['server:ts'],
 	createVirtualCode(_scriptId, languageId, snapshot) {

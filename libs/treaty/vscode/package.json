@@ -2,7 +2,7 @@
   "name": "treaty-vscode",
   "version": "0.0.1",
   "displayName": "Treaty",
-  "description": "Best-in-class language support for Treaty (.treaty / .tjsx) and Angular, powered by the Treaty language server: completion, hover, diagnostics, go-to-definition, references, rename, signature help, semantic tokens and formatting — plus selectorless, signals-aware template intelligence.",
+  "description": "Best-in-class language support for Treaty (.treaty / .tsx / .jsx / .tjsx) and Angular, powered by the Treaty language server: region-aware completion, hover, diagnostics, go-to-definition, references, rename, signature help, semantic tokens and formatting — plus selectorless, signals-aware, use:-optional template intelligence.",
   "publisher": "treaty",
   "license": "MIT",
   "author": "Jordan Hall",
@@ -69,6 +69,8 @@
           "Treaty JSX"
         ],
         "extensions": [
+          ".tsx",
+          ".jsx",
           ".tjsx"
         ],
         "icon": {

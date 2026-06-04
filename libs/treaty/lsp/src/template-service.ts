@@ -139,7 +139,7 @@ export function createTemplateService(
 			/** Keep the registry current for a document about to be served. */
 			function indexDocument(document: TextDocument): void {
 				warm()
-				const fileName = uriToFileName(document.uri)
+				const fileName = uriToFileName(sourceUriOf(context, document.uri))
 				if (isAuthoringFile(fileName)) {
 					registry.indexFile(fileName, document.getText())
 				}
@@ -151,7 +151,7 @@ export function createTemplateService(
 						return undefined
 					}
 					indexDocument(document)
-					return provideCompletions(document, position, registry)
+					return provideCompletions(document, position, registry, context)
 				},
 
 				provideHover(document, position) {
@@ -167,7 +167,7 @@ export function createTemplateService(
 						return undefined
 					}
 					indexDocument(document)
-					return provideDefinition(document, position, registry)
+					return provideDefinition(document, position, registry, context)
 				},
 
 				provideDiagnostics(document) {
@@ -191,6 +191,7 @@ function provideCompletions(
 	document: TextDocument,
 	position: Position,
 	registry: ComponentRegistry,
+	context: LanguageServiceContext,
 ): CompletionList | undefined {
 	const source = document.getText()
 	const offset = document.offsetAt(position)
@@ -211,9 +212,11 @@ function provideCompletions(
 			? controlFlowCompletions(ctx.prefix, replaceRange)
 			: ctx.completion === 'use-directive'
 				? directiveCompletions(registry, ctx.prefix, replaceRange)
-				: ctx.completion === 'tag'
-					? tagCompletions(document, registry, ctx.prefix, replaceRange)
-					: []
+				: ctx.completion === 'attribute'
+					? attributeDirectiveCompletions(document, registry, ctx.prefix, replaceRange, context)
+					: ctx.completion === 'tag'
+						? tagCompletions(document, registry, ctx.prefix, replaceRange, context)
+						: []
 
 	if (items.length === 0) {
 		return undefined
@@ -234,9 +237,10 @@ function tagCompletions(
 	registry: ComponentRegistry,
 	prefix: string,
 	replaceRange: Range,
+	context: LanguageServiceContext,
 ): CompletionItem[] {
 	const source = document.getText()
-	const selfFile = uriToFileName(document.uri)
+	const selfFile = uriToFileName(sourceUriOf(context, document.uri))
 	const items: CompletionItem[] = []
 	for (const entry of registry.all()) {
 		if (entry.fileName === selfFile) {
@@ -245,7 +249,7 @@ function tagCompletions(
 		if (prefix && !entry.tag.startsWith(prefix.toLowerCase())) {
 			continue
 		}
-		const additionalTextEdits = autoImportEdit(document, source, entry)
+		const additionalTextEdits = autoImportEdit(document, source, entry, context)
 		items.push({
 			label: entry.tag,
 			kind: CompletionItemKind.Class,
@@ -268,8 +272,11 @@ function directiveCompletions(
 ): CompletionItem[] {
 	const items: CompletionItem[] = []
 	for (const entry of registry.directives()) {
-		const name = entry.tag
-		if (prefix && !name.startsWith(prefix.toLowerCase())) {
+		// Under `use:`, an attribute-selector directive is referenced by its
+		// attribute name (`use:routerLink`), not the kebab class fold; a plain
+		// selectorless directive uses its filename-fold tag.
+		const name = entry.attributeSelector ?? entry.tag
+		if (prefix && !name.toLowerCase().startsWith(prefix.toLowerCase())) {
 			continue
 		}
 		items.push({
@@ -279,6 +286,46 @@ function directiveCompletions(
 			documentation: componentDoc(entry),
 			textEdit: { range: replaceRange, newText: name },
 			sortText: `1_${name}`,
+		})
+	}
+	return items
+}
+
+/**
+ * Bare attribute-selector directive completions WITH auto-import. Every
+ * attribute-selector directive (built-in Angular like `routerLink`, plus any
+ * imported `@Directive({ selector: '[x]' })`) is offered under its bare attribute
+ * name — NO `use:` required, recognized via its attribute selector the way the
+ * SelectorRegistry resolves it. Accepting one inserts the attribute and — when
+ * the directive's class is not already imported — an import edit, so the bare
+ * `routerLink` resolves with no `NgModule`. The documentation hints that `use:`
+ * is valid but optional/redundant for a selector-bearing directive.
+ */
+function attributeDirectiveCompletions(
+	document: TextDocument,
+	registry: ComponentRegistry,
+	prefix: string,
+	replaceRange: Range,
+	context: LanguageServiceContext,
+): CompletionItem[] {
+	const source = document.getText()
+	const lower = prefix.toLowerCase()
+	const items: CompletionItem[] = []
+	for (const entry of registry.attributeDirectives()) {
+		const name = entry.attributeSelector!
+		if (lower && !name.toLowerCase().startsWith(lower)) {
+			continue
+		}
+		const additionalTextEdits = autoImportEdit(document, source, entry, context)
+		items.push({
+			label: name,
+			kind: CompletionItemKind.Property,
+			detail: `directive ${entry.className} (selector [${name}])`,
+			documentation: attributeDirectiveDoc(entry),
+			textEdit: { range: replaceRange, newText: name },
+			filterText: name,
+			sortText: `0_${name}`,
+			...(additionalTextEdits ? { additionalTextEdits } : {}),
 		})
 	}
 	return items
@@ -309,11 +356,17 @@ function autoImportEdit(
 	document: TextDocument,
 	source: string,
 	entry: ComponentEntry,
+	context: LanguageServiceContext,
 ): TextEdit[] | undefined {
 	if (importsSymbol(source, entry.className)) {
 		return undefined
 	}
-	const specifier = relativeSpecifier(uriToFileName(document.uri), entry.importSpecifier)
+	// A built-in directive imports from a bare package specifier (`@angular/router`);
+	// everything else imports from a project-relative sibling path.
+	const specifier =
+		entry.origin === 'builtin'
+			? entry.importSpecifier
+			: relativeSpecifier(uriToFileName(sourceUriOf(context, document.uri)), entry.importSpecifier)
 	const importLine = `import { ${entry.className} } from '${specifier}'\n`
 	const insertOffset = importInsertionOffset(source)
 	const pos = document.positionAt(insertOffset)
@@ -336,7 +389,29 @@ function provideHover(
 	if (!word) {
 		return undefined
 	}
-	const entry = registry.getByTag(word.text) ?? registry.getByClass(word.text)
+	const wordRange: Range = {
+		start: document.positionAt(word.start),
+		end: document.positionAt(word.end),
+	}
+
+	// The `server` keyword that opens an inline `server { … }` / `server:lang { … }`
+	// block: surface that the block runs on the server and is lifted out of the
+	// client bundle.
+	if (word.text === 'server' && opensServerBlock(source, word.start)) {
+		return { contents: { kind: MarkupKind.Markdown, value: serverBlockHover(source, word.start) }, range: wordRange }
+	}
+
+	// A destructured-props input binding (`function C({ label, count = 5 })`): the
+	// compiler lowers each destructured prop to a signal `input()`, so annotate the
+	// hovered name as an input.
+	if (isDestructuredInput(source, word.text)) {
+		return { contents: { kind: MarkupKind.Markdown, value: destructuredInputHover(word.text) }, range: wordRange }
+	}
+
+	const entry =
+		registry.getByTag(word.text) ??
+		registry.getByClass(word.text) ??
+		registry.getByAttribute(word.text)
 	if (!entry) {
 		return undefined
 	}
@@ -345,11 +420,89 @@ function provideHover(
 			kind: MarkupKind.Markdown,
 			value: hoverMarkdown(entry),
 		},
-		range: {
-			start: document.positionAt(word.start),
-			end: document.positionAt(word.end),
-		},
+		range: wordRange,
 	}
+}
+
+/**
+ * Whether the `server` word at `start` opens an inline `server { … }` /
+ * `server:lang { … }` block: it must be a standalone identifier (not `x.server`
+ * or `serverFoo`) followed by an optional `:lang` tag and then a `{`.
+ */
+function opensServerBlock(source: string, start: number): boolean {
+	const before = source[start - 1]
+	if (before !== undefined && /[.$\w]/.test(before)) {
+		return false
+	}
+	const rest = source.slice(start + 'server'.length)
+	// optional whitespace, optional `:ident`, optional whitespace, then `{`.
+	return /^\s*(?::\s*[A-Za-z_]\w*\s*)?\{/.test(rest)
+}
+
+/** The `server { … }` hover, naming the language tag when present. */
+function serverBlockHover(source: string, start: number): string {
+	const rest = source.slice(start + 'server'.length)
+	const tag = /^\s*:\s*([A-Za-z_]\w*)/.exec(rest)
+	const lang = tag ? tag[1] : 'rust'
+	return [
+		'**`server` block** — _runs on the server_.',
+		'',
+		`Code inside this block is lifted OUT of the client bundle and emitted as a server module (target language: \`${lang}\`).`,
+		'',
+		'Each function inside becomes a callable endpoint; the client calls it over the wire. Secrets here never ship to the browser.',
+	].join('\n')
+}
+
+/**
+ * Whether `name` is a destructured-props input binding of the component function
+ * — a name listed in a `function C({ a, b = 5 }: …)` / `(props: …) => …` object
+ * destructuring of the FIRST parameter. The compiler lowers each such prop to a
+ * signal `input()`, so the LSP annotates it as an input. Best-effort: a light
+ * scan for the first `({ … })` parameter list and a word-boundary match of the
+ * name inside it.
+ */
+function isDestructuredInput(source: string, name: string): boolean {
+	if (!/^[A-Za-z_$][\w$]*$/.test(name)) {
+		return false
+	}
+	for (const params of destructuredParamLists(source)) {
+		// The destructured key is `name` at the start of the pattern or after a `,`
+		// (allowing surrounding whitespace), optionally followed by `=default`,
+		// `: alias` or `,`/end — match it as a property name, not a default-value
+		// reference. `destructuredParamLists` returns the `{ … }` INTERIOR, so the
+		// first key sits after leading whitespace at string start.
+		const re = new RegExp(`(?:^|,)\\s*${escapeRegExp(name)}\\s*(?:[,=:]|$)`)
+		if (re.test(params)) {
+			return true
+		}
+	}
+	return false
+}
+
+/**
+ * The inner text of every component-function FIRST-parameter object pattern
+ * `({ … })` in a source — the destructured-props parameter lists. Scans for
+ * `function NAME({ … })` and `({ … }) =>` / `({ … }:` arrow forms.
+ */
+function destructuredParamLists(source: string): string[] {
+	const out: string[] = []
+	// `function Name ( { … } ` and `( { … } ) =>` — capture the brace interior.
+	const re = /(?:function\s+[A-Za-z_$][\w$]*\s*\(|\(\s*)\{([^{}]*)\}/g
+	for (let m = re.exec(source); m; m = re.exec(source)) {
+		out.push(m[1]!)
+	}
+	return out
+}
+
+/** Hover for a destructured-props input binding. */
+function destructuredInputHover(name: string): string {
+	return [
+		`**${name}** — _component \`input()\`_.`,
+		'',
+		'A destructured prop of the component function is lowered to a signal `input()`.',
+		'',
+		`Read it as \`${name}()\` (it is a signal). Bind it from a parent with \`<this-component ${name}="…" />\`.`,
+	].join('\n')
 }
 
 // ---------------------------------------------------------------------------
@@ -361,6 +514,7 @@ function provideDefinition(
 	document: TextDocument,
 	position: Position,
 	registry: ComponentRegistry,
+	context: LanguageServiceContext,
 ): LocationLink[] | undefined {
 	const source = document.getText()
 	const offset = document.offsetAt(position)
@@ -368,8 +522,13 @@ function provideDefinition(
 	if (!word) {
 		return undefined
 	}
-	const entry = registry.getByTag(word.text) ?? registry.getByClass(word.text)
-	if (!entry || entry.fileName === uriToFileName(document.uri)) {
+	const entry =
+		registry.getByTag(word.text) ??
+		registry.getByClass(word.text) ??
+		registry.getByAttribute(word.text)
+	// A built-in directive resolves to a bare package specifier, not a workspace
+	// file, so there is no in-project declaration to navigate to.
+	if (!entry || entry.origin === 'builtin' || entry.fileName === uriToFileName(sourceUriOf(context, document.uri))) {
 		return undefined
 	}
 	const targetUri = fileNameToUri(entry.fileName)
@@ -563,7 +722,7 @@ function provideTemplateDiagnostics(
 	context: LanguageServiceContext,
 ): Diagnostic[] {
 	const source = document.getText()
-	const fileName = uriToFileName(document.uri)
+	const fileName = uriToFileName(sourceUriOf(context, document.uri))
 	const imported = registry.importedSelectorsFor(source)
 	const compiled = compileWithSelectors(source, fileName, imported)
 	const diagnosticDocument: DiagnosticDocument = {
@@ -571,7 +730,7 @@ function provideTemplateDiagnostics(
 		languageId: document.languageId,
 		text: source,
 	}
-	const rootVirtualCode = rootVirtualCodeOf(context, document.uri)
+	const rootVirtualCode = rootVirtualCodeOf(context, sourceUriOf(context, document.uri))
 	return mapErrorsToDiagnostics(compiled.errors, diagnosticDocument, rootVirtualCode)
 }
 
@@ -621,6 +780,35 @@ function parseUri(uri: string): URI | undefined {
 	}
 }
 
+/**
+ * Resolve the SOURCE-script uri behind a (possibly embedded) document uri.
+ *
+ * When volarjs serves a plugin over a root virtual code it hands the plugin the
+ * EMBEDDED document, whose uri is the encoded `volar-embedded-content://…` form,
+ * NOT the original `file://…/Foo.treaty`. Deriving a filename from that encoded
+ * uri yields garbage — corrupting the registry's class/tag fold and the
+ * self-file exclusion so a real prefix like `<st` matches nothing. This decodes
+ * the embedded uri back to its source-script uri via
+ * {@link LanguageServiceContext.decodeEmbeddedDocumentUri}, so every
+ * `uriToFileName` call site works on the real path. A non-embedded (plain
+ * `file://`) uri — as in the in-process unit smokes — is returned unchanged.
+ */
+function sourceUriOf(context: LanguageServiceContext, uri: string): string {
+	const parsed = parseUri(uri)
+	if (parsed === undefined) {
+		return uri
+	}
+	// `decodeEmbeddedDocumentUri` is present on a real server context; an
+	// in-process / unit-test caller may pass a minimal context without it (and a
+	// plain `file://` uri that needs no decoding), so guard before calling.
+	const decode = context.decodeEmbeddedDocumentUri
+	if (typeof decode !== 'function') {
+		return uri
+	}
+	const decoded = decode.call(context, parsed)
+	return decoded ? decoded[0].toString() : uri
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -658,10 +846,13 @@ function wordAround(
 
 /** Markdown documentation block for a component/directive entry. */
 function hoverMarkdown(entry: ComponentEntry): string {
+	const handle = entry.attributeSelector
+		? `Attribute selector: \`[${entry.attributeSelector}]\` — applied bare (no \`use:\` needed)`
+		: `Selectorless tag: \`<${entry.tag}>\``
 	const lines = [
 		`**${entry.className}** _(${entry.kind})_`,
 		'',
-		`Selectorless tag: \`<${entry.tag}>\``,
+		handle,
 		`Origin: \`${entry.origin}\` — \`${entry.fileName}\``,
 		'',
 		'_Treaty resolves this selectorlessly — no `NgModule`, no `imports: []`._',
@@ -676,6 +867,29 @@ function componentDoc(entry: ComponentEntry): { kind: typeof MarkupKind.Markdown
 	return {
 		kind: MarkupKind.Markdown,
 		value: `Selectorless ${entry.kind} **${entry.className}** from \`${entry.importSpecifier}\`.\n\nAuto-imported on accept — no \`NgModule\`.`,
+	}
+}
+
+/**
+ * Documentation for a bare attribute-selector directive completion. Names the
+ * directive class + its attribute selector, and HINTS that `use:` is valid but
+ * optional/redundant for a selector-bearing directive (it is applied by its
+ * attribute selector directly).
+ */
+function attributeDirectiveDoc(entry: ComponentEntry): {
+	kind: typeof MarkupKind.Markdown
+	value: string
+} {
+	const attr = entry.attributeSelector!
+	return {
+		kind: MarkupKind.Markdown,
+		value: [
+			`Attribute directive **${entry.className}** (selector \`[${attr}]\`) from \`${entry.importSpecifier}\`.`,
+			'',
+			`Applied by its attribute selector — \`use:\` is **optional/redundant** here (\`use:${attr}\` also works).`,
+			'',
+			'Auto-imported on accept — no `NgModule`.',
+		].join('\n'),
 	}
 }
 

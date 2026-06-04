@@ -71,6 +71,133 @@ export function typeScriptRegions(source: string): TreatyRegion[] {
 	return scanTreatyRegions(source).filter((r) => r.kind === 'ts')
 }
 
+/** A half-open `[start, end)` span of one region's INNER content (delimiters stripped). */
+export interface RegionInner {
+	/** Inclusive start offset of the inner content into the original source. */
+	readonly start: number
+	/** Exclusive end offset of the inner content into the original source. */
+	readonly end: number
+}
+
+/**
+ * The inner expression span of a `{{ … }}` interpolation region — the text
+ * between the opening `{{` and the closing `}}`, with the surrounding
+ * whitespace trimmed off. Returns `undefined` when the region is not a
+ * well-formed interpolation (no closing `}}`).
+ *
+ * This is the span the language layer projects into the embedded TypeScript
+ * code so a `{{ count }}` expression shares the component-body scope and the
+ * TypeScript service drives completion/hover inside it.
+ */
+export function interpolationInner(source: string, region: TreatyRegion): RegionInner | undefined {
+	if (region.kind !== 'expression') {
+		return undefined
+	}
+	// `{{` … `}}`. Guard a malformed region missing the closing braces.
+	const open = region.start + 2
+	const hasClose = source.startsWith('}}', region.end - 2) && region.end - 2 >= open
+	const close = hasClose ? region.end - 2 : region.end
+	return trimInner(source, open, close)
+}
+
+/**
+ * The inner CSS-body span of a `<style …>…</style>` region — the text between
+ * the opening tag's `>` and the closing `</style>`. Returns `undefined` when no
+ * opening `>` is found inside the region.
+ *
+ * This is the span the language layer projects into an embedded `css` code so
+ * the CSS language service drives completion/hover/validation inside a `<style>`
+ * block.
+ */
+export function styleInner(source: string, region: TreatyRegion): RegionInner | undefined {
+	if (region.kind !== 'style') {
+		return undefined
+	}
+	const gt = source.indexOf('>', region.start)
+	if (gt === -1 || gt >= region.end) {
+		return undefined
+	}
+	const bodyStart = gt + 1
+	const closeIdx = source.lastIndexOf('</style>', region.end)
+	const bodyEnd = closeIdx > bodyStart ? closeIdx : region.end
+	return { start: bodyStart, end: bodyEnd }
+}
+
+/**
+ * Find every `{{ … }}` interpolation WITHIN a region's span and return each
+ * one's inner expression span (delimiters stripped, whitespace trimmed). Used to
+ * project interpolations that live INSIDE an `html` region (the common case —
+ * `<div>{{ count }}</div>` is one `html` region, not a separate `expression`
+ * region) into the embedded TypeScript code so TS completion works inside them.
+ *
+ * Strings inside the interpolation are skipped so a `}}` inside a `"…"` literal
+ * never closes the interpolation early. Returns spans in source order.
+ */
+export function findInterpolationsIn(source: string, region: TreatyRegion): RegionInner[] {
+	const out: RegionInner[] = []
+	let i = region.start
+	const end = region.end
+	while (i < end) {
+		if (source.startsWith('{{', i)) {
+			const open = i + 2
+			let j = open
+			let depth = 0
+			while (j < end) {
+				const ch = source[j]
+				if (ch === '"' || ch === "'" || ch === '`') {
+					j = skipString(source, j, end)
+					continue
+				}
+				if (ch === '{') {
+					depth++
+				} else if (ch === '}') {
+					if (depth === 0 && source.startsWith('}}', j)) {
+						break
+					}
+					depth--
+				}
+				j++
+			}
+			out.push(trimInner(source, open, j))
+			i = j + 2
+			continue
+		}
+		i++
+	}
+	return out
+}
+
+/** Skip a quoted string starting at `i` (the opening quote); returns the index past the close. */
+function skipString(source: string, i: number, end: number): number {
+	const quote = source[i]
+	let j = i + 1
+	while (j < end) {
+		const ch = source[j]
+		if (ch === '\\') {
+			j += 2
+			continue
+		}
+		if (ch === quote) {
+			return j + 1
+		}
+		j++
+	}
+	return end
+}
+
+/** Trim leading/trailing ASCII whitespace from a `[start, end)` span. */
+function trimInner(source: string, start: number, end: number): RegionInner {
+	let s = start
+	let e = end
+	while (s < e && isWhitespace(source[s]!)) {
+		s++
+	}
+	while (e > s && isWhitespace(source[e - 1]!)) {
+		e--
+	}
+	return { start: s, end: e }
+}
+
 class RegionScanner {
 	private readonly src: string
 	private readonly len: number

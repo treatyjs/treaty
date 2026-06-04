@@ -39,7 +39,7 @@ import {
 export type ComponentKind = 'component' | 'directive'
 
 /** Which authoring front-end a registered entry comes from. */
-export type ComponentOrigin = 'treaty' | 'jsx' | 'angular'
+export type ComponentOrigin = 'treaty' | 'jsx' | 'angular' | 'builtin'
 
 /** A single resolvable template dependency known to the workspace. */
 export interface ComponentEntry {
@@ -48,9 +48,20 @@ export interface ComponentEntry {
 	/**
 	 * The selectorless tag this entry renders as in a template, lowercase
 	 * (e.g. `stat-card` or `app-stat-card`). Used to match a template `<tag>` and
-	 * as the completion insert text.
+	 * as the completion insert text. For an ATTRIBUTE-selector directive (whose
+	 * selector is `[routerLink]`, not an element name) this is the kebab fold of
+	 * the class — a fallback only; {@link attributeSelector} is the real handle.
 	 */
 	readonly tag: string
+	/**
+	 * The ATTRIBUTE-selector name a directive applies under, WITHOUT `use:` — the
+	 * inner name of a `[name]` selector (`[routerLink]` → `routerLink`). Present
+	 * only for attribute-selector directives (built-in Angular like `routerLink`,
+	 * or any imported `@Directive({ selector: '[x]' })`); `undefined` for an
+	 * element-selector component/directive. These complete in plain attribute
+	 * position and auto-import — `use:` is optional/redundant for them.
+	 */
+	readonly attributeSelector?: string
 	/** Component vs directive (directives surface under `use:` too). */
 	readonly kind: ComponentKind
 	/** Which authoring format declared it. */
@@ -59,7 +70,8 @@ export interface ComponentEntry {
 	readonly fileName: string
 	/**
 	 * The module specifier a consumer would import this from, derived from
-	 * {@link fileName} (extension dropped). Used to synthesize an auto-import.
+	 * {@link fileName} (extension dropped), or a bare package specifier for a
+	 * built-in (`@angular/router`). Used to synthesize an auto-import.
 	 */
 	readonly importSpecifier: string
 }
@@ -83,8 +95,20 @@ interface FileContribution {
 export class ComponentRegistry {
 	private readonly byTag = new Map<string, ComponentEntry>()
 	private readonly byClass = new Map<string, ComponentEntry>()
+	private readonly byAttribute = new Map<string, ComponentEntry>()
 	private readonly contributions = new Map<string, FileContribution>()
 	private projectSelectors: ProjectSelectors = {}
+
+	constructor() {
+		// Seed the built-in Angular attribute-selector directives (routerLink, …)
+		// so a bare `routerLink` completes + auto-imports out of the box, the way
+		// the SelectorRegistry resolves an attribute selector — no `use:` required.
+		this.contributions.set(BUILTIN_CONTRIBUTION_KEY, {
+			fileName: BUILTIN_CONTRIBUTION_KEY,
+			entries: BUILTIN_ATTRIBUTE_DIRECTIVES,
+		})
+		this.reindex()
+	}
 
 	/**
 	 * Replace the project-wide `className → selector` map (from the Rust `.ts`
@@ -148,10 +172,28 @@ export class ComponentRegistry {
 		return this.all().filter((e) => e.kind === 'directive')
 	}
 
-	/** Rebuild the tag/class indexes from the current per-file contributions. */
+	/**
+	 * Every ATTRIBUTE-selector directive (built-in Angular like `routerLink`, plus
+	 * any imported `@Directive({ selector: '[x]' })`), in attribute-name order.
+	 * These complete in plain attribute position and auto-import — `use:` is
+	 * optional/redundant for them.
+	 */
+	attributeDirectives(): ComponentEntry[] {
+		return [...this.byAttribute.values()].sort((a, b) =>
+			a.attributeSelector!.localeCompare(b.attributeSelector!),
+		)
+	}
+
+	/** Look up an attribute-selector directive by its bare attribute name (case-insensitive). */
+	getByAttribute(attribute: string): ComponentEntry | undefined {
+		return this.byAttribute.get(attribute.toLowerCase())
+	}
+
+	/** Rebuild the tag/class/attribute indexes from the current per-file contributions. */
 	private reindex(): void {
 		this.byTag.clear()
 		this.byClass.clear()
+		this.byAttribute.clear()
 		for (const contribution of this.contributions.values()) {
 			for (const original of contribution.entries) {
 				// Re-fold a `.ts` entry's tag from the latest project selectors so a
@@ -163,10 +205,46 @@ export class ComponentRegistry {
 				if (!this.byClass.has(entry.className)) {
 					this.byClass.set(entry.className, entry)
 				}
+				if (entry.attributeSelector) {
+					const key = entry.attributeSelector.toLowerCase()
+					if (!this.byAttribute.has(key)) {
+						this.byAttribute.set(key, entry)
+					}
+				}
 			}
 		}
 	}
 }
+
+/** Synthetic file key under which the built-in attribute-selector directives are registered. */
+const BUILTIN_CONTRIBUTION_KEY = '<builtin>'
+
+/**
+ * The built-in Angular attribute-selector directives a Treaty author applies
+ * with a BARE attribute (no `use:`), recognized by their attribute selector the
+ * way the Rust SelectorRegistry resolves `[routerLink]`. Each carries the
+ * package its class is imported from, so accepting the completion auto-imports
+ * the directive with no `NgModule`. This is the common, high-value subset
+ * (router + common structural/attribute directives); a project's own imported
+ * attribute-selector directives are discovered from source on top of these.
+ */
+const BUILTIN_ATTRIBUTE_DIRECTIVES: readonly ComponentEntry[] = (
+	[
+		['RouterLink', 'routerLink', '@angular/router'],
+		['RouterLinkActive', 'routerLinkActive', '@angular/router'],
+		['NgClass', 'ngClass', '@angular/common'],
+		['NgStyle', 'ngStyle', '@angular/common'],
+		['NgModel', 'ngModel', '@angular/forms'],
+	] as const
+).map(([className, attributeSelector, importSpecifier]) => ({
+	className,
+	tag: tagFromClassName(className),
+	attributeSelector,
+	kind: 'directive' as ComponentKind,
+	origin: 'builtin' as ComponentOrigin,
+	fileName: importSpecifier,
+	importSpecifier,
+}))
 
 /**
  * Scan a workspace folder once for its `.ts` component selectors via the Rust
@@ -246,9 +324,11 @@ function angularEntries(
 		if (!selector) {
 			continue
 		}
+		const attributeSelector = attributeSelectorOf(selector)
 		entries.push({
 			className: decl.className,
 			tag: firstTagOfSelector(selector),
+			...(attributeSelector ? { attributeSelector } : {}),
 			kind: decl.kind,
 			origin: 'angular',
 			fileName,
@@ -258,7 +338,7 @@ function angularEntries(
 	return entries
 }
 
-/** Re-fold a `.ts` entry's tag from the current project selectors (no-op otherwise). */
+/** Re-fold a `.ts` entry's tag/attribute-selector from the current project selectors (no-op otherwise). */
 function refoldEntry(entry: ComponentEntry, projectSelectors: ProjectSelectors): ComponentEntry {
 	if (entry.origin !== 'angular') {
 		return entry
@@ -268,7 +348,15 @@ function refoldEntry(entry: ComponentEntry, projectSelectors: ProjectSelectors):
 		return entry
 	}
 	const tag = firstTagOfSelector(selector)
-	return tag === entry.tag ? entry : { ...entry, tag }
+	const attributeSelector = attributeSelectorOf(selector)
+	if (tag === entry.tag && attributeSelector === entry.attributeSelector) {
+		return entry
+	}
+	return {
+		...entry,
+		tag,
+		...(attributeSelector ? { attributeSelector } : { attributeSelector: undefined }),
+	}
 }
 
 /** A lightweight `@Component`/`@Directive class X` declaration found in a `.ts` source. */
@@ -344,6 +432,24 @@ function firstTagOfSelector(selector: string): string {
 	// Strip attribute/class/pseudo qualifiers, keep the leading element name.
 	const m = /^[A-Za-z][\w-]*/.exec(first)
 	return (m ? m[0] : first).toLowerCase()
+}
+
+/**
+ * The ATTRIBUTE-selector name of a directive selector, if any. Reads the FIRST
+ * `[attr]` group across the selector list, returning its inner attribute name
+ * preserving case (`[routerLink]` → `routerLink`, `a[routerLink]` →
+ * `routerLink`, `[appHighlight]` → `appHighlight`). An attribute selector that
+ * pins a value (`[type=text]`) is not a directive-application handle, so only a
+ * bare `[name]` group counts. Returns `undefined` for a pure element selector.
+ */
+function attributeSelectorOf(selector: string): string | undefined {
+	for (const part of selector.split(',')) {
+		const m = /\[\s*([A-Za-z_][\w-]*)\s*\]/.exec(part)
+		if (m) {
+			return m[1]
+		}
+	}
+	return undefined
 }
 
 /** PascalCase a file stem (`stat-card` / `stat_card` / `stat card` → `StatCard`). */

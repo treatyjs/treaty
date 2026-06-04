@@ -32,10 +32,17 @@ export {
 	createAngularSourceVirtualCode,
 	EMBEDDED_TS_ID,
 	EMBEDDED_HTML_ID,
+	EMBEDDED_CSS_ID_PREFIX,
 } from './language.js'
 
-export type { TreatyRegion, TreatyRegionKind } from './regions.js'
-export { scanTreatyRegions, typeScriptRegions } from './regions.js'
+export type { TreatyRegion, TreatyRegionKind, RegionInner } from './regions.js'
+export {
+	scanTreatyRegions,
+	typeScriptRegions,
+	interpolationInner,
+	styleInner,
+	findInterpolationsIn,
+} from './regions.js'
 
 export type { DiagnosticDocument } from './diagnostics.js'
 export { provideDiagnostics, mapErrorsToDiagnostics, DIAGNOSTIC_SOURCE } from './diagnostics.js'
