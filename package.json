@@ -3,10 +3,9 @@
   "version": "0.0.0",
   "license": "MIT",
   "scripts": {
-    "build:language": "cd ./language-server/vscode && npm run build",
-    "watch:language": "cd ./language-server/vscode && npm run watch",
-    "pack:language": "cd ./language-server/vscode && npm run pack",
-    "release:language": "cd ./language-server/vscode && npm run release"
+    "build:language": "cd ./libs/treaty/vscode && npm run build",
+    "watch:language": "cd ./libs/treaty/vscode && npm run watch",
+    "pack:language": "cd ./libs/treaty/vscode && npm run package"
   },
   "private": true,
   "dependencies": {

@@ -1,8 +1,0 @@
-{
-  "extends": "../../tsconfig.base.json",
-  "compilerOptions": {
-    "noEmit": true,
-    "typeRoots": ["../../types"]
-  },
-  "include": ["src/**/*.ts", "src/**/*.d.ts", "../../types/**/*.d.ts"]
-}
