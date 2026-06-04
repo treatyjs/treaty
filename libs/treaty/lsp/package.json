@@ -3,7 +3,7 @@
   "version": "0.0.1",
   "description": "Plugin-extensible volarjs language server for Treaty authoring formats, backed by the Rust authoring compiler.",
   "author": "Jordan Hall",
-  "license": "IDGAF-1.0",
+  "license": "MIT",
   "type": "module",
   "bin": {
     "treaty-lsp": "./dist/server.js"

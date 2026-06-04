@@ -4,7 +4,7 @@
   "displayName": "Treaty",
   "description": "Best-in-class language support for Treaty (.treaty / .tjsx) and Angular, powered by the Treaty language server: completion, hover, diagnostics, go-to-definition, references, rename, signature help, semantic tokens and formatting — plus selectorless, signals-aware template intelligence.",
   "publisher": "treaty",
-  "license": "IDGAF-1.0",
+  "license": "MIT",
   "author": "Jordan Hall",
   "icon": "icon.png",
   "repository": {
@@ -193,7 +193,7 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "watch": "node scripts/build.mjs --watch",
-    "package": "vsce package"
+    "package": "node scripts/build.mjs && vsce package --no-dependencies"
   },
   "dependencies": {
     "@treaty/lsp": "*",

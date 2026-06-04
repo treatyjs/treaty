@@ -3,6 +3,7 @@
 **/tmp
 **/out-tsc
 **/bazel-out
+**/*.vsix
 
 # Node
 **/node_modules
