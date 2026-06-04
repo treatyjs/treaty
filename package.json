@@ -8,6 +8,12 @@
     "pack:language": "cd ./libs/treaty/vscode && npm run package"
   },
   "private": true,
+  "workspaces": [
+    "libs/*/*",
+    "examples/*",
+    "tools/affected",
+    "tools/treaty-bench"
+  ],
   "dependencies": {
     "@volar/language-core": "~2.4.0",
     "@volar/language-server": "~2.4.0",

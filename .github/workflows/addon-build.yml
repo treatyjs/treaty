@@ -39,13 +39,15 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
 
-      # Pin to the repo's rust-toolchain.toml channel (1.95.0) so the cross
-      # target's std is installed for the SAME toolchain cargo uses (the prior
-      # @stable installed the target for stable, not 1.95.0 -> "can't find crate
-      # for core").
+      # Pin to the repo's rust-toolchain.toml channel (1.95.0) so the target's std
+      # is installed for the SAME toolchain cargo uses. NOTE: dtolnay/rust-toolchain
+      # is referenced as @master with a `toolchain:` input for a specific version —
+      # `@1.95.0` is NOT a valid action ref (only @stable/@nightly/@master + tagged
+      # channels exist), which failed the Setup-Rust step on every target.
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@1.95.0
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.95.0"
           targets: ${{ matrix.target }}
           components: rust-src
 
