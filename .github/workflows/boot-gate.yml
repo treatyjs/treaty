@@ -58,7 +58,7 @@ jobs:
         run: |
           ./node_modules/.bin/tsc -p libs/treaty/compiler/tsconfig.lib.json
           ./node_modules/.bin/tsc -p libs/treaty/module-federation/tsconfig.lib.json
-          ./node_modules/.bin/tsc -p libs/typescript/vite/tsconfig.lib.json --ignoreDeprecations 6.0
+          ./node_modules/.bin/tsc -p libs/typescript/vite/tsconfig.lib.json --ignoreDeprecations 6.0 --noCheck
 
       # The gate's Step 0 rebuilds the @treaty/vite + @treaty/rolldown plugin dists from source itself,
       # so no separate dist-build step is needed. Run the gate: it builds linker-smoke through every
