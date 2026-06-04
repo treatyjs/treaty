@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: 🚚 Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       # The repo pins its toolchain via rust-toolchain.toml (edition 2024); rustup honours it
       # automatically when cargo runs in the repo, installing it on demand.
@@ -29,6 +29,23 @@ jobs:
       # node_modules/@angular is present (a fresh CI checkout), so this passes without an npm install.
       - name: Workspace tests
         run: cargo test --workspace
+
+      # ZERO-OXC swc backend gate. treaty_ivy has two byte-identical parse backends — oxc
+      # (default/preferred) and a fully native swc — selectable by cargo feature. Under
+      # `--no-default-features --features swc` the crate must (a) build + test green and (b) link
+      # ZERO oxc_* crates (the whole AST->Ivy walk is engine-neutral). The parse_parity tests assert
+      # swc's neutral ParseOutput is byte-identical to oxc's across the real Angular corpus (1225/0).
+      - name: swc backend — build + test (zero-oxc variant)
+        run: |
+          cargo build -p treaty_ivy --no-default-features --features swc
+          cargo test  -p treaty_ivy --no-default-features --features swc
+      - name: swc backend — parse parity (oxc vs swc, byte-identical)
+        run: cargo test -p treaty_ivy --features swc parse_parity
+      - name: swc backend — assert ZERO oxc linked under --features swc
+        run: |
+          n=$(cargo tree -p treaty_ivy --no-default-features --features swc 2>/dev/null | grep -c 'oxc_' || true)
+          echo "oxc_* crates under --features swc: $n"
+          test "$n" -eq 0 || { echo "::error::swc build links $n oxc crate(s); expected 0"; exit 1; }
 
       # libs/file-routing is `exclude`d from the workspace (so the NAPI addon can depend on it by path
       # without a "multiple workspace roots" conflict), which means `--workspace` never runs its ~90
@@ -45,10 +62,11 @@ jobs:
       # migration/SWC-BACKEND-PLAN.md §4 and migration/BACKEND-PARITY.md). Like dep-updater it is its
       # own standalone workspace, so it is outside `--workspace` and must be gated explicitly. The
       # `parity` subcommand compiles the shared corpus through every wired backend and asserts the
-      # emitted Ivy is byte-identical (today: the oxc baseline oxc-vs-oxc; once the swc feature lands,
-      # real oxc<->swc cross-backend parity). It exits non-zero on any byte diff.
-      - name: backend-parity — oxc baseline + cross-backend parity (standalone workspace)
-        run: cargo run --manifest-path tools/backend-parity/Cargo.toml -- parity
+      # emitted Ivy is byte-identical. The swc backend has landed, so this runs REAL oxc<->swc
+      # cross-backend parity (--features oxc,swc): all 29 fixtures must be byte-identical across both.
+      # It exits non-zero on any byte diff.
+      - name: backend-parity — oxc<->swc cross-backend parity (standalone workspace)
+        run: cargo run --manifest-path tools/backend-parity/Cargo.toml --features oxc,swc -- parity
 
       # `drift` re-fingerprints the live corpus against the committed parity baseline (the
       # tripwire artifact, mirroring tools/render3-sync/baseline.json) and exits non-zero when the
