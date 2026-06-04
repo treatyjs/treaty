@@ -740,32 +740,47 @@ fn lower_props(params: &oxc_ast::ast::FormalParameters, source: &str) -> Lowered
     // parameter (e.g. a `ref`) is out of scope.
     if let Some(first) = params.items.first() {
         match &first.pattern {
-            // `function C({ a, b = 5 })` — lower each destructured property to a signal input.
+            // `function C({ a, b = 5, label: caption })` — lower each destructured property to a
+            // signal input. Shorthand (`a`), default (`b = 5`), AND rename (`label: caption`, where
+            // the local is `caption` and the PUBLIC input name is `label`) are all handled.
             BindingPattern::ObjectPattern(obj) => {
                 for prop in &obj.properties {
-                    // The bound local name (for `{ a }` it is `a`; for `{ a: x }` the local is `x`).
+                    // The bound local name (for `{ a }` it is `a`; for `{ label: caption }` the local
+                    // is `caption`).
                     let local = binding_pattern_local(&prop.value);
                     let Some(local) = local else {
                         diagnostics.push(
                             "jsx/props: a destructured prop is not a simple binding (nested \
-                             destructure / rename); skipped from `input()` lowering".to_string(),
+                             destructure); skipped from `input()` lowering".to_string(),
                         );
                         continue;
                     };
+                    // The PUBLIC input name is the property key; for `{ label: caption }` it is
+                    // `label` (differs from the local `caption` — a rename). A computed key falls back
+                    // to the local. When key == local (shorthand) there is no alias.
+                    let public = property_key_text(&prop.key).unwrap_or_else(|| local.clone());
+                    let alias = (public != local).then_some(public);
                     // A `b = 5` default lives on the property value's `AssignmentPattern` right side.
-                    let default = binding_pattern_default(&prop.value, source);
-                    match default {
+                    let default = binding_pattern_default(&prop.value, source).map(|d| {
                         // The default expression may carry TS (`'info' as AlertType`, `x satisfies T`,
                         // `f<T>()`) — it is spliced into runtime `input(<default>)`, so any TS syntax
                         // must be erased or the emitted `.mjs` is invalid JavaScript (the bare `as`
                         // breaks esbuild/Node). Erase via the shared AST pass; fall back to verbatim if
                         // the slice carries no TS (the common case re-parses to itself).
-                        Some(d) => {
-                            let d = ts_erase::erase_via_reparse(&d).unwrap_or(d);
-                            decls.push(format!("const {local} = input({d});"));
-                        }
-                        None => decls.push(format!("const {local} = input();")),
-                    }
+                        ts_erase::erase_via_reparse(&d).unwrap_or(d)
+                    });
+                    // A renamed prop carries its public name as the Angular `input(<default>, { alias:
+                    // "<public>" })` option, so a parent still binds by the public name; the shared
+                    // backend's `extract_io` reads this alias into the input's `binding_property_name`.
+                    // Shorthand props keep the byte-identical single-arg `input()` / `input(<default>)`
+                    // form the matchGolden corpus and the existing param tests depend on.
+                    let arg = match (&default, &alias) {
+                        (Some(d), Some(a)) => format!("{d}, {{ alias: {a:?} }}"),
+                        (Some(d), None) => d.clone(),
+                        (None, Some(a)) => format!("undefined, {{ alias: {a:?} }}"),
+                        (None, None) => String::new(),
+                    };
+                    decls.push(format!("const {local} = input({arg});"));
                     names.push(local);
                 }
                 if obj.rest.is_some() {
@@ -797,6 +812,17 @@ fn lower_props(params: &oxc_ast::ast::FormalParameters, source: &str) -> Lowered
         },
         names,
         diagnostics,
+    }
+}
+
+/// The identifier text of an object-pattern property key (`label` for `{ label: caption }` /
+/// `{ label }`), or `None` for a computed key.
+fn property_key_text(key: &oxc_ast::ast::PropertyKey) -> Option<String> {
+    use oxc_ast::ast::PropertyKey;
+    match key {
+        PropertyKey::StaticIdentifier(id) => Some(id.name.to_string()),
+        PropertyKey::StringLiteral(s) => Some(s.value.to_string()),
+        _ => None,
     }
 }
 
@@ -2286,6 +2312,58 @@ export default function greetingCard() {\n\
         assert!(out.code.contains("export default About;"), "wrong default export; got: {}", out.code);
     }
 
+    #[test]
+    fn jsx_inline_server_fn_in_component_body_absent_from_client_and_map() {
+        // FEATURE: server fn IN a component (JSX). A `'use server'` fn declared INSIDE the component
+        // body is extracted to the backend, its call site rewritten to the API call, and its body
+        // ABSENT from BOTH the client code AND the client source map (no secret leak).
+        let source = "export default function Card() {\n\
+  async function loadUser(id: number) {\n\
+    'use server';\n\
+    return secretDb.users.find(id);\n\
+  }\n\
+  const onClick = () => loadUser(1);\n\
+  return <button onClick={onClick}>go</button>;\n\
+}\n";
+        let out = compile(source, "card.tsx");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+
+        // A server module carries the lifted body.
+        let server_module = out.server_module.expect("expected a server module for the inline fn");
+        assert!(
+            server_module.contains("secretDb.users.find") || server_module.contains("__server_loadUser"),
+            "server module did not carry the lifted inline fn; got:\n{server_module}"
+        );
+
+        // The client code re-parses (as TSX — the emitted `.tsx` client is TypeScript, TS-erased
+        // downstream by the bundler), calls the server route, and does NOT contain the body.
+        let allocator = Allocator::default();
+        let parsed = JsParser::new(&allocator, &out.code, SourceType::tsx()).parse();
+        assert!(
+            parsed.errors.is_empty(),
+            "emitted client did not re-parse as TSX: {:?}\n{}",
+            parsed.errors,
+            out.code
+        );
+        assert!(
+            out.code.contains("fetch('/__server/loadUser'"),
+            "inline server call not rewritten to the API call; got:\n{}",
+            out.code
+        );
+        assert!(
+            !out.code.contains("secretDb.users.find"),
+            "SECURITY: inline server body leaked into the JSX client; got:\n{}",
+            out.code
+        );
+
+        // The client source map does NOT embed the server body either.
+        let map = out.map.expect("expected a client source map");
+        assert!(
+            !map.contains("secretDb.users.find"),
+            "SECURITY: inline server body leaked into the client source map; got:\n{map}"
+        );
+    }
+
     // --- React-compat mode -----------------------------------------------------
     // A plain React component (hooks + JSX) compiles to Angular Ivy through the same backend.
 
@@ -2481,6 +2559,55 @@ export default function Logger() {\n\
         );
         // The synthesized declaration is present.
         assert!(code.contains("title = input()"), "title input declaration missing; got: {code}");
+    }
+
+    #[test]
+    fn tsx_input_body_destructure_lowers_each_property_to_an_input() {
+        // FEATURE: object destructuring → inputs (BODY form). A component that destructures
+        // `input<Props>()` inside its body — `const { name, age = 0, label: caption } = input<Props>()`
+        // — lowers each property to an INDIVIDUAL input through the SAME shared expansion the `.treaty`
+        // path uses, including shorthand, default, and rename.
+        let source = "export default function Card() {\n\
+  const { name, age = 0, label: caption } = input<Props>();\n\
+  return <div>{name()} {age()} {caption()}</div>;\n\
+}\n";
+        let out = compile(source, "card.tsx");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+        assert_well_formed_module(code);
+        assert!(code.contains(DEFINE), "no defineComponent; got: {code}");
+        // The body expands to one `input()` per property (no surviving object destructure).
+        assert!(code.contains("const name = input()"), "no expanded `name`; got: {code}");
+        assert!(code.contains("const age = input(0)"), "`age` default lost; got: {code}");
+        assert!(code.contains("const caption = input()"), "rename local `caption` lost; got: {code}");
+        assert!(!code.contains("const { name"), "object destructure survived; got: {code}");
+        // The renamed property keeps its PUBLIC `label` name in the Ivy inputs map (the three-element
+        // `[flags, publicName, declaredName]` form).
+        assert!(code.contains("\"label\""), "rename public name `label` missing; got: {code}");
+        assert!(code.contains("\"caption\""), "rename declared name `caption` missing; got: {code}");
+    }
+
+    #[test]
+    fn tsx_props_param_rename_carries_public_alias() {
+        // FEATURE: object destructuring → inputs (PARAM form, rename). A renamed destructured prop
+        // `function Card({ label: caption })` keeps `caption` as the runtime signal / class property
+        // and `label` as the PUBLIC input name a parent binds to.
+        let source = "export default function Card({ label: caption }: Props) {\n\
+  return <div>{caption()}</div>;\n\
+}\n";
+        let out = compile(source, "card.tsx");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+        assert_well_formed_module(code);
+        // The synthesized declaration aliases to the public name, and the inputs map records both.
+        assert!(
+            code.contains("input(undefined, { alias: \"label\" })"),
+            "rename alias option missing on the synthesized input; got: {code}"
+        );
+        assert!(
+            code.contains("\"label\"") && code.contains("\"caption\""),
+            "inputs map missing the rename public/declared name pair; got: {code}"
+        );
     }
 
     #[test]

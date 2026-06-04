@@ -319,6 +319,241 @@ fn signal_call<'a>(expr: &'a Expression<'a>) -> Option<(&'a str, bool)> {
     }
 }
 
+/// Read the `alias` string from a signal-input call's options object — `input(<default>, { alias:
+/// "public" })` → `Some("public")`. Returns `None` when the call has no second-argument options
+/// object, or it carries no string-valued `alias` key. Used so a renamed input (the JSX param-form
+/// `{ label: caption }`, lowered to `input(undefined, { alias: "label" })`) surfaces its PUBLIC name
+/// as the input's `binding_property_name`.
+fn input_alias<'a>(expr: &'a Expression<'a>) -> Option<String> {
+    use oxc_ast::ast::{Argument, Expression as E, ObjectPropertyKind, PropertyKey};
+    let E::CallExpression(call) = expr else {
+        return None;
+    };
+    // The options object is the SECOND argument (`input(<default>, { … })`).
+    let Argument::ObjectExpression(obj) = call.arguments.get(1)? else {
+        return None;
+    };
+    for prop in &obj.properties {
+        let ObjectPropertyKind::ObjectProperty(p) = prop else {
+            continue;
+        };
+        let key = match &p.key {
+            PropertyKey::StaticIdentifier(id) => id.name.as_str(),
+            PropertyKey::StringLiteral(s) => s.value.as_str(),
+            _ => continue,
+        };
+        if key == "alias" {
+            if let E::StringLiteral(s) = &p.value {
+                return Some(s.value.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// One destructured property lifted out of a `const { … } = input<Props>()` declaration:
+/// the LOCAL binding name (the runtime signal name), the PUBLIC input name (`alias`, which differs
+/// from `local` only for a `{ key: local }` rename), the optional default-value source text
+/// (`{ local = <default> }`), and whether the destructured initializer was `input.required()` /
+/// `model()`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DestructuredInput {
+    /// The local binding identifier — becomes a `const <local> = input(...)` runtime signal.
+    pub local: String,
+    /// The PUBLIC input name. Equals `local` unless the author wrote a `{ alias: local }` rename, in
+    /// which case it is the object key — the name a parent binds to (the input's
+    /// `binding_property_name`).
+    pub alias: String,
+    /// Verbatim default-value source text (`{ local = <default> }`), already TS-erased; `None` when
+    /// the property carries no default.
+    pub default: Option<String>,
+    /// `input.required()` / `model.required()` — the lifted property is a REQUIRED input.
+    pub required: bool,
+    /// The initializer was `model()` (not `input()`): the lifted property is a two-way signal and
+    /// also yields a paired `<local>Change` output.
+    pub is_model: bool,
+}
+
+/// Expand every top-level `const { … } = input<Props>()` / `model<Props>()` object-destructure in
+/// `javascript` into one individual `const <local> = input(<default?>)` declaration per property.
+///
+/// This is the AUTHORING ergonomics feature "object destructuring → inputs": a component may declare
+/// its inputs in one destructuring statement —
+/// ```ignore
+/// const { name, age = 0, label: caption } = input<Props>();
+/// ```
+/// — and each destructured property becomes an INDIVIDUAL component input. The expansion lowers that
+/// to the per-property `input()` form the rest of the pipeline (signal lowering, binding collection,
+/// `defineComponent` emit) already understands:
+/// ```ignore
+/// const name = input();
+/// const age = input(0);
+/// const caption = input();
+/// ```
+/// The PUBLIC name of a renamed property (`{ label: caption }` → public `label`, local `caption`) is
+/// NOT carried in the emitted `input()` call (the runtime signal is just the local); it is recorded
+/// separately by [`collect_destructured_inputs`] and threaded into the input's
+/// `binding_property_name` so a parent still binds by the public name.
+///
+/// Only a SINGLE-declarator `const { … } = <input-call>` whose initializer is `input()` /
+/// `input.required()` / `model()` is rewritten — any other destructure (e.g. `const { x } = obj`) is
+/// left untouched so unrelated destructuring is never disturbed. A `...rest` element is dropped (it
+/// cannot be enumerated into discrete inputs) and recorded as a non-fatal note by the collector.
+/// Returns the source unchanged when it contains no such declaration, so the common case is a
+/// byte-for-byte passthrough.
+pub(crate) fn expand_input_destructures(javascript: &str) -> String {
+    if javascript.trim().is_empty() {
+        return javascript.to_string();
+    }
+    let allocator = Allocator::default();
+    let source_type = SourceType::default().with_typescript(true);
+    let ret = JsParser::new(&allocator, javascript, source_type).parse();
+
+    // (span_to_replace, replacement_text), highest span first so earlier offsets stay valid.
+    let mut replacements: Vec<((usize, usize), String)> = Vec::new();
+    for stmt in &ret.program.body {
+        let oxc_ast::ast::Statement::VariableDeclaration(decl) = stmt else {
+            continue;
+        };
+        let Some((props, _required, is_model)) = input_destructure_decl(decl, javascript) else {
+            continue;
+        };
+        let kind = if is_model { "model" } else { "input" };
+        let lines: Vec<String> = props
+            .iter()
+            .map(|p| match &p.default {
+                Some(d) => format!("const {} = {}({});", p.local, kind, d),
+                None => format!("const {} = {}();", p.local, kind),
+            })
+            .collect();
+        replacements.push((
+            (decl.span.start as usize, decl.span.end as usize),
+            lines.join("\n"),
+        ));
+    }
+    if replacements.is_empty() {
+        return javascript.to_string();
+    }
+    replacements.sort_by(|a, b| b.0 .0.cmp(&a.0 .0));
+    let mut out = javascript.to_string();
+    for ((start, end), text) in replacements {
+        out.replace_range(start..end, &text);
+    }
+    out
+}
+
+/// Collect the `{ … } = input<Props>()` destructured inputs from the ORIGINAL (un-expanded) body JS,
+/// each with its public alias / default / required / model classification. Used by [`extract_io`] to
+/// register one component input per destructured property with the correct `binding_property_name`.
+pub(crate) fn collect_destructured_inputs(javascript: &str) -> Vec<DestructuredInput> {
+    if javascript.trim().is_empty() {
+        return Vec::new();
+    }
+    let allocator = Allocator::default();
+    let source_type = SourceType::default().with_typescript(true);
+    let ret = JsParser::new(&allocator, javascript, source_type).parse();
+
+    let mut out: Vec<DestructuredInput> = Vec::new();
+    for stmt in &ret.program.body {
+        let oxc_ast::ast::Statement::VariableDeclaration(decl) = stmt else {
+            continue;
+        };
+        if let Some((props, _required, _is_model)) = input_destructure_decl(decl, javascript) {
+            out.extend(props);
+        }
+    }
+    out
+}
+
+/// If `decl` is a single-declarator `const { … } = input()/input.required()/model()` object
+/// destructure, return its destructured properties plus whether the initializer was `.required()` and
+/// whether it was `model()`. Returns `None` for any other declaration shape so unrelated destructuring
+/// (`const { x } = obj`) is never matched.
+fn input_destructure_decl<'a>(
+    decl: &oxc_ast::ast::VariableDeclaration<'a>,
+    source: &str,
+) -> Option<(Vec<DestructuredInput>, bool, bool)> {
+    use oxc_ast::ast::BindingPattern;
+    // Only a single-declarator declaration carries one initializer to classify.
+    if decl.declarations.len() != 1 {
+        return None;
+    }
+    let declarator = &decl.declarations[0];
+    // The binding target must be an object pattern (`{ … }`).
+    let BindingPattern::ObjectPattern(obj) = &declarator.id else {
+        return None;
+    };
+    // The initializer must be an `input()` / `input.required()` / `model()` signal call.
+    let init = declarator.init.as_ref()?;
+    let (base, required) = signal_call(init)?;
+    if base != "input" && base != "model" {
+        return None;
+    }
+    let is_model = base == "model";
+
+    let mut props: Vec<DestructuredInput> = Vec::new();
+    for prop in &obj.properties {
+        // The bound local (`a` for `{ a }`; `local` for `{ key: local }`; the assignment target for
+        // `{ a = 5 }`). A nested destructure has no single local — skip it.
+        let Some(local) = binding_pattern_local_name(&prop.value) else {
+            continue;
+        };
+        // The PUBLIC name is the object key for a shorthand/rename; default it to the local when the
+        // key is a non-identifier (computed) key.
+        let alias = property_key_name(&prop.key).unwrap_or_else(|| local.clone());
+        let default = binding_pattern_default_text(&prop.value, source)
+            .map(|d| crate::jsx::ts_erase::erase_via_reparse(&d).unwrap_or(d));
+        props.push(DestructuredInput {
+            local,
+            alias,
+            default,
+            required,
+            is_model,
+        });
+    }
+    if props.is_empty() {
+        return None;
+    }
+    Some((props, required, is_model))
+}
+
+/// The single local identifier bound by a binding pattern: `a` for `a`, the assignment target for
+/// `a = <default>`. `None` for a nested array/object destructure (no single local name).
+fn binding_pattern_local_name(pat: &oxc_ast::ast::BindingPattern) -> Option<String> {
+    use oxc_ast::ast::BindingPattern;
+    match pat {
+        BindingPattern::BindingIdentifier(id) => Some(id.name.to_string()),
+        BindingPattern::AssignmentPattern(assign) => binding_pattern_local_name(&assign.left),
+        _ => None,
+    }
+}
+
+/// The verbatim default-value source text of a defaulted binding pattern (`5` for `a = 5`), sliced
+/// from `source` (the body the pattern was parsed from). `None` when it carries no default.
+fn binding_pattern_default_text(
+    pat: &oxc_ast::ast::BindingPattern,
+    source: &str,
+) -> Option<String> {
+    use oxc_ast::ast::BindingPattern;
+    let BindingPattern::AssignmentPattern(assign) = pat else {
+        return None;
+    };
+    let span = oxc_span::GetSpan::span(&assign.right);
+    source
+        .get(span.start as usize..span.end as usize)
+        .map(|t| t.trim().to_string())
+}
+
+/// The identifier text of a property key (`a` for `{ a: x }` / `{ a }`), or `None` for a computed key.
+fn property_key_name(key: &oxc_ast::ast::PropertyKey) -> Option<String> {
+    use oxc_ast::ast::PropertyKey;
+    match key {
+        PropertyKey::StaticIdentifier(id) => Some(id.name.to_string()),
+        PropertyKey::StringLiteral(s) => Some(s.value.to_string()),
+        _ => None,
+    }
+}
+
 /// Parse the component-body JS chunk and extract Treaty signal inputs/outputs.
 ///
 /// In the Treaty SFC model the top-level JS *is* the component body, so top-level
@@ -338,6 +573,30 @@ fn extract_io(
 ) {
     if javascript.trim().is_empty() {
         return;
+    }
+
+    // First lift every `const { … } = input<Props>()` object-destructure: each destructured property
+    // becomes an INDIVIDUAL component input. A renamed property (`{ key: local }`) keeps `local` as
+    // the runtime signal / class-property name and `key` as the PUBLIC `binding_property_name`, so a
+    // parent still binds by the public name. (Defaults carry no input metadata — they affect only the
+    // runtime `input(<default>)` call the body expansion emits.) Runs over the ORIGINAL body so the
+    // rename's public key is still visible (the body expansion lowers `{ key: local }` to a bare
+    // `const local = input()`, dropping the key).
+    for d in collect_destructured_inputs(javascript) {
+        inputs.insert(
+            d.local.clone(),
+            R3InputMetadata {
+                class_property_name: d.local.clone(),
+                binding_property_name: d.alias.clone(),
+                required: d.required,
+                is_signal: true,
+                transform_function: None,
+            },
+        );
+        if d.is_model {
+            let change = format!("{}Change", d.local);
+            outputs.insert(change.clone(), change);
+        }
     }
 
     let allocator = Allocator::default();
@@ -361,11 +620,15 @@ fn extract_io(
             };
             match base {
                 "input" | "model" => {
+                    // A renamed prop reaches the body as `input(<default>, { alias: "<public>" })`
+                    // (e.g. the JSX param-form rename `{ label: caption }`), so the PUBLIC binding name
+                    // is the alias, falling back to the local declaration name when none is present.
+                    let binding = input_alias(init).unwrap_or_else(|| name.clone());
                     inputs.insert(
                         name.clone(),
                         R3InputMetadata {
                             class_property_name: name.clone(),
-                            binding_property_name: name.clone(),
+                            binding_property_name: binding,
                             required,
                             is_signal: true,
                             transform_function: None,
@@ -927,10 +1190,21 @@ fn compile_from_parts_inner(
     };
 
     // 0. Extract signal inputs/outputs from the component-body JS chunk.
+    //
+    // The signal-input metadata is read from the ORIGINAL body so a `const { key: local } =
+    // input<Props>()` rename still surfaces its PUBLIC `key` as the input's `binding_property_name`
+    // (see [`extract_io`] → [`collect_destructured_inputs`]). The body EMITTED below is the expanded
+    // form (each destructured property lowered to an individual `const local = input(<default>)`), so
+    // the runtime creates one signal per input and the binding collector sees discrete `const`s. When
+    // the body declares no `input<>()` destructure the expansion is a byte-for-byte passthrough, so
+    // every existing `.treaty` source compiles exactly as before.
     let mut inputs: OrderedMap<String, R3InputMetadata> = OrderedMap::new();
     let mut outputs: OrderedMap<String, String> = OrderedMap::new();
     extract_io(javascript, &mut inputs, &mut outputs);
     let is_signal = inputs.iter().any(|(_, m)| m.is_signal);
+
+    let expanded_javascript = expand_input_destructures(javascript);
+    let javascript = expanded_javascript.as_str();
 
     // 1. Template HTML -> HTML AST.
     let parse_result = treaty_ivy::ml_parser::parse(template_html, "template.html");
@@ -1449,6 +1723,67 @@ mod tests {
     }
 
     #[test]
+    fn treaty_input_object_destructure_lowers_each_property_to_an_input() {
+        // FEATURE: object destructuring → inputs. `const { name, age = 0, label: caption } =
+        // input<Props>()` lowers each destructured property to an INDIVIDUAL component input —
+        // handling shorthand, a default, and a rename — and the runtime body declares one
+        // `input(<default>)` signal per property.
+        let source = "const { name, age = 0, label: caption } = input<Props>();\n\
+<div>{{ name() }} {{ age() }} {{ caption() }}</div>\n";
+        let out = compile_treaty_file(source, "card.treaty");
+        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
+        let code = &out.code;
+        assert!(code.contains(DEFINE), "no defineComponent; got: {code}");
+
+        // The body emits one `input()` per property (no surviving object destructure), so the runtime
+        // creates a distinct signal for each input.
+        assert!(
+            code.contains("const name = input()"),
+            "no expanded `name` input; got: {code}"
+        );
+        assert!(
+            code.contains("const age = input(0)"),
+            "default not carried into the expanded `age` input; got: {code}"
+        );
+        assert!(
+            code.contains("const caption = input()"),
+            "rename local `caption` not expanded; got: {code}"
+        );
+        assert!(
+            !code.contains("const { name"),
+            "the object destructure survived into the client body; got: {code}"
+        );
+
+        // Each property is registered as a component input. The renamed property keeps the PUBLIC
+        // key `label` as its binding name (a parent binds `<card label="…">`), with the runtime
+        // signal/class-property name `caption`.
+        let allocator = Allocator::default();
+        let module_type = SourceType::default().with_module(true);
+        let parsed = JsParser::new(&allocator, code, module_type).parse();
+        assert!(parsed.errors.is_empty(), "client did not parse: {:?}\n{code}", parsed.errors);
+        for needle in ["name", "age", "caption", "label"] {
+            assert!(code.contains(needle), "inputs map missing `{needle}`; got: {code}");
+        }
+    }
+
+    #[test]
+    fn treaty_input_destructure_only_fires_for_input_initializer() {
+        // A plain (non-`input`) object destructure is NOT touched — only `input<>()`/`model<>()`
+        // destructures expand. `const { x, y } = obj;` survives verbatim, so unrelated destructuring
+        // is never disturbed (a byte-for-byte passthrough).
+        let before = "const obj = { x: 1, y: 2 };\nconst { x, y } = obj;\n";
+        assert_eq!(
+            expand_input_destructures(before),
+            before,
+            "a non-`input` object destructure must be left untouched"
+        );
+        assert!(
+            collect_destructured_inputs(before).is_empty(),
+            "a non-`input` object destructure must yield no inputs"
+        );
+    }
+
+    #[test]
     fn compiles_realistic_sfc_layout() {
         // The real REPL `.treaty` layout: a leading <style> CSS block, top-level JS
         // (imports + const), an HTML template region with {{ }} interpolation, and
@@ -1951,6 +2286,42 @@ function setup(user) {\n\
             !out.code.contains("db.insert"),
             "server body leaked into client; got: {}",
             out.code
+        );
+    }
+
+    #[test]
+    fn treaty_inline_use_server_fn_in_component_body_absent_from_client_and_map() {
+        // FEATURE: server fn IN a component (.treaty). A `'use server'` marker fn declared INSIDE a
+        // nested function body must be lifted to the backend, its call site rewritten, and its body
+        // ABSENT from BOTH the client code AND the client source map — closing the inline marker-form
+        // gap (the `server { … }` block form was already depth-agnostic).
+        let source = "function setup(user) {\n\
+  async function save(u) {\n\
+    'use server';\n\
+    return secretDb.insert(u);\n\
+  }\n\
+  return save(user);\n\
+}\n\
+<div>{{ setup }}</div>\n";
+
+        let out = compile_treaty_authoring(source, "form.treaty");
+
+        let server_module = out.server_module.expect("expected a server module for the inline fn");
+        assert!(
+            server_module.contains("\"/__server/save\""),
+            "no save route in axum server module; got: {server_module}"
+        );
+        // The body is absent from the client code.
+        assert!(
+            !out.code.contains("secretDb.insert"),
+            "SECURITY: inline server body leaked into the .treaty client; got: {}",
+            out.code
+        );
+        // The body is absent from the client source map.
+        let map = out.map.expect("expected a client source map");
+        assert!(
+            !map.contains("secretDb.insert"),
+            "SECURITY: inline server body leaked into the client source map; got:\n{map}"
         );
     }
 

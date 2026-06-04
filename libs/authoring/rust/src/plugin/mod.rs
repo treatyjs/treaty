@@ -470,8 +470,171 @@ fn extract_marker_fns_detect(
         }
     }
 
+    // INLINE (in-component) server fns: a `'use server'` / `$$` marker fn declared INSIDE a component
+    // body — a nested `function`/arrow at brace depth > 0 — is also a server fn and must be lifted, or
+    // its body LEAKS into the client bundle. The top-level scan above only sees program-top-level
+    // declarations, so a marker fn nested in a component function (the JSX `function Card() { async
+    // function load() { 'use server'; … } }` form, and the `.treaty` nested-function form) was missed.
+    // Walk every function/arrow body and collect each nested marker fn, requiring its own marker (a
+    // nested fn is never part of a file-level module's blanket lift). Each is removed by span — a
+    // nested span never overlaps a top-level removal — leaving only the rewritten call site behind.
+    // The `server { … }` block form is already depth-agnostic (see `find_server_block`); this closes
+    // the SAME inline gap for the marker forms.
+    //
+    // SKIPPED for a file-level `'use server'` / `'use websocket'` module: there the WHOLE module is
+    // server-side and the top-level scan already removed every runtime statement WHOLE (its nested
+    // fns included), so descending would produce a span INSIDE an already-removed one. Such a module
+    // ships nothing to the client, so its in-body fns are irrelevant to it.
+    if !file_level {
+        collect_nested_marker_fns(source, &ret.program.body, &mut fns, &mut removals);
+    }
+
     let client_source = strip_spans(source, &mut removals);
     (client_source, fns, server_only_sources)
+}
+
+/// Recursively collect `'use server'` / `$$`-marker server fns declared INSIDE function / arrow
+/// bodies (brace depth > 0) — the in-component inline form — appending each lifted [`ServerFn`] and
+/// its byte span to `fns` / `removals`. Only NESTED declarations are considered here; the
+/// program-top-level forms are handled by the caller's own scan, so the walk descends into bodies but
+/// does not re-collect a statement that is itself top-level.
+///
+/// A nested marker fn always REQUIRES its own marker (`require_marker = true`): unlike a file-level
+/// `'use server'` module's blanket lift, a fn buried in a component body is server-only only when it
+/// explicitly says so. It is never `exported` (it is local to the component body), so the call site is
+/// rewritten in place to the client binding and no module re-export is emitted.
+fn collect_nested_marker_fns(
+    source: &str,
+    statements: &[Statement],
+    fns: &mut Vec<ServerFn>,
+    removals: &mut Vec<(usize, usize)>,
+) {
+    for stmt in statements {
+        // A program-top-level statement that is ITSELF a marker server fn was already lifted wholesale
+        // by the caller's top-level scan (its entire span, nested declarations included, is in
+        // `removals`). Descending into it would double-collect a marker fn nested inside it, so skip
+        // it. `require_marker = false` would over-match a file-level module's fns, so probe with the
+        // same `true` the top-level scan used for the non-file-level case; a file-level module's whole
+        // body is server-side anyway, so any in-body fn there is irrelevant to the client.
+        if server_fn_from_top_level(source, stmt, true, DEFAULT_LANG).is_some() {
+            continue;
+        }
+        collect_nested_in_statement(source, stmt, fns, removals);
+    }
+}
+
+/// Descend into a single statement, collecting nested marker server fns from any function/arrow body
+/// it (transitively) contains. The statement itself is NOT lifted (the caller's top-level scan owns
+/// the program-top-level forms); only declarations nested INSIDE its bodies are.
+fn collect_nested_in_statement(
+    source: &str,
+    stmt: &Statement,
+    fns: &mut Vec<ServerFn>,
+    removals: &mut Vec<(usize, usize)>,
+) {
+    use oxc_ast::ast::{Declaration, ExportDefaultDeclarationKind};
+    match stmt {
+        Statement::FunctionDeclaration(func) => {
+            if let Some(body) = func.body.as_deref() {
+                collect_nested_in_function_body(source, &body.statements, fns, removals);
+            }
+        }
+        Statement::VariableDeclaration(decl) => {
+            for d in &decl.declarations {
+                if let Some(init) = &d.init {
+                    collect_nested_in_expression(source, init, fns, removals);
+                }
+            }
+        }
+        Statement::ExportNamedDeclaration(export) => {
+            if let Some(decl) = export.declaration.as_ref() {
+                match decl {
+                    Declaration::FunctionDeclaration(func) => {
+                        if let Some(body) = func.body.as_deref() {
+                            collect_nested_in_function_body(source, &body.statements, fns, removals);
+                        }
+                    }
+                    Declaration::VariableDeclaration(decl) => {
+                        for d in &decl.declarations {
+                            if let Some(init) = &d.init {
+                                collect_nested_in_expression(source, init, fns, removals);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Statement::ExportDefaultDeclaration(export) => {
+            if let ExportDefaultDeclarationKind::FunctionDeclaration(func) = &export.declaration {
+                if let Some(body) = func.body.as_deref() {
+                    collect_nested_in_function_body(source, &body.statements, fns, removals);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Walk the statements of a function / arrow BODY. Each statement here is at brace depth > 0, so a
+/// `function`/arrow-const declaration carrying a `'use server'` / `$$` marker IS an inline server fn
+/// and is lifted; non-marker statements are recursed into so a marker fn nested deeper still (a fn
+/// inside a fn) is found.
+fn collect_nested_in_function_body(
+    source: &str,
+    statements: &[Statement],
+    fns: &mut Vec<ServerFn>,
+    removals: &mut Vec<(usize, usize)>,
+) {
+    for stmt in statements {
+        // A nested `function`/arrow-const with its own marker is an inline server fn: lift it (it is
+        // not exported — it is local to the enclosing body). `server_fn_from_top_level` unwraps and
+        // builds the fn; `require_marker = true` so only MARKED nested fns are lifted.
+        if let Some((server_fn, span)) =
+            server_fn_from_top_level(source, stmt, true, DEFAULT_LANG)
+        {
+            fns.push(server_fn);
+            removals.push(span);
+            continue;
+        }
+        // Not a marker fn itself — descend so a marker fn nested deeper is still found.
+        collect_nested_in_statement(source, stmt, fns, removals);
+    }
+}
+
+/// Descend into an initializer expression to find a function/arrow body to walk: a `const f = () => {
+/// … }` arrow, a `const f = function () { … }` function expression, or either wrapped in a
+/// parenthesized / `as` / `!` TS wrapper. Used so a marker fn nested inside an arrow-const component
+/// (`const Card = () => { async function load() { 'use server'; … }; return <…/>; }`) is found.
+fn collect_nested_in_expression(
+    source: &str,
+    expr: &Expression,
+    fns: &mut Vec<ServerFn>,
+    removals: &mut Vec<(usize, usize)>,
+) {
+    match expr {
+        Expression::ArrowFunctionExpression(arrow) => {
+            collect_nested_in_function_body(source, &arrow.body.statements, fns, removals);
+        }
+        Expression::FunctionExpression(func) => {
+            if let Some(body) = func.body.as_deref() {
+                collect_nested_in_function_body(source, &body.statements, fns, removals);
+            }
+        }
+        Expression::ParenthesizedExpression(p) => {
+            collect_nested_in_expression(source, &p.expression, fns, removals)
+        }
+        Expression::TSAsExpression(e) => {
+            collect_nested_in_expression(source, &e.expression, fns, removals)
+        }
+        Expression::TSNonNullExpression(e) => {
+            collect_nested_in_expression(source, &e.expression, fns, removals)
+        }
+        Expression::TSSatisfiesExpression(e) => {
+            collect_nested_in_expression(source, &e.expression, fns, removals)
+        }
+        _ => {}
+    }
 }
 
 /// Whether a top-level statement of a file-level `'use server'` module is RUNTIME code that must be
@@ -515,6 +678,11 @@ fn is_server_only_runtime_statement(stmt: &Statement) -> bool {
 
 /// Remove each `(start, end)` byte span from `source`. Also swallows one trailing newline after each
 /// removed span so a lifted declaration does not leave a dangling blank line.
+///
+/// Removals come from several collection passes (the top-level marker scan and the in-component nested
+/// walk), so a span nested INSIDE an already-collected one is skipped defensively: removing it after
+/// the enclosing span is gone would index a no-longer-valid offset. (The collectors already avoid
+/// emitting an overlap, so this is belt-and-braces — it never fires on the supported authoring shapes.)
 fn strip_spans(source: &str, removals: &mut Vec<(usize, usize)>) -> String {
     if removals.is_empty() {
         return source.to_string();
@@ -523,7 +691,15 @@ fn strip_spans(source: &str, removals: &mut Vec<(usize, usize)>) -> String {
     removals.sort_by(|a, b| b.0.cmp(&a.0));
     let bytes = source.as_bytes();
     let mut out = source.to_string();
+    // The end of the most-recently-removed span (in original-source coordinates); a later span that
+    // starts before this end overlaps it and is skipped.
+    let mut last_removed_start = source.len();
     for &(start, end) in removals.iter() {
+        // Skip a span contained in / overlapping one already removed (descending order means an
+        // overlap shows up as `end > last_removed_start`).
+        if end > last_removed_start {
+            continue;
+        }
         let mut end = end;
         if end < bytes.len() && bytes[end] == b'\r' {
             end += 1;
@@ -532,6 +708,7 @@ fn strip_spans(source: &str, removals: &mut Vec<(usize, usize)>) -> String {
             end += 1;
         }
         out.replace_range(start..end, "");
+        last_removed_start = start;
     }
     out
 }
@@ -2165,6 +2342,79 @@ export default function greetingCard() {\n\
             !jsx.client_source.contains("greetings[name.length"),
             "server body leaked into client after JSX extraction; got: {}",
             jsx.client_source
+        );
+    }
+
+    #[test]
+    fn inline_use_server_fn_in_component_body_is_lifted() {
+        // FEATURE: server fn IN a component. A `'use server'` marker fn declared INSIDE a component
+        // body (a nested `function` at brace depth > 0) must be lifted exactly like a top-level one —
+        // its body never reaches the client. The plain top-level scan missed it; the nested walk lifts
+        // it. (JSX-aware parse so the component's JSX body does not break the parse.)
+        let source = "export default function Card() {\n\
+  async function loadUser(id: number) {\n\
+    'use server';\n\
+    return secretDb.users.find(id);\n\
+  }\n\
+  const onClick = () => loadUser(1);\n\
+  return <button onClick={onClick}>go</button>;\n\
+}\n";
+        let extraction = extract_server_block_jsx(source);
+        assert_eq!(extraction.server_fns.len(), 1, "the inline `'use server'` fn was not lifted");
+        assert_eq!(extraction.server_fns[0].name, "loadUser");
+        // The nested fn is LOCAL to the component body — not exported as module surface.
+        assert!(!extraction.server_fns[0].exported, "inline server fn must not be exported");
+        // The body is gone from the client source; the enclosing component fn survives.
+        assert!(
+            !extraction.client_source.contains("secretDb.users.find"),
+            "SECURITY: inline server body leaked into client; got: {}",
+            extraction.client_source
+        );
+        assert!(
+            extraction.client_source.contains("function Card()"),
+            "the enclosing component must survive the inline lift; got: {}",
+            extraction.client_source
+        );
+    }
+
+    #[test]
+    fn inline_dollar_suffix_fn_in_component_body_is_lifted() {
+        // The `$$`-suffix marker form of an inline (in-component) server fn is lifted the same way as
+        // the `'use server'` directive form.
+        let source = "export default function Card() {\n\
+  const load$$ = async (id: number) => {\n\
+    return secretDb.users.find(id);\n\
+  };\n\
+  return <button onClick={() => load$$(1)}>go</button>;\n\
+}\n";
+        let extraction = extract_server_block_jsx(source);
+        assert_eq!(extraction.server_fns.len(), 1, "the inline `$$` fn was not lifted");
+        assert_eq!(extraction.server_fns[0].name, "load$$");
+        assert!(
+            !extraction.client_source.contains("secretDb.users.find"),
+            "SECURITY: inline `$$` server body leaked into client; got: {}",
+            extraction.client_source
+        );
+    }
+
+    #[test]
+    fn non_marker_nested_fn_is_not_lifted() {
+        // A plain nested fn (no marker) inside a component body is NOT a server fn — it stays on the
+        // client. Only MARKED nested fns are lifted, so ordinary local helpers are never disturbed.
+        let source = "export default function Card() {\n\
+  function helper(x: number) { return x + 1; }\n\
+  return <button onClick={() => helper(1)}>go</button>;\n\
+}\n";
+        let extraction = extract_server_block_jsx(source);
+        assert!(
+            extraction.server_fns.is_empty(),
+            "an unmarked nested helper must not be lifted; got: {:?}",
+            extraction.server_fns.iter().map(|f| &f.name).collect::<Vec<_>>()
+        );
+        assert!(
+            extraction.client_source.contains("function helper"),
+            "the unmarked helper must stay on the client; got: {}",
+            extraction.client_source
         );
     }
 
