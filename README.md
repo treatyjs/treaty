@@ -40,6 +40,37 @@ default.
 
 Legend: ✅ done · 🏗️ in progress · ⏳ queued.
 
+## Treaty vs AnalogJS
+
+[AnalogJS](https://analogjs.org) (by Brandon Roberts) is the established
+Vite-powered Angular meta-framework. Both bring file-routing, SSR/SSG and
+single-file-component authoring to Angular — but they sit at different layers.
+AnalogJS is a Vite + Nitro layer **around the standard Angular toolchain**;
+Treaty **replaces the toolchain** with a from-scratch Rust/OXC compiler, packager
+and CLI.
+
+| | Treaty | AnalogJS |
+| --- | --- | --- |
+| Compiler | Custom **Rust/OXC** compiler — direct-to-Ivy, **no `@angular/compiler` at runtime**, **no `tsc`**; dual **oxc + swc** backends, byte-identical | Standard `@angular/compiler` via a Vite plugin (`@analogjs/vite-plugin-angular`) |
+| Authoring | `.treaty` SFC, JSX-flavored Angular, **and plain React `.tsx` → Angular**; **signals-by-default**; **selectorless** (no `NgModule`/`imports:[]`) | `.analog`/`.ag` Angular SFC (standard Angular semantics) |
+| Cross-framework | **React → Angular** (today); **Angular/Treaty → React** compiled UI (in progress) | — (Angular only) |
+| CLI | Native **Rust** CLI (`treaty`) — reads `angular.json`, real `@angular-devkit` schematics/migrations, native Rust bundler + **tokio** dev server | `ng` / Vite / Nitro tooling |
+| Library packaging | **`treaty-packagr`** — oxc-powered ng-packagr alternative, byte-parity, ~35× faster | `ng-packagr` (standard) |
+| Bundlers | `@treaty/{vite,rolldown,rspack,rsbuild,rslib}` + a native Rust bundler | Vite |
+| Routing | File-based (build-time virtual module) | File-based |
+| SSR / SSG | SSG core (Rust); SSR request-time render 🏗️ | **Mature** SSR + SSG via Nitro (deployment presets, many hosts) |
+| Server functions | Inline (`server{}` / `'use server'`), backend-agnostic (axum default), bodies stripped from client + source map | API / server routes via Nitro |
+| Runtime | Own Node-compatible runtime (Nova-based) | Node / Nitro |
+
+**Where AnalogJS leads today:** SSR maturity + deployment presets (Nitro),
+ecosystem/community, and production track record. **Where Treaty leads:** a
+from-scratch Rust compiler (speed, no JIT, a zero-oxc swc variant), multi-format
+authoring (`.treaty` + JSX + **plain React**), cross-framework compilation, a
+native Rust CLI + packager, and signals-by-default + selectorless out of the box.
+Treaty also stays a drop-in for existing Angular workspaces (`angular.json`,
+`@angular/*`, CDK/Material) — so it can ingest an AnalogJS or standard Angular app
+and compile it with the Rust toolchain unchanged.
+
 ## Examples
 
 - [`examples/everything-app`](examples/everything-app) — broad feature coverage.
