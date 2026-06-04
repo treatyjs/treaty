@@ -29,6 +29,10 @@
     { "pattern": "readline-*",       "reason": "node:readline pending" },
     { "pattern": "repl-*",           "reason": "node:repl is out of scope for the harness" },
     { "pattern": "tty-*",            "reason": "node:tty pending" },
-    { "pattern": "inspector-*",      "reason": "node:inspector is out of scope for the harness" }
+    { "pattern": "inspector-*",      "reason": "node:inspector is out of scope for the harness" },
+    { "pattern": "struct-*",         "reason": "struct: unimplemented (TC39 JavaScript Structs, Stage 2; unshared-struct lowering = M4, no runtime struct heap)" },
+    { "pattern": "shared-struct-*",  "reason": "struct: unimplemented (TC39 shared structs, Stage 2; needs a shared heap + tear-free fields — not polyfillable; swc recognizer = M3, lowering = M4)" },
+    { "pattern": "shared-array",     "reason": "struct: unimplemented (TC39 SharedArray, Stage 2; needs a shared heap — not polyfillable)" },
+    { "pattern": "atomics-*",        "reason": "struct: unimplemented (TC39 Atomics.Mutex/Condition, Stage 2; needs a futex-backed shared-memory sync runtime — not polyfillable)" }
   ]
 }

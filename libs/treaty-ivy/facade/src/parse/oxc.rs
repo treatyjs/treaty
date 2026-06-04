@@ -26,8 +26,10 @@ use super::{
     ClassWithDecorators, DecoratorInfo, ImportInfo, LitValue, MemberInfo, MemberKind, NArg,
     NArrayElement, NArrowBody, NAssignment, NCtorParam, NExpr, NObjectProp, NParam, NStmt, NTopStmt,
     NTypeRef, NVarDeclarator, NgDeclareCall, ObjLit, ParseBackend, ParseOutput, SourceKind,
-    TreatySpan,
+    StructKind, TreatySpan,
 };
+
+mod struct_recognizer;
 
 /// The oxc parse backend. Zero-sized; the parse arena is created per [`Self::parse_module`] call so
 /// each parse is independent (no shared mutable state — mirrors the historical per-call
@@ -72,10 +74,17 @@ impl ParseBackend for OxcParseBackend {
     ) -> R {
         let allocator = Allocator::default();
         let source_type = source_type_for(kind);
-        let ret = Parser::new(&allocator, source, source_type).parse();
+
+        // Pre-pass: recognize + bridge-rewrite any `struct`/`shared struct` declaration to a `class`
+        // (span-preserving) so oxc 0.133 — which has no struct AST node — parses the body unchanged.
+        // For struct-free sources this is one lexical scan that returns the input verbatim, so the
+        // parse + lowering below are byte-identical to before (matchGolden is unaffected).
+        let pre = struct_recognizer::pre_scan(source);
+        let parse_src: &str = if pre.is_empty() { source } else { &pre.rewritten };
+        let ret = Parser::new(&allocator, parse_src, source_type).parse();
 
         let summary = if ret.errors.is_empty() {
-            lower_program(&ret.program, source)
+            lower_program(&ret.program, source, &pre.structs)
         } else {
             ParseOutput {
                 classes: Vec::new(),
@@ -129,7 +138,17 @@ fn span_of<T: GetSpan>(node: &T) -> TreatySpan {
 
 /// Lower a parsed program into the neutral [`ParseOutput`] (decorated classes + `ɵɵngDeclare*` calls,
 /// source order).
-fn lower_program(program: &Program, source: &str) -> ParseOutput {
+///
+/// `recognized` carries any `struct`/`shared struct` declarations the pre-pass found (empty for a
+/// struct-free source). A class is surfaced into `classes` when it is DECORATED (the historical rule)
+/// OR its name matches a recognized struct; in the struct case its additive
+/// [`ClassWithDecorators::struct_kind`] is set so the neutral output records the struct-ness. An empty
+/// `recognized` makes this byte-identical to the historical decorated-only behaviour.
+fn lower_program(
+    program: &Program,
+    source: &str,
+    recognized: &[struct_recognizer::RecognizedStruct],
+) -> ParseOutput {
     let mut classes = Vec::new();
     let mut ng_declare_calls = Vec::new();
     let mut imports = Vec::new();
@@ -137,8 +156,17 @@ fn lower_program(program: &Program, source: &str) -> ParseOutput {
 
     for stmt in &program.body {
         if let Some(class) = statement_class(stmt) {
-            if !class.decorators.is_empty() {
-                classes.push(lower_class(class, span_of(stmt)));
+            let struct_kind = class
+                .id
+                .as_ref()
+                .and_then(|id| recognized.iter().find(|r| r.name == id.name.as_str()))
+                .map(|r| r.kind);
+            if !class.decorators.is_empty() || struct_kind.is_some() {
+                let mut lowered = lower_class(class, span_of(stmt));
+                if let Some(kind) = struct_kind {
+                    lowered.struct_kind = kind;
+                }
+                classes.push(lowered);
             }
             collect_ng_declares_in_class(class, &mut ng_declare_calls);
         }
@@ -323,6 +351,10 @@ pub(crate) fn lower_class(class: &Class, stmt_span: TreatySpan) -> ClassWithDeco
         members,
         span: span_of(class),
         stmt_span,
+        // Defaulted here; the struct recognizer (`struct_recognizer`) overrides it after the
+        // bridge-rewrite turned a `struct`/`shared struct` keyword into `class`. A genuine `class`
+        // keeps `None`, so the neutral output is byte-identical to before — `matchGolden` is unaffected.
+        struct_kind: StructKind::None,
     }
 }
 

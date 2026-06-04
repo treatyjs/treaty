@@ -77,7 +77,7 @@ pub enum SourceKind<'a> {
 pub use treaty_ivy_core::neutral::{
     ClassWithDecorators, DecoratorInfo, LitValue, MemberInfo, MemberKind, NArg, NArrayElement,
     NArrowBody, NAssignment, NCtorParam, NExpr, NObjectProp, NParam, NStmt, NTopStmt, NTypeRef,
-    NVarDeclarator, ObjLit, TreatySpan,
+    NVarDeclarator, ObjLit, StructKind, TreatySpan,
 };
 
 /// A top-level (or inline) IMPORT binding the foreign-import / imported-name collection reads: the
@@ -905,5 +905,77 @@ export function plain() { return 1; }
         let s_text = SwcParseBackend.span_text(src, s_span);
         assert_eq!(o_text, s_text, "span_text must recover identical slices");
         assert!(o_text.starts_with('{') && o_text.ends_with('}'), "got: {o_text}");
+    }
+
+    /// The TC39-structs RECOGNIZER (M2): the oxc backend recognizes a `struct Name {…}` and a
+    /// `shared struct Name {…}` declaration in statement position, bridge-rewrites the keyword to
+    /// `class` (span-preserving) so oxc parses the body unchanged, and records the additive
+    /// [`StructKind`] + the declared field names (via the class members) onto the neutral
+    /// [`ClassWithDecorators`]. Asserts the oxc neutral output for BOTH forms.
+    ///
+    /// This asserts the OXC backend directly (not `assert_parity`): the swc struct recognizer is M3
+    /// (deferred), so swc cannot parse raw `struct` source yet. A plain `class` stays
+    /// [`StructKind::None`] across BOTH backends, which is what keeps the broad parity corpus +
+    /// `matchGolden` byte-identical.
+    #[test]
+    fn struct_parse_parity() {
+        use super::{MemberKind, StructKind};
+
+        // --- unshared struct: fixed-layout, class-shaped body (fields + ctor + method). ---
+        let unshared = r#"struct Box {
+  x;
+  y;
+  constructor(x, y) { this.x = x; this.y = y; }
+  sum() { return this.x + this.y; }
+}"#;
+        let o = oxc_summary(unshared, SourceKind::TypeScriptModule);
+        assert!(o.errors.is_empty(), "struct source must parse after bridge-rewrite: {:?}", o.errors);
+        assert_eq!(o.classes.len(), 1, "the struct surfaces as one neutral class");
+        let s = &o.classes[0];
+        assert_eq!(s.name.as_deref(), Some("Box"));
+        assert_eq!(s.struct_kind, StructKind::Struct, "recognized as an unshared struct");
+        // The declared FIELD names flow through as Property members (the body parsed as a class).
+        let fields: Vec<&str> = s
+            .members
+            .iter()
+            .filter(|m| m.kind == MemberKind::Property)
+            .filter_map(|m| m.name.as_deref())
+            .collect();
+        assert_eq!(fields, vec!["x", "y"], "declared struct fields recorded");
+        // The bridge-rewrite preserved spans: the class-name span recovers `Box` exactly.
+        assert_eq!(OxcParseBackend.span_text(unshared, s.name_span), "Box");
+        // The ctor + method are still present (class body parsed unchanged).
+        assert!(s.members.iter().any(|m| m.kind == MemberKind::Constructor), "ctor present");
+        assert!(
+            s.members.iter().any(|m| m.kind == MemberKind::Method && m.name.as_deref() == Some("sum")),
+            "method present"
+        );
+
+        // --- shared struct: data-only, fields hold primitives/other shared values. ---
+        let shared = r#"shared struct SharedBox {
+  x;
+  y;
+}"#;
+        let o = oxc_summary(shared, SourceKind::TypeScriptModule);
+        assert!(o.errors.is_empty(), "shared struct must parse after rewrite: {:?}", o.errors);
+        assert_eq!(o.classes.len(), 1);
+        let ss = &o.classes[0];
+        assert_eq!(ss.name.as_deref(), Some("SharedBox"));
+        assert_eq!(ss.struct_kind, StructKind::SharedStruct, "recognized as a shared struct");
+        let fields: Vec<&str> = ss
+            .members
+            .iter()
+            .filter(|m| m.kind == MemberKind::Property)
+            .filter_map(|m| m.name.as_deref())
+            .collect();
+        assert_eq!(fields, vec!["x", "y"], "shared-struct fields recorded");
+        assert_eq!(OxcParseBackend.span_text(shared, ss.name_span), "SharedBox");
+
+        // --- a plain class is untouched: StructKind::None on BOTH backends (parity preserved). ---
+        let plain = r#"@Component({ selector: "c", template: "" }) export class C { x = 1; }"#;
+        let o = oxc_summary(plain, SourceKind::TypeScriptModule);
+        let sw = swc_summary(plain, SourceKind::TypeScriptModule);
+        assert_eq!(o, sw, "a plain class stays byte-identical across backends");
+        assert_eq!(o.classes[0].struct_kind, StructKind::None, "a class is not a struct");
     }
 }

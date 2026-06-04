@@ -534,6 +534,31 @@ pub struct NTypeRef {
     pub type_args: Vec<NTypeRef>,
 }
 
+/// Whether a class-shaped declaration was authored as a plain `class`, an (unshared) `struct`, or a
+/// `shared struct` — the TC39 "JavaScript Structs: Fixed Layout Objects" proposal (Stage 2,
+/// <https://github.com/tc39/proposal-structs>).
+///
+/// `struct`/`shared struct` are class-SHAPED declarations (same field/method/getter/setter member
+/// grammar), so a parse backend lowers them into the SAME [`ClassWithDecorators`] as a `class` and
+/// records only which form it saw here. The distinction drives later lowering (an unshared `struct`
+/// → a sealed `class`; a `shared struct` → a shared-heap target / an explicit diagnostic), but is
+/// inert for the current emit: the field defaults to [`StructKind::None`], so a class is byte-identical
+/// to before and `matchGolden` is unaffected.
+///
+/// `struct` and `shared` are CONTEXTUAL keywords (legal identifiers elsewhere); the recognizer that
+/// sets this respects the proposal's `[no LineTerminator here]` ASI rule after `struct`/`shared`.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum StructKind {
+    /// A plain `class` — the default; carries no struct semantics.
+    #[default]
+    None,
+    /// An unshared `struct Name { … }` — fixed layout (sealed), fields pre-initialized to `undefined`.
+    Struct,
+    /// A `shared struct Name { … }` — the cross-agent variant (null prototype, data-only, fields hold
+    /// only primitives / other shared values).
+    SharedStruct,
+}
+
 /// A pre-lowered class carrying an Angular decorator: name + its decorators + its members.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ClassWithDecorators {
@@ -562,4 +587,12 @@ pub struct ClassWithDecorators {
     /// the emitted Ivy statics. Equals [`Self::span`] for a bare `class X {}`, and starts at the
     /// `export`/decorator for an exported / decorated class. Filled identically by both backends.
     pub stmt_span: TreatySpan,
+    /// Whether the declaration was authored as a plain `class`, an unshared `struct`, or a
+    /// `shared struct` (TC39 JavaScript Structs, Stage 2). [`StructKind::None`] for a `class` — the
+    /// default — so this is ADDITIVE: a class lowers byte-identically to before and `matchGolden` is
+    /// unaffected. A struct recognizer (the oxc backend's pre-scan) sets it to
+    /// [`StructKind::Struct`] / [`StructKind::SharedStruct`] after bridge-rewriting the `struct` /
+    /// `shared struct` keyword to `class` so the engine parses the class body unchanged. Filled by
+    /// both backends (the swc recognizer is deferred to M3).
+    pub struct_kind: StructKind,
 }

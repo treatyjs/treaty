@@ -49,7 +49,7 @@ use super::{
     ClassWithDecorators, DecoratorInfo, ImportInfo, LitValue, MemberInfo, MemberKind, NArg,
     NArrayElement, NArrowBody, NAssignment, NCtorParam, NExpr, NObjectProp, NParam, NStmt, NTopStmt,
     NTypeRef, NVarDeclarator, NgDeclareCall, ObjLit, ParseBackend, ParseOutput, SourceKind,
-    TreatySpan,
+    StructKind, TreatySpan,
 };
 
 /// The swc parse backend. Zero-sized; a fresh `GLOBALS` scope + `SourceMap` is created per
@@ -459,6 +459,10 @@ fn lower_class(
         members,
         span,
         stmt_span,
+        // The swc backend does not yet recognize `struct`/`shared struct` (the recognizer is M3 —
+        // deferred); every class it lowers is a plain `class`. ADDITIVE: this matches the oxc backend
+        // for all non-struct sources, so `ParseOutput` stays byte-identical at the parity gate.
+        struct_kind: StructKind::None,
     }
 }
 
