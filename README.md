@@ -7,8 +7,6 @@ ng-packagr alternative), provides an `ng`-compatible native CLI, and lets you
 author with `.treaty` SFCs, JSX-flavored Angular, or **plain React** — signals by
 default.
 
-> Branch: `migration/v22-oxc133` · OXC 0.133 · Angular **22.0.0-rc.3** (re-pin to `22.0.0` when it ships) · TypeScript 6.0.
-> Detailed state: [`migration/STATUS.md`](migration/STATUS.md).
 
 ## Features
 
