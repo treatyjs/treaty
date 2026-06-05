@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-06-02T18:13:11.378Z",
+  "generatedAt": "2026-06-05T00:19:07.729Z",
   "app": "examples/linker-smoke",
   "layer": "e2e-of-output",
   "method": "After timing+sizing each build tool, boot its emitted bundle headlessly in jsdom (a fresh child process per tool, reusing the linker-smoke e2e Step-4 boot pattern) and assert: (a) bootstrap throws NO JIT / \"@angular/compiler not available\" error, and (b) the routed component renders into the DOM (an <h1 id=\"smoke-heading\">Linker smoke</h1>). A fast build that ships broken output is flagged works:\"FAIL\", never rewarded.",
@@ -19,7 +19,7 @@
       "rendered": true,
       "renderedAnything": true,
       "heading": "Linker smoke",
-      "entry": "D:\\dev\\treaty\\examples\\linker-smoke\\dist\\buildtool-bench\\vite-0\\assets\\index-DWLwfn5l.js"
+      "entry": "D:\\dev\\treaty\\examples\\linker-smoke\\dist\\buildtool-bench\\vite-2\\assets\\index-HxInfXDc.js"
     },
     {
       "tool": "rolldown",
@@ -31,22 +31,22 @@
       "rendered": true,
       "renderedAnything": true,
       "heading": "Linker smoke",
-      "entry": "D:\\dev\\treaty\\examples\\linker-smoke\\dist\\buildtool-bench\\rolldown-0\\main.js"
+      "entry": "D:\\dev\\treaty\\examples\\linker-smoke\\dist\\buildtool-bench\\rolldown-2\\main.js"
     },
     {
       "tool": "rspack",
       "works": "SKIPPED",
-      "reason": "not booted: build status=\"pending\" (peer @rspack/core not installed in this monorepo — @treaty/rspack's plugin dist is present but the bundler core it drives is absent, so no build can run here. Install @rspack/core to measure.)"
+      "reason": "not booted: build status=\"pending\" (peer @rspack/core present (v2.0.6) but no runner is wired in this benchmark; add a build step for rspack to measure.)"
     },
     {
       "tool": "rsbuild",
       "works": "SKIPPED",
-      "reason": "not booted: build status=\"pending\" (peer @rsbuild/core not installed in this monorepo — @treaty/rsbuild's plugin dist is present but the bundler core it drives is absent, so no build can run here. Install @rsbuild/core to measure.)"
+      "reason": "not booted: build status=\"pending\" (peer @rsbuild/core present (v2.0.10) but no runner is wired in this benchmark; add a build step for rsbuild to measure.)"
     },
     {
       "tool": "rslib",
       "works": "SKIPPED",
-      "reason": "not booted: build status=\"pending\" (peer @rslib/core not installed in this monorepo — @treaty/rslib's plugin dist is present but the bundler core it drives is absent, so no build can run here. Install @rslib/core to measure.)"
+      "reason": "not booted: build status=\"pending\" (peer @rslib/core present (v0.22.0) but no runner is wired in this benchmark; add a build step for rslib to measure.)"
     },
     {
       "tool": "ng-cli",

@@ -16,7 +16,7 @@
                     "kind": "bin"
                 }
             },
-            "args": ["${workspaceFolder}/apps/rust/authoring/src/test.ts"],
+            "args": ["${workspaceFolder}/libs/authoring/rust/src/test.treaty"],
             "cwd": "${workspaceFolder}",
             "env": {
                 "RUST_BACKTRACE": "1"

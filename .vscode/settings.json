@@ -1,5 +1,6 @@
 {
 	"rust-analyzer.linkedProjects": [
 		"Cargo.toml"
-	]
+	],
+	"typescript.native-preview.tsdk": "node_modules\\@typescript\\native-preview"
 }
