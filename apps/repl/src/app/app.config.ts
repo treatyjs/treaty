@@ -1,7 +1,7 @@
 import {
   APP_INITIALIZER,
   ApplicationConfig,
-  ɵprovideZonelessChangeDetection as provideZonelessChangeDetection,
+  provideZonelessChangeDetection,
 } from '@angular/core';
 
 import { provideHttpClient, withFetch } from '@angular/common/http';

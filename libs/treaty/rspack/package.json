@@ -1,0 +1,49 @@
+{
+  "name": "@treaty/rspack",
+  "version": "0.0.1",
+  "description": "Rspack/webpack integration for Treaty: a loader that lowers .treaty/.tsx/.tjsx and @Component .ts to Ivy JS via @treaty/compiler, plus a plugin that wires the loader rule and resolve.extensions. Backed by the Rust authoring compiler.",
+  "author": "Jordan Hall",
+  "license": "IDGAF-1.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    "./package.json": {
+      "default": "./package.json"
+    },
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./loader": {
+      "types": "./dist/loader.d.ts",
+      "default": "./dist/loader.js"
+    },
+    "./link-partial-loader": {
+      "types": "./dist/link-partial-loader.d.ts",
+      "default": "./dist/link-partial-loader.js"
+    },
+    "./plugin": {
+      "types": "./dist/plugin.d.ts",
+      "default": "./dist/plugin.js"
+    }
+  },
+  "sideEffects": false,
+  "dependencies": {
+    "@treaty/compiler": "*",
+    "@treaty/module-federation": "*",
+    "@treaty/ts-vite": "*"
+  },
+  "peerDependencies": {
+    "@rspack/core": ">=1",
+    "@module-federation/enhanced": ">=0.9"
+  },
+  "peerDependenciesMeta": {
+    "@module-federation/enhanced": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=20.19"
+  }
+}

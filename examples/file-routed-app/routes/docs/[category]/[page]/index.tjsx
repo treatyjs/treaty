@@ -1,0 +1,24 @@
+// Deeper nested dynamic route (routes/docs/[category]/[page]/index.tjsx).
+//
+// Two stacked dynamic directories produce a multi-parameter route:
+// docs/[category]/[page] -> "docs/[category]/[page]" binding both `category`
+// and `page`. None of docs/, [category]/, or [page]/ has a layout, so they
+// FLATTEN: each directory segment is prefixed onto this index's path rather
+// than nesting as parent routes. Authored as a JSX function component.
+import { input } from '@angular/core'
+
+export default function docPage() {
+	const category = input<string>()
+	const page = input<string>()
+
+	return (
+		<article class="doc">
+			<nav class="crumbs">
+				<a routerLink="/docs/guide/intro">docs</a> / {category()} / {page()}
+			</nav>
+			<h1>
+				{category()} — {page()}
+			</h1>
+		</article>
+	)
+}

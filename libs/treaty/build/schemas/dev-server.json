@@ -1,0 +1,43 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema",
+  "title": "Treaty Dev Server Target",
+  "description": "Serve a Treaty application with the Rspack dev server and automatic Module Federation.",
+  "type": "object",
+  "properties": {
+    "entry": {
+      "type": "string",
+      "description": "The application entry point, relative to the workspace root (e.g. `src/main.ts`).",
+      "default": "src/main.ts"
+    },
+    "port": {
+      "type": "number",
+      "description": "Port the dev server listens on.",
+      "default": 4200
+    },
+    "host": {
+      "type": "string",
+      "description": "Host interface the dev server binds to.",
+      "default": "localhost"
+    },
+    "name": {
+      "type": "string",
+      "description": "This app's Module Federation container/library name. Defaults to the project name."
+    },
+    "remotes": {
+      "type": "object",
+      "description": "Remotes this app consumes while serving, keyed by the local alias used in dynamic imports.",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "exposes": {
+      "type": "object",
+      "description": "Modules this app exposes while serving, keyed by public import path.",
+      "additionalProperties": {
+        "type": "string"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": ["entry", "port"]
+}

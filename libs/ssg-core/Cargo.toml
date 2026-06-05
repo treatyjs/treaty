@@ -1,0 +1,27 @@
+# treaty_ssg — the pure, deterministic Rust core of `@treaty/ssg`.
+#
+# Treaty is a compiler, not a host. This crate ports the deterministic core of
+# the TS `@treaty/ssg` package (route discovery, an Ivy->static-HTML
+# interpreter, head/SEO emit, the per-route hydration manifest, sitemap.xml +
+# robots.txt) to Rust. The TS package becomes a thin shim over it later. See
+# [[rust-core-ts-shim-layering]].
+#
+# It is kept pure: the Nova prerender EXECUTION (running a route's render-time
+# macro to obtain its render data) is an INJECTED `RenderSeam` trait, so this
+# crate carries no heavy deps and is unit-tested with a fake seam. All outputs
+# are serde-serializable.
+#
+# DETACHED CRATE: the empty `[workspace]` table below makes this crate its own
+# workspace root, so it is NOT a member of the parent workspace and builds
+# independently of the in-flight render3 / runtime edits. Build with:
+#   cargo build --manifest-path libs/ssg-core/Cargo.toml
+[workspace]
+
+[package]
+name = "treaty_ssg"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

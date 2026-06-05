@@ -20,4 +20,13 @@ tasks:
     command: node tools/scripts/publish.mjs vite {args.ver} {args.tag}
     deps:
     - ~:build
+  # Unit suite for the partial-declaration linker. Uses a standalone Jest config (the repo's shared
+  # jest.preset.js still references the removed @nx/jest preset after the moon migration); this config
+  # mirrors jest.config.ts's SWC transform without that preset dependency.
+  test:
+    command: js jest --config $workspaceRoot/libs/typescript/vite/jest.standalone.config.cjs
+    inputs:
+    - 'src/**/*'
+    - 'jest.standalone.config.cjs'
+    - '.swcrc'
 type: library

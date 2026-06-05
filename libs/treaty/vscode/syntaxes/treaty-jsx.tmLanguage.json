@@ -1,0 +1,213 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Treaty JSX",
+  "scopeName": "source.tjsx",
+  "patterns": [
+    { "include": "#serverBlock" },
+    { "include": "#controlFlow" },
+    { "include": "source.tsx" }
+  ],
+  "repository": {
+    "serverBlock": {
+      "comment": "Inline `server { … }` / `server:lang { … }` block in JSX: server-only code lifted out of the client bundle. The `server` keyword + optional `:lang` tag paint as a server marker; the body embeds TS+JSX so it still highlights, scoped under a `server` meta so a theme can tint 'runs on server'.",
+      "begin": "(?<![.$\\w])(server)\\b(?:\\s*(:)\\s*([A-Za-z_][\\w]*))?\\s*(\\{)",
+      "beginCaptures": {
+        "1": { "name": "keyword.control.server.tjsx storage.type.server.tjsx" },
+        "2": { "name": "punctuation.separator.server-lang.tjsx" },
+        "3": { "name": "entity.name.type.server-lang.tjsx" },
+        "4": { "name": "punctuation.definition.block.begin.tjsx" }
+      },
+      "end": "(\\})",
+      "endCaptures": {
+        "1": { "name": "punctuation.definition.block.end.tjsx" }
+      },
+      "name": "meta.block.server.tjsx",
+      "contentName": "meta.embedded.block.server.tjsx",
+      "patterns": [
+        { "include": "source.tsx" }
+      ]
+    },
+    "controlFlow": {
+      "comment": "Angular @-prefixed control-flow blocks appearing inside JSX/TSX.",
+      "patterns": [
+        { "include": "#letDeclaration" },
+        { "include": "#caseBlock" },
+        { "include": "#block" }
+      ]
+    },
+    "hostBindingKey": {
+      "comment": "A host{} spec binding/listener key: a quoted Angular host microsyntax string used as an object key, e.g. '[style.color]', '(click)', '[(ngModel)]', 'class.active', 'attr.role'. The directive-authoring function returns `{ host: { … } }`; this paints those keys as binding names so they read like template bindings, not plain strings.",
+      "begin": "(['\"])(?=\\s*(?:\\[[^'\"]*\\]|\\([^'\"]*\\)|\\[\\([^'\"]*\\)\\]|(?:class|style|attr|animate)\\.[^'\"]*)\\1\\s*:)",
+      "beginCaptures": {
+        "1": { "name": "string.quoted.ng-binding.tjsx punctuation.definition.string.begin.ts" }
+      },
+      "end": "\\1",
+      "endCaptures": {
+        "0": { "name": "string.quoted.ng-binding.tjsx punctuation.definition.string.end.ts" }
+      },
+      "name": "meta.host-binding.key.tjsx",
+      "patterns": [
+        {
+          "match": "(\\[\\(?|\\(|\\)?\\])",
+          "name": "punctuation.definition.ng-binding-name.tjsx"
+        },
+        {
+          "match": "(class|style|attr|animate)(?=\\.)",
+          "name": "entity.other.ng-binding-name.special.html"
+        },
+        { "match": "\\.", "name": "punctuation.accessor.html" },
+        {
+          "match": "[-_$[:alnum:]]+",
+          "name": "entity.other.ng-binding-name.property.html"
+        }
+      ]
+    },
+    "block": {
+      "begin": "(?<![$._[:alnum:]])(@)(if|else if|else|defer|placeholder|loading|error|switch|for|empty)\\b\\s*",
+      "beginCaptures": {
+        "1": { "name": "keyword.control.block.transition.ng" },
+        "2": { "name": "keyword.control.block.kind.ng" }
+      },
+      "patterns": [
+        { "include": "#blockExpression" },
+        { "include": "#blockBody" }
+      ],
+      "name": "meta.block.control.tjsx control.block.ng",
+      "end": "(?<=\\})"
+    },
+    "caseBlock": {
+      "begin": "(?=(?<![$._[:alnum:]])@(?:case|default)\\b)",
+      "patterns": [
+        { "include": "#caseExhaustive" },
+        { "include": "#caseHeader" },
+        { "include": "#blockBody" }
+      ],
+      "end": "(?<=\\})",
+      "name": "control.block.case.ng"
+    },
+    "caseHeader": {
+      "begin": "(@)(case|default)\\b\\s*",
+      "beginCaptures": {
+        "1": { "name": "keyword.control.block.transition.ng" },
+        "2": { "name": "keyword.control.block.kind.ng" }
+      },
+      "patterns": [
+        { "include": "#blockExpression" }
+      ],
+      "end": "(?=@|{|})",
+      "name": "control.block.case.header.ng"
+    },
+    "caseExhaustive": {
+      "match": "(@)(default\\s+never)\\s*(;)",
+      "captures": {
+        "1": { "name": "keyword.control.block.transition.ng" },
+        "2": { "name": "keyword.control.block.kind.ng" },
+        "3": { "name": "punctuation.terminator.statement.ng" }
+      },
+      "name": "control.block.case.ng"
+    },
+    "blockExpression": {
+      "begin": "\\(",
+      "beginCaptures": { "0": { "name": "meta.brace.round.ts" } },
+      "contentName": "control.block.expression.ng",
+      "patterns": [
+        { "include": "#blockExpressionOfClause" },
+        { "include": "#blockExpressionLetBinding" },
+        { "include": "#blockExpressionTrackClause" },
+        { "include": "source.tsx#expression" }
+      ],
+      "end": "\\)",
+      "endCaptures": { "0": { "name": "meta.brace.round.ts" } }
+    },
+    "blockExpressionOfClause": {
+      "begin": "([_$[:alpha:]][_$[:alnum:]]*)\\s+(of)\\b",
+      "beginCaptures": {
+        "1": { "name": "variable.other.constant.ng" },
+        "2": { "name": "keyword.operator.expression.of.ng" }
+      },
+      "end": "(?=[$)])|(?<=;)",
+      "patterns": [
+        { "include": "source.tsx#expression" }
+      ]
+    },
+    "blockExpressionLetBinding": {
+      "begin": "\\blet\\b",
+      "beginCaptures": { "0": { "name": "storage.type.ng" } },
+      "end": "(?=[$)])|(?<=;)",
+      "patterns": [
+        { "include": "source.tsx#expression" }
+      ]
+    },
+    "blockExpressionTrackClause": {
+      "begin": "\\btrack\\b",
+      "beginCaptures": { "0": { "name": "keyword.control.track.ng" } },
+      "end": "(?=[$)])|(?<=;)",
+      "patterns": [
+        { "include": "source.tsx#expression" }
+      ]
+    },
+    "blockBody": {
+      "begin": "\\{",
+      "beginCaptures": { "0": { "name": "punctuation.definition.block.ts" } },
+      "end": "\\}",
+      "endCaptures": { "0": { "name": "punctuation.definition.block.ts" } },
+      "contentName": "control.block.body.ng",
+      "patterns": [
+        { "include": "#caseExhaustive" },
+        { "include": "#caseBlock" },
+        { "include": "#letDeclaration" },
+        { "include": "#block" },
+        { "include": "source.tsx" }
+      ]
+    },
+    "letDeclaration": {
+      "name": "meta.definition.variable.ng",
+      "begin": "(?<![$._[:alnum:]])(@let)\\s+([_$[:alpha:]][_$[:alnum:]]*)\\s*(=)?",
+      "beginCaptures": {
+        "1": { "name": "storage.type.ng" },
+        "2": { "name": "variable.other.constant.ng" },
+        "3": { "name": "keyword.operator.assignment.ng" }
+      },
+      "patterns": [
+        { "include": "#letInitializer" }
+      ],
+      "end": "(?<=;)"
+    },
+    "letInitializer": {
+      "begin": "\\s*",
+      "contentName": "meta.definition.variable.initializer.ng",
+      "patterns": [
+        { "include": "source.tsx#expression" }
+      ],
+      "end": ";",
+      "endCaptures": { "0": { "name": "punctuation.terminator.statement.ng" } }
+    }
+  },
+  "injections": {
+    "L:meta.tag.attributes.tsx, L:meta.tag.attributes.ts, L:JSXAttributes": {
+      "patterns": [
+        {
+          "comment": "Treat lowercase `class` as an Angular class binding name on JSX elements.",
+          "match": "(?<![-_$[:alnum:]])(class)(?=\\s*=)",
+          "captures": {
+            "1": { "name": "entity.other.attribute-name.class.tjsx entity.other.ng-binding-name.property.html" }
+          }
+        },
+        {
+          "comment": "`use:<name>` directive application: the `use` namespace, the `:` separator, and the directive name.",
+          "match": "(?<![-_$[:alnum:]])(use)(:)([_$[:alpha:]][-_$[:alnum:]]*)",
+          "captures": {
+            "1": { "name": "keyword.control.directive.use.tjsx entity.other.attribute-name.tjsx" },
+            "2": { "name": "punctuation.separator.directive.use.tjsx" },
+            "3": { "name": "entity.name.function.directive.tjsx entity.other.ng-binding-name.property.html" }
+          }
+        }
+      ]
+    },
+    "L:meta.objectliteral.ts": {
+      "patterns": [
+        { "include": "source.tjsx#hostBindingKey" }
+      ]
+    }
+  }
+}

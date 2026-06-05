@@ -1,0 +1,61 @@
+id: treaty-schematics
+language: typescript
+platform: node
+type: library
+tags: []
+tasks:
+  build:
+    command: tsc
+    args:
+    - -p
+    - $projectRoot/tsconfig.lib.json
+    inputs:
+    - src/**/*
+    - tsconfig.json
+    - tsconfig.lib.json
+    outputs:
+    - dist
+  copy-assets:
+    command: node
+    args:
+    - $projectRoot/tools/copy-assets.mjs
+    deps:
+    - ~:build
+    inputs:
+    - src/collection.json
+    - src/**/schema.json
+    - src/**/files/**/*
+    - tools/copy-assets.mjs
+    outputs:
+    - dist/collection.json
+    - dist/**/schema.json
+    - dist/**/files/**/*
+  typecheck:
+    command: tsgo
+    args:
+    - --noEmit
+    - -p
+    - $projectRoot/tsconfig.lib.json
+    inputs:
+    - src/**/*
+    - tsconfig.json
+    - tsconfig.lib.json
+  lint:
+    command: oxlint
+    args:
+    - -c
+    - $workspaceRoot/.oxlintrc.json
+    - $projectRoot/src
+    inputs:
+    - src/**/*
+    - $workspaceRoot/.oxlintrc.json
+  smoke:
+    command: node
+    args:
+    - $projectRoot/test/schematics.smoke.mjs
+    deps:
+    - ~:build
+    - ~:copy-assets
+    inputs:
+    - test/**/*
+    - dist/**/*

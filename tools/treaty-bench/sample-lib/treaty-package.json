@@ -1,0 +1,18 @@
+{
+  "name": "@treaty-bench/widgets",
+  "version": "1.0.0",
+  "dest": "dist",
+  "lib": {
+    "entryFile": "src/public-api.ts"
+  },
+  "secondaryEntryPoints": [
+    {
+      "path": "hello",
+      "entryFile": "src/hello.component.ts"
+    },
+    {
+      "path": "counter",
+      "entryFile": "src/counter.component.ts"
+    }
+  ]
+}

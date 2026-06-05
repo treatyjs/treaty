@@ -1,0 +1,42 @@
+{
+  "name": "@treaty/ssg",
+  "version": "0.0.1",
+  "description": "Static Site Generation for Treaty apps: prerender routes to static HTML at BUILD time. Treaty is a compiler, not a host — @treaty/ssg discovers prerenderable routes (static + parameterized) from an Angular Routes / @treaty/module-federation route config, compiles each route's component(s) to Ivy via @treaty/compiler, executes any top-of-file ``` macro / RSC render-time data through the Nova runtime (a RenderRuntime the Nova-backed run_macro impl satisfies), statically interprets the emitted Ivy template against that data, and emits a static, hydration-ready HTML document per route plus a route -> output-file manifest. prerenderAll(config) is the one-call entry point. SSG only EMITS static output; serving it is the dev/platform job. The Angular platform-server / @angular/platform-browser hydration pieces are referenced structurally as optional peers.",
+  "author": "Jordan Hall",
+  "license": "IDGAF-1.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    "./package.json": {
+      "default": "./package.json"
+    },
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./runtime": {
+      "types": "./dist/runtime.d.ts",
+      "default": "./dist/runtime.js"
+    }
+  },
+  "sideEffects": false,
+  "dependencies": {
+    "@treaty/compiler": "*"
+  },
+  "peerDependencies": {
+    "@angular/platform-server": ">=18",
+    "@angular/platform-browser": ">=18"
+  },
+  "peerDependenciesMeta": {
+    "@angular/platform-server": {
+      "optional": true
+    },
+    "@angular/platform-browser": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=20.19"
+  }
+}

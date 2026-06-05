@@ -1,0 +1,28 @@
+{
+  "name": "@treaty-examples/treaty-shadcn-demo",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "A minimal standalone Angular gallery that consumes the built treaty-shadcn showcase library and renders all six components (Button, Badge, the React Card, the React Alert, Input, Switch) across their full variant/size surface — selectorlessly, from the library's compiled Ivy dist.",
+  "scripts": {
+    "build:vite": "vite build",
+    "dev:vite": "vite",
+    "e2e:full-build": "node full-build.e2e.mjs",
+    "build:e2e": "node full-build.e2e.mjs"
+  },
+  "peerDependencies": {
+    "@angular/core": "22.0.0",
+    "@angular/platform-browser": "22.0.0",
+    "vite": "^5.0.0 || ^6.0.0 || ^7.0.0"
+  },
+  "peerDependenciesMeta": {
+    "vite": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@treaty/compiler": "*",
+    "@treaty/vite": "*",
+    "treaty-shadcn": "*"
+  }
+}

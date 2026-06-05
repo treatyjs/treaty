@@ -1,0 +1,51 @@
+# backend-parity — deterministic (NO-AI) backend-parity harness for Treaty's Ivy compiler.
+#
+# Mirrors `tools/render3-sync` in shape + spirit, but the two sides it diffs are
+# **oxc-built Treaty vs swc-built Treaty** (same compiler, two parser/codegen backends)
+# rather than Treaty vs Angular. See `migration/SWC-BACKEND-PLAN.md` §4 — this tool is
+# specified there as `tools/backend-parity`, asserting BYTE-IDENTICAL Ivy across backends.
+#
+# STANDALONE: this crate carries its OWN empty [workspace] table so it detaches from the
+# parent Treaty workspace (`D:/dev/treaty/Cargo.toml`). It is built/tested in isolation
+# (`cargo run -p backend-parity -- parity`) and depends on the REAL compiler crate
+# `treaty_ivy` (the facade) BY PATH so it compiles fixtures for real on the oxc side.
+[workspace]
+
+[package]
+name = "backend-parity"
+version = "0.1.0"
+edition = "2024"
+description = "Deterministic backend-parity harness asserting byte-identical Ivy across Treaty's oxc/swc backends (NO AI)"
+publish = false
+
+[lib]
+name = "backend_parity"
+path = "src/lib.rs"
+
+[[bin]]
+name = "backend-parity"
+path = "src/main.rs"
+
+[features]
+# `oxc` is the default + reference backend (REAL today). `swc` gates IN the second backend
+# (`src/backend/swc.rs`): the engine-neutral printer surfaced as `compile_component_swc`. When off,
+# the swc backend is SKIPPED with a logged notice so the harness runs oxc-only.
+#
+# IMPORTANT: `swc` here is a LOCAL gate — it does NOT enable `treaty_ivy/swc`. The neutral printer
+# (`compile_component_swc`) is ALWAYS compiled into `treaty_ivy`, so a single backend-parity binary
+# can drive both the oxc emit path (OxcBackend → `compile_component`) and the neutral path
+# (SwcBackend → `compile_component_swc`) and diff the two printers in one process. Turning on
+# `treaty_ivy/swc` would flip the oxc path to the neutral printer too (feature-global emit dispatch),
+# making the diff trivially pass — so we deliberately do not.
+default = ["oxc"]
+oxc = []
+swc = []
+
+[dependencies]
+# The REAL Treaty Ivy compiler (the facade crate, package name `treaty_ivy`), built with its DEFAULT
+# (oxc) features. OxcBackend calls `compile::compile_component` (oxc emit); SwcBackend calls
+# `compile::compile_component_swc` (the always-compiled neutral printer).
+treaty_ivy = { path = "../../libs/treaty-ivy/facade" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

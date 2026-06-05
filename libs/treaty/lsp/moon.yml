@@ -1,0 +1,99 @@
+id: treaty-lsp
+language: typescript
+platform: node
+type: library
+tags: []
+tasks:
+  build:
+    command: tsc
+    args:
+    - -p
+    - $projectRoot/tsconfig.lib.json
+    inputs:
+    - src/**/*
+    - tsconfig.json
+    - tsconfig.lib.json
+    outputs:
+    - dist
+  typecheck:
+    command: tsgo
+    args:
+    - --noEmit
+    - -p
+    - $projectRoot/tsconfig.lib.json
+    inputs:
+    - src/**/*
+    - tsconfig.json
+    - tsconfig.lib.json
+  lint:
+    command: oxlint
+    args:
+    - -c
+    - $workspaceRoot/.oxlintrc.json
+    - $projectRoot/src
+    inputs:
+    - src/**/*
+    - $workspaceRoot/.oxlintrc.json
+  smoke:
+    command: node
+    args:
+    - $projectRoot/test/template-service.smoke.mjs
+    deps:
+    - ~:build
+    inputs:
+    - src/**/*
+    - test/template-service.smoke.mjs
+  smoke-oxlint:
+    command: node
+    args:
+    - $projectRoot/test/oxlint-plugin.smoke.mjs
+    deps:
+    - ~:build
+    inputs:
+    - src/oxlint-plugin.ts
+    - test/oxlint-plugin.smoke.mjs
+  smoke-diagnostics:
+    command: node
+    args:
+    - $projectRoot/test/diagnostics.smoke.mjs
+    deps:
+    - ~:build
+    inputs:
+    - src/**/*
+    - test/diagnostics.smoke.mjs
+  smoke-angular:
+    command: node
+    args:
+    - $projectRoot/test/angular.smoke.mjs
+    deps:
+    - ~:build
+    inputs:
+    - src/**/*
+    - test/angular.smoke.mjs
+  smoke-jsx-types:
+    command: node
+    args:
+    - $projectRoot/test/jsx-types.smoke.mjs
+    deps:
+    - ~:build
+    inputs:
+    - src/**/*
+    - test/jsx-types.smoke.mjs
+  smoke-regions:
+    command: node
+    args:
+    - $projectRoot/test/regions.smoke.mjs
+    deps:
+    - ~:build
+    inputs:
+    - src/**/*
+    - test/regions.smoke.mjs
+  smoke-use-optional:
+    command: node
+    args:
+    - $projectRoot/test/use-optional.smoke.mjs
+    deps:
+    - ~:build
+    inputs:
+    - src/**/*
+    - test/use-optional.smoke.mjs

@@ -1,0 +1,15 @@
+{
+  "$schema": "../../../node_modules/@angular-devkit/architect/src/builders-schema.json",
+  "builders": {
+    "application": {
+      "implementation": "./dist/application.js",
+      "schema": "./schemas/application.json",
+      "description": "Build a Treaty application with Rspack and automatic, zero-config Module Federation (federated host/remote output). The `ng build` path."
+    },
+    "dev-server": {
+      "implementation": "./dist/dev-server.js",
+      "schema": "./schemas/dev-server.json",
+      "description": "Serve a Treaty application with the Rspack dev server and automatic Module Federation. The `ng serve` path."
+    }
+  }
+}

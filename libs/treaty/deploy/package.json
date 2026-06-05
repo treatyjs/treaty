@@ -1,0 +1,26 @@
+{
+  "name": "@treaty/deploy",
+  "version": "0.0.1",
+  "description": "Build-to-deploy for Treaty apps. Treaty compiles every lazy feature route and library into an independently versioned, deployable, rollback-able federated module (see @treaty/module-federation); @treaty/federation-deploy is the versioned-manifest + pluggable-deploy layer. This package is the assembly step between a finished build and a release: assembleDeployArtifact({ buildDir, manifest, target }) walks a built output directory against a FederationManifest and produces a DeployArtifact — the exact files to upload, the manifest to publish, and the per-module versioned upload paths needed for partial deploy and rollback. deploy(artifact, target) hands that artifact to a pluggable DeployTarget (Treaty is a compiler, not a host: it emits the artifact and invokes a target, it never runs a server). A reference FsDeployTarget writes the artifact to a local directory and maintains the on-disk manifest; a structural CloudDeployTarget interface models self-hosted object-storage / static-host / Treaty-cloud backends, and any @treaty/federation-deploy DeployPlugin is adaptable into a target. Partial deploy (only the modules a change touches, via computeAffectedModules) and rollback (flip one manifest entry to an already-published version) are first-class.",
+  "author": "Jordan Hall",
+  "license": "IDGAF-1.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    "./package.json": {
+      "default": "./package.json"
+    },
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "sideEffects": false,
+  "dependencies": {
+    "@treaty/federation-deploy": "workspace:*"
+  },
+  "engines": {
+    "node": ">=20.19"
+  }
+}

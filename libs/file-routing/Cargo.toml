@@ -1,0 +1,34 @@
+# treaty_file_routing — the pure, deterministic Rust core for file-based routing.
+#
+# Treaty is a compiler, not a host: this crate takes a directory tree (via an
+# injectable `DirTree` abstraction so it is unit-testable with in-memory
+# fixtures — no real filesystem) and a `FileRoutingConfig`, and produces
+# serde-serializable *data*: an Angular lazy-route config plus Module
+# Federation remote descriptors, and a server-endpoint manifest from an `api/`
+# folder. A thin TS/NAPI binding consumes these outputs in a later step. See
+# [[rust-core-ts-shim-layering]].
+#
+# This crate is `exclude`d from the parent workspace (see the repo-root
+# Cargo.toml `[workspace].exclude`) so it still builds independently with
+#   cargo build --manifest-path libs/file-routing/Cargo.toml
+# yet can be consumed as a normal path dependency by a workspace member (the
+# NAPI addon `authoring_node`) without the "multiple workspace roots" conflict an
+# empty nested `[workspace]` table would cause. Exclusion (not a nested
+# workspace) is the right primitive: it keeps the crate out of the member glob
+# while letting members depend on it by path.
+[package]
+name = "treaty_file_routing"
+version = "0.1.0"
+edition = "2024"
+
+# The library is the pure, deterministic core. The `treaty-file-routing` binary
+# is the runnable CLI host that drives it against a real directory on disk and
+# emits the GeneratedRouting as JSON or a ready-to-import TypeScript route
+# module. See `src/main.rs` for the full argument/output contract.
+[[bin]]
+name = "treaty-file-routing"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

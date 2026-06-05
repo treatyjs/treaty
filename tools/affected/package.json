@@ -1,0 +1,31 @@
+{
+	"name": "@treaty-tools/affected",
+	"version": "0.0.1",
+	"private": true,
+	"description": "Nx/Turborepo-style 'affected' at federated-module granularity. Given a changed-file list (e.g. `git diff --name-only`) and a project dependency graph (federated modules, lazy routes-as-remotes, libs), compute the affected set = the directly-changed modules PLUS their transitive dependents, so CI compiles/tests/deploys only that federation. A standalone, dependency-free tool isolated from the main workspace.",
+	"author": "Jordan Hall",
+	"license": "IDGAF-1.0",
+	"type": "module",
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"bin": {
+		"treaty-affected": "./bin/affected.mjs"
+	},
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"default": "./dist/index.js"
+		}
+	},
+	"sideEffects": false,
+	"scripts": {
+		"build": "tsgo -p ./tsconfig.json",
+		"typecheck": "tsgo --noEmit -p ./tsconfig.json",
+		"lint": "oxlint -c ../../.oxlintrc.json src bin test",
+		"test": "vitest run --config ./vitest.config.ts",
+		"check": "npm run typecheck && npm run lint && npm run test"
+	},
+	"engines": {
+		"node": ">=20.19"
+	}
+}

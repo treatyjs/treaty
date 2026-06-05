@@ -1,0 +1,35 @@
+// Root layout (routes/layout.treaty).
+//
+// A `layout` file makes its directory a parent route. Because this layout sits
+// at the routes root, it becomes the single top-level route at path "" and
+// every other route in the tree nests beneath it as a child. Selectorless +
+// signal-by-default: the compiler synthesizes the @Component, standalone:true,
+// and OnPush change detection -- none of that ceremony is authored here.
+import { signal } from '@angular/core'
+
+const year = signal(new Date().getFullYear())
+
+<div class="app-shell">
+  <header class="masthead">
+    <a routerLink="/">file-routed-app</a>
+    <nav>
+      <a routerLink="/about">About</a>
+      <a routerLink="/blog">Blog</a>
+      <a routerLink="/docs/guide/intro">Docs</a>
+    </nav>
+  </header>
+
+  <main><router-outlet /></main>
+
+  <footer class="colophon">© {{ year() }} file-routed-app</footer>
+</div>
+
+<style lang="scss">
+  .app-shell {
+    display: grid;
+    grid-template-rows: auto 1fr auto;
+    min-height: 100vh;
+    .masthead { display: flex; gap: 1rem; align-items: center; }
+    .colophon { color: gray; font-size: 0.85rem; }
+  }
+</style>

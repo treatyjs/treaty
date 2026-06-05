@@ -1,0 +1,64 @@
+{
+  "generatedAt": "2026-06-02T18:13:11.378Z",
+  "app": "examples/linker-smoke",
+  "layer": "e2e-of-output",
+  "method": "After timing+sizing each build tool, boot its emitted bundle headlessly in jsdom (a fresh child process per tool, reusing the linker-smoke e2e Step-4 boot pattern) and assert: (a) bootstrap throws NO JIT / \"@angular/compiler not available\" error, and (b) the routed component renders into the DOM (an <h1 id=\"smoke-heading\">Linker smoke</h1>). A fast build that ships broken output is flagged works:\"FAIL\", never rewarded.",
+  "host": {
+    "platform": "win32",
+    "arch": "x64",
+    "node": "v24.7.0"
+  },
+  "results": [
+    {
+      "tool": "vite",
+      "works": "PASS",
+      "reason": "routed component rendered (\"Linker smoke\") with no JIT / @angular/compiler error",
+      "jitError": false,
+      "importError": null,
+      "bootError": null,
+      "rendered": true,
+      "renderedAnything": true,
+      "heading": "Linker smoke",
+      "entry": "D:\\dev\\treaty\\examples\\linker-smoke\\dist\\buildtool-bench\\vite-0\\assets\\index-DWLwfn5l.js"
+    },
+    {
+      "tool": "rolldown",
+      "works": "PASS",
+      "reason": "routed component rendered (\"Linker smoke\") with no JIT / @angular/compiler error",
+      "jitError": false,
+      "importError": null,
+      "bootError": null,
+      "rendered": true,
+      "renderedAnything": true,
+      "heading": "Linker smoke",
+      "entry": "D:\\dev\\treaty\\examples\\linker-smoke\\dist\\buildtool-bench\\rolldown-0\\main.js"
+    },
+    {
+      "tool": "rspack",
+      "works": "SKIPPED",
+      "reason": "not booted: build status=\"pending\" (peer @rspack/core not installed in this monorepo — @treaty/rspack's plugin dist is present but the bundler core it drives is absent, so no build can run here. Install @rspack/core to measure.)"
+    },
+    {
+      "tool": "rsbuild",
+      "works": "SKIPPED",
+      "reason": "not booted: build status=\"pending\" (peer @rsbuild/core not installed in this monorepo — @treaty/rsbuild's plugin dist is present but the bundler core it drives is absent, so no build can run here. Install @rsbuild/core to measure.)"
+    },
+    {
+      "tool": "rslib",
+      "works": "SKIPPED",
+      "reason": "not booted: build status=\"pending\" (peer @rslib/core not installed in this monorepo — @treaty/rslib's plugin dist is present but the bundler core it drives is absent, so no build can run here. Install @rslib/core to measure.)"
+    },
+    {
+      "tool": "ng-cli",
+      "works": "PASS",
+      "reason": "routed component rendered (\"Linker smoke\") with no JIT / @angular/compiler error",
+      "jitError": false,
+      "importError": null,
+      "bootError": null,
+      "rendered": true,
+      "renderedAnything": true,
+      "heading": "Linker smoke",
+      "entry": "D:\\dev\\treaty\\examples\\linker-smoke\\dist\\buildtool-bench\\ng-project\\dist\\browser\\main.js"
+    }
+  ]
+}

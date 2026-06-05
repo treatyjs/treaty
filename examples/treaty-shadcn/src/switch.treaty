@@ -1,0 +1,79 @@
+// == Component body (TypeScript by default -- no <script> needed) ==
+// Treaty defaults to standalone + signal + selectorless; the compiler fills in
+// @Component, the selector (derived from the filename `switch`), standalone, and
+// OnPush. This is the shadcn-style toggle Switch.
+import { input, signal } from '@angular/core'
+
+// Signal INPUTS, bound by the host: <Switch [checked]="..." [disabled]="..." [label]="..." />.
+const checked = input(false)
+const disabled = input(false)
+const label = input('')
+
+// A LOCAL signal mirrors `checked` for the visual on/off state.
+const state = signal(checked())
+
+// NAMED handler (no inline arrows in the view) -- flips the local visual state.
+const toggle = () => state.set(!state())
+
+// == View (interleaved tag-HTML, NO <template> wrapper) ==
+<button class="switch" [class.on]="state()" [disabled]="disabled()" (click)="toggle()">
+  <span class="knob"></span>
+  @if (label()) {
+    <span class="label">{{ label }}</span>
+  }
+</button>
+
+<style lang="scss">
+  .switch {
+    $track-w: 2.5rem;
+    $track-h: 1.4rem;
+    $knob: 1.1rem;
+
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0;
+    border: none;
+    background: transparent;
+    cursor: pointer;
+    font-family: system-ui, sans-serif;
+
+    &::before {
+      content: '';
+      width: $track-w;
+      height: $track-h;
+      border-radius: $track-h;
+      background: #cbd5e1;
+      transition: background 150ms ease;
+      flex: none;
+    }
+
+    .knob {
+      position: absolute;
+      width: $knob;
+      height: $knob;
+      margin-left: calc((#{$track-h} - #{$knob}) / 2);
+      border-radius: 50%;
+      background: #fff;
+      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
+      transition: transform 150ms ease;
+    }
+
+    &.on::before {
+      background: #6d28d9;
+    }
+    &.on .knob {
+      transform: translateX(calc(#{$track-w} - #{$track-h}));
+    }
+
+    .label {
+      color: #334155;
+      font-size: 0.875rem;
+    }
+
+    &:disabled {
+      cursor: not-allowed;
+      opacity: 0.5;
+    }
+  }
+</style>

@@ -1,0 +1,36 @@
+id: treaty-rspack
+language: typescript
+platform: node
+type: library
+tags: []
+tasks:
+  build:
+    command: tsc
+    args:
+    - -p
+    - $projectRoot/tsconfig.lib.json
+    inputs:
+    - src/**/*
+    - tsconfig.json
+    - tsconfig.lib.json
+    outputs:
+    - dist
+  typecheck:
+    command: tsgo
+    args:
+    - --noEmit
+    - -p
+    - $projectRoot/tsconfig.lib.json
+    inputs:
+    - src/**/*
+    - tsconfig.json
+    - tsconfig.lib.json
+  lint:
+    command: oxlint
+    args:
+    - -c
+    - $workspaceRoot/.oxlintrc.json
+    - $projectRoot/src
+    inputs:
+    - src/**/*
+    - $workspaceRoot/.oxlintrc.json

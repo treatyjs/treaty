@@ -1,0 +1,85 @@
+```
+// == Macro block (compile-time) ==
+// A fenced block at the TOP of a .treaty file is a MACRO: it runs at COMPILE
+// time (RSC/Astro-style) and its VALUE (the trailing expression) is inlined as
+// the constant `$macro`, so there is zero runtime cost. Here we precompute a
+// static greeting palette and expose it as `$macro`.
+const palette = ['#6d28d9', '#2563eb', '#059669']
+const accents = palette.map((hex, i) => ({ hex, tier: i + 1 }))
+// The trailing expression is the macro's value, injected as `const $macro = …`.
+;({ accents, builtAt: new Date(0).toISOString() })
+```
+
+// == Component body (TypeScript by default -- no <script> needed) ==
+// Treaty defaults to standalone + signal + selectorless; the compiler fills
+// those in, so there is no @Component, selector, signal() ceremony, or
+// standalone:true here. `name`/`greeting` author as plain reactive state.
+import { signal, computed } from '@angular/core'
+import { type Greeting } from './greeting.types'
+
+const name = signal('Ada')
+const greeting = signal<Greeting | null>(null)
+const headline = computed(() => greeting()?.text ?? `Say hello to ${name()}`)
+
+// == server { ... } block (server-fn extraction marker) ==
+// Every function inside this block is server-only: the body is extracted to a
+// sibling backend module (axum default) and the client keeps only a typed
+// binding. This is one of Treaty's three server-fn markers.
+server {
+	async function greet(who: string): Promise<Greeting> {
+		const text = `Hello, ${who}!`
+		return { text, at: Date.now() }
+	}
+}
+
+// More TypeScript AFTER a server block: TS and HTML (and server blocks) freely
+// interleave. This handler calls the extracted server fn via its typed binding.
+async function sayHello(): Promise<void> {
+	greeting.set(await greet(name().trim() || 'world'))
+}
+
+// == View region (interleaved tag-HTML, NO <template> wrapper) ==
+<section class="greeter">
+  <header>
+    <h2>{{ headline() }}</h2>
+    <small>palette built {{ $macro.builtAt }}</small>
+  </header>
+
+  <form (submit)="sayHello()">
+    <input name="name" [value]="name()" (input)="name.set($event.target.value)" />
+    <button type="submit">Greet</button>
+  </form>
+
+  @if (greeting()) {
+    <p class="result">server replied: {{ greeting()!.text }}</p>
+  } @else {
+    <p class="hint">Submit to call the extracted server fn.</p>
+  }
+
+  <ul class="swatches">
+    @for (accent of $macro.accents; track accent.tier) {
+      <li [style.color]="accent.hex">tier {{ accent.tier }}: {{ accent.hex }}</li>
+    }
+  </ul>
+</section>
+
+<style lang="scss">
+  .greeter {
+    $radius: 0.5rem;
+    font-family: system-ui, sans-serif;
+
+    header small { color: gray; }
+    .result { font-weight: 600; }
+    .hint { color: gray; font-style: italic; }
+
+    .swatches {
+      list-style: none;
+      padding: 0;
+      li {
+        padding: 0.15rem 0.4rem;
+        border-radius: $radius;
+        &:hover { background: color-mix(in srgb, currentColor 12%, white); }
+      }
+    }
+  }
+</style>

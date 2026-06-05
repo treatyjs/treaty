@@ -1,0 +1,165 @@
+/*
+ * Global base theme for the everything-app.
+ *
+ * Treaty component-scoped styles (a `.treaty` `<style>` block, a `@Component`
+ * `styles: [...]`/`styleUrls`) handle each component's OWN look; this stylesheet
+ * is the app-wide BASE the components sit on — design tokens, document
+ * typography/reset, and the app shell layout (`<app-root>`'s header / nav /
+ * main, authored in `app-root.component.ts`).
+ *
+ * It is a plain `.css` file: Vite handles CSS natively, and `@treaty/vite` does
+ * NOT claim `.css` (its ownership is only the authoring extensions
+ * `.treaty`/`.tjsx`/`.tsx`/`@Component` `.ts`), so this passes through Vite's
+ * own CSS pipeline untouched in both dev-serve and build. It is pulled into the
+ * module graph by a side-effect `import './styles.css'` in `main.ts`, so the dev
+ * server injects it and the production build emits it as a bundled asset.
+ */
+
+/* ---- Design tokens ---------------------------------------------------- */
+:root {
+	--color-bg: #0f172a;
+	--color-surface: #1e293b;
+	--color-surface-raised: #273449;
+	--color-border: #334155;
+	--color-text: #e2e8f0;
+	--color-text-muted: #94a3b8;
+	--color-accent: #38bdf8;
+	--color-accent-strong: #0ea5e9;
+
+	--font-sans: system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial,
+		sans-serif;
+	--font-mono: ui-monospace, 'SFMono-Regular', 'Cascadia Code', Menlo, Consolas,
+		monospace;
+
+	--radius: 0.5rem;
+	--space: 1rem;
+	--shadow: 0 1px 3px rgb(0 0 0 / 0.35), 0 1px 2px rgb(0 0 0 / 0.25);
+
+	color-scheme: dark;
+}
+
+/* ---- Document reset + base typography --------------------------------- */
+*,
+*::before,
+*::after {
+	box-sizing: border-box;
+}
+
+html {
+	-webkit-text-size-adjust: 100%;
+	line-height: 1.55;
+}
+
+body {
+	margin: 0;
+	min-height: 100vh;
+	font-family: var(--font-sans);
+	font-size: 16px;
+	color: var(--color-text);
+	background: var(--color-bg);
+}
+
+h1,
+h2,
+h3,
+h4 {
+	margin: 0 0 0.5em;
+	font-weight: 650;
+	line-height: 1.2;
+}
+
+p {
+	margin: 0 0 1em;
+}
+
+a {
+	color: var(--color-accent);
+	text-decoration: none;
+}
+
+a:hover,
+a:focus-visible {
+	color: var(--color-accent-strong);
+	text-decoration: underline;
+}
+
+code,
+pre,
+kbd {
+	font-family: var(--font-mono);
+}
+
+button {
+	font: inherit;
+	color: inherit;
+	cursor: pointer;
+	padding: 0.4rem 0.85rem;
+	border: 1px solid var(--color-border);
+	border-radius: var(--radius);
+	background: var(--color-surface-raised);
+	transition: background-color 120ms ease, border-color 120ms ease;
+}
+
+button:hover {
+	background: var(--color-border);
+}
+
+button:focus-visible,
+a:focus-visible {
+	outline: 2px solid var(--color-accent);
+	outline-offset: 2px;
+}
+
+/* ---- App shell (rendered by app-root.component.ts) -------------------- */
+app-root {
+	display: block;
+	min-height: 100vh;
+}
+
+.app-header {
+	padding: var(--space) calc(var(--space) * 1.5);
+	font-size: 1.35rem;
+	font-weight: 700;
+	letter-spacing: 0.01em;
+	background: var(--color-surface);
+	border-bottom: 1px solid var(--color-border);
+}
+
+.app-nav {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 0.25rem;
+	padding: 0.5rem calc(var(--space) * 1.5);
+	background: var(--color-surface);
+	border-bottom: 1px solid var(--color-border);
+}
+
+.app-nav a {
+	padding: 0.35rem 0.75rem;
+	border-radius: var(--radius);
+	color: var(--color-text-muted);
+	font-weight: 550;
+}
+
+.app-nav a:hover {
+	color: var(--color-text);
+	background: var(--color-surface-raised);
+	text-decoration: none;
+}
+
+.app-main {
+	display: block;
+	max-width: 64rem;
+	margin: 0 auto;
+	padding: calc(var(--space) * 1.5);
+}
+
+/* A light card affordance feature pages can lean on without re-declaring it. */
+.app-main section {
+	margin-bottom: var(--space);
+	padding: var(--space);
+	background: var(--color-surface);
+	border: 1px solid var(--color-border);
+	border-radius: var(--radius);
+	box-shadow: var(--shadow);
+}

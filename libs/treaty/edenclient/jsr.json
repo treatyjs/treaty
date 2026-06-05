@@ -4,6 +4,8 @@
 	"license": "IDGAF-1.0",
 	"description": "Alysia eden HTTP client for Angular",
   "exports": {
-    ".": "./src/"
+    ".": "./src/mod.ts",
+    "./client": "./src/client.ts",
+    "./resources": "./src/resources.ts"
   }
 }

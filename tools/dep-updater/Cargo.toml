@@ -1,0 +1,30 @@
+# Standalone crate: NOT a member of the parent treaty workspace.
+# The empty [workspace] table below makes Cargo treat this directory as its
+# own workspace root, so building/testing here never touches libs/treaty-ivy or
+# apps/**. This is intentional and required by the dep-updater plan.
+[workspace]
+
+[package]
+name = "dep-updater"
+version = "0.1.0"
+edition = "2024"
+description = "Deterministic, AI-free self-updater for the treaty repo's own crate/npm dependencies, with a codemod registry that fixes breaking changes (seeded from the OXC 0.29->0.133 migration crib)."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "dep_updater"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dep-updater"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+semver = { version = "1", features = ["serde"] }
+regex = "1"
+
+[dev-dependencies]

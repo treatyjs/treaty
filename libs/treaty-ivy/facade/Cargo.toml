@@ -1,0 +1,75 @@
+[package]
+name = "treaty_ivy"
+version = "0.1.0"
+edition = "2024"
+
+# Treaty's direct-to-Ivy Angular compiler, ported from Angular 22.1 packages/compiler.
+# See migration/PORT-ARCHITECTURE.md and migration/render3-specs/.
+
+[features]
+# `oxc` (default) is the reference backend: oxc_parser front-end + oxc_codegen emit.
+# `swc` additionally compiles in the engine-neutral emit printer (`treaty_ivy_core/swc`) AND the
+# SWC PARSE backend (`src/parse/swc.rs`, `SwcParseBackend`), gated 1:1 by `tools/backend-parity`
+# (SWC-BACKEND-PLAN.md §3.2 / §4). The SWC parse backend fills the SAME engine-neutral
+# `crate::parse::ParseOutput`/`ObjLit`/`LitValue` the oxc backend does, in SOURCE order, and exposes
+# `span_text` via `SourceMap::span_to_snippet`. The two parse backends are proven to emit the
+# byte-identical neutral summary by the parse-parity test in `src/parse/mod.rs`.
+#
+# NOTE (honest scope): the facade's source/linker/partial-emit WALK still reaches the live oxc
+# `Program` through `OxcModule::program()` (the `compile_program_with_source` AOT walk is oxc-typed).
+# The `treaty_ivy_decorators` PUBLIC API (`ClassMeta`) is now engine-neutral and that crate no longer
+# depends on oxc at all — the live oxc nodes its plugins still walk ride opaquely through the
+# facade-private `ClassMeta::live` handle. Fully removing oxc from the `--features swc` dep graph
+# therefore additionally requires neutralizing that AOT/linker walk + the shared `treaty_ivy_core` /
+# `treaty_ivy_template` oxc deps (SWC-BACKEND-PLAN.md §3.2 phase 3, the wide port). The SWC PARSE
+# backend here is that port's parser half + its parity gate; the alias below stays on oxc until the
+# walk is neutralized so the default + swc builds both compile.
+default = ["oxc"]
+# `oxc` pulls in the OXC PARSE backend (`src/parse/oxc.rs`, the only facade file that `use`s `oxc_`)
+# + its `oxc_*` parser crates. With the source/linker/partial-emit WALK now reading the engine-neutral
+# `ParseOutput` (no live oxc `Program`), the oxc crates are confined to that one feature-gated module,
+# so a pure `--no-default-features --features swc` build excludes them entirely.
+oxc = [
+    "treaty_ivy_core/oxc",
+    "treaty_ivy_template/oxc",
+    "treaty_ivy_decorators/oxc",
+    "dep:oxc_allocator",
+    "dep:oxc_ast",
+    "dep:oxc_parser",
+    "dep:oxc_codegen",
+    "dep:oxc_span",
+]
+swc = [
+    "treaty_ivy_core/swc",
+    "treaty_ivy_template/swc",
+    "treaty_ivy_decorators/swc",
+    "dep:swc_common",
+    "dep:swc_ecma_ast",
+    "dep:swc_ecma_parser",
+    "dep:swc_atoms",
+]
+
+[dependencies]
+treaty_ivy_core = { path = "../core", default-features = false }
+treaty_ivy_template = { path = "../template", default-features = false }
+treaty_ivy_decorators = { path = "../decorators", default-features = false }
+# OXC PARSE backend crates — compiled ONLY under `--features oxc` (the default). Confined to
+# `src/parse/oxc.rs` now that the AOT/linker/partial-emit walks read the engine-neutral IR.
+oxc_allocator = { version = "0.133.0", optional = true }
+oxc_ast = { version = "0.133.0", optional = true }
+oxc_parser = { version = "0.133.0", optional = true }
+oxc_codegen = { version = "0.133.0", optional = true }
+oxc_span = { version = "0.133.0", optional = true }
+
+# SWC PARSE backend — compiled ONLY under `--features swc` (off by default; default users never
+# build these heavy crates). `SwcParseBackend` parses with `swc_ecma_parser::parse_file_as_program`
+# inside its own `GLOBALS`/`SourceMap` scope and walks `swc_ecma_ast` to fill the engine-neutral
+# `crate::parse` structs identically to the oxc backend.
+# Versions pinned to the SAME generation `swc_ecma_parser` resolves (parser 26 → ast 17 / common 16),
+# so the `Program` the parser returns is OUR `swc_ecma_ast::Program` (no cross-version type mismatch).
+swc_common = { version = "16", optional = true }
+swc_ecma_ast = { version = "17", optional = true }
+swc_ecma_parser = { version = "26", optional = true }
+# `swc_atoms` 8 is the version `swc_ecma_ast` 17 re-exports; named directly so the `Wtf8Atom` string
+# value of a string literal / template `cooked` can be converted to a Rust `String`.
+swc_atoms = { version = "8", optional = true }

@@ -1,0 +1,265 @@
+/*
+ * Global base theme for the treaty-shadcn-demo gallery.
+ *
+ * A plain `.css` file: Vite handles CSS natively, and `@treaty/vite` does NOT
+ * claim `.css`, so this passes through Vite's own pipeline untouched. It is pulled
+ * into the module graph by `import './styles.css'` in `main.ts`.
+ *
+ * The library ships SCOPED styles only for Badge + Switch (their `.treaty`
+ * `<style>` blocks ride inside the lowered Ivy defs). Button / Card / Alert /
+ * Input emit semantic class names (`btn`, `card`, `alert`, `input`) and lean on
+ * the CONSUMER for their base look — exactly like shadcn/ui, where the design
+ * tokens live in the app. This stylesheet supplies that base.
+ */
+
+/* ---- Design tokens ---------------------------------------------------- */
+:root {
+	--color-bg: #f8fafc;
+	--color-surface: #ffffff;
+	--color-border: #e4e4e7;
+	--color-text: #18181b;
+	--color-text-muted: #71717a;
+	--color-accent: #6d28d9;
+
+	--font-sans: system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial,
+		sans-serif;
+
+	--radius: 0.5rem;
+	--space: 1rem;
+	--shadow: 0 1px 3px rgb(0 0 0 / 0.1), 0 1px 2px rgb(0 0 0 / 0.06);
+
+	color-scheme: light;
+}
+
+/* ---- Document reset + base typography --------------------------------- */
+*,
+*::before,
+*::after {
+	box-sizing: border-box;
+}
+
+body {
+	margin: 0;
+	min-height: 100vh;
+	font-family: var(--font-sans);
+	font-size: 16px;
+	color: var(--color-text);
+	background: var(--color-bg);
+}
+
+h1,
+h2,
+h3 {
+	margin: 0 0 0.5em;
+	font-weight: 650;
+	line-height: 1.2;
+}
+
+h2 small {
+	font-weight: 400;
+	font-size: 0.7em;
+	color: var(--color-text-muted);
+}
+
+/* ---- Gallery shell (rendered by app-root.component.ts) ---------------- */
+app-root {
+	display: block;
+	max-width: 60rem;
+	margin: 0 auto;
+	padding: calc(var(--space) * 1.5);
+}
+
+.demo-header {
+	margin-bottom: calc(var(--space) * 1.5);
+}
+
+.demo-header h1 {
+	color: var(--color-accent);
+}
+
+.demo-header p {
+	color: var(--color-text-muted);
+	margin: 0;
+}
+
+.demo-section {
+	margin-bottom: var(--space);
+	padding: var(--space);
+	background: var(--color-surface);
+	border: 1px solid var(--color-border);
+	border-radius: var(--radius);
+	box-shadow: var(--shadow);
+}
+
+.demo-section .row {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 0.5rem;
+	margin-bottom: 0.5rem;
+}
+
+.demo-section .col {
+	display: flex;
+	flex-direction: column;
+	gap: 0.5rem;
+	align-items: flex-start;
+}
+
+.demo-section .row-label {
+	min-width: 6rem;
+	font-size: 0.75rem;
+	font-weight: 600;
+	color: var(--color-text-muted);
+	text-transform: uppercase;
+	letter-spacing: 0.03em;
+}
+
+/* ---- Button base (consumer-owned look for the library `btn` classes) -- */
+.btn {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	gap: 0.5rem;
+	font-family: var(--font-sans);
+	font-weight: 600;
+	border: 1px solid transparent;
+	border-radius: var(--radius);
+	cursor: pointer;
+	white-space: nowrap;
+	transition: background 120ms ease, border-color 120ms ease, opacity 120ms ease;
+
+	/* default variant */
+	background: #18181b;
+	color: #fafafa;
+}
+.btn:disabled {
+	cursor: not-allowed;
+	opacity: 0.5;
+}
+.btn-outline {
+	background: transparent;
+	color: #18181b;
+	border-color: var(--color-border);
+}
+.btn-ghost {
+	background: transparent;
+	color: #18181b;
+}
+.btn-ghost:hover {
+	background: #f4f4f5;
+}
+.btn-destructive {
+	background: #dc2626;
+	color: #fafafa;
+}
+/* sizes */
+.btn-sm {
+	font-size: 0.8rem;
+	padding: 0.25rem 0.6rem;
+}
+.btn-md {
+	font-size: 0.875rem;
+	padding: 0.4rem 0.85rem;
+}
+.btn-lg {
+	font-size: 1rem;
+	padding: 0.55rem 1.1rem;
+}
+
+/* ---- Card base -------------------------------------------------------- */
+.card {
+	display: inline-block;
+	min-width: 16rem;
+	padding: var(--space);
+	background: var(--color-surface);
+	border: 1px solid var(--color-border);
+	border-radius: var(--radius);
+	box-shadow: var(--shadow);
+}
+.card h3 {
+	margin-top: 0;
+}
+.card-toggle {
+	font: inherit;
+	font-size: 0.8rem;
+	padding: 0.25rem 0.6rem;
+	border: 1px solid var(--color-border);
+	border-radius: var(--radius);
+	background: transparent;
+	cursor: pointer;
+}
+.card-description {
+	margin: 0.5rem 0 0;
+	color: var(--color-text-muted);
+}
+
+/* ---- Alert base ------------------------------------------------------- */
+.alert {
+	position: relative;
+	display: flex;
+	align-items: flex-start;
+	justify-content: space-between;
+	gap: 0.75rem;
+	width: 100%;
+	max-width: 32rem;
+	padding: 0.75rem 1rem;
+	border: 1px solid transparent;
+	border-radius: var(--radius);
+	background: #f4f4f5;
+}
+.alert-info {
+	background: #eff6ff;
+	border-color: #bfdbfe;
+}
+.alert-success {
+	background: #ecfdf5;
+	border-color: #a7f3d0;
+}
+.alert-warning {
+	background: #fffbeb;
+	border-color: #fde68a;
+}
+.alert-error {
+	background: #fef2f2;
+	border-color: #fecaca;
+}
+.alert-title {
+	display: block;
+	font-weight: 650;
+}
+.alert-message {
+	margin: 0.15rem 0 0;
+	color: var(--color-text);
+}
+.alert-dismiss {
+	font-size: 1.1rem;
+	line-height: 1;
+	padding: 0 0.35rem;
+	border: none;
+	background: transparent;
+	cursor: pointer;
+	color: var(--color-text-muted);
+}
+
+/* ---- Input base ------------------------------------------------------- */
+.input {
+	font: inherit;
+	font-size: 0.875rem;
+	padding: 0.45rem 0.7rem;
+	width: 18rem;
+	max-width: 100%;
+	border: 1px solid var(--color-border);
+	border-radius: var(--radius);
+	background: var(--color-surface);
+	color: var(--color-text);
+}
+.input:focus-visible {
+	outline: 2px solid var(--color-accent);
+	outline-offset: 1px;
+}
+.input:disabled {
+	background: #f4f4f5;
+	cursor: not-allowed;
+	opacity: 0.7;
+}

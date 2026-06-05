@@ -1,0 +1,35 @@
+{
+  "name": "@treaty/federation-deploy",
+  "version": "0.0.1",
+  "description": "Versioned federation manifest + runtime for Treaty apps. Treaty compiles every lazy feature route and library into an independently versioned, deployable, rollback-able federated module; this package is the deployment layer. A FederationManifest maps every moduleId (host + route remotes + libs) to its current { version, url }. buildManifest/serializeManifest/parseManifest produce and round-trip the manifest as JSON; setModuleVersion (deploy) and rollbackModule (rollback) produce a NEW manifest with exactly one module repointed without touching the rest. createTreatyMfRuntimePlugin builds a @module-federation/enhanced runtime plugin that resolves the current url+version of each remote from the manifest at load. On top of the manifest, the CI deployment layer compiles/tests/deploys ONLY the modules a change touches: computeAffectedModules walks a moduleId -> { files, dependsOn } graph (direct edits + transitive shared-lib fan-out); a DeployPlugin interface + DeployPluginRegistry make deploy methods pluggable (with reference NoopDeployPlugin and FsDeployPlugin); and affectedDeployPlan is the CI entry point that returns which modules to compile/test/deploy plus the resulting manifest deltas.",
+  "author": "Jordan Hall",
+  "license": "IDGAF-1.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    "./package.json": {
+      "default": "./package.json"
+    },
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./runtime": {
+      "types": "./dist/runtime.d.ts",
+      "default": "./dist/runtime.js"
+    }
+  },
+  "sideEffects": false,
+  "peerDependencies": {
+    "@module-federation/enhanced": ">=0.9"
+  },
+  "peerDependenciesMeta": {
+    "@module-federation/enhanced": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=20.19"
+  }
+}

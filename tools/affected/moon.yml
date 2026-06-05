@@ -1,0 +1,48 @@
+id: treaty-affected
+language: typescript
+platform: node
+type: tool
+tags: []
+tasks:
+  build:
+    command: tsgo
+    args:
+    - -p
+    - $projectRoot/tsconfig.json
+    inputs:
+    - src/**/*
+    - tsconfig.json
+    outputs:
+    - dist
+  typecheck:
+    command: tsgo
+    args:
+    - --noEmit
+    - -p
+    - $projectRoot/tsconfig.json
+    inputs:
+    - src/**/*
+    - tsconfig.json
+  lint:
+    command: oxlint
+    args:
+    - -c
+    - $workspaceRoot/.oxlintrc.json
+    - $projectRoot/src
+    - $projectRoot/bin
+    - $projectRoot/test
+    inputs:
+    - src/**/*
+    - bin/**/*
+    - test/**/*
+    - $workspaceRoot/.oxlintrc.json
+  test:
+    command: vitest
+    args:
+    - run
+    - --config
+    - $projectRoot/vitest.config.ts
+    inputs:
+    - src/**/*
+    - test/**/*
+    - vitest.config.ts

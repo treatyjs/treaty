@@ -1,0 +1,21 @@
+<!doctype html>
+<!--
+  Vite HTML entry for the file-routed-app.
+
+  Treaty is a compiler, not a host: Vite owns the page. This document loads the
+  ES-module entry `src/main.ts`, which bootstraps Angular with the routes that
+  the build-time route generator lowers from the `routes/` directory tree. Every
+  route component is a `.treaty` / `.tjsx` authoring file the `@treaty/vite`
+  plugin lowers to Ivy as it enters the bundle.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Treaty file-routed-app</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+  </head>
+  <body>
+    <app-routed-root></app-routed-root>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

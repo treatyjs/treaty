@@ -1,0 +1,24 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ES2022",
+    "moduleResolution": "bundler",
+    "declaration": true,
+    "strict": false,
+    "skipLibCheck": true,
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": false,
+    "lib": [
+      "ES2022",
+      "dom"
+    ],
+    "types": []
+  },
+  "angularCompilerOptions": {
+    "strictTemplates": false,
+    "compilationMode": "full"
+  },
+  "files": [
+    "src/public-api.ts"
+  ]
+}

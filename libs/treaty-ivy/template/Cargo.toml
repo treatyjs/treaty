@@ -1,0 +1,22 @@
+[package]
+name = "treaty_ivy_template"
+version = "0.1.0"
+edition = "2024"
+
+# The HTML/template -> instruction-IR layer of Treaty's direct-to-Ivy Angular
+# compiler: ml_parser, the template AST + transform + control-flow / defer
+# lowerings, the t2 binder, the template-definition builder + query generation,
+# and i18n. Depends on treaty_ivy_core. Ported from Angular 22.1 packages/compiler.
+#
+# Engine-neutral: this crate names NO `oxc_*`/`swc_*` type. Its `oxc`/`swc` features
+# are pure pass-throughs that select the matching backend feature of `treaty_ivy_core`
+# (the only crate it depends on). Built `--no-default-features --features swc` it pulls
+# in zero oxc crates; the default build keeps the oxc emit backend (SWC-BACKEND-PLAN §3.2).
+
+[features]
+default = ["oxc"]
+oxc = ["treaty_ivy_core/oxc"]
+swc = ["treaty_ivy_core/swc"]
+
+[dependencies]
+treaty_ivy_core = { path = "../core", default-features = false }

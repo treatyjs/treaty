@@ -1,0 +1,38 @@
+{
+  "$comment": [
+    "Known-unsupported manifest for the Treaty Node.js conformance harness.",
+    "",
+    "Each entry names a corpus test (by case name = the .js file stem) or a glob over case names",
+    "that the Treaty runtime CANNOT yet pass, paired with the reason. The runner consults this file",
+    "for every corpus case and records a SKIP (with the reason below) WITHOUT evaluating the test --",
+    "the same outcome as an in-file `// CONFORMANCE: skip` directive, but tracked centrally so every",
+    "known gap is visible and diffable in one place (the way Bun/Deno track Node-compat gaps).",
+    "",
+    "Glob metacharacters in `pattern`: `*` = any run of chars (incl. none), `?` = exactly one char;",
+    "everything else is literal and the whole case name must match. First matching entry wins, so a",
+    "specific entry may precede a broad glob to override its reason.",
+    "",
+    "To re-enable a test once the runtime supports it: delete its entry here (and, if it had an",
+    "in-file skip directive, remove that too). See README.md."
+  ],
+  "unsupported": [
+    { "pattern": "net-*",            "reason": "node:net raw TCP sockets (net.Socket/createConnection) pending; the HTTP/TLS transport reactor IS implemented" },
+    { "pattern": "dgram-*",          "reason": "node:dgram (UDP) pending" },
+    { "pattern": "dns-*",            "reason": "node:dns resolver pending" },
+    { "pattern": "worker-threads*",  "reason": "worker_threads is pending (no thread/MessageChannel support yet)" },
+    { "pattern": "cluster-*",        "reason": "node:cluster pending (depends on child_process + net)" },
+    { "pattern": "vm-*",             "reason": "node:vm contexts pending" },
+    { "pattern": "v8-*",             "reason": "node:v8 introspection not exposed by the runtime" },
+    { "pattern": "assert-*",         "reason": "node:assert module is not implemented (tests use an inline assert helper instead)" },
+    { "pattern": "module-esm-*",     "reason": "native ESM import() of node: builtins inside a test is pending" },
+    { "pattern": "perf-hooks-*",     "reason": "node:perf_hooks (performance, PerformanceObserver) pending" },
+    { "pattern": "readline-*",       "reason": "node:readline pending" },
+    { "pattern": "repl-*",           "reason": "node:repl is out of scope for the harness" },
+    { "pattern": "tty-*",            "reason": "node:tty pending" },
+    { "pattern": "inspector-*",      "reason": "node:inspector is out of scope for the harness" },
+    { "pattern": "struct-*",         "reason": "struct: unimplemented (TC39 JavaScript Structs, Stage 2; unshared-struct lowering = M4, no runtime struct heap)" },
+    { "pattern": "shared-struct-*",  "reason": "struct: unimplemented (TC39 shared structs, Stage 2; needs a shared heap + tear-free fields — not polyfillable; swc recognizer = M3, lowering = M4)" },
+    { "pattern": "shared-array",     "reason": "struct: unimplemented (TC39 SharedArray, Stage 2; needs a shared heap — not polyfillable)" },
+    { "pattern": "atomics-*",        "reason": "struct: unimplemented (TC39 Atomics.Mutex/Condition, Stage 2; needs a futex-backed shared-memory sync runtime — not polyfillable)" }
+  ]
+}

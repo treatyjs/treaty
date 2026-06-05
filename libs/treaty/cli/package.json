@@ -1,0 +1,56 @@
+{
+  "name": "@treaty/cli",
+  "version": "0.0.1",
+  "description": "The standalone Treaty CLI (bin: treaty). Drives Treaty projects that have NO angular.json — a convention-based, federation-ready compiler driver. `treaty dev` starts the Vite or Rspack dev server with the Treaty plugin and automatic Module Federation; `treaty build` produces a deployable production build; `treaty generate` scaffolds standalone, federation-ready apps/libs/components. Treaty is a compiler, not a host: the CLI emits/builds and the developer runs the output, configuring nothing.",
+  "author": "Jordan Hall",
+  "license": "IDGAF-1.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "treaty": "./dist/cli.js"
+  },
+  "exports": {
+    "./package.json": {
+      "default": "./package.json"
+    },
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "sideEffects": false,
+  "dependencies": {
+    "@treaty/compiler": "*",
+    "@treaty/module-federation": "*",
+    "@treaty/vite": "*",
+    "@treaty/rspack": "*"
+  },
+  "peerDependencies": {
+    "vite": "^5.0.0 || ^6.0.0 || ^7.0.0",
+    "@rspack/core": ">=1.0.0",
+    "@rspack/dev-server": ">=1.0.0",
+    "@module-federation/vite": ">=1.2",
+    "@module-federation/enhanced": ">=0.9"
+  },
+  "peerDependenciesMeta": {
+    "vite": {
+      "optional": true
+    },
+    "@rspack/core": {
+      "optional": true
+    },
+    "@rspack/dev-server": {
+      "optional": true
+    },
+    "@module-federation/vite": {
+      "optional": true
+    },
+    "@module-federation/enhanced": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=20.19"
+  }
+}

@@ -1,0 +1,43 @@
+{
+  "name": "@treaty/rsbuild",
+  "version": "0.0.1",
+  "description": "Rsbuild plugin that lowers Treaty authoring formats (.treaty/.tsx/.tjsx) to Ivy JS via the shared @treaty/compiler core. Backed by the Rust authoring compiler.",
+  "author": "Jordan Hall",
+  "license": "IDGAF-1.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    "./package.json": {
+      "default": "./package.json"
+    },
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./loader": {
+      "types": "./dist/loader.d.ts",
+      "default": "./dist/loader.js"
+    },
+    "./link-partial": {
+      "types": "./dist/link-partial.d.ts",
+      "default": "./dist/link-partial.js"
+    },
+    "./dev-backend": {
+      "types": "./dist/dev-backend.d.ts",
+      "default": "./dist/dev-backend.js"
+    }
+  },
+  "sideEffects": false,
+  "dependencies": {
+    "@treaty/compiler": "*",
+    "@treaty/ts-vite": "*",
+    "@treaty/vite": "*"
+  },
+  "peerDependencies": {
+    "@rsbuild/core": ">=1.0.0"
+  },
+  "engines": {
+    "node": ">=20.19"
+  }
+}

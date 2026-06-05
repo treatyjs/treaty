@@ -3,7 +3,23 @@ resolver = '2'
 members = [
 	'libs/authoring/node',
 	'libs/authoring/treaty_authoring',
-	'apps/rust/authoring',
+	'libs/treaty-ivy/core',
+	'libs/treaty-ivy/template',
+	'libs/treaty-ivy/decorators',
+	'libs/treaty-ivy/facade',
+	'libs/authoring/rust',
+	'libs/runtime',
+	'apps/treaty-cli',
+	'libs/packagr',
+	'tools/node-conformance',
+]
+# `libs/file-routing` is the pure file-routing core. It is excluded from the
+# member set so it still builds standalone (`--manifest-path
+# libs/file-routing/Cargo.toml`), yet the NAPI addon depends on it by path so the
+# CLI and the build virtual module share one emitter. Exclusion avoids the
+# "multiple workspace roots" conflict a nested `[workspace]` table would cause.
+exclude = [
+	'libs/file-routing',
 ]
 
 [profile.release]

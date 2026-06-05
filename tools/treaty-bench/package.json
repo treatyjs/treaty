@@ -1,0 +1,10 @@
+{
+  "name": "@treaty/bench",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Treaty benchmark suite: Angular compiler vs Treaty-oxc vs Treaty-swc, across vite/rspack/rsbuild/rslib/rolldown + ng. The runner drives compiler-bench.mjs + buildtool-bench.mjs and emits a combined report.",
+  "type": "module",
+  "scripts": {
+    "bench": "node run.mjs"
+  }
+}

@@ -1,0 +1,5 @@
+# Prebuilt platform-specific NAPI binaries are build artifacts (produced per
+# platform by `napi build`), not source — mirror the authoring addon convention
+# and keep them out of git. The crate's own `target/` is ignored by the root
+# `.gitignore` (`**/*/target/`).
+*.node

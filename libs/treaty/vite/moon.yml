@@ -1,0 +1,42 @@
+id: treaty-vite
+language: typescript
+platform: node
+type: library
+tags: []
+tasks:
+  build:
+    # Bundle to an ESM dist via esbuild with every @treaty/* dependency kept
+    # EXTERNAL (build.mjs), then emit declarations with tsgo. Keeping
+    # @treaty/ts-vite external is load-bearing: inlining it into this ESM bundle
+    # turns its native `require("@treaty/authoring-node")` into a throwing
+    # dynamic-require shim, silently disabling the partial-Angular linker. tsc is
+    # never used (forbidden); tsgo emits the .d.ts.
+    command: node
+    args:
+    - build.mjs
+    inputs:
+    - src/**/*
+    - build.mjs
+    - tsconfig.json
+    - tsconfig.lib.json
+    outputs:
+    - dist
+  typecheck:
+    command: tsgo
+    args:
+    - --noEmit
+    - -p
+    - $projectRoot/tsconfig.lib.json
+    inputs:
+    - src/**/*
+    - tsconfig.json
+    - tsconfig.lib.json
+  lint:
+    command: oxlint
+    args:
+    - -c
+    - $workspaceRoot/.oxlintrc.json
+    - $projectRoot/src
+    inputs:
+    - src/**/*
+    - $workspaceRoot/.oxlintrc.json

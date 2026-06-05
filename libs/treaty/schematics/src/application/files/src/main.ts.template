@@ -1,0 +1,19 @@
+import { bootstrapApplication } from '@angular/platform-browser'
+
+import { <%= classify(name) %>Component } from './app/app.component'
+import { appConfig } from './app/app.config'
+<% if (host) { %>
+/**
+ * <%= classify(name) %> is a Treaty Module Federation HOST. The Treaty build
+ * builders initialize the federation runtime and share the Angular singletons
+ * automatically (see federation.config.json) — there is nothing to configure
+ * here. Remotes are consumed lazily via the routes in app.routes.ts.
+ */
+<% } else { %>
+/**
+ * <%= classify(name) %> is a Treaty Module Federation REMOTE. It is exposable
+ * out-of-the-box (see federation.config.json `exposes`) and also bootstraps
+ * standalone for local development. Zero MF configuration is required.
+ */
+<% } %>
+bootstrapApplication(<%= classify(name) %>Component, appConfig).catch((err) => console.error(err))

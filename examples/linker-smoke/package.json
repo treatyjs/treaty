@@ -1,0 +1,22 @@
+{
+  "name": "@treaty-examples/linker-smoke",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "End-to-end proof that an Angular app consuming published partial-compiled libraries (@angular/common/router/platform-browser) builds and boots with NO JIT and NO @angular/compiler, because the @treaty/ts-vite plugin links ɵɵngDeclare* -> AOT ɵɵdefine* at build time.",
+  "scripts": {
+    "build": "vite build",
+    "preview": "vite preview",
+    "e2e": "node e2e.mjs"
+  },
+  "peerDependencies": {
+    "@angular/common": "22.0.0",
+    "@angular/core": "22.0.0",
+    "@angular/platform-browser": "22.0.0",
+    "@angular/router": "22.0.0",
+    "vite": "^7.0.0"
+  },
+  "devDependencies": {
+    "@treaty/ts-vite": "*"
+  }
+}

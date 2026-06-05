@@ -1,0 +1,44 @@
+# render3-sync — deterministic (NO-AI) drift/sync harness keeping Treaty's Rust/oxc
+# render3 port 1:1 with Angular's `packages/compiler`. See migration/RENDER3-SYNC-PLAN.md.
+#
+# STANDALONE: this crate carries its OWN empty [workspace] table so it detaches from the
+# parent Treaty workspace (`D:/dev/treaty/Cargo.toml`). It is built/tested in isolation
+# (`cd tools/render3-sync && cargo build`) and intentionally does NOT touch libs/render3.
+[workspace]
+
+[package]
+name = "render3-sync"
+version = "0.1.0"
+edition = "2024"
+description = "Deterministic drift-detection + mechanical-codegen harness keeping the Rust render3 port 1:1 with Angular"
+publish = false
+
+[lib]
+name = "render3_sync"
+path = "src/lib.rs"
+
+[[bin]]
+name = "render3-sync"
+path = "src/main.rs"
+
+# Pillar 2 (conformance gate) CLI: run the existing libs/render3 compliance + oracle JS harnesses,
+# parse their output into a ConformanceReport, and diff against a baseline for the drift surface.
+[[bin]]
+name = "conformance"
+path = "src/bin/conformance.rs"
+
+[dependencies]
+# Pinned to the SAME oxc major as libs/render3 (0.133) so the TS we parse here is parsed
+# exactly as the port consumes it.
+oxc_parser = "0.133.0"
+oxc_ast = "0.133.0"
+oxc_span = "0.133.0"
+oxc_allocator = "0.133.0"
+# Provides BinaryOperator / UnaryOperator used by the ts2rust enum const-expr evaluator.
+oxc_syntax = "0.133.0"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Text diffing for staged-codegen vs committed-Rust comparison and drift line reports.
+similar = "2"

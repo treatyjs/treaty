@@ -1,0 +1,44 @@
+{
+  "name": "@treaty/vite",
+  "version": "0.0.1",
+  "description": "Vite plugin for Treaty authoring formats (.treaty / .tsx / .tjsx / Angular .ts @Component), lowering each file to Ivy JS via @treaty/compiler. Backed by the Rust authoring compiler.",
+  "author": "Jordan Hall",
+  "license": "IDGAF-1.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    "./package.json": {
+      "default": "./package.json"
+    },
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "sideEffects": false,
+  "scripts": {
+    "build": "node build.mjs",
+    "watch": "node build.mjs --watch"
+  },
+  "dependencies": {
+    "@treaty/compiler": "*",
+    "@treaty/module-federation": "*",
+    "@treaty/ts-vite": "*"
+  },
+  "peerDependencies": {
+    "vite": "^5.0.0 || ^6.0.0 || ^7.0.0",
+    "@module-federation/vite": ">=1.2"
+  },
+  "peerDependenciesMeta": {
+    "@module-federation/vite": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "esbuild": "latest"
+  },
+  "engines": {
+    "node": ">=20.19"
+  }
+}

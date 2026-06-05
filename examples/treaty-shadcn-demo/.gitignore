@@ -1,0 +1,5 @@
+# Build output (vite build / the full-build e2e harness emit here).
+dist/
+# Local node_modules symlink farm wired by full-build.e2e.mjs (the examples are
+# not in the root lockfile; the harness junctions the deps it needs run-to-run).
+node_modules/

@@ -1,0 +1,70 @@
+{
+  "generatedAt": "2026-06-03T00:03:25.370Z",
+  "app": "examples/ng-bench-app",
+  "appNote": "Realistic standard-Angular application (6 components, a service layer, a pure pipe, an attribute directive, an eager route + 3 lazy routes). Pure @Component/@Directive/@Pipe .ts — zero Treaty-only features — so the SAME app drives both CLIs.",
+  "host": {
+    "platform": "win32",
+    "arch": "x64",
+    "node": "v24.7.0"
+  },
+  "buildRunsPerCli": 3,
+  "serveRunsPerCli": 3,
+  "versions": {
+    "@angular/core": "22.0.0-rc.3",
+    "@angular/build": "22.0.0-rc.3",
+    "@angular/cli": "22.0.0-rc.3",
+    "vite": "7.3.3"
+  },
+  "drivers": {
+    "treaty": "the standalone Treaty CLI's own command functions (@treaty/cli dist resolveConfig + runBuild/runDev), i.e. the exact `treaty build` / `treaty serve` code path (Vite bundler + Treaty plugin). Module Federation opted out (moduleFederation:false) for a like-for-like app build with no MF peer.",
+    "ng": "the Angular builders `@angular/build:application` (build) and `@angular/build:dev-server` (serve) driven through the Architect programmatic API — exactly what `ng build` / `ng serve` run; only the @angular/cli BIN is bypassed (it trips a hard Node-version floor), not the builder."
+  },
+  "metrics": {
+    "build": "best (min) wall-clock build time over N clean builds; distBytes = sum of all emitted output files; works = headless jsdom boot verdict (eager Dashboard route renders, no JIT / @angular/compiler error).",
+    "serve": "coldToFirstByteMs = time from kicking off the dev server in a cold start to the first byte of GET /; firstModuleCompileMs (Treaty only) = time to compile + serve the first component module (GET of the Dashboard @Component .ts, lowered to Ivy on demand by the Treaty plugin). Angular has no separable first-module number (it compiles the whole app before first byte)."
+  },
+  "build": [
+    {
+      "cli": "treaty",
+      "op": "build",
+      "status": "measured",
+      "buildMs": 2436,
+      "distBytes": 583380,
+      "note": "best of 3 clean build(s); times(ms)=[4497, 2658, 2436]; jsFiles=4 residualNgDeclare=0 importsCompiler=false linkedOk=true",
+      "works": "PASS",
+      "worksReason": "eager Dashboard route rendered (\"Inventory dashboard\") with no JIT / @angular/compiler error; statCards=3 navLinks=3",
+      "statCards": 3,
+      "navLinks": 3
+    },
+    {
+      "cli": "ng",
+      "op": "build",
+      "status": "measured",
+      "buildMs": 4731,
+      "distBytes": 253529,
+      "note": "best of 3 clean build(s); times(ms)=[8126, 4934, 4731]; jsFiles=4 residualNgDeclare=0 importsCompiler=false linkedOk=true",
+      "works": "PASS",
+      "worksReason": "eager Dashboard route rendered (\"Inventory dashboard\") with no JIT / @angular/compiler error; statCards=3 navLinks=3",
+      "statCards": 3,
+      "navLinks": 3
+    }
+  ],
+  "serve": [
+    {
+      "cli": "treaty",
+      "op": "serve",
+      "status": "measured",
+      "coldToFirstByteMs": 80,
+      "firstModuleCompileMs": 185,
+      "note": "best of 3 cold start(s); coldToFirstByte(ms)=[141, 120, 80]; firstModuleCompile(ms)=[194, 225, 185]; GET / -> 200; GET src/app/features/dashboard/dashboard.ts -> 200 (14523B, compiled=true)"
+    },
+    {
+      "cli": "ng",
+      "op": "serve",
+      "status": "measured",
+      "coldToFirstByteMs": 4703,
+      "note": "best of 3 cold start(s); coldToFirstByte(ms)=[7305, 5346, 4703]; GET / -> 200",
+      "firstModuleCompileNote": "N/A — the Angular dev-server (@angular/build:dev-server) prebundles + compiles the whole app BEFORE serving the first byte, so per-module on-demand compile is not separately observable. The cold-start-to-first-byte already INCLUDES the full app compile."
+    }
+  ]
+}

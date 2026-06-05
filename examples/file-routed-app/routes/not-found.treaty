@@ -1,0 +1,11 @@
+// Not-found route for the routes root (routes/not-found.treaty).
+//
+// A `not-found` file lowers to an Angular wildcard route (path: "**"). At the
+// root it is the top-level catch-all that matches any unrecognised URL. Inside
+// a layout it is scoped to that layout's children.
+
+<section class="not-found">
+  <h1>404</h1>
+  <p>That page does not exist.</p>
+  <a routerLink="/">Go home</a>
+</section>

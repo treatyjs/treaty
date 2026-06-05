@@ -246,6 +246,19 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
-const { sum } = nativeBinding
+const { compileComponent, compileComponentSource, compileComponentSourceResolved, linkPartial, compileTreatyFile, compile, compileWithRegistry, buildSelectorRegistry, buildImportedSelectors, compileMany, compileManyWithRegistry, generateRoutes, runMacro, runServerFn } = nativeBinding
 
-module.exports.sum = sum
+module.exports.compileComponent = compileComponent
+module.exports.compileComponentSource = compileComponentSource
+module.exports.compileComponentSourceResolved = compileComponentSourceResolved
+module.exports.linkPartial = linkPartial
+module.exports.compileTreatyFile = compileTreatyFile
+module.exports.compile = compile
+module.exports.compileWithRegistry = compileWithRegistry
+module.exports.buildSelectorRegistry = buildSelectorRegistry
+module.exports.buildImportedSelectors = buildImportedSelectors
+module.exports.compileMany = compileMany
+module.exports.compileManyWithRegistry = compileManyWithRegistry
+module.exports.generateRoutes = generateRoutes
+module.exports.runMacro = runMacro
+module.exports.runServerFn = runServerFn

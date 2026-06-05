@@ -1,0 +1,87 @@
+{
+  "generatedAt": "2026-06-03T07:18:27.188Z",
+  "app": "examples/linker-smoke",
+  "gate": "standing-boot-gate",
+  "host": {
+    "platform": "win32",
+    "arch": "x64",
+    "node": "v24.7.0"
+  },
+  "bootProbe": "tools/treaty-bench/boot-headless.mjs (reused verbatim)",
+  "toolsCovered": [
+    "vite",
+    "rolldown",
+    "native",
+    "ng"
+  ],
+  "positives": [
+    {
+      "tool": "vite",
+      "works": "PASS",
+      "reason": "routed component rendered (\"Linker smoke\") with no JIT / @angular/compiler error",
+      "jitError": false,
+      "importError": null,
+      "bootError": null,
+      "rendered": true,
+      "renderedAnything": true,
+      "heading": "Linker smoke",
+      "entry": "D:\\dev\\treaty\\examples\\linker-smoke\\dist\\boot-gate\\vite\\assets\\main-D-Cb1EIK.js"
+    },
+    {
+      "tool": "rolldown",
+      "works": "PASS",
+      "reason": "routed component rendered (\"Linker smoke\") with no JIT / @angular/compiler error",
+      "jitError": false,
+      "importError": null,
+      "bootError": null,
+      "rendered": true,
+      "renderedAnything": true,
+      "heading": "Linker smoke",
+      "entry": "D:\\dev\\treaty\\examples\\linker-smoke\\dist\\boot-gate\\rolldown\\main.js"
+    },
+    {
+      "tool": "native",
+      "works": "PASS",
+      "reason": "routed component rendered (\"Linker smoke\") with no JIT / @angular/compiler error",
+      "jitError": false,
+      "importError": null,
+      "bootError": null,
+      "rendered": true,
+      "renderedAnything": true,
+      "heading": "Linker smoke",
+      "entry": "D:\\dev\\treaty\\examples\\linker-smoke\\dist\\boot-gate\\native\\main.js"
+    },
+    {
+      "tool": "ng",
+      "works": "PASS",
+      "reason": "routed component rendered (\"Linker smoke\") with no JIT / @angular/compiler error",
+      "jitError": false,
+      "importError": null,
+      "bootError": null,
+      "rendered": true,
+      "renderedAnything": true,
+      "heading": "Linker smoke",
+      "entry": "D:\\dev\\treaty\\examples\\linker-smoke\\dist\\boot-gate\\ng-project\\dist\\browser\\main.js"
+    }
+  ],
+  "negative": {
+    "tool": "negative",
+    "works": "FAIL",
+    "reason": "app reported a bootstrap error: Error: NG0906: The f3 is not an Angular component, make sure it has the `@Component` decorator.",
+    "jitError": false,
+    "importError": null,
+    "bootError": "Error: NG0906: The f3 is not an Angular component, make sure it has the `@Component` decorator.",
+    "rendered": false,
+    "renderedAnything": false,
+    "heading": null,
+    "entry": "D:\\dev\\treaty\\examples\\linker-smoke\\dist\\boot-gate\\negative\\assets\\main-h_jNT5sF.js",
+    "mustFail": true,
+    "flaggedFail": true
+  },
+  "verdict": {
+    "pass": true,
+    "anyRealOutputFailedToBoot": false,
+    "nothingBuilt": false,
+    "negativeTestCaughtBrokenOutput": true
+  }
+}

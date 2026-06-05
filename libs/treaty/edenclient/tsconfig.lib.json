@@ -5,13 +5,18 @@
     "declaration": true,
     "declarationMap": true,
     "inlineSources": true,
+    "moduleResolution": "bundler",
     "types": []
   },
   "exclude": [
     "src/**/*.spec.ts",
     "src/test-setup.ts",
+    "src/test-setup.standalone.ts",
     "jest.config.ts",
-    "src/**/*.test.ts"
+    "jest.standalone.config.js",
+    "src/**/*.test.ts",
+    "src/typecheck/**/*",
+    "src/testing/**/*"
   ],
   "include": ["src/**/*.ts"]
 }

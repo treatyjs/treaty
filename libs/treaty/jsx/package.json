@@ -1,0 +1,40 @@
+{
+  "name": "@treaty/jsx",
+  "version": "0.0.1",
+  "description": "Ambient JSX types and automatic-runtime entry for Treaty's selectorless, signal-aware, standalone JSX authoring format. Ships the global JSX namespace so projects never hand-copy a treaty-jsx.d.ts; the @treaty/lsp language server auto-provides these types. Also ships the authoring-format module shims (*.treaty / *.tjsx) via the ./ambient entry so apps never hand-declare them.",
+  "author": "Jordan Hall",
+  "license": "IDGAF-1.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "typesVersions": {
+    "*": {
+      "ambient": ["./dist/ambient.d.ts"],
+      "jsx-runtime": ["./dist/jsx-runtime.d.ts"]
+    }
+  },
+  "exports": {
+    "./package.json": {
+      "default": "./package.json"
+    },
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./jsx-runtime": {
+      "types": "./dist/jsx-runtime.d.ts",
+      "default": "./dist/jsx-runtime.js"
+    },
+    "./jsx-dev-runtime": {
+      "types": "./dist/jsx-runtime.d.ts",
+      "default": "./dist/jsx-runtime.js"
+    },
+    "./ambient": {
+      "types": "./dist/ambient.d.ts"
+    }
+  },
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20.19"
+  }
+}

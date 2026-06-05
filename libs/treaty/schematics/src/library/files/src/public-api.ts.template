@@ -1,0 +1,6 @@
+/**
+ * Public API of the <%= dasherize(name) %> library. This module is exposed as
+ * `<%= dasherize(name) %>/Module` via federation.config.json, so any Treaty host
+ * can `import('<%= dasherize(name) %>/Module')` with zero MF configuration.
+ */
+export * from './lib/<%= dasherize(name) %>.component'

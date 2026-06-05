@@ -1,0 +1,75 @@
+[package]
+name = "treaty_runtime"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Pure-Rust JS engine. The 1.0.0 release is broken both ways (temporal-on pulls a broken
+# temporal_rs 0.1.2; temporal-off leaves ungated Temporal intrinsic refs), so track git main,
+# which keeps itself compiling.
+nova_vm = { git = "https://github.com/trynova/nova", rev = "bece61ac" }
+serde_json = "1.0.150"
+
+# TypeScript -> JavaScript transpilation for the macro / server-fn render-time path. The macro
+# fenced block in a `.treaty` file is TypeScript; Nova only executes JavaScript, so type
+# annotations and other TS-only syntax must be stripped before evaluation.
+oxc_allocator = "0.133.0"
+oxc_parser = "0.133.0"
+oxc_span = "0.133.0"
+oxc_semantic = "0.133.0"
+oxc_transformer = "0.133.0"
+oxc_codegen = "0.133.0"
+
+# Node-style module resolution for the Node-compat layer: node_modules walk, package.json
+# main/exports/imports + conditions, extension probing, and tsconfig paths. Standalone crate (no
+# dependency on the oxc 0.133 AST crates), so 11.20.0 — the current release — builds alongside them.
+# Used instead of a hand-rolled resolver (see node/resolver.rs).
+oxc_resolver = "11.20.0"
+
+# `node:crypto` primitives. `sha2`/`sha1`/`md-5` supply the SHA-256/SHA-1/MD5 digests behind
+# `createHash`/`Hash`; `hmac` (over the same `digest` 0.10 trait family) supplies `createHmac`;
+# `getrandom` supplies the OS CSPRNG behind `randomBytes`/`randomUUID`/`randomFillSync`. All pure-Rust,
+# no system OpenSSL, and build offline. (No HTTP client is pulled in: `fetch` stays a minimal,
+# transport-free shape — it resolves as a global and rejects with a catchable error — because this
+# runtime is offline-oriented and a real transport behind the event loop is a tracked follow-up.)
+sha2 = "0.10.8"
+sha1 = "0.10.6"
+md-5 = "0.10.6"
+hmac = "0.12.1"
+digest = "0.10.7"
+rand = "0.8.5"
+getrandom = "0.2.15"
+
+# `node:crypto` symmetric ciphers + key derivation, all pure-Rust RustCrypto crates that build
+# offline (no system OpenSSL, no network). `aes` is the AES block cipher; `cbc` wraps it in the
+# CBC block mode (`createCipheriv("aes-256-cbc", …)` is the workhorse Node cipher); `cipher`
+# supplies the shared `BlockModeEncrypt`/`KeyIvInit` traits the two are driven through; `pbkdf2`
+# supplies `crypto.pbkdf2`/`pbkdf2Sync` over the same `hmac`/`sha2` digests already pulled in.
+aes = "0.8.4"
+cbc = "0.1.2"
+# `block-padding` brings PKCS#7 padding and the `*_padded_*` helpers; `alloc` enables the
+# `encrypt_padded_vec_mut`/`decrypt_padded_vec_mut` one-shot allocating forms this module uses.
+cipher = { version = "0.4.4", features = ["block-padding", "alloc"] }
+pbkdf2 = "0.12.2"
+
+# `node:zlib` DEFLATE family. flate2's `rust_backend` selects the pure-Rust miniz_oxide backend, so
+# there is no `libz`/C toolchain dependency and the crate builds fully offline. Used for
+# `gzipSync`/`gunzipSync`/`deflateSync`/`inflateSync` and the `deflateRaw`/`inflateRaw` variants.
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+
+# `node:zlib` Brotli (`brotliCompressSync`/`brotliDecompressSync`). The `brotli` crate is a pure-Rust
+# port of the reference encoder/decoder (over `alloc-no-stdlib`/`alloc-stdlib` and
+# `brotli-decompressor`); no C toolchain, builds fully offline. The default `std` feature supplies the
+# `CompressorWriter`/`DecompressorWriter` one-shot `Write` wrappers this module drives.
+brotli = "8.0"
+
+# `node:tls` + `node:https` transport. `rustls` is the TLS 1.2/1.3 state machine; we pin the `ring`
+# crypto provider (`default-features = false` drops the C/CMake `aws-lc-rs` default) because `ring`
+# ships pre-generated assembly and builds fully offline here — no system OpenSSL, no network, no nasm.
+# `tls12` keeps the broadly-deployed TLS 1.2 suites alongside 1.3. `rustls-pki-types` supplies the
+# `CertificateDer`/`PrivateKeyDer`/`ServerName` types at the API surface; `rustls-pemfile` parses the
+# loopback test server's self-signed cert/key PEM. `rustls-webpki` (pulled transitively) drives chain
+# verification when a real root store is configured.
+rustls = { version = "0.23.40", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pki-types = "1.14"
+rustls-pemfile = "2.2"

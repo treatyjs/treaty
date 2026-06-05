@@ -1,0 +1,23 @@
+{
+  "name": "@treaty-bench/widgets",
+  "version": "1.0.0",
+  "module": "fesm2022/treaty-bench-widgets.mjs",
+  "typings": "types/treaty-bench-widgets.d.ts",
+  "exports": {
+    "./package.json": {
+      "default": "./package.json"
+    },
+    ".": {
+      "types": "./types/treaty-bench-widgets.d.ts",
+      "default": "./fesm2022/treaty-bench-widgets.mjs"
+    }
+  },
+  "sideEffects": false,
+  "type": "module",
+  "dependencies": {
+    "tslib": "^2.3.0"
+  },
+  "scripts": {
+    "prepublishOnly": "node --eval \"console.error('ERROR: Trying to publish a package that has been compiled in full compilation mode. This is not allowed.\\nPlease delete and rebuild the package with partial compilation mode, before attempting to publish.\\n')\" && exit 1"
+  }
+}

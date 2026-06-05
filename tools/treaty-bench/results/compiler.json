@@ -1,0 +1,83 @@
+{
+  "benchmark": "compiler-ivy-lowering",
+  "generatedAt": "2026-06-02T21:51:10.468Z",
+  "corpus": {
+    "source": "libs/treaty-ivy/facade/parity/parity.mjs#FIXTURES",
+    "totalFixtures": 29
+  },
+  "env": {
+    "node": "v24.7.0",
+    "platform": "win32",
+    "arch": "x64",
+    "cpu": "AMD Ryzen 7 PRO 5850U with Radeon Graphics"
+  },
+  "config": {
+    "warmupIters": 200,
+    "measureIters": 2000,
+    "bestOf": 3
+  },
+  "angularCompilerVersions": {
+    "v22": "22.0.0-rc.3",
+    "v21": "21.2.15",
+    "v21Status": "isolated+measured"
+  },
+  "correctness": {
+    "file": "correctness.json",
+    "summary": "27/29 renderable fixtures STRICTLY byte/AST-equivalent under parity normalize(); 27/29 are equivalent except the Rust emitter writes a `changeDetection:0` field the v22 oracle now omits (single metadata field, instruction streams identical); 2 genuine lowering divergence(s); 0 not renderable by the oracle printer (i18n is now rendered + compared, so this is 0 unless a new unsupported node appears)",
+    "match": 27,
+    "diff": 2,
+    "oracleError": 0,
+    "diffFixtures": [
+      "i18n-static",
+      "i18n-interp"
+    ]
+  },
+  "results": [
+    {
+      "compiler": "angular-compiler@22",
+      "status": "measured",
+      "fixtures": 29,
+      "components": 58000,
+      "iterations": 2000,
+      "warmup": 200,
+      "totalMs": 13741.222,
+      "msPerComponent": 0.236918,
+      "opsPerSec": 4220.9,
+      "skipped": [],
+      "note": "29 shared fixtures timed (intersection both compilers can lower)",
+      "angularVersion": "22.0.0-rc.3"
+    },
+    {
+      "compiler": "angular-compiler@21",
+      "status": "measured",
+      "fixtures": 29,
+      "components": 58000,
+      "iterations": 2000,
+      "warmup": 200,
+      "totalMs": 14125.968,
+      "msPerComponent": 0.243551,
+      "opsPerSec": 4105.9,
+      "skipped": [],
+      "note": "29 shared fixtures timed (intersection both compilers can lower)",
+      "angularVersion": "21.2.15"
+    },
+    {
+      "compiler": "treaty-oxc",
+      "status": "measured",
+      "fixtures": 29,
+      "components": 58000,
+      "iterations": 2000,
+      "warmup": 200,
+      "totalMs": 5429.976,
+      "msPerComponent": 0.09362,
+      "opsPerSec": 10681.4,
+      "skipped": [],
+      "note": "29 shared fixtures timed (intersection both compilers can lower)"
+    },
+    {
+      "compiler": "treaty-swc",
+      "status": "pending",
+      "note": "swc backend NOT YET IMPLEMENTED — see migration/SWC-BACKEND-PLAN.md (Cargo feature `swc` + libs/treaty-ivy/core/src/output/emitter_swc.rs, phase 2). Will be measured once the swc feature lands and @treaty/authoring-node exposes the swc-backed compile path."
+    }
+  ]
+}

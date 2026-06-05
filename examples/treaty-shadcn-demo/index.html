@@ -1,0 +1,21 @@
+<!doctype html>
+<!--
+  Vite HTML entry for the treaty-shadcn-demo gallery.
+
+  Treaty is a compiler, not a host: Vite owns the page. This is the single
+  document Vite serves; it loads the ES-module entry `src/main.ts`, which
+  bootstraps the Angular gallery. The gallery's app-root (`@Component` `.ts`) is
+  lowered to Ivy by the `@treaty/vite` plugin; the six library components it
+  imports are consumed pre-compiled from `treaty-shadcn/dist`.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>treaty-shadcn gallery</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+  </head>
+  <body>
+    <app-root></app-root>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

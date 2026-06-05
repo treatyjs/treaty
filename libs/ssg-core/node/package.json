@@ -1,0 +1,23 @@
+{
+  "name": "@treaty/ssg-node",
+  "version": "0.1.0",
+  "description": "NAPI binding exposing the pure Rust SSG core (treaty_ssg) to JavaScript, so @treaty/ssg becomes a thin shim over it.",
+  "private": true,
+  "main": "index.js",
+  "types": "index.d.ts",
+  "napi": {
+    "name": "treaty_ssg_node",
+    "triples": {
+      "additional": [
+        "aarch64-apple-darwin",
+        "aarch64-unknown-linux-gnu",
+        "aarch64-pc-windows-msvc",
+        "x86_64-apple-darwin",
+        "x86_64-unknown-linux-musl"
+      ]
+    }
+  },
+  "engines": {
+    "node": ">= 20.19"
+  }
+}

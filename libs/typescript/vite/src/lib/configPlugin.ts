@@ -4,6 +4,7 @@ import { resolve } from 'path';
 import { cwd } from 'process';
 import { getGlobalObject } from './utils/getGlobalObject';
 import { Plugin, normalizePath, searchForWorkspaceRoot } from 'vite';
+import { LinkPartialConfigPlugin } from './linkPartialPlugins';
 
 const globalObject = getGlobalObject('angularConfigPlugin.ts', {
   root: undefined as string | undefined,
@@ -71,10 +72,11 @@ const ConfigPlugin: Plugin[] = [
             },
           },
         },
-        optimizeDeps: {
-          exclude: ['@angular/compiler'],
-        },
       };
     },
   },
+  // The Angular-compiler exclusion + the partial-declaration prebundle linker. Reused verbatim from
+  // the shared linker surface ({@link LinkPartialConfigPlugin}) so the optimizeDeps wiring lives in
+  // exactly one place across `@treaty/ts-vite` and `@treaty/vite`.
+  LinkPartialConfigPlugin,
 ];

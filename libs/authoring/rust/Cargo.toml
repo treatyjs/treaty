@@ -1,0 +1,47 @@
+[package]
+name = "rust_authoring"
+version = "0.1.0"
+edition = "2024"
+
+
+[dependencies]
+treaty_ivy = { path = "../../../libs/treaty-ivy/facade" }
+treaty_runtime = { path = "../../../libs/runtime" }
+oxc = "0.133.0"
+oxc_allocator = "0.133.0"
+oxc_parser = "0.133.0"
+oxc_span = "0.133.0"
+oxc_semantic = "0.133.0"
+oxc_transformer = "0.133.0"
+oxc_codegen = "0.133.0"
+oxc_diagnostics = "0.133.0"
+oxc_ast    = { version = "0.133.0" }
+oxc_ast_visit = "0.133.0"
+oxc_str = "0.133.0"
+assert-unchecked = { version = "0.1.2" }
+bitflags         = { version = "2.4.2" }
+rustc-hash       = { version = "2.0.0" }
+num-bigint       = { version = "0.4.6" }
+seq-macro        = { version = "0.3.5" }
+serde_json = { version = "1.0.114" }
+regex = "1"
+memchr = "2.7.1"
+cargo-watch = "8.5.2"
+once_cell = "1.19.0"
+phf = "0.11.2"
+base64     = "0.22.0"
+lazy_static = "1.4.0"
+grass = "0.13"
+
+[dev-dependencies]
+
+miette     = { version = "7.1.0", features = ["fancy-no-backtrace"] }
+ouroboros  = "0.18.3"
+# Parses the GENERATED axum server module AND the generated production host as real Rust in tests,
+# asserting the emit is well-formed (a far stronger check than substring matching). Already in the
+# lockfile transitively, so this adds no new download. `full` enables item/fn/expr parsing of a whole
+# `syn::File`.
+syn        = { version = "2", features = ["full", "parsing"] }
+
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

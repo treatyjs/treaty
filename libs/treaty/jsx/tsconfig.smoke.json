@@ -1,0 +1,18 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "composite": false,
+    "lib": ["es2022", "dom"],
+    "types": [],
+    "jsx": "react-jsx",
+    "jsxImportSource": "@treaty/jsx",
+    "paths": {
+      "@treaty/jsx": ["./src/index.ts"],
+      "@treaty/jsx/jsx-runtime": ["./src/jsx-runtime.ts"]
+    }
+  },
+  "include": ["test/**/*.tsx", "src/**/*.ts", "src/**/*.d.ts"]
+}

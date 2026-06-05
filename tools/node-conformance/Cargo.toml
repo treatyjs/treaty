@@ -1,0 +1,19 @@
+[package]
+name = "node_conformance"
+version = "0.1.0"
+edition = "2024"
+
+# Deterministic, no-AI Node.js compatibility conformance harness for the Treaty runtime. Executes
+# Node `test/parallel`-style `.js` tests through `JsRuntime::with_node_compat`, classifies each as
+# Pass / Fail / Skip(unsupported, with reason), and reports an aggregate pass-rate — modelled on
+# the Node-compat scoreboards Bun and Deno publish.
+
+[dependencies]
+# The runtime under test. Path dependency on the committed, green `treaty_runtime` (NOT render3),
+# so this crate builds and tests independently of in-flight render3 edits.
+treaty_runtime = { path = "../../libs/runtime" }
+
+# Report (de)serialization: the `ConformanceReport` is emitted as JSON by the binary so CI / a
+# scoreboard can diff pass-rates over time.
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

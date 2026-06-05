@@ -1,0 +1,34 @@
+{
+  "name": "@treaty/schematics",
+  "version": "0.0.1",
+  "description": "Zero-config Angular schematics for Treaty. `ng add @treaty/schematics` rewrites angular.json to the @treaty/build builders and scaffolds the Module Federation structure (host + a sample remote, shared Angular singletons) automatically; the `application` and `library` generators keep that federation structure out-of-the-box (a remote app is exposable, a host consumes remotes) with zero MF config. Treaty is a compiler, not a host: the developer configures nothing.",
+  "author": "Jordan Hall",
+  "license": "IDGAF-1.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "schematics": "./dist/collection.json",
+  "exports": {
+    "./package.json": {
+      "default": "./package.json"
+    },
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./collection.json": {
+      "default": "./dist/collection.json"
+    }
+  },
+  "sideEffects": false,
+  "dependencies": {
+    "@treaty/module-federation": "*"
+  },
+  "peerDependencies": {
+    "@angular-devkit/core": ">=18",
+    "@angular-devkit/schematics": ">=18"
+  },
+  "engines": {
+    "node": ">=20.19"
+  }
+}

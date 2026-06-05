@@ -1,0 +1,17 @@
+{
+  "//": "checkJs typecheck for the everything-demo Node ESM module + smoke. These .mjs files are NOT part of the Angular app bundle (the app's tsconfig.app.json only includes *.ts + app.treaty); they run under `node` for the headless smoke. This config type-checks them in isolation so the demo stays well-typed. Driven by the repl `typecheck-demo` moon task with tsgo (never tsc).",
+  "compilerOptions": {
+    "noEmit": true,
+    "allowJs": true,
+    "checkJs": true,
+    "skipLibCheck": true,
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "target": "ESNext",
+    "lib": ["ESNext"],
+    "strict": true,
+    "esModuleInterop": true,
+    "types": ["node"]
+  },
+  "include": ["everything-demo.mjs", "everything-demo.smoke.mjs"]
+}

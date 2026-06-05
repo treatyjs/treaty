@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <!--
+    Declares asInvoker so Windows does NOT apply installer-detection elevation
+    to binaries whose names contain "update"/"updater" (UAC heuristic, os error
+    740). Embedded into every binary this crate links (bins + test harnesses)
+    via build.rs so `cargo test`/`cargo run` execute without elevation.
+  -->
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false" />
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+</assembly>

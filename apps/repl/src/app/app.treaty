@@ -24,16 +24,32 @@
 </style>
 
 import logo from './component/logo.treaty';
+import { PluginOutputViewer } from './plugin-output-viewer.component';
 import { viewChild, ElementRef, effect, signal } from '@angular/core';
 import {EditorView, basicSetup} from "codemirror"
 import {javascript} from "@codemirror/lang-javascript"
 import { treaty } from './lang-treaty/treatyjs'
-import { formatAngularTemplate, formatJs } from './utils/prettier'
 import { highlighter } from './utils/highlighter';
 
 
 const editor = viewChild('editor');
 const viewer = viewChild('viewer');
+
+// Which right-hand surface is shown: the live Codegen output (default) or the
+// Treaty plugin-output viewer, which compiles one sample per authoring surface
+// (.treaty SFC, .tjsx JSX, Angular .ts with a server fn) on mount.
+const showPluginOutput = signal(false);
+// Show the codegen pane and (re)run codegen against the current editor doc. When
+// switching back from the plugin-output pane the `#viewer` element is recreated,
+// so defer the codegen pass until after the view updates and the ref resolves.
+const showCodegen = () => {
+  showPluginOutput.set(false);
+  queueMicrotask(() => {
+    const el = viewer()?.nativeElement;
+    if (el) onClick(el);
+  });
+};
+const showPlugins = () => showPluginOutput.set(true);
 
 const defaultDoc = `
 <style>
@@ -98,23 +114,37 @@ effect(async () => {
   <div #right id="right">
     <div class="header controls">
       <div>
-        <button type="button" id="codegen" (click)="onClick(viewer)">Codegen</button>
+        <button type="button" id="codegen" [class.active]="!showPluginOutput()" (click)="showCodegen()">Codegen</button>
+        <button type="button" id="plugin-output" [class.active]="showPluginOutput()" (click)="showPlugins()">Plugin output</button>
       </div>
     </div>
-    <pre #viewer id="viewer"></pre>
+    @if (showPluginOutput()) {
+      <div id="plugin-output-panel" style="flex: 1; overflow-y: auto; padding: 1em;">
+        <PluginOutputViewer></PluginOutputViewer>
+      </div>
+    } @else {
+      <pre #viewer id="viewer"></pre>
+    }
   </div>
 </div>
 
-import { treatyToIvy } from '../tools/treaty-sfc/treat-to-ivy'
-import * as ng from '@angular/compiler';
- 
+// Live in-browser codegen of arbitrary editor input is intentionally NOT wired to a
+// TypeScript compiler: Treaty has ONE compiler — the Rust/OXC `authoring_node` NAPI
+// addon — and it runs in Node (build time), not in the browser. The old TS
+// `treatyToIvy` fallback has been removed. The "Plugin output" pane shows REAL Rust
+// codegen for every authoring surface, precompiled in Node via the addon and shipped
+// to the browser as the `virtual:treaty-gallery` data module (see gallery-plugin.ts).
 const onClick = async (viwer) => {
-  const result = await treatyToIvy(window.view.state.doc.toLocaleString(), 'example.treat', ng, () => 'example')
-  const formatted = await formatJs(result);
-  const highlighted = highlighter.codeToHtml(formatted, {
+  if (!viwer) return;
+  const note = [
+    '// Live codegen for arbitrary editor input is disabled in the browser.',
+    '// Treaty compiles with the Rust/OXC addon (Node-only) — there is no in-browser',
+    '// TypeScript compiler. Use the "Plugin output" tab to see real Rust Ivy codegen',
+    '// for every authoring surface, compiled at build time through the same addon.',
+  ].join('\n');
+  const highlighted = highlighter.codeToHtml(note, {
     lang: 'javascript',
     theme: 'github-dark',
   });
   viwer.innerHTML = highlighted;
-  console.log(result);
 }

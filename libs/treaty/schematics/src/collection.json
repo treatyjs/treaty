@@ -1,0 +1,24 @@
+{
+  "$schema": "../../../../node_modules/@angular-devkit/schematics/collection-schema.json",
+  "version": "0.0.1",
+  "schematics": {
+    "ng-add": {
+      "factory": "./ng-add/index.js#ngAdd",
+      "description": "Convert an existing Angular workspace to Treaty: rewrite angular.json to the @treaty/build builders for every project's build/serve targets and scaffold the Module Federation structure (host + a sample remote, shared Angular singletons) automatically. Zero configuration.",
+      "schema": "./ng-add/schema.json",
+      "aliases": ["install", "treaty"]
+    },
+    "application": {
+      "factory": "./application/index.js#application",
+      "description": "Generate a Treaty application. Every Treaty app is a Module Federation host automatically and is itself exposable as a remote — wired with zero MF configuration.",
+      "schema": "./application/schema.json",
+      "aliases": ["app"]
+    },
+    "library": {
+      "factory": "./library/index.js#library",
+      "description": "Generate a Treaty library, exposable as a Module Federation remote out-of-the-box with zero MF configuration.",
+      "schema": "./library/schema.json",
+      "aliases": ["lib"]
+    }
+  }
+}

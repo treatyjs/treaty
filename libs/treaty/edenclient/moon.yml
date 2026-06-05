@@ -20,4 +20,13 @@ tasks:
     args:
     - --tsConfig
     - $workspaceRoot/libs/treaty/edenclient/tsconfig.lib.prod.json
+  lint:
+    command: oxlint
+    args:
+    - -c
+    - $workspaceRoot/.oxlintrc.json
+    - $projectRoot/src
+    inputs:
+    - src/**/*
+    - $workspaceRoot/.oxlintrc.json
 type: library

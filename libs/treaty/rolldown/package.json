@@ -1,0 +1,41 @@
+{
+  "name": "@treaty/rolldown",
+  "version": "0.0.1",
+  "description": "Rolldown plugin for Treaty authoring formats (.treaty / .tsx / .tjsx / Angular .ts @Component), lowering each file to Ivy JS via @treaty/compiler and linking published partial @angular/* libraries to AOT via @treaty/ts-vite. Backed by the Rust authoring compiler + linker.",
+  "author": "Jordan Hall",
+  "license": "IDGAF-1.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "keywords": [
+    "rolldown",
+    "rolldown-plugin",
+    "treaty",
+    "angular",
+    "ivy"
+  ],
+  "exports": {
+    "./package.json": {
+      "default": "./package.json"
+    },
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "sideEffects": false,
+  "scripts": {
+    "build": "node build.mjs",
+    "watch": "node build.mjs --watch"
+  },
+  "dependencies": {
+    "@treaty/compiler": "*",
+    "@treaty/ts-vite": "*"
+  },
+  "peerDependencies": {
+    "rolldown": "^1.0.0"
+  },
+  "engines": {
+    "node": ">=20.19"
+  }
+}

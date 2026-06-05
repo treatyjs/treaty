@@ -1,0 +1,22 @@
+<!doctype html>
+<!--
+  NAV e2e HTML entry (consumed ONLY by nav.e2e.mjs via a real `vite build`).
+
+  Identical in shape to the app's real index.html, but loads the nav-e2e
+  bootstrap (`src/main.nav-e2e.ts`) which exposes the bootstrapped Angular
+  `Router` on `globalThis.__treatyNav` so the headless harness can drive
+  navigation across every route and assert the `<router-outlet>` renders the
+  right view per route. Build output lands under `dist/` (gitignored), never
+  committed.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Treaty everything-app — nav e2e</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+  </head>
+  <body>
+    <app-root></app-root>
+    <script type="module" src="/src/main.nav-e2e.ts"></script>
+  </body>
+</html>

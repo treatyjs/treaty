@@ -1,0 +1,30 @@
+{
+  "name": "@treaty/rslib",
+  "version": "0.0.1",
+  "description": "Rslib preset for building Treaty libraries: a defineTreatyLib() helper and rslib/rsbuild plugin that wires the Treaty transform (via @treaty/compiler) into an esm + dts library build with @angular/* externalized.",
+  "author": "Jordan Hall",
+  "license": "IDGAF-1.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    "./package.json": {
+      "default": "./package.json"
+    },
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "sideEffects": false,
+  "dependencies": {
+    "@treaty/compiler": "*",
+    "@treaty/ts-vite": "*"
+  },
+  "peerDependencies": {
+    "@rslib/core": "^0.0.0 || >=0.1.0"
+  },
+  "engines": {
+    "node": ">=20.19"
+  }
+}

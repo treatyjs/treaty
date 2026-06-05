@@ -1,0 +1,20 @@
+<!doctype html>
+<!--
+  FULL-BUILD e2e HTML entry (Phase 1 harness only — NOT the app's real page).
+
+  Mirrors index.html but loads `src/main.full-e2e.ts`, the harness bootstrap that
+  builds every authoring surface the Rust compiler lowers correctly (JSX .tsx/.tjsx,
+  .treaty gauge SFC, @Component .ts) plus the partial-@angular linker, omitting only
+  the route blocked by the reported greeter.treaty Rust gap.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Treaty everything-app (full-build e2e)</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+  </head>
+  <body>
+    <app-root></app-root>
+    <script type="module" src="/src/main.full-e2e.ts"></script>
+  </body>
+</html>

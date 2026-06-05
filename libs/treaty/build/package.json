@@ -1,0 +1,54 @@
+{
+  "name": "@treaty/build",
+  "version": "0.0.1",
+  "description": "Angular CLI architect builders that run Treaty. Registers @treaty/build:application (ng build) and @treaty/build:dev-server (ng serve), each driving the Treaty Rspack plugin (@treaty/rspack) with automatic, zero-config Module Federation (@treaty/module-federation) so every Treaty app builds and serves as a federated host/remote with nothing to configure in angular.json beyond pointing the target at the builder.",
+  "author": "Jordan Hall",
+  "license": "IDGAF-1.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "builders": "./builders.json",
+  "exports": {
+    "./package.json": {
+      "default": "./package.json"
+    },
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./builders.json": {
+      "default": "./builders.json"
+    },
+    "./application": {
+      "types": "./dist/application.d.ts",
+      "default": "./dist/application.js"
+    },
+    "./dev-server": {
+      "types": "./dist/dev-server.d.ts",
+      "default": "./dist/dev-server.js"
+    }
+  },
+  "sideEffects": false,
+  "dependencies": {
+    "@treaty/rspack": "*",
+    "@treaty/module-federation": "*"
+  },
+  "peerDependencies": {
+    "@angular-devkit/architect": ">=0.2000.0",
+    "@angular-devkit/core": ">=20",
+    "@rspack/core": ">=1",
+    "@rspack/dev-server": ">=1",
+    "@module-federation/enhanced": ">=0.9"
+  },
+  "peerDependenciesMeta": {
+    "@rspack/dev-server": {
+      "optional": true
+    },
+    "@module-federation/enhanced": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=20.19"
+  }
+}

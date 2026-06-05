@@ -3,6 +3,7 @@
 **/tmp
 **/out-tsc
 **/bazel-out
+**/*.vsix
 
 # Node
 **/node_modules
@@ -48,6 +49,7 @@
 # will have compiled files and executables
 **/debug/
 **/target/
+**/.target-*/
 
 **/*/debug/
 **/*/target/
@@ -70,3 +72,17 @@
 # moon
 .moon/cache
 .moon/docker
+
+# Vendored Angular reference (render3 port spec source)
+/tools/angular-ref/
+
+# Migration build logs
+baseline-cargo-build.log
+
+# Agent/editor local config (was untracked in upstream)
+.claude/
+
+# NAPI build artifact
+libs/authoring/node/*.node
+migration/*.log
+.target-parity/

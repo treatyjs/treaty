@@ -1,0 +1,104 @@
+```
+// == Macro block (compile-time) ==
+// A fenced block at the TOP of a .treaty file runs at COMPILE time; its VALUE
+// (the trailing expression) is inlined as the constant `$macro` (zero runtime
+// cost). Here we precompute the colored threshold bands the gauge labels itself
+// against and expose them as `$macro`.
+const bands = [
+	{ upTo: 0.5, label: 'low', hex: '#dc2626' },
+	{ upTo: 0.8, label: 'ok', hex: '#d97706' },
+	{ upTo: 1.01, label: 'high', hex: '#059669' },
+]
+// The trailing expression is the macro's value, injected as `const $macro = …`.
+;({ bands, builtAt: new Date(0).toISOString() })
+```
+
+// == Component body: SIGNALS BY DEFAULT ==
+// Treaty defaults to standalone + signal + selectorless; this gauge leans into
+// the signal graph with NO @Component, selector, or `standalone: true`:
+//   - MULTIPLE signal INPUTS (`min`, `max`, `value`) -- the parent binds them;
+//   - two COMPUTED values derived from those inputs (`clamped`, `ratio`);
+//   - an EFFECT that records each settled reading into a local history signal.
+// It also pipes a computed through the `percent01` PIPE in the view and binds
+// the trend through the selectorless `HighlightDelta` directive on the readout.
+import { input, computed, effect, signal } from '@angular/core'
+import { Percent01Pipe } from './percent.pipe'
+import { HighlightDelta } from './highlight-delta.directive'
+
+// Three signal INPUTS -- bound by the host: <Gauge [value]="..." [max]="..." />.
+const min = input(0)
+const max = input(100)
+const value = input(0)
+
+// COMPUTED: clamp the input into [min, max], then express it as a 0..1 ratio.
+const clamped = computed(() => Math.min(max(), Math.max(min(), value())))
+const ratio = computed(() => {
+	const span = max() - min()
+	return span <= 0 ? 0 : (clamped() - min()) / span
+})
+
+// COMPUTED off the macro data ($macro): which precomputed band the ratio falls into.
+const band = computed(() => $macro.bands.find((b) => ratio() <= b.upTo) ?? $macro.bands[2])
+
+// Local history + the per-tick delta the directive paints.
+const history = signal<number[]>([])
+const delta = computed(() => {
+	const h = history()
+	return h.length < 2 ? 0 : h[h.length - 1] - h[h.length - 2]
+})
+
+// EFFECT: every time the settled reading changes, append it to the history.
+// Reads `clamped()` (a signal) and writes `history` (allowed: effects may write
+// signals they do not themselves read).
+effect(() => {
+	const reading = clamped()
+	history.update((prev) => [...prev, reading])
+})
+
+// == View (interleaved tag-HTML, NO <template> wrapper) ==
+<section class="gauge">
+  <header>
+    <h3>{{ band().label }} gauge</h3>
+    <small>built {{ $macro.builtAt }}</small>
+  </header>
+
+  <div class="track">
+    <div class="fill" [style.width]="(ratio() | percent01)" [style.background]="band().hex"></div>
+  </div>
+
+  <p class="readout">
+    <span HighlightDelta [delta]="delta()">{{ clamped() }}</span>
+    of {{ max() }} ({{ ratio() | percent01:1 }})
+  </p>
+
+  @if (history().length > 1) {
+    <small class="trend">{{ history().length }} samples, last delta {{ delta() }}</small>
+  } @else {
+    <small class="trend">collecting samples...</small>
+  }
+</section>
+
+<style lang="scss">
+  .gauge {
+    $radius: 0.4rem;
+    font-family: system-ui, sans-serif;
+
+    header {
+      display: flex;
+      align-items: baseline;
+      gap: 0.5rem;
+      small { color: gray; }
+    }
+
+    .track {
+      height: 0.6rem;
+      background: color-mix(in srgb, currentColor 12%, white);
+      border-radius: $radius;
+      overflow: hidden;
+      .fill { height: 100%; transition: width 150ms ease; }
+    }
+
+    .readout { font-weight: 600; }
+    .trend { color: gray; font-style: italic; }
+  }
+</style>

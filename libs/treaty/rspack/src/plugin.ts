@@ -1,0 +1,323 @@
+/**
+ * @module
+ *
+ * A thin Rspack (webpack-compatible) plugin that wires the Treaty loader into a
+ * build. On `apply(compiler)` it:
+ *   1. registers a module rule that runs {@link treatyLoader} over Treaty's
+ *      owned extensions (`.treaty`, `.tsx`, `.tjsx` by default), and
+ *   2. adds those extensions to `resolve.extensions` so bare imports resolve.
+ *
+ * The plugin contains no compilation logic of its own — all lowering happens in
+ * the loader, which delegates to the Rust authoring compiler via
+ * `@treaty/compiler`. Treaty is a compiler, not a host.
+ *
+ * Batch vs. per-file: Rspack/webpack is a loader-based, pull pipeline — the loader
+ * is invoked once per module as the graph is walked, and there is no clean hook
+ * that hands a plugin the full set of owned source files up front. The core's
+ * batch `transformMany` therefore has no natural wiring point here, so this
+ * integration stays on the per-file loader path (which still shares one compiler
+ * instance per option set for incremental-cache reuse across the build). The
+ * batch path is wired in the bundlers that expose a cold-build hook (Vite's
+ * `buildStart`, rsbuild/rslib's `onBeforeBuild`).
+ */
+
+import { createRequire } from 'node:module'
+import { toRspackModuleFederation, type MfOptions } from '@treaty/module-federation'
+import { loaderPath } from './loader.js'
+import { LINK_PARTIAL_TEST, linkPartialLoaderPath } from './link-partial-loader.js'
+import {
+	ROUTES_SENTINEL_TEST,
+	routesLoaderPath,
+	routesSentinelPath,
+	TREATY_ROUTES_ID,
+	type RoutesLoaderOptions,
+} from './routes-virtual.js'
+import {
+	DEFAULT_EXTENSIONS,
+	DEFAULT_TEST,
+	type TreatyLoaderOptions,
+	type TreatyPluginOptions,
+} from './options.js'
+import {
+	registryFor,
+	SERVER_FN_MANIFEST_ASSET,
+	serverFnManifestAsset,
+} from './server-chunks.js'
+
+/** A single `use` entry on a module rule. */
+interface RuleUseEntry {
+	loader: string
+	options?: TreatyLoaderOptions | RoutesLoaderOptions
+}
+
+/** The subset of a module rule the plugin produces. */
+interface ModuleRule {
+	test?: RegExp
+	use?: RuleUseEntry[]
+	[key: string]: unknown
+}
+
+/**
+ * The slice of an Rspack/webpack `Compiler` the plugin mutates. Declared
+ * structurally so the package typechecks without the peer-only `@rspack/core`
+ * types installed; the real `Compiler` is assignable to this.
+ */
+export interface TreatyCompilerHost {
+	options: {
+		module?: { rules?: unknown[] }
+		resolve?: {
+			extensions?: string[]
+			/** Module aliases; the file-routes virtual id is aliased to the sentinel here. */
+			alias?: Record<string, string | false | string[]>
+		}
+		/** The build's plugin list; auto-MF pushes the federation plugin here. */
+		plugins?: unknown[]
+		[key: string]: unknown
+	}
+	/**
+	 * The compiler hook surface the plugin taps to emit the server-fn manifest.
+	 * Optional + structural so the package typechecks without `@rspack/core` and
+	 * the plugin no-ops on a minimal host (e.g. the resolve/rule unit tests).
+	 */
+	hooks?: {
+		thisCompilation?: {
+			tap(name: string, fn: (compilation: TreatyCompilation) => void): void
+		}
+	}
+	/** Rspack/webpack's own `sources` namespace, used to build a RawSource. */
+	webpack?: { sources?: { RawSource?: RawSourceCtor } }
+}
+
+/** A constructable webpack/rspack `RawSource` (the asset source wrapper). */
+interface RawSourceCtor {
+	new (value: string): unknown
+}
+
+/**
+ * The structural slice of a compilation the plugin uses: the `processAssets`
+ * hook (to run at asset-emit time) and `emitAsset` (to write the manifest). The
+ * real Rspack/webpack `Compilation` is assignable to this.
+ */
+export interface TreatyCompilation {
+	hooks: {
+		processAssets: {
+			tap(options: { name: string; stage?: number }, fn: () => void): void
+		}
+	}
+	emitAsset(name: string, source: unknown): void
+}
+
+/**
+ * A constructable `@module-federation/enhanced` `ModuleFederationPlugin`.
+ * Declared structurally so the package typechecks without the peer installed.
+ */
+interface ModuleFederationPluginCtor {
+	new (options: unknown): { apply(compiler: unknown): void }
+}
+
+/**
+ * Resolve the `moduleFederation` option to concrete {@link MfOptions} when
+ * enabled, or `null` when disabled. `true`/omitted ⇒ the zero-config defaults;
+ * `false` ⇒ disabled. An {@link MfOptions} object with `enabled: false` is also
+ * treated as disabled, so federation can be turned off in the config block
+ * without deleting the rest of its wiring.
+ */
+function resolveMfOptions(value: MfOptions | boolean | undefined): MfOptions | null {
+	if (value === false) return null
+	if (value === true || value === undefined) return {}
+	if (value.enabled === false) return null
+	return value
+}
+
+/**
+ * Load the `@module-federation/enhanced` `ModuleFederationPlugin` synchronously
+ * (so it can be added during the synchronous `apply`). The peer is optional: if
+ * it is not installed this returns `null` and the caller skips MF wiring with a
+ * one-line warning, so a build without the peer keeps working (and existing
+ * loader/resolve behaviour is unchanged). Tries the package's `/rspack` subpath
+ * first (the Rspack-specific export some versions ship) then the root.
+ */
+function loadModuleFederationPlugin(): ModuleFederationPluginCtor | null {
+	const require = createRequire(import.meta.url)
+	const specifiers = ['@module-federation/enhanced/rspack', '@module-federation/enhanced']
+	for (const specifier of specifiers) {
+		try {
+			const mod = require(specifier) as {
+				ModuleFederationPlugin?: ModuleFederationPluginCtor
+				default?: ModuleFederationPluginCtor
+			}
+			const ctor = mod.ModuleFederationPlugin ?? mod.default
+			if (typeof ctor === 'function') return ctor
+		} catch {
+			// Try the next specifier; a fully-missing peer is handled by the caller.
+		}
+	}
+	return null
+}
+
+/**
+ * Build the module rule the plugin installs. Exposed so callers who prefer to
+ * wire the rule into their own config (instead of using the plugin) can reuse
+ * the exact same loader configuration.
+ */
+export function treatyRule(options: TreatyPluginOptions = {}): ModuleRule {
+	const {
+		extensions: _extensions,
+		test,
+		moduleFederation: _moduleFederation,
+		// Plugin-only key — wired separately (alias + routesRule), never a loader option.
+		fileRoutes: _fileRoutes,
+		...loaderOptions
+	} = options
+	// `loaderOptions` carries the {@link TreatyCompilerOptions} PLUS the loader-only
+	// `selectorRoot`: forwarding it here is what threads CROSS-MODULE selector resolution
+	// into the per-file loader, which prewarms the project scan once and derives each
+	// file's registry (mirroring the `@treaty/vite` `selectorRoot` wiring).
+	return {
+		test: test ?? DEFAULT_TEST,
+		use: [
+			{
+				loader: loaderPath,
+				options: loaderOptions,
+			},
+		],
+	}
+}
+
+/**
+ * Build the module rule that runs the Angular partial-declaration linker over published
+ * `node_modules` Angular modules. The rule matches `node_modules` `.mjs`/`.js`/`.cjs` files and runs
+ * {@link linkPartialLoader}, which delegates to the SHARED Rust-backed linker from `@treaty/ts-vite`
+ * (de-partialling `ɵɵngDeclare*` → AOT `ɵɵdefine*`). The loader's own cheap partial guard keeps the
+ * link off any matched file that is not actually partial-compiled, so this is safe to register
+ * broadly. `type: 'javascript/auto'` so the rule applies to ESM `.mjs` Angular fesm chunks.
+ *
+ * Exposed so callers wiring their own config can reuse the exact same linker rule.
+ */
+export function linkPartialRule(): ModuleRule {
+	return {
+		test: LINK_PARTIAL_TEST,
+		type: 'javascript/auto',
+		use: [{ loader: linkPartialLoaderPath }],
+	}
+}
+
+/**
+ * Build the module rule that turns the file-routing sentinel into the virtual
+ * routes module. The rule matches the in-package sentinel ({@link ROUTES_SENTINEL_TEST})
+ * — which the `virtual:treaty-routes` import is aliased to — and runs the routes
+ * loader, which REPLACES the sentinel source with the routes module generated by the
+ * Rust file-routing core for the given {@link RoutesLoaderOptions}. No prebuilt
+ * `routes.ts` exists on disk; the module is produced during the build.
+ *
+ * Exposed so callers wiring their own config can reuse the exact same rule.
+ */
+export function routesRule(options: RoutesLoaderOptions): ModuleRule {
+	return {
+		test: ROUTES_SENTINEL_TEST,
+		type: 'javascript/auto',
+		use: [{ loader: routesLoaderPath, options }],
+	}
+}
+
+/** Rspack/webpack plugin that registers the Treaty loader and resolves its extensions. */
+export class TreatyRspackPlugin {
+	/** Stable plugin name surfaced in Rspack stats/diagnostics. */
+	static readonly NAME = 'TreatyRspackPlugin'
+
+	private readonly options: TreatyPluginOptions
+
+	constructor(options: TreatyPluginOptions = {}) {
+		this.options = options
+	}
+
+	/**
+	 * Mutate the compiler config: add the loader rule, resolve extensions, and —
+	 * unless `moduleFederation` is `false` — the auto-generated
+	 * `@module-federation/enhanced` `ModuleFederationPlugin` so every Treaty app
+	 * is a federation host with zero developer config.
+	 */
+	apply(compiler: TreatyCompilerHost): void {
+		const config = compiler.options
+
+		const moduleConfig = (config.module ??= {})
+		const rules = (moduleConfig.rules ??= [])
+		rules.push(treatyRule(this.options))
+		// Link published partial-compiled Angular libraries (node_modules `ɵɵngDeclare*`) to AOT via
+		// the shared Rust linker, so the build needs NO JIT and NO `@angular/compiler`.
+		rules.push(linkPartialRule())
+
+		const resolve = (config.resolve ??= {})
+		const wanted = this.options.extensions ?? DEFAULT_EXTENSIONS
+		const existing = (resolve.extensions ??= [])
+		for (const ext of wanted) {
+			if (!existing.includes(ext)) existing.push(ext)
+		}
+
+		// File routing as a virtual module, generated during the build (no prebuilt
+		// routes.ts). Alias the `virtual:treaty-routes` import to the in-package
+		// sentinel and run the routes loader over it; the loader replaces the
+		// sentinel source with the Rust-generated route graph. Only wired when the
+		// app opted in via `fileRoutes`.
+		if (this.options.fileRoutes !== undefined) {
+			const alias = (resolve.alias ??= {})
+			alias[TREATY_ROUTES_ID] = routesSentinelPath
+			rules.push(routesRule(this.options.fileRoutes))
+		}
+
+		// Server-fn chunking: at asset-emit time, write the aggregate fn-id -> chunk
+		// manifest (built from the same per-compilation registry the loader fed) as a
+		// build asset. The per-fn body chunks themselves are emitted by the loader.
+		this.tapServerFnManifest(compiler)
+
+		// Auto Module Federation: default-on, opt-out via moduleFederation: false.
+		const mf = resolveMfOptions(this.options.moduleFederation ?? true)
+		if (mf !== null) {
+			const ModuleFederationPlugin = loadModuleFederationPlugin()
+			if (ModuleFederationPlugin === null) {
+				// The optional peer is not installed: skip MF rather than fail the
+				// build. Install @module-federation/enhanced to enable auto-MF (or
+				// pass moduleFederation: false to silence this).
+				console.warn(
+					'@treaty/rspack: Module Federation is enabled but ' +
+						'"@module-federation/enhanced" is not installed — skipping federation wiring. ' +
+						'Install @module-federation/enhanced to enable auto-MF, or pass moduleFederation: false.'
+				)
+			} else {
+				const federationOptions = toRspackModuleFederation(mf)
+				const plugins = (config.plugins ??= [])
+				plugins.push(new ModuleFederationPlugin(federationOptions))
+			}
+		}
+	}
+
+	/**
+	 * Tap the compiler to emit the server-fn manifest. For each compilation it
+	 * hooks `processAssets` and, when the loader recorded any server-fn chunks for
+	 * that compilation, writes them as the {@link SERVER_FN_MANIFEST_ASSET} JSON
+	 * asset. No-ops on a minimal host without the hook surface (the unit tests) so
+	 * the loader/resolve wiring stays usable standalone.
+	 */
+	private tapServerFnManifest(compiler: TreatyCompilerHost): void {
+		const thisCompilation = compiler.hooks?.thisCompilation
+		if (thisCompilation === undefined) return
+		const RawSource = compiler.webpack?.sources?.RawSource
+
+		thisCompilation.tap(TreatyRspackPlugin.NAME, (compilation) => {
+			// PROCESS_ASSETS_STAGE_ADDITIONAL (= 100): emit alongside other added
+			// assets, before optimization stages run.
+			compilation.hooks.processAssets.tap(
+				{ name: TreatyRspackPlugin.NAME, stage: 100 },
+				() => {
+					const registry = registryFor(compilation)
+					if (registry.isEmpty) return
+					const json = serverFnManifestAsset(registry)
+					const source = RawSource !== undefined ? new RawSource(json) : json
+					compilation.emitAsset(SERVER_FN_MANIFEST_ASSET, source)
+				}
+			)
+		})
+	}
+}
+
+export default TreatyRspackPlugin
