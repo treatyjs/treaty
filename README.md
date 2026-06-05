@@ -2,13 +2,11 @@
 
 A Rust/OXC Angular compiler, packager, CLI and Node-compatible runtime. Treaty
 compiles Angular **directly to Ivy** in Rust (no `tsc`, no `@angular/compiler` at
-runtime), ships its own Node-compatible runtime, packages libraries (an
+runtime), packages libraries (an
 ng-packagr alternative), provides an `ng`-compatible native CLI, and lets you
 author with `.treaty` SFCs, JSX-flavored Angular, or **plain React** — signals by
 default.
 
-> Branch: `migration/v22-oxc133` · OXC 0.133 · Angular **22.0.0-rc.3** (re-pin to `22.0.0` when it ships) · TypeScript 6.0.
-> Detailed state: [`migration/STATUS.md`](migration/STATUS.md).
 
 ## Features
 
@@ -42,7 +40,7 @@ Legend: ✅ done · 🏗️ in progress · ⏳ queued.
 
 ## Treaty vs AnalogJS
 
-[AnalogJS](https://analogjs.org) (by Brandon Roberts) is the established
+[AnalogJS](https://analogjs.org) is the established
 Vite-powered Angular meta-framework. Both bring file-routing, SSR/SSG and
 single-file-component authoring to Angular — but they sit at different layers.
 AnalogJS is a Vite + Nitro layer **around the standard Angular toolchain**;
@@ -68,7 +66,7 @@ from-scratch Rust compiler (speed, no JIT, a zero-oxc swc variant), multi-format
 authoring (`.treaty` + JSX + **plain React**), cross-framework compilation, a
 native Rust CLI + packager, and signals-by-default + selectorless out of the box.
 Treaty also stays a drop-in for existing Angular workspaces (`angular.json`,
-`@angular/*`, CDK/Material) — so it can ingest an AnalogJS or standard Angular app
+`@angular/*`) — so it can ingest an AnalogJS or standard Angular app
 and compile it with the Rust toolchain unchanged.
 
 ## Examples
@@ -78,8 +76,6 @@ and compile it with the Rust toolchain unchanged.
 - [`examples/treaty-shadcn`](examples/treaty-shadcn) — a publishable shadcn-style component library across ALL THREE surfaces (`.treaty`, Treaty `.tsx`, and **plain React `.tsx`**), packaged to `dist/` (typed `.d.ts` + APF `package.json`) via `treaty-packagr`.
 - [`examples/treaty-shadcn-demo`](examples/treaty-shadcn-demo) — an Angular gallery app consuming the built `treaty-shadcn` library (proves JSX→Angular **and** React→Angular end to end).
 
-## Status
+## Benchmark (WIP)
 
-See [`migration/STATUS.md`](migration/STATUS.md) for the full per-workstream
-breakdown (compiler parity, the Angular linker, runtime conformance, file
-routing, examples, tooling) and the prioritized roadmap.
+See [`tools/treaty-bench/results/REPORT.md`](tools/treaty-bench/results/REPORT.md) for the full benchmark
