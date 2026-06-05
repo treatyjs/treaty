@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-06-03T00:03:25.370Z",
+  "generatedAt": "2026-06-05T00:18:35.573Z",
   "app": "examples/ng-bench-app",
   "appNote": "Realistic standard-Angular application (6 components, a service layer, a pure pipe, an attribute directive, an eager route + 3 lazy routes). Pure @Component/@Directive/@Pipe .ts — zero Treaty-only features — so the SAME app drives both CLIs.",
   "host": {
@@ -10,9 +10,9 @@
   "buildRunsPerCli": 3,
   "serveRunsPerCli": 3,
   "versions": {
-    "@angular/core": "22.0.0-rc.3",
-    "@angular/build": "22.0.0-rc.3",
-    "@angular/cli": "22.0.0-rc.3",
+    "@angular/core": "22.0.0",
+    "@angular/build": "22.0.0",
+    "@angular/cli": "22.0.0",
     "vite": "7.3.3"
   },
   "drivers": {
@@ -28,25 +28,21 @@
       "cli": "treaty",
       "op": "build",
       "status": "measured",
-      "buildMs": 2436,
-      "distBytes": 583380,
-      "note": "best of 3 clean build(s); times(ms)=[4497, 2658, 2436]; jsFiles=4 residualNgDeclare=0 importsCompiler=false linkedOk=true",
+      "buildMs": 2235,
+      "distBytes": 464440,
+      "note": "best of 3 clean build(s); times(ms)=[6703, 3547, 2235]; jsFiles=4 residualNgDeclare=0 importsCompiler=false linkedOk=true",
       "works": "PASS",
-      "worksReason": "eager Dashboard route rendered (\"Inventory dashboard\") with no JIT / @angular/compiler error; statCards=3 navLinks=3",
-      "statCards": 3,
+      "worksReason": "eager Dashboard route rendered (\"Inventory dashboard\") with no JIT / @angular/compiler error; statCards=0 navLinks=3",
+      "statCards": 0,
       "navLinks": 3
     },
     {
       "cli": "ng",
       "op": "build",
-      "status": "measured",
-      "buildMs": 4731,
-      "distBytes": 253529,
-      "note": "best of 3 clean build(s); times(ms)=[8126, 4934, 4731]; jsFiles=4 residualNgDeclare=0 importsCompiler=false linkedOk=true",
-      "works": "PASS",
-      "worksReason": "eager Dashboard route rendered (\"Inventory dashboard\") with no JIT / @angular/compiler error; statCards=3 navLinks=3",
-      "statCards": 3,
-      "navLinks": 3
+      "status": "failed",
+      "note": "ng build failed: \u001bX \u001b[\u001bERROR\u001b]\u001b \u001bTS2345: Argument of type 'import(\"D:/dev/treaty/examples/ng-bench-app/node_modules/rxjs/dist/types/internal/types\").OperatorFunction<number, import(\"D:/dev/treaty/examples/ng-bench-app/src/app/core/product.model\").Product>' is not assignable to parameter of type 'import(\"D:/dev/treaty/node_modules/rxjs/dist/types/internal/types\").OperatorFunction<number, import(\"D:/dev/treaty/examples/ng-bench-app/src/app/core/product.model\").Product>'.\r   Types of parameters 'source' and 'source' are incompatible.\r     Type 'import(\"D:/dev/treaty/node_modules/rxjs/dist/types/internal/Observable\").Observable<number>' is not assignable to type 'import(\"D:/dev/treaty/examples/ng-bench-app/node_modules/rxjs/dist/types/internal/Observable\").Observable<number>'.\r       The types of 'source.operator.call' are incompatible between these types.\r",
+      "works": "SKIPPED",
+      "worksReason": "not booted: build status=\"failed\" (ng build failed: \u001bX \u001b[\u001bERROR\u001b]\u001b \u001bTS2345: Argument of type 'import(\"D:/dev/treaty/examples/ng-bench-app/node_modules/rxjs/dist/types/internal/types\").OperatorFunction<number, import(\"D:/dev/treaty/examples/ng-bench-app/src/app/core/product.model\").Product>' is not assignable to parameter of type 'import(\"D:/dev/treaty/node_modules/rxjs/dist/types/internal/types\").OperatorFunction<number, import(\"D:/dev/treaty/examples/ng-bench-app/src/app/core/product.model\").Product>'.\r   Types of parameters 'source' and 'source' are incompatible.\r     Type 'import(\"D:/dev/treaty/node_modules/rxjs/dist/types/internal/Observable\").Observable<number>' is not assignable to type 'import(\"D:/dev/treaty/examples/ng-bench-app/node_modules/rxjs/dist/types/internal/Observable\").Observable<number>'.\r       The types of 'source.operator.call' are incompatible between these types.\r)"
     }
   ],
   "serve": [
@@ -54,16 +50,15 @@
       "cli": "treaty",
       "op": "serve",
       "status": "measured",
-      "coldToFirstByteMs": 80,
-      "firstModuleCompileMs": 185,
-      "note": "best of 3 cold start(s); coldToFirstByte(ms)=[141, 120, 80]; firstModuleCompile(ms)=[194, 225, 185]; GET / -> 200; GET src/app/features/dashboard/dashboard.ts -> 200 (14523B, compiled=true)"
+      "coldToFirstByteMs": 48,
+      "firstModuleCompileMs": 111,
+      "note": "best of 3 cold start(s); coldToFirstByte(ms)=[127, 67, 48]; firstModuleCompile(ms)=[130, 111, 111]; GET / -> 200; GET src/app/features/dashboard/dashboard.ts -> 200 (14579B, compiled=true)"
     },
     {
       "cli": "ng",
       "op": "serve",
-      "status": "measured",
-      "coldToFirstByteMs": 4703,
-      "note": "best of 3 cold start(s); coldToFirstByte(ms)=[7305, 5346, 4703]; GET / -> 200",
+      "status": "failed",
+      "note": "ng dev-server build failed: \u001bX \u001b[\u001bERROR\u001b]\u001b \u001bTS2345: Argument of type 'import(\"D:/dev/treaty/examples/ng-bench-app/node_modules/rxjs/dist/types/internal/types\").OperatorFunction<number, import(\"D:/dev/treaty/examples/ng-bench-app/src/app/core/product.model\").Product>' is not assignable to parameter of type 'import(\"D:/dev/treaty/node_modules/rxjs/dist/types/internal/types\").OperatorFunction<number, import(\"D:/dev/treaty/examples/ng-bench-app/src/app/core/product.model\").Product>'.\r   Types of parameters 'source' and 'source' are incompatible.\r     Type 'import(\"D:/dev/treaty/node_modules/rxjs/dist/types/internal/Observable\").Observable<number>' is not assignable to type 'import(\"D:/dev/treaty/examples/ng-bench-app/node_modules/rxjs/dist/types/internal/Observable\").Observable<number>'.\r",
       "firstModuleCompileNote": "N/A — the Angular dev-server (@angular/build:dev-server) prebundles + compiles the whole app BEFORE serving the first byte, so per-module on-demand compile is not separately observable. The cold-start-to-first-byte already INCLUDES the full app compile."
     }
   ]

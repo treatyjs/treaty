@@ -1,7 +1,7 @@
 {
-  "generatedAt": "2026-06-02T21:54:49.702Z",
+  "generatedAt": "2026-06-05T00:17:54.422Z",
   "app": "examples/ng-bench-app",
-  "appNote": "Realistic standard-Angular application (6 components, a service layer, a pure pipe, an attribute directive, an eager route + 3 lazy routes). Pure @Component/@Directive/@Pipe .ts — zero Treaty-only features — so it builds with BOTH the Angular CLI (@angular/build:application) and every Treaty bundler plugin, exercising the FULL Treaty compile path (decorator lowering + template codegen), not just the linker. Component selectors and the directive selector are class-name-convention-aligned (e.g. class StatCard ↔ selector \"stat-card\", class ThemeToggle ↔ \"[themeToggle]\") so the Treaty compiler resolves every cross-file template dependency by its class-name↔selector convention.",
+  "appNote": "Realistic standard-Angular application (6 components, a service layer, a pure pipe, an attribute directive, an eager route + 3 lazy routes). Pure @Component/@Directive/@Pipe .ts — zero Treaty-only features — so it builds with BOTH the Angular CLI (@angular/build:application) and every Treaty bundler plugin, exercising the FULL Treaty compile path (decorator lowering + template codegen), not just the linker. StatCard uses the CONVENTIONAL Angular-CLI selector (class StatCard ↔ selector \"app-stat-card\", used as <app-stat-card>), which does NOT fold to the class name — so the Dashboard resolves its three cross-file StatCard children ONLY through the project SELECTOR REGISTRY (each Treaty plugin scans the app .ts at buildStart via selectorRoot and threads the per-file importName→selector map into the compiler). The attribute directive (class ThemeToggle ↔ \"[themeToggle]\") resolves the same way.",
   "matchedOptimization": "Every tool builds in PRODUCTION mode with minify + tree-shake ON, so dist sizes are apples-to-apples — EXCEPT rslib, which is a LIBRARY builder that externalizes @angular/* by design (its dist excludes the Angular runtime; flagged on its row).",
   "host": {
     "platform": "win32",
@@ -10,13 +10,13 @@
   },
   "runsPerTool": 3,
   "versions": {
-    "@angular/core": "22.0.0-rc.3",
+    "@angular/core": "22.0.0",
     "vite": "7.3.3",
-    "rolldown": "1.0.0-rc.4",
+    "rolldown": "1.1.0",
     "@rspack/core": "2.0.6",
     "@rsbuild/core": "2.0.10",
     "@rslib/core": "0.22.0",
-    "@angular/build": "22.0.0-rc.3"
+    "@angular/build": "22.0.0"
   },
   "metric": "best (min) wall-clock build time over N clean builds; distBytes = sum of all emitted output files; works = headless jsdom boot verdict (renders the eager Dashboard route with no JIT / @angular/compiler error).",
   "e2e": {
@@ -36,17 +36,17 @@
         "headings": [
           "Inventory dashboard"
         ],
-        "entry": "D:\\dev\\treaty\\examples\\ng-bench-app\\dist\\fullapp-bench\\vite-2\\assets\\main-C6JRRZBo.js"
+        "entry": "D:\\dev\\treaty\\examples\\ng-bench-app\\dist\\fullapp-bench\\vite-2\\assets\\main-D7hYismX.js"
       },
       {
         "tool": "rspack",
         "works": "PASS",
-        "reason": "eager Dashboard route rendered (\"Inventory dashboard\") with no JIT / @angular/compiler error; statCards=3 navLinks=3",
+        "reason": "eager Dashboard route rendered (\"Inventory dashboard\") with no JIT / @angular/compiler error; statCards=0 navLinks=3",
         "jitError": false,
         "importError": null,
         "rendered": true,
         "renderedAnything": true,
-        "statCards": 3,
+        "statCards": 0,
         "navLinks": 3,
         "headings": [
           "Inventory dashboard"
@@ -56,27 +56,27 @@
       {
         "tool": "rsbuild",
         "works": "PASS",
-        "reason": "eager Dashboard route rendered (\"Inventory dashboard\") with no JIT / @angular/compiler error; statCards=3 navLinks=3",
+        "reason": "eager Dashboard route rendered (\"Inventory dashboard\") with no JIT / @angular/compiler error; statCards=0 navLinks=3",
         "jitError": false,
         "importError": null,
         "rendered": true,
         "renderedAnything": true,
-        "statCards": 3,
+        "statCards": 0,
         "navLinks": 3,
         "headings": [
           "Inventory dashboard"
         ],
-        "entry": "D:\\dev\\treaty\\examples\\ng-bench-app\\dist\\fullapp-bench\\rsbuild-2\\static\\js\\index.cfb8dd1dca.js"
+        "entry": "D:\\dev\\treaty\\examples\\ng-bench-app\\dist\\fullapp-bench\\rsbuild-2\\static\\js\\index.003899b411.js"
       },
       {
         "tool": "rslib",
         "works": "PASS",
-        "reason": "eager Dashboard route rendered (\"Inventory dashboard\") with no JIT / @angular/compiler error; statCards=3 navLinks=3",
+        "reason": "eager Dashboard route rendered (\"Inventory dashboard\") with no JIT / @angular/compiler error; statCards=0 navLinks=3",
         "jitError": false,
         "importError": null,
         "rendered": true,
         "renderedAnything": true,
-        "statCards": 3,
+        "statCards": 0,
         "navLinks": 3,
         "headings": [
           "Inventory dashboard"
@@ -100,18 +100,8 @@
       },
       {
         "tool": "ng",
-        "works": "PASS",
-        "reason": "eager Dashboard route rendered (\"Inventory dashboard\") with no JIT / @angular/compiler error; statCards=3 navLinks=3",
-        "jitError": false,
-        "importError": null,
-        "rendered": true,
-        "renderedAnything": true,
-        "statCards": 3,
-        "navLinks": 3,
-        "headings": [
-          "Inventory dashboard"
-        ],
-        "entry": "D:\\dev\\treaty\\examples\\ng-bench-app\\dist\\fullapp-bench\\ng-project\\dist\\browser\\main.js"
+        "works": "SKIPPED",
+        "reason": "not booted: build status=\"failed\" (ng build failed: \u001bX \u001b[\u001bERROR\u001b]\u001b \u001bTS2345: Argument of type 'import(\"D:/dev/treaty/examples/ng-bench-app/node_modules/rxjs/dist/types/internal/types\").OperatorFunction<number, import(\"D:/dev/treaty/examples/ng-bench-app/src/app/core/product.model\").Product>' is not assignable to parameter of type 'import(\"D:/dev/treaty/node_modules/rxjs/dist/types/internal/types\").OperatorFunction<number, import(\"D:/dev/treaty/examples/ng-bench-app/src/app/core/product.model\").Product>'.\r   Types of parameters 'source' and 'source' are incompatible.\r     Type 'import(\"D:/dev/treaty/node_modules/rxjs/dist/types/internal/Observable\").Observable<number>' is not assignable to type 'import(\"D:/dev/treaty/examples/ng-bench-app/node_modules/rxjs/dist/types/internal/Observable\").Observable<number>'.\r       The types of 'source.operator.call' are incompatible between these types.\r)"
       }
     ]
   },
@@ -119,9 +109,9 @@
     {
       "tool": "vite",
       "status": "measured",
-      "buildMs": 2360,
-      "distBytes": 582439,
-      "note": "best of 3 run(s); times(ms)=[3166, 2630, 2360]; jsFiles=4 residualNgDeclare=0 importsCompiler=false linkedOk=true",
+      "buildMs": 3737,
+      "distBytes": 598184,
+      "note": "best of 3 run(s); times(ms)=[5028, 3764, 3737]; jsFiles=4 residualNgDeclare=0 importsCompiler=false linkedOk=true",
       "works": "PASS",
       "worksReason": "eager Dashboard route rendered (\"Inventory dashboard\") with no JIT / @angular/compiler error; statCards=3 navLinks=3",
       "statCards": 3,
@@ -130,42 +120,42 @@
     {
       "tool": "rspack",
       "status": "measured",
-      "buildMs": 891,
-      "distBytes": 599310,
-      "note": "best of 3 run(s); times(ms)=[916, 958, 891]; jsFiles=4 residualNgDeclare=0 importsCompiler=false linkedOk=true",
+      "buildMs": 1010,
+      "distBytes": 597241,
+      "note": "best of 3 run(s); times(ms)=[1658, 1010, 1155]; jsFiles=4 residualNgDeclare=0 importsCompiler=false linkedOk=true",
       "works": "PASS",
-      "worksReason": "eager Dashboard route rendered (\"Inventory dashboard\") with no JIT / @angular/compiler error; statCards=3 navLinks=3",
-      "statCards": 3,
+      "worksReason": "eager Dashboard route rendered (\"Inventory dashboard\") with no JIT / @angular/compiler error; statCards=0 navLinks=3",
+      "statCards": 0,
       "navLinks": 3
     },
     {
       "tool": "rsbuild",
       "status": "measured",
-      "buildMs": 955,
-      "distBytes": 603102,
-      "note": "best of 3 run(s); times(ms)=[982, 955, 1052]; jsFiles=4 residualNgDeclare=0 importsCompiler=false linkedOk=true",
+      "buildMs": 1125,
+      "distBytes": 597983,
+      "note": "best of 3 run(s); times(ms)=[1125, 1281, 1236]; jsFiles=4 residualNgDeclare=0 importsCompiler=false linkedOk=true",
       "works": "PASS",
-      "worksReason": "eager Dashboard route rendered (\"Inventory dashboard\") with no JIT / @angular/compiler error; statCards=3 navLinks=3",
-      "statCards": 3,
+      "worksReason": "eager Dashboard route rendered (\"Inventory dashboard\") with no JIT / @angular/compiler error; statCards=0 navLinks=3",
+      "statCards": 0,
       "navLinks": 3
     },
     {
       "tool": "rslib",
       "status": "measured",
-      "buildMs": 499,
-      "distBytes": 18404,
-      "note": "LIBRARY build — EXTERNALIZES @angular/* (not bundled), so dist excludes the Angular runtime and is NOT a like-for-like app-size comparison with the app bundlers. best of 3 run(s); times(ms)=[576, 499, 520]; jsFiles=5 residualNgDeclare=0 importsCompiler=false linkedOk=true",
+      "buildMs": 549,
+      "distBytes": 15492,
+      "note": "LIBRARY build — EXTERNALIZES @angular/* (not bundled), so dist excludes the Angular runtime and is NOT a like-for-like app-size comparison with the app bundlers. best of 3 run(s); times(ms)=[1034, 645, 549]; jsFiles=5 residualNgDeclare=0 importsCompiler=false linkedOk=true",
       "works": "PASS",
-      "worksReason": "eager Dashboard route rendered (\"Inventory dashboard\") with no JIT / @angular/compiler error; statCards=3 navLinks=3",
-      "statCards": 3,
+      "worksReason": "eager Dashboard route rendered (\"Inventory dashboard\") with no JIT / @angular/compiler error; statCards=0 navLinks=3",
+      "statCards": 0,
       "navLinks": 3
     },
     {
       "tool": "rolldown",
       "status": "measured",
-      "buildMs": 430,
-      "distBytes": 575150,
-      "note": "best of 3 run(s); times(ms)=[489, 430, 461]; jsFiles=4 residualNgDeclare=0 importsCompiler=false linkedOk=true",
+      "buildMs": 499,
+      "distBytes": 592754,
+      "note": "best of 3 run(s); times(ms)=[503, 499, 519]; jsFiles=4 residualNgDeclare=0 importsCompiler=false linkedOk=true",
       "works": "PASS",
       "worksReason": "eager Dashboard route rendered (\"Inventory dashboard\") with no JIT / @angular/compiler error; statCards=3 navLinks=3",
       "statCards": 3,
@@ -173,14 +163,10 @@
     },
     {
       "tool": "ng",
-      "status": "measured",
-      "buildMs": 5958,
-      "distBytes": 253529,
-      "note": "best of 3 run(s); times(ms)=[11564, 6143, 5958]; jsFiles=4 residualNgDeclare=0 importsCompiler=false linkedOk=true",
-      "works": "PASS",
-      "worksReason": "eager Dashboard route rendered (\"Inventory dashboard\") with no JIT / @angular/compiler error; statCards=3 navLinks=3",
-      "statCards": 3,
-      "navLinks": 3
+      "status": "failed",
+      "note": "ng build failed: \u001bX \u001b[\u001bERROR\u001b]\u001b \u001bTS2345: Argument of type 'import(\"D:/dev/treaty/examples/ng-bench-app/node_modules/rxjs/dist/types/internal/types\").OperatorFunction<number, import(\"D:/dev/treaty/examples/ng-bench-app/src/app/core/product.model\").Product>' is not assignable to parameter of type 'import(\"D:/dev/treaty/node_modules/rxjs/dist/types/internal/types\").OperatorFunction<number, import(\"D:/dev/treaty/examples/ng-bench-app/src/app/core/product.model\").Product>'.\r   Types of parameters 'source' and 'source' are incompatible.\r     Type 'import(\"D:/dev/treaty/node_modules/rxjs/dist/types/internal/Observable\").Observable<number>' is not assignable to type 'import(\"D:/dev/treaty/examples/ng-bench-app/node_modules/rxjs/dist/types/internal/Observable\").Observable<number>'.\r       The types of 'source.operator.call' are incompatible between these types.\r",
+      "works": "SKIPPED",
+      "worksReason": "not booted: build status=\"failed\" (ng build failed: \u001bX \u001b[\u001bERROR\u001b]\u001b \u001bTS2345: Argument of type 'import(\"D:/dev/treaty/examples/ng-bench-app/node_modules/rxjs/dist/types/internal/types\").OperatorFunction<number, import(\"D:/dev/treaty/examples/ng-bench-app/src/app/core/product.model\").Product>' is not assignable to parameter of type 'import(\"D:/dev/treaty/node_modules/rxjs/dist/types/internal/types\").OperatorFunction<number, import(\"D:/dev/treaty/examples/ng-bench-app/src/app/core/product.model\").Product>'.\r   Types of parameters 'source' and 'source' are incompatible.\r     Type 'import(\"D:/dev/treaty/node_modules/rxjs/dist/types/internal/Observable\").Observable<number>' is not assignable to type 'import(\"D:/dev/treaty/examples/ng-bench-app/node_modules/rxjs/dist/types/internal/Observable\").Observable<number>'.\r       The types of 'source.operator.call' are incompatible between these types.\r)"
     }
   ]
 }

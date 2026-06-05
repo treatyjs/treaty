@@ -1,6 +1,6 @@
 {
   "benchmark": "packagr-treaty-vs-ngpackagr",
-  "generatedAt": "2026-06-03T10:23:39.483Z",
+  "generatedAt": "2026-06-05T00:19:14.498Z",
   "library": {
     "path": "tools/treaty-bench/sample-lib",
     "note": "Standard-Angular library: 2 plain @Component .ts classes (one @Input, one event listener) + a public-api.ts barrel — authored as standard Angular TS so BOTH packagers can compile it.",
@@ -23,11 +23,11 @@
     "node": "v24.7.0",
     "cpu": "AMD Ryzen 7 PRO 5850U with Radeon Graphics"
   },
-  "runsPerTool": 2,
+  "runsPerTool": 3,
   "versions": {
     "ng-packagr": "21.2.3",
-    "@angular/core": "22.0.0-rc.3",
-    "@angular/compiler-cli": "22.0.0-rc.3",
+    "@angular/core": "22.0.0",
+    "@angular/compiler-cli": "22.0.0",
     "typescript": "6.0.3"
   },
   "metric": "treaty-packagr buildMs = its own in-process build_to_disk() time (compile every entry to Ivy + .d.ts + write APF dist); ng-packagr buildMs = ngPackagr().build() wall time. best (min) of N. distBytes = sum of emitted dist files.",
@@ -36,18 +36,18 @@
     {
       "tool": "treaty-packagr",
       "status": "measured",
-      "buildMs": 42.84,
+      "buildMs": 26.79,
       "distBytes": 2977,
       "dest": "D:\\dev\\treaty\\tools\\treaty-bench\\sample-lib\\dist",
-      "note": "best of 2 run(s); times(ms)=[43, 46]"
+      "note": "best of 3 run(s); times(ms)=[77, 28, 27]"
     },
     {
       "tool": "ng-packagr",
       "status": "measured",
-      "buildMs": 1147.12,
+      "buildMs": 636.67,
       "distBytes": 6834,
       "dest": "D:\\dev\\treaty\\tools\\treaty-bench\\sample-lib\\dist-ng-full",
-      "note": "best of 2 run(s); times(ms)=[2378, 1147]"
+      "note": "best of 3 run(s); times(ms)=[2940, 1055, 637]"
     }
   ],
   "equivalence": {
@@ -105,5 +105,5 @@
       }
     }
   },
-  "speedNote": "treaty-packagr 42.84 ms vs ng-packagr 1147.12 ms — treaty-packagr is 26.8x faster"
+  "speedNote": "treaty-packagr 26.79 ms vs ng-packagr 636.67 ms — treaty-packagr is 23.8x faster"
 }

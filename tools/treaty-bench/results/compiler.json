@@ -1,9 +1,9 @@
 {
   "benchmark": "compiler-ivy-lowering",
-  "generatedAt": "2026-06-02T21:51:10.468Z",
+  "generatedAt": "2026-06-05T00:16:20.705Z",
   "corpus": {
     "source": "libs/treaty-ivy/facade/parity/parity.mjs#FIXTURES",
-    "totalFixtures": 29
+    "totalFixtures": 30
   },
   "env": {
     "node": "v24.7.0",
@@ -17,62 +17,59 @@
     "bestOf": 3
   },
   "angularCompilerVersions": {
-    "v22": "22.0.0-rc.3",
+    "v22": "22.0.0",
     "v21": "21.2.15",
     "v21Status": "isolated+measured"
   },
   "correctness": {
     "file": "correctness.json",
-    "summary": "27/29 renderable fixtures STRICTLY byte/AST-equivalent under parity normalize(); 27/29 are equivalent except the Rust emitter writes a `changeDetection:0` field the v22 oracle now omits (single metadata field, instruction streams identical); 2 genuine lowering divergence(s); 0 not renderable by the oracle printer (i18n is now rendered + compared, so this is 0 unless a new unsupported node appears)",
-    "match": 27,
-    "diff": 2,
+    "summary": "30/30 renderable fixtures STRICTLY byte/AST-equivalent under parity normalize(); 30/30 are equivalent except the Rust emitter writes a `changeDetection:0` field the v22 oracle now omits (single metadata field, instruction streams identical); 0 genuine lowering divergence(s); 0 not renderable by the oracle printer (i18n is now rendered + compared, so this is 0 unless a new unsupported node appears)",
+    "match": 30,
+    "diff": 0,
     "oracleError": 0,
-    "diffFixtures": [
-      "i18n-static",
-      "i18n-interp"
-    ]
+    "diffFixtures": []
   },
   "results": [
     {
       "compiler": "angular-compiler@22",
       "status": "measured",
-      "fixtures": 29,
-      "components": 58000,
+      "fixtures": 30,
+      "components": 60000,
       "iterations": 2000,
       "warmup": 200,
-      "totalMs": 13741.222,
-      "msPerComponent": 0.236918,
-      "opsPerSec": 4220.9,
+      "totalMs": 15632.825,
+      "msPerComponent": 0.260547,
+      "opsPerSec": 3838.1,
       "skipped": [],
-      "note": "29 shared fixtures timed (intersection both compilers can lower)",
-      "angularVersion": "22.0.0-rc.3"
+      "note": "30 shared fixtures timed (intersection both compilers can lower)",
+      "angularVersion": "22.0.0"
     },
     {
       "compiler": "angular-compiler@21",
       "status": "measured",
-      "fixtures": 29,
-      "components": 58000,
+      "fixtures": 30,
+      "components": 60000,
       "iterations": 2000,
       "warmup": 200,
-      "totalMs": 14125.968,
-      "msPerComponent": 0.243551,
-      "opsPerSec": 4105.9,
+      "totalMs": 16008.953,
+      "msPerComponent": 0.266816,
+      "opsPerSec": 3747.9,
       "skipped": [],
-      "note": "29 shared fixtures timed (intersection both compilers can lower)",
+      "note": "30 shared fixtures timed (intersection both compilers can lower)",
       "angularVersion": "21.2.15"
     },
     {
       "compiler": "treaty-oxc",
       "status": "measured",
-      "fixtures": 29,
-      "components": 58000,
+      "fixtures": 30,
+      "components": 60000,
       "iterations": 2000,
       "warmup": 200,
-      "totalMs": 5429.976,
-      "msPerComponent": 0.09362,
-      "opsPerSec": 10681.4,
+      "totalMs": 5972.529,
+      "msPerComponent": 0.099542,
+      "opsPerSec": 10046,
       "skipped": [],
-      "note": "29 shared fixtures timed (intersection both compilers can lower)"
+      "note": "30 shared fixtures timed (intersection both compilers can lower)"
     },
     {
       "compiler": "treaty-swc",

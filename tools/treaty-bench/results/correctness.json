@@ -1,12 +1,12 @@
 {
   "benchmark": "compiler-correctness",
-  "generatedAt": "2026-06-02T21:51:10.462Z",
-  "oracle": "@angular/compiler@22.0.0-rc.3",
+  "generatedAt": "2026-06-05T00:16:20.698Z",
+  "oracle": "@angular/compiler@22.0.0",
   "treaty": "authoring_node.win32-x64-msvc.node",
   "comparison": "normalize() from libs/treaty-ivy/facade/parity/parity.mjs (same check the parity harness reports)",
   "corpus": {
     "source": "libs/treaty-ivy/facade/parity/parity.mjs#FIXTURES",
-    "totalFixtures": 29
+    "totalFixtures": 30
   },
   "env": {
     "node": "v24.7.0",
@@ -14,23 +14,17 @@
     "arch": "x64",
     "cpu": "AMD Ryzen 7 PRO 5850U with Radeon Graphics"
   },
-  "total": 29,
-  "renderable": 29,
-  "match": 27,
-  "diff": 2,
+  "total": 30,
+  "renderable": 30,
+  "match": 30,
+  "diff": 0,
   "oracleError": 0,
   "changeDetectionOnly": 0,
-  "loweringDivergences": 2,
-  "equivalentIgnoringChangeDetectionField": 27,
-  "summary": "27/29 renderable fixtures STRICTLY byte/AST-equivalent under parity normalize(); 27/29 are equivalent except the Rust emitter writes a `changeDetection:0` field the v22 oracle now omits (single metadata field, instruction streams identical); 2 genuine lowering divergence(s); 0 not renderable by the oracle printer (i18n is now rendered + compared, so this is 0 unless a new unsupported node appears)",
-  "diffFixtures": [
-    "i18n-static",
-    "i18n-interp"
-  ],
-  "loweringDivergenceFixtures": [
-    "i18n-static",
-    "i18n-interp"
-  ],
+  "loweringDivergences": 0,
+  "equivalentIgnoringChangeDetectionField": 30,
+  "summary": "30/30 renderable fixtures STRICTLY byte/AST-equivalent under parity normalize(); 30/30 are equivalent except the Rust emitter writes a `changeDetection:0` field the v22 oracle now omits (single metadata field, instruction streams identical); 0 genuine lowering divergence(s); 0 not renderable by the oracle printer (i18n is now rendered + compared, so this is 0 unless a new unsupported node appears)",
+  "diffFixtures": [],
+  "loweringDivergenceFixtures": [],
   "perFixture": [
     {
       "id": "static-element",
@@ -169,21 +163,18 @@
     },
     {
       "id": "i18n-static",
-      "result": "diff",
-      "category": "lowering-divergence",
-      "rustDiagnostics": null,
-      "firstDivergenceIndex": 82,
-      "oracleNear": "2,vars:0,consts:()=>{leti18n_0;if(typeofngI18nClosur",
-      "rustNear": "2,vars:0,consts:()=>{let$i18n_0$;if(typeofngI18nClos"
+      "result": "match",
+      "rustDiagnostics": null
     },
     {
       "id": "i18n-interp",
-      "result": "diff",
-      "category": "lowering-divergence",
-      "rustDiagnostics": null,
-      "firstDivergenceIndex": 82,
-      "oracleNear": "2,vars:1,consts:()=>{leti18n_0;if(typeofngI18nClosur",
-      "rustNear": "2,vars:1,consts:()=>{let$i18n_0$;if(typeofngI18nClos"
+      "result": "match",
+      "rustDiagnostics": null
+    },
+    {
+      "id": "html-comment",
+      "result": "match",
+      "rustDiagnostics": null
     }
   ]
 }
