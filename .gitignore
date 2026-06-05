@@ -5,6 +5,8 @@
 **/bazel-out
 **/*.vsix
 
+.claude
+
 # Node
 **/node_modules
 **/**/*/node_modules
