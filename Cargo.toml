@@ -6,6 +6,7 @@ members = [
 	'libs/treaty-ivy/core',
 	'libs/treaty-ivy/template',
 	'libs/treaty-ivy/decorators',
+	'libs/treaty-ivy/facts',
 	'libs/treaty-ivy/facade',
 	'libs/authoring/rust',
 	'libs/runtime',

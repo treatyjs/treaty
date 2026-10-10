@@ -57,6 +57,16 @@ use crate::view::compiler::{
 };
 use crate::util::R3Reference as DirRef;
 
+// Decorator facts (raw, plain-data) read through this front-end's own helpers; see the module doc.
+mod decorator_facts;
+pub use decorator_facts::{decorator_facts_of_source, lower_to_text};
+// The ng-analyze facts path (opt-in feature `ng-analyze`): component/directive metadata from the bridge's facts.
+mod facts_emit;
+pub use facts_emit::{ng_analyze_counters, reset_ng_analyze_counters, NgAnalyzeCounters};
+#[cfg(feature = "ng-analyze")]
+pub use facts_emit::with_treaty_extraction;
+use facts_emit::NgFacts;
+
 /// Helper to build a `CompiledComponent` carrying a single fatal error and no code.
 fn err(msg: impl Into<String>) -> CompiledComponent {
     CompiledComponent {
@@ -1822,11 +1832,16 @@ use crate::decorators::registry::CompiledDef as ClassEmit;
 /// constructor (or a parameterless one) yields the empty-deps form Angular generates for a
 /// parameterless constructor: `function X_Factory(t) { return new (t || X)(); }`.
 fn class_factory(class: &ClassWithDecorators, class_name: &str, target: FactoryTarget) -> R3FactoryMetadata {
+    class_factory_from_deps(class_name, extract_ctor_deps(class), target)
+}
+
+/// The constructor factory of `class_name` injecting `deps` (from either extractor).
+fn class_factory_from_deps(class_name: &str, deps: FactoryDeps, target: FactoryTarget) -> R3FactoryMetadata {
     R3FactoryMetadata::Constructor(R3ConstructorFactoryMetadata {
         name: class_name.to_string(),
         ty: directive_ref(class_name),
         type_argument_count: 0,
-        deps: extract_ctor_deps(class),
+        deps,
         target,
     })
 }
@@ -2174,6 +2189,17 @@ fn compile_program_with_source(
 ) -> CompiledComponent {
     let imported_names = collect_imported_names(summary);
 
+    // The ng-analyze facts for this source (feature `ng-analyze`; `NgFacts::Off` otherwise).
+    let (ng_classes, ng_file_error) = match source {
+        Some(src) => facts_emit::bridge_facts(src, summary, resolved),
+        None => (None, None),
+    };
+    let ng = match (&ng_classes, &ng_file_error) {
+        (Some(classes), _) => NgFacts::Classes(classes),
+        (None, Some(e)) => NgFacts::FileError(e),
+        (None, None) => NgFacts::Off,
+    };
+
     // Walk every decorated class in SOURCE ORDER. R1: collect EVERY decorated class (not just the
     // first) so multi-class files emit each definition.
     let mut decorated: Vec<TopStmt> = Vec::new();
@@ -2262,6 +2288,7 @@ fn compile_program_with_source(
             jit_mode,
             &module_with_providers,
             emit_partial_component,
+            &ng,
         ) {
             Ok(emit) => {
                 errors.extend(emit.errors.clone());
@@ -2806,6 +2833,7 @@ fn compile_decorated_class(
     jit_mode: bool,
     module_with_providers: &std::collections::HashMap<String, String>,
     emit_partial_component: bool,
+    ng: &NgFacts,
 ) -> Result<ClassEmit, String> {
     let (class_name, class_name_span) = match &class.name {
         // The neutral `ClassWithDecorators::name_span` is the class NAME identifier's byte span — the
@@ -2856,6 +2884,43 @@ fn compile_decorated_class(
     let has_injectable = class_decorator(class, "Injectable").is_some();
     if has_pipe && has_injectable {
         return compile_pipe_and_injectable(class, &meta);
+    }
+
+    // The ng-analyze facts path (feature `ng-analyze`): a component or directive whose facts the bridge
+    // supplies is compiled from them, through the same emit tail. Anything else falls through to the
+    // Treaty extraction below, and each fallback is counted by reason.
+    if matches!(kind, TopLevel::Component | TopLevel::Directive) {
+        match ng {
+            NgFacts::Off => {}
+            NgFacts::FileError(reason) => {
+                facts_emit::record_fallback(&format!("ng-analyze file error: {reason}"));
+            }
+            NgFacts::Classes(list) => match facts_emit::facts_for_class(list, class.span.start as usize) {
+                None => facts_emit::record_fallback("ng-analyze: no facts for the class"),
+                Some(facts) => {
+                    let resolved = resolved_content.and_then(|m| m.get(&meta.class_name));
+                    match facts_emit::facts_directive_extract(facts, kind, object, resolved, default_selector, modernize) {
+                        Ok(extract) => {
+                            facts_emit::record_hit();
+                            return directive_emit(
+                                extract,
+                                class,
+                                kind,
+                                meta.class_name.clone(),
+                                meta.class_name_span.clone(),
+                                auto_import_candidates,
+                                sibling_directives,
+                                legacy_optional_chaining,
+                                modernize,
+                                class_decl_positions,
+                                emit_partial_component,
+                            );
+                        }
+                        Err(reason) => facts_emit::record_fallback(&format!("facts: {reason}")),
+                    }
+                }
+            },
+        }
     }
 
     let kind = AngularDecoratorKind::from(kind);
@@ -2917,30 +2982,52 @@ fn compile_pipe_and_injectable(
         errors: pipe_emit.errors,
     })
 }
-/// Compile a `@Component` or `@Directive` class. Shares the common metadata extraction (selector,
-/// inputs/outputs, queries, host bindings, `hostDirectives`, `exportAs`) and then routes to the
-/// component emitter (`compile_component_from_metadata`, with template) or the directive emitter
-/// (`compile_directive_from_metadata`, no template).
-#[allow(clippy::too_many_arguments)]
-fn compile_component_or_directive(
+/// The metadata ONE `@Component` / `@Directive` class contributes, extracted from its decorator object
+/// and class members. Two extractors produce it with this one shape: [`treaty_directive_extract`] (Treaty's
+/// own walk over the parse IR, the default) and, with the `ng-analyze` feature, the bridge's facts. The
+/// shared emit tail, [`directive_emit`], consumes either.
+struct DirectiveExtract {
+    selector: Option<String>,
+    /// The template HTML (inline `template:`, or the host-resolved `templateUrl` content). `None` for a
+    /// directive.
+    template_html: Option<String>,
+    /// Whether the template is an INLINE `template:` string (vs an external `templateUrl`).
+    inline_template_is_some: bool,
+    standalone: bool,
+    change_detection: ChangeDetectionStrategy,
+    styles: Vec<String>,
+    encapsulation: ViewEncapsulation,
+    animations: Option<Expr>,
+    foreign_imports: Option<Vec<R3ForeignComponentMetadata>>,
+    view_providers: Option<Expr>,
+    preserve_whitespaces: Option<bool>,
+    host: R3HostMetadata,
+    host_directives: Option<Vec<R3HostDirectiveMetadata>>,
+    export_as: Option<Vec<String>>,
+    providers: Option<Expr>,
+    inputs: OrderedMap<String, R3InputMetadata>,
+    outputs: OrderedMap<String, String>,
+    content_queries: Vec<R3QueryMetadata>,
+    view_queries: Vec<R3QueryMetadata>,
+    is_signal: bool,
+    uses_on_changes: bool,
+    /// `imports:` carries a `forwardRef(() => …)` (closure-wraps the component's dependencies).
+    import_has_forward_ref: bool,
+    /// The constructor dependencies the factory injects.
+    ctor_deps: FactoryDeps,
+}
+
+/// Treaty's own extraction for a `@Component` / `@Directive` (the default path). Reads the decorator
+/// object and the class members through the parse IR and the existing helpers, in the same order as
+/// always, so the first error reported is unchanged.
+fn treaty_directive_extract(
     class: &ClassWithDecorators,
     kind: TopLevel,
     obj: Option<&ObjLit>,
-    class_name: String,
-    class_name_span: ParseSourceSpan,
-    auto_import_candidates: &[String],
-    sibling_directives: &[crate::binder::SelectorDirective],
-    resolved_content: Option<&ResolvedContentMap>,
+    resolved: Option<&crate::decorators::registry::ResolvedComponentContent>,
     default_selector: Option<&str>,
-    legacy_optional_chaining: bool,
     modernize: ModernizeOptions,
-    class_decl_positions: &std::collections::HashMap<String, u32>,
-    emit_partial_component: bool,
-) -> Result<ClassEmit, String> {
-    // The host-resolved external content for THIS class (keyed by class name), if the caller wired
-    // the resolution channel and supplied an entry. Used to back `templateUrl`/`styleUrls`.
-    let resolved = resolved_content.and_then(|m| m.get(&class_name));
-
+) -> Result<DirectiveExtract, String> {
     // Reject decorator-level metadata we cannot yet model.
     if let Some(obj) = obj {
         for k in UNSUPPORTED_DECORATOR_KEYS {
@@ -2953,12 +3040,12 @@ fn compile_component_or_directive(
     // selector.
     //
     // A `@Component` that declares its own `selector` keeps it verbatim. A SELECTORLESS `@Component`
-    // (no `selector` key) adopts `default_selector` when the caller supplied one — the Treaty
-    // convention's filename-derived kebab tag — so a bootstrapped selectorless `.ts` component
-    // renders a real host element instead of Angular's `ng-component` no-selector default. The
-    // fallback applies ONLY to a component (`default_selector` is threaded as `None` for the
-    // `@Directive` path, and for the golden-corpus / inline compile entries), so a selectorless
-    // directive and the golden corpus emit byte-identically (`selector: None`).
+    // (no `selector` key) adopts `default_selector` when the caller supplied one — the Treaty convention's
+    // filename-derived kebab tag — so a bootstrapped selectorless `.ts` component renders a real host
+    // element instead of Angular's `ng-component` no-selector default. The fallback applies ONLY to a
+    // component (`default_selector` is threaded as `None` for the `@Directive` path, and for the
+    // golden-corpus / inline compile entries), so a selectorless directive and the golden corpus emit
+    // byte-identically (`selector: None`).
     let selector = obj
         .and_then(|o| find_prop(o, "selector"))
         .and_then(string_value)
@@ -2975,12 +3062,8 @@ fn compile_component_or_directive(
     //     for this class — file reading is the bundler's job (rust-core / ts-shim boundary). When a
     //     `templateUrl` is declared but no resolved template was supplied, this is a clear error (NOT
     //     a silent empty template).
-    let has_template_url = obj
-        .and_then(|o| find_prop(o, "templateUrl"))
-        .is_some();
-    let inline_template = obj
-        .and_then(|o| find_prop(o, "template"))
-        .and_then(string_value);
+    let has_template_url = obj.and_then(|o| find_prop(o, "templateUrl")).is_some();
+    let inline_template = obj.and_then(|o| find_prop(o, "template")).and_then(string_value);
     // Whether the template is an INLINE `template:` string (vs an external `templateUrl` whose
     // resolved content backs `template_html`). Used by the partial emit to decide `isInline`.
     let inline_template_is_some = inline_template.is_some();
@@ -3069,10 +3152,7 @@ fn compile_component_or_directive(
 
     // R2: host bindings — the `host: {...}` object merged with `@HostBinding`/`@HostListener`
     // members, parsed into the `R3HostMetadata` the `DefaultHostBindingsBuilder` consumes.
-    let host = match build_host_metadata(obj.and_then(|o| find_prop(o, "host")), class) {
-        Ok(host) => host,
-        Err(e) => return Err(e),
-    };
+    let host = build_host_metadata(obj.and_then(|o| find_prop(o, "host")), class)?;
 
     // R2: hostDirectives -> HostDirectivesFeature.
     let host_directives = obj
@@ -3113,9 +3193,7 @@ fn compile_component_or_directive(
     // inputs / outputs.
     let mut inputs: OrderedMap<String, R3InputMetadata> = OrderedMap::new();
     let mut outputs: OrderedMap<String, String> = OrderedMap::new();
-    if let Err(e) = collect_io(class, &mut inputs, &mut outputs, modernize) {
-        return Err(e);
-    }
+    collect_io(class, &mut inputs, &mut outputs, modernize)?;
 
     // Queries: signal-based member initializers (`viewChild`/…) AND R3 decorator members
     // (`@ViewChild`/…). Both feed the SAME `R3QueryMetadata` lists. Angular emits single-result
@@ -3143,6 +3221,123 @@ fn compile_component_or_directive(
     let is_signal =
         explicit_signals || inputs.iter().any(|(_, m)| m.is_signal) || has_signal_query;
 
+    let preserve_whitespaces = obj
+        .and_then(|o| find_prop(o, "preserveWhitespaces"))
+        .and_then(|e| match e {
+            NExpr::Boolean(b) => Some(*b),
+            _ => None,
+        });
+
+    // Closure-wrap inputs: a literal `forwardRef(() => …)` in this standalone component's
+    // `imports:` array (see `compile_component_meta` for the decision).
+    let import_has_forward_ref = imports_has_forward_ref(obj);
+
+    Ok(DirectiveExtract {
+        selector,
+        template_html,
+        inline_template_is_some,
+        standalone,
+        change_detection,
+        styles,
+        encapsulation,
+        animations,
+        foreign_imports,
+        view_providers,
+        preserve_whitespaces,
+        host,
+        host_directives,
+        export_as,
+        providers,
+        inputs,
+        outputs,
+        content_queries,
+        view_queries,
+        is_signal,
+        uses_on_changes: class_uses_on_changes(class),
+        import_has_forward_ref,
+        ctor_deps: extract_ctor_deps(class),
+    })
+}
+
+/// Compiles one `@Component` / `@Directive` class through Treaty's own extraction, then the shared emit
+/// tail. Its behaviour is the pre-refactor inline code, unchanged.
+#[allow(clippy::too_many_arguments)]
+fn compile_component_or_directive(
+    class: &ClassWithDecorators,
+    kind: TopLevel,
+    obj: Option<&ObjLit>,
+    class_name: String,
+    class_name_span: ParseSourceSpan,
+    auto_import_candidates: &[String],
+    sibling_directives: &[crate::binder::SelectorDirective],
+    resolved_content: Option<&ResolvedContentMap>,
+    default_selector: Option<&str>,
+    legacy_optional_chaining: bool,
+    modernize: ModernizeOptions,
+    class_decl_positions: &std::collections::HashMap<String, u32>,
+    emit_partial_component: bool,
+) -> Result<ClassEmit, String> {
+    // The host-resolved external content for THIS class (keyed by class name), if the caller wired
+    // the resolution channel and supplied an entry. Used to back `templateUrl`/`styleUrls`.
+    let resolved = resolved_content.and_then(|m| m.get(&class_name));
+    let extract = treaty_directive_extract(class, kind, obj, resolved, default_selector, modernize)?;
+    directive_emit(
+        extract,
+        class,
+        kind,
+        class_name,
+        class_name_span,
+        auto_import_candidates,
+        sibling_directives,
+        legacy_optional_chaining,
+        modernize,
+        class_decl_positions,
+        emit_partial_component,
+    )
+}
+
+/// The shared emit tail of a `@Component` / `@Directive`: builds the base directive metadata from an
+/// extraction and drives the component or directive emitter (full or partial).
+#[allow(clippy::too_many_arguments)]
+fn directive_emit(
+    extract: DirectiveExtract,
+    class: &ClassWithDecorators,
+    kind: TopLevel,
+    class_name: String,
+    class_name_span: ParseSourceSpan,
+    auto_import_candidates: &[String],
+    sibling_directives: &[crate::binder::SelectorDirective],
+    legacy_optional_chaining: bool,
+    modernize: ModernizeOptions,
+    class_decl_positions: &std::collections::HashMap<String, u32>,
+    emit_partial_component: bool,
+) -> Result<ClassEmit, String> {
+    let DirectiveExtract {
+        selector,
+        template_html,
+        inline_template_is_some,
+        standalone,
+        change_detection,
+        styles,
+        encapsulation,
+        animations,
+        foreign_imports,
+        view_providers,
+        preserve_whitespaces,
+        host,
+        host_directives,
+        export_as,
+        providers,
+        inputs,
+        outputs,
+        content_queries,
+        view_queries,
+        is_signal,
+        uses_on_changes,
+        import_has_forward_ref,
+        ctor_deps,
+    } = extract;
+
     // Build the base directive metadata. The class-name reference carries the original
     // class-id span so the additive source map can anchor the emitted `type: <ClassName>`
     // back to the class declaration. Stamping the span is value-preserving (it never
@@ -3157,9 +3352,7 @@ fn compile_component_or_directive(
         queries: content_queries,
         view_queries,
         host,
-        lifecycle: Lifecycle {
-            uses_on_changes: class_uses_on_changes(class),
-        },
+        lifecycle: Lifecycle { uses_on_changes },
         inputs,
         outputs,
         uses_inheritance: false,
@@ -3182,17 +3375,11 @@ fn compile_component_or_directive(
                 .filter(|d| d.name != class_name)
                 .cloned()
                 .collect();
-            let factory = class_factory(class, &class_name, FactoryTarget::Component);
+            let factory = class_factory_from_deps(&class_name, ctor_deps.clone(), FactoryTarget::Component);
             // PARTIAL mode: emit `ɵɵngDeclareComponent` from the metadata + the ORIGINAL template
             // string (no instruction lowering / decompilation). The DI-family `ɵfac` is still emitted
             // as AOT here and inverted to `ɵɵngDeclareFactory` by the caller's `emit_partial` pass.
             if emit_partial_component {
-                let preserve_whitespaces = obj
-                    .and_then(|o| find_prop(o, "preserveWhitespaces"))
-                    .and_then(|e| match e {
-                        NExpr::Boolean(b) => Some(*b),
-                        _ => None,
-                    });
                 return compile_component_meta_partial(
                     base,
                     &template_html.unwrap_or_default(),
@@ -3211,10 +3398,8 @@ fn compile_component_or_directive(
                     factory,
                 );
             }
-            // Closure-wrap inputs: a literal `forwardRef(() => …)` in this standalone component's
-            // `imports:` array, and the component's own source position (used to detect a dependency
-            // class declared LATER in the file). See `compile_component_meta` for the decision.
-            let import_has_forward_ref = imports_has_forward_ref(obj);
+            // `own_position` detects a dependency class declared LATER in the file (see
+            // `compile_component_meta`).
             let own_position = class.span.start;
             compile_component_meta(
                 base,
@@ -3245,8 +3430,10 @@ fn compile_component_or_directive(
                 animations,
                 foreign_imports,
                 view_providers,
+                import_has_forward_ref,
+                class_decl_positions,
             );
-            let factory = class_factory(class, &class_name, FactoryTarget::Directive);
+            let factory = class_factory_from_deps(&class_name, ctor_deps, FactoryTarget::Directive);
             // PARTIAL mode: emit `ɵɵngDeclareDirective` from the directive base (no template / view
             // metadata). The `ɵfac` is inverted to `ɵɵngDeclareFactory` by the caller's `emit_partial`.
             if emit_partial_component {
@@ -6369,6 +6556,8 @@ mod corpus_dump {
         let mut test_case_files = Vec::new();
         collect_test_cases(&corpus, &mut test_case_files);
 
+        #[cfg(feature = "ng-analyze")]
+        super::reset_ng_analyze_counters();
         let mut json = String::from("{\n");
         let mut first = true;
         let mut count = 0usize;
@@ -6424,5 +6613,7 @@ mod corpus_dump {
         json.push_str("\n}\n");
         std::fs::write(&dump_path, json).expect("write corpus dump");
         eprintln!("wrote {count} corpus entries to {dump_path}");
+        #[cfg(feature = "ng-analyze")]
+        eprintln!("ng-analyze facts path: {:?}", super::ng_analyze_counters());
     }
 }

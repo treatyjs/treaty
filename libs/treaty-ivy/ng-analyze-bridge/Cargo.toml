@@ -1,0 +1,18 @@
+[package]
+name = "treaty_ivy_ng_bridge"
+version = "0.1.0"
+edition = "2024"
+
+# Opt-in bridge between Treaty's source front-end and Angular's own Rust decorator analyser
+# (`ng-analyze`, packages/compiler-cli/preprocessor/ng-analyze, MIT, built on oxc 0.144).
+# The fact types come from the dependency-free `treaty_ivy_facts` crate. The analyser integration is
+# compiled only with the `analyze` feature, which is what pulls in ng-analyze. See README.md.
+[features]
+default = []
+analyze = ["dep:ng-analyze"]
+
+[dependencies]
+treaty_ivy_facts = { path = "../facts" }
+# Pinned to the same Angular commit the rest of this branch targets (tools/render3-sync/ANGULAR_REF).
+# Bump this rev together with ANGULAR_REF; see README.md.
+ng-analyze = { git = "https://github.com/angular/angular", rev = "78d2a67d922b2a2af29d50aed587bc78a99a5450", optional = true }
