@@ -52,7 +52,7 @@ pub struct ChangedFile {
 /// by diffing the vendored Angular `packages/compiler` between two refs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct DriftReport {
-    /// The old Angular git ref (e.g. a tag/sha) the port is currently 1:1 with.
+    /// The old Angular git ref (a commit SHA) the port is currently 1:1 with.
     pub old_ref: String,
     /// The new Angular git ref being compared against.
     pub new_ref: String,
@@ -60,16 +60,17 @@ pub struct DriftReport {
     pub files: Vec<ChangedFile>,
     /// The derived, deduplicated hand-port task list (pillar 1's deliverable).
     pub tasks: Vec<PortTask>,
+    /// TS files under the Angular compiler src root that are neither mapped in the symbol map nor
+    /// listed as out of scope. Any entry makes the report unclean: classify the file to proceed.
+    #[serde(default)]
+    pub unclassified_files: Vec<String>,
 }
 
 impl DriftReport {
-    /// True when no mapped symbol changed — i.e. the port is still 1:1 (the expected pillar-3
-    /// verification result against the current pinned Angular).
+    /// True when nothing drifted: no changed mapped export, no unclassified compiler file, and no
+    /// derived task. This is the expected result against the pinned Angular ref.
     pub fn is_clean(&self) -> bool {
-        self.files
-            .iter()
-            .all(|f| f.symbols.iter().all(|s| s.rust_files.is_empty() && !f.mapped))
-            || (self.files.is_empty() && self.tasks.is_empty())
+        self.files.is_empty() && self.tasks.is_empty() && self.unclassified_files.is_empty()
     }
 }
 
@@ -82,7 +83,7 @@ pub enum TaskAction {
     Codegen,
     /// Hand-ported logic drift: a human must re-port; the task pins the exact file + symbols.
     ManualPort,
-    /// An Angular export with no mapping — the map itself needs a new row.
+    /// The symbol map needs a row: an Angular export or file that no mapping covers.
     UpdateMap,
 }
 
@@ -94,14 +95,29 @@ pub struct PortTask {
     pub rust_file: String,
     /// Originating TS source file(s), relative to `tools/angular-ref/packages/compiler/src/`.
     pub ts_files: Vec<String>,
-    /// The symbols driving this task.
+    /// The symbols driving this task (empty for an unclassified whole file).
     pub symbols: Vec<String>,
     /// What to do.
     pub action: TaskAction,
-    /// Per-module port spec under `migration/render3-specs/`, if known.
+    /// Per-module port spec, if known.
     pub spec: Option<String>,
     /// Human-readable one-line summary.
     pub summary: String,
+}
+
+/// The `UpdateMap` task for a compiler file that is neither mapped nor out of scope.
+pub fn unclassified_task(ts_file: &str) -> PortTask {
+    PortTask {
+        rust_file: String::new(),
+        ts_files: vec![ts_file.to_string()],
+        symbols: Vec::new(),
+        action: TaskAction::UpdateMap,
+        spec: None,
+        summary: format!(
+            "unclassified Angular file {ts_file}: add a symbol_map::MODULE_MAP row for it, or an \
+             OUT_OF_SCOPE_FILES entry with a reason"
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -132,6 +148,7 @@ mod tests {
                 spec: Some("migration/render3-specs/14-identifiers.md".into()),
                 summary: "regenerate identifier table".into(),
             }],
+            unclassified_files: vec!["brand/new.ts".into()],
         };
 
         let json = serde_json::to_string_pretty(&report).expect("serialize");
@@ -140,7 +157,30 @@ mod tests {
     }
 
     #[test]
+    fn report_without_unclassified_field_still_parses() {
+        // Reports written before the field existed must still deserialize (serde default).
+        let json = r#"{"old_ref":"a","new_ref":"b","files":[],"tasks":[]}"#;
+        let report: DriftReport = serde_json::from_str(json).expect("deserialize old report");
+        assert!(report.unclassified_files.is_empty());
+        assert!(report.is_clean());
+    }
+
+    #[test]
     fn empty_report_is_clean() {
         assert!(DriftReport::default().is_clean());
+    }
+
+    #[test]
+    fn unclassified_file_is_not_clean() {
+        let report = DriftReport {
+            unclassified_files: vec!["brand/new.ts".into()],
+            tasks: vec![unclassified_task("brand/new.ts")],
+            ..DriftReport::default()
+        };
+        assert!(
+            !report.is_clean(),
+            "an unclassified file must not read as clean"
+        );
+        assert_eq!(report.tasks[0].action, TaskAction::UpdateMap);
     }
 }
