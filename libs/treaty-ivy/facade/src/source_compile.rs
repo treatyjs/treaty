@@ -42,7 +42,6 @@ use crate::factory::{
     MaybeForwardRef, R3ConstructorFactoryMetadata, R3DependencyMetadata, R3FactoryMetadata,
     R3InjectableMetadata,
 };
-use crate::identifiers::R3;
 use crate::output_ast::{self as o, Expr, FnParam, LiteralValue, ParseSourceSpan};
 use crate::template::template_transform::{
     html_ast_to_render3_ast, BindingParser, Render3ParseOptions,
@@ -54,8 +53,7 @@ use crate::view::compiler::{
     DefaultHostBindingsBuilder, Deps, HostValue, Lifecycle, OrderedMap, QueryPredicate,
     R3ComponentDeferMetadata, R3ComponentMetadata, R3DirectiveMetadata,
     R3ForeignComponentMetadata, R3HostDirectiveMetadata, R3HostMetadata, R3InputMetadata,
-    R3QueryMetadata, R3TemplateDependency, R3TemplateDependencyMetadata, TemplateBuilder,
-    TemplateBuilderResult, ViewEncapsulation,
+    R3QueryMetadata, R3TemplateDependencyMetadata, ViewEncapsulation,
 };
 use crate::util::R3Reference as DirRef;
 
@@ -651,20 +649,22 @@ fn decorator_string_alias(dec: &DecoratorInfo) -> Option<String> {
     }
 }
 
-/// Parse an `@Input(...)` decorator's first argument into `(alias, transform)`. ngtsc accepts two
-/// forms: a string `@Input('publicName')` (alias only), or an options object
+/// Parse an `@Input(...)` decorator's first argument into `(alias, transform, required)`. ngtsc accepts
+/// two forms: a string `@Input('publicName')` (alias only), or an options object
 /// `@Input({alias?: 'publicName', transform?: fn, required?: bool})`. Returns the public-name alias
-/// (when present) and the transform function expression (when present and convertible). A transform
-/// we cannot structurally convert (e.g. an inline arrow body) is dropped rather than mis-emitted.
-fn input_decorator_options(dec: &DecoratorInfo) -> (Option<String>, Option<Expr>) {
+/// (when present), the transform function expression (when present and convertible) and the
+/// `required` flag (`false` unless the object sets `required: true`). A transform we cannot
+/// structurally convert (e.g. an inline arrow body) is dropped rather than mis-emitted.
+fn input_decorator_options(dec: &DecoratorInfo) -> (Option<String>, Option<Expr>, bool) {
     match dec.arguments.first().map(NArg::expr) {
-        Some(NExpr::String(s)) => (Some(s.clone()), None),
+        Some(NExpr::String(s)) => (Some(s.clone()), None, false),
         Some(NExpr::Object(props)) => {
             let alias = object_props_get(props, "alias").and_then(string_value);
             let transform = object_props_get(props, "transform").and_then(convert_expr);
-            (alias, transform)
+            let required = matches!(object_props_get(props, "required"), Some(NExpr::Boolean(true)));
+            (alias, transform, required)
         }
-        _ => (None, None),
+        _ => (None, None, false),
     }
 }
 
@@ -712,15 +712,17 @@ fn collect_io(
         let mut decorated_output = false;
         let mut decorator_alias: Option<String> = None;
         let mut decorator_transform: Option<Expr> = None;
+        let mut decorator_required = false;
         for dec in &member.decorators {
             if let Some(name) = decorator_name(dec) {
                 match name {
                     "Input" => {
                         decorated_input = true;
                         // `@Input('alias')` (string) OR `@Input({alias?, transform?})` (object).
-                        let (alias, transform) = input_decorator_options(dec);
+                        let (alias, transform, required) = input_decorator_options(dec);
                         decorator_alias = alias;
                         decorator_transform = transform;
+                        decorator_required = required;
                     }
                     "Output" => {
                         decorated_output = true;
@@ -751,7 +753,7 @@ fn collect_io(
                 R3InputMetadata {
                     class_property_name: member_name.clone(),
                     binding_property_name: public_name,
-                    required: false,
+                    required: decorator_required,
                     is_signal: modernize.signal_inputs,
                     transform_function: decorator_transform,
                 },
@@ -831,15 +833,24 @@ fn signal_query_kind(name: &str) -> Option<(bool /*first*/, bool /*is_content*/)
     }
 }
 
-/// Returns the callee identifier name of a call expression `foo(...)`, if the callee is a bare
-/// identifier. (Signal queries are never `.required`, unlike `input`/`model`.)
+/// Returns the query function name of a signal-query call: `foo(...)`, or `viewChild.required(...)` /
+/// `contentChild.required(...)`. `.required` exists only on the single-result queries. It changes the
+/// query's TYPE (`Signal<T>` rather than `Signal<T | undefined>`), not its metadata: Angular's
+/// `R3QueryMetadata` has no `required` field, so the required form lowers exactly like the plain call.
 fn call_callee_name(expr: &NExpr) -> Option<&str> {
-    if let NExpr::Call { callee, .. } = expr {
-        if let NExpr::Identifier(id) = callee.as_ref() {
-            return Some(id.as_str());
-        }
+    let NExpr::Call { callee, .. } = expr else {
+        return None;
+    };
+    match callee.as_ref() {
+        NExpr::Identifier(id) => Some(id.as_str()),
+        NExpr::Member { object, property } if property.as_str() == "required" => match object.as_ref() {
+            NExpr::Identifier(base) if base == "viewChild" || base == "contentChild" => {
+                Some(base.as_str())
+            }
+            _ => None,
+        },
+        _ => None,
     }
-    None
 }
 
 /// Parse the `descendants` boolean from a query options object literal (2nd arg). Faithful to
@@ -3000,11 +3011,13 @@ fn compile_component_or_directive(
         .map(|e| matches!(e, NExpr::Boolean(b) if *b))
         .unwrap_or(true);
 
-    // changeDetection (OnPush vs Default). Angular's runtime default is `Default`, which is
-    // OMITTED from the emitted definition; an explicit `OnPush` emits `changeDetection: 0`.
-    // So when the source `@Component` has no `changeDetection` property we default to `Default`
-    // (omitted) — matching the golden — and only emit `OnPush` when the source EXPLICITLY declares
-    // it, OR the opt-in `modernize.on_push` flag (the signals-by-default design) is set.
+    // changeDetection. In Angular main `OnPush` is the default (`render3/partial/api.ts`: "Defaults
+    // to `ChangeDetectionStrategy.OnPush`"), and the runtime reads an absent field as OnPush
+    // (`definition.ts`: `onPush: changeDetection !== ChangeDetectionStrategy.Eager`). The compiler
+    // (`render3/view/compiler.ts`) omits OnPush and emits any other numeric strategy, so:
+    //   * no `changeDetection` in source, or an explicit `OnPush`  -> OnPush -> omitted;
+    //   * an explicit `Default` (or its `Eager` alias, both = 1)    -> `changeDetection: 1`.
+    // The `modernize.on_push` opt-in therefore produces the same (omitted) definition as the default.
     let change_detection = obj
         .and_then(|o| find_prop(o, "changeDetection"))
         .and_then(|e| match e {
@@ -3012,14 +3025,10 @@ fn compile_component_or_directive(
             _ => None,
         })
         .map(|name| match name {
-            "OnPush" => ChangeDetectionStrategy::OnPush,
-            _ => ChangeDetectionStrategy::Default,
+            "Default" | "Eager" => ChangeDetectionStrategy::Default,
+            _ => ChangeDetectionStrategy::OnPush,
         })
-        .unwrap_or(if modernize.on_push {
-            ChangeDetectionStrategy::OnPush
-        } else {
-            ChangeDetectionStrategy::Default
-        });
+        .unwrap_or(ChangeDetectionStrategy::OnPush);
 
     // styles: ['...', ...] — inline component styles. Threaded into the definition `styles:[...]`
     // array (and, for emulated encapsulation, scoped) by the emitter. The HOST-RESOLVED `styleUrls`/
@@ -3617,141 +3626,6 @@ fn resolve_module_with_providers_imports(
         None
     }
 }
-/// A [`TemplateBuilder`] that recognises foreign-component usages and emits a creation-time
-/// `ɵɵforeignComponent` instruction for them, delegating everything else to the classic
-/// [`RealTemplateBuilder`].
-///
-/// Angular's pipeline (`ingest.ts` `ingestElement` → `reify.ts` `OpKind.ForeignComponent`)
-/// short-circuits a matched foreign element to a single creation op:
-///   `ɵɵforeignComponent(slot, foreignComponentRef, { …props })`
-/// with NO update block (foreign components react to directly-passed signal props), so the view
-/// has `vars: 0` and no per-element attribute `consts`. The instruction args are
-/// `[literal(slot), component, props?]`; `props` is a `literalMap` of the element's static
-/// attributes (string-literal values) followed by its bound inputs (converted against `ctx`),
-/// each key quoted iff it contains `-`/`.` (Angular's `isUnsafeObjectKey`). We only take this
-/// path when the WHOLE template is exactly one such matched element (the shape Angular's
-/// `foreignImports` corpus exercises); any other template falls through to the real builder
-/// untouched, so nothing else can regress.
-#[derive(Debug, Default)]
-struct ForeignAwareTemplateBuilder {
-    inner: RealTemplateBuilder,
-}
-
-impl ForeignAwareTemplateBuilder {
-    /// If `meta`'s template is a single element matching one of the component's `foreignImports`,
-    /// build the `ɵɵforeignComponent` template-function result. Returns `None` otherwise.
-    fn try_foreign<D: R3TemplateDependency>(
-        meta: &R3ComponentMetadata<D>,
-    ) -> Option<TemplateBuilderResult> {
-        let foreign = meta.foreign_imports.as_ref()?;
-        if foreign.is_empty() {
-            return None;
-        }
-
-        // Exactly one significant template node (ignore inter-element whitespace text), and it must
-        // be a plain element whose tag matches a foreign import by name.
-        let element = sole_element(&meta.template.nodes)?;
-        let matched = foreign.iter().find(|f| f.name == element.name)?;
-
-        // Build the `{ …attrs, …inputs }` props literal map (or `None` when empty), faithfully
-        // mirroring `ingestElement`'s foreign-component branch: static attributes first (in source
-        // order) then bound inputs (in source order).
-        let mut props: Vec<(String, bool, Expr)> = Vec::new();
-        for attr in &element.attributes {
-            props.push((
-                attr.name.clone(),
-                is_unsafe_object_key(&attr.name),
-                o::literal(LiteralValue::String(attr.value.clone()), None),
-            ));
-        }
-        for input in &element.inputs {
-            let converted = crate::expression_converter::convert_property_binding(
-                &input.value,
-                o::variable("ctx", None),
-                "0",
-            );
-            props.push((
-                input.name.clone(),
-                is_unsafe_object_key(&input.name),
-                converted.expr,
-            ));
-        }
-
-        // `ɵɵforeignComponent(0, <component>, { …props })` in the creation block.
-        let mut args = vec![
-            o::literal(LiteralValue::Number(0.0), None),
-            matched.component.clone(),
-        ];
-        if !props.is_empty() {
-            args.push(o::literal_map(props, None));
-        }
-        let create_stmt = o::import_expr(R3::ForeignComponent.reference(), None)
-            .call_fn(args, false)
-            .to_stmt();
-
-        // `function <Name>_Template(rf, ctx) { if (rf & 1) { …create } }` — no update block.
-        let cond = o::variable("rf", None).bitwise_and(o::literal(LiteralValue::Number(1.0), None));
-        let body = vec![o::if_stmt(cond, vec![create_stmt], None)];
-        let template_fn = o::fn_(
-            vec![FnParam::new("rf", None), FnParam::new("ctx", None)],
-            body,
-            None,
-            Some(format!("{}_Template", meta.base.name)),
-        );
-
-        Some(TemplateBuilderResult {
-            template_fn,
-            // One data slot for the foreign component; no binding vars; no element consts.
-            decls: 1,
-            vars: 0,
-            consts: Vec::new(),
-            consts_initializers: Vec::new(),
-            content_selectors: None,
-            pool_statements: Vec::new(),
-        })
-    }
-}
-
-impl TemplateBuilder for ForeignAwareTemplateBuilder {
-    fn build<D: R3TemplateDependency>(
-        &mut self,
-        meta: &R3ComponentMetadata<D>,
-        all_deferrable_deps_fn: Option<&Expr>,
-        deferred_deps: &std::collections::HashMap<(u32, u32), Expr>,
-    ) -> TemplateBuilderResult {
-        if let Some(result) = Self::try_foreign(meta) {
-            return result;
-        }
-        self.inner.build(meta, all_deferrable_deps_fn, deferred_deps)
-    }
-}
-
-/// Angular's `isUnsafeObjectKey` (`render3/util.ts`): an object-literal key must be quoted iff it
-/// contains a `-` or `.` (otherwise it is a bare JS identifier).
-fn is_unsafe_object_key(key: &str) -> bool {
-    key.contains('-') || key.contains('.')
-}
-
-/// The sole significant element of a template node list, ignoring whitespace-only text nodes.
-/// Returns `None` if there is not exactly one element (or any non-text sibling is present).
-fn sole_element(nodes: &[crate::template::r3_ast::Node]) -> Option<&crate::template::r3_ast::Element> {
-    use crate::template::r3_ast::Node;
-    let mut found: Option<&crate::template::r3_ast::Element> = None;
-    for node in nodes {
-        match node {
-            Node::Text(t) if t.value.trim().is_empty() => {}
-            Node::Element(el) => {
-                if found.is_some() {
-                    return None;
-                }
-                found = Some(el);
-            }
-            _ => return None,
-        }
-    }
-    found
-}
-
 #[allow(clippy::too_many_arguments)]
 fn compile_component_meta(
     base: R3DirectiveMetadata,
@@ -3946,7 +3820,7 @@ fn compile_component_meta(
         imported_directive_names: imported_names.to_vec(),
     };
 
-    let mut template_builder = ForeignAwareTemplateBuilder::default();
+    let mut template_builder = RealTemplateBuilder;
     // R2: the production host-bindings generator (was `StubHostBindingsBuilder`). For a component
     // with no host bindings it is a no-op (emits no `hostBindings`/`hostAttrs`/`hostVars`), so this
     // is byte-identical to the stub for the existing no-host cases.
@@ -5322,6 +5196,25 @@ AuthService.\u{0275}prov = i0.\u{0275}\u{0275}defineInjectable({
     // -----------------------------------------------------------------------
 
     #[test]
+    fn required_signal_queries_lower_like_the_plain_call() {
+        // `viewChild.required(...)` / `contentChild.required(...)` change only the query's type; the
+        // emitted query is the same `ɵɵviewQuerySignal` / `ɵɵcontentQuerySignal` as `viewChild(...)`.
+        let src = r#"
+            import {Component, viewChild, contentChild} from '@angular/core';
+            @Component({ selector: 'req-query', template: '<div #a></div>' })
+            export class ReqQueryComponent {
+                first = viewChild.required<any>('a');
+                content = contentChild.required<any>('b');
+            }
+        "#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "errors: {:?}", out.errors);
+        let flat = normalize_ws(&out.code);
+        assert!(flat.contains("viewQuerySignal"), "required viewChild not lowered: {flat}");
+        assert!(flat.contains("contentQuerySignal"), "required contentChild not lowered: {flat}");
+    }
+
+    #[test]
     fn decorator_view_queries_emit_view_query_fn() {
         let src = r#"
             @Component({
@@ -6142,35 +6035,41 @@ export class BCmp {}
     }
 
     #[test]
-    fn modernizer_on_push_emits_change_detection_zero() {
-        // OPT-IN `on_push` modernizer (the signals-by-default → OnPush design, now opt-in): a
-        // source with NO `changeDetection` now emits `changeDetection: 0` (OnPush).
+    fn modernizer_on_push_is_the_default_and_is_omitted() {
+        // The `on_push` modernizer flag used to emit `changeDetection: 0`. OnPush is Angular main's
+        // default (`partial/api.ts`), so the compiler omits it (`render3/view/compiler.ts` emits only
+        // a non-OnPush strategy): the flag now yields the same definition as no flag at all.
         let src = r#"@Component({selector:"a",standalone:true,template:'<div>{{x}}</div>'}) export class C { x = 1; }"#;
         let on = compile_modernized(src, ModernizeOptions { on_push: true, ..Default::default() });
         assert!(on.errors.is_empty(), "errors: {:?}", on.errors);
         assert!(
-            on.code.contains("changeDetection"),
-            "on_push flag must emit changeDetection; got: {}",
+            !on.code.contains("changeDetection"),
+            "OnPush is the default and must be omitted; got: {}",
             on.code
-        );
-        let flat = normalize_ws(&on.code);
-        assert!(
-            flat.contains("changeDetection: 0"),
-            "on_push must emit OnPush (changeDetection: 0); got: {flat}"
         );
     }
 
     #[test]
-    fn explicit_on_push_emits_regardless_of_flag() {
-        // An EXPLICIT `@Component({changeDetection: ChangeDetectionStrategy.OnPush})` emits
-        // `changeDetection: 0` even with the modernizer OFF — the source's explicit choice wins.
-        let src = r#"@Component({selector:"a",standalone:true,changeDetection:ChangeDetectionStrategy.OnPush,template:'<div>{{x}}</div>'}) export class C { x = 1; }"#;
-        let out = compile_component_source(src);
+    fn explicit_on_push_is_omitted_and_explicit_default_emits_one() {
+        // `render3/view/compiler.ts`: `changeDetection` is set only when the strategy is not OnPush.
+        // An explicit OnPush is therefore omitted (runtime-equivalent to the default), while an
+        // explicit `Default` (= 1, the `Eager` alias) is emitted so the runtime keeps it non-OnPush.
+        let on_push = r#"@Component({selector:"a",standalone:true,changeDetection:ChangeDetectionStrategy.OnPush,template:'<div>{{x}}</div>'}) export class C { x = 1; }"#;
+        let out = compile_component_source(on_push);
+        assert!(out.errors.is_empty(), "errors: {:?}", out.errors);
+        assert!(
+            !out.code.contains("changeDetection"),
+            "explicit OnPush must be omitted; got: {}",
+            out.code
+        );
+
+        let default = r#"@Component({selector:"a",standalone:true,changeDetection:ChangeDetectionStrategy.Default,template:'<div>{{x}}</div>'}) export class C { x = 1; }"#;
+        let out = compile_component_source(default);
         assert!(out.errors.is_empty(), "errors: {:?}", out.errors);
         let flat = normalize_ws(&out.code);
         assert!(
-            flat.contains("changeDetection: 0"),
-            "explicit OnPush must emit changeDetection: 0 even with modernizer OFF; got: {flat}"
+            flat.contains("changeDetection: 1"),
+            "explicit Default must emit changeDetection: 1; got: {flat}"
         );
     }
 
@@ -6441,6 +6340,19 @@ mod corpus_dump {
     #[test]
     #[ignore = "corpus dump; run explicitly with TREATY_IVY_CORPUS_DUMP set"]
     fn dump_corpus() {
+        // The dump compiles the whole corpus through the recursive-descent front-end, which needs far
+        // more stack than the libtest default (2 MiB) for the deepest corpus templates. Run it on a
+        // thread with a 256 MiB stack so it needs no `RUST_MIN_STACK` environment variable.
+        std::thread::Builder::new()
+            .name("corpus-dump".to_string())
+            .stack_size(256 * 1024 * 1024)
+            .spawn(dump_corpus_on_big_stack)
+            .expect("spawn corpus dump thread")
+            .join()
+            .expect("corpus dump thread panicked");
+    }
+
+    fn dump_corpus_on_big_stack() {
         let Ok(dump_path) = std::env::var("TREATY_IVY_CORPUS_DUMP") else {
             eprintln!("TREATY_IVY_CORPUS_DUMP not set; skipping corpus dump");
             return;

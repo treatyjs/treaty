@@ -25,6 +25,8 @@ const BLOCK_PLACEHOLDER: &str = "%BLOCK%";
 const COMMA_IN_PLACEHOLDER: &str = "%COMMA_IN_PLACEHOLDER%";
 const SEMI_IN_PLACEHOLDER: &str = "%SEMI_IN_PLACEHOLDER%";
 const COLON_IN_PLACEHOLDER: &str = "%COLON_IN_PLACEHOLDER%";
+const LBRACE_IN_PLACEHOLDER: &str = "%LBRACE_IN_PLACEHOLDER%";
+const RBRACE_IN_PLACEHOLDER: &str = "%RBRACE_IN_PLACEHOLDER%";
 
 const POLYFILL_HOST: &str = "-shadowcsshost";
 const POLYFILL_HOST_CONTEXT: &str = "-shadowcsscontext";
@@ -91,13 +93,19 @@ static POLYFILL_HOST_RE: LazyLock<Regex> =
 static POLYFILL_HOST_NO_COMBINATOR_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"-shadowcsshost-no-combinator([^\s,]*)").unwrap());
 
-// `_ruleRe`: `(\s*(?:%COMMENT%\s*)*)([^;{}]+?)(\s*)((?:{%BLOCK%}?\s*;?)|(?:\s*;))`
+// `_ruleRe`: `(\s*(?:%COMMENT%\s*)*)([^;{}]+?)(\s*)((?:{%BLOCK%}?\s*;?)|(?:\s*;)|$)`
 static RULE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?s)(\s*(?:%COMMENT%\s*)*)([^;{}]+?)(\s*)((?:\{%BLOCK%\}?\s*;?)|(?:\s*;))").unwrap()
+    Regex::new(r"(?s)(\s*(?:%COMMENT%\s*)*)([^;{}]+?)(\s*)((?:\{%BLOCK%\}?\s*;?)|(?:\s*;)|$)").unwrap()
 });
 
 // nth-child / nth-of-type expression matcher (simplified one-level paren form, sufficient for
 // authored CSS): `(:nth-[-\w]+)\(([^)]*)\)`
+// `_cssVariableRe`: a CSS variable name (`--name`), optionally preceded by `var(` or `@property`
+// and optionally followed by a `:`. `[^\x00-\x7F]` admits non-ASCII name characters.
+static CSS_VARIABLE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(var\(\s*|@property\s+)?(--(?:[a-zA-Z0-9_-]|[^\x00-\x7F])+)(\s*:)?").unwrap()
+});
+
 static NTH_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(:nth-[-\w]+)\(([^)]*)\)").unwrap());
 
 // Attribute selector matcher for SafeSelector: `(\[[^\]]*\])`
@@ -108,6 +116,29 @@ static ATTR_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\[[^\]]*\])").u
 // `\2` backreference (matching close quote) which the `regex` crate does not support.
 static KEYFRAMES_PREFIX_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(@(?:-webkit-)?keyframes\s+)").unwrap());
+
+/// `namespaceCssVariables(cssText)`: rewrites every CSS variable reference or declaration to its
+/// namespaced form (`--foo: bar;` → `--%NS%foo: bar;`, `var(--foo)` → `var(--%NS%foo)`,
+/// `@property --foo` → `@property --%NS%foo`). A `--global--` prefix opts out and is removed. A
+/// variable name that is not in one of those three positions is left alone (`.a--b {}`, `"--foo"`).
+pub fn namespace_css_variables(css_text: &str) -> String {
+    CSS_VARIABLE_RE
+        .replace_all(css_text, |caps: &Captures| {
+            let prefix = caps.get(1).map(|m| m.as_str());
+            let var_name = &caps[2];
+            let trailing_colon = caps.get(3).map(|m| m.as_str());
+            if prefix.is_none() && trailing_colon.is_none() {
+                return caps[0].to_string();
+            }
+            format!(
+                "{}{}{}",
+                prefix.unwrap_or(""),
+                treaty_ivy_core::util::namespace_css_variable(var_name),
+                trailing_colon.unwrap_or("")
+            )
+        })
+        .into_owned()
+}
 
 // ---------------------------------------------------------------------------
 // Public entry.
@@ -335,7 +366,18 @@ impl ShadowCss {
             let mut selector = rule.selector.clone();
             let mut content = rule.content.clone();
             if !rule.selector.starts_with('@') {
-                selector = self.scope_selector(&selector, scope_selector, host_selector, true);
+                if rule.is_block {
+                    // `_scopeSelectors`: a nested block is scoped; its content is recursed into only
+                    // when the selector has no deep combinator (`>>>`, `/deep/`, `::ng-deep`) and the
+                    // content holds child blocks, otherwise the scoping selectors are stripped.
+                    let contains_deep = SHADOW_DEEP_SELECTORS.is_match(&rule.selector);
+                    selector = self.scope_selector(&selector, scope_selector, host_selector, true);
+                    content = if !contains_deep && rule.content.contains('{') {
+                        self.scope_selectors(&rule.content, scope_selector, host_selector)
+                    } else {
+                        strip_scoping_selectors(&rule.content)
+                    };
+                }
             } else if SCOPED_AT_RULE_IDENTIFIERS
                 .iter()
                 .any(|at| rule.selector.starts_with(at))
@@ -344,7 +386,11 @@ impl ShadowCss {
             } else if rule.selector.starts_with("@font-face") || rule.selector.starts_with("@page") {
                 content = strip_scoping_selectors(&rule.content);
             }
-            CssRule { selector, content }
+            CssRule {
+                selector,
+                content,
+                is_block: rule.is_block,
+            }
         })
     }
 
@@ -508,7 +554,7 @@ impl ShadowCss {
         attr_name: &str,
     ) -> String {
         let trimmed = p.trim();
-        if trimmed.is_empty() {
+        if trimmed.is_empty() || trimmed == "&" {
             return p.to_string();
         }
 
@@ -579,6 +625,7 @@ fn strip_scoping_selectors(css_text: &str) -> String {
         CssRule {
             selector,
             content: rule.content.clone(),
+            is_block: rule.is_block,
         }
     })
 }
@@ -613,6 +660,7 @@ fn scope_local_keyframe_declarations(
     CssRule {
         selector: format!("{start}{quote}{scope_selector}_{name}{quote}{end_spaces}"),
         content: rule.content.clone(),
+        is_block: rule.is_block,
     }
 }
 
@@ -644,7 +692,7 @@ fn scope_animation_keyframe(keyframe: &str, scope_selector: &str, unscoped: &[St
 
 fn scope_animation_rule(rule: &CssRule, scope_selector: &str, unscoped: &[String]) -> CssRule {
     // `animation: …`
-    let anim_re = Regex::new(r"((?:^|\s+|;)(?:-webkit-)?animation\s*:\s*)([^;]+)").unwrap();
+    let anim_re = Regex::new(r"((?:^|[\s;{])(?:-webkit-)?animation\s*:\s*)([^;}]+)").unwrap();
     // Capture a single keyframe token: either a quoted name (group 3) or a non-quoted CSS ident
     // (group 4), preceded by start/space/comma (group 1) and followed by a separator. The original
     // uses a `(?!['"])`-based inner repetition for the quoted body; the `regex` crate has no
@@ -689,7 +737,7 @@ fn scope_animation_rule(rule: &CssRule, scope_selector: &str, unscoped: &[String
 
     // `animation-name: …`
     let anim_name_re =
-        Regex::new(r"((?:^|\s+|;)(?:-webkit-)?animation-name\s*:\s*)([^;]+)").unwrap();
+        Regex::new(r"((?:^|[\s;{])(?:-webkit-)?animation-name\s*:\s*)([^;}]+)").unwrap();
     let content = anim_name_re
         .replace_all(&content, |caps: &Captures| {
             let start = &caps[1];
@@ -706,6 +754,7 @@ fn scope_animation_rule(rule: &CssRule, scope_selector: &str, unscoped: &[String
     CssRule {
         selector: rule.selector.clone(),
         content,
+        is_block: rule.is_block,
     }
 }
 
@@ -1031,6 +1080,9 @@ impl SafeSelector {
 pub struct CssRule {
     pub selector: String,
     pub content: String,
+    /// Whether the rule has a `{ … }` block (Angular `CssRule.isBlock`); a statement such as
+    /// `color: red;` does not, and its selector is therefore not scoped.
+    pub is_block: bool,
 }
 
 /// Iterate over CSS rules, calling `cb` with each `(selector, block-content)` pair and substituting
@@ -1049,17 +1101,20 @@ fn process_rules(input: &str, cb: &mut dyn FnMut(&CssRule) -> CssRule) -> String
 
         let mut content = String::new();
         let mut content_prefix = "";
+        let mut has_block = false;
         let block_open = format!("{{{BLOCK_PLACEHOLDER}");
         if suffix.starts_with(&block_open) {
             content = blocks.blocks.get(next_block).cloned().unwrap_or_default();
             next_block += 1;
             suffix = suffix[BLOCK_PLACEHOLDER.len() + 1..].to_string();
             content_prefix = "{";
+            has_block = true;
         }
 
         let rule = cb(&CssRule {
             selector: selector.to_string(),
             content,
+            is_block: has_block,
         });
         format!(
             "{prefix}{}{between}{content_prefix}{}{suffix}",
@@ -1151,6 +1206,8 @@ fn escape_in_strings(input: &str) -> String {
                         ';' => result.push_str(SEMI_IN_PLACEHOLDER),
                         ',' => result.push_str(COMMA_IN_PLACEHOLDER),
                         ':' => result.push_str(COLON_IN_PLACEHOLDER),
+                        '{' => result.push_str(LBRACE_IN_PLACEHOLDER),
+                        '}' => result.push_str(RBRACE_IN_PLACEHOLDER),
                         _ => result.push(c),
                     }
                 }
@@ -1171,6 +1228,8 @@ fn unescape_in_strings(input: &str) -> String {
         .replace(COMMA_IN_PLACEHOLDER, ",")
         .replace(SEMI_IN_PLACEHOLDER, ";")
         .replace(COLON_IN_PLACEHOLDER, ":")
+        .replace(LBRACE_IN_PLACEHOLDER, "{")
+        .replace(RBRACE_IN_PLACEHOLDER, "}")
 }
 
 // ---------------------------------------------------------------------------
@@ -1316,5 +1375,50 @@ mod tests {
         let out = s("@font-face {font-family: x;}");
         assert!(out.starts_with("@font-face"), "got: {out}");
         assert!(!out.contains("_ngcontent"), "got: {out}");
+    }
+
+    #[test]
+    fn namespace_css_variables_rewrites_declarations_and_references() {
+        // `namespaceCssVariables`: a declaration (`--x:`), a `var(--x)` reference and a `@property`
+        // name are namespaced; `--global--` opts out. A plain `--x` with neither is left alone.
+        let out = namespace_css_variables(
+            "--foo: red; color: var(--foo); --global--bar: 1px; @property --baz { }",
+        );
+        assert_eq!(
+            out,
+            "--%NS%foo: red; color: var(--%NS%foo); --bar: 1px; @property --%NS%baz { }"
+        );
+        assert_eq!(namespace_css_variables(".foo--bar { }"), ".foo--bar { }");
+        assert_eq!(namespace_css_variables("p { content: \"--foo\"; }"), "p { content: \"--foo\"; }");
+    }
+
+    #[test]
+    fn nested_blocks_are_scoped_and_their_content_recursed() {
+        // `_scopeSelectors` with `rule.isBlock`: a nested `.child` block inside `.parent` is scoped.
+        let out = s(".parent { .child { color: red; } }");
+        assert!(out.contains(".parent[_ngcontent-%COMP%]"), "got: {out}");
+        assert!(out.contains(".child[_ngcontent-%COMP%]"), "nested selector not scoped: {out}");
+    }
+
+    #[test]
+    fn nested_block_with_a_deep_selector_is_not_recursed() {
+        // A nested block whose selector contains `::ng-deep` is not recursed into (its content is
+        // only stripped of the scoping selectors), so the inner `.child` keeps its raw selector.
+        let out = s(".parent ::ng-deep { .child { color: red; } }");
+        assert!(out.contains(".child {"), "deep-nested child must stay unscoped: {out}");
+    }
+
+    #[test]
+    fn ampersand_part_is_not_scoped() {
+        // `_scopeSelectorPart`: a bare `&` (CSS nesting parent reference) is left untouched.
+        let out = s(".a { & .b { color: red; } }");
+        assert!(out.contains("& .b"), "the `&` must not be scoped: {out}");
+    }
+
+    #[test]
+    fn braces_inside_strings_do_not_split_rules() {
+        // `escapeInStrings` protects `{` and `}` inside quoted strings, so `content: "{"` survives.
+        let out = s(".a { content: \"{\"; }");
+        assert!(out.contains("content:\"{\""), "brace in string was altered: {out}");
     }
 }

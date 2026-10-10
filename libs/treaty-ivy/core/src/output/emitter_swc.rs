@@ -964,7 +964,7 @@ impl Printer {
 
     fn print_object_entry(&mut self, entry: &LiteralMapEntry) {
         match entry {
-            LiteralMapEntry::Property { key, value, quoted } => {
+            LiteralMapEntry::Property { key, value, quoted, .. } => {
                 let ident_key = !*quoted && is_valid_ident_name(key);
                 // SHORTHAND: `{ child }` when an unquoted identifier key equals a same-named variable
                 // value. `oxc_codegen` emits this regardless of the AST `shorthand` flag (it compares

@@ -75,6 +75,20 @@ const VERBOSE = process.argv.includes('--verbose');
 // score directly against a freshly-built treaty_ivy WITHOUT rebuilding the authoring_node
 // addon (which links treaty_runtime — pinned during runtime work). Byte-for-byte the same
 // `compile_component_source` output the addon would surface.
+import {
+  expectEmit,
+  replaceMacros,
+  stripSourceMappingAnnotations,
+  verifyUniqueFunctions,
+  verifyUniqueFactory,
+  ExpectEmitMismatch,
+  ExpectEmitInvalid,
+  UnsupportedMacro,
+} from './expect-emit.mjs';
+
+// `--fail-on-diff`: exit 1 when the FULL-golden bucket has any DIFF (the CI gate). The partial bucket
+// is reported but does not gate, until its remaining DIFFs are triaged.
+const FAIL_ON_DIFF = process.argv.includes('--fail-on-diff');
 const CARGO_DUMP_ARG = process.argv.find((a) => a.startsWith('--cargo-dump='));
 const CARGO_DUMP_PATH = CARGO_DUMP_ARG ? CARGO_DUMP_ARG.slice('--cargo-dump='.length) : null;
 
@@ -295,7 +309,7 @@ function canonicalize(code) {
   // from one `�` to the next; its body never contains a nested `�`.
   const sentinelStash = [];
   s = s.replace(/�(?:(?!�)[\s\S])*?�/g, (m) => {
-    const token = ` SENTINEL${sentinelStash.length} `;
+    const token = `\x00SENTINEL${sentinelStash.length}\x00`;
     sentinelStash.push(m);
     return token;
   });
@@ -304,7 +318,7 @@ function canonicalize(code) {
   s = s.replace(/\/\*[^]*?\*\//g, ''); // block comments incl. /*@__PURE__*/
   // Restore the protected i18n sentinel spans verbatim.
   if (sentinelStash.length) {
-    s = s.replace(/ SENTINEL(\d+) /g, (_, i) => sentinelStash[Number(i)]);
+    s = s.replace(/\x00SENTINEL(\d+)\x00/g, (_, i) => sentinelStash[Number(i)]);
   }
   // Normalise string quotes to double.
   s = s.replace(/'([^'\\]*)'/g, '"$1"');
@@ -655,6 +669,8 @@ function main() {
     passIds: [],
     diffIds: [],
     skipIds: [],
+    // Cases the full bucket skips for want of a full golden: scored by `runPartialBucket`.
+    partialCandidates: [],
   };
 
   if (!rust.ok) {
@@ -690,6 +706,7 @@ function main() {
     const golden = pickFullGolden(tc.dir, goldens);
     if (!golden) {
       bumpSkip(result, 'no-full-golden(partial/ngDeclare-only)', id);
+      result.partialCandidates.push({ tc, id, def });
       continue;
     }
     const defineKind = golden.kind; // the Ivy define kind this golden is anchored on
@@ -738,10 +755,213 @@ function main() {
   }
 
   result.skipped = Object.values(result.skipByCat).reduce((a, b) => a + b, 0);
+  result.partial = runPartialBucket(result.partialCandidates, rust);
 
   printReport(result, rust);
   if (WRITE_REPORT) writeReport(result, rust);
-  process.exit(0);
+  process.exit(FAIL_ON_DIFF && result.diff > 0 ? 1 : 0);
+}
+
+// ---------------------------------------------------------------------------
+// Partial-golden bucket. Cases with no full (`ɵɵdefine*`) golden: a template-function golden matched
+// with Angular's own `expectEmit` rules (`expect-emit.mjs`), against the same front-end emit. Kept
+// separate from the full bucket so the full numbers stay comparable.
+// ---------------------------------------------------------------------------
+
+/** Extra checks this bucket runs. The i18n checks need Angular's message serializer and are skipped. */
+const PARTIAL_EXTRA_CHECKS = new Set(['verifyUniqueFunctions', 'verifyUniqueFactory']);
+const I18N_EXTRA_CHECKS = new Set(['verifyPlaceholdersIntegrity', 'verifyUniqueConsts']);
+
+/**
+ * The expectation files of a case that Angular checks in the FULL compile and that name the full
+ * compile's output, `<input stem>.js`. Local, linked and normalized variants (other `generated` names,
+ * `compilationModeFilter`s without `full compile`) and `GOLDEN_PARTIAL.js` (the ngDeclare partial
+ * output) are not this bucket's concern.
+ */
+function partialPairsOf(def, inputFile) {
+  const wantGenerated = `${path.basename(inputFile).replace(/\.ts$/, '')}.js`;
+  const pairs = [];
+  const counts = { notFullCompile: 0, variant: 0, ngDeclare: 0, expectsErrors: 0 };
+  // Angular's `parseExpectations`: no `expectations` key, or an expectation with no `files` key, means
+  // the default files: every `.ts` input's `<stem>.js`, as expected and generated.
+  const tsInputs = (def.inputFiles || []).filter((f) => f.endsWith('.ts') && !f.endsWith('.d.ts'));
+  const defaultFiles = tsInputs.map((f) => {
+    const out = f.replace(/\.ts$/, '.js');
+    return { expected: out, generated: out };
+  });
+  const expectations =
+    def.expectations === undefined
+      ? [{ failureMessage: 'Incorrect generated output.', files: defaultFiles }]
+      : def.expectations;
+  for (const exp of expectations) {
+    const filter = exp.compilationModeFilter;
+    if (filter && !filter.includes('full compile')) {
+      counts.notFullCompile++;
+      continue;
+    }
+    // An expectation that expects compile errors has no emit to match.
+    if (exp.expectedErrors && exp.expectedErrors.length) {
+      counts.expectsErrors++;
+      continue;
+    }
+    for (const f of exp.files === undefined ? defaultFiles : exp.files) {
+      const pair = typeof f === 'string' ? { expected: f, generated: f } : f;
+      if (/GOLDEN_PARTIAL\.js$/.test(pair.expected)) {
+        counts.ngDeclare++;
+        continue;
+      }
+      if (path.basename(pair.generated) !== wantGenerated) {
+        counts.variant++;
+        continue;
+      }
+      pairs.push({
+        expected: pair.expected,
+        extraChecks: exp.extraChecks || [],
+        failureMessage: exp.failureMessage || 'Incorrect generated output',
+      });
+    }
+  }
+  return { pairs, counts };
+}
+
+/**
+ * Category of the token at which a partial golden stops matching. `after` is the golden text the
+ * match had consumed up to the miss, so the category names the instruction whose ARGUMENTS diverge
+ * (the last `ɵɵname` before the miss), which is the most useful grouping for the template owner.
+ */
+function partialCategory(piece, after) {
+  if (piece === '<chunk>') return 'unlocated-chunk';
+  if (/^\$.*\$$/.test(piece)) return 'placeholder-binding';
+  if (piece === 'static' || piece === 'class') return 'class-shape (static ɵ members / class body)';
+  if (piece.startsWith('ɵ')) return 'missing-instruction:' + (piece.length > 1 ? 'ɵɵ' + piece.slice(1).replace(/^ɵ/, '') : '?');
+  const instructions = after.match(/ɵɵ\w+/g);
+  if (instructions) return 'args-of:' + instructions[instructions.length - 1];
+  return 'token-outside-instruction';
+}
+
+/**
+ * Score one partial case. Returns { status: 'pass' | 'diff' | 'skip', cat, detail, mappingAssertions }.
+ * A case is a PASS only when every applicable golden file is fully matched, with no skipped check.
+ */
+function runPartialCase(cand, rust) {
+  const { tc, id, def } = cand;
+  const skip = (cat) => ({ status: 'skip', cat });
+  if (def.expectedErrors && def.expectedErrors.length) return skip('partial:expects-errors');
+  const inputFiles = def.inputFiles || [];
+  if (inputFiles.length !== 1) return skip('partial:multi-or-no-input-file');
+  const inputFile = inputFiles[0];
+
+  const { pairs, counts } = partialPairsOf(def, inputFile);
+  if (pairs.length === 0) {
+    if (counts.ngDeclare) return skip('partial:ngDeclare-partial-golden-only');
+    if (counts.variant) return skip('partial:variant-generated-name(local/linked/normalized)');
+    if (counts.notFullCompile) return skip('partial:compilationModeFilter-excludes-full-compile');
+    if (counts.expectsErrors) return skip('partial:expects-errors');
+    return skip('partial:no-expectation-files');
+  }
+
+  const inputPath = path.join(tc.dir, inputFile);
+  if (!fs.existsSync(inputPath)) return skip('partial:input-missing');
+  const src = fs.readFileSync(inputPath, 'utf8');
+  const inputRel = path.relative(COMPLIANCE_ROOT, inputPath).replace(/\\/g, '/');
+  let out;
+  try {
+    out = rust.compileSource(src, inputRel);
+  } catch {
+    return skip('partial:source-fe-threw');
+  }
+  if (out.errors && out.errors.length) return skip('partial:' + classifyFeError(out.errors));
+  if (!out.code) return skip('partial:no-emit');
+
+  let mappingAssertions = 0;
+  for (const pair of pairs) {
+    const expPath = path.join(tc.dir, pair.expected);
+    if (!fs.existsSync(expPath)) return skip('partial:expected-missing');
+    const raw = fs.readFileSync(expPath, 'utf8');
+    // A golden that carries a `ɵɵdefine*` block is a FULL golden. The full bucket selects its goldens
+    // from explicitly listed files only, so a default-file full golden is reported here, unscored.
+    if (definePresentKind(raw)) return skip('partial:full-define-golden(default file, not in full bucket)');
+    let expected = raw;
+    try {
+      // Angular order: macros first, then the source-map annotations, then `expectEmit`.
+      expected = replaceMacros(expected);
+    } catch (err) {
+      if (err instanceof UnsupportedMacro) return skip('partial:macro:' + err.macro);
+      throw err;
+    }
+    const stripped = stripSourceMappingAnnotations(expected);
+    expected = stripped.expected;
+    mappingAssertions += stripped.mappingAssertions;
+
+    try {
+      expectEmit(out.code, expected, `${id}: ${pair.failureMessage}`);
+    } catch (err) {
+      if (err instanceof ExpectEmitMismatch) {
+        // The message ends with the text the golden matched before the missing token (`After "…"`).
+        const after = /After "([\s\S]*)"$/.exec(err.message)?.[1] ?? '';
+        return {
+          status: 'diff',
+          cat: partialCategory(err.piece, after),
+          detail: `missing ${JSON.stringify(err.piece)} after ${JSON.stringify(after.slice(-60))}`,
+          mappingAssertions,
+        };
+      }
+      if (err instanceof ExpectEmitInvalid) return skip('partial:golden-untokenizable');
+      throw err;
+    }
+
+    for (const check of pair.extraChecks) {
+      const [name, ...args] = Array.isArray(check) ? check : [check];
+      if (I18N_EXTRA_CHECKS.has(name)) return skip('partial:extra-check:i18n');
+      if (!PARTIAL_EXTRA_CHECKS.has(name)) return skip(`partial:extra-check:${name}`);
+      const ok =
+        name === 'verifyUniqueFunctions'
+          ? verifyUniqueFunctions(out.code, ...args)
+          : verifyUniqueFactory(out.code, ...args);
+      if (!ok) return { status: 'diff', cat: `extra-check:${name}`, detail: JSON.stringify(args), mappingAssertions };
+    }
+  }
+  return { status: 'pass', mappingAssertions };
+}
+
+function bumpMap(map, key) {
+  map[key] = (map[key] || 0) + 1;
+}
+
+/** Score every partial candidate; returns the bucket summary used by the report. */
+function runPartialBucket(candidates, rust) {
+  const b = {
+    candidates: candidates.length,
+    runnable: 0,
+    pass: 0,
+    diff: 0,
+    passWithUnverifiedMappings: 0,
+    mappingAssertions: 0,
+    skipByCat: {},
+    diffByCat: {},
+    passIds: [],
+    diffIds: [],
+  };
+  for (const cand of candidates) {
+    const r = runPartialCase(cand, rust);
+    if (r.status === 'skip') {
+      bumpMap(b.skipByCat, r.cat);
+      continue;
+    }
+    b.runnable++;
+    b.mappingAssertions += r.mappingAssertions || 0;
+    if (r.status === 'pass') {
+      b.pass++;
+      if (r.mappingAssertions) b.passWithUnverifiedMappings++;
+      b.passIds.push(cand.id);
+    } else {
+      b.diff++;
+      bumpMap(b.diffByCat, r.cat);
+      b.diffIds.push({ id: cand.id, cat: r.cat, detail: r.detail });
+    }
+  }
+  b.skipped = Object.values(b.skipByCat).reduce((a, n) => a + n, 0);
+  return b;
 }
 
 /** Bucket a front-end error message into a stable skip category. */
@@ -800,6 +1020,36 @@ function printReport(r, rust) {
   for (const [cat, n] of ranked(r.skipByCat).slice(0, 20)) {
     console.log(`  ${String(n).padStart(4)}  ${cat}`);
   }
+  printPartialSummary(r.partial);
+}
+
+/** The partial-golden bucket, printed separately from the full-golden numbers above. */
+function printPartialSummary(p) {
+  if (!p) return;
+  const pct = p.runnable ? ((p.pass / p.runnable) * 100).toFixed(1) : '0.0';
+  console.log('');
+  console.log('='.repeat(70));
+  console.log('Partial-golden bucket (template-function goldens, Angular expectEmit rules)');
+  console.log('='.repeat(70));
+  console.log(`Candidates (no full golden): ${p.candidates}`);
+  console.log(`Runnable                    : ${p.runnable}`);
+  console.log(`  PASS  : ${p.pass}   (${pct}% of runnable)`);
+  console.log(`  DIFF  : ${p.diff}`);
+  console.log(`Skipped                     : ${p.skipped}`);
+  console.log(`Source-map assertions not verified (in passing cases): ${p.passWithUnverifiedMappings} case(s), ${p.mappingAssertions} assertion(s) total`);
+  console.log('DIFF by category:');
+  for (const [cat, n] of ranked(p.diffByCat).slice(0, 25)) console.log(`  ${String(n).padStart(4)}  ${cat}`);
+  console.log('Skip by reason:');
+  for (const [cat, n] of ranked(p.skipByCat).slice(0, 25)) console.log(`  ${String(n).padStart(4)}  ${cat}`);
+}
+
+/** The pinned Angular commit (`tools/render3-sync/ANGULAR_REF`), or `unknown` if it is missing. */
+function angularRefSha() {
+  try {
+    return fs.readFileSync(path.join(repoRoot, 'tools', 'render3-sync', 'ANGULAR_REF'), 'utf8').trim();
+  } catch {
+    return 'unknown';
+  }
 }
 
 function writeReport(r, rust) {
@@ -809,6 +1059,8 @@ function writeReport(r, rust) {
   lines.push('# Treaty `render3` — Angular Compliance Report');
   lines.push('');
   lines.push(`Generated by \`libs/treaty-ivy/facade/compliance/run-compliance.mjs\` on ${new Date().toISOString().slice(0, 10)}.`);
+  lines.push('');
+  lines.push(`Angular reference: \`${angularRefSha()}\` (\`tools/render3-sync/ANGULAR_REF\`), corpus \`tools/angular-ref/packages/compiler-cli/test/compliance/test_cases\`, ${r.total} cases.`);
   lines.push('');
   lines.push('This harness runs Treaty\'s Rust/OXC Angular compiler (`render3` crate, via the');
   lines.push('`authoring_node` NAPI addon\'s **source front-end**');
@@ -827,6 +1079,11 @@ function writeReport(r, rust) {
   lines.push(`| Skipped (un-runnable) | ${r.skipped} |`);
   lines.push(`| **Pass-rate (of runnable subset)** | **${runnablePass}%** (${r.pass}/${r.runnable}) |`);
   lines.push(`| Pass-rate (of full corpus) | ${totalPass}% (${r.pass}/${r.total}) |`);
+  if (r.partial) {
+    const p = r.partial;
+    const partialPct = p.runnable ? ((p.pass / p.runnable) * 100).toFixed(1) : '0.0';
+    lines.push(`| **Partial-golden bucket** (separate; no full golden) | **${partialPct}%** PASS (${p.pass}/${p.runnable} runnable, ${p.candidates} candidates, ${p.diff} DIFF, ${p.skipped} skipped) |`);
+  }
   lines.push('');
   lines.push('### How a case is run and matched');
   lines.push('');
@@ -888,6 +1145,53 @@ function writeReport(r, rust) {
   for (const id of r.passIds.slice().sort()) lines.push(`- ${id}`);
   lines.push('');
 
+  const p = r.partial;
+  if (p) {
+    lines.push('## Partial-golden bucket (template-function goldens)');
+    lines.push('');
+    lines.push('Cases with no full `ɵɵdefine*` golden: a template-function golden (for example');
+    lines.push('`r3_view_compiler_boundaries/basic.js`), matched with Angular\'s own `expectEmit` rules');
+    lines.push('(`compiler-cli/test/compliance/test_helpers/expect_emit.ts`, ported in `expect-emit.mjs`):');
+    lines.push('`…` / `// ...` skip, `$name$` identifier placeholders, `__AttributeMarker__` and');
+    lines.push('`__SelectorFlags__` / `__QueryFlags__` macros. Tokens must appear IN ORDER.');
+    lines.push('');
+    lines.push('Reported separately so the full-golden numbers above stay comparable. i18n macros and');
+    lines.push('i18n extra checks are skipped (they need Angular\'s message serializer). The `// SOURCE:`');
+    lines.push(`source-map assertions are not verified: ${p.mappingAssertions} assertion(s) in ${p.passWithUnverifiedMappings} passing case(s).`);
+    lines.push('');
+    lines.push('| Metric | Value |');
+    lines.push('| --- | --- |');
+    lines.push(`| Candidates (no full golden) | ${p.candidates} |`);
+    lines.push(`| Runnable | ${p.runnable} |`);
+    lines.push(`| PASS | ${p.pass} |`);
+    lines.push(`| DIFF | ${p.diff} |`);
+    lines.push(`| Skipped | ${p.skipped} |`);
+    lines.push('');
+    lines.push('### Partial DIFF categories');
+    lines.push('');
+    lines.push('| Count | Category (token at which the golden stops matching) |');
+    lines.push('| --- | --- |');
+    for (const [cat, n] of ranked(p.diffByCat)) lines.push(`| ${n} | \`${cat}\` |`);
+    lines.push('');
+    lines.push('### Partial skip reasons');
+    lines.push('');
+    lines.push('| Count | Reason |');
+    lines.push('| --- | --- |');
+    for (const [cat, n] of ranked(p.skipByCat)) lines.push(`| ${n} | \`${cat}\` |`);
+    lines.push('');
+    lines.push('### Partial DIFF cases');
+    lines.push('');
+    for (const d of p.diffIds.slice().sort((a, b) => a.cat.localeCompare(b.cat) || a.id.localeCompare(b.id))) {
+      lines.push(`- \`${d.cat}\` — ${d.id}`);
+      if (d.detail) lines.push(`  - ${String(d.detail).replace(/`/g, "'")}`);
+    }
+    lines.push('');
+    lines.push('### Passing partial cases');
+    lines.push('');
+    for (const id of p.passIds.slice().sort()) lines.push(`- ${id}`);
+    lines.push('');
+  }
+
   const outPath = path.join(__dirname, 'COMPLIANCE-REPORT.md');
   fs.writeFileSync(outPath, lines.join('\n'), 'utf8');
   console.log('\nWrote ' + path.relative(repoRoot, outPath));
@@ -902,6 +1206,10 @@ export {
   anchorTypeOfBlock,
   anchorSelectorOfBlock,
   selectMatchingBlock,
+  partialPairsOf,
+  partialCategory,
+  runPartialCase,
+  runPartialBucket,
 };
 
 if (!process.env.COMPLIANCE_NO_MAIN) main();

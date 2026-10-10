@@ -117,12 +117,20 @@ fn content_attr() -> String {
 // `core` enums (`../../core`), reproduced locally with their runtime discriminants.
 // ---------------------------------------------------------------------------
 
-/// `core.ViewEncapsulation` — discriminants pinned to the runtime enum.
+/// `render3/view/config.ts` `ENABLE_TEMPLATE_SOURCE_LOCATIONS`: the global default for adding source
+/// locations to template elements. Angular's `setEnableTemplateSourceLocations` /
+/// `getTemplateSourceLocationsEnabled` accessors were removed upstream, and the flag is read as
+/// `meta.enableTemplateSourceLocations || ENABLE_TEMPLATE_SOURCE_LOCATIONS`. Treaty has no
+/// `attachSourceLocations` phase, so the flag has no effect yet.
+pub const ENABLE_TEMPLATE_SOURCE_LOCATIONS: bool = false;
+
+/// `core.ViewEncapsulation` — discriminants pinned to the runtime enum (`core.ts`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewEncapsulation {
     Emulated = 0,
     None = 2,
     ShadowDom = 3,
+    ExperimentalIsolatedShadowDom = 4,
 }
 
 impl ViewEncapsulation {
@@ -131,11 +139,20 @@ impl ViewEncapsulation {
     }
 }
 
-/// `core.ChangeDetectionStrategy` — `OnPush = 0`, `Default = 1`.
+/// `core.ChangeDetectionStrategy` — `OnPush = 0`, `Default = 1`, plus the `Eager = 1` alias that
+/// `core.ts` declares (a duplicate discriminant is not legal in a Rust enum, so it is an associated
+/// const of the same type, as `render3-sync`'s enum emitter renders it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChangeDetectionStrategy {
     OnPush = 0,
     Default = 1,
+}
+
+impl ChangeDetectionStrategy {
+    /// `ChangeDetectionStrategy.Eager` (`core.ts`): an alias of `Default` (both are `1`). The name is
+    /// Angular's, so it is kept in its TypeScript spelling.
+    #[allow(non_upper_case_globals)]
+    pub const Eager: ChangeDetectionStrategy = ChangeDetectionStrategy::Default;
 }
 
 /// `core.InputFlags` — bitflags. `bitflags` is unavailable, so a `u16` newtype.
@@ -1032,11 +1049,14 @@ impl crate::expression_converter::PipeSlotAllocator for HostPureFunctions {
 }
 
 /// `class.X`/`style.X` host bindings reserve TWO host vars; every other regular binding reserves ONE
-/// (Angular `bindingCount`). Animation string host attrs and listeners are create-block ops that
-/// consume no host vars. Mirrors the per-binding accounting in [`DefaultHostBindingsBuilder::build`].
+/// (Angular `bindingCount`). Animation string host attrs, animation value bindings and listeners are
+/// create-block ops that consume no host vars. Mirrors the per-binding accounting in
+/// [`DefaultHostBindingsBuilder::build`].
 fn host_binding_var_count(prop: &str) -> usize {
     if prop.starts_with("class.") || prop.starts_with("style.") {
         2
+    } else if prop.starts_with("animate.") {
+        0
     } else {
         1
     }
@@ -1277,11 +1297,34 @@ impl HostBindingsBuilder for DefaultHostBindingsBuilder {
         let regular_bindings: usize =
             host.properties.keys().map(|p| host_binding_var_count(p)).sum();
         let pures = HostPureFunctions::new(regular_bindings);
+        // `[animate.enter]`/`[animate.leave]` value bindings: Angular's `ingestHostBinding` routes
+        // `property.isAnimation` to `BindingKind.Animation`, which `binding_specialization` turns into
+        // an `AnimationBinding` (VALUE) and `convert_animations` appends to the CREATE block as
+        // `ɵɵanimateEnter(function <Cls>_HostBindings_animateenter_cb() { <spill>; return <value>; })`.
+        // Animations reserve no host vars and are created after the listeners (same create group).
+        let mut animate_stmts: Vec<Stmt> = Vec::new();
 
         for (prop, value_src) in host.properties.iter() {
             let converted = lower_host_property_value(value_src, &pures, legacy_optional_chaining);
             let value = converted.expr;
             let spill = converted.stmts;
+
+            if prop.starts_with("animate.") {
+                // Angular `convert_animations` `getAnimationOp`: `=== 'animate.enter' ? ENTER : LEAVE`.
+                let reference = if prop == "animate.enter" {
+                    R3::AnimationEnter
+                } else {
+                    R3::AnimationLeave
+                };
+                // `naming.ts`: `${unit.fnName}_${name.replace('.', '')}_cb`, with the host unit's
+                // `fnName` being `<Cls>_HostBindings`.
+                let cb_name = format!("{name}_HostBindings_{}_cb", prop.replace('.', ""));
+                let mut body = spill;
+                body.push(Stmt::bare(StmtKind::Return(value)));
+                let callback = o::fn_(Vec::new(), body, None, Some(cb_name));
+                animate_stmts.push(host_instruction(reference, vec![callback]));
+                continue;
+            }
 
             if let Some(cls) = prop.strip_prefix("class.") {
                 host_vars += 2;
@@ -1294,10 +1337,18 @@ impl HostBindingsBuilder for DefaultHostBindingsBuilder {
             }
             if let Some(sty) = prop.strip_prefix("style.") {
                 host_vars += 2;
+                // `host_style_property_parsing.ts`: a CSS custom property (`--x`) is namespaced
+                // (`--%NS%x`), any other style name is hyphenated (`backgroundColor` →
+                // `background-color`).
+                let sty = if sty.starts_with("--") {
+                    treaty_ivy_core::util::namespace_css_variable(sty)
+                } else {
+                    hyphenate_style_prop(sty)
+                };
                 style_stmts.extend(spill);
                 style_stmts.push(host_instruction(
                     R3::StyleProp,
-                    vec![o::literal(LiteralValue::String(sty.to_string()), None), value],
+                    vec![o::literal(LiteralValue::String(sty), None), value],
                 ));
                 continue;
             }
@@ -1328,6 +1379,7 @@ impl HostBindingsBuilder for DefaultHostBindingsBuilder {
             };
             update_stmts.push(stmt);
         }
+        create_stmts.extend(animate_stmts);
         // Styling flush: all style bindings, then all class bindings (Angular's styling order).
         update_stmts.extend(style_stmts);
         update_stmts.extend(class_stmts);
@@ -1892,7 +1944,10 @@ where
             // `() => { …initializers…; return [ …consts… ]; }`.
             let mut body = tpl.consts_initializers.clone();
             body.push(Stmt::bare(StmtKind::Return(o::literal_arr(tpl.consts.clone(), None))));
-            definition_map.set("consts", Some(o::arrow_fn(Vec::new(), ArrowBody::Block(body), None)));
+            definition_map.set(
+                "consts",
+                Some(o::arrow_fn(Vec::new(), ArrowBody::Block(body), Some(o::dynamic_type()))),
+            );
         } else {
             definition_map.set("consts", Some(o::literal_arr(tpl.consts.clone(), None)));
         }
@@ -1957,10 +2012,17 @@ where
     let mut has_styles = meta.external_styles.as_ref().is_some_and(|s| !s.is_empty());
 
     if !meta.styles.is_empty() {
+        // `render3/view/compiler.ts`: `namespacedStyles = meta.styles.map(namespaceCssVariables)`, then
+        // the (possibly shimmed) namespaced styles are emitted.
+        let namespaced_styles: Vec<String> = meta
+            .styles
+            .iter()
+            .map(|s| crate::shadow_css::namespace_css_variables(s))
+            .collect();
         let style_values: Vec<String> = if meta.encapsulation == ViewEncapsulation::Emulated {
-            compile_styles(&meta.styles, &content_attr(), &host_attr())
+            compile_styles(&namespaced_styles, &content_attr(), &host_attr())
         } else {
-            meta.styles.clone()
+            namespaced_styles
         };
         let mut style_nodes: Vec<Expr> = Vec::new();
         for style in &style_values {
@@ -2003,14 +2065,14 @@ where
         );
     }
 
-    // Change detection. Angular v21 (`compiler.ts` setting-change-detection block):
-    // a numeric strategy is emitted only when it differs from `ChangeDetectionStrategy.Default`
-    // (the implicit runtime default). OnPush (= 0) is therefore emitted as `changeDetection: 0`,
-    // while Default (= 1) is omitted.
+    // Change detection (`render3/view/compiler.ts`, "Setting change detection flag"): a numeric
+    // strategy is emitted only when it is NOT `ChangeDetectionStrategy.OnPush`. The runtime treats an
+    // absent `changeDetection` as OnPush (`definition.ts`: `onPush: changeDetection !== Eager`), so
+    // OnPush is omitted and Default (= 1) is emitted as `changeDetection: 1`.
     if let Some(cd) = &meta.change_detection {
         match cd {
             ChangeDetection::Strategy(strategy) => {
-                if *strategy != ChangeDetectionStrategy::Default {
+                if *strategy != ChangeDetectionStrategy::OnPush {
                     definition_map.set(
                         "changeDetection",
                         Some(o::literal(LiteralValue::Number(*strategy as i32 as f64), None)),
@@ -2225,7 +2287,7 @@ fn create_host_directives_feature_arg(host_directives: &[R3HostDirectiveMetadata
         o::fn_(
             Vec::new(),
             vec![Stmt::bare(StmtKind::Return(o::literal_arr(expressions, None)))],
-            None,
+            Some(o::dynamic_type()),
             None,
         )
     } else {
@@ -2257,14 +2319,14 @@ fn compile_declaration_list(list: Expr, mode: DeclarationListEmitMode) -> Expr {
         DeclarationListEmitMode::Direct => list,
         // `() => [MyDir]`.
         DeclarationListEmitMode::Closure => {
-            o::arrow_fn(Vec::new(), ArrowBody::Expr(Box::new(list)), None)
+            o::arrow_fn(Vec::new(), ArrowBody::Expr(Box::new(list)), Some(o::dynamic_type()))
         }
         // `() => [MyDir].map(ng.resolveForwardRef)`.
         DeclarationListEmitMode::ClosureResolved => {
             let resolved = list
                 .prop("map")
                 .call_fn(vec![import_r3(R3::ResolveForwardRef)], false);
-            o::arrow_fn(Vec::new(), ArrowBody::Expr(Box::new(resolved)), None)
+            o::arrow_fn(Vec::new(), ArrowBody::Expr(Box::new(resolved)), Some(o::dynamic_type()))
         }
         DeclarationListEmitMode::RuntimeResolved => {
             panic!("Unsupported with an array of pre-resolved dependencies")
@@ -2631,7 +2693,7 @@ pub fn compile_defer_resolver_function(meta: &R3DeferResolverFunctionMetadata) -
     o::arrow_fn(
         Vec::new(),
         ArrowBody::Expr(Box::new(o::literal_arr(dep_expressions, None))),
-        None,
+        Some(o::dynamic_type()),
     )
 }
 
@@ -2641,7 +2703,7 @@ fn dynamic_import_then(import_path: String, prop: &str) -> Expr {
     let inner_fn = o::arrow_fn(
         vec![FnParam::new("m", Some(o::dynamic_type()))],
         ArrowBody::Expr(Box::new(o::variable("m", None).prop(prop))),
-        None,
+        Some(o::dynamic_type()),
     );
     let dynamic_import = Expr::bare(ExprKind::DynamicImport {
         url: o::ImportUrl::Str(import_path),
@@ -2812,29 +2874,29 @@ mod tests {
     }
 
     #[test]
-    fn onpush_emits_change_detection_zero_default_is_omitted() {
-        // Angular v21 emits the numeric strategy only when it differs from
-        // ChangeDetectionStrategy.Default. OnPush (= 0) → `changeDetection: 0`.
-        let mut meta = component_meta("C", "c");
-        meta.change_detection = Some(ChangeDetection::Strategy(ChangeDetectionStrategy::OnPush));
+    fn onpush_is_omitted_and_default_emits_change_detection_one() {
+        // `render3/view/compiler.ts`: `typeof changeDetection === 'number' && !== OnPush` → set it.
+        // OnPush (= 0) is the runtime default when the field is absent, so it is omitted.
         let mut tb = StubTemplateBuilder;
         let mut hb = StubHostBindingsBuilder;
         let mut pool = Vec::new();
-        let compiled = compile_component_from_metadata(&mut meta, &mut tb, &mut hb, &mut pool);
-        let js = emit_expression(&compiled.expression);
-        assert!(js.contains("changeDetection"), "OnPush should emit changeDetection: {js}");
-        assert!(
-            js.contains("changeDetection: 0") || js.contains("changeDetection:0"),
-            "OnPush should emit changeDetection: 0: {js}"
-        );
 
-        // Default (1) is the implicit runtime default → omitted.
         let mut meta = component_meta("C", "c");
-        meta.change_detection = Some(ChangeDetection::Strategy(ChangeDetectionStrategy::Default));
+        meta.change_detection = Some(ChangeDetection::Strategy(ChangeDetectionStrategy::OnPush));
         let compiled = compile_component_from_metadata(&mut meta, &mut tb, &mut hb, &mut pool);
         assert!(
             !emit_expression(&compiled.expression).contains("changeDetection"),
-            "Default should omit changeDetection"
+            "OnPush should omit changeDetection"
+        );
+
+        // Default (1) is emitted: the runtime treats `changeDetection !== Eager` as OnPush.
+        let mut meta = component_meta("C", "c");
+        meta.change_detection = Some(ChangeDetection::Strategy(ChangeDetectionStrategy::Default));
+        let compiled = compile_component_from_metadata(&mut meta, &mut tb, &mut hb, &mut pool);
+        let js = emit_expression(&compiled.expression);
+        assert!(
+            js.contains("changeDetection: 1") || js.contains("changeDetection:1"),
+            "Default should emit changeDetection: 1: {js}"
         );
     }
 
@@ -3419,5 +3481,85 @@ mod tests {
             "missing sanitized handler name: {js}"
         );
         assert!(!js.contains("ɵɵlistener("), "must not use ɵɵlistener: {js}");
+    }
+
+    #[test]
+    fn host_animate_enter_value_binding_emits_create_block_callback() {
+        // `host: { '[animate.enter]': "disabled ? undefined : 'enter-class'" }` → CREATE-block
+        // `ɵɵanimateEnter(function TestCmp_HostBindings_animateenter_cb() { return ctx.disabled ?
+        // undefined : "enter-class"; })` (mirrors r3_compiler_compliance/components_and_directives/
+        // host_animate_enter). It is NOT a `ɵɵdomProperty` update, and reserves no host var.
+        let mut meta = directive_meta("TestCmp", "test-cmp");
+        meta.host.properties.insert(
+            "animate.enter".to_string(),
+            "disabled ? undefined : 'enter-class'".to_string(),
+        );
+        let mut hb = DefaultHostBindingsBuilder;
+        let compiled = compile_directive_from_metadata(&meta, &mut hb);
+        let js = emit_expression(&compiled.expression);
+        assert!(
+            js.contains("ɵɵanimateEnter(function TestCmp_HostBindings_animateenter_cb() {"),
+            "missing ɵɵanimateEnter callback: {js}"
+        );
+        assert!(
+            js.contains("return ctx.disabled ? undefined : \"enter-class\";")
+                || js.contains("return ctx.disabled ? undefined : 'enter-class';"),
+            "callback must return the lowered expression: {js}"
+        );
+        assert!(!js.contains("ɵɵdomProperty"), "animate must not be a domProperty: {js}");
+        assert!(!js.contains("hostVars"), "animate value must reserve no host vars: {js}");
+        assert!(!js.contains("animate.enter\""), "raw key must not appear as a property name: {js}");
+    }
+
+    #[test]
+    fn host_animate_leave_value_binding_emits_animate_leave_callback() {
+        // `host: { '[animate.leave]': 'fade' }` → `ɵɵanimateLeave(function ..._animateleave_cb() {
+        // return ctx.fade; })` in the create block.
+        let mut meta = directive_meta("ChildComponent", "child-component");
+        meta.host
+            .properties
+            .insert("animate.leave".to_string(), "fade".to_string());
+        let mut hb = DefaultHostBindingsBuilder;
+        let compiled = compile_directive_from_metadata(&meta, &mut hb);
+        let js = emit_expression(&compiled.expression);
+        assert!(
+            js.contains("ɵɵanimateLeave(function ChildComponent_HostBindings_animateleave_cb() {"),
+            "missing ɵɵanimateLeave callback: {js}"
+        );
+        assert!(js.contains("return ctx.fade;"), "callback must return ctx.fade: {js}");
+        assert!(!js.contains("ɵɵdomProperty"), "animate must not be a domProperty: {js}");
+    }
+
+    #[test]
+    fn host_style_property_names_are_hyphenated_and_custom_properties_namespaced() {
+        // `host_style_property_parsing.ts`: `style.backgroundColor` → `background-color`; a CSS custom
+        // property `style.--my-color` → `--%NS%my-color` (`namespaceCssVariable`).
+        let mut meta = directive_meta("TestCmp", "test-cmp");
+        meta.host
+            .properties
+            .insert("style.backgroundColor".to_string(), "'red'".to_string());
+        meta.host
+            .properties
+            .insert("style.--my-color".to_string(), "'blue'".to_string());
+        let mut hb = DefaultHostBindingsBuilder;
+        let compiled = compile_directive_from_metadata(&meta, &mut hb);
+        let js = emit_expression(&compiled.expression);
+        assert!(js.contains("ɵɵstyleProp(\"background-color\""), "not hyphenated: {js}");
+        assert!(js.contains("(\"--%NS%my-color\", \"blue\")"), "custom property not namespaced: {js}");
+    }
+
+    #[test]
+    fn component_styles_namespace_css_variables() {
+        // `render3/view/compiler.ts`: `namespacedStyles = meta.styles.map(namespaceCssVariables)`.
+        let mut meta = component_meta("C", "c");
+        meta.styles = vec![":host { --bg: red; color: var(--bg); }".to_string()];
+        meta.encapsulation = ViewEncapsulation::None;
+        let mut tb = StubTemplateBuilder;
+        let mut hb = StubHostBindingsBuilder;
+        let mut pool = Vec::new();
+        let compiled = compile_component_from_metadata(&mut meta, &mut tb, &mut hb, &mut pool);
+        let js = emit_expression(&compiled.expression);
+        assert!(js.contains("--%NS%bg"), "style variables not namespaced: {js}");
+        assert!(!js.contains("--bg:"), "raw variable must not survive: {js}");
     }
 }

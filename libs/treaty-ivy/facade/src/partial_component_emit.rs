@@ -391,6 +391,7 @@ fn encapsulation_field(encapsulation: ViewEncapsulation) -> Option<(String, bool
         ViewEncapsulation::Emulated => return None,
         ViewEncapsulation::None => "None",
         ViewEncapsulation::ShadowDom => "ShadowDom",
+        ViewEncapsulation::ExperimentalIsolatedShadowDom => "ExperimentalIsolatedShadowDom",
     };
     Some(field(
         "encapsulation",

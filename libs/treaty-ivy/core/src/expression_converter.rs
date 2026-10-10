@@ -969,6 +969,7 @@ impl<R: LocalResolver> Converter<'_, R> {
                                 key: key.clone(),
                                 value,
                                 quoted: *quoted,
+                                leading_comments: Vec::new(),
                             },
                             LiteralMapKey::Spread { .. } => {
                                 o::LiteralMapEntry::Spread { expression: value }
@@ -1354,9 +1355,19 @@ impl<R: LocalResolver> Converter<'_, R> {
                         });
                     }
                 }
-                o::LiteralMapEntry::Property { key, value, quoted } => {
+                o::LiteralMapEntry::Property {
+                    key,
+                    value,
+                    quoted,
+                    leading_comments,
+                } => {
                     if value.is_constant() {
-                        derived.push(o::LiteralMapEntry::Property { key, value, quoted });
+                        derived.push(o::LiteralMapEntry::Property {
+                            key,
+                            value,
+                            quoted,
+                            leading_comments,
+                        });
                     } else {
                         let idx = args.len();
                         let param = pure_param(idx);
@@ -1365,6 +1376,7 @@ impl<R: LocalResolver> Converter<'_, R> {
                             key,
                             value: param,
                             quoted,
+                            leading_comments,
                         });
                     }
                 }

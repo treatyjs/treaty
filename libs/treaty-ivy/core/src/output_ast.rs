@@ -377,11 +377,14 @@ impl TemplateLiteralElement {
 /// `LiteralMapEntry` union: `LiteralMapPropertyAssignment` | `LiteralMapSpreadAssignment`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LiteralMapEntry {
-    /// `LiteralMapPropertyAssignment { key, value, quoted }`.
+    /// `LiteralMapPropertyAssignment { key, value, quoted, leadingComments }`.
     Property {
         key: String,
         value: Expr,
         quoted: bool,
+        /// `leadingComments`: comments printed before this entry (e.g. the `@ts-ignore` that guards a
+        /// `ctorParameters` `type` in `r3_class_metadata_compiler.ts`). Empty when there are none.
+        leading_comments: Vec<LeadingComment>,
     },
     /// `LiteralMapSpreadAssignment { expression }`.
     Spread { expression: Expr },
@@ -1331,7 +1334,12 @@ pub fn spread(expr: Expr) -> Expr {
 pub fn literal_map(values: Vec<(String, bool, Expr)>, value_type: Option<Type>) -> Expr {
     let entries = values
         .into_iter()
-        .map(|(key, quoted, value)| LiteralMapEntry::Property { key, value, quoted })
+        .map(|(key, quoted, value)| LiteralMapEntry::Property {
+            key,
+            value,
+            quoted,
+            leading_comments: Vec::new(),
+        })
         .collect();
     Expr::bare(ExprKind::LiteralMap {
         entries,

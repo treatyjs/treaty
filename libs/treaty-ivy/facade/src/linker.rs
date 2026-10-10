@@ -208,6 +208,7 @@ fn convert_expr(expr: &NExpr) -> Option<Expr> {
                             key: key.clone(),
                             value: convert_expr(value)?,
                             quoted: *quoted,
+                            leading_comments: Vec::new(),
                         });
                     }
                     // `{...defaults}` — an object spread carries its argument through as `...expr`.
@@ -1547,7 +1548,8 @@ fn read_change_detection(obj: Props, major: u32, placeholder: bool) -> ChangeDet
         };
         let strategy = match name {
             Some("OnPush") => ChangeDetectionStrategy::OnPush,
-            // `Default` and its alias `Eager` are the omitted runtime default.
+            // `Default` and its alias `Eager` (both = 1) are not OnPush, so the AOT definition keeps
+            // `changeDetection: 1` (`render3/view/compiler.ts` omits only OnPush).
             _ => ChangeDetectionStrategy::Default,
         };
         return ChangeDetection::Strategy(strategy);
@@ -2269,8 +2271,8 @@ mod tests {
             "got: {}",
             out.code
         );
-        // Eager == Default == omitted change detection.
-        assert!(!out.code.contains("changeDetection"), "got: {}", out.code);
+        // Eager == Default (= 1) is not OnPush, so the AOT definition keeps `changeDetection: 1`.
+        assert!(out.code.contains("changeDetection: 1"), "got: {}", out.code);
         assert_no_declare(&out.code);
         assert_reparses(&out.code);
     }

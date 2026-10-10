@@ -1000,6 +1000,22 @@ mod tests {
             "inputs map field shape diverges from the real ng-packagr golden; got:\n{}",
             esm
         );
+        // A decorator `@Input({required: true})` carries `isRequired: true` into the partial
+        // declaration (`R3InputMetadata.required`); a bare `@Input()` stays `false`.
+        let src = "import { Directive, Input } from '@angular/core';\n\
+                   @Directive({})\n\
+                   export class TestDir { @Input({required: true}) name: string; @Input() other: string; }";
+        let esm_required = partial_pipeline(src).code.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            esm_required.contains("name: { classPropertyName: \"name\", publicName: \"name\", isSignal: false, isRequired: true"),
+            "@Input({{required: true}}) must set isRequired; got:\n{}",
+            esm_required
+        );
+        assert!(
+            esm_required.contains("other: { classPropertyName: \"other\", publicName: \"other\", isSignal: false, isRequired: false"),
+            "a bare @Input must keep isRequired false; got:\n{}",
+            esm_required
+        );
         // The `model()` two-way output (`<name>Change`) shape, exactly as Angular emits it.
         assert!(
             esm.contains("outputs: { counter: \"counterChange\", name: \"nameChange\" }"),

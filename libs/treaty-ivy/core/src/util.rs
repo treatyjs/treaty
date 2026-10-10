@@ -121,6 +121,40 @@ pub fn match_let_pattern(expression: &str) -> Option<&str> {
     Some(trimmed)
 }
 
+/// `util.ts` `namespaceCssVariable(varName)`: namespaces a CSS variable name. `--global--x` opts out
+/// of namespacing (`--x`); any other `--x` becomes `--%NS%x`, which the component's style scoping
+/// later replaces with the component's namespace. The single-hyphen `--global-` error is commented
+/// out upstream (`g3-only`), so it is not raised here either.
+pub fn namespace_css_variable(var_name: &str) -> String {
+    match var_name.strip_prefix("--global--") {
+        Some(rest) => format!("--{rest}"),
+        None => format!("--%NS%{}", &var_name["--".len()..]),
+    }
+}
+
+#[cfg(test)]
+mod namespace_css_variable_tests {
+    use super::namespace_css_variable;
+
+    #[test]
+    fn namespaces_a_plain_variable() {
+        assert_eq!(namespace_css_variable("--foo"), "--%NS%foo");
+        assert_eq!(namespace_css_variable("--my-color"), "--%NS%my-color");
+    }
+
+    #[test]
+    fn global_double_hyphen_opts_out_of_namespacing() {
+        assert_eq!(namespace_css_variable("--global--mycolor"), "--mycolor");
+    }
+
+    #[test]
+    fn single_hyphen_global_is_namespaced_as_a_plain_variable() {
+        // The `--global-` single-hyphen form throws upstream only in the g3-internal build, so the
+        // public behaviour is to namespace it like any other variable.
+        assert_eq!(namespace_css_variable("--global-x"), "--%NS%global-x");
+    }
+}
+
 #[cfg(test)]
 mod let_and_identifier_tests {
     use super::*;

@@ -542,10 +542,20 @@ impl VerifyReport {
 ///
 /// Rows marked `pending` are never blocking while they drift; see [`VerifyStatus::Pending`].
 pub fn verify_codegen(reader: &dyn SourceReader) -> io::Result<VerifyReport> {
+    verify_codegen_with(reader, MODULE_MAP)
+}
+
+/// [`verify_codegen`] over an explicit module map. The live `MODULE_MAP` is the production input; the
+/// tests of the `pending` mechanism pass their own rows so they do not depend on which live rows are
+/// currently pending.
+pub fn verify_codegen_with(
+    reader: &dyn SourceReader,
+    module_map: &[symbol_map::ModuleMapping],
+) -> io::Result<VerifyReport> {
     require_reference_root(reader)?;
     let mut entries = Vec::new();
 
-    for m in MODULE_MAP {
+    for m in module_map {
         if m.kind != PortKind::Mechanical {
             continue;
         }
@@ -944,6 +954,34 @@ fn extract_item(source: &str, header: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::symbol_map::{ModuleMapping, PortKind as Kind};
+
+    /// Two pending `core.ts` enum rows, as the live map carried them before the decorators port
+    /// landed. The `pending` tests exercise the pending mechanism itself, so they run over these
+    /// rows rather than over whichever live rows happen to be pending.
+    const PENDING_ENUM_ROWS: &[ModuleMapping] = &[
+        ModuleMapping {
+            ts_file: "core.ts",
+            rust_file: "decorators/src/compiler.rs",
+            kind: Kind::Mechanical,
+            spec: None,
+            anchor_symbols: &["ViewEncapsulation"],
+            pending: Some(
+                "fixture: decorators/src/compiler.rs ViewEncapsulation lacks the ExperimentalIsolatedShadowDom = 4 member",
+            ),
+        },
+        ModuleMapping {
+            ts_file: "core.ts",
+            rust_file: "decorators/src/compiler.rs",
+            kind: Kind::Mechanical,
+            spec: None,
+            anchor_symbols: &["ChangeDetectionStrategy"],
+            pending: Some(
+                "fixture: decorators/src/compiler.rs ChangeDetectionStrategy lacks the Eager = 1 alias",
+            ),
+        },
+    ];
+
 
     /// An in-memory [`SourceReader`] for deterministic tests.
     #[derive(Default)]
@@ -1300,7 +1338,7 @@ mod tests {
                 "decorators/src/compiler.rs",
                 "pub enum ViewEncapsulation {\n    Emulated = 0,\n    None = 2,\n    ShadowDom = 3,\n}\n",
             );
-        let report = verify_codegen(&reader).unwrap();
+        let report = verify_codegen_with(&reader, PENDING_ENUM_ROWS).unwrap();
         let entry = report
             .entries
             .iter()
@@ -1339,7 +1377,7 @@ mod tests {
                 "decorators/src/compiler.rs",
                 "pub enum ViewEncapsulation {\n    Emulated = 0,\n    None = 2,\n    ShadowDom = 3,\n    ExperimentalIsolatedShadowDom = 4,\n}\n",
             );
-        let report = verify_codegen(&reader).unwrap();
+        let report = verify_codegen_with(&reader, PENDING_ENUM_ROWS).unwrap();
         let stale = report
             .entries
             .iter()
@@ -1361,7 +1399,7 @@ mod tests {
             "decorators/src/compiler.rs",
             "pub enum ChangeDetectionStrategy {\n    OnPush = 0,\n    Default = 1,\n}\n",
         );
-        let report = verify_codegen(&reader).unwrap();
+        let report = verify_codegen_with(&reader, PENDING_ENUM_ROWS).unwrap();
         let detail = report
             .entries
             .iter()

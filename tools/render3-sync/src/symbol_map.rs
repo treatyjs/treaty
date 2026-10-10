@@ -565,11 +565,7 @@ pub const MODULE_MAP: &[ModuleMapping] = &[
         kind: PortKind::Mechanical,
         spec: None,
         anchor_symbols: &["ViewEncapsulation"],
-        pending: Some(
-            "PRE-EXISTING gap, not caused by 78d2a67 (core.ts is identical at the old and new ref): \
-             decorators/src/compiler.rs ViewEncapsulation lacks the ExperimentalIsolatedShadowDom = 4 \
-             member that core.ts declares. Owner: the decorators port. Remove this marker when it lands.",
-        ),
+        pending: None,
     },
     ModuleMapping {
         ts_file: "core.ts",
@@ -577,11 +573,7 @@ pub const MODULE_MAP: &[ModuleMapping] = &[
         kind: PortKind::Mechanical,
         spec: None,
         anchor_symbols: &["ChangeDetectionStrategy"],
-        pending: Some(
-            "PRE-EXISTING gap, not caused by 78d2a67 (core.ts is identical at the old and new ref): \
-             decorators/src/compiler.rs ChangeDetectionStrategy lacks the Eager = 1 alias that core.ts \
-             declares. Owner: the decorators port. Remove this marker when it lands.",
-        ),
+        pending: None,
     },
     ModuleMapping {
         ts_file: "core.ts",
@@ -1063,7 +1055,7 @@ pub const MODULE_MAP: &[ModuleMapping] = &[
         kind: PortKind::Logic,
         spec: None,
         anchor_symbols: &[],
-        pending: Some("planned new file template/src/template/boundary.rs; not created yet"),
+        pending: None,
     },
     ModuleMapping {
         ts_file: "render3/r3_content_blocks.ts",
@@ -1071,7 +1063,7 @@ pub const MODULE_MAP: &[ModuleMapping] = &[
         kind: PortKind::Logic,
         spec: None,
         anchor_symbols: &[],
-        pending: Some("planned new file template/src/template/boundary.rs; not created yet"),
+        pending: None,
     },
     ModuleMapping {
         ts_file: "ml_parser/html_whitespaces.ts",

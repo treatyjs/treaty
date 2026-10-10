@@ -1123,7 +1123,7 @@ impl<'a> Lowerer<'a> {
 
     fn lower_map_entry(&self, entry: &LiteralMapEntry) -> ObjectPropertyKind<'a> {
         match entry {
-            LiteralMapEntry::Property { key, value, quoted } => {
+            LiteralMapEntry::Property { key, value, quoted, .. } => {
                 // A `quoted` key emits as a string-literal property name (`{"foo": …}`); otherwise
                 // an identifier name (`{foo: …}`). Angular's emitter (`AbstractJsEmitterVisitor`'s
                 // `visitLiteralMapExpr`) keys on the entry's `quoted` flag — i18n `goog.getMsg`

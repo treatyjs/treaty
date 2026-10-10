@@ -52,7 +52,7 @@ pub use crate::view::compiler::R3DeferPerComponentDependency;
 pub fn refs_to_array(refs: &[R3Reference], should_forward_declare: bool) -> Expr {
     let values = literal_arr(refs.iter().map(|r| r.value.clone()).collect(), None);
     if should_forward_declare {
-        arrow_fn(vec![], ArrowBody::Expr(Box::new(values)), None)
+        arrow_fn(vec![], ArrowBody::Expr(Box::new(values)), Some(dynamic_type()))
     } else {
         values
     }
@@ -530,11 +530,14 @@ fn generate_set_ng_module_scope_call(meta: &R3NgModuleMetadata) -> Option<Stmt> 
     // (ngJitMode guard) && ɵɵsetNgModuleScope(...)
     let guarded_call = jit_only_guarded_expression(fn_call);
     // function() { (guard) && setNgModuleScope(...); }
-    let iife = Expr::bare(ExprKind::Function {
-        params: vec![],
-        statements: vec![guarded_call.to_stmt()],
-        name: None,
-    });
+    let iife = Expr::with_type(
+        ExprKind::Function {
+            params: vec![],
+            statements: vec![guarded_call.to_stmt()],
+            name: None,
+        },
+        Some(dynamic_type()),
+    );
     // (function() { ... })()
     let iife_call = iife.call_fn(vec![], false);
     Some(iife_call.to_stmt())
@@ -614,13 +617,90 @@ pub fn create_injector_type(meta: &R3InjectorMetadata) -> Type {
 // Class metadata — r3_class_metadata_compiler.ts
 // ===========================================================================
 
+/// `r3_class_metadata_compiler.ts` `R3ClassMetadataCtorParameter`: one constructor parameter captured
+/// in the `ctorParameters` callback of `setClassMetadata`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct R3ClassMetadataCtorParameter {
+    /// A value-position reference to the parameter's type, or `None` when it cannot be referenced at
+    /// runtime (emitted as `undefined`).
+    pub r#type: Option<Expr>,
+    /// The Angular decorators applied to the parameter, or `None` (the `decorators` key is omitted).
+    pub decorators: Option<Expr>,
+    /// Whether to guard `type` with a `@ts-ignore` (see the upstream docs: only pass `false` when the
+    /// reference is known to resolve to a value).
+    pub suppress_type_errors: bool,
+}
+
+/// `R3ClassMetadata.ctorParameters` (`o.Expression | R3ClassMetadataCtorParameter[] | null`): an
+/// already-built callback is passed through; a structured list lets the compiler build it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum R3ClassMetadataCtorParameters {
+    Expr(Expr),
+    Parameters(Vec<R3ClassMetadataCtorParameter>),
+}
+
 /// `r3_class_metadata_compiler.ts` `R3ClassMetadata`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct R3ClassMetadata {
     pub r#type: Expr,
     pub decorators: Expr,
-    pub ctor_parameters: Option<Expr>,
+    pub ctor_parameters: Option<R3ClassMetadataCtorParameters>,
     pub prop_decorators: Option<Expr>,
+}
+
+/// `compileCtorParameters(ctorParameters, allowSuppressions)`: the `ctorParameters` callback passed to
+/// `setClassMetadata`. `None` → `null`; an expression passes through untouched; a structured list
+/// becomes `() => [{ type: …, decorators: … }, …]`. A guarded `type` gets its `@ts-ignore` on the
+/// `type` property assignment itself (so a formatter splitting the literal keeps the comment there).
+pub fn compile_ctor_parameters(
+    ctor_parameters: Option<&R3ClassMetadataCtorParameters>,
+    allow_suppressions: bool,
+) -> Expr {
+    let params = match ctor_parameters {
+        None => return literal(LiteralValue::Null, None),
+        Some(R3ClassMetadataCtorParameters::Expr(expr)) => return expr.clone(),
+        Some(R3ClassMetadataCtorParameters::Parameters(params)) => params,
+    };
+
+    let entries = params
+        .iter()
+        .map(|param| {
+            let guarded = allow_suppressions && param.r#type.is_some() && param.suppress_type_errors;
+            let mut type_comments = Vec::new();
+            if guarded {
+                type_comments.push(ts_ignore_comment());
+            }
+            // `undefined` is always valid in a value position, so it never needs suppressing.
+            let type_value = param
+                .r#type
+                .clone()
+                .unwrap_or_else(|| literal(LiteralValue::Undefined, None));
+            let mut entries = vec![LiteralMapEntry::Property {
+                key: "type".to_string(),
+                value: type_value,
+                quoted: false,
+                leading_comments: type_comments,
+            }];
+            if let Some(decorators) = &param.decorators {
+                entries.push(LiteralMapEntry::Property {
+                    key: "decorators".to_string(),
+                    value: decorators.clone(),
+                    quoted: false,
+                    leading_comments: Vec::new(),
+                });
+            }
+            Expr::bare(ExprKind::LiteralMap {
+                entries,
+                value_type: None,
+            })
+        })
+        .collect();
+
+    arrow_fn(
+        vec![],
+        ArrowBody::Expr(Box::new(literal_arr(entries, None))),
+        Some(dynamic_type()),
+    )
 }
 
 /// `compileClassMetadata(metadata)` → `(() => { ngDevMode && ɵsetClassMetadata(...); })()`.
@@ -629,7 +709,7 @@ pub fn compile_class_metadata(metadata: &R3ClassMetadata) -> Expr {
     arrow_fn(
         vec![],
         ArrowBody::Block(vec![dev_only_guarded_expression(fn_call).to_stmt()]),
-        None,
+        Some(dynamic_type()),
     )
     .call_fn(vec![], false)
 }
@@ -637,10 +717,7 @@ pub fn compile_class_metadata(metadata: &R3ClassMetadata) -> Expr {
 /// `internalCompileClassMetadata(metadata)` — the bare `ɵsetClassMetadata(type, decorators,
 /// ctorParameters ?? null, propDecorators ?? null)` call (no dev-mode wrapper).
 fn internal_compile_class_metadata(metadata: &R3ClassMetadata) -> Expr {
-    let ctor_parameters = metadata
-        .ctor_parameters
-        .clone()
-        .unwrap_or_else(|| literal(LiteralValue::Null, None));
+    let ctor_parameters = compile_ctor_parameters(metadata.ctor_parameters.as_ref(), true);
     let prop_decorators = metadata
         .prop_decorators
         .clone()
@@ -666,17 +743,36 @@ pub fn compile_component_class_metadata(
         None => compile_class_metadata(metadata),
         Some(deps) if deps.is_empty() => compile_class_metadata(metadata),
         Some(deps) => {
-            let wrapper_params = deps
+            // Angular `r3_class_metadata_compiler.ts`: the dependencies are first de-duplicated by
+            // `symbolName` through a `Map` (the first key position is kept, the last value wins), and
+            // both the wrapper params and the resolver use that de-duplicated list.
+            let deduped = dedupe_defer_dependencies(deps);
+            let wrapper_params = deduped
                 .iter()
                 .map(|dep| FnParam::new(dep.symbol_name.clone(), Some(dynamic_type())))
                 .collect();
             internal_compile_set_class_metadata_async(
                 metadata,
                 wrapper_params,
-                compile_component_metadata_async_resolver(deps),
+                compile_component_metadata_async_resolver(&deduped),
             )
         }
     }
+}
+
+/// Angular's `new Map<string, R3DeferPerComponentDependency>()` keyed by `symbolName`: a repeated
+/// symbol keeps its first position and takes the value of its last occurrence.
+fn dedupe_defer_dependencies(
+    dependencies: &[R3DeferPerComponentDependency],
+) -> Vec<R3DeferPerComponentDependency> {
+    let mut out: Vec<R3DeferPerComponentDependency> = Vec::new();
+    for dep in dependencies {
+        match out.iter_mut().find(|d| d.symbol_name == dep.symbol_name) {
+            Some(slot) => *slot = dep.clone(),
+            None => out.push(dep.clone()),
+        }
+    }
+    out
 }
 
 /// `compileOpaqueAsyncClassMetadata(metadata, deferResolver, deferredDependencyNames)` — the
@@ -704,7 +800,7 @@ fn internal_compile_set_class_metadata_async(
     let set_class_meta_wrapper = arrow_fn(
         wrapper_params,
         ArrowBody::Block(vec![set_class_metadata_call.to_stmt()]),
-        None,
+        Some(dynamic_type()),
     );
     let set_class_meta_async = import_expr(R3::SetClassMetadataAsync.reference(), None).call_fn(
         vec![
@@ -717,7 +813,7 @@ fn internal_compile_set_class_metadata_async(
     arrow_fn(
         vec![],
         ArrowBody::Block(vec![dev_only_guarded_expression(set_class_meta_async).to_stmt()]),
-        None,
+        Some(dynamic_type()),
     )
     .call_fn(vec![], false)
 }
@@ -739,7 +835,7 @@ pub fn compile_component_metadata_async_resolver(
             let inner_fn = arrow_fn(
                 vec![FnParam::new("m", Some(dynamic_type()))],
                 ArrowBody::Expr(Box::new(variable("m", None).prop(prop))),
-                None,
+                Some(dynamic_type()),
             );
             // import('<path>').then(innerFn) /* @ts-ignore on the call */
             let then_callee = dynamic_import_str(&dep.import_path).prop("then");
@@ -750,7 +846,7 @@ pub fn compile_component_metadata_async_resolver(
     arrow_fn(
         vec![],
         ArrowBody::Expr(Box::new(literal_arr(dynamic_imports, None))),
-        None,
+        Some(dynamic_type()),
     )
 }
 
@@ -761,6 +857,7 @@ pub fn compile_component_metadata_async_resolver(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::output::emitter::emit_expression;
     use crate::output_ast::BinaryOperator;
 
     fn ref_to(name: &str) -> R3Reference {
@@ -1148,5 +1245,101 @@ mod tests {
             }
             other => panic!("expected arrow with expr body, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn structured_ctor_parameters_emit_a_type_and_decorators_callback() {
+        // `compileCtorParameters`: each parameter becomes `{ type: <type>, decorators: <decorators> }`
+        // in a `() => [...]` callback typed dynamic; a `null` type is emitted as `undefined`.
+        let params = R3ClassMetadataCtorParameters::Parameters(vec![
+            R3ClassMetadataCtorParameter {
+                r#type: Some(variable("Svc", None)),
+                decorators: Some(literal_arr(vec![], None)),
+                suppress_type_errors: false,
+            },
+            R3ClassMetadataCtorParameter {
+                r#type: None,
+                decorators: None,
+                suppress_type_errors: false,
+            },
+        ]);
+        let out = emit_expression(&compile_ctor_parameters(Some(&params), true));
+        let flat = out.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains("() => [{ type: Svc, decorators: [] }, { type: undefined }]"),
+            "got: {out}"
+        );
+    }
+
+    #[test]
+    fn suppressed_type_gets_ts_ignore_on_the_type_property() {
+        // `suppressTypeErrors` attaches `@ts-ignore` to the `type` property assignment (not the
+        // parameter literal), and only when suppressions are allowed.
+        let params = R3ClassMetadataCtorParameters::Parameters(vec![R3ClassMetadataCtorParameter {
+            r#type: Some(variable("Svc", None)),
+            decorators: None,
+            suppress_type_errors: true,
+        }]);
+        let expr = compile_ctor_parameters(Some(&params), true);
+        let ExprKind::Arrow { body: ArrowBody::Expr(list), .. } = &expr.kind else {
+            panic!("expected an arrow callback, got {:?}", expr.kind);
+        };
+        let ExprKind::LiteralArray(entries) = &list.kind else {
+            panic!("expected an array literal, got {:?}", list.kind);
+        };
+        let ExprKind::LiteralMap { entries: props, .. } = &entries[0].kind else {
+            panic!("expected a parameter literal, got {:?}", entries[0].kind);
+        };
+        let LiteralMapEntry::Property { leading_comments, .. } = &props[0] else {
+            panic!("expected the type property");
+        };
+        assert_eq!(leading_comments.len(), 1, "type must carry the @ts-ignore");
+
+        // Suppressions disabled (partial/JS output): no comment.
+        let no_comments = compile_ctor_parameters(Some(&params), false);
+        let ExprKind::Arrow { body: ArrowBody::Expr(list), .. } = &no_comments.kind else {
+            panic!("expected an arrow callback");
+        };
+        let ExprKind::LiteralArray(entries) = &list.kind else {
+            panic!("expected an array literal");
+        };
+        let ExprKind::LiteralMap { entries: props, .. } = &entries[0].kind else {
+            panic!("expected a parameter literal");
+        };
+        let LiteralMapEntry::Property { leading_comments, .. } = &props[0] else {
+            panic!("expected the type property");
+        };
+        assert!(leading_comments.is_empty());
+    }
+
+    #[test]
+    fn expression_ctor_parameters_pass_through_and_none_is_null() {
+        let raw = literal_arr(vec![variable("X", None)], None);
+        let passed = compile_ctor_parameters(
+            Some(&R3ClassMetadataCtorParameters::Expr(raw.clone())),
+            true,
+        );
+        assert_eq!(passed, raw);
+        assert_eq!(
+            emit_expression(&compile_ctor_parameters(None, true)).trim_end_matches([';', '\n']),
+            "null"
+        );
+    }
+
+    #[test]
+    fn duplicate_defer_dependencies_keep_first_position_and_last_value() {
+        // Angular dedupes by `symbolName` through a `Map`: the first key position is kept, the last
+        // value wins.
+        let dep = |sym: &str, path: &str| R3DeferPerComponentDependency {
+            symbol_name: sym.to_string(),
+            import_path: path.to_string(),
+            is_default_import: false,
+        };
+        let deps = vec![dep("A", "./a"), dep("B", "./b"), dep("A", "./a2")];
+        let out = dedupe_defer_dependencies(&deps);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].symbol_name, "A");
+        assert_eq!(out[0].import_path, "./a2");
+        assert_eq!(out[1].symbol_name, "B");
     }
 }
