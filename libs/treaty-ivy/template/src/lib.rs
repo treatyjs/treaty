@@ -36,5 +36,6 @@ pub use treaty_ivy_core::output_ast;
 pub mod ml_parser;
 pub mod template;
 pub mod binder;
+pub mod dom_security_schema;
 pub mod i18n;
 pub mod view;

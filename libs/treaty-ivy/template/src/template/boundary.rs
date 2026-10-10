@@ -315,6 +315,25 @@ mod tests {
         );
     }
 
+    /// `r3_boundaries.ts`: a `let` name declared twice in one `@error` is reported (message per Angular).
+    #[test]
+    fn duplicate_let_parameter_is_an_error() {
+        let (_node, errors) = run("@boundary {x} @error (let err, err) {y}");
+        assert!(errors
+            .iter()
+            .any(|e| e.msg == "Duplicate \"let\" parameter variable \"err\""), "{errors:?}");
+    }
+
+    /// `r3_boundaries.ts`: a second `when` parameter on one `@error` is reported and the first is kept.
+    #[test]
+    fn second_when_parameter_is_an_error() {
+        let (node, errors) = run("@boundary {x} @error (when a; when b) {y}");
+        assert!(errors
+            .iter()
+            .any(|e| e.msg == "@error block can only have one \"when\" expression"), "{errors:?}");
+        assert!(node.is_some());
+    }
+
     #[test]
     fn unrecognized_connected_block_is_an_error() {
         let (node, errors) = run("@boundary {x} @placeholder {y}");

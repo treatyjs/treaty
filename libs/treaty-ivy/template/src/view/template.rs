@@ -708,6 +708,34 @@ fn num(n: f64) -> Expr {
     o::literal(o::LiteralValue::Number(n), None)
 }
 
+/// `ir.Namespace` (`template/pipeline/ir/src/enums.ts`): the element namespace an op is created in.
+/// Drives the `ɵɵnamespaceHTML` / `ɵɵnamespaceSVG` / `ɵɵnamespaceMathML` instructions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Namespace {
+    Html,
+    Svg,
+    Math,
+}
+
+/// `namespaceForKey` (`template/pipeline/src/conversion.ts`): `svg` -> SVG, `math` -> MathML, any other
+/// (or absent) prefix -> HTML.
+pub fn namespace_for_key(key: Option<&str>) -> Namespace {
+    match key {
+        Some("svg") => Namespace::Svg,
+        Some("math") => Namespace::Math,
+        _ => Namespace::Html,
+    }
+}
+
+/// The namespace-switch instruction for `ns` (`reify.ts` `OpKind.Namespace`).
+fn namespace_instruction(ns: Namespace) -> R3 {
+    match ns {
+        Namespace::Html => R3::NamespaceHTML,
+        Namespace::Svg => R3::NamespaceSVG,
+        Namespace::Math => R3::NamespaceMathML,
+    }
+}
+
 /// The `undefined` literal — the value Angular emits for a *valueless* legacy-animation property
 /// binding (`@bar` / `[@baz]` → `ɵɵproperty("@bar", undefined)`).
 fn undefined_expr() -> Expr {
@@ -887,6 +915,27 @@ impl I18nCollector {
             Node::SwitchBlock(b) => self.visit_switch_block(b),
             Node::ForLoopBlock(b) => self.visit_for_block(b),
             Node::DeferredBlock(b) => self.visit_deferred_block(b),
+            // `@boundary` (`i18n_parser.ts` `visitBlock`): a `boundary` block placeholder around the
+            // main content, then one `error` block placeholder per connected `@error` block, in
+            // source order (they are siblings of the boundary in the html tree). The `@error`
+            // parameter is its `when` expression; `let` parameters are not part of the signature.
+            Node::BoundaryBlock(b) => {
+                self.push_block_placeholder("boundary", Vec::new(), &b.children);
+                for e in &b.error_blocks {
+                    let params = e.expression.as_ref().map(|x| vec![ast_to_source(x)]).unwrap_or_default();
+                    self.push_block_placeholder("error", params, &e.children);
+                }
+            }
+            // `@content (name; let a, b)` is a block placeholder named `content` whose parameters are
+            // the slot name and the `let` list (`i18n_parser.ts` `visitBlock`).
+            Node::ContentBlock(c) => {
+                let mut params = vec![c.name.clone()];
+                if !c.variables.is_empty() {
+                    let names: Vec<String> = c.variables.iter().map(|v| v.name.clone()).collect();
+                    params.push(format!("let {}", names.join(", ")));
+                }
+                self.push_block_placeholder("content", params, &c.children);
+            }
             Node::Icu(icu) => self.visit_icu(icu),
             // `@let` declarations are update-only and contribute nothing to the message
             // (`i18n_parser.ts` `visitLetDeclaration` returns `null`).
@@ -2641,6 +2690,12 @@ pub struct TemplateDefinitionBuilder {
     /// `ɵɵelement` unless it has nested element/control-flow children, and its children are walked via
     /// [`Self::visit_i18n_create_children`].
     in_i18n_create: bool,
+    /// The namespace active in this view's create block (`emitNamespaceChanges`,
+    /// `phases/namespace.ts`): starts as HTML and changes only when an element's namespace differs.
+    active_namespace: Namespace,
+    /// Creation-block prelude (`generate_variables.ts` prepends scope variables to `view.create`):
+    /// the `const ctx_r<level> = ɵɵnextContext(n)` a foreign component's creation-time inputs need.
+    create_prelude: Vec<Stmt>,
     /// Per-`@defer`-block lazy dependency resolver thunks, keyed by the block's `main_block_span`
     /// `(start, end)`. Threaded from [`TemplateCompilationInput::deferred_deps`] into the root view
     /// and propagated to every embedded view (a nested `@defer` block lowers in an embedded view),
@@ -2728,6 +2783,8 @@ impl TemplateDefinitionBuilder {
             i18n_child_view: None,
             i18n_block_ctx: None,
             in_i18n_create: false,
+            active_namespace: Namespace::Html,
+            create_prelude: Vec::new(),
             deferred_deps: input.deferred_deps.clone(),
             foreign_components: input.foreign_components.clone(),
         }
@@ -3288,7 +3345,9 @@ impl TemplateDefinitionBuilder {
         // collapse each maximal run of adjacent expression-statements whose call callee is the
         // *same* instruction into one left-folded chained call. Applied to both buffers before
         // they are wrapped in the `rf`-guarded ifs.
-        let creation = chain_statements(std::mem::take(&mut self.creation_code));
+        let mut creation_body: Vec<Stmt> = std::mem::take(&mut self.create_prelude);
+        creation_body.extend(std::mem::take(&mut self.creation_code));
+        let creation = chain_statements(creation_body);
         // Update-block prelude order (Angular `generateNextContextExpr` then `generate_variables`):
         //   1. `const ctx_r<level> = ɵɵnextContext();` — once, when any expression in this nested
         //      view read an ancestor context (`needs_next_context` was set during lowering).
@@ -3752,6 +3811,11 @@ impl TemplateDefinitionBuilder {
 
         // Props: static attributes (string literals), then bound inputs, then the content locals.
         let mut props: Vec<(String, bool, Expr)> = Vec::new();
+        // The foreign component's inputs are read in the CREATION block (`ɵɵforeignComponent(…, () =>
+        // ({…}))`), so an ancestor-context read among them needs its `ɵɵnextContext()` there, not in
+        // the update block. Lower them with the update-block flag saved, then move the flag to the
+        // creation prelude.
+        let update_ctx_flag = self.needs_next_context.replace(false);
         for attr in &element.attributes {
             props.push((
                 attr.name.clone(),
@@ -3762,6 +3826,19 @@ impl TemplateDefinitionBuilder {
         for input in &element.inputs {
             let value = self.lower_expr(&input.value);
             props.push((input.name.clone(), is_unsafe_object_key(&input.name), value));
+        }
+        if self.needs_next_context.replace(update_ctx_flag) {
+            let ctx_name = self.next_context_var_name();
+            let hops = self.view_level;
+            let args = if hops <= 1 { vec![] } else { vec![num(hops as f64)] };
+            self.create_prelude.push(Stmt::with_modifiers(
+                StmtKind::DeclareVar {
+                    name: ctx_name,
+                    value: Some(o::import_expr(R3::NextContext.reference(), None).call_fn(args, false)),
+                    ty: None,
+                },
+                StmtModifier::FINAL,
+            ));
         }
 
         // The component const (`job.addConst`): appended after the content views' own consts.
@@ -3967,11 +4044,16 @@ impl TemplateDefinitionBuilder {
             || element.i18n.is_some()
             || control_bindings > 0;
 
+        // `ingestElement`: the op's tag is the local name (`splitNsName(element.name)[1]`); the
+        // namespace prefix selects the element namespace (`namespaceForKey`).
+        let (ns_key, local_name) = crate::ml_parser::split_ns_name(&element.name);
+        let namespace = namespace_for_key(ns_key.as_deref());
+
         // `element`/`elementStart` reify to `(slot, tag, attributes, localRefs, span)`; the
         // trailing `null` attributes / localRefs args are trimmed (Angular `instruction.ts`).
         let mut params = vec![
             num(slot as f64),
-            str_lit(&element.name),
+            str_lit(&local_name),
             attrs_index.map(|i| num(i as f64)).unwrap_or_else(o::null_expr),
             local_refs_index
                 .map(|i| num(i as f64))
@@ -3988,6 +4070,13 @@ impl TemplateDefinitionBuilder {
         } else {
             (R3::ElementStart, R3::Element)
         };
+        // `emitNamespaceChanges` (`phases/namespace.ts`): a namespace-switch instruction precedes the
+        // element's start op whenever its namespace differs from the one active in this view.
+        if namespace != self.active_namespace {
+            self.creation_code
+                .push(instruction(namespace_instruction(namespace), vec![]));
+            self.active_namespace = namespace;
+        }
         if needs_end {
             self.creation_code.push(instruction(start_ref, params));
         } else {
@@ -4006,7 +4095,7 @@ impl TemplateDefinitionBuilder {
         // `(event)="handler"` → creation-block listener (`ɵɵdomListener` in DomOnly mode,
         // `ɵɵlistener` in Full mode).
         for output in &element.outputs {
-            self.build_listener(slot, &element.name, output);
+            self.build_listener(slot, &local_name, output);
         }
 
         // Modern animation bindings (`animate.enter`/`[animate.leave]`) reify to a CREATE-block
@@ -4703,16 +4792,29 @@ impl TemplateDefinitionBuilder {
                 // DomOnly mode the property name is run through `DOM_PROPERTY_REMAPPING` (e.g.
                 // `class` → `className`); in Full mode an ARIA-attribute name (`aria-*`) selects
                 // `ɵɵariaProperty` instead and the DOM remapping is not applied.
+                // `resolve_sanitizers.ts`: the security-context sanitizer, when one applies, is the
+                // trailing argument of the (DOM)property op (`ɵɵproperty("href", v, ɵɵsanitizeUrl)`).
+                let sanitizer = attribute_sanitizer(&input.security_context, &input.name);
+                let sanitized = |mut params: Vec<Expr>| {
+                    if let Some(sanitizer) = sanitizer {
+                        params.push(o::import_expr(sanitizer.reference(), None));
+                    }
+                    params
+                };
                 if self.dom_only {
                     let name = remap_dom_property(&input.name);
-                    self.update_code
-                        .push(instruction(R3::DomProperty, vec![str_lit(name), lowered]));
+                    self.update_code.push(instruction(
+                        R3::DomProperty,
+                        sanitized(vec![str_lit(name), lowered]),
+                    ));
                 } else if is_aria_attribute(&input.name) {
                     self.update_code
                         .push(instruction(R3::AriaProperty, vec![str_lit(&input.name), lowered]));
                 } else {
-                    self.update_code
-                        .push(instruction(R3::Property, vec![str_lit(&input.name), lowered]));
+                    self.update_code.push(instruction(
+                        R3::Property,
+                        sanitized(vec![str_lit(&input.name), lowered]),
+                    ));
                 }
             }
             BindingType::Class => {
@@ -5169,7 +5271,8 @@ impl TemplateDefinitionBuilder {
             fn_ref,
             num(decls as f64),
             num(vars as f64),
-            str_lit(&tag_name),
+            // `ingestTemplate`: the op's tag is the local name; the namespace only feeds the fn name.
+            str_lit(&crate::ml_parser::split_ns_name(&tag_name).1),
             attrs_index.map(|i| num(i as f64)).unwrap_or_else(o::null_expr),
         ];
         if let Some(refs_idx) = local_refs_index {
@@ -5521,7 +5624,7 @@ impl TemplateDefinitionBuilder {
             } else {
                 R3::ConditionalBranchCreate
             };
-            let tag = single_root_tag(&branch.children);
+            let tag = single_root_tag(&branch.children, &self.foreign_components);
             // `instruction.ts` `conditionalCreate`/`conditionalBranchCreate` trim trailing `null`
             // arguments, so a text-only branch (no element tag) drops the final `null` tag arg.
             let mut params = vec![num(slot as f64), fn_ref, num(decls as f64), num(vars as f64), tag];
@@ -5582,7 +5685,7 @@ impl TemplateDefinitionBuilder {
         // Primary branch: the boundary's main content, reified with its single root tag (if any).
         let primary_slot = self.allocate_data_slot();
         let primary_name = format!("{}_Primary_{}_Template", self.base_name, primary_slot);
-        let primary_tag = single_root_tag(&block.children);
+        let primary_tag = single_root_tag(&block.children, &self.foreign_components);
         let (primary_ref, primary_decls, primary_vars) = self.build_embedded_view(
             primary_name,
             block.children.clone(),
@@ -5633,30 +5736,33 @@ impl TemplateDefinitionBuilder {
         // The update block reads the boundary state; one binding slot backs `ɵɵboundaryUpdate`.
         self.allocate_binding_slots(1);
 
-        // Lower the `when` conditions. A `$error`-valued alias (`let err` / `$error`) reads `<bnd>.error`.
-        let state_inline = o::import_expr(R3::GetBoundary.reference(), None)
-            .call_fn(vec![num(boundary_slot as f64)], false)
-            .prop("error");
-        let mut test = self.boundary_test(block, &state_inline, &error_slots, primary_slot);
+        // Lower the `when` conditions ONCE. A `$error`-valued alias (`let err` / `$error`) reads
+        // `<bnd>.error`; the state is first referenced through a placeholder variable so the single
+        // lowering is reused whichever way the state ends up being read (Angular `BoundaryStateExpr`).
+        const STATE_PLACEHOLDER: &str = "\u{0}bnd_state";
+        let state_placeholder = o::variable(STATE_PLACEHOLDER.to_string(), None).prop("error");
+        let mut test = self.boundary_test(block, &state_placeholder, &error_slots, primary_slot);
+        let state_read = || {
+            o::import_expr(R3::GetBoundary.reference(), None)
+                .call_fn(vec![num(boundary_slot as f64)], false)
+        };
         // Read more than once (the `=== null` check plus any `when`) => materialise the state in a
-        // `const` at the top of the update block; otherwise the read stays inline.
-        if crate::output::emitter::emit_expression(&test).matches("getBoundary(").count() > 1 {
+        // `const` at the top of the update block; otherwise the read is inlined in place.
+        if replace_read_var(&mut test, STATE_PLACEHOLDER, None) > 1 {
             self.var_counter += 1;
             let local = format!("bnd_r{}", self.var_counter);
-            let state_var = o::variable(local.clone(), None).prop("error");
-            test = self.boundary_test(block, &state_var, &error_slots, primary_slot);
+            replace_read_var(&mut test, STATE_PLACEHOLDER, Some(&o::variable(local.clone(), None)));
             let prelude = Stmt::with_modifiers(
                 StmtKind::DeclareVar {
                     name: local,
-                    value: Some(
-                        o::import_expr(R3::GetBoundary.reference(), None)
-                            .call_fn(vec![num(boundary_slot as f64)], false),
-                    ),
+                    value: Some(state_read()),
                     ty: None,
                 },
                 StmtModifier::FINAL,
             );
             self.update_code.insert(0, prelude);
+        } else {
+            replace_read_var(&mut test, STATE_PLACEHOLDER, Some(&state_read()));
         }
 
         // Update: advance to the boundary slot, then `ɵɵboundaryUpdate(slot, matching, primary)`.
@@ -5748,7 +5854,7 @@ impl TemplateDefinitionBuilder {
             } else {
                 R3::ConditionalBranchCreate
             };
-            let tag = single_root_tag(&group.children);
+            let tag = single_root_tag(&group.children, &self.foreign_components);
             // `instruction.ts` `conditionalCreate`/`conditionalBranchCreate` trim trailing `null`
             // arguments (exactly as `build_if_block` does), so a case whose body has no single
             // element root (e.g. a multi-node `before<span>…</span>after` body inside `i18n`, whose
@@ -5902,7 +6008,7 @@ impl TemplateDefinitionBuilder {
         let (track_fn, track_uses_component_instance) = self.build_track_fn(block, slot);
 
         // The item element tag (`'li'`) when the body has a single element root, else null.
-        let tag = single_root_tag(&block.children);
+        let tag = single_root_tag(&block.children, &self.foreign_components);
         let attrs = o::null_expr();
 
         let mut params = vec![
@@ -5949,7 +6055,7 @@ impl TemplateDefinitionBuilder {
             params.push(empty_fn);
             params.push(num(empty_decls as f64));
             params.push(num(empty_vars as f64));
-            params.push(single_root_tag(&empty.children));
+            params.push(single_root_tag(&empty.children, &self.foreign_components));
             // `ɵɵrepeaterCreate` trims a trailing `null` empty-view tag (Angular `instruction.ts`).
             trim_trailing_nulls(&mut params);
         } else if track_uses_component_instance {
@@ -6746,14 +6852,16 @@ fn bare_read_name(node: &AstNode) -> Option<&str> {
 /// (a single text node, etc.). Mirrors `ingestControlFlowInsertionPoint` (`ingest.ts`): comment /
 /// `@let` nodes are skipped; an `ng-template` tag is not passed (it would enable directive matching),
 /// and a namespaced root tag is passed without its namespace prefix.
-fn single_root_tag(children: &[Node]) -> Expr {
+fn single_root_tag(children: &[Node], foreign: &[ForeignComponentRef]) -> Expr {
     let mut root: Option<&str> = None;
     for child in children {
         match child {
             // Skipped: they don't anchor a DOM insertion point.
             Node::LetDeclaration(_) => continue,
+            // `child instanceof t.Element && unit.job.getForeignComponent(child) === null`: a foreign
+            // component root is not a plain element, so the body has no inferable tag.
             Node::Element(el) => {
-                if root.is_some() {
+                if root.is_some() || foreign.iter().any(|f| f.name == el.name) {
                     return o::null_expr();
                 }
                 root = Some(&el.name);
@@ -7333,6 +7441,89 @@ fn remap_pipe_slots_in_stmt(stmt: &mut Stmt, slots: &[usize]) {
 /// Rewrite every placeholder slot literal `>= placeholder` reachable from `stmt`, mapping its
 /// ordinal (`literal - placeholder`) through `resolve`. Shared by pipe-slot finalisation and
 /// local-ref-slot finalisation (which differ only in their placeholder base + resolver).
+/// Replace every `ReadVar { name }` in `expr` by `with` (or just count them when `with` is `None`),
+/// returning how many were found. Used to inline a boundary state read (`bnd_rN`) that is read once,
+/// or to materialise it in a `const` when it is read more than once, without lowering the `when`
+/// expression a second time (lowering has side effects on the constant pool and the pipe state).
+fn replace_read_var(expr: &mut Expr, name: &str, with: Option<&Expr>) -> usize {
+    use o::ExprKind as K;
+    if let K::ReadVar { name: n } = &expr.kind {
+        if n == name {
+            if let Some(w) = with {
+                *expr = w.clone();
+            }
+            return 1;
+        }
+        return 0;
+    }
+    let mut count = 0;
+    {
+        let mut recur = |e: &mut Expr| count += replace_read_var(e, name, with);
+        match &mut expr.kind {
+            K::Literal(_)
+            | K::ReadVar { .. }
+            | K::WrappedNode(_)
+            | K::RegExpLiteral { .. }
+            | K::TemplateLiteralElement(_)
+            | K::External { .. }
+            | K::Function { .. }
+            | K::DynamicImport { .. } => {}
+            K::Typeof(e) | K::Void(e) | K::Not(e) | K::Parenthesized(e) | K::Spread(e) => recur(e),
+            K::Unary { expr: inner, .. } => recur(inner),
+            K::Invoke { callee, args, .. } => {
+                recur(callee);
+                args.iter_mut().for_each(&mut recur);
+            }
+            K::TaggedTemplate { tag, template } => {
+                recur(tag);
+                recur(template);
+            }
+            K::New { class_expr, args } => {
+                recur(class_expr);
+                args.iter_mut().for_each(&mut recur);
+            }
+            K::TemplateLiteral { expressions, .. } | K::LocalizedString { expressions, .. } => {
+                expressions.iter_mut().for_each(&mut recur);
+            }
+            K::Conditional {
+                condition,
+                true_case,
+                false_case,
+            } => {
+                recur(condition);
+                recur(true_case);
+                if let Some(f) = false_case {
+                    recur(f);
+                }
+            }
+            K::Binary { lhs, rhs, .. } => {
+                recur(lhs);
+                recur(rhs);
+            }
+            K::ReadProp { receiver, .. } => recur(receiver),
+            K::ReadKey { receiver, index, .. } => {
+                recur(receiver);
+                recur(index);
+            }
+            K::LiteralArray(entries) | K::Comma(entries) => entries.iter_mut().for_each(&mut recur),
+            K::LiteralMap { entries, .. } => {
+                for entry in entries {
+                    match entry {
+                        o::LiteralMapEntry::Property { value, .. } => recur(value),
+                        o::LiteralMapEntry::Spread { expression } => recur(expression),
+                    }
+                }
+            }
+            K::Arrow { body, .. } => {
+                if let o::ArrowBody::Expr(e) = body {
+                    recur(e);
+                }
+            }
+        }
+    }
+    count
+}
+
 fn remap_placeholder_slots_in_stmt(
     stmt: &mut Stmt,
     placeholder: usize,
@@ -10122,6 +10313,95 @@ mod tests {
         }]
     }
 
+    /// `ingestControlFlowInsertionPoint`: a foreign component root is not a plain element, so the
+    /// surrounding `@if` branch passes `null` as its content-projection tag (golden
+    /// `foreign_component.js` `TestCmpConditional_Conditional_0_Template`: `conditionalCreate(0, …, 1, 0)`).
+    #[test]
+    fn foreign_root_passes_no_control_flow_tag() {
+        let foreign = fancy_button_foreign();
+        let root = Node::Element(Element {
+            name: "FancyButton".to_string(),
+            attributes: vec![],
+            inputs: vec![],
+            outputs: vec![],
+            directives: vec![],
+            children: vec![],
+            references: vec![],
+            is_self_closing: true,
+            source_span: t_span(),
+            start_source_span: t_span(),
+            end_source_span: None,
+            is_void: false,
+            i18n: None,
+        });
+        assert_eq!(
+            emit_expression(&single_root_tag(std::slice::from_ref(&root), &foreign)).trim(),
+            "null;"
+        );
+        // Without the foreign registration the same element is an ordinary root tag.
+        assert_eq!(
+            emit_expression(&single_root_tag(std::slice::from_ref(&root), &[])).trim(),
+            "(\"FancyButton\");"
+        );
+    }
+
+    /// `resolve_sanitizers.ts` with the DOM security schema (`dom_security_schema.ts`): a bound
+    /// property gets the sanitizer of its element's context. `a[href]` is URL, `link[href]` is
+    /// RESOURCE_URL, `innerHTML` is HTML, and `img[src]` is no longer sanitized in the NEW schema.
+    #[test]
+    fn bound_properties_get_schema_sanitizers() {
+        let url = compile_template_html("<a [href]=\"u\"></a>", "C_Template", false);
+        assert!(url.contains("\u{0275}\u{0275}sanitizeUrl"), "got: {url}");
+
+        let res = compile_template_html("<link [href]=\"u\">", "C_Template", false);
+        assert!(res.contains("\u{0275}\u{0275}sanitizeResourceUrl"), "got: {res}");
+
+        let html = compile_template_html("<div [innerHTML]=\"h\"></div>", "C_Template", false);
+        assert!(html.contains("\u{0275}\u{0275}sanitizeHtml"), "got: {html}");
+
+        let img = compile_template_html("<img [src]=\"u\">", "C_Template", false);
+        assert!(!img.contains("sanitize"), "got: {img}");
+    }
+
+    /// `[attr.href]` is looked up as an attribute (`isAttribute = true`) on the element, so an anchor
+    /// gets `ɵɵattribute("href", …, ɵɵsanitizeUrl)`, and a namespaced `<a>` inside `<svg>` uses the
+    /// SVG table (`xlink:href` is URL there).
+    #[test]
+    fn attribute_bindings_and_namespaced_elements_get_schema_sanitizers() {
+        let attr = compile_template_html("<a [attr.href]=\"u\"></a>", "C_Template", false);
+        assert!(attr.contains("\u{0275}\u{0275}attribute(\"href\""), "got: {attr}");
+        assert!(attr.contains("\u{0275}\u{0275}sanitizeUrl"), "got: {attr}");
+
+        let svg = compile_template_html(
+            "<svg><a [attr.xlink:href]=\"u\"></a></svg>",
+            "C_Template",
+            false,
+        );
+        assert!(svg.contains("\u{0275}\u{0275}sanitizeUrl"), "got: {svg}");
+    }
+
+    /// `generate_variables.ts` prepends the scope's variables to `view.create`, and the foreign
+    /// component's inputs are read in the creation block (`ɵɵforeignComponent(…, () => ({label:
+    /// ctx_r0.title}))`). The nested view's `ɵɵnextContext(2)` must therefore be declared in the create
+    /// block, before the foreign instruction, and NOT in the update block (golden
+    /// `foreign_component.js` `TestCmpConditional_Conditional_0_Conditional_0_Template`).
+    #[test]
+    fn nested_foreign_input_reads_context_in_creation_block() {
+        let src = "@if (outer) { @if (inner) { <FancyButton [label]=\"title\" /> } }";
+        let out = compile_template_html_with_foreign(src, "TestCmpConditional_Template", false, fancy_button_foreign());
+        let inner_start = out
+            .find("function TestCmpConditional_Conditional_0_Conditional_0_Template")
+            .unwrap_or_else(|| panic!("no inner view: {out}"));
+        let inner = &out[inner_start..];
+        let inner = &inner[..inner.find("\n}\n").unwrap_or(inner.len())];
+        let ctx_decl = inner.find("nextContext(2)").unwrap_or_else(|| panic!("no nextContext(2): {inner}"));
+        let fc = inner.find("foreignComponent(").unwrap_or_else(|| panic!("no foreignComponent: {inner}"));
+        let rf2 = inner.find("rf & 2").unwrap_or(inner.len());
+        assert!(ctx_decl < fc, "context must be read before the foreign instruction: {inner}");
+        assert!(ctx_decl < rf2 && fc < rf2, "context must live in the creation block: {inner}");
+        assert!(!inner[rf2..].contains("nextContext"), "no update-block context read: {inner}");
+    }
+
     /// Golden `components_and_directives/standalone/foreign_component.js` (`TestCmp`): a foreign element
     /// is one `ɵɵforeignComponent(slot, constIndex, () => ({ … }))` with no update block; the component
     /// reference is the `consts` entry, and `unsafe-*` keys are quoted.
@@ -10268,6 +10548,67 @@ mod tests {
         );
     }
 
+    /// `i18n_parser.ts` `visitBlock`: a `@boundary` inside an i18n block is a `boundary` block
+    /// placeholder (its content is part of the message), and its `@error` is an `error` placeholder.
+    /// The message therefore carries the boundary's text (`Main`/`Fallback`) and both placeholders.
+    #[test]
+    fn boundary_inside_i18n_block_contributes_placeholders() {
+        let nodes = {
+            let parsed = crate::ml_parser::parse(
+                "<div i18n>@boundary {\n  Main\n} @error {\n  Fallback\n}</div>",
+                "test.html",
+            );
+            let mut bp = crate::template::template_transform::BindingParser::new();
+            let r3 = crate::template::template_transform::html_ast_to_render3_ast(
+                &parsed.root_nodes,
+                &mut bp,
+                crate::template::template_transform::Render3ParseOptions::default(),
+            );
+            r3.nodes
+        };
+        let div = match &nodes[0] {
+            Node::Element(e) => e.clone(),
+            other => panic!("expected element, got {other:?}"),
+        };
+        let mut builder = I18nCollector::new();
+        builder.visit_children(&div.children);
+        let names: Vec<String> = builder
+            .nodes
+            .iter()
+            .filter_map(|n| match n {
+                crate::i18n::Node::BlockPlaceholder(b) => Some(b.name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, vec!["boundary".to_string(), "error".to_string()]);
+    }
+
+    /// `boundary_conditions.ts` lowers each `when` expression once; a pipe inside it must reserve its
+    /// slot and constant-pool entry exactly once, however many times the boundary state is read.
+    #[test]
+    fn boundary_when_expression_with_pipe_is_lowered_once() {
+        let out = golden_shape(&compile_template_html(
+            "\n    @boundary {\n      Main\n    } @error (let err; when (err.message | uppercase) === 'X') {\n      Fallback\n    }\n  ",
+            "TestComponent_Template",
+            true,
+        ));
+        assert_eq!(out.matches("pipe(").count(), 1, "pipe lowered more than once: {out}");
+        assert_eq!(out.matches("pipeBind1(").count(), 1, "pipe bind lowered more than once: {out}");
+        assert!(out.contains("const bnd_r1 = ɵɵgetBoundary(0);"), "got: {out}");
+    }
+
+    /// A boundary state read only once (no `when` alias reads it) stays inline: no `const bnd_rN`.
+    #[test]
+    fn boundary_state_read_once_stays_inline() {
+        let out = golden_shape(&compile_template_html(
+            "\n    @boundary {\n      Main\n    } @error {\n      Fallback\n    }\n  ",
+            "TestComponent_Template",
+            true,
+        ));
+        assert!(!out.contains("bnd_r"), "got: {out}");
+        assert!(out.contains("ɵɵboundaryUpdate(0, ɵɵgetBoundary(0).error === null ? 1 : 2, 1);"), "got: {out}");
+    }
+
     /// Golden `nested.js`: an inner boundary inside a primary branch advances to its own slot and
     /// names its branch views after the enclosing branch (`_Primary_1_Primary_2_Template`).
     #[test]
@@ -10290,6 +10631,67 @@ mod tests {
     /// `ingestControlFlowInsertionPoint`: a namespaced single root (`<svg>` is `:svg:svg` in the r3
     /// AST) passes its plain tag name, so the branch's `ɵɵconditionalCreate` gets `"svg"` (golden
     /// `if_namespaced_root_node`). `ng-template` and multi-root bodies still pass `null`.
+    /// `emitNamespaceChanges` (`phases/namespace.ts`): the svg/math element switches the namespace
+    /// instruction, and the HTML `p` switches back. Mirrors `svg_template.js`.
+    #[test]
+    fn svg_subtree_emits_namespace_switches_and_strips_prefix() {
+        let out = compile_template_html(
+            "<div><svg><circle></circle></svg><p>test</p></div>",
+            "MyComponent_Template",
+            false,
+        );
+        let pos = |needle: &str| {
+            out.find(needle)
+                .unwrap_or_else(|| panic!("missing `{needle}` in:\n{out}"))
+        };
+        // div (HTML), then SVG switch before the svg element, then HTML before the trailing p.
+        let div = pos("\u{0275}\u{0275}elementStart(0, \"div\")");
+        let ns_svg = pos("\u{0275}\u{0275}namespaceSVG()");
+        let svg = pos("\u{0275}\u{0275}elementStart(1, \"svg\")");
+        let ns_html = pos("\u{0275}\u{0275}namespaceHTML()");
+        let p = pos("\u{0275}\u{0275}elementStart(3, \"p\")");
+        assert!(div < ns_svg && ns_svg < svg && svg < ns_html && ns_html < p, "got: {out}");
+        // The circle is already in SVG, so no second switch is emitted before it.
+        assert_eq!(out.matches("namespaceSVG()").count(), 1, "got: {out}");
+        // Namespace prefixes are stripped from the tag (`:svg:circle` -> `circle`).
+        assert!(!out.contains(":svg:"), "got: {out}");
+        assert!(out.contains("\u{0275}\u{0275}element(2, \"circle\")"), "got: {out}");
+    }
+
+    /// MathML (`mathml_template.js`): `ɵɵnamespaceMathML()` before `math`, `ɵɵnamespaceHTML()` after.
+    #[test]
+    fn mathml_subtree_emits_mathml_namespace() {
+        let out = compile_template_html("<div><math><infinity></infinity></math><p>t</p></div>", "C_Template", false);
+        assert!(out.contains("\u{0275}\u{0275}namespaceMathML()"), "got: {out}");
+        assert!(out.contains("\u{0275}\u{0275}elementStart(1, \"math\")"), "got: {out}");
+        assert!(out.contains("\u{0275}\u{0275}element(2, \"infinity\")"), "got: {out}");
+        assert!(out.contains("\u{0275}\u{0275}namespaceHTML()"), "got: {out}");
+    }
+
+    /// A template with no namespaced element emits no namespace instruction at all.
+    #[test]
+    fn html_only_template_emits_no_namespace_instruction() {
+        let out = compile_template_html("<div><p>x</p></div>", "C_Template", false);
+        assert!(!out.contains("namespace"), "got: {out}");
+    }
+
+    /// `phases/namespace.ts` runs per unit: an embedded view whose root is `<svg>` starts in HTML and
+    /// so emits its own `ɵɵnamespaceSVG()` (`svg_embedded_view_template.js`). The `ng-template` inside
+    /// the svg keeps its plain `ng-template` tag (`ingestTemplate` strips the prefix).
+    #[test]
+    fn svg_embedded_view_root_emits_namespace_in_child_view() {
+        let out = compile_template_html(
+            "<svg><ng-template [ngIf]=\"x\"><text>Hello</text></ng-template></svg>",
+            "C_Template",
+            false,
+        );
+        // One switch in the root view (before `svg`), one in the embedded view (before `text`).
+        assert_eq!(out.matches("namespaceSVG()").count(), 2, "got: {out}");
+        assert!(out.contains("\u{0275}\u{0275}elementStart(0, \"text\")"), "got: {out}");
+        assert!(out.contains("\"ng-template\""), "got: {out}");
+        assert!(!out.contains(":svg:"), "got: {out}");
+    }
+
     #[test]
     fn control_flow_root_tag_strips_namespace() {
         let svg = Node::Element(Element {
@@ -10307,10 +10709,10 @@ mod tests {
             is_void: false,
             i18n: None,
         });
-        let tag = single_root_tag(std::slice::from_ref(&svg));
+        let tag = single_root_tag(std::slice::from_ref(&svg), &[]);
         assert_eq!(emit_expression(&tag).trim(), "(\"svg\");");
 
         let two_roots = vec![svg.clone(), svg];
-        assert_eq!(emit_expression(&single_root_tag(&two_roots)).trim(), "null;");
+        assert_eq!(emit_expression(&single_root_tag(&two_roots, &[])).trim(), "null;");
     }
 }

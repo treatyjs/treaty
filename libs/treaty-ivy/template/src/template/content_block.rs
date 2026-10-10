@@ -219,6 +219,14 @@ mod tests {
         );
     }
 
+    /// `r3_content_blocks.ts`: an empty entry in the `let` list (`let x,,y`) is an invalid name.
+    #[test]
+    fn empty_let_entry_is_an_invalid_variable_name() {
+        let (node, errors) = content_block("@content(a; let x,,y) {z}");
+        assert!(node.is_some());
+        assert!(errors.iter().any(|e| e.msg == "Invalid variable name in @content block"), "{errors:?}");
+    }
+
     #[test]
     fn reports_variable_errors_but_keeps_the_block() {
         let (node, errors) = content_block("@content(a; let x = 1, x, 2bad) {y}");

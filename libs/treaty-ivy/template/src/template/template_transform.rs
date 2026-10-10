@@ -2292,7 +2292,7 @@ impl BindingParser {
     /// [`SecurityContext::None`] (the schema default for unknown elements/attributes).
     pub fn create_bound_element_property(
         &mut self,
-        _element_name: Option<&str>,
+        element_name: Option<&str>,
         prop: &ParsedProperty,
         _skip_validation: bool,
         _map_property_name: bool,
@@ -2300,6 +2300,18 @@ impl BindingParser {
         const SEP: char = '.';
         let mut unit: Option<String> = None;
         let parts: Vec<&str> = prop.name.split(SEP).collect();
+        // `calcPossibleSecurityContexts` for a concrete element selector: the schema lookup on the
+        // element's local tag name and namespace (`:svg:a` -> `a` in `svg`). An absent element name
+        // has no single context and stays `None` (see the module note).
+        let schema_context = |property: &str| -> SecurityContext {
+            match element_name {
+                Some(el) => {
+                    let (ns, local) = crate::ml_parser::split_ns_name(el);
+                    crate::dom_security_schema::check_security_context(&local, property, ns.as_deref())
+                }
+                None => SecurityContext::None,
+            }
+        };
 
         let (ty, name, security): (BindingType, String, SecurityContext) = if parts.len() > 1 {
             match parts[0] {
@@ -2311,7 +2323,11 @@ impl BindingParser {
                         let local = &bound_name[idx + 1..];
                         bound_name = format!("{ns}:{local}");
                     }
-                    (BindingType::Attribute, bound_name, SecurityContext::None)
+                    // `securityContexts` for an `attr.` binding: looked up on the name before the
+                    // `ns:name` merge (`boundPropertyName`), with `isAttribute = true`.
+                    let raw_attr_name = parts[1..].join(".");
+                    let security = schema_context(&raw_attr_name);
+                    (BindingType::Attribute, bound_name, security)
                 }
                 "class" => (
                     BindingType::Class,
@@ -2333,10 +2349,10 @@ impl BindingParser {
                 ),
                 // A dotted name that is not one of the special prefixes falls through to the plain
                 // property path below.
-                _ => fallthrough_property(prop),
+                _ => fallthrough_property(prop, schema_context(&prop.name)),
             }
         } else {
-            fallthrough_property(prop)
+            fallthrough_property(prop, schema_context(&prop.name))
         };
 
         BoundElementProperty {
@@ -2435,13 +2451,16 @@ impl BindingParser {
 /// The "not a special case" branch of `createBoundElementProperty`: the full property name, a
 /// `TwoWay` or `Property` binding type, and the schema-derived security context (`None` here —
 /// the DOM security schema is not ported). `mapPropertyName`/validation are no-ops in this port.
-fn fallthrough_property(prop: &ParsedProperty) -> (BindingType, String, SecurityContext) {
+fn fallthrough_property(
+    prop: &ParsedProperty,
+    security: SecurityContext,
+) -> (BindingType, String, SecurityContext) {
     let ty = if prop.ty == ParsedPropertyType::TwoWay {
         BindingType::TwoWay
     } else {
         BindingType::Property
     };
-    (ty, prop.name.clone(), SecurityContext::None)
+    (ty, prop.name.clone(), security)
 }
 
 // ===========================================================================

@@ -1981,6 +1981,17 @@ impl<'a, 't> Visitor for TemplateBinder<'a, 't> {
         self.visit_expr(&text.value);
     }
 
+    /// `TemplateBinder.visitBoundaryErrorBlock` → `ingestScopedNode` (`t2_binder.ts`): context
+    /// variables, then the `when` expression (its pipes and references bind against the branch), then
+    /// the children.
+    fn visit_boundary_error_block(&mut self, block: &t::BoundaryErrorBlock) {
+        self.visit_all_variables(&block.context_variables);
+        if let Some(expression) = &block.expression {
+            self.visit_expr(expression);
+        }
+        self.visit_all(&block.children);
+    }
+
     fn visit_variable(&mut self, variable: &Variable) {
         self.register_symbol(addr(variable));
     }
@@ -2781,6 +2792,53 @@ mod tests {
         assert!(bound
             .get_eagerly_used_pipes()
             .contains(&"eagerPipe".to_string()));
+    }
+
+    /// `TemplateBinder.visitBoundaryErrorBlock` → `ingestScopedNode` → `expression.visit(this)`: a pipe
+    /// inside an `@error (when …)` expression is recorded as used (it was skipped before this port).
+    #[test]
+    fn boundary_error_when_expression_pipes_are_bound() {
+        use crate::template::r3_ast::{BoundaryBlock, BoundaryErrorBlock, BlockSpans};
+        let pipe = AstNode::new(
+            ParseSpan::new(0, 0),
+            AbsoluteSourceSpan::new(0, 0),
+            ExprKind::BindingPipe {
+                name_span: AbsoluteSourceSpan::new(0, 0),
+                exp: Box::new(implicit_read("err")),
+                name: "whenPipe".to_string(),
+                args: vec![],
+                pipe_type: crate::expression::ast::BindingPipeType::ReferencedByName,
+            },
+        );
+        let error_block = BoundaryErrorBlock {
+            children: vec![],
+            context_variables: vec![],
+            expression: Some(pipe),
+            spans: crate::template::r3_ast::BlockSpans {
+                name_span: span(),
+                source_span: span(),
+                start_source_span: span(),
+                end_source_span: None,
+            },
+            i18n: None,
+        };
+        let nodes = vec![Node::BoundaryBlock(BoundaryBlock {
+            children: vec![],
+            error_blocks: vec![error_block],
+            main_block_span: span(),
+            spans: crate::template::r3_ast::BlockSpans {
+                name_span: span(),
+                source_span: span(),
+                start_source_span: span(),
+                end_source_span: None,
+            },
+            i18n: None,
+        })];
+        let bound = R3TargetBinder::new(None).bind(Target {
+            template: Some(&nodes),
+            host: None,
+        });
+        assert!(bound.get_used_pipes().contains(&"whenPipe".to_string()));
     }
 
     #[test]
