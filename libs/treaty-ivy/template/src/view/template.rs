@@ -472,6 +472,11 @@ struct LoopVar {
     /// is `ctx.$error`; `retry = $reset` is `ctx.$reset`). Reads lower to `ctx.<prop>` inline, and a
     /// listener re-roots them at its restored view.
     context_prop: Option<String>,
+    /// The embedded-view context property this variable is read from (`ctx.$implicit`, `ctx.index`,
+    /// …) when it is a template `let-x="prop"` variable. A listener re-reads it off its restored view
+    /// with this key; `None` keeps the loop-variable default (`$implicit`, or the special `$index`-style
+    /// name).
+    ctx_key: Option<String>,
 }
 
 impl LoopVar {
@@ -643,8 +648,12 @@ impl LocalResolver for ListenerResolver<'_> {
         if let Some((_, local)) = self.context_let_locals.iter().find(|(src, _)| src == name) {
             return Some(o::variable(local.clone(), None));
         }
-        // Otherwise a `@for` loop item / `$index` etc. resolves to its generated loop local.
+        // Otherwise a `@for` loop item / `$index` etc. resolves to its generated loop local. A computed
+        // variable (`$first`, …) is re-declared by the handler from the restored view, so it reads that local.
         if let Some(v) = self.vars.iter().find(|v| v.source_name == name) {
+            if v.inline.is_some() && v.ctx_key.is_some() {
+                return Some(o::variable(v.local_name.clone(), None));
+            }
             return Some(v.read_expr());
         }
         None
@@ -809,6 +818,52 @@ fn local_ref_var_name(name: &str, counter: usize) -> String {
 /// Pop trailing `null` literal arguments off an instruction's parameter list, mirroring the
 /// `while (args[args.length - 1].isEquivalent(o.NULL_EXPR)) args.pop()` tail in Angular's
 /// `instruction.ts` builders (`templateBase` / `conditionalCreate` / …).
+/// Which trigger set a defer op belongs to (Angular `ir.DeferOpModifierKind`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeferOpModifier {
+    Main,
+    Prefetch,
+    Hydrate,
+}
+
+/// Angular `ingestDeferTriggers` kind order: idle, immediate, timer, hover, interaction, viewport, never.
+fn defer_trigger_rank(kind: &DeferredTriggerKind) -> u8 {
+    match kind {
+        DeferredTriggerKind::When { .. } => 7,
+        DeferredTriggerKind::Idle { .. } => 0,
+        DeferredTriggerKind::Immediate => 1,
+        DeferredTriggerKind::Timer { .. } => 2,
+        DeferredTriggerKind::Hover { .. } => 3,
+        DeferredTriggerKind::Interaction { .. } => 4,
+        DeferredTriggerKind::Viewport { .. } => 5,
+        DeferredTriggerKind::Never => 6,
+    }
+}
+
+/// The trigger instruction for a modifier and trigger name (`instruction.ts` `deferTriggerToR3TriggerInstructionsMap`).
+fn defer_on_instruction(modifier: DeferOpModifier, trigger: &str) -> R3 {
+    match (modifier, trigger) {
+        (DeferOpModifier::Main, "Idle") => R3::DeferOnIdle,
+        (DeferOpModifier::Main, "Immediate") => R3::DeferOnImmediate,
+        (DeferOpModifier::Main, "Timer") => R3::DeferOnTimer,
+        (DeferOpModifier::Main, "Hover") => R3::DeferOnHover,
+        (DeferOpModifier::Main, "Interaction") => R3::DeferOnInteraction,
+        (DeferOpModifier::Main, _) => R3::DeferOnViewport,
+        (DeferOpModifier::Prefetch, "Idle") => R3::DeferPrefetchOnIdle,
+        (DeferOpModifier::Prefetch, "Immediate") => R3::DeferPrefetchOnImmediate,
+        (DeferOpModifier::Prefetch, "Timer") => R3::DeferPrefetchOnTimer,
+        (DeferOpModifier::Prefetch, "Hover") => R3::DeferPrefetchOnHover,
+        (DeferOpModifier::Prefetch, "Interaction") => R3::DeferPrefetchOnInteraction,
+        (DeferOpModifier::Prefetch, _) => R3::DeferPrefetchOnViewport,
+        (DeferOpModifier::Hydrate, "Idle") => R3::DeferHydrateOnIdle,
+        (DeferOpModifier::Hydrate, "Immediate") => R3::DeferHydrateOnImmediate,
+        (DeferOpModifier::Hydrate, "Timer") => R3::DeferHydrateOnTimer,
+        (DeferOpModifier::Hydrate, "Hover") => R3::DeferHydrateOnHover,
+        (DeferOpModifier::Hydrate, "Interaction") => R3::DeferHydrateOnInteraction,
+        (DeferOpModifier::Hydrate, _) => R3::DeferHydrateOnViewport,
+    }
+}
+
 fn trim_trailing_nulls(params: &mut Vec<Expr>) {
     while params
         .last()
@@ -1600,7 +1655,7 @@ impl I18nSentinelResolver {
                     });
                     // Record each block in SOURCE order so the placeholder-registry suffixes match the
                     // collector, but with its view-creation slot/sub.
-                    let mut record_block =
+                    let record_block =
                         |this: &mut Self,
                          reg: &mut PlaceholderRegistryShim,
                          keyword: &str,
@@ -2472,6 +2527,9 @@ fn chains_onto(first: &Expr, next: &Expr) -> bool {
 /// applied to the prior `Invoke` expression, i.e. `callee(args0)(args1)(args2)…`. Single-element
 /// runs (and any non-call statement, e.g. an interleaved `ɵɵadvance`) pass through unchanged —
 /// which is exactly what breaks a run, so distinct instructions are never chained together.
+/// Maximum number of instructions folded into one chained call (Angular `chaining.ts` `MAX_CHAIN_LENGTH`).
+const MAX_CHAIN_LENGTH: usize = 256;
+
 pub fn chain_statements(stmts: Vec<Stmt>) -> Vec<Stmt> {
     let mut out: Vec<Stmt> = Vec::with_capacity(stmts.len());
     let mut iter = stmts.into_iter().peekable();
@@ -2493,7 +2551,13 @@ pub fn chain_statements(stmts: Vec<Stmt>) -> Vec<Stmt> {
         // first callee (Angular `CHAIN_COMPATIBILITY`: usually the same instruction, but a
         // `conditionalCreate` run continues with `conditionalBranchCreate`).
         let mut chained = false;
-        while let Some(next) = iter.peek() {
+        // Angular `chaining.ts` `MAX_CHAIN_LENGTH`: a run holds at most 256 instructions; the next
+        // compatible instruction starts a new chain.
+        let mut length = 1usize;
+        while length < MAX_CHAIN_LENGTH {
+            let Some(next) = iter.peek() else {
+                break;
+            };
             let Some((next_callee, next_args)) = as_call(next) else {
                 break;
             };
@@ -2504,6 +2568,7 @@ pub fn chain_statements(stmts: Vec<Stmt>) -> Vec<Stmt> {
             // Apply the next call to the prior `Invoke` expression: `…(prevArgs)(nextArgs)`.
             folded = folded.call_fn(next_args, false);
             chained = true;
+            length += 1;
             iter.next();
         }
 
@@ -2535,6 +2600,9 @@ pub fn chain_statements(stmts: Vec<Stmt>) -> Vec<Stmt> {
 pub struct TemplateDefinitionBuilder {
     name: String,
     data_index: usize,
+    /// Whether this view already emitted its `ɵɵenableIncrementalHydrationRuntime()` activator
+    /// (Angular `insert_incremental_hydration_runtime.ts`: one per view, before the first hydrating defer).
+    hydration_runtime_emitted: bool,
     /// Slot the update block has currently advanced to.
     advance_cursor: usize,
     /// Number of binding (var) slots reserved so far (`_bindingSlots` / `allocateBindingSlots`).
@@ -2758,6 +2826,7 @@ impl TemplateDefinitionBuilder {
             const_pool: std::rc::Rc::new(std::cell::RefCell::new(ConstantPool::new())),
             loop_vars: Vec::new(),
             context_lets: Vec::new(),
+            hydration_runtime_emitted: false,
             external_lets: std::collections::HashMap::new(),
             current_nodes: None,
             saved_view_name: None,
@@ -3781,6 +3850,7 @@ impl TemplateDefinitionBuilder {
                     local_name,
                     inline: None,
                     context_prop: None,
+                    ctx_key: None,
                 });
             }
             let (fn_ref, decls, vars) = self.build_embedded_view(
@@ -3962,6 +4032,15 @@ impl TemplateDefinitionBuilder {
             binding_names.push(output.name.clone());
         }
         for input in &element.inputs {
+            // An EMPTY `[class.x]` / `[style.x]` binding (no `=` value) is extracted as a Property name
+            // (Angular `attribute_extraction.ts`, StyleProp/ClassProp with an `EmptyExpr`: the old
+            // compiler treated it as a regular binding for directive matching), with no update op.
+            if matches!(input.kind, BindingType::Class | BindingType::Style)
+                && is_empty_binding_value(&input.value)
+            {
+                binding_names.push(input.name.clone());
+                continue;
+            }
             if matches!(
                 input.kind,
                 BindingType::Class
@@ -4119,7 +4198,8 @@ impl TemplateDefinitionBuilder {
             .iter()
             .filter(|input| !matches!(input.kind, BindingType::Animation))
             .collect();
-        ordered.sort_by_key(|input| update_order_rank(input));
+        let dom_only = self.dom_only;
+        ordered.sort_by_key(|input| update_order_rank(input, dom_only));
         for input in ordered {
             self.build_property(slot, input);
         }
@@ -4447,6 +4527,7 @@ impl TemplateDefinitionBuilder {
                 local_name,
                 inline: None,
                 context_prop: None,
+                ctx_key: None,
             });
         }
     }
@@ -4711,6 +4792,14 @@ impl TemplateDefinitionBuilder {
     fn build_property(&mut self, slot: usize, input: &BoundAttribute) {
         use crate::expression::ast::BindingType;
 
+        // An empty `[class.x]` / `[style.x]` binding is removed before var counting
+        // (`remove_empty_bindings.ts`): it emits no instruction and reserves no slot.
+        if matches!(input.kind, BindingType::Class | BindingType::Style)
+            && is_empty_binding_value(&input.value)
+        {
+            return;
+        }
+
         // Number of interpolation expressions contributing extra var slots.
         let interp_extra = match &input.value.kind {
             AstExprKind::Interpolation { expressions, .. } => expressions.len(),
@@ -4784,9 +4873,32 @@ impl TemplateDefinitionBuilder {
                 } else {
                     R3::ClassMap
                 };
-                self.update_code.push(instruction(reference, vec![lowered]));
+                // A `class="foo-{{x}}"` / `[style]="a{{x}}"` interpolation reifies its value through
+                // `ɵɵinterpolateN(...)` (Angular `interpolate.ts`, `ClassMap`/`StyleMap` interpolation),
+                // not a raw string concatenation. A non-interpolation value passes through unchanged.
+                let value = self.style_class_binding_value(&input.value, lowered);
+                self.update_code.push(instruction(reference, vec![value]));
             }
-            BindingType::Property | BindingType::TwoWay => {
+            BindingType::TwoWay => {
+                // A `[(name)]="expr"` two-way property reifies to `ɵɵtwoWayProperty(name, expr[, sanitizer])`
+                // in both modes (Angular `reify.ts`: `ng.twoWayProperty(op.name, op.expression, op.sanitizer)`).
+                // Its paired `ɵɵtwoWayListener` is the listener op built by `build_listener`.
+                let sanitizer = attribute_sanitizer(&input.security_context, &input.name);
+                let mut params = vec![str_lit(&input.name), lowered];
+                if let Some(sanitizer) = sanitizer {
+                    params.push(o::import_expr(sanitizer.reference(), None));
+                }
+                self.update_code.push(instruction(R3::TwoWayProperty, params));
+            }
+            BindingType::Property => {
+                // A `[name]="a{{x}}b"` interpolation reifies its value through `ɵɵinterpolateN(...)`
+                // (Angular `interpolate.ts`; a singleton `{{x}}` becomes `ɵɵinterpolate(x)`), not a raw
+                // string concatenation. Attribute singletons are collapsed instead (see `update_order_rank`).
+                let lowered = if matches!(input.value.kind, AstExprKind::Interpolation { .. }) {
+                    self.style_class_binding_value(&input.value, lowered)
+                } else {
+                    lowered
+                };
                 // A plain `[name]="expr"` property binding reifies to `ɵɵdomProperty` in DomOnly mode
                 // and `ɵɵproperty` in Full mode (`reify.ts` `reifyDomProperty`/`reifyProperty`). In
                 // DomOnly mode the property name is run through `DOM_PROPERTY_REMAPPING` (e.g.
@@ -4801,7 +4913,13 @@ impl TemplateDefinitionBuilder {
                     }
                     params
                 };
-                if self.dom_only {
+                if self.dom_only && is_aria_attribute(&input.name) {
+                    // DomOnly `[aria-x]="v"` is an ARIA attribute binding: Angular's
+                    // `binding_specialization.ts` turns it into an Attribute op before reify, so it
+                    // reifies to `ɵɵattribute("aria-x", v)` (no DOM remapping).
+                    self.update_code
+                        .push(instruction(R3::Attribute, sanitized(vec![str_lit(&input.name), lowered])));
+                } else if self.dom_only {
                     let name = remap_dom_property(&input.name);
                     self.update_code.push(instruction(
                         R3::DomProperty,
@@ -5057,10 +5175,10 @@ impl TemplateDefinitionBuilder {
                 for v in &referenced_loop_vars {
                     // The item reads `ctx.$implicit`; the special vars (`$index`/`$count`/…) read their
                     // own name — the same mapping as `collect_loop_vars`.
-                    let prop = if v.source_name.starts_with('$') {
-                        v.source_name.clone()
-                    } else {
-                        "$implicit".to_string()
+                    let prop = match &v.ctx_key {
+                        Some(key) => key.clone(),
+                        None if v.source_name.starts_with('$') => v.source_name.clone(),
+                        None => "$implicit".to_string(),
                     };
                     body.push(Stmt::with_modifiers(
                         StmtKind::DeclareVar {
@@ -5089,8 +5207,24 @@ impl TemplateDefinitionBuilder {
                 StmtModifier::FINAL,
             ));
         }
+        // A two-way `[(x)]` listener (`ParsedEventType::TwoWay`) sets its target and returns the
+        // event: `ɵɵtwoWayBindingSet(target, $event) || (target = $event); return $event;`
+        // (Angular `ingest.ts` `makeTwoWayListenerHandlerOps` + `transform_two_way_binding_set.ts`).
+        let is_two_way = matches!(output.kind, ParsedEventType::TwoWay);
+        let event_ref = || o::variable(EVENT_NAME, None);
         body.extend(converted.stmts);
-        let ret = if needs_view_restore {
+        let ret = if is_two_way {
+            let target = converted.expr;
+            let set = o::import_expr(R3::TwoWayBindingSet.reference(), None)
+                .call_fn(vec![target.clone(), event_ref()], false)
+                .or(target.set(event_ref()));
+            body.push(set.to_stmt());
+            if needs_view_restore {
+                o::import_expr(R3::ResetView.reference(), None).call_fn(vec![event_ref()], false)
+            } else {
+                event_ref()
+            }
+        } else if needs_view_restore {
             o::import_expr(R3::ResetView.reference(), None).call_fn(vec![converted.expr], false)
         } else {
             converted.expr
@@ -5134,7 +5268,7 @@ impl TemplateDefinitionBuilder {
             slot,
         );
         // Only add the `$event` parameter when the handler AST actually references `$event`.
-        let params = if handler_references_dollar_event(&output.handler) {
+        let params = if is_two_way || handler_references_dollar_event(&output.handler) {
             vec![FnParam::new(EVENT_NAME, None)]
         } else {
             vec![]
@@ -5166,7 +5300,10 @@ impl TemplateDefinitionBuilder {
         // and its event-name argument is the synthetic `@${name}.${phase}` form
         // (`prepareSyntheticListenerName`). A regular listener reifies to `ɵɵdomListener` in DomOnly
         // mode / `ɵɵlistener` otherwise, with the raw event name.
-        let listener_ref = if self.dom_only && !is_legacy_animation_listener {
+        // A two-way listener reifies to `ɵɵtwoWayListener` in both modes (Angular `reify.ts`).
+        let listener_ref = if is_two_way {
+            R3::TwoWayListener
+        } else if self.dom_only && !is_legacy_animation_listener {
             R3::DomListener
         } else {
             R3::Listener
@@ -5255,11 +5392,35 @@ impl TemplateDefinitionBuilder {
             c.interpolations = self.collect_child_i18n_interpolations(&template.children);
             c
         });
+        // A `<ng-template let-x="prop">` variable reads `ctx.<prop>` of the embedded view's context
+        // (`$implicit` for a bare `let-x`). Angular (`generate_variables.ts`) declares each one as
+        // `const x_rN = ctx.<prop>;` at the head of the view's update block and reads it by that name.
+        let mut template_vars: Vec<LoopVar> = Vec::new();
+        let mut template_prelude: Vec<Stmt> = Vec::new();
+        for var in &template.variables {
+            self.var_counter += 1;
+            let local_name = format!("{}_r{}", var.name, self.var_counter);
+            template_prelude.push(Stmt::with_modifiers(
+                StmtKind::DeclareVar {
+                    name: local_name.clone(),
+                    value: Some(o::variable(CONTEXT_NAME, None).prop(var.value.clone())),
+                    ty: None,
+                },
+                StmtModifier::FINAL,
+            ));
+            template_vars.push(LoopVar {
+                source_name: var.name.clone(),
+                local_name,
+                inline: None,
+                context_prop: None,
+                ctx_key: Some(var.value.clone()),
+            });
+        }
         let (fn_ref, decls, vars) = self.build_embedded_view_i18n(
             fn_name,
             template.children.clone(),
-            Vec::new(),
-            Vec::new(),
+            template_vars,
+            template_prelude,
             tmpl_child_i18n,
         );
 
@@ -5718,6 +5879,7 @@ impl TemplateDefinitionBuilder {
                     local_name: v.name.clone(),
                     inline: None,
                     context_prop: Some(v.value.clone()),
+                    ctx_key: None,
                 })
                 .collect();
             let (fn_ref, decls, vars) =
@@ -5802,6 +5964,7 @@ impl TemplateDefinitionBuilder {
                     local_name: v.name.clone(),
                     inline: Some(state.clone()),
                     context_prop: None,
+                    ctx_key: None,
                 });
             }
             let condition = self.lower_expr(expression);
@@ -6189,17 +6352,42 @@ impl TemplateDefinitionBuilder {
     /// (item, `$index`, `$count`). Unreferenced variables are skipped (and consume no `_rN` index),
     /// matching the `variable_optimization` phase which drops unused embedded-view variables.
     fn collect_loop_vars(&mut self, block: &ForLoopBlock) -> (Vec<LoopVar>, Vec<Stmt>) {
-        // (source name the author writes, ctx property it reads).
+        // (source name the author writes, the context value it reads): the item, the implicit
+        // variables in Angular's fixed order, then the `let` aliases (`let idx = $index`).
         let mut candidates: Vec<(String, String)> =
             vec![(block.item.name.clone(), "$implicit".to_string())];
         for implicit in ["$index", "$count", "$first", "$last", "$even", "$odd"] {
             candidates.push((implicit.to_string(), implicit.to_string()));
         }
+        for v in &block.context_variables {
+            if !candidates.iter().any(|(src, _)| src == &v.name) {
+                candidates.push((v.name.clone(), v.value.clone()));
+            }
+        }
 
-        let mut vars = Vec::new();
-        let mut prelude = Vec::new();
-        for (source_name, ctx_property) in candidates {
+        let mut vars: Vec<LoopVar> = Vec::new();
+        let mut prelude: Vec<Stmt> = Vec::new();
+        // The `$index` / `$count` locals the computed variables read (Angular `ingestForBlock`:
+        // `$first` is `ɵ$index === 0`, `$last` is `ɵ$index === ɵ$count - 1`, …).
+        let mut index_local: Option<String> = None;
+        let mut count_local: Option<String> = None;
+        // Computed variables, by position in `vars`: (source name, context value).
+        let mut computed: Vec<(usize, String, String)> = Vec::new();
+        for (source_name, ctx_value) in candidates {
             if !for_body_references(&block.children, &source_name) {
+                continue;
+            }
+            if matches!(ctx_value.as_str(), "$first" | "$last" | "$even" | "$odd") {
+                // A computed variable has no const of its own: it is an inline expression over the
+                // index (and count) local, filled in below.
+                computed.push((vars.len(), source_name.clone(), ctx_value.clone()));
+                vars.push(LoopVar {
+                    source_name,
+                    local_name: String::new(),
+                    inline: None,
+                    context_prop: None,
+                    ctx_key: Some(ctx_value),
+                });
                 continue;
             }
             self.var_counter += 1;
@@ -6208,17 +6396,73 @@ impl TemplateDefinitionBuilder {
             prelude.push(Stmt::with_modifiers(
                 StmtKind::DeclareVar {
                     name: local_name.clone(),
-                    value: Some(o::variable(CONTEXT_NAME, None).prop(ctx_property.clone())),
+                    value: Some(o::variable(CONTEXT_NAME, None).prop(ctx_value.clone())),
                     ty: None,
                 },
                 StmtModifier::FINAL,
             ));
+            if ctx_value == "$index" && index_local.is_none() {
+                index_local = Some(local_name.clone());
+            }
+            if ctx_value == "$count" && count_local.is_none() {
+                count_local = Some(local_name.clone());
+            }
             vars.push(LoopVar {
                 source_name,
                 local_name,
                 inline: None,
                 context_prop: None,
+                ctx_key: Some(ctx_value),
             });
+        }
+
+        if !computed.is_empty() {
+            let needs_count = computed.iter().any(|(_, _, value)| value == "$last");
+            // Shared index / count locals for the computed variables, declared on demand.
+            let mut hidden_const = |this: &mut Self, prop: &str| -> String {
+                this.var_counter += 1;
+                let name = format!("{}_r{}", prop, this.var_counter);
+                prelude.push(Stmt::with_modifiers(
+                    StmtKind::DeclareVar {
+                        name: name.clone(),
+                        value: Some(o::variable(CONTEXT_NAME, None).prop(prop.to_string())),
+                        ty: None,
+                    },
+                    StmtModifier::FINAL,
+                ));
+                name
+            };
+            let index = match index_local {
+                Some(name) => name,
+                None => hidden_const(self, "$index"),
+            };
+            let count = if needs_count {
+                match count_local {
+                    Some(name) => Some(name),
+                    None => Some(hidden_const(self, "$count")),
+                }
+            } else {
+                None
+            };
+            for (position, source_name, value) in computed {
+                let index_read = o::variable(index.clone(), None);
+                let expr = match value.as_str() {
+                    "$first" => index_read.identical(num(0.0)),
+                    "$last" => index_read.identical(
+                        o::variable(count.clone().unwrap_or_default(), None).minus(num(1.0)),
+                    ),
+                    "$even" => index_read.modulo(num(2.0)).identical(num(0.0)),
+                    _ => index_read.modulo(num(2.0)).not_identical(num(0.0)),
+                };
+                self.var_counter += 1;
+                vars[position] = LoopVar {
+                    local_name: format!("{}_r{}", source_name, self.var_counter),
+                    source_name,
+                    inline: Some(expr),
+                    context_prop: None,
+                    ctx_key: Some(value),
+                };
+            }
         }
         (vars, prelude)
     }
@@ -6311,6 +6555,7 @@ impl TemplateDefinitionBuilder {
                 local_name,
                 inline: None,
                 context_prop: None,
+                ctx_key: None,
             });
         }
 
@@ -6439,6 +6684,7 @@ impl TemplateDefinitionBuilder {
                 local_name,
                 inline: None,
                 context_prop: None,
+                ctx_key: None,
             });
         } else {
             // Unused in this view: the value runs as a bare statement (for its side effects / the
@@ -6599,6 +6845,14 @@ impl TemplateDefinitionBuilder {
         // interned timing-config const indices; `enableTimerScheduling` becomes the
         // `ɵɵdeferEnableTimerScheduling` import when any timing config is present (else `null`); the
         // trailing `flags` arg is always `null` here (basic block).
+        // `ɵɵenableIncrementalHydrationRuntime()` once per view, immediately before the first defer op
+        // that has hydrate triggers (Angular `insert_incremental_hydration_runtime.ts`).
+        let has_hydrate = !deferred.hydrate_triggers.defined_in_order().is_empty();
+        if has_hydrate && !self.hydration_runtime_emitted {
+            self.creation_code
+                .push(instruction(R3::EnableIncrementalHydrationRuntime, vec![]));
+            self.hydration_runtime_emitted = true;
+        }
         let mut defer_params = vec![
             num(defer_slot as f64),
             num(main_slot as f64),
@@ -6626,14 +6880,16 @@ impl TemplateDefinitionBuilder {
             } else {
                 o::null_expr()
             },
-            o::null_expr(), // flags (TDeferDetailsFlags) — always null for a basic defer block.
+            // `TDeferDetailsFlags.HasHydrateTriggers` (1) when the block has any hydrate trigger
+            // (`ingest.ts` `calcDeferBlockFlags`), else null.
+            if has_hydrate { num(1.0) } else { o::null_expr() },
         ];
         trim_trailing_nulls(&mut defer_params);
         self.creation_code.push(instruction(R3::Defer, defer_params));
 
-        // Trigger instructions (regular `on` triggers only; prefetch/hydrate are a separate
-        // subsystem). Default to `ɵɵdeferOnIdle()` when no concrete trigger is given.
-        self.emit_defer_triggers(&deferred.triggers);
+        // Trigger instructions: hydrate, then main, then prefetch, then the idle default
+        // (`ingest.ts` `ingestDeferBlock`).
+        self.emit_defer_triggers(deferred);
 
         // A `when <cond>` trigger is an UPDATE op (`ɵɵdeferWhen(<cond>)`), not a create-block `on`
         // trigger: the binding cursor advances to the defer op's slot, then `ɵɵdeferWhen` re-evaluates
@@ -6667,37 +6923,69 @@ impl TemplateDefinitionBuilder {
         }
     }
 
-    /// Emit the create-block trigger instructions for a defer block's regular trigger set, defaulting
-    /// to `ɵɵdeferOnIdle()` ONLY when no concrete trigger is present (`ingest.ts`: the idle fallback
-    /// is suppressed when any concrete `on` OR `when` trigger exists, since `when` is a real trigger
-    /// even though it reifies as a separate `ɵɵdeferWhen` UPDATE op).
-    fn emit_defer_triggers(&mut self, triggers: &DeferredBlockTriggers) {
-        let mut emitted_concrete = false;
-        for trigger in triggers.defined_in_order() {
-            let (reference, args): (R3, Vec<Expr>) = match &trigger.kind {
-                DeferredTriggerKind::Idle { timeout } => (
-                    R3::DeferOnIdle,
-                    timeout.map(|t| vec![num(t)]).unwrap_or_default(),
-                ),
-                DeferredTriggerKind::Immediate => (R3::DeferOnImmediate, vec![]),
-                DeferredTriggerKind::Timer { delay } => (R3::DeferOnTimer, vec![num(*delay)]),
-                DeferredTriggerKind::Hover { .. } => (R3::DeferOnHover, vec![]),
-                DeferredTriggerKind::Interaction { .. } => (R3::DeferOnInteraction, vec![]),
-                DeferredTriggerKind::Viewport { .. } => (R3::DeferOnViewport, vec![]),
-                // `when` reifies as a `ɵɵdeferWhen` UPDATE op (emitted separately), but it IS a
-                // concrete trigger, so it suppresses the idle fallback. `never` is hydrate-only.
-                DeferredTriggerKind::When { .. } => {
-                    emitted_concrete = true;
-                    continue;
-                }
-                DeferredTriggerKind::Never => continue,
-            };
-            emitted_concrete = true;
-            self.creation_code.push(instruction(reference, args));
-        }
-        if !emitted_concrete {
+    /// Emit the create-block trigger instructions of a defer block (Angular `ingestDeferBlock` +
+    /// `ingestDeferTriggers`): the hydrate triggers, then the main triggers, then the prefetch
+    /// triggers, each group in Angular's kind order (idle, immediate, timer, hover, interaction,
+    /// viewport, never). When the main group has no concrete trigger (`on` or `when`), a default
+    /// `ɵɵdeferOnIdle()` is appended last.
+    fn emit_defer_triggers(&mut self, deferred: &DeferredBlock) {
+        self.emit_defer_trigger_group(&deferred.hydrate_triggers, DeferOpModifier::Hydrate);
+        let main_concrete =
+            self.emit_defer_trigger_group(&deferred.triggers, DeferOpModifier::Main);
+        self.emit_defer_trigger_group(&deferred.prefetch_triggers, DeferOpModifier::Prefetch);
+        if !main_concrete {
             self.creation_code.push(instruction(R3::DeferOnIdle, vec![]));
         }
+    }
+
+    /// Emit one trigger group's `ɵɵdeferOn*` / `ɵɵdeferPrefetchOn*` / `ɵɵdeferHydrateOn*` create ops in
+    /// Angular's kind order. Returns whether the group holds a concrete trigger (`on` or `when`).
+    /// `when` reifies as a `ɵɵdeferWhen` UPDATE op (emitted separately) but still counts as concrete.
+    fn emit_defer_trigger_group(
+        &mut self,
+        triggers: &DeferredBlockTriggers,
+        modifier: DeferOpModifier,
+    ) -> bool {
+        let mut ordered = triggers.defined_in_order();
+        ordered.sort_by_key(|t| defer_trigger_rank(&t.kind));
+        let mut concrete = false;
+        for trigger in ordered {
+            let (reference, args): (R3, Vec<Expr>) = match &trigger.kind {
+                DeferredTriggerKind::When { .. } => {
+                    concrete = concrete || modifier == DeferOpModifier::Main;
+                    continue;
+                }
+                // `never` is a hydrate-only trigger (`ɵɵdeferHydrateNever()`).
+                DeferredTriggerKind::Never => {
+                    if modifier == DeferOpModifier::Hydrate {
+                        self.creation_code.push(instruction(R3::DeferHydrateNever, vec![]));
+                    }
+                    continue;
+                }
+                DeferredTriggerKind::Idle { timeout } => (
+                    defer_on_instruction(modifier, "Idle"),
+                    timeout.map(|t| vec![num(t)]).unwrap_or_default(),
+                ),
+                DeferredTriggerKind::Immediate => {
+                    (defer_on_instruction(modifier, "Immediate"), vec![])
+                }
+                DeferredTriggerKind::Timer { delay } => {
+                    (defer_on_instruction(modifier, "Timer"), vec![num(*delay)])
+                }
+                DeferredTriggerKind::Hover { .. } => (defer_on_instruction(modifier, "Hover"), vec![]),
+                DeferredTriggerKind::Interaction { .. } => {
+                    (defer_on_instruction(modifier, "Interaction"), vec![])
+                }
+                DeferredTriggerKind::Viewport { .. } => {
+                    (defer_on_instruction(modifier, "Viewport"), vec![])
+                }
+            };
+            if modifier == DeferOpModifier::Main {
+                concrete = true;
+            }
+            self.creation_code.push(instruction(reference, args));
+        }
+        concrete
     }
 
     /// Build a `@defer` secondary/main view as a hoisted, named DOM-only embedded view, returning
@@ -6926,10 +7214,20 @@ fn attribute_sanitizer(
     }
 }
 
-fn update_order_rank(input: &BoundAttribute) -> u8 {
+fn update_order_rank(input: &BoundAttribute, dom_only: bool) -> u8 {
     use crate::expression::ast::BindingType;
     let is_interp = matches!(input.value.kind, AstExprKind::Interpolation { .. });
-    match input.kind {
+    // A DomOnly `[aria-x]` property is specialized to an Attribute op before ordering
+    // (`binding_specialization.ts`), so it ranks with the attribute bindings.
+    let kind = if dom_only
+        && matches!(input.kind, BindingType::Property)
+        && is_aria_attribute(&input.name)
+    {
+        BindingType::Attribute
+    } else {
+        input.kind
+    };
+    match kind {
         // A whole-element `[style]="exp"` / `[class]="exp"` binding (a `Property` whose name is
         // exactly `style`/`class`) is a StyleMap / ClassMap — Angular's `UPDATE_ORDERING` groups 0/1,
         // ahead of the per-key StyleProp/ClassProp groups.
@@ -6937,8 +7235,16 @@ fn update_order_rank(input: &BoundAttribute) -> u8 {
         BindingType::Property | BindingType::TwoWay if input.name == "class" => 1,
         BindingType::Style => 2,
         BindingType::Class => 3,
+        // `collapse_singleton_interpolations.ts` runs before `ordering.ts` and rewrites an Attribute
+        // `{{x}}` (no literal text, one expression) into the bare expression, so only a real
+        // interpolation (`a{{x}}`) is in the interpolated-attribute group.
         BindingType::Attribute => {
-            if is_interp {
+            let is_singleton = matches!(
+                &input.value.kind,
+                AstExprKind::Interpolation { strings, expressions }
+                    if expressions.len() == 1 && strings.iter().all(String::is_empty)
+            );
+            if is_interp && !is_singleton {
                 4
             } else {
                 7
@@ -7882,6 +8188,223 @@ mod tests {
 
         assert!(out.contains("\u{0275}\u{0275}classMap(ctx.x)"), "got: {out}");
         assert!(!out.contains("\u{0275}\u{0275}domProperty"), "got: {out}");
+    }
+
+    #[test]
+    fn class_interpolation_lowers_to_interpolate_inside_class_map() {
+        // `<div class="foo foo-{{ x }}">` is a whole-element class binding whose value is an
+        // interpolation. Angular (`interpolate.ts`) wraps it as `ɵɵclassMap(ɵɵinterpolate1("foo foo-", ctx.x))`,
+        // NOT a string concatenation. (`binding_slots` compliance golden.)
+        let nodes = element_with_input("div", "class", BindingType::Property, interpolation_ab());
+        let input = TemplateCompilationInput::new("Test_Template", nodes);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let out = emit_expression(&func);
+
+        assert!(
+            out.contains("ɵɵclassMap(i0.ɵɵinterpolate2(\"\", ctx.a, \" \", ctx.b))")
+                || out.contains("ɵɵclassMap(ɵɵinterpolate2(\"\", ctx.a, \" \", ctx.b))"),
+            "got: {out}"
+        );
+        assert!(!out.contains("+ ctx.b"), "got: {out}");
+    }
+
+    #[test]
+    fn ng_template_let_variables_read_context_properties_through_consts() {
+        use crate::template::r3_ast::Variable;
+        // `<ng-template let-item let-i="index">{{ i }} {{ item }}</ng-template>`: each `let-` variable
+        // is `const <name>_rN = ctx.<prop>;` at the head of the embedded view's update block, and the
+        // body reads that local (Angular `generate_variables.ts`), not `ctx.<name>` off the component.
+        let read = |name: &str| {
+            AstNode::new(
+                ParseSpan::new(0, 0),
+                AbsoluteSourceSpan::new(0, 0),
+                AstExprKind::PropertyRead {
+                    name_span: AbsoluteSourceSpan::new(0, 0),
+                    receiver: Box::new(AstNode::new(
+                        ParseSpan::new(0, 0),
+                        AbsoluteSourceSpan::new(0, 0),
+                        AstExprKind::ImplicitReceiver,
+                    )),
+                    name: name.to_string(),
+                },
+            )
+        };
+        let child_interp = AstNode::new(
+            ParseSpan::new(0, 0),
+            AbsoluteSourceSpan::new(0, 0),
+            AstExprKind::Interpolation {
+                strings: vec!["".to_string(), " ".to_string(), "".to_string()],
+                expressions: vec![read("i"), read("item")],
+            },
+        );
+        let var = |name: &str, value: &str| Variable {
+            name: name.to_string(),
+            value: value.to_string(),
+            source_span: t_span(),
+            key_span: t_span(),
+            value_span: None,
+        };
+        let nodes = vec![Node::Template(Template {
+            tag_name: Some("ng-template".to_string()),
+            attributes: vec![],
+            inputs: vec![],
+            outputs: vec![],
+            directives: vec![],
+            template_attrs: vec![],
+            children: vec![Node::BoundText(BoundText {
+                value: child_interp,
+                source_span: t_span(),
+                i18n: None,
+            })],
+            references: vec![],
+            variables: vec![var("item", "$implicit"), var("i", "index")],
+            is_self_closing: false,
+            source_span: t_span(),
+            start_source_span: t_span(),
+            end_source_span: None,
+            i18n: None,
+        })];
+        let input = TemplateCompilationInput::new("MyComponent_Template", nodes);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let out = emit_with_hoisted(&builder, &func);
+
+        assert!(out.contains("const item_r1 = ctx.$implicit;"), "got: {out}");
+        assert!(out.contains("const i_r2 = ctx.index;"), "got: {out}");
+        assert!(out.contains("i_r2, \" \", item_r1"), "reads must use the locals, got: {out}");
+        assert!(!out.contains("ctx_r"), "no ancestor context read expected, got: {out}");
+    }
+
+    #[test]
+    fn chain_statements_breaks_runs_at_max_chain_length() {
+        // Angular `chaining.ts`: at most `MAX_CHAIN_LENGTH` (256) instructions per chain. 257 compatible
+        // `ɵɵelement` calls form a chain of 256 followed by a new chain of 1.
+        let stmts: Vec<Stmt> = (0..257)
+            .map(|i| instruction(R3::Element, vec![num(i as f64)]))
+            .collect();
+        let chained = chain_statements(stmts);
+        assert_eq!(chained.len(), 2, "expected two chained statements");
+    }
+
+    #[test]
+    fn empty_class_binding_is_extracted_as_name_without_instruction() {
+        // `<div [class.color]>` (no value): Angular extracts `color` into the element's bindings const group
+        // (`attribute_extraction.ts`) and removes the op (`remove_empty_bindings.ts`), so the element is
+        // `ɵɵelement(0, "div", 0)` (DomOnly: `ɵɵdomElement`) with no `ɵɵclassProp`.
+        let empty = AstNode::new(
+            ParseSpan::new(0, 0),
+            AbsoluteSourceSpan::new(0, 0),
+            AstExprKind::EmptyExpr,
+        );
+        let nodes = element_with_input("div", "color", BindingType::Class, empty);
+        let input = TemplateCompilationInput::new("Test_Template", nodes);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let out = emit_expression(&func);
+
+        assert!(out.contains("ɵɵdomElement(0, \"div\", 0)"), "got: {out}");
+        assert!(!out.contains("ɵɵclassProp"), "got: {out}");
+    }
+
+    #[test]
+    fn dom_only_aria_property_reifies_to_attribute() {
+        // DomOnly `[aria-readonly]="x"` is specialized to an Attribute op by Angular's
+        // `binding_specialization.ts` (`isAriaAttribute`), so it emits `ɵɵattribute("aria-readonly", ctx.x)`
+        // and not `ɵɵdomProperty`. A non-aria DomOnly property keeps `ɵɵdomProperty`.
+        let nodes = element_with_input("input", "aria-readonly", BindingType::Property, prop_read("x"));
+        let input = TemplateCompilationInput::new("Test_Template", nodes);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let out = emit_expression(&func);
+
+        assert!(out.contains("ɵɵattribute(\"aria-readonly\", ctx.x)"), "got: {out}");
+        assert!(!out.contains("ɵɵdomProperty"), "got: {out}");
+    }
+
+    #[test]
+    fn singleton_attribute_interpolation_is_ordered_with_plain_attributes() {
+        // `[attr.title]="a" attr.id="{{b}}"`: Angular's `collapse_singleton_interpolations` turns the
+        // `{{b}}` into a bare expression before `ordering.ts`, so both are non-interpolated attribute
+        // ops and keep source order (`ɵɵattribute("title", …)("id", …)`), not interpolated-first.
+        let mut nodes = element_with_input("button", "title", BindingType::Attribute, prop_read("a"));
+        if let Node::Element(el) = &mut nodes[0] {
+            el.inputs.push(BoundAttribute {
+                name: "id".to_string(),
+                kind: BindingType::Attribute,
+                security_context: SecurityContext::None,
+                value: AstNode::new(
+                    ParseSpan::new(0, 0),
+                    AbsoluteSourceSpan::new(0, 0),
+                    AstExprKind::Interpolation {
+                        strings: vec![String::new(), String::new()],
+                        expressions: vec![prop_read("b")],
+                    },
+                ),
+                unit: None,
+                source_span: t_span(),
+                key_span: t_span(),
+                value_span: None,
+                i18n: None,
+            });
+        }
+        let input = TemplateCompilationInput::new("Test_Template", nodes);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let out = emit_expression(&func);
+
+        // The two attribute ops chain into one `ɵɵattribute("title", …)("id", …)` call.
+        let title = out.find("\"title\"").expect("title attribute op");
+        let id = out.find("\"id\"").expect("id attribute op");
+        assert!(title < id, "got: {out}");
+    }
+
+    #[test]
+    fn property_interpolation_lowers_to_interpolate_instruction() {
+        // `[title]="a{{ x }}"`-style interpolation: Angular emits `ɵɵproperty("title", ɵɵinterpolate1(…))`
+        // (`interpolate.ts`), not `ɵɵproperty("title", "a" + ctx.x)`.
+        let nodes = element_with_input("div", "title", BindingType::Property, interpolation_ab());
+        let input = TemplateCompilationInput::new("Test_Template", nodes).with_dom_only(false);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let out = emit_expression(&func);
+
+        assert!(out.contains("ɵɵproperty(\"title\", i0.ɵɵinterpolate2(\"\", ctx.a, \" \", ctx.b))")
+            || out.contains("ɵɵproperty(\"title\", ɵɵinterpolate2(\"\", ctx.a, \" \", ctx.b))"), "got: {out}");
+        assert!(!out.contains("+ ctx.b"), "got: {out}");
+    }
+
+    #[test]
+    fn two_way_property_lowers_to_two_way_property_and_listener() {
+        // `[(ngModel)]="x"` reifies to `ɵɵtwoWayProperty("ngModel", ctx.x)` in the update block and a
+        // `ɵɵtwoWayListener("ngModelChange", fn)` whose body is `ɵɵtwoWayBindingSet(ctx.x, $event) ||
+        // (ctx.x = $event); return $event;` (Angular `ingest.ts` `makeTwoWayListenerHandlerOps`,
+        // `reify.ts`, `transform_two_way_binding_set.ts`).
+        let mut nodes = element_with_input("input", "ngModel", BindingType::TwoWay, prop_read("x"));
+        if let Node::Element(el) = &mut nodes[0] {
+            el.outputs.push(BoundEvent {
+                name: "ngModelChange".to_string(),
+                kind: ParsedEventType::TwoWay,
+                handler: prop_read("x"),
+                target: None,
+                phase: None,
+                source_span: t_span(),
+                handler_span: t_span(),
+                key_span: t_span(),
+            });
+        }
+        let input = TemplateCompilationInput::new("Test_Template", nodes);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let out = emit_expression(&func);
+
+        assert!(out.contains("ɵɵtwoWayProperty(\"ngModel\", ctx.x)"), "got: {out}");
+        assert!(out.contains("ɵɵtwoWayListener(\"ngModelChange\", function"), "got: {out}");
+        assert!(
+            out.contains("ɵɵtwoWayBindingSet(ctx.x, $event) || (ctx.x = $event)"),
+            "got: {out}"
+        );
+        assert!(!out.contains("ɵɵproperty(\"ngModel\""), "got: {out}");
     }
 
     #[test]
@@ -9067,6 +9590,50 @@ mod tests {
     }
 
     #[test]
+    fn for_block_computed_variables_read_index_and_count_locals() {
+        // `@for (x of xs; track x) { {{ $first }} {{ $last }} }`: Angular `ingestForBlock` makes
+        // `$first` / `$last` inline expressions over the index / count locals (`ɵ$index === 0`,
+        // `ɵ$index === ɵ$count - 1`), declaring `const $index_rN = ctx.$index` and `const $count_rN =
+        // ctx.$count` at the head of the update block, instead of reading `ctx.$first` / `ctx.$last`.
+        let item = Variable {
+            name: "x".to_string(),
+            value: "$implicit".to_string(),
+            source_span: t_span(),
+            key_span: t_span(),
+            value_span: None,
+        };
+        let text = |name: &str| {
+            Node::BoundText(BoundText {
+                value: prop_read(name),
+                source_span: t_span(),
+                i18n: None,
+            })
+        };
+        let block = ForLoopBlock {
+            item,
+            expression: AstWithSource::new(prop_read("xs"), None, String::new(), 0, vec![]),
+            track_by: Some(AstWithSource::new(prop_read("x"), None, String::new(), 0, vec![])),
+            track_keyword_span: None,
+            context_variables: vec![],
+            children: vec![text("$first"), text("$last")],
+            empty: None,
+            main_block_span: t_span(),
+            spans: block_spans(),
+            i18n: None,
+        };
+        let input = TemplateCompilationInput::new("Test_Template", vec![Node::ForLoopBlock(block)]);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let out = emit_with_hoisted(&builder, &func);
+
+        assert!(!out.contains("ctx.$first") && !out.contains("ctx.$last"), "got: {out}");
+        assert!(out.contains("const $index_r1 = ctx.$index;"), "got: {out}");
+        assert!(out.contains("const $count_r2 = ctx.$count;"), "got: {out}");
+        assert!(out.contains("$index_r1 === 0"), "got: {out}");
+        assert!(out.contains("$index_r1 === $count_r2 - 1"), "got: {out}");
+    }
+
+    #[test]
     fn for_block_track_index_uses_track_by_index() {
         let item = Variable {
             name: "x".to_string(),
@@ -9885,6 +10452,74 @@ mod tests {
             !out.contains("\u{0275}\u{0275}deferOnIdle("),
             "ɵɵdeferOnIdle must not be emitted when a when-trigger exists, got: {out}"
         );
+    }
+
+    #[test]
+    fn defer_triggers_follow_angular_group_and_kind_order_with_hydrate_runtime() {
+        use crate::template::r3_ast::{
+            BlockSpans, DeferredBlock, DeferredBlockTriggers, DeferredTrigger, DeferredTriggerKind,
+            TriggerKey, TriggerSpans,
+        };
+        let trig = |kind: DeferredTriggerKind| DeferredTrigger {
+            kind,
+            spans: TriggerSpans {
+                name_span: None,
+                source_span: t_span(),
+                prefetch_span: None,
+                when_or_on_source_span: None,
+                hydrate_span: None,
+            },
+        };
+        // Main: `on timer(500ms); on idle` (source order), so Angular's kind order emits idle first.
+        let mut main = DeferredBlockTriggers::default();
+        main.timer = Some(trig(DeferredTriggerKind::Timer { delay: 500.0 }));
+        main.push_order(TriggerKey::Timer);
+        main.idle = Some(trig(DeferredTriggerKind::Idle { timeout: None }));
+        main.push_order(TriggerKey::Idle);
+        // Hydrate: `hydrate on immediate`.
+        let mut hydrate = DeferredBlockTriggers::default();
+        hydrate.immediate = Some(trig(DeferredTriggerKind::Immediate));
+        hydrate.push_order(TriggerKey::Immediate);
+        let block = |triggers, hydrate_triggers| {
+            Node::DeferredBlock(DeferredBlock {
+                children: vec![],
+                triggers,
+                prefetch_triggers: DeferredBlockTriggers::default(),
+                hydrate_triggers,
+                placeholder: None,
+                loading: None,
+                error: None,
+                main_block_span: t_span(),
+                spans: BlockSpans {
+                    name_span: t_span(),
+                    source_span: t_span(),
+                    start_source_span: t_span(),
+                    end_source_span: None,
+                },
+                defined_name: None,
+                i18n: None,
+            })
+        };
+        // Two sibling hydrating defers: the runtime activator is emitted once, before the first defer.
+        let nodes = vec![block(main.clone(), hydrate.clone()), block(main, hydrate)];
+        let input = TemplateCompilationInput::new("MyApp_Template", nodes);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let out = emit_with_hoisted(&builder, &func);
+
+        assert_eq!(out.matches("\u{0275}\u{0275}enableIncrementalHydrationRuntime()").count(), 1, "got: {out}");
+        let activator = out.find("enableIncrementalHydrationRuntime()").unwrap();
+        let first_defer = out.find("\u{0275}\u{0275}defer(").unwrap();
+        assert!(activator < first_defer, "got: {out}");
+        // The defer op carries `TDeferDetailsFlags.HasHydrateTriggers` (1) as its trailing argument.
+        let defer_call = &out[first_defer..];
+        let defer_call = &defer_call[..defer_call.find(");").unwrap()];
+        assert!(defer_call.ends_with(", 1"), "hydrate flag missing, got: {defer_call}");
+        // Hydrate triggers come before the main group, and within the main group idle precedes timer.
+        let hydrate_at = out.find("deferHydrateOnImmediate()").unwrap();
+        let idle_at = out.find("deferOnIdle()").unwrap();
+        let timer_at = out.find("deferOnTimer(500)").unwrap();
+        assert!(hydrate_at < idle_at && idle_at < timer_at, "got: {out}");
     }
 
     #[test]

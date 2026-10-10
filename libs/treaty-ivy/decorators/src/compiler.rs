@@ -1053,7 +1053,9 @@ impl crate::expression_converter::PipeSlotAllocator for HostPureFunctions {
 /// create-block ops that consume no host vars. Mirrors the per-binding accounting in
 /// [`DefaultHostBindingsBuilder::build`].
 fn host_binding_var_count(prop: &str) -> usize {
-    if prop.starts_with("class.") || prop.starts_with("style.") {
+    // A whole-element `[class]` / `[style]` host binding is a ClassMap / StyleMap (two var slots), like
+    // the `class.x` / `style.x` styling bindings.
+    if prop.starts_with("class.") || prop.starts_with("style.") || prop == "class" || prop == "style" {
         2
     } else if prop.starts_with("animate.") {
         0
@@ -1290,6 +1292,8 @@ impl HostBindingsBuilder for DefaultHostBindingsBuilder {
         // `style.X`/`class.X` styling binding reserves TWO (the bound value plus styling bookkeeping).
         let mut style_stmts: Vec<Stmt> = Vec::new();
         let mut class_stmts: Vec<Stmt> = Vec::new();
+        let mut style_map_stmts: Vec<Stmt> = Vec::new();
+        let mut class_map_stmts: Vec<Stmt> = Vec::new();
 
         // Pure-literal extraction (`generatePureLiteralStructures`): a literal array/object host
         // binding value becomes a `ɵɵpureFunctionN` whose `varOffset` is assigned AFTER every regular
@@ -1323,6 +1327,21 @@ impl HostBindingsBuilder for DefaultHostBindingsBuilder {
                 body.push(Stmt::bare(StmtKind::Return(value)));
                 let callback = o::fn_(Vec::new(), body, None, Some(cb_name));
                 animate_stmts.push(host_instruction(reference, vec![callback]));
+                continue;
+            }
+
+            // A whole-element `[class]="exp"` / `[style]="exp"` host binding is a ClassMap / StyleMap
+            // (`style_binding_specialization.ts`), flushed before the per-key styling props.
+            if prop == "class" {
+                host_vars += 2;
+                class_map_stmts.extend(spill);
+                class_map_stmts.push(host_instruction(R3::ClassMap, vec![value]));
+                continue;
+            }
+            if prop == "style" {
+                host_vars += 2;
+                style_map_stmts.extend(spill);
+                style_map_stmts.push(host_instruction(R3::StyleMap, vec![value]));
                 continue;
             }
 
@@ -1380,7 +1399,10 @@ impl HostBindingsBuilder for DefaultHostBindingsBuilder {
             update_stmts.push(stmt);
         }
         create_stmts.extend(animate_stmts);
-        // Styling flush: all style bindings, then all class bindings (Angular's styling order).
+        // Styling flush (`ordering.ts` UPDATE_HOST_ORDERING): the whole-element StyleMap then ClassMap
+        // (keep-last), then the per-key StyleProp, then ClassProp.
+        update_stmts.extend(style_map_stmts);
+        update_stmts.extend(class_map_stmts);
         update_stmts.extend(style_stmts);
         update_stmts.extend(class_stmts);
 
@@ -3087,6 +3109,24 @@ mod tests {
             js.contains("hostVars: 1") || js.contains("hostVars:1"),
             "expected hostVars: 1: {js}"
         );
+    }
+
+    #[test]
+    fn host_class_and_style_property_reify_to_class_map_and_style_map() {
+        // `host: { '[class]': 'c', '[style]': 's' }` is a whole-element ClassMap / StyleMap (`ɵɵclassMap(ctx.c)`,
+        // `ɵɵstyleMap(ctx.s)`), each reserving two host vars (`style_binding_specialization.ts`), not a
+        // `ɵɵdomProperty("class")`. The styleMap is flushed before the classMap.
+        let mut meta = directive_meta("D", "[d]");
+        meta.host.properties.insert("class".to_string(), "c".to_string());
+        meta.host.properties.insert("style".to_string(), "s".to_string());
+        let mut hb = DefaultHostBindingsBuilder;
+        let compiled = compile_directive_from_metadata(&meta, &mut hb);
+        let js = emit_expression(&compiled.expression);
+        assert!(js.contains("ɵɵclassMap(ctx.c)"), "missing classMap: {js}");
+        assert!(js.contains("ɵɵstyleMap(ctx.s)"), "missing styleMap: {js}");
+        assert!(!js.contains("ɵɵdomProperty(\"class\""), "class must not be a domProperty: {js}");
+        assert!(js.find("ɵɵstyleMap").unwrap() < js.find("ɵɵclassMap").unwrap(), "{js}");
+        assert!(js.contains("hostVars: 4") || js.contains("hostVars:4"), "expected hostVars: 4: {js}");
     }
 
     #[test]

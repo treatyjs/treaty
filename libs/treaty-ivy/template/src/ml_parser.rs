@@ -234,10 +234,16 @@ impl ParseError {
 
 mod chars {
     pub const EOF: u32 = 0;
+    // Mirrors Angular chars.ts; not every code point is referenced by this port yet.
+    #[allow(dead_code)]
     pub const BSPACE: u32 = 8;
     pub const TAB: u32 = 9;
     pub const LF: u32 = 10;
+    // Mirrors Angular chars.ts (unused by this port's lexer so far).
+    #[allow(dead_code)]
     pub const VTAB: u32 = 11;
+    // Mirrors Angular chars.ts (form feed is not a separate lexer case in this port).
+    #[allow(dead_code)]
     pub const FF: u32 = 12;
     pub const CR: u32 = 13;
     pub const SPACE: u32 = 32;
@@ -261,6 +267,8 @@ mod chars {
     pub const GT: u32 = 62;
 
     pub const D0: u32 = 48;
+    // Mirrors Angular chars.ts; kept for the octal-digit helper's parity.
+    #[allow(dead_code)]
     pub const D7: u32 = 55;
     pub const D9: u32 = 57;
 
@@ -275,12 +283,24 @@ mod chars {
     pub const UNDERSCORE: u32 = 95;
 
     pub const A_LO: u32 = 97;
+    // Mirrors Angular chars.ts (escape-sequence letters not lexed by this port).
+    #[allow(dead_code)]
     pub const B_LO: u32 = 98;
     pub const F_LO: u32 = 102;
+    // Mirrors Angular chars.ts (escape-sequence letters not lexed by this port).
+    #[allow(dead_code)]
     pub const N_LO: u32 = 110;
+    // Mirrors Angular chars.ts (escape-sequence letters not lexed by this port).
+    #[allow(dead_code)]
     pub const R_LO: u32 = 114;
+    // Mirrors Angular chars.ts (escape-sequence letters not lexed by this port).
+    #[allow(dead_code)]
     pub const T_LO: u32 = 116;
+    // Mirrors Angular chars.ts (escape-sequence letters not lexed by this port).
+    #[allow(dead_code)]
     pub const U_LO: u32 = 117;
+    // Mirrors Angular chars.ts (escape-sequence letters not lexed by this port).
+    #[allow(dead_code)]
     pub const V_LO: u32 = 118;
     pub const X_LO: u32 = 120;
     pub const Z_LO: u32 = 122;
@@ -307,6 +327,8 @@ mod chars {
     pub fn is_new_line(code: u32) -> bool {
         code == LF || code == CR
     }
+    // Mirrors Angular chars.ts `isOctalDigit`; not called by this port's lexer yet.
+    #[allow(dead_code)]
     pub fn is_octal_digit(code: u32) -> bool {
         D0 <= code && code <= D7
     }
@@ -627,6 +649,8 @@ pub struct Token {
 }
 
 impl Token {
+    // Mirrors Angular ml_parser `Token` helper; not used by this port's tree builder yet.
+    #[allow(dead_code)]
     fn is_interpolated_text(&self) -> bool {
         matches!(
             self.kind,

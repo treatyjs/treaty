@@ -21,7 +21,7 @@ This harness runs Treaty's Rust/OXC Angular compiler (`render3` crate, via the
 | Skipped (un-runnable) | 471 |
 | **Pass-rate (of runnable subset)** | **100.0%** (189/189) |
 | Pass-rate (of full corpus) | 28.6% (189/660) |
-| **Partial-golden bucket** (separate; no full golden) | **39.6%** PASS (137/346 runnable, 448 candidates, 209 DIFF, 102 skipped) |
+| **Partial-golden bucket** (separate; no full golden) | **50.0%** PASS (173/346 runnable, 448 candidates, 173 DIFF, 102 skipped) |
 
 ### How a case is run and matched
 
@@ -267,58 +267,55 @@ Cases with no full `ɵɵdefine*` golden: a template-function golden (for example
 
 Reported separately so the full-golden numbers above stay comparable. i18n macros and
 i18n extra checks are skipped (they need Angular's message serializer). The `// SOURCE:`
-source-map assertions are not verified: 191 assertion(s) in 31 passing case(s).
+source-map assertions are not verified: 191 assertion(s) in 37 passing case(s).
 
 | Metric | Value |
 | --- | --- |
 | Candidates (no full golden) | 448 |
 | Runnable | 346 |
-| PASS | 137 |
-| DIFF | 209 |
+| PASS | 173 |
+| DIFF | 173 |
 | Skipped | 102 |
 
 ### Partial DIFF categories
 
 | Count | Category (token at which the golden stops matching) |
 | --- | --- |
-| 93 | `token-outside-instruction` |
+| 83 | `token-outside-instruction` |
 | 21 | `class-shape (static ɵ members / class body)` |
-| 16 | `placeholder-binding` |
-| 7 | `args-of:ɵɵdomProperty` |
-| 6 | `missing-instruction:ɵɵtwoWayListener` |
+| 7 | `placeholder-binding` |
+| 6 | `args-of:ɵɵdomProperty` |
 | 5 | `args-of:ɵɵnextContext` |
-| 4 | `args-of:ɵɵtextInterpolate` |
 | 4 | `args-of:ɵɵstyleProp` |
 | 4 | `missing-instruction:ɵɵdomProperty` |
-| 4 | `missing-instruction:ɵɵenableIncrementalHydrationRuntime` |
 | 3 | `args-of:ɵɵelementStart` |
 | 3 | `args-of:ɵɵtextInterpolate1` |
-| 3 | `args-of:ɵɵelement` |
 | 3 | `args-of:ɵɵpureFunction0` |
 | 3 | `missing-instruction:ɵɵelementStart` |
-| 2 | `missing-instruction:ɵɵinterpolate` |
+| 2 | `args-of:ɵɵtextInterpolate` |
+| 2 | `args-of:ɵɵrestoreView` |
 | 2 | `missing-instruction:ɵɵproperty` |
+| 2 | `args-of:ɵɵdeferPrefetchOnViewport` |
 | 2 | `args-of:ɵɵdeferOnInteraction` |
 | 2 | `args-of:ɵɵpipe` |
-| 2 | `args-of:ɵɵattribute` |
-| 2 | `args-of:ɵɵproperty` |
+| 1 | `args-of:ɵɵclassMap` |
 | 1 | `args-of:ɵɵinterpolate1` |
 | 1 | `missing-instruction:ɵɵExternalStylesFeature` |
 | 1 | `args-of:ɵɵpureFunction2` |
-| 1 | `args-of:ɵɵresetView` |
-| 1 | `missing-instruction:ɵɵdeferOnImmediate` |
-| 1 | `missing-instruction:ɵɵdeferPrefetchOnIdle` |
+| 1 | `args-of:ɵɵdeferOnHover` |
+| 1 | `args-of:ɵɵdeferPrefetchOnHover` |
 | 1 | `args-of:ɵɵdeferOnViewport` |
-| 1 | `missing-instruction:ɵɵdeferPrefetchOnViewport` |
+| 1 | `args-of:ɵɵdeferHydrateOnViewport` |
 | 1 | `missing-instruction:ɵɵtextInterpolate1` |
 | 1 | `args-of:ɵɵconditionalCreate` |
 | 1 | `args-of:ɵɵconditional` |
-| 1 | `missing-instruction:ɵɵtwoWayProperty` |
+| 1 | `args-of:ɵɵelement` |
 | 1 | `missing-instruction:ɵɵsyntheticHostListener` |
-| 1 | `missing-instruction:ɵɵstyleMap` |
 | 1 | `args-of:ɵɵlistener` |
+| 1 | `args-of:ɵɵproperty` |
 | 1 | `missing-instruction:ɵɵelementContainerStart` |
 | 1 | `missing-instruction:ɵɵelementContainer` |
+| 1 | `args-of:ɵɵattribute` |
 | 1 | `args-of:ɵɵprojection` |
 
 ### Partial skip reasons
@@ -343,18 +340,28 @@ source-map assertions are not verified: 191 assertion(s) in 31 passing case(s).
 
 - `args-of:ɵɵattribute` — r3_compiler_compliance/elements/should validate iframe attributes
   - missing "," after "\t\t\ti0.ɵɵattribute(\"fetchpriority\", \"low\""
-- `args-of:ɵɵattribute` — r3_view_compiler_bindings/attribute_bindings/should chain multiple attribute bindings into a single instruction
-  - missing "\"title\"" after "\t\t\ti0.ɵɵattribute("
+- `args-of:ɵɵclassMap` — r3_view_compiler_styling/interpolations/should generate the proper update instructions for interpolated classes
+  - missing "ctx" after "\t\t\ti0.ɵɵclassMap("
 - `args-of:ɵɵconditional` — r3_view_compiler_control_flow/should generate a switch block with multiple/consecutive case expressions
   - missing "tmp_1_0" after "\t\t\ti0.ɵɵconditional(("
 - `args-of:ɵɵconditionalCreate` — r3_view_compiler_control_flow/should generate a switch block with cases that have ng-template root nodes
   - missing "," after "...ɵɵconditionalCreate(0, MyApp_Case_0_Template, 1, 1"
+- `args-of:ɵɵdeferHydrateOnViewport` — r3_view_compiler_deferred/should generate a defer block with a `hydrate on viewport` trigger that has options
+  - missing "{" after "\t\t\ti0.ɵɵdeferHydrateOnViewport("
+- `args-of:ɵɵdeferOnHover` — r3_view_compiler_deferred/should generate a deferred block with triggers
+  - missing "0" after "\t\t\ti0.ɵɵdeferOnHover("
 - `args-of:ɵɵdeferOnInteraction` — r3_view_compiler_deferred/should generate a deferred block with an interaction trigger in a parent view
   - missing "1" after "\t\ti0.ɵɵdeferOnInteraction("
 - `args-of:ɵɵdeferOnInteraction` — r3_view_compiler_deferred/should generate a deferred block with an interaction trigger in the same view
   - missing "7" after "\t\t\ti0.ɵɵdeferOnInteraction("
 - `args-of:ɵɵdeferOnViewport` — r3_view_compiler_deferred/should generate a defer block with a `on viewport` trigger that has options
   - missing "0" after "\t\t\ti0.ɵɵdeferOnViewport("
+- `args-of:ɵɵdeferPrefetchOnHover` — r3_view_compiler_deferred/should generate a deferred block with prefetch triggers
+  - missing "0" after "\t\t\ti0.ɵɵdeferPrefetchOnHover("
+- `args-of:ɵɵdeferPrefetchOnViewport` — r3_view_compiler_deferred/should generate a defer block with a `prefetch on viewport` trigger that has options
+  - missing "0" after "\t\t\ti0.ɵɵdeferPrefetchOnViewport("
+- `args-of:ɵɵdeferPrefetchOnViewport` — r3_view_compiler_deferred/should insert hydrate triggers before all other triggers
+  - missing "0" after "\t\t\ti0.ɵɵdeferPrefetchOnViewport("
 - `args-of:ɵɵdomProperty` — r3_view_compiler_bindings/host_bindings/should chain both host properties in the decorator and on the class
   - missing "\"tabIndex\"" after "\t\t\ti0.ɵɵdomProperty("
 - `args-of:ɵɵdomProperty` — r3_view_compiler_bindings/host_bindings/should chain multiple host property bindings in the presence of other bindings
@@ -363,18 +370,12 @@ source-map assertions are not verified: 191 assertion(s) in 31 passing case(s).
   - missing "\"tabIndex\"" after "\t\t\ti0.ɵɵdomProperty(\"title\", ctx.myTitle)("
 - `args-of:ɵɵdomProperty` — r3_view_compiler_bindings/host_bindings/should sanitize dangerous bindings
   - missing "\"innerHTML\"" after "\t\t\ti0.ɵɵdomProperty("
-- `args-of:ɵɵdomProperty` — r3_view_compiler_bindings/property_bindings/should generate attribute instructions for DOM-only ARIA bindings
-  - missing "\"ariaLabel\"" after "\t\t\ti0.ɵɵdomProperty("
 - `args-of:ɵɵdomProperty` — r3_view_compiler_bindings/property_bindings/should sanitize dangerous bindings
   - missing "," after "\t\t\ti0.ɵɵdomProperty(\"sandbox\", ctx.evil"
 - `args-of:ɵɵdomProperty` — r3_view_compiler_template/should handle a bindings on plain ng-template elements
   - missing "(" after "\t\t\ti0.ɵɵdomProperty(\"p\", ctx.p1)"
 - `args-of:ɵɵelement` — r3_view_compiler_bindings/non_bindable_behavior/should not generate extra instructions for elements with no children
   - missing ")" after "\t\t\ti0.ɵɵelement(0, \"div\""
-- `args-of:ɵɵelement` — r3_view_compiler_styling/class_bindings/should not create instructions for empty class bindings
-  - missing "," after "\t\t\ti0.ɵɵelement(0, \"div\""
-- `args-of:ɵɵelement` — r3_view_compiler_styling/style_bindings/should not create instructions for empty style bindings
-  - missing "," after "\t\t\ti0.ɵɵelement(0, \"div\""
 - `args-of:ɵɵelementStart` — r3_compiler_compliance/components_and_directives/content_projection/should support content projection in nested templates
   - missing "2" after "\t\ti0.ɵɵelementStart(0, \"div\","
 - `args-of:ɵɵelementStart` — r3_view_compiler_listener/should generate a two-way binding to a @for loop variable that is a signal
@@ -401,8 +402,6 @@ source-map assertions are not verified: 191 assertion(s) in 31 passing case(s).
   - missing "3" after "\t\t\ti0.ɵɵpipe("
 - `args-of:ɵɵprojection` — r3_compiler_compliance/components_and_directives/content_projection/should support content projection in both the root and nested templates
   - missing "3" after "\t\ti0.ɵɵprojection(0,"
-- `args-of:ɵɵproperty` — r3_view_compiler/any/should strip out $any wrappers
-  - missing "10" after "\t\t\ti0.ɵɵproperty(\"tabIndex\","
 - `args-of:ɵɵproperty` — r3_view_compiler/safe_access/should handle safe keyed reads inside templates with legacyOptionalChaining
   - missing "(" after "\t\t\ti0.ɵɵproperty(\"title\", \"Your last name is \" + ("
 - `args-of:ɵɵpureFunction0` — r3_view_compiler_styling/mixed_style_and_class/should properly offset multiple style pipe references for styling bindings
@@ -413,24 +412,22 @@ source-map assertions are not verified: 191 assertion(s) in 31 passing case(s).
   - missing "_c0" after "\t\t\t\ttypeof i0.ɵɵpureFunction0(13,"
 - `args-of:ɵɵpureFunction2` — r3_view_compiler_styling/binding_slots/should generate the correct amount of host bindings when styling is present
   - missing "_c1" after "...ntheticHostProperty(\"@anim\", i0.ɵɵpureFunction2(7,"
-- `args-of:ɵɵresetView` — r3_view_compiler_listener/should generate the view restoration statements if a keyed write is used in an event listener from within an ng-template
-  - missing "[" after "\t\t\treturn i0.ɵɵresetView(ctx_r1"
-- `args-of:ɵɵstyleProp` — r3_view_compiler_bindings/host_bindings/should allow $any in host binding expressions
-  - missing "\"red\"" after "\t\t\ti0.ɵɵstyleProp(\"color\","
+- `args-of:ɵɵrestoreView` — r3_view_compiler_listener/should reference correct context in listener inside embedded view
+  - missing "." after "\t\t\tconst $restored_3$ = i0.ɵɵrestoreView($s_2$)"
+- `args-of:ɵɵrestoreView` — r3_view_compiler_template/should correctly bind to context in nested template
+  - missing "." after "\t\t\tconst $restored_5$ = i0.ɵɵrestoreView($s_4$)"
 - `args-of:ɵɵstyleProp` — r3_view_compiler_styling/host_bindings/should generate override instructions for only single-level styling bindings when !important is present
   - missing "\"width\"" after "\t\t\ti0.ɵɵstyleProp("
+- `args-of:ɵɵstyleProp` — r3_view_compiler_styling/host_bindings/should generate style/class instructions for multiple host binding definitions
+  - missing "\"height\"" after "\t\t\ti0.ɵɵstyleProp("
 - `args-of:ɵɵstyleProp` — r3_view_compiler_styling/interpolations/should generate the proper update instructions for interpolated style properties
   - missing "ctx" after "\t\t\ti0.ɵɵstyleProp(\"color\","
 - `args-of:ɵɵstyleProp` — r3_view_compiler_styling/interpolations/should generate update instructions for interpolated style properties with !important
   - missing "\"width\"" after "\t\t\ti0.ɵɵstyleProp("
 - `args-of:ɵɵtextInterpolate` — r3_view_compiler/nullish_coalescing/should preserve required parentheses for nullish coalescing with legacyOptionalChaining
   - missing "(" after "\t\t\ti0.ɵɵtextInterpolate("
-- `args-of:ɵɵtextInterpolate` — source_mapping/inline_templates/should map *ngFor scenario (full compile)
-  - missing "item_r1" after "\t\ti0.ɵɵtextInterpolate("
 - `args-of:ɵɵtextInterpolate` — source_mapping/inline_templates/should map *ngIf scenario (full compile)
   - missing "ctx_r0" after "\t\ti0.ɵɵtextInterpolate("
-- `args-of:ɵɵtextInterpolate` — source_mapping/inline_templates/should map ng-template [ngFor] scenario (full compile)
-  - missing "item_r1" after "\t\ti0.ɵɵtextInterpolate("
 - `args-of:ɵɵtextInterpolate1` — r3_view_compiler_let/should transform an invalid let reference to undefined
   - missing "undefined" after "\t\ti0.ɵɵtextInterpolate1(\" \","
 - `args-of:ɵɵtextInterpolate1` — r3_view_compiler_template/should safely nest ternary operations with legacyOptionalChaining
@@ -479,12 +476,6 @@ source-map assertions are not verified: 191 assertion(s) in 31 passing case(s).
   - missing "static" after "\n"
 - `class-shape (static ɵ members / class body)` — r3_view_compiler/should be able to generate the TODO example
   - missing "static" after "\n"
-- `missing-instruction:ɵɵdeferOnImmediate` — r3_view_compiler_deferred/should generate a deferred block with triggers
-  - missing "ɵdeferOnImmediate" after "\t\t\ti0.ɵ"
-- `missing-instruction:ɵɵdeferPrefetchOnIdle` — r3_view_compiler_deferred/should generate a deferred block with prefetch triggers
-  - missing "ɵdeferPrefetchOnIdle" after "\t\t\ti0.ɵ"
-- `missing-instruction:ɵɵdeferPrefetchOnViewport` — r3_view_compiler_deferred/should generate a defer block with a `prefetch on viewport` trigger that has options
-  - missing "ɵdeferPrefetchOnViewport" after "\t\t\ti0.ɵ"
 - `missing-instruction:ɵɵdomProperty` — r3_view_compiler_bindings/host_bindings/should chain multiple host attribute bindings in the presence of other bindings
   - missing "ɵdomProperty" after "\t\t\ti0.ɵ"
 - `missing-instruction:ɵɵdomProperty` — r3_view_compiler_bindings/host_bindings/should support host bindings to ARIA attributes
@@ -503,76 +494,30 @@ source-map assertions are not verified: 191 assertion(s) in 31 passing case(s).
   - missing "ɵelementStart" after "\t\ti0.ɵ"
 - `missing-instruction:ɵɵelementStart` — r3_view_compiler_deferred/should generate a deferred block with no dependencies followed by one that has dependencies
   - missing "ɵelementStart" after "\t\t\ti0.ɵ"
-- `missing-instruction:ɵɵenableIncrementalHydrationRuntime` — r3_view_compiler_deferred/should emit `ɵɵenableIncrementalHydrationRuntime` only once per view, even when multiple sibling `@defer` blocks use hydrate triggers
-  - missing "ɵenableIncrementalHydrationRuntime" after "\t\t\ti0.ɵ"
-- `missing-instruction:ɵɵenableIncrementalHydrationRuntime` — r3_view_compiler_deferred/should generate a defer block with a `hydrate on viewport` trigger that has options
-  - missing "ɵenableIncrementalHydrationRuntime" after "\t\t\ti0.ɵ"
-- `missing-instruction:ɵɵenableIncrementalHydrationRuntime` — r3_view_compiler_deferred/should generate a deferred block with hydrate triggers
-  - missing "ɵenableIncrementalHydrationRuntime" after "\t\t\ti0.ɵ"
-- `missing-instruction:ɵɵenableIncrementalHydrationRuntime` — r3_view_compiler_deferred/should insert hydrate triggers before all other triggers
-  - missing "ɵenableIncrementalHydrationRuntime" after "\t\t\ti0.ɵ"
 - `missing-instruction:ɵɵExternalStylesFeature` — r3_view_compiler_styling/component_styles/should emit external runtime styles component feature for file-based styles when 'externalRuntimeStyles' option is enabled
   - missing "ɵExternalStylesFeature" after "MyComponent.ɵ"
-- `missing-instruction:ɵɵinterpolate` — source_mapping/inline_templates/should map interpolated properties (full compile)
-  - missing "ɵinterpolate" after "\t\t\ti0.ɵ"
-- `missing-instruction:ɵɵinterpolate` — source_mapping/inline_templates/should map interpolated properties (partial compile)
-  - missing "ɵinterpolate" after "\t\t\ti0.ɵ"
 - `missing-instruction:ɵɵproperty` — r3_view_compiler_bindings/property_bindings/should generate synthetic bindings and listeners on structural directives
   - missing "ɵproperty" after "\t\ti0.ɵ"
 - `missing-instruction:ɵɵproperty` — r3_view_compiler_template/should handle attribute bindings inside an ng-template
   - missing "ɵproperty" after "\t\ti0.ɵ"
-- `missing-instruction:ɵɵstyleMap` — r3_view_compiler_bindings/host_bindings/should handle security-sensitive style bindings
-  - missing "ɵstyleMap" after "\t\t\ti0.ɵ"
 - `missing-instruction:ɵɵsyntheticHostListener` — r3_view_compiler_bindings/host_bindings/should chain multiple regular and synthetic host listeners into two instructions
   - missing "ɵsyntheticHostListener" after "\t\t\ti0.ɵ"
 - `missing-instruction:ɵɵtextInterpolate1` — r3_view_compiler_control_flow/should not generate code for empty switch blocks
   - missing "ɵtextInterpolate1" after "\t\t\ti0.ɵ"
-- `missing-instruction:ɵɵtwoWayListener` — r3_view_compiler_listener/should generate a nested two-way binding
-  - missing "ɵtwoWayListener" after "\t\ti0.ɵ"
-- `missing-instruction:ɵɵtwoWayListener` — r3_view_compiler_listener/should generate a simple two-way binding
-  - missing "ɵtwoWayListener" after "\t\t\ti0.ɵ"
-- `missing-instruction:ɵɵtwoWayListener` — r3_view_compiler_listener/should generate a two-way binding to a $any expression
-  - missing "ɵtwoWayListener" after "\t\t\ti0.ɵ"
-- `missing-instruction:ɵɵtwoWayListener` — r3_view_compiler_listener/should maintain the binding order between plain listeners and listeners part of a two-way binding
-  - missing "ɵtwoWayListener" after "\t\t\ti0.ɵ"
-- `missing-instruction:ɵɵtwoWayListener` — source_mapping/inline_templates/should map a longhand two-way binding expression (full compile)
-  - missing "ɵtwoWayListener" after "\t\t\ti0.ɵ"
-- `missing-instruction:ɵɵtwoWayListener` — source_mapping/inline_templates/should map a two-way binding expression (full compile)
-  - missing "ɵtwoWayListener" after "\t\t\ti0.ɵ"
-- `missing-instruction:ɵɵtwoWayProperty` — r3_view_compiler_bindings/property_bindings/should maintain the binding order between one-way and two-way properties
-  - missing "ɵtwoWayProperty" after "\t\t\ti0.ɵ"
 - `placeholder-binding` — r3_view_compiler_bindings/attribute_bindings/should chain attribute bindings in the presence of other bindings
   - missing "$r3$" after "\t\t\ti0.ɵɵattribute(\"aria-label\","
 - `placeholder-binding` — r3_view_compiler_bindings/attribute_bindings/should generate the proper update instructions for interpolated attributes
   - missing "$r3$" after "\t\t\ti0.ɵɵattribute(\"title\","
 - `placeholder-binding` — r3_view_compiler_bindings/attribute_bindings/should not add interpolated attributes to the attribute instruction chain
   - missing "$r3$" after "\t\t\ti0.ɵɵattribute(\"tabindex\","
-- `placeholder-binding` — r3_view_compiler_bindings/property_bindings/should chain property bindings in the presence of other bindings
-  - missing "$r3$" after "\t\t\ti0.ɵɵproperty(\"label\","
-- `placeholder-binding` — r3_view_compiler_bindings/property_bindings/should generate interpolation instruction for {{...}} bindings
-  - missing "$r3$" after "\t\t\ti0.ɵɵproperty(\"title\","
-- `placeholder-binding` — r3_view_compiler_bindings/property_bindings/should generate the proper update instructions for interpolated properties
-  - missing "$r3$" after "\t\t\ti0.ɵɵproperty(\"title\","
-- `placeholder-binding` — r3_view_compiler_bindings/property_bindings/should not add interpolated properties to the property instruction chain
-  - missing "$r3$" after "\t\t\ti0.ɵɵproperty(\"tabindex\","
 - `placeholder-binding` — r3_view_compiler_control_flow/should optimize tracking function that calls a method on the component with $index and the item from a nested template
   - missing "$r3$" after "...pp_ng_template_2_For_1_Template, 0, 0, null, null,"
 - `placeholder-binding` — r3_view_compiler_control_flow/should support `@else if` with same alias as `@if`
   - missing "$r3$" after "\n"
 - `placeholder-binding` — r3_view_compiler_control_flow/should support `as` on multiple conditional branches
   - missing "$r3$" after "\n"
-- `placeholder-binding` — r3_view_compiler_styling/host_bindings/should support class interpolation
-  - missing "$r3$" after "\t\t\ti0.ɵɵclassMap("
-- `placeholder-binding` — r3_view_compiler_styling/host_bindings/should support style interpolation
-  - missing "$r3$" after "\t\t\ti0.ɵɵstyleMap("
-- `placeholder-binding` — r3_view_compiler_styling/interpolations/should generate the proper update instructions for interpolated classes
-  - missing "$r3$" after "\t\t\ti0.ɵɵclassMap("
-- `placeholder-binding` — r3_view_compiler_styling/style_bindings/should correctly count the total slots required when style/class bindings include interpolation
-  - missing "$r3$" after "\t\t\ti0.ɵɵclassMap("
-- `placeholder-binding` — r3_view_compiler_template/should allow directive inputs as an interpolated prop on <ng-template>
-  - missing "$r3$" after "\t\t\ti0.ɵɵproperty(\"dir\","
-- `placeholder-binding` — r3_view_compiler_template/should allow directive inputs as an interpolated prop on <ng-template> (with structural directives)
-  - missing "$r3$" after "\t\ti0.ɵɵproperty(\"dir\","
+- `placeholder-binding` — r3_view_compiler_deferred/should generate a deferred block with hydrate triggers
+  - missing "$r3$" after "\n"
 - `token-outside-instruction` — r3_compiler_compliance/components_and_directives/content_projection/support projectAs on ng-content
   - missing "const" after "\n"
 - `token-outside-instruction` — r3_compiler_compliance/components_and_directives/should emit a valid setClassMetadata call in ES5 if a class with a custom decorator is referencing itself inside its own metadata
@@ -608,19 +553,17 @@ source-map assertions are not verified: 191 assertion(s) in 31 passing case(s).
 - `token-outside-instruction` — r3_view_compiler_control_flow/should be able to refer to aliased template variables in nested for blocks
   - missing "ctx" after "\t\tconst ctx_r2 ="
 - `token-outside-instruction` — r3_view_compiler_control_flow/should be able to use for loop variables in an event listener
-  - missing "$index" after "\t\t\tconst $count_r2 = $restored_5$."
+  - missing "$index" after "\t\t\tconst $count_r2 = $restored_6$."
 - `token-outside-instruction` — r3_view_compiler_control_flow/should expose the alias to nested event listeners
   - missing "const" after "\n"
 - `token-outside-instruction` — r3_view_compiler_control_flow/should generate a for block that tracks by a field on the item
   - missing "(" after "\t\tconst item_r1 ="
-- `token-outside-instruction` — r3_view_compiler_control_flow/should generate a for block with aliased template variables
-  - missing "ctx" after "\t\tconst ctx_r1 ="
 - `token-outside-instruction` — r3_view_compiler_control_flow/should generate a for block with an element root node
   - missing "0" after "...peaterCreate(0, MyApp_For_1_Template, 2, 2, \"div\","
 - `token-outside-instruction` — r3_view_compiler_control_flow/should generate a for block with an ng-template root node
   - missing "0" after "...epeaterCreate(0, MyApp_For_1_Template, 1, 1, null,"
 - `token-outside-instruction` — r3_view_compiler_control_flow/should generate a for block with references both to original and aliased template variables
-  - missing "ctx" after "\t\tconst ctx_r1 ="
+  - missing "$index" after "\t\tconst $count_r2 = ctx."
 - `token-outside-instruction` — r3_view_compiler_control_flow/should generate a for block with template variables
   - missing "$index" after "\t\tconst $count_r2 = ctx."
 - `token-outside-instruction` — r3_view_compiler_control_flow/should generate a nested for block
@@ -638,13 +581,11 @@ source-map assertions are not verified: 191 assertion(s) in 31 passing case(s).
 - `token-outside-instruction` — r3_view_compiler_control_flow/should generate computed for loop variables that depend on shadowed $index and $count
   - missing "ctx" after "\t\tconst ctx_r3 ="
 - `token-outside-instruction` — r3_view_compiler_control_flow/should generate computed for loop variables that depend on shadowed $index and $count inside of listeners
-  - missing "const" after "\n"
+  - missing "$index" after "\t\t\tconst innermostOdd_r19 = $restored_24$."
 - `token-outside-instruction` — r3_view_compiler_control_flow/should generate tracking function in a nested for loop
   - missing "_forTrack0" after "function"
 - `token-outside-instruction` — r3_view_compiler_control_flow/should not expose for loop variables to the surrounding scope
   - missing "$index" after "\t\tconst $count_r2 = ctx."
-- `token-outside-instruction` — r3_view_compiler_control_flow/should parenthesize context variables used in an expression
-  - missing "$index" after "\t\tconst $odd_r1 = ctx."
 - `token-outside-instruction` — r3_view_compiler_control_flow/should preserve object and array literals inside tracking expressions
   - missing "$index" after "function MyApp_For_1_Template("
 - `token-outside-instruction` — r3_view_compiler_control_flow/should reuse identical impure tracking functions
@@ -684,7 +625,7 @@ source-map assertions are not verified: 191 assertion(s) in 31 passing case(s).
 - `token-outside-instruction` — r3_view_compiler_i18n/namespaces/should handle namespaces on i18n block containers
   - missing "/*" after "\n"
 - `token-outside-instruction` — r3_view_compiler_i18n/should support i18n nodes with ICUs inside
-  - missing "diskView_r1" after "\t\tconst"
+  - missing "$implicit" after "\t\tconst diskView_r1 = ctx."
 - `token-outside-instruction` — r3_view_compiler_i18n/whitespace_preserving_mode/should keep inner content of i18n block as is
   - missing "/*" after "\n"
 - `token-outside-instruction` — r3_view_compiler_listener/should chain multiple listeners on the same template
@@ -695,40 +636,24 @@ source-map assertions are not verified: 191 assertion(s) in 31 passing case(s).
   - missing ")" after "...ick\", function Comp_Template_div_click_0_listener("
 - `token-outside-instruction` — r3_view_compiler_listener/should preserve accesses to $event if it is done through `this` in a listener inside a host binding
   - missing ")" after "...er(\"click\", function Dir_click_HostBindingHandler("
-- `token-outside-instruction` — r3_view_compiler_listener/should reference correct context in listener inside embedded view
-  - missing "const" after "\n"
-- `token-outside-instruction` — r3_view_compiler_styling/binding_slots/should count only non-style and non-class host bindings on Components
-  - missing "6" after "\thostVars:"
 - `token-outside-instruction` — r3_view_compiler_styling/component_styles/should pass in the component metadata styles into the component definition and shim them using style encapsulation
   - missing "\"div.bar { color: blue; }\\n\"" after "\tselectors: ["
-- `token-outside-instruction` — r3_view_compiler_styling/host_bindings/should generate style/class instructions for a host component creation definition
-  - missing "8" after "\thostVars:"
-- `token-outside-instruction` — r3_view_compiler_styling/host_bindings/should generate style/class instructions for multiple host binding definitions
-  - missing "12" after "\thostVars:"
-- `token-outside-instruction` — r3_view_compiler_styling/host_bindings/should generate styling instructions for multiple directives that contain host binding definitions
-  - missing "2" after "\thostVars:"
 - `token-outside-instruction` — r3_view_compiler_styling/style_bindings/should not mangle css custom property names
   - missing "\"--camel-case\"" after "\n"
 - `token-outside-instruction` — r3_view_compiler_styling/style_bindings/should support style bindings with a colon at the start of the applied style
   - missing "\":root {color\"" after "\n"
-- `token-outside-instruction` — r3_view_compiler_template/should break large element creation chains
-  - missing ";" after "...\")(252, \"div\")(253, \"div\")(254, \"div\")(255, \"div\")"
-- `token-outside-instruction` — r3_view_compiler_template/should correctly bind to context in nested template
-  - missing "const" after "\n"
+- `token-outside-instruction` — r3_view_compiler_template/should allow directive inputs as an interpolated prop on <ng-template> (with structural directives)
+  - missing "null" after "...template(0, TestComp_ng_template_0_Template, 1, 2,"
 - `token-outside-instruction` — r3_view_compiler_template/should correctly bind to context in nested template with many bindings
-  - missing "const" after "\n"
-- `token-outside-instruction` — r3_view_compiler_template/should handle implict contezt in ng-template
-  - missing "ctx" after "\t\tconst ctx_r1 ="
+  - missing "$implicit" after "\t\t\tconst d_r1 = $restored_4$."
 - `token-outside-instruction` — r3_view_compiler_template/should handle ngFor context variables when used in bindings
-  - missing "ctx" after "\t\tconst ctx_r1 ="
+  - missing "$implicit" after "\t\tconst someElem_r1 = ctx."
 - `token-outside-instruction` — r3_view_compiler_template/should handle structural directive on ng-template
   - missing "MyComponent_0_ng_template_0_Template" after "function"
 - `token-outside-instruction` — r3_view_compiler_template/should support directive outputs on <ng-template>
   - missing "consts" after "\n"
 - `token-outside-instruction` — r3_view_compiler_template/should support ngFor context variables
-  - missing "ctx" after "\t\tconst ctx_r1 ="
-- `token-outside-instruction` — r3_view_compiler/safe_access/should handle non-null assertions after a safe access
-  - missing "val" after "...foo.bar, \" \", ctx.foo(ctx.val)?.foo.bar, \" \", ctx."
+  - missing "$implicit" after "\t\tconst item_r1 = ctx."
 - `token-outside-instruction` — r3_view_compiler/safe_access/should handle non-null assertions after a safe access with legacyOptionalChaining
   - missing "let" after "\n"
 - `token-outside-instruction` — r3_view_compiler/safe_access/should handle property reads requiring temporary variables with legacyOptionalChaining
@@ -771,6 +696,7 @@ source-map assertions are not verified: 191 assertion(s) in 31 passing case(s).
 - r3_compiler_compliance/elements/should handle SVG with an embedded ng-template
 - r3_compiler_compliance/elements/should reserve slots for pure functions in host binding function
 - r3_view_compiler/any/should preserve $any if it is accessed through `this`
+- r3_view_compiler/any/should strip out $any wrappers
 - r3_view_compiler/legacy_animations/should dedup multiple [@event] listeners
 - r3_view_compiler/legacy_animations/should not register any @attr attributes as static attributes
 - r3_view_compiler/nullish_coalescing/should handle nullish coalescing inside host bindings
@@ -778,13 +704,16 @@ source-map assertions are not verified: 191 assertion(s) in 31 passing case(s).
 - r3_view_compiler/nullish_coalescing/should handle nullish coalescing inside property bindings
 - r3_view_compiler/nullish_coalescing/should preserve required parentheses for nullish coalescing
 - r3_view_compiler/safe_access/should handle deep safe property reads inside templates
+- r3_view_compiler/safe_access/should handle non-null assertions after a safe access
 - r3_view_compiler/safe_access/should handle property reads requiring temporary variables
 - r3_view_compiler/safe_access/should handle safe keyed reads inside templates
 - r3_view_compiler/safe_access/should handle safe method calls inside templates
+- r3_view_compiler_bindings/attribute_bindings/should chain multiple attribute bindings into a single instruction
 - r3_view_compiler_bindings/attribute_bindings/should chain multiple attribute bindings when there are child elements
 - r3_view_compiler_bindings/attribute_bindings/should chain multiple attribute bindings when there are multiple elements
 - r3_view_compiler_bindings/attribute_bindings/should chain multiple single-interpolation attribute bindings into one instruction
 - r3_view_compiler_bindings/attribute_bindings/should exclude attribute bindings from the attributes array
+- r3_view_compiler_bindings/host_bindings/should allow $any in host binding expressions
 - r3_view_compiler_bindings/host_bindings/should chain both host attributes in the decorator and on the class
 - r3_view_compiler_bindings/host_bindings/should chain multiple host attribute bindings into a single instruction
 - r3_view_compiler_bindings/host_bindings/should chain multiple host listeners into a single instruction
@@ -792,16 +721,23 @@ source-map assertions are not verified: 191 assertion(s) in 31 passing case(s).
 - r3_view_compiler_bindings/host_bindings/should chain multiple synthetic properties into a single instruction call
 - r3_view_compiler_bindings/host_bindings/should handle deceptive attribute names
 - r3_view_compiler_bindings/host_bindings/should handle security-sensitive constant attributes
+- r3_view_compiler_bindings/host_bindings/should handle security-sensitive style bindings
 - r3_view_compiler_bindings/host_bindings/should support host class bindings with temporary expressions
 - r3_view_compiler_bindings/host_bindings/should support host style bindings with temporary expressions
 - r3_view_compiler_bindings/property_bindings/should chain multiple property bindings into a single instruction
 - r3_view_compiler_bindings/property_bindings/should chain multiple property bindings on an ng-template
 - r3_view_compiler_bindings/property_bindings/should chain multiple property bindings when there are child elements
 - r3_view_compiler_bindings/property_bindings/should chain multiple property bindings when there are multiple elements
+- r3_view_compiler_bindings/property_bindings/should chain property bindings in the presence of other bindings
 - r3_view_compiler_bindings/property_bindings/should chain synthetic property bindings together with regular property bindings
 - r3_view_compiler_bindings/property_bindings/should emit temporary evaluation within the binding expression for in-order execution
 - r3_view_compiler_bindings/property_bindings/should generate ariaProperty instructions for ARIA bindings
+- r3_view_compiler_bindings/property_bindings/should generate attribute instructions for DOM-only ARIA bindings
 - r3_view_compiler_bindings/property_bindings/should generate bind instruction
+- r3_view_compiler_bindings/property_bindings/should generate interpolation instruction for {{...}} bindings
+- r3_view_compiler_bindings/property_bindings/should generate the proper update instructions for interpolated properties
+- r3_view_compiler_bindings/property_bindings/should maintain the binding order between one-way and two-way properties
+- r3_view_compiler_bindings/property_bindings/should not add interpolated properties to the property instruction chain
 - r3_view_compiler_bindings/property_bindings/should not remap special property names when outputting property instructions
 - r3_view_compiler_bindings/property_bindings/should remap special property names when outputting domProperty instructions
 - r3_view_compiler_bindings/text_bindings/should generate interpolation instruction
@@ -818,6 +754,7 @@ source-map assertions are not verified: 191 assertion(s) in 31 passing case(s).
 - r3_view_compiler_control_flow/should generate a basic if/else if block
 - r3_view_compiler_control_flow/should generate a basic switch block
 - r3_view_compiler_control_flow/should generate a for block that tracks by index
+- r3_view_compiler_control_flow/should generate a for block with aliased template variables
 - r3_view_compiler_control_flow/should generate a for block with an element root node preceded by non-element node
 - r3_view_compiler_control_flow/should generate a for block with an empty block
 - r3_view_compiler_control_flow/should generate a nested if block
@@ -829,6 +766,8 @@ source-map assertions are not verified: 191 assertion(s) in 31 passing case(s).
 - r3_view_compiler_control_flow/should implicitly allocate data slots for primary and empty block
 - r3_view_compiler_control_flow/should optimize tracking function that calls a method on the component only with $index from the root template
 - r3_view_compiler_control_flow/should optimize tracking function that calls a method on the component with $index and the item from the root template
+- r3_view_compiler_control_flow/should parenthesize context variables used in an expression
+- r3_view_compiler_deferred/should emit `ɵɵenableIncrementalHydrationRuntime` only once per view, even when multiple sibling `@defer` blocks use hydrate triggers
 - r3_view_compiler_deferred/should generate a defer block with an `on idle` trigger that has a timeout
 - r3_view_compiler_deferred/should generate a deferred block with a `when` trigger that has a pipe
 - r3_view_compiler_listener/should assume $event is referring to the event variable in a listener by default
@@ -838,30 +777,46 @@ source-map assertions are not verified: 191 assertion(s) in 31 passing case(s).
 - r3_view_compiler_listener/should create listener instruction on element
 - r3_view_compiler_listener/should create listener instruction on other components
 - r3_view_compiler_listener/should create multiple listener instructions that share a view snapshot
+- r3_view_compiler_listener/should generate a nested two-way binding
+- r3_view_compiler_listener/should generate a simple two-way binding
+- r3_view_compiler_listener/should generate a two-way binding to a $any expression
 - r3_view_compiler_listener/should generate listener with multiple statements
 - r3_view_compiler_listener/should generate the $event argument if it is being used in a host listener
+- r3_view_compiler_listener/should generate the view restoration statements if a keyed write is used in an event listener from within an ng-template
+- r3_view_compiler_listener/should maintain the binding order between plain listeners and listeners part of a two-way binding
 - r3_view_compiler_listener/should not assume that $event is referring to an event object inside a property
 - r3_view_compiler_listener/should not generate the $event argument if it is not being used in a host listener
 - r3_view_compiler_listener/should not generate the $event argument if it is not being used in a template
 - r3_view_compiler_providers/should emit the ProvidersFeature feature when providers and viewProviders are used
 - r3_view_compiler_providers/should emit the ProvidersFeature feature when providers only
 - r3_view_compiler_providers/should emit the ProvidersFeature feature when viewProviders only
+- r3_view_compiler_styling/binding_slots/should count only non-style and non-class host bindings on Components
 - r3_view_compiler_styling/binding_slots/should count only non-style and non-class host bindings on Directives
 - r3_view_compiler_styling/class_bindings/should create class styling instructions on the element
+- r3_view_compiler_styling/class_bindings/should not create instructions for empty class bindings
 - r3_view_compiler_styling/component_styles/should pass in styles, but skip shimming the styles if the view encapsulation signals not to
 - r3_view_compiler_styling/component_styles/should pass in the component metadata styles into the component definition and shim them using style encapsulation
+- r3_view_compiler_styling/host_bindings/should generate style/class instructions for a host component creation definition
+- r3_view_compiler_styling/host_bindings/should generate styling instructions for multiple directives that contain host binding definitions
 - r3_view_compiler_styling/host_bindings/should not mangle css custom property names
+- r3_view_compiler_styling/host_bindings/should support class interpolation
+- r3_view_compiler_styling/host_bindings/should support style interpolation
 - r3_view_compiler_styling/interpolations/should generate update instructions for interpolated style properties with a suffix
 - r3_view_compiler_styling/mixed_style_and_class/should always generate advance() statements before any styling instructions
 - r3_view_compiler_styling/mixed_style_and_class/should split [style] and [class] bindings into a separate instructions
 - r3_view_compiler_styling/mixed_style_and_class/should stamp out pipe definitions in the creation block if used by styling bindings
+- r3_view_compiler_styling/style_bindings/should correctly count the total slots required when style/class bindings include interpolation
 - r3_view_compiler_styling/style_bindings/should create style instructions on the element
 - r3_view_compiler_styling/style_bindings/should handle duplicate style bindings
+- r3_view_compiler_styling/style_bindings/should not create instructions for empty style bindings
 - r3_view_compiler_styling/style_bindings/should support [style.foo.suffix] style bindings with a suffix
+- r3_view_compiler_template/should allow directive inputs as an interpolated prop on <ng-template>
 - r3_view_compiler_template/should allow self-closing custom elements in templates
+- r3_view_compiler_template/should break large element creation chains
 - r3_view_compiler_template/should create unique listener function names even for similar nested template structures
 - r3_view_compiler_template/should create unique template function names even for similar nested template structures
 - r3_view_compiler_template/should create unique template function names for ng-content templates
+- r3_view_compiler_template/should handle implict contezt in ng-template
 - r3_view_compiler_template/should handle shorthand property declarations in templates
 - r3_view_compiler_template/should not confuse self-closing tag for an end tag
 - r3_view_compiler_template/should safely nest ternary operations
@@ -874,6 +829,7 @@ source-map assertions are not verified: 191 assertion(s) in 31 passing case(s).
 - source_mapping/inline_templates/should create correct inline template source-mapping when the source contains escape sequences (partial compile)
 - source_mapping/inline_templates/should create simple i18n message source-mapping (full compile)
 - source_mapping/inline_templates/should create simple i18n message source-mapping (partial compile)
+- source_mapping/inline_templates/should map *ngFor scenario (full compile)
 - source_mapping/inline_templates/should map a class input binding (full compile)
 - source_mapping/inline_templates/should map a class input binding (partial compile)
 - source_mapping/inline_templates/should map a complex input binding expression (full compile)
@@ -885,15 +841,20 @@ source-map assertions are not verified: 191 assertion(s) in 31 passing case(s).
 - source_mapping/inline_templates/should map a longhand input binding expression (partial compile)
 - source_mapping/inline_templates/should map a longhand output binding expression (full compile)
 - source_mapping/inline_templates/should map a longhand output binding expression (partial compile)
+- source_mapping/inline_templates/should map a longhand two-way binding expression (full compile)
 - source_mapping/inline_templates/should map a mix of interpolated and static content (full compile)
 - source_mapping/inline_templates/should map a mix of interpolated and static content (partial compile)
 - source_mapping/inline_templates/should map a simple input binding expression (full compile)
 - source_mapping/inline_templates/should map a simple input binding expression (partial compile)
 - source_mapping/inline_templates/should map a simple output binding expression (full compile)
+- source_mapping/inline_templates/should map a two-way binding expression (full compile)
 - source_mapping/inline_templates/should map default and selected projection (full compile)
 - source_mapping/inline_templates/should map default and selected projection (partial compile)
+- source_mapping/inline_templates/should map interpolated properties (full compile)
+- source_mapping/inline_templates/should map interpolated properties (partial compile)
 - source_mapping/inline_templates/should map interpolation with pipe (full compile)
 - source_mapping/inline_templates/should map interpolation with pipe (partial compile)
+- source_mapping/inline_templates/should map ng-template [ngFor] scenario (full compile)
 - source_mapping/inline_templates/should map ng-template [ngIf] scenario (full compile)
 - source_mapping/inline_templates/should map simple element with content (full compile)
 - source_mapping/inline_templates/should map simple element with content (partial compile)

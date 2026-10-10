@@ -1399,6 +1399,8 @@ impl<'b> HtmlAstToIvyAst<'b> {
         } else if identifier.is_empty() {
             self.report_error("Variable does not have a name", source_span);
         }
+        // `binding_parser.ts`: a `let-x` with no value reads the context's `$implicit` property.
+        let value = if value.is_empty() { "$implicit" } else { value };
         variables.push(t::Variable {
             name: identifier.to_string(),
             value: value.to_string(),
@@ -2519,6 +2521,26 @@ mod tests {
             "expected interpolated text to become BoundText, got {:?}",
             element.children[0]
         );
+    }
+
+    #[test]
+    fn let_without_value_defaults_to_implicit_context_property() {
+        // `binding_parser.ts`: `let-item` (no `=`) reads the context's `$implicit`; `let-i="index"` keeps its
+        // explicit property.
+        let nodes = parse_html(r#"<ng-template let-item let-i="index"><span>x</span></ng-template>"#);
+        let mut bp = BindingParser::new();
+        let result = html_ast_to_render3_ast(&nodes, &mut bp, Render3ParseOptions::default());
+
+        let template = match &result.nodes[0] {
+            t::Node::Template(t) => t,
+            other => panic!("expected Template, got {other:?}"),
+        };
+        let pairs: Vec<(&str, &str)> = template
+            .variables
+            .iter()
+            .map(|v| (v.name.as_str(), v.value.as_str()))
+            .collect();
+        assert_eq!(pairs, vec![("item", "$implicit"), ("i", "index")]);
     }
 
     #[test]

@@ -914,6 +914,13 @@ impl<R: LocalResolver> Converter<'_, R> {
 
             // Call: `f(args)`.
             EK::Call { receiver, args, .. } => {
+                // `$any(expr)` is a type-cast builtin with no runtime effect: Angular's `any_cast.ts`
+                // (`deleteAnyCasts`) replaces the call with its argument. `this.$any(…)` is a real call.
+                if let (EK::PropertyRead { receiver: root, name, .. }, [inner]) = (&receiver.kind, args.as_slice()) {
+                    if name == "$any" && matches!(root.kind, EK::ImplicitReceiver) {
+                        return self.convert(inner);
+                    }
+                }
                 let callee = self.convert(receiver);
                 let args = args.iter().map(|a| self.convert(a)).collect();
                 callee.call_fn(args, false)
@@ -1640,6 +1647,17 @@ mod tests {
             argument_span: ab(),
         });
         assert_eq!(emit(&n), "ctx.fn(ctx.a);\n");
+    }
+
+    #[test]
+    fn any_cast_call_is_replaced_by_its_argument() {
+        // $any(a) -> ctx.a (Angular any_cast.ts deleteAnyCasts); this.$any(a) stays a call.
+        let n = node(EK::Call {
+            receiver: Box::new(prop("$any")),
+            args: vec![prop("a")],
+            argument_span: ab(),
+        });
+        assert_eq!(emit(&n), "ctx.a;\n");
     }
 
     #[test]
