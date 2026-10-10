@@ -237,11 +237,21 @@ impl BinaryOperation {
     }
 }
 
-/// Operator for [`ExprKind::Unary`]. In TS, `Unary` only allows `'+'` / `'-'`.
+/// Operator for [`ExprKind::Unary`]. Angular main allows `'+'` / `'-'` plus the update operators
+/// `'++'` / `'--'` (prefix or postfix, see [`ExprKind::Unary::is_prefix`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnaryOperator {
-    Plus,  // +
-    Minus, // -
+    Plus,      // +
+    Minus,     // -
+    Increment, // ++
+    Decrement, // --
+}
+
+impl UnaryOperator {
+    /// `Unary.isUpdateOperation`: whether this is `++` or `--`.
+    pub fn is_update(self) -> bool {
+        matches!(self, UnaryOperator::Increment | UnaryOperator::Decrement)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -406,13 +416,14 @@ pub enum ExprKind {
         left: Box<AstNode>,
         right: Box<AstNode>,
     },
-    /// `Unary` — `+expr` / `-expr`. Modeled independently of `Binary` (the TS
-    /// inheritance is a back-compat hack). See [`AstNode::create_plus`] /
-    /// [`AstNode::create_minus`] for the desugaring constructors and
-    /// [`AstVisitor::visit_unary`] for the binary fallback semantics.
+    /// `Unary` — `+expr` / `-expr` / `++expr` / `--expr` / `expr++` / `expr--`. Modeled
+    /// independently of `Binary` (the TS inheritance is a back-compat hack). `is_prefix` is `false`
+    /// only for a postfix update. See [`AstNode::create_plus`] / [`AstNode::create_minus`] and
+    /// [`AstNode::create_prefix_update`] / [`AstNode::create_postfix_update`].
     Unary {
         operator: UnaryOperator,
         expr: Box<AstNode>,
+        is_prefix: bool,
     },
     /// `PrefixNot` — `!expression`.
     PrefixNot { expression: Box<AstNode> },
@@ -479,6 +490,7 @@ impl AstNode {
             ExprKind::Unary {
                 operator: UnaryOperator::Minus,
                 expr: Box::new(expr),
+                is_prefix: true,
             },
         )
     }
@@ -492,6 +504,43 @@ impl AstNode {
             ExprKind::Unary {
                 operator: UnaryOperator::Plus,
                 expr: Box::new(expr),
+                is_prefix: true,
+            },
+        )
+    }
+
+    /// `Unary.createPrefixUpdate`: a prefix `++x` / `--x`.
+    pub fn create_prefix_update(
+        span: ParseSpan,
+        source_span: AbsoluteSourceSpan,
+        operator: UnaryOperator,
+        expr: AstNode,
+    ) -> AstNode {
+        AstNode::new(
+            span,
+            source_span,
+            ExprKind::Unary {
+                operator,
+                expr: Box::new(expr),
+                is_prefix: true,
+            },
+        )
+    }
+
+    /// `Unary.createPostfixUpdate`: a postfix `x++` / `x--`.
+    pub fn create_postfix_update(
+        span: ParseSpan,
+        source_span: AbsoluteSourceSpan,
+        operator: UnaryOperator,
+        expr: AstNode,
+    ) -> AstNode {
+        AstNode::new(
+            span,
+            source_span,
+            ExprKind::Unary {
+                operator,
+                expr: Box::new(expr),
+                is_prefix: false,
             },
         )
     }
@@ -1030,6 +1079,19 @@ pub trait AstVisitor {
     /// `visitASTWithSource?` — default transparently forwards to the wrapped node.
     fn visit_ast_with_source(&mut self, node: &AstWithSource) {
         self.visit(&node.ast);
+    }
+}
+
+/// `unwrapWriteTarget(ast)` (`ast.ts`): unwraps any parentheses and non-null assertions around the
+/// target of a write operation (assignment or `++` / `--`), returning the inner node.
+pub fn unwrap_write_target(ast: &AstNode) -> &AstNode {
+    let mut current = ast;
+    loop {
+        match &current.kind {
+            ExprKind::ParenthesizedExpression { expression }
+            | ExprKind::NonNullAssert { expression } => current = expression,
+            _ => return current,
+        }
     }
 }
 

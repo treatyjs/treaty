@@ -95,3 +95,65 @@ pub fn type_with_parameters(ty: Expr, num_params: u32) -> Type {
 pub fn ts_ignore_comment() -> LeadingComment {
     o::leading_comment("@ts-ignore", true, true)
 }
+
+/// `util.ts` `IDENTIFIER_PATTERN = /^[$A-Z_][0-9A-Z_$]*$/i`: whether `name` is a valid JavaScript
+/// identifier for the purposes of `let` parameters and variable names. ASCII only, case-insensitive
+/// (the regex has no `u` flag). The empty string is not an identifier.
+pub fn is_identifier_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) if first == '$' || first == '_' || first.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|c| c == '$' || c == '_' || c.is_ascii_alphanumeric())
+}
+
+/// `util.ts` `LET_PATTERN = /^let\s+([\S\s]*)/`: when `expression` starts with the keyword `let`
+/// followed by at least one whitespace character, returns the captured remainder (the leading
+/// whitespace run is consumed, as the greedy `\s+` does). Returns `None` otherwise.
+pub fn match_let_pattern(expression: &str) -> Option<&str> {
+    let rest = expression.strip_prefix("let")?;
+    let trimmed = rest.trim_start_matches(char::is_whitespace);
+    if trimmed.len() == rest.len() {
+        // No whitespace followed `let` (e.g. `letter`, or a bare `let`): not a `let` parameter.
+        return None;
+    }
+    Some(trimmed)
+}
+
+#[cfg(test)]
+mod let_and_identifier_tests {
+    use super::*;
+
+    #[test]
+    fn identifier_pattern_accepts_js_identifiers() {
+        assert!(is_identifier_name("foo"));
+        assert!(is_identifier_name("$bar"));
+        assert!(is_identifier_name("_baz9"));
+        assert!(is_identifier_name("Qux_$1"));
+    }
+
+    #[test]
+    fn identifier_pattern_rejects_non_identifiers() {
+        assert!(!is_identifier_name(""));
+        assert!(!is_identifier_name("9lives"));
+        assert!(!is_identifier_name("a-b"));
+        assert!(!is_identifier_name("a b"));
+        assert!(!is_identifier_name("café"));
+    }
+
+    #[test]
+    fn let_pattern_captures_remainder_after_whitespace() {
+        assert_eq!(match_let_pattern("let  foo = $index"), Some("foo = $index"));
+        assert_eq!(match_let_pattern("let\tbar"), Some("bar"));
+        assert_eq!(match_let_pattern("let "), Some(""));
+    }
+
+    #[test]
+    fn let_pattern_requires_keyword_then_whitespace() {
+        assert_eq!(match_let_pattern("letter"), None);
+        assert_eq!(match_let_pattern("let"), None);
+        assert_eq!(match_let_pattern(" let x"), None);
+        assert_eq!(match_let_pattern("x = let y"), None);
+    }
+}

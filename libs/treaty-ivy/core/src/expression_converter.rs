@@ -1013,14 +1013,21 @@ impl<R: LocalResolver> Converter<'_, R> {
                 binary_expr(op, lhs, rhs)
             }
 
-            // Unary `+x` / `-x`.
-            EK::Unary { operator, expr } => {
+            // Unary `+x` / `-x` / `++x` / `--x` / `x++` / `x--` (`convertAst` with
+            // `UNARY_OPERATORS`; `isPrefix` is forwarded to `UnaryOperatorExpr`).
+            EK::Unary {
+                operator,
+                expr,
+                is_prefix,
+            } => {
                 let inner = self.convert(expr);
                 let op = match operator {
                     EUnary::Plus => OUnary::Plus,
                     EUnary::Minus => OUnary::Minus,
+                    EUnary::Increment => OUnary::Increment,
+                    EUnary::Decrement => OUnary::Decrement,
                 };
-                o::unary(op, inner, None)
+                o::unary_with_prefix(op, inner, None, *is_prefix)
             }
 
             // PrefixNot `!x`.
@@ -1108,7 +1115,12 @@ impl<R: LocalResolver> Converter<'_, R> {
                 let body = self.convert(body);
                 self.in_child_operation -= 1;
                 self.arrow_params.truncate(scope_base);
-                let inline_arrow = o::arrow_fn(params, ArrowBody::Expr(Box::new(body)), None);
+                // `convertAst` types the arrow as `DYNAMIC_TYPE` (Angular main, 2026-10-10).
+                let inline_arrow = o::arrow_fn(
+                    params,
+                    ArrowBody::Expr(Box::new(body)),
+                    Some(dynamic_type()),
+                );
 
                 // Hoist into a const-pool `ɵɵarrowFunction` factory when this is the
                 // outermost arrow of a property/interpolation binding and the arrow only

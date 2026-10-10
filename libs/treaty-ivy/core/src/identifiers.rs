@@ -19,7 +19,7 @@
 //! `String`s. A `'static` `&str` table backs each variant so construction is a
 //! single allocation of the name plus the module name.
 //!
-//! Pinned to Angular `22.1.0-next.0`. Field name vs wire name diverge in several
+//! Pinned to Angular main `78d2a67d922b` (2026-10-10; 219 members). Field name vs wire name diverge in several
 //! cases (`templateCreate` -> `ɵɵtemplate`, the `animation*` family -> `ɵɵanimate*`,
 //! `ɵɵdefineInjectable` whose field is itself prefixed); the wire string is copied
 //! verbatim from the TS source and never derived from the field name.
@@ -66,6 +66,8 @@ pub enum R3 {
     ElementStart,
     ElementEnd,
     ForeignComponent,
+    ForeignContent,
+    ForeignContentFn,
     DomElement,
     DomElementStart,
     DomElementEnd,
@@ -160,6 +162,9 @@ pub enum R3 {
     ConditionalCreate,
     ConditionalBranchCreate,
     Conditional,
+    BoundaryCreate,
+    BoundaryUpdate,
+    GetBoundary,
     Repeater,
     RepeaterCreate,
     RepeaterTrackByIndex,
@@ -349,6 +354,8 @@ impl R3 {
             R3::ElementStart => "ɵɵelementStart",
             R3::ElementEnd => "ɵɵelementEnd",
             R3::ForeignComponent => "ɵɵforeignComponent",
+            R3::ForeignContent => "ɵɵforeignContent",
+            R3::ForeignContentFn => "ɵɵforeignContentFn",
             R3::DomElement => "ɵɵdomElement",
             R3::DomElementStart => "ɵɵdomElementStart",
             R3::DomElementEnd => "ɵɵdomElementEnd",
@@ -442,6 +449,9 @@ impl R3 {
             R3::ConditionalCreate => "ɵɵconditionalCreate",
             R3::ConditionalBranchCreate => "ɵɵconditionalBranchCreate",
             R3::Conditional => "ɵɵconditional",
+            R3::BoundaryCreate => "ɵɵboundaryCreate",
+            R3::BoundaryUpdate => "ɵɵboundaryUpdate",
+            R3::GetBoundary => "ɵɵgetBoundary",
             R3::Repeater => "ɵɵrepeater",
             R3::RepeaterCreate => "ɵɵrepeaterCreate",
             R3::RepeaterTrackByIndex => "ɵɵrepeaterTrackByIndex",
@@ -692,6 +702,8 @@ mod tests {
         R3::ElementStart,
         R3::ElementEnd,
         R3::ForeignComponent,
+        R3::ForeignContent,
+        R3::ForeignContentFn,
         R3::DomElement,
         R3::DomElementStart,
         R3::DomElementEnd,
@@ -773,6 +785,9 @@ mod tests {
         R3::ConditionalCreate,
         R3::ConditionalBranchCreate,
         R3::Conditional,
+        R3::BoundaryCreate,
+        R3::BoundaryUpdate,
+        R3::GetBoundary,
         R3::Repeater,
         R3::RepeaterCreate,
         R3::RepeaterTrackByIndex,
@@ -901,9 +916,21 @@ mod tests {
     ];
 
     #[test]
-    fn table_has_214_members() {
-        // Matches Angular 22.1.0-next.0's `Identifiers` static-member count.
-        assert_eq!(ALL.len(), 214);
+    fn table_has_219_members() {
+        // Matches Angular main (2026-10-10, 78d2a67d922b)'s `Identifiers` static-member count.
+        // Was 214 at 22.1.0-next.0; main added foreignContent, foreignContentFn,
+        // boundaryCreate, boundaryUpdate and getBoundary.
+        assert_eq!(ALL.len(), 219);
+    }
+
+    #[test]
+    fn boundary_and_foreign_content_identifiers() {
+        assert_eq!(R3::ForeignContent.name(), "ɵɵforeignContent");
+        assert_eq!(R3::ForeignContentFn.name(), "ɵɵforeignContentFn");
+        assert_eq!(R3::BoundaryCreate.name(), "ɵɵboundaryCreate");
+        assert_eq!(R3::BoundaryUpdate.name(), "ɵɵboundaryUpdate");
+        assert_eq!(R3::GetBoundary.name(), "ɵɵgetBoundary");
+        assert_eq!(R3::GetBoundary.reference().module_name.as_deref(), Some("@angular/core"));
     }
 
     #[test]
