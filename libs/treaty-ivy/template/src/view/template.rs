@@ -38,6 +38,7 @@ use crate::identifiers::R3;
 use crate::output_ast as o;
 use crate::output_ast::{Expr, FnParam, Stmt, StmtKind, StmtModifier};
 use crate::template::r3_ast::{
+    BoundaryBlock,
     BoundAttribute, BoundEvent, BoundText, Content, DeferredBlock, DeferredBlockTriggers,
     DeferredTrigger, DeferredTriggerKind, Element, ForLoopBlock, Icu, IfBlock, LetDeclaration,
     Node, SwitchBlock, SwitchBlockCase, Template, Text, TextAttribute, Visitor,
@@ -120,6 +121,20 @@ pub struct TemplateCompilationInput {
     /// in which case `ɵɵdefer` keeps its `null` resolver — byte-identical to before. Keyed by span
     /// (not document order) so the lookup is correct regardless of nesting / view boundaries.
     pub deferred_deps: std::collections::HashMap<(u32, u32), Expr>,
+    /// The component's `foreignImports` (Angular `R3ForeignComponentMetadata`): an element whose tag
+    /// matches one of these is a foreign component, lowered to `ɵɵforeignComponent` (see
+    /// [`TemplateDefinitionBuilder::build_foreign_component`]). Empty for ordinary templates.
+    pub foreign_components: Vec<ForeignComponentRef>,
+}
+
+/// A foreign component usable from a template: the element tag it is matched by and the
+/// framework-provided component reference that is stored in the component's `consts` array.
+#[derive(Clone, Debug)]
+pub struct ForeignComponentRef {
+    /// The element tag name (`FancyButton`).
+    pub name: String,
+    /// The component reference expression (`frameworkImport(FancyButton)`).
+    pub component: Expr,
 }
 
 impl TemplateCompilationInput {
@@ -129,7 +144,14 @@ impl TemplateCompilationInput {
             nodes,
             dom_only: true,
             deferred_deps: std::collections::HashMap::new(),
+            foreign_components: Vec::new(),
         }
+    }
+
+    /// Set the foreign components the template may use (see [`Self::foreign_components`]).
+    pub fn with_foreign_components(mut self, foreign_components: Vec<ForeignComponentRef>) -> Self {
+        self.foreign_components = foreign_components;
+        self
     }
 
     /// Set the DOM-only compilation mode (see [`Self::dom_only`]) and return `self`, so callers that
@@ -442,6 +464,25 @@ struct LoopVar {
     source_name: String,
     /// The generated local identifier (`x_r1`, `$index_r2`, …).
     local_name: String,
+    /// When set, a read of `source_name` lowers to this expression inline instead of the local
+    /// identifier (a `@error` `when` alias reads the boundary state inline, as Angular's `Alias`
+    /// variables do).
+    inline: Option<Expr>,
+    /// When set, `source_name` is a property of this view's own context object (`@error (let err)`
+    /// is `ctx.$error`; `retry = $reset` is `ctx.$reset`). Reads lower to `ctx.<prop>` inline, and a
+    /// listener re-roots them at its restored view.
+    context_prop: Option<String>,
+}
+
+impl LoopVar {
+    /// The expression a read of this variable lowers to (in a non-listener context).
+    fn read_expr(&self) -> Expr {
+        match (&self.inline, &self.context_prop) {
+            (Some(expr), _) => expr.clone(),
+            (None, Some(prop)) => o::variable(CONTEXT_NAME, None).prop(prop.clone()),
+            (None, None) => o::variable(self.local_name.clone(), None),
+        }
+    }
 }
 
 /// A `@let` declaration that reserved a `ɵɵdeclareLet` data slot in some view and is therefore
@@ -493,7 +534,7 @@ impl LocalResolver for LoopVarResolver<'_> {
 
     fn maybe_resolve_local(&self, name: &str) -> Option<Expr> {
         if let Some(v) = self.vars.iter().find(|v| v.source_name == name) {
-            return Some(o::variable(v.local_name.clone(), None));
+            return Some(v.read_expr());
         }
         resolve_local_ref(name, self.local_refs, self.used_local_refs)
     }
@@ -542,7 +583,7 @@ impl LocalResolver for NestedViewResolver<'_> {
 
     fn maybe_resolve_local(&self, name: &str) -> Option<Expr> {
         if let Some(v) = self.vars.iter().find(|v| v.source_name == name) {
-            return Some(o::variable(v.local_name.clone(), None));
+            return Some(v.read_expr());
         }
         resolve_local_ref(name, self.local_refs, self.used_local_refs)
     }
@@ -567,6 +608,9 @@ struct ListenerResolver<'a> {
     /// read occurred), so [`TemplateDefinitionBuilder::build_listener`] emits the matching
     /// `const ctx_r<level> = ɵɵnextContext(<hops>);` inside the handler body.
     reads_ancestor: &'a std::cell::Cell<bool>,
+    /// The name the handler captured its restored view under (`ɵɵrestoreView`), when the handler
+    /// reads a context-property alias (`@error (let err)` reads `<restored>.$error`).
+    restored_ctx: Option<String>,
 }
 
 impl LocalResolver for ListenerResolver<'_> {
@@ -585,6 +629,11 @@ impl LocalResolver for ListenerResolver<'_> {
         if name == EVENT_NAME {
             return Some(o::variable(EVENT_NAME, None));
         }
+        if let Some(v) = self.vars.iter().find(|v| v.source_name == name) {
+            if let (Some(prop), Some(restored)) = (&v.context_prop, &self.restored_ctx) {
+                return Some(o::variable(restored.clone(), None).prop(prop.clone()));
+            }
+        }
         // Inside a callback, EVERY in-scope `@let` is read through its `ɵɵreadContextLet` local —
         // even one declared in THIS view — rather than its in-view `ɵɵstoreLet` local
         // (`generate_variables.ts`: `scope.view !== view.xref || isCallback`). A `@let`'s in-view
@@ -596,7 +645,7 @@ impl LocalResolver for ListenerResolver<'_> {
         }
         // Otherwise a `@for` loop item / `$index` etc. resolves to its generated loop local.
         if let Some(v) = self.vars.iter().find(|v| v.source_name == name) {
-            return Some(o::variable(v.local_name.clone(), None));
+            return Some(v.read_expr());
         }
         None
     }
@@ -1799,6 +1848,25 @@ fn ast_to_source(node: &AstNode) -> String {
                 ast_to_source(right)
             )
         }
+        // `expression_parser/serializer.ts` `visitUnary`: a prefix operator gets a separating space
+        // when the operand already starts with the operator's first character (`- -x`, `+ +x`,
+        // `- --x`); a postfix update is written `x++` / `x--`.
+        AstExprKind::Unary { operator, expr, is_prefix } => {
+            use crate::expression::ast::UnaryOperator as UO;
+            let op = match operator {
+                UO::Plus => "+",
+                UO::Minus => "-",
+                UO::Increment => "++",
+                UO::Decrement => "--",
+            };
+            let inner = ast_to_source(expr);
+            if *is_prefix {
+                let space = if inner.starts_with(&op[..1]) { " " } else { "" };
+                format!("{op}{space}{inner}")
+            } else {
+                format!("{inner}{op}")
+            }
+        }
         _ => String::new(),
     }
 }
@@ -2580,6 +2648,9 @@ pub struct TemplateDefinitionBuilder {
     /// nesting. Empty for `@defer`-free templates (and blocks without lazy deps) — leaving the
     /// existing `null`-resolver `ɵɵdefer(…)` path byte-identical.
     deferred_deps: std::collections::HashMap<(u32, u32), Expr>,
+    /// The component's foreign components (see [`TemplateCompilationInput::foreign_components`]),
+    /// shared with every embedded view so a foreign element nested in a control-flow block lowers too.
+    foreign_components: Vec<ForeignComponentRef>,
 }
 
 /// The i18n continuation context threaded into a child view spawned inside an `i18n` block.
@@ -2658,6 +2729,7 @@ impl TemplateDefinitionBuilder {
             i18n_block_ctx: None,
             in_i18n_create: false,
             deferred_deps: input.deferred_deps.clone(),
+            foreign_components: input.foreign_components.clone(),
         }
     }
 
@@ -3581,7 +3653,167 @@ impl TemplateDefinitionBuilder {
     /// creation pass, binding refreshes to the update pass. The names of all bound inputs/outputs are
     /// also collected into the element's const attrs array under `AttributeMarker.Bindings` (`3`).
     fn build_element(&mut self, element: &Element) {
+        if let Some(component) = self.foreign_component_for(&element.name) {
+            self.build_foreign_component(element, component);
+            return;
+        }
         self.build_element_inner(element)
+    }
+
+    /// The `foreignImports` entry matched by an element tag (`unsafe-attr` etc. keep their spelling),
+    /// as the component reference to store in `consts`. `None` for an ordinary element.
+    fn foreign_component_for(&self, tag: &str) -> Option<Expr> {
+        self.foreign_components
+            .iter()
+            .find(|f| f.name == tag)
+            .map(|f| f.component.clone())
+    }
+
+    /// Lower a foreign component element (`ingest.ts` `ingestForeignComponent`, `resolve_foreign_content.ts`,
+    /// `reify.ts` `ForeignComponent`).
+    ///
+    /// The element becomes one creation instruction, `ɵɵforeignComponent(slot, constIndex, () => props)`,
+    /// with no update block. `props` are the static attributes, then the bound inputs, then one entry per
+    /// `@content` block / the default children, whose value is a creation-time local read off the
+    /// foreign component through `ɵɵforeignContent(slot, constIndex)` (or `ɵɵforeignContentFn` when the
+    /// block declares `let` variables). Each `@content` block (and the default children) is its own
+    /// embedded view, created as a template before the foreign component. The component reference is
+    /// appended to the component `consts` array, after the content views (Angular `job.addConst`).
+    fn build_foreign_component(&mut self, element: &Element, component: Expr) {
+        // The `@content` blocks become templates named after their property; everything else is the
+        // default `children` view. Content views are built first, as Angular ingests them first.
+        let mut content_blocks: Vec<&crate::template::r3_ast::ContentBlock> = Vec::new();
+        let mut child_nodes: Vec<Node> = Vec::new();
+        for child in &element.children {
+            match child {
+                Node::ContentBlock(block) => content_blocks.push(block),
+                other => child_nodes.push(other.clone()),
+            }
+        }
+
+        // (slot, template fn, decls, vars, property name, declares let-variables)
+        let mut contents: Vec<(usize, Expr, usize, usize, String, bool)> = Vec::new();
+        for block in content_blocks {
+            let slot = self.allocate_data_slot();
+            let fn_name = format!(
+                "{}_{}_{}_Template",
+                self.base_name,
+                capitalize_first(&block.name),
+                slot
+            );
+            // `@content (items; let item, index)`: the content view receives the render arguments as
+            // its context, so `item` / `index` are `ctx[0]` / `ctx[1]` read into locals in the update
+            // block (`generate_variables.ts` numeric context variables).
+            let mut loop_vars: Vec<LoopVar> = Vec::new();
+            let mut prelude: Vec<Stmt> = Vec::new();
+            for (i, var) in block.variables.iter().enumerate() {
+                self.var_counter += 1;
+                let local_name = format!("{}_r{}", var.name, self.var_counter);
+                prelude.push(Stmt::with_modifiers(
+                    StmtKind::DeclareVar {
+                        name: local_name.clone(),
+                        value: Some(o::variable(CONTEXT_NAME, None).key(num(i as f64))),
+                        ty: None,
+                    },
+                    StmtModifier::FINAL,
+                ));
+                loop_vars.push(LoopVar {
+                    source_name: var.name.clone(),
+                    local_name,
+                    inline: None,
+                    context_prop: None,
+                });
+            }
+            let (fn_ref, decls, vars) = self.build_embedded_view(
+                fn_name,
+                block.children.clone(),
+                loop_vars,
+                prelude,
+            );
+            contents.push((
+                slot,
+                fn_ref,
+                decls,
+                vars,
+                block.name.clone(),
+                !block.variables.is_empty(),
+            ));
+        }
+        if !child_nodes.is_empty() {
+            let slot = self.allocate_data_slot();
+            let fn_name = format!("{}_Children_{}_Template", self.base_name, slot);
+            let (fn_ref, decls, vars) =
+                self.build_embedded_view(fn_name, child_nodes, Vec::new(), Vec::new());
+            contents.push((slot, fn_ref, decls, vars, "children".to_string(), false));
+        }
+
+        // The foreign component occupies the next data slot (after its content views).
+        let foreign_slot = self.allocate_data_slot();
+
+        // Props: static attributes (string literals), then bound inputs, then the content locals.
+        let mut props: Vec<(String, bool, Expr)> = Vec::new();
+        for attr in &element.attributes {
+            props.push((
+                attr.name.clone(),
+                is_unsafe_object_key(&attr.name),
+                o::literal(o::LiteralValue::String(attr.value.clone()), None),
+            ));
+        }
+        for input in &element.inputs {
+            let value = self.lower_expr(&input.value);
+            props.push((input.name.clone(), is_unsafe_object_key(&input.name), value));
+        }
+
+        // The component const (`job.addConst`): appended after the content views' own consts.
+        let const_index = self
+            .const_pool
+            .borrow_mut()
+            .add_const_with_initializers(component, Vec::new());
+
+        // Creation block: the content templates (chained), then one `const <name>_rN = ɵɵforeignContent(…)`
+        // per content slot, then `ɵɵforeignComponent`.
+        for (slot, fn_ref, decls, vars, _, _) in &contents {
+            let template = if self.dom_only { R3::DomTemplate } else { R3::TemplateCreate };
+            let params = vec![
+                num(*slot as f64),
+                fn_ref.clone(),
+                num(*decls as f64),
+                num(*vars as f64),
+            ];
+            self.creation_code.push(instruction(template, params));
+        }
+        for (slot, _, _, _, name, parameterized) in &contents {
+            self.var_counter += 1;
+            let local_name = format!("{}_r{}", name, self.var_counter);
+            let reference = if *parameterized {
+                R3::ForeignContentFn
+            } else {
+                R3::ForeignContent
+            };
+            let read = o::import_expr(reference.reference(), None)
+                .call_fn(vec![num(*slot as f64), num(const_index as f64)], false);
+            self.creation_code.push(Stmt::with_modifiers(
+                StmtKind::DeclareVar {
+                    name: local_name.clone(),
+                    value: Some(read),
+                    ty: None,
+                },
+                StmtModifier::FINAL,
+            ));
+            props.push((name.clone(), is_unsafe_object_key(name), o::variable(local_name, None)));
+        }
+
+        let mut params = vec![num(foreign_slot as f64), num(const_index as f64)];
+        if !props.is_empty() {
+            // Angular `reify.ts`: the props are a `() => ({ … })` arrow so they re-evaluate reactively.
+            params.push(o::arrow_fn(
+                Vec::new(),
+                o::ArrowBody::Expr(Box::new(o::literal_map(props, None))),
+                Some(o::dynamic_type()),
+            ));
+        }
+        self.creation_code
+            .push(instruction(R3::ForeignComponent, params));
     }
 
     /// The value expression for a `[style.x]`/`[class.x]` binding. A literal interpolation value
@@ -3725,7 +3957,15 @@ impl TemplateDefinitionBuilder {
         // `(event)` output stays in `elementStart … elementEnd` form even with no children.
         // An i18n-marked element always wraps an `ɵɵi18nStart … ɵɵi18nEnd` pair around its content,
         // so it stays in `elementStart … elementEnd` form even when it has no element children.
-        let needs_end = has_children || !element.outputs.is_empty() || element.i18n.is_some();
+        // A control binding (`phases/control_directives.ts`) inserts an `ɵɵcontrolCreate()` right
+        // after the element's start op. That op sits between `ElementStart` and `ElementEnd`, which
+        // blocks the `empty_elements` phase from merging the pair, so such an element always stays
+        // in `elementStart … elementEnd` form (even with no children and no listeners).
+        let control_bindings = element.inputs.iter().filter(|i| is_control_binding(i)).count();
+        let needs_end = has_children
+            || !element.outputs.is_empty()
+            || element.i18n.is_some()
+            || control_bindings > 0;
 
         // `element`/`elementStart` reify to `(slot, tag, attributes, localRefs, span)`; the
         // trailing `null` attributes / localRefs args are trimmed (Angular `instruction.ts`).
@@ -3752,6 +3992,15 @@ impl TemplateDefinitionBuilder {
             self.creation_code.push(instruction(start_ref, params));
         } else {
             self.creation_code.push(instruction(single_ref, params));
+        }
+
+        // `ɵɵcontrolCreate()` for each control-eligible binding on this element. Angular's
+        // `addControlInstruction` (`phases/control_directives.ts`) does `insertAfter(controlCreateOp,
+        // targetCreateOp)` where `targetCreateOp` is the FIRST Element/ElementStart op for the xref
+        // (`findCreateInstruction` returns the first match), so the control op sits directly after
+        // the element's start op, before its listeners and children.
+        for _ in 0..control_bindings {
+            self.creation_code.push(instruction(R3::ControlCreate, vec![]));
         }
 
         // `(event)="handler"` → creation-block listener (`ɵɵdomListener` in DomOnly mode,
@@ -3793,7 +4042,6 @@ impl TemplateDefinitionBuilder {
         // create op, below). `ɵɵcontrol` is not a chainable instruction, so it stands alone after the
         // (possibly chained) property run for this element. Count the eligible bindings so the create
         // block emits a matching `ɵɵcontrolCreate()` per control op.
-        let control_bindings = element.inputs.iter().filter(|i| is_control_binding(i)).count();
         for _ in 0..control_bindings {
             self.update_code.push(instruction(R3::Control, vec![]));
         }
@@ -3837,14 +4085,6 @@ impl TemplateDefinitionBuilder {
                 R3::ElementEnd
             };
             self.creation_code.push(instruction(end_ref, vec![]));
-        }
-
-        // `ɵɵcontrolCreate()` for each control-eligible binding on this element, emitted after the
-        // element's LAST create op (`ɵɵelement`, or `ɵɵelementEnd` when the element opened a
-        // start/end pair). Angular's `addControlInstruction` does `insertAfter(controlCreateOp,
-        // targetCreateOp)` where `targetCreateOp` is the last Element/ElementEnd op for the xref.
-        for _ in 0..control_bindings {
-            self.creation_code.push(instruction(R3::ControlCreate, vec![]));
         }
     }
 
@@ -4116,6 +4356,8 @@ impl TemplateDefinitionBuilder {
             self.loop_vars.push(LoopVar {
                 source_name: decl.name.clone(),
                 local_name,
+                inline: None,
+                context_prop: None,
             });
         }
     }
@@ -4630,11 +4872,23 @@ impl TemplateDefinitionBuilder {
         let referenced_loop_vars: Vec<LoopVar> = if self.view_level > 0 {
             self.loop_vars
                 .iter()
+                .filter(|v| v.context_prop.is_none())
                 .filter(|v| expr_references_implicit(&output.handler, &v.source_name))
                 .cloned()
                 .collect()
         } else {
             Vec::new()
+        };
+        // A context-property alias (`@error (let err)` / `retry = $reset`) read in the handler is
+        // re-rooted at the restored view, which the handler captures as `const <restored> = …`.
+        let has_context_alias = self.loop_vars.iter().any(|v| {
+            v.context_prop.is_some() && expr_references_implicit(&output.handler, &v.source_name)
+        });
+        let restored_ctx: Option<String> = if has_context_alias {
+            self.var_counter += 1;
+            Some(format!("$restored_{}$", self.var_counter))
+        } else {
+            None
         };
 
         // Pre-mint the shared ancestor-context name (`ctx_r<level>`); it is only EMITTED if the
@@ -4658,6 +4912,7 @@ impl TemplateDefinitionBuilder {
             ctx_name: ctx_name.clone(),
             is_embedded: self.view_level > 0,
             reads_ancestor: &reads_ancestor,
+            restored_ctx: restored_ctx.clone(),
         };
         let converted = convert_action_binding_with(&output.handler, &resolver);
 
@@ -4668,6 +4923,7 @@ impl TemplateDefinitionBuilder {
         let needs_view_restore = !referenced_lets.is_empty()
             || !referenced_refs.is_empty()
             || !referenced_loop_vars.is_empty()
+            || has_context_alias
             || needs_next_context;
 
         // Handler body, in Angular `generate_variables.ts` (callback) order: `ɵɵrestoreView(savedView)`
@@ -4680,13 +4936,18 @@ impl TemplateDefinitionBuilder {
             let saved = self.saved_view_var_name();
             let restore_call = o::import_expr(R3::RestoreView.reference(), None)
                 .call_fn(vec![o::variable(saved, None)], false);
-            if referenced_loop_vars.is_empty() {
+            if referenced_loop_vars.is_empty() && restored_ctx.is_none() {
                 // No loop var to read off it — a bare restore suffices.
                 body.push(restore_call.to_stmt());
             } else {
-                // Capture the restored view so the loop variables can be read off it.
-                self.var_counter += 1;
-                let restored = format!("$restored_{}$", self.var_counter);
+                // Capture the restored view so the loop variables / context aliases can be read off it.
+                let restored = match &restored_ctx {
+                    Some(name) => name.clone(),
+                    None => {
+                        self.var_counter += 1;
+                        format!("$restored_{}$", self.var_counter)
+                    }
+                };
                 body.push(Stmt::with_modifiers(
                     StmtKind::DeclareVar { name: restored.clone(), value: Some(restore_call), ty: None },
                     StmtModifier::FINAL,
@@ -5140,6 +5401,7 @@ impl TemplateDefinitionBuilder {
             .with_dom_only(self.dom_only)
             .with_deferred_deps(self.deferred_deps.clone());
         let mut nested = TemplateDefinitionBuilder::new(&nested_input);
+        nested.foreign_components = self.foreign_components.clone();
         // SHARE the component's single constant pool with the nested view (Angular threads one
         // `ConstantPool` through the whole view tree). The nested view interns its own element-attr /
         // local-ref consts DIRECTLY into this pool, so the const index baked into each nested
@@ -5299,6 +5561,149 @@ impl TemplateDefinitionBuilder {
         self.advance_to(anchor_slot);
         self.update_code
             .push(instruction(R3::Conditional, vec![test]));
+    }
+
+    /// Lower a `@boundary { … } @error { … }` block (`ingestBoundaryBlock` + `boundary_conditions.ts`
+    /// + `reify.ts`).
+    ///
+    /// Creation: `ɵɵboundaryCreate(slot)` for the boundary container, then one
+    /// `ɵɵconditionalBranchCreate` per branch: the primary block (`<fn>_Primary_<slot>_Template`) and
+    /// each `@error` (`<fn>_Error_<slot>_Template`). Update: `ɵɵboundaryUpdate(slot, matching, primary)`
+    /// where `matching` is `bnd.error === null ? primary : <when-chain over the @error branches>`, the
+    /// fallback being the unconditional `@error` slot or `-1`. `bnd` is `ɵɵgetBoundary(slot)` inline,
+    /// or a `const bnd_rN = ɵɵgetBoundary(slot)` declared at the top of the update block when the
+    /// boundary state is read more than once (the variable is inlined otherwise, as in
+    /// `variable_optimization.ts`).
+    fn build_boundary_block(&mut self, block: &BoundaryBlock) {
+        let boundary_slot = self.allocate_data_slot();
+        self.creation_code
+            .push(instruction(R3::BoundaryCreate, vec![num(boundary_slot as f64)]));
+
+        // Primary branch: the boundary's main content, reified with its single root tag (if any).
+        let primary_slot = self.allocate_data_slot();
+        let primary_name = format!("{}_Primary_{}_Template", self.base_name, primary_slot);
+        let primary_tag = single_root_tag(&block.children);
+        let (primary_ref, primary_decls, primary_vars) = self.build_embedded_view(
+            primary_name,
+            block.children.clone(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let mut primary_params = vec![
+            num(primary_slot as f64),
+            primary_ref,
+            num(primary_decls as f64),
+            num(primary_vars as f64),
+            primary_tag,
+        ];
+        trim_trailing_nulls(&mut primary_params);
+        self.creation_code
+            .push(instruction(R3::ConditionalBranchCreate, primary_params));
+
+        // `@error` branches, in source order. Their context variables (`$error`, `$reset`, and any
+        // `let` aliases) read from this view's own context object.
+        let mut error_slots: Vec<usize> = Vec::with_capacity(block.error_blocks.len());
+        for error_block in &block.error_blocks {
+            let slot = self.allocate_data_slot();
+            error_slots.push(slot);
+            let fn_name = format!("{}_Error_{}_Template", self.base_name, slot);
+            let aliases: Vec<LoopVar> = error_block
+                .context_variables
+                .iter()
+                .map(|v| LoopVar {
+                    source_name: v.name.clone(),
+                    local_name: v.name.clone(),
+                    inline: None,
+                    context_prop: Some(v.value.clone()),
+                })
+                .collect();
+            let (fn_ref, decls, vars) =
+                self.build_embedded_view(fn_name, error_block.children.clone(), aliases, Vec::new());
+            let mut params = vec![
+                num(slot as f64),
+                fn_ref,
+                num(decls as f64),
+                num(vars as f64),
+            ];
+            trim_trailing_nulls(&mut params);
+            self.creation_code
+                .push(instruction(R3::ConditionalBranchCreate, params));
+        }
+
+        // The update block reads the boundary state; one binding slot backs `ɵɵboundaryUpdate`.
+        self.allocate_binding_slots(1);
+
+        // Lower the `when` conditions. A `$error`-valued alias (`let err` / `$error`) reads `<bnd>.error`.
+        let state_inline = o::import_expr(R3::GetBoundary.reference(), None)
+            .call_fn(vec![num(boundary_slot as f64)], false)
+            .prop("error");
+        let mut test = self.boundary_test(block, &state_inline, &error_slots, primary_slot);
+        // Read more than once (the `=== null` check plus any `when`) => materialise the state in a
+        // `const` at the top of the update block; otherwise the read stays inline.
+        if crate::output::emitter::emit_expression(&test).matches("getBoundary(").count() > 1 {
+            self.var_counter += 1;
+            let local = format!("bnd_r{}", self.var_counter);
+            let state_var = o::variable(local.clone(), None).prop("error");
+            test = self.boundary_test(block, &state_var, &error_slots, primary_slot);
+            let prelude = Stmt::with_modifiers(
+                StmtKind::DeclareVar {
+                    name: local,
+                    value: Some(
+                        o::import_expr(R3::GetBoundary.reference(), None)
+                            .call_fn(vec![num(boundary_slot as f64)], false),
+                    ),
+                    ty: None,
+                },
+                StmtModifier::FINAL,
+            );
+            self.update_code.insert(0, prelude);
+        }
+
+        // Update: advance to the boundary slot, then `ɵɵboundaryUpdate(slot, matching, primary)`.
+        self.advance_to(boundary_slot);
+        self.update_code.push(instruction(
+            R3::BoundaryUpdate,
+            vec![num(boundary_slot as f64), test, num(primary_slot as f64)],
+        ));
+    }
+
+    /// Build the `matching` selector of a boundary: `state === null ? primary : <@error chain>`, where
+    /// the chain tests each conditional `@error` in source order and falls back to the unconditional
+    /// `@error` slot (or `-1`). Mirrors `generateBoundaryConditions` (`boundary_conditions.ts`).
+    fn boundary_test(
+        &mut self,
+        block: &BoundaryBlock,
+        state: &Expr,
+        error_slots: &[usize],
+        primary_slot: usize,
+    ) -> Expr {
+        let mut fallback: Expr = num(-1.0);
+        for (error_block, slot) in block.error_blocks.iter().zip(error_slots) {
+            if error_block.expression.is_none() {
+                fallback = num(*slot as f64);
+            }
+        }
+        let mut result = fallback;
+        for (error_block, slot) in block.error_blocks.iter().zip(error_slots).rev() {
+            let Some(expression) = &error_block.expression else {
+                continue;
+            };
+            // Every `$error`-valued context variable of this branch reads the boundary state.
+            let saved = self.loop_vars.len();
+            for v in error_block.context_variables.iter().filter(|v| v.value == "$error") {
+                self.loop_vars.push(LoopVar {
+                    source_name: v.name.clone(),
+                    local_name: v.name.clone(),
+                    inline: Some(state.clone()),
+                    context_prop: None,
+                });
+            }
+            let condition = self.lower_expr(expression);
+            self.loop_vars.truncate(saved);
+            result = condition.conditional(num(*slot as f64), Some(result));
+        }
+        let is_healthy = state.clone().identical(o::null_expr());
+        is_healthy.conditional(num(primary_slot as f64), Some(result))
     }
 
     /// Lower a `@switch` (`SwitchBlock`) onto the same `ɵɵconditional` mechanism.
@@ -5705,6 +6110,8 @@ impl TemplateDefinitionBuilder {
             vars.push(LoopVar {
                 source_name,
                 local_name,
+                inline: None,
+                context_prop: None,
             });
         }
         (vars, prelude)
@@ -5796,6 +6203,8 @@ impl TemplateDefinitionBuilder {
             self.loop_vars.push(LoopVar {
                 source_name: cl.name.clone(),
                 local_name,
+                inline: None,
+                context_prop: None,
             });
         }
 
@@ -5922,6 +6331,8 @@ impl TemplateDefinitionBuilder {
             self.loop_vars.push(LoopVar {
                 source_name: decl.name.clone(),
                 local_name,
+                inline: None,
+                context_prop: None,
             });
         } else {
             // Unused in this view: the value runs as a bare statement (for its side effects / the
@@ -6198,6 +6609,7 @@ impl TemplateDefinitionBuilder {
             .with_dom_only(true)
             .with_deferred_deps(self.deferred_deps.clone());
         let mut nested = TemplateDefinitionBuilder::new(&nested_input);
+        nested.foreign_components = self.foreign_components.clone();
         nested.is_root = false;
         nested.view_level = self.view_level + 1;
         nested.var_counter = self.var_counter;
@@ -6283,6 +6695,24 @@ impl Visitor for TemplateDefinitionBuilder {
     fn visit_deferred_block(&mut self, deferred: &DeferredBlock) {
         self.build_deferred_block(deferred);
     }
+
+    fn visit_boundary_block(&mut self, block: &BoundaryBlock) {
+        self.build_boundary_block(block);
+    }
+}
+
+/// `isUnsafeObjectKey` (`render3/util.ts`): an object-literal key is quoted iff it has `-` or `.`.
+fn is_unsafe_object_key(key: &str) -> bool {
+    key.contains('-') || key.contains('.')
+}
+
+/// Upper-cases the first character (`propertyName.charAt(0).toUpperCase() + slice(1)`).
+fn capitalize_first(name: &str) -> String {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
 }
 
 /// Whether an event-handler expression AST references `$event`.
@@ -6314,7 +6744,8 @@ fn bare_read_name(node: &AstNode) -> Option<&str> {
 /// `ɵɵrepeaterCreate` argument: the single root element/template tag of a control-flow block body,
 /// or `null` when the body has zero or multiple non-trivial roots, or a root that is not an element
 /// (a single text node, etc.). Mirrors `ingestControlFlowInsertionPoint` (`ingest.ts`): comment /
-/// `@let` nodes are skipped; an `ng-template` tag is not passed (it would enable directive matching).
+/// `@let` nodes are skipped; an `ng-template` tag is not passed (it would enable directive matching),
+/// and a namespaced root tag is passed without its namespace prefix.
 fn single_root_tag(children: &[Node]) -> Expr {
     let mut root: Option<&str> = None;
     for child in children {
@@ -6342,8 +6773,17 @@ fn single_root_tag(children: &[Node]) -> Expr {
         }
     }
     match root {
-        Some(tag) if tag != "ng-template" => str_lit(tag),
-        _ => o::null_expr(),
+        // The namespace is stripped (`:svg:svg` -> `svg`): content projection matches the plain tag
+        // name (`ingestControlFlowInsertionPoint` splits `rawTagName` with `splitNsName`).
+        Some(tag) => {
+            let plain = crate::ml_parser::split_ns_name(tag).1;
+            if plain == "ng-template" {
+                o::null_expr()
+            } else {
+                str_lit(&plain)
+            }
+        }
+        None => o::null_expr(),
     }
 }
 
@@ -7050,6 +7490,35 @@ mod tests {
         ParseSourceSpan { start: 0, end: 0 }
     }
 
+    /// Parse a template string and run the real HTML -> r3 transform and template builder over it
+    /// (the same path `RealTemplateBuilder` takes), returning the emitted root view function plus its
+    /// hoisted nested-view functions. Used to prove a golden's template input lowers to its expected
+    /// instructions without the harness (which only compares full `ɵɵdefine*` goldens).
+    fn compile_template_html(src: &str, name: &str, dom_only: bool) -> String {
+        compile_template_html_with_foreign(src, name, dom_only, Vec::new())
+    }
+
+    /// As [`compile_template_html`], with the component's `foreignImports` in scope.
+    fn compile_template_html_with_foreign(
+        src: &str,
+        name: &str,
+        dom_only: bool,
+        foreign: Vec<ForeignComponentRef>,
+    ) -> String {
+        use crate::template::template_transform::{html_ast_to_render3_ast, Render3ParseOptions};
+        let parsed = crate::ml_parser::parse(src, "test.html");
+        assert!(parsed.errors.is_empty(), "html parse errors: {:?}", parsed.errors);
+        let mut bp = crate::template::template_transform::BindingParser::new();
+        let r3 = html_ast_to_render3_ast(&parsed.root_nodes, &mut bp, Render3ParseOptions::default());
+        assert!(r3.errors.is_empty(), "r3 transform errors: {:?}", r3.errors);
+        let input = TemplateCompilationInput::new(name, r3.nodes)
+            .with_dom_only(dom_only)
+            .with_foreign_components(foreign);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        emit_with_hoisted(&builder, &func)
+    }
+
     /// Emit the root view function PLUS its hoisted nested-view functions concatenated, mirroring
     /// the real component definition where Angular prints every `function …_Template(rf, ctx) {…}`
     /// on `ConstantPool.statements` as a sibling of (and before) the `ɵɵdefineComponent` call. The
@@ -7160,7 +7629,7 @@ mod tests {
     fn control_property_binding_emits_control_create_and_control() {
         // `<input [formField]="x">` — `formField` is an eligible CONTROL property
         // (`specializeControlProperties`). The create block gains a `ɵɵcontrolCreate()` right after
-        // the element op; the update block gains a `ɵɵcontrol()` right after the `ɵɵproperty` op.
+        // the element start op; the update block gains a `ɵɵcontrol()` right after the `ɵɵproperty` op.
         let nodes = element_with_input("input", "formField", BindingType::Property, prop_read("x"));
         let input = TemplateCompilationInput::new("Test_Template", nodes).with_dom_only(false);
         let mut builder = TemplateDefinitionBuilder::new(&input);
@@ -7168,10 +7637,13 @@ mod tests {
 
         assert!(out.contains("\u{0275}\u{0275}controlCreate()"), "got: {out}");
         assert!(out.contains("\u{0275}\u{0275}control()"), "got: {out}");
-        // The control-create op follows the element create op (ɵɵelement(0,...) then controlCreate).
-        let el_idx = out.find("\u{0275}\u{0275}element(0").expect("element op");
+        // The control-create op sits between `ɵɵelementStart(0,…)` and `ɵɵelementEnd()` (Angular
+        // keeps the start/end pair, so `empty_elements` cannot merge it into `ɵɵelement`).
+        let el_idx = out.find("\u{0275}\u{0275}elementStart(0").expect("elementStart op");
         let cc_idx = out.find("\u{0275}\u{0275}controlCreate(").expect("controlCreate op");
-        assert!(cc_idx > el_idx, "controlCreate must follow element: {out}");
+        let end_idx = out.find("\u{0275}\u{0275}elementEnd(").expect("elementEnd op");
+        assert!(el_idx < cc_idx && cc_idx < end_idx, "elementStart, controlCreate, elementEnd: {out}");
+        assert!(!out.contains("\u{0275}\u{0275}element(0"), "element must not be merged: {out}");
         // The control op follows the property op in the update block.
         let prop_idx = out.find("\u{0275}\u{0275}property(\"formField\"").expect("property op");
         let ctrl_idx = out.find("\u{0275}\u{0275}control(").expect("control op");
@@ -7546,6 +8018,34 @@ mod tests {
     use crate::template::r3_ast::{BoundAttribute, BoundEvent};
 
     /// `{{ name }}` — implicit-receiver property read of `name`.
+    /// `serializer.ts` `visitUnary`: prefix operators are written in front (with a separating space
+    /// when the operand starts with the same character), postfix updates after the operand.
+    #[test]
+    fn ast_to_source_serializes_unary_prefix_and_postfix() {
+        use crate::expression::ast::{UnaryOperator as UO};
+        let span = || ParseSpan::new(0, 0);
+        let abs = || AbsoluteSourceSpan::new(0, 0);
+        let x = || prop_read("x");
+        let minus_minus_x = AstNode::create_minus(span(), abs(), AstNode::create_minus(span(), abs(), x()));
+        assert_eq!(ast_to_source(&minus_minus_x), "- -x");
+        assert_eq!(ast_to_source(&AstNode::create_plus(span(), abs(), x())), "+x");
+        assert_eq!(
+            ast_to_source(&AstNode::create_prefix_update(span(), abs(), UO::Increment, x())),
+            "++x"
+        );
+        assert_eq!(
+            ast_to_source(&AstNode::create_postfix_update(span(), abs(), UO::Decrement, x())),
+            "x--"
+        );
+        let prefix_in_prefix = AstNode::create_prefix_update(
+            span(),
+            abs(),
+            UO::Decrement,
+            AstNode::create_prefix_update(span(), abs(), UO::Decrement, x()),
+        );
+        assert_eq!(ast_to_source(&prefix_in_prefix), "-- --x");
+    }
+
     fn prop_read(name: &str) -> AstNode {
         let implicit = AstNode::new(
             ParseSpan::new(0, 0),
@@ -9176,6 +9676,7 @@ mod tests {
                 start_source_span: t_span(),
                 end_source_span: None,
             },
+            defined_name: None,
             i18n: None,
         });
         let input = TemplateCompilationInput::new("MyApp_Template", vec![defer]);
@@ -9606,5 +10107,210 @@ mod tests {
         assert!(out.contains("return ctx.exp;"), "got: {out}");
         // Legacy `[@trig]` → update-block `ɵɵdomProperty("@trig", ctx.exp2)`.
         assert!(out.contains("\u{0275}\u{0275}domProperty(\"@trig\", ctx.exp2)"), "got: {out}");
+    }
+
+    /// Strip the `i0.` / `$r3$.` module prefixes so emitted text compares with a golden's shape.
+    fn golden_shape(out: &str) -> String {
+        out.replace("i0.", "").replace("$r3$.", "")
+    }
+
+    fn fancy_button_foreign() -> Vec<ForeignComponentRef> {
+        vec![ForeignComponentRef {
+            name: "FancyButton".to_string(),
+            component: o::variable("frameworkImport", None)
+                .call_fn(vec![o::variable("FancyButton", None)], false),
+        }]
+    }
+
+    /// Golden `components_and_directives/standalone/foreign_component.js` (`TestCmp`): a foreign element
+    /// is one `ɵɵforeignComponent(slot, constIndex, () => ({ … }))` with no update block; the component
+    /// reference is the `consts` entry, and `unsafe-*` keys are quoted.
+    #[test]
+    fn foreign_component_matches_golden_instructions() {
+        let out = golden_shape(&compile_template_html_with_foreign(
+            "\n    <FancyButton class=\"btn-cls\" unsafe-attr=\"value\" [label]=\"title\" [unsafe-input]=\"title\" />\n  ",
+            "TestCmp_Template",
+            true,
+            fancy_button_foreign(),
+        ));
+        assert!(
+            out.contains("ɵɵforeignComponent(0, 0, () => ({"),
+            "got: {out}"
+        );
+        assert!(out.contains("\"unsafe-attr\": \"value\""), "got: {out}");
+        assert!(out.contains("\"unsafe-input\": ctx.title"), "got: {out}");
+        assert!(!out.contains("ɵɵforeignContent"), "got: {out}");
+        assert!(!out.contains("ɵɵadvance"), "no update block: {out}");
+    }
+
+    /// Golden `foreign_component.js` (`TestCmpChildren`): each `@content` block is a template created
+    /// before the foreign component, read back through `ɵɵforeignContent` into a local named after the
+    /// block; the default children become a `Children` view; the props end with those locals.
+    #[test]
+    fn foreign_component_content_blocks_and_children() {
+        let out = golden_shape(&compile_template_html_with_foreign(
+            "\n    <FancyButton [label]=\"title\">\n      @content (icon) {\n        <span>Icon!</span>\n      }\n      @content (description) {\n        <span>Description text</span>\n      }\n      <span>Other children</span>\n    </FancyButton>\n  ",
+            "TestCmpChildren_Template",
+            true,
+            fancy_button_foreign(),
+        ));
+        assert!(
+            out.contains("ɵɵdomTemplate(0, TestCmpChildren_Icon_0_Template, 2, 0)(1, TestCmpChildren_Description_1_Template, 2, 0)(2, TestCmpChildren_Children_2_Template, 2, 0);"),
+            "got: {out}"
+        );
+        assert!(out.contains("const icon_r1 = ɵɵforeignContent(0, 0);"), "got: {out}");
+        assert!(out.contains("const description_r2 = ɵɵforeignContent(1, 0);"), "got: {out}");
+        assert!(out.contains("const children_r3 = ɵɵforeignContent(2, 0);"), "got: {out}");
+        assert!(
+            out.contains("ɵɵforeignComponent(3, 0, () => ({\n\t\t\tlabel: ctx.title,\n\t\t\ticon: icon_r1,\n\t\t\tdescription: description_r2,\n\t\t\tchildren: children_r3\n\t\t}));")
+                || out.contains("ɵɵforeignComponent(3, 0, () => ({ label: ctx.title, icon: icon_r1, description: description_r2, children: children_r3 }));")
+                || (out.contains("icon: icon_r1") && out.contains("children: children_r3") && out.contains("ɵɵforeignComponent(3, 0,")),
+            "got: {out}"
+        );
+    }
+
+    /// Golden `foreign_component.js` (`TestCmpRenderProps`): a `@content` block with `let` variables is
+    /// read through `ɵɵforeignContentFn` and its variables are the render arguments (`ctx[0]`, `ctx[1]`).
+    #[test]
+    fn foreign_component_render_props_read_context_arguments() {
+        let out = golden_shape(&compile_template_html_with_foreign(
+            "\n    <FancyButton [label]=\"title\">\n      @content (items; let item, index) {\n        <span>#{{index}}: {{item}}</span>\n      }\n    </FancyButton>\n  ",
+            "TestCmpRenderProps_Template",
+            true,
+            fancy_button_foreign(),
+        ));
+        assert!(out.contains("ɵɵdomTemplate(0, TestCmpRenderProps_Items_0_Template, 2, 2);"), "got: {out}");
+        assert!(out.contains("const items_r3 = ɵɵforeignContentFn(0, 0);"), "got: {out}");
+        assert!(out.contains("ɵɵforeignComponent(1, 0, () => ({"), "got: {out}");
+        assert!(out.contains("const item_r1 = ctx[0];"), "got: {out}");
+        assert!(out.contains("const index_r2 = ctx[1];"), "got: {out}");
+    }
+
+    /// Golden `r3_view_compiler_boundaries/basic.js`: boundary container, primary and `@error` branches,
+    /// and the `error === null` selector; no `when` so the boundary state is read once (inline).
+    #[test]
+    fn boundary_basic_matches_golden_instructions() {
+        let out = golden_shape(&compile_template_html(
+            "\n    @boundary {\n      Main Content\n    } @error {\n      Fallback Content\n    }\n  ",
+            "TestComponent_Template",
+            true,
+        ));
+        assert!(out.contains("ɵɵboundaryCreate(0);"), "got: {out}");
+        assert!(
+            out.contains("ɵɵconditionalBranchCreate(1, TestComponent_Primary_1_Template, 1, 0)(2, TestComponent_Error_2_Template, 1, 0);"),
+            "got: {out}"
+        );
+        assert!(
+            out.contains("ɵɵboundaryUpdate(0, ɵɵgetBoundary(0).error === null ? 1 : 2, 1);"),
+            "got: {out}"
+        );
+        assert!(out.contains("function TestComponent_Primary_1_Template(rf, ctx) {"), "got: {out}");
+        assert!(out.contains("ɵɵtext(0, \" Fallback Content \");"), "got: {out}");
+    }
+
+    /// Golden `error_declaration.js`: `@error (let err)` reads `ctx.$error` inline in the branch view.
+    #[test]
+    fn boundary_error_declaration_reads_error_context_variable() {
+        let out = golden_shape(&compile_template_html(
+            "\n    @boundary {\n      Main Content\n    } @error (let err) {\n      Error: {{err.message}}\n    }\n  ",
+            "TestComponent_Template",
+            true,
+        ));
+        assert!(
+            out.contains("ɵɵconditionalBranchCreate(1, TestComponent_Primary_1_Template, 1, 0)(2, TestComponent_Error_2_Template, 1, 1);"),
+            "got: {out}"
+        );
+        assert!(out.contains("ɵɵtextInterpolate1(\" Error: \", ctx.$error.message, \" \");"), "got: {out}");
+    }
+
+    /// Golden `retry_alias.js` / `retry_implicit.js`: a listener re-reads `$reset` off the restored
+    /// view (`ɵɵresetView($ctx.$reset())`).
+    #[test]
+    fn boundary_retry_listener_resets_through_restored_view() {
+        let out = golden_shape(&compile_template_html(
+            "\n    @boundary {\n      Main Content\n    } @error (let err, retry = $reset) {\n      <button (click)=\"retry()\">Retry</button>\n    }\n  ",
+            "TestComponent_Template",
+            true,
+        ));
+        assert!(out.contains("const $restored_1$ = ɵɵrestoreView($s_2$);"), "got: {out}");
+        assert!(out.contains("return ɵɵresetView($restored_1$.$reset());"), "got: {out}");
+        assert!(!out.contains("ctx.$reset()"), "got: {out}");
+    }
+
+    /// Golden `when_condition.js` / `multiple_error_blocks.js`: a `when` reads the boundary state more
+    /// than once, so it is materialised as `const bnd_rN = ɵɵgetBoundary(0)`; the unconditional
+    /// `@error` is the fallback, and with none the fallback is `-1`.
+    #[test]
+    fn boundary_when_conditions_chain_and_materialise_state() {
+        let out = golden_shape(&compile_template_html(
+            "\n    @boundary {\n      Main Content\n    } @error (let err; when err.message === '404') {\n      Not Found\n    } @error (let err) {\n      Generic Error\n    }\n  ",
+            "TestComponent_Template",
+            true,
+        ));
+        assert!(
+            out.contains("ɵɵconditionalBranchCreate(1, TestComponent_Primary_1_Template, 1, 0)(2, TestComponent_Error_2_Template, 1, 0)(3, TestComponent_Error_3_Template, 1, 0);"),
+            "got: {out}"
+        );
+        assert!(out.contains("const bnd_r1 = ɵɵgetBoundary(0);"), "got: {out}");
+        assert!(
+            out.contains("ɵɵboundaryUpdate(0, bnd_r1.error === null ? 1 : bnd_r1.error.message === \"404\" ? 2 : 3, 1);"),
+            "got: {out}"
+        );
+
+        let no_fallback = golden_shape(&compile_template_html(
+            "\n    @boundary {\n      Main Content\n    } @error (let err; when err.message === '404') {\n      Not Found\n    }\n  ",
+            "TestComponent_Template",
+            true,
+        ));
+        assert!(
+            no_fallback.contains("ɵɵboundaryUpdate(0, bnd_r1.error === null ? 1 : bnd_r1.error.message === \"404\" ? 2 : -1, 1);"),
+            "got: {no_fallback}"
+        );
+    }
+
+    /// Golden `nested.js`: an inner boundary inside a primary branch advances to its own slot and
+    /// names its branch views after the enclosing branch (`_Primary_1_Primary_2_Template`).
+    #[test]
+    fn boundary_nested_names_views_and_advances() {
+        let out = golden_shape(&compile_template_html(
+            "\n    @boundary {\n      Outer Main\n      @boundary {\n        Inner Main\n      } @error {\n        Inner Fallback\n      }\n    } @error {\n      Outer Fallback\n    }\n  ",
+            "TestComponent_Template",
+            true,
+        ));
+        assert!(out.contains("function TestComponent_Primary_1_Primary_2_Template(rf, ctx) {"), "got: {out}");
+        assert!(out.contains("function TestComponent_Primary_1_Error_3_Template(rf, ctx) {"), "got: {out}");
+        assert!(out.contains("ɵɵboundaryCreate(1);"), "got: {out}");
+        assert!(
+            out.contains("ɵɵadvance();\n\t\ti0.ɵɵboundaryUpdate(1, ɵɵgetBoundary(1).error === null ? 2 : 3, 2);")
+                || out.contains("ɵɵadvance();\n\t\tɵɵboundaryUpdate(1, ɵɵgetBoundary(1).error === null ? 2 : 3, 2);"),
+            "got: {out}"
+        );
+    }
+
+    /// `ingestControlFlowInsertionPoint`: a namespaced single root (`<svg>` is `:svg:svg` in the r3
+    /// AST) passes its plain tag name, so the branch's `ɵɵconditionalCreate` gets `"svg"` (golden
+    /// `if_namespaced_root_node`). `ng-template` and multi-root bodies still pass `null`.
+    #[test]
+    fn control_flow_root_tag_strips_namespace() {
+        let svg = Node::Element(Element {
+            name: ":svg:svg".to_string(),
+            attributes: vec![],
+            inputs: vec![],
+            outputs: vec![],
+            directives: vec![],
+            children: vec![],
+            references: vec![],
+            is_self_closing: false,
+            source_span: t_span(),
+            start_source_span: t_span(),
+            end_source_span: None,
+            is_void: false,
+            i18n: None,
+        });
+        let tag = single_root_tag(std::slice::from_ref(&svg));
+        assert_eq!(emit_expression(&tag).trim(), "(\"svg\");");
+
+        let two_roots = vec![svg.clone(), svg];
+        assert_eq!(emit_expression(&single_root_tag(&two_roots)).trim(), "null;");
     }
 }

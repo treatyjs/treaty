@@ -62,8 +62,7 @@ use crate::expression::ast::{
 use crate::expression::parser::Parser as ExprParser;
 use crate::ml_parser as html;
 use crate::ml_parser::{ParseError, ParseErrorLevel, ParseSourceSpan};
-use crate::template::control_flow;
-use crate::template::deferred;
+use crate::template::{boundary, content_block, control_flow, deferred};
 use crate::template::r3_ast as t;
 
 use std::collections::HashSet;
@@ -330,6 +329,9 @@ impl<'b> HtmlAstToIvyAst<'b> {
             html::Node::Directive(_) => {}
             html::Node::Attribute(_) => {}
             html::Node::LetDeclaration(d) => out.push(self.visit_let_declaration(d)),
+            // Start-tag comments live on `Element.comments` / `Component.comments` and are never
+            // children; they are collected by the element/component visitors (see `visit_element`).
+            html::Node::StartTagComment(_) => {}
         }
     }
 
@@ -484,6 +486,17 @@ impl<'b> HtmlAstToIvyAst<'b> {
             })
         };
 
+        // `collectCommentNodes`: comments written inside the start tag are collected after the
+        // element's children (Angular `visitElement` `element.comments.forEach`).
+        if self.options.collect_comment_nodes {
+            for comment in &element.comments {
+                self.comment_nodes.push(t::Comment {
+                    value: comment.value.clone(),
+                    source_span: to_offset_span(&comment.source_span),
+                });
+            }
+        }
+
         if prepared.element_has_inline_template {
             parsed_element = self.wrap_in_template(
                 parsed_element,
@@ -625,6 +638,17 @@ impl<'b> HtmlAstToIvyAst<'b> {
             i18n: component_i18n,
         });
 
+        // `collectCommentNodes`: start-tag comments of a selectorless component (Angular
+        // `visitComponent` `component.comments.forEach`).
+        if self.options.collect_comment_nodes {
+            for comment in &component.comments {
+                self.comment_nodes.push(t::Comment {
+                    value: comment.value.clone(),
+                    source_span: to_offset_span(&comment.source_span),
+                });
+            }
+        }
+
         if prepared.element_has_inline_template {
             node = self.wrap_in_template(
                 node,
@@ -756,6 +780,28 @@ impl<'b> HtmlAstToIvyAst<'b> {
                 let (n, e) = control_flow::create_switch_block(block, self, &parser);
                 (n.map(t::Node::SwitchBlock), e)
             }
+            "content" => {
+                // `createContentBlock(block, this)`: the body is re-entered through the visitor.
+                let visitor: &mut Self = self;
+                let mut transform = |children: &[html::Node]| visitor.visit_all(children, children);
+                let (n, e) = content_block::create_content_block(block, &mut transform);
+                (n.map(t::Node::ContentBlock), e)
+            }
+            "boundary" => {
+                let connected = self.find_connected_blocks(
+                    index,
+                    context,
+                    boundary::is_connected_boundary_error_block,
+                );
+                // `createBoundaryBlock(block, connected, this, bindingParser)`.
+                let result = {
+                    let visitor: &mut Self = self;
+                    let mut transform =
+                        |children: &[html::Node]| visitor.visit_all(children, children);
+                    boundary::create_boundary_block(block, &connected, &mut transform, &parser)
+                };
+                (result.0.map(t::Node::BoundaryBlock), result.1)
+            }
             "for" => {
                 let connected = self.find_connected_blocks(
                     index,
@@ -772,7 +818,13 @@ impl<'b> HtmlAstToIvyAst<'b> {
                 (n.map(t::Node::IfBlock), e)
             }
             other => {
-                let (error_message, mark_processed) = if deferred::is_connected_defer_loop_block(other)
+                let (error_message, mark_processed) = if boundary::is_connected_boundary_error_block(other)
+                {
+                    (
+                        format!("@{other} block can only be used after an @defer or @boundary block."),
+                        true,
+                    )
+                } else if deferred::is_connected_defer_loop_block(other)
                 {
                     (
                         format!("@{other} block can only be used after an @defer block."),
@@ -1843,6 +1895,7 @@ impl NonBindableVisitor {
                 | html::Node::ExpansionCase(_)
                 | html::Node::Attribute(_)
                 | html::Node::BlockParameter(_)
+                | html::Node::StartTagComment(_)
                 | html::Node::Directive(_) => {}
                 html::Node::Block(b) => out.extend(self.visit_block(b)),
                 html::Node::Component(c) => out.push(self.visit_component(c)),

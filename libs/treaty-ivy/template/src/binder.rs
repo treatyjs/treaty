@@ -180,7 +180,6 @@ impl DirectiveMeta {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ForeignComponentMeta {
     pub name: String,
-    pub ref_key: String,
 }
 
 /// `t2_api.DirectiveOwner` — `Element | Template | Component | Directive | HostElement`.
@@ -219,6 +218,12 @@ pub enum ScopedNode {
     DeferredBlockError(usize),
     DeferredBlockLoading(usize),
     DeferredBlockPlaceholder(usize),
+    /// `@boundary` (`t2_binder.ts` `visitBoundaryBlock` → `ingestScopedNode`).
+    BoundaryBlock(usize),
+    /// An `@error` branch of a `@boundary` (its context variables are declared in this scope).
+    BoundaryErrorBlock(usize),
+    /// `@content` (`t2_binder.ts` `visitContentBlock`).
+    ContentBlock(usize),
     Content(usize),
     HostElement(usize),
 }
@@ -995,6 +1000,35 @@ impl<'a, 't> Visitor for ScopeBuilder<'a, 't> {
 
     fn visit_content(&mut self, content: &Content) {
         self.ingest_scoped_node_dispatch_content(content);
+    }
+
+    /// `visitBoundaryBlock`: the primary block is a scope, then each `@error` branch is its own scope.
+    fn visit_boundary_block(&mut self, block: &t::BoundaryBlock) {
+        self.ingest_simple(ScopedNode::BoundaryBlock(addr(block)), &block.children);
+        for error_block in &block.error_blocks {
+            self.visit_boundary_error_block(error_block);
+        }
+    }
+
+    /// `visitBoundaryErrorBlock`: the context variables (`$error`, `$reset`, `let` aliases) and children.
+    fn visit_boundary_error_block(&mut self, block: &t::BoundaryErrorBlock) {
+        let node = ScopedNode::BoundaryErrorBlock(addr(block));
+        let child = self.arena.alloc(Some(self.current), Some(node));
+        let parent = self.current;
+        self.current = child;
+        for v in &block.context_variables {
+            self.visit_variable(v);
+        }
+        for c in &block.children {
+            self.visit_node(c);
+        }
+        self.current = parent;
+        self.arena.scopes[parent].child_scopes.insert(node, child);
+    }
+
+    /// `visitContentBlock`: a scope over the block's children.
+    fn visit_content_block(&mut self, block: &t::ContentBlock) {
+        self.ingest_simple(ScopedNode::ContentBlock(addr(block)), &block.children);
     }
 }
 
