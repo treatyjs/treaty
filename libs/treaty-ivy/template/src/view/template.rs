@@ -35,6 +35,8 @@ use crate::expression_converter::{
     LocalResolver, PipeSlotAllocator, PipeSlots,
 };
 use crate::identifiers::R3;
+use crate::ml_parser::{ParseError, ParseSourceSpan};
+use crate::template::r3_ast as t;
 use crate::output_ast as o;
 use crate::output_ast::{Expr, FnParam, Stmt, StmtKind, StmtModifier};
 use crate::template::r3_ast::{
@@ -4809,11 +4811,11 @@ impl TemplateDefinitionBuilder {
             }
         }
 
-        // SCOPE BOUNDARY: the `i18n` attribute value (`meaning|description@@id`) cannot be threaded
-        // here because the r3_ast `I18nMeta` marker is an opaque zero-field struct (`pub struct
-        // I18nMeta;`) — it carries no parsed metadata. So meaning/description/customId are empty. When
-        // the upstream marker is fleshed out to carry the parsed meta, it would feed `Message::new`
-        // and `compute_msg_id`; until then the metadata is structurally unavailable.
+        // SCOPE BOUNDARY: this builder derives the message from the R3 children and keeps an empty
+        // meaning / description / custom id. The transform's own message on the element (`i18n:
+        // Some(I18nMeta::Message(..))`, which carries the parsed `meaning|description@@id`) is not
+        // read here yet; reading it would change the emitted message metadata and is left for a
+        // separate change with its golden checks.
         let message = i18n::Message::new(nodes, "", "", "");
 
         // Build the interpolation placeholder params (`I18nMessageOp.params`): each interpolation maps
@@ -5200,7 +5202,7 @@ impl TemplateDefinitionBuilder {
         // The `$localize` substitution expressions: the placeholder magic strings, in placeholder
         // order. Without these the emitted tagged template drops the `${…}` substitution entirely.
         let mut expressions: Vec<o::Expr> = Vec::new();
-        let no_span = o::ParseSourceSpan::new(0, 0);
+        let no_span = o::ParseSourceSpan::synthetic();
         let mut param_by_name = std::collections::HashMap::new();
         for p in params {
             param_by_name.insert(p.name.clone(), p.value.clone());
@@ -7351,7 +7353,10 @@ impl TemplateDefinitionBuilder {
         // hoist it under that name, and pass the reference as the third `ɵɵdefer` argument. Blocks
         // with no lazy deps carry no entry and keep the `null` resolver.
         let resolver_fn_ref: Option<Expr> = {
-            let key = (deferred.main_block_span.start, deferred.main_block_span.end);
+            let key = (
+                deferred.main_block_span.start.offset as u32,
+                deferred.main_block_span.end.offset as u32,
+            );
             self.deferred_deps.get(&key).cloned().map(|deps_fn| {
                 let fn_name = format!("{}_Defer_{}_DepsFn", self.base_name, defer_slot);
                 self.hoisted_fns.push(Stmt::with_modifiers(
@@ -8632,6 +8637,192 @@ fn remap_placeholder_slots_in_expr(
 // Tests.
 // ---------------------------------------------------------------------------
 
+// ===========================================================================
+// parseTemplate — port of `render3/view/template.ts` (`parseTemplate`, `ParseTemplateOptions`,
+// `ParsedTemplate`). The single public entry point for parse-only consumers: it runs the HTML
+// parser, the whitespace pass and the render3 transform with Angular's option semantics, and
+// returns every diagnostic in one list.
+// ===========================================================================
+
+/// `LEADING_TRIVIA_CHARS` (`render3/view/template.ts`): the characters a text or element span skips
+/// when it starts at a token, so spans start at the first significant character.
+pub const LEADING_TRIVIA_CHARS: [char; 4] = [' ', '\n', '\r', '\t'];
+
+/// Angular's `LexerRange` (`ml_parser/lexer.ts`): a sub-range of the template to lex. Not supported by
+/// this port; see [`ParseTemplateOptions::range`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LexerRange {
+    pub start_pos: usize,
+    pub start_line: usize,
+    pub start_col: usize,
+    pub end_pos: usize,
+}
+
+/// `ParseTemplateOptions` (`render3/view/template.ts`). `Default` is Angular's `{}`: insignificant
+/// whitespace removed, block and `@let` syntax on, selectorless off.
+///
+/// Angular's `ParsedTemplate` has no `interpolationConfig`, and neither do these options: the
+/// interpolation markers are `{{` and `}}` (as in the reference at commit 78d2a67d).
+///
+/// Options marked **unsupported** are not implemented by this port. Setting one to a non-default
+/// value does not change the parse; [`parse_template`] reports it as an error in
+/// [`ParsedTemplate::errors`], so it is never silently ignored.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ParseTemplateOptions {
+    /// Angular `preserveWhitespaces`: keep insignificant whitespace text nodes (default `false`).
+    pub preserve_whitespaces: bool,
+    /// Angular `preserveLineEndings`: keep `\r\n` as written instead of normalising to `\n`.
+    pub preserve_line_endings: bool,
+    /// Angular `preserveSignificantWhitespace` (default `true`). **Unsupported** when `Some(false)`.
+    pub preserve_significant_whitespace: Option<bool>,
+    /// Angular `range`. **Unsupported**: when `Some`, an error is reported and the whole template is
+    /// still parsed.
+    pub range: Option<LexerRange>,
+    /// Angular `escapedString` (the template is the body of an escaped JavaScript string).
+    /// **Unsupported**: when `true`, an error is reported.
+    pub escaped_string: bool,
+    /// Angular `leadingTriviaChars`. `None` means [`LEADING_TRIVIA_CHARS`], as in `parseTemplate`.
+    pub leading_trivia_chars: Option<Vec<char>>,
+    /// Angular `enableI18nLegacyMessageIdFormat`. **Unsupported** (the i18n meta pass is folded into
+    /// the transform and does not compute legacy message ids): when `true`, an error is reported.
+    pub enable_i18n_legacy_message_id_format: bool,
+    /// Angular `i18nNormalizeLineEndingsInICUs`.
+    pub i18n_normalize_line_endings_in_icus: bool,
+    /// Angular `alwaysAttemptHtmlToR3AstConversion`: convert to the r3 AST even when the HTML parser
+    /// reported errors (Angular returns no nodes in that case by default).
+    pub always_attempt_html_to_r3_ast_conversion: bool,
+    /// Angular `collectCommentNodes`: fill [`ParsedTemplate::comment_nodes`].
+    pub collect_comment_nodes: bool,
+    /// Angular `enableBlockSyntax` (default `true`): `@` control-flow blocks.
+    pub enable_block_syntax: Option<bool>,
+    /// Angular `enableLetSyntax` (default `true`): `@let` declarations.
+    pub enable_let_syntax: Option<bool>,
+    /// Angular `enableSelectorless` (default `false`): `<Foo>` / `@Foo` component and directive
+    /// usages. Also sets the expression parser's direct pipe references, as `makeBindingParser` does.
+    pub enable_selectorless: Option<bool>,
+}
+
+/// `ParsedTemplate` (`render3/view/template.ts`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ParsedTemplate {
+    /// `preserveWhitespaces` as given in the options.
+    pub preserve_whitespaces: bool,
+    /// Every diagnostic, in Angular's order: the binding and transform errors, then the HTML parser
+    /// errors, then errors about unsupported options. Angular uses `null` for "none"; here it is empty.
+    pub errors: Vec<ParseError>,
+    pub nodes: Vec<t::Node>,
+    pub style_urls: Vec<String>,
+    pub styles: Vec<String>,
+    pub ng_content_selectors: Vec<String>,
+    /// `Some` iff `collectCommentNodes` was set (empty when the parse was abandoned).
+    pub comment_nodes: Option<Vec<t::Comment>>,
+}
+
+/// `parseTemplate(template, templateUrl, options)`: parse an Angular template into the render3 AST.
+///
+/// Parse-only consumers depend on `treaty_ivy_template` with `default-features = false,
+/// features = ["parse-only"]`; this function needs no emitter.
+///
+/// ```
+/// use treaty_ivy_template::{parse_template, ParseTemplateOptions};
+///
+/// let parsed = parse_template("<p>{{ name }}</p>", "app.html", &ParseTemplateOptions::default());
+/// assert!(parsed.errors.is_empty());
+/// assert_eq!(parsed.nodes.len(), 1);
+/// ```
+///
+/// This runs what Angular's `parseTemplate` runs, in the same order: the HTML parser with
+/// `tokenizeExpansionForms: true` and the block, `@let` and selectorless flags from `options`;
+/// an early return with no nodes when the HTML parse failed (unless
+/// `always_attempt_html_to_r3_ast_conversion`); the whitespace pass unless `preserve_whitespaces`;
+/// and the render3 transform with the binding parser.
+///
+/// The i18n meta pass (`I18nMetaVisitor`) is not a separate step here: its i18n metadata is read
+/// inline by the transform. Its early-return on errors is therefore not reproduced.
+pub fn parse_template(
+    template: &str,
+    template_url: &str,
+    options: &ParseTemplateOptions,
+) -> ParsedTemplate {
+    let mut unsupported = Vec::new();
+    let mut report_unsupported = |message: &str| {
+        unsupported.push(ParseError::new(
+            ParseSourceSpan::synthetic(),
+            format!("ParseTemplateOptions: {message} is not supported by treaty_ivy_template"),
+        ));
+    };
+    if options.range.is_some() {
+        report_unsupported("range");
+    }
+    if options.escaped_string {
+        report_unsupported("escapedString");
+    }
+    if options.enable_i18n_legacy_message_id_format {
+        report_unsupported("enableI18nLegacyMessageIdFormat");
+    }
+    if options.preserve_significant_whitespace == Some(false) {
+        report_unsupported("preserveSignificantWhitespace: false");
+    }
+
+    let selectorless = options.enable_selectorless.unwrap_or(false);
+    let tokenize_options = crate::ml_parser::TokenizeOptions {
+        tokenize_expansion_forms: true,
+        tokenize_blocks: options.enable_block_syntax.unwrap_or(true),
+        tokenize_let: options.enable_let_syntax.unwrap_or(true),
+        selectorless_enabled: selectorless,
+        preserve_line_endings: options.preserve_line_endings,
+        i18n_normalize_line_endings_in_icus: options.i18n_normalize_line_endings_in_icus,
+        leading_trivia_chars: options
+            .leading_trivia_chars
+            .clone()
+            .unwrap_or_else(|| LEADING_TRIVIA_CHARS.to_vec()),
+    };
+    let parse_result =
+        crate::ml_parser::HtmlParser::parse(template, template_url, &tokenize_options);
+
+    let abandon = !options.always_attempt_html_to_r3_ast_conversion
+        && !parse_result.errors.is_empty();
+    if abandon {
+        let mut errors = parse_result.errors;
+        errors.extend(unsupported);
+        return ParsedTemplate {
+            preserve_whitespaces: options.preserve_whitespaces,
+            errors,
+            nodes: Vec::new(),
+            style_urls: Vec::new(),
+            styles: Vec::new(),
+            ng_content_selectors: Vec::new(),
+            comment_nodes: options.collect_comment_nodes.then(Vec::new),
+        };
+    }
+
+    let mut binding_parser = crate::template::template_transform::BindingParser::with_selectorless(selectorless);
+    let r3 = crate::template::template_transform::html_ast_to_render3_ast_with_whitespace(
+        &parse_result.root_nodes,
+        &mut binding_parser,
+        crate::template::template_transform::Render3ParseOptions {
+            collect_comment_nodes: options.collect_comment_nodes,
+        },
+        !options.preserve_whitespaces,
+    );
+
+    // Angular: `errors = [...bindingParser.errors, ...transformer.errors]` (already merged into
+    // `r3.errors`), then `errors.push(...parseResult.errors, ...i18nMetaResult.errors)`.
+    let mut errors = r3.errors;
+    errors.extend(parse_result.errors);
+    errors.extend(unsupported);
+
+    ParsedTemplate {
+        preserve_whitespaces: options.preserve_whitespaces,
+        errors,
+        nodes: r3.nodes,
+        style_urls: r3.style_urls,
+        styles: r3.styles,
+        ng_content_selectors: r3.ng_content_selectors,
+        comment_nodes: r3.comment_nodes,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8642,7 +8833,7 @@ mod tests {
     use crate::template::r3_ast::{BoundText, Element, Node, Text};
 
     fn t_span() -> ParseSourceSpan {
-        ParseSourceSpan { start: 0, end: 0 }
+        ParseSourceSpan::synthetic()
     }
 
     /// Parse a template string and run the real HTML -> r3 transform and template builder over it
@@ -10415,7 +10606,7 @@ mod tests {
             start_source_span: t_span(),
             end_source_span: None,
             is_void: false,
-            i18n: Some(crate::template::r3_ast::I18nMeta),
+            i18n: Some(crate::template::r3_ast::I18nMeta::Message(crate::i18n::Message::new(Vec::new(), "", "", ""))),
         })]
     }
 
@@ -10522,7 +10713,7 @@ mod tests {
             exhaustive_check: None,
         };
         let input =
-            TemplateCompilationInput::new("Test_Template", i18n_div(vec![Node::SwitchBlock(block)]))
+            TemplateCompilationInput::new("Test_Template", i18n_div(vec![Node::SwitchBlock(Box::new(block))]))
                 .with_dom_only(false);
         let mut builder = TemplateDefinitionBuilder::new(&input);
         let func = builder.build_template_function(&input);
@@ -10587,7 +10778,7 @@ mod tests {
             spans: block_spans(),
             i18n: None,
         };
-        let input = TemplateCompilationInput::new("Test_Template", vec![Node::ForLoopBlock(block)]);
+        let input = TemplateCompilationInput::new("Test_Template", vec![Node::ForLoopBlock(Box::new(block))]);
         let mut builder = TemplateDefinitionBuilder::new(&input);
         let func = builder.build_template_function(&input);
         let out = emit_with_hoisted(&builder, &func);
@@ -10645,7 +10836,7 @@ mod tests {
             spans: block_spans(),
             i18n: None,
         };
-        let input = TemplateCompilationInput::new("Test_Template", vec![Node::ForLoopBlock(block)]);
+        let input = TemplateCompilationInput::new("Test_Template", vec![Node::ForLoopBlock(Box::new(block))]);
         let mut builder = TemplateDefinitionBuilder::new(&input);
         let func = builder.build_template_function(&input);
         let out = emit_with_hoisted(&builder, &func);
@@ -10684,7 +10875,7 @@ mod tests {
             spans: block_spans(),
             i18n: None,
         };
-        let input = TemplateCompilationInput::new("Test_Template", vec![Node::ForLoopBlock(block)]);
+        let input = TemplateCompilationInput::new("Test_Template", vec![Node::ForLoopBlock(Box::new(block))]);
         let mut builder = TemplateDefinitionBuilder::new(&input);
         let func = builder.build_template_function(&input);
         let out = emit_expression(&func);
@@ -10729,7 +10920,7 @@ mod tests {
             spans: block_spans(),
             i18n: None,
         };
-        let input = TemplateCompilationInput::new("Test_Template", vec![Node::ForLoopBlock(block)]);
+        let input = TemplateCompilationInput::new("Test_Template", vec![Node::ForLoopBlock(Box::new(block))]);
         let mut builder = TemplateDefinitionBuilder::new(&input);
         let func = builder.build_template_function(&input);
         let out = emit_expression(&func);
@@ -10779,7 +10970,7 @@ mod tests {
             spans: block_spans(),
             i18n: None,
         };
-        let input = TemplateCompilationInput::new("Test_Template", vec![Node::ForLoopBlock(block)]);
+        let input = TemplateCompilationInput::new("Test_Template", vec![Node::ForLoopBlock(Box::new(block))]);
         let mut builder = TemplateDefinitionBuilder::new(&input);
         let func = builder.build_template_function(&input);
         let out = emit_expression(&func);
@@ -10814,7 +11005,7 @@ mod tests {
             spans: block_spans(),
             i18n: None,
         };
-        let input = TemplateCompilationInput::new("Test_Template", vec![Node::ForLoopBlock(block)]);
+        let input = TemplateCompilationInput::new("Test_Template", vec![Node::ForLoopBlock(Box::new(block))]);
         let mut builder = TemplateDefinitionBuilder::new(&input);
         let func = builder.build_template_function(&input);
         let out = emit_expression(&func);
@@ -10851,7 +11042,7 @@ mod tests {
             exhaustive_check: None,
             spans: block_spans(),
         };
-        let input = TemplateCompilationInput::new("Test_Template", vec![Node::SwitchBlock(block)]);
+        let input = TemplateCompilationInput::new("Test_Template", vec![Node::SwitchBlock(Box::new(block))]);
         let mut builder = TemplateDefinitionBuilder::new(&input);
         let func = builder.build_template_function(&input);
         let out = emit_with_hoisted(&builder, &func);
@@ -10940,7 +11131,7 @@ mod tests {
             inputs: vec![],
             outputs: vec![],
             directives: vec![],
-            children: vec![Node::ForLoopBlock(for_block)],
+            children: vec![Node::ForLoopBlock(Box::new(for_block))],
             references: vec![],
             is_self_closing: false,
             source_span: t_span(),
@@ -11113,7 +11304,7 @@ mod tests {
             start_source_span: t_span(),
             end_source_span: None,
             is_void: false,
-            i18n: Some(I18nMeta),
+            i18n: Some(I18nMeta::Message(crate::i18n::Message::new(Vec::new(), "", "", ""))),
         })]
     }
 
@@ -11159,7 +11350,7 @@ mod tests {
             start_source_span: t_span(),
             end_source_span: None,
             is_void: false,
-            i18n: Some(I18nMeta),
+            i18n: Some(I18nMeta::Message(crate::i18n::Message::new(Vec::new(), "", "", ""))),
         })]
     }
 
@@ -11277,7 +11468,7 @@ mod tests {
             start_source_span: t_span(),
             end_source_span: None,
             is_void: false,
-            i18n: Some(I18nMeta),
+            i18n: Some(I18nMeta::Message(crate::i18n::Message::new(Vec::new(), "", "", ""))),
         })]
     }
 
@@ -11368,7 +11559,7 @@ mod tests {
             start_source_span: t_span(),
             end_source_span: None,
             is_void: false,
-            i18n: Some(I18nMeta),
+            i18n: Some(I18nMeta::Message(crate::i18n::Message::new(Vec::new(), "", "", ""))),
         })]
     }
 
@@ -11443,7 +11634,7 @@ mod tests {
             is_void: false,
             i18n: None,
         });
-        let defer = Node::DeferredBlock(DeferredBlock {
+        let defer = Node::DeferredBlock(Box::new(DeferredBlock {
             children: vec![span_el],
             triggers,
             prefetch_triggers: DeferredBlockTriggers::default(),
@@ -11460,7 +11651,7 @@ mod tests {
             },
             defined_name: None,
             i18n: None,
-        });
+        }));
         let input = TemplateCompilationInput::new("MyApp_Template", vec![defer]);
         let mut builder = TemplateDefinitionBuilder::new(&input);
         let func = builder.build_template_function(&input);
@@ -11521,7 +11712,7 @@ mod tests {
             reference: Some("go".to_string()),
         }));
         main.push_order(TriggerKey::Interaction);
-        let block = Node::DeferredBlock(DeferredBlock {
+        let block = Node::DeferredBlock(Box::new(DeferredBlock {
             children: vec![],
             triggers: main,
             prefetch_triggers: DeferredBlockTriggers::default(),
@@ -11548,7 +11739,7 @@ mod tests {
             },
             defined_name: None,
             i18n: None,
-        });
+        }));
         let go_ref = Reference {
             name: "go".to_string(),
             value: String::new(),
@@ -11596,7 +11787,7 @@ mod tests {
         hydrate.immediate = Some(trig(DeferredTriggerKind::Immediate));
         hydrate.push_order(TriggerKey::Immediate);
         let block = |triggers, hydrate_triggers| {
-            Node::DeferredBlock(DeferredBlock {
+            Node::DeferredBlock(Box::new(DeferredBlock {
                 children: vec![],
                 triggers,
                 prefetch_triggers: DeferredBlockTriggers::default(),
@@ -11613,7 +11804,7 @@ mod tests {
                 },
                 defined_name: None,
                 i18n: None,
-            })
+            }))
         };
         // Two sibling hydrating defers: the runtime activator is emitted once, before the first defer.
         let nodes = vec![block(main.clone(), hydrate.clone()), block(main, hydrate)];
@@ -11940,7 +12131,7 @@ mod tests {
             spans: block_spans(),
             i18n: None,
         };
-        let input = TemplateCompilationInput::new("Test_Template", vec![Node::ForLoopBlock(block)]);
+        let input = TemplateCompilationInput::new("Test_Template", vec![Node::ForLoopBlock(Box::new(block))]);
         let mut builder = TemplateDefinitionBuilder::new(&input);
         let func = builder.build_template_function(&input);
         let out = emit_expression(&func);
@@ -11979,7 +12170,7 @@ mod tests {
             exhaustive_check: None,
             spans: block_spans(),
         };
-        let input = TemplateCompilationInput::new("Test_Template", vec![Node::SwitchBlock(block)]);
+        let input = TemplateCompilationInput::new("Test_Template", vec![Node::SwitchBlock(Box::new(block))]);
         let mut builder = TemplateDefinitionBuilder::new(&input);
         let func = builder.build_template_function(&input);
         let out = emit_expression(&func);
@@ -12464,5 +12655,135 @@ mod tests {
 
         let two_roots = vec![svg.clone(), svg];
         assert_eq!(emit_expression(&single_root_tag(&two_roots, &[])).trim(), "null;");
+    }
+}
+
+#[cfg(test)]
+mod parse_template_tests {
+    use super::*;
+
+    fn element(node: &t::Node) -> &t::Element {
+        match node {
+            t::Node::Element(e) => e,
+            other => panic!("expected element, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn returns_nodes_and_every_diagnostic_in_one_list() {
+        // A binding error (`a b`) is produced by the transform; it is reported with the nodes.
+        let parsed = parse_template("<p>{{ a b }}</p>", "t.html", &ParseTemplateOptions::default());
+        assert_eq!(parsed.nodes.len(), 1);
+        assert_eq!(parsed.errors.len(), 1, "{:?}", parsed.errors);
+        assert!(parsed.errors[0].msg.starts_with("Parser Error:"));
+        assert_eq!(parsed.errors[0].span.start.line, 0);
+        assert!(parsed.comment_nodes.is_none());
+    }
+
+    #[test]
+    fn html_errors_abandon_the_parse_unless_always_attempted() {
+        // `}` in text is an HTML parse error ("Unexpected closing block").
+        let default = parse_template("<p>}</p>", "t.html", &ParseTemplateOptions::default());
+        assert!(default.nodes.is_empty(), "{:?}", default.nodes);
+        assert_eq!(default.errors.len(), 1, "{:?}", default.errors);
+        assert!(default.errors[0].msg.starts_with("Unexpected closing block"));
+
+        let always = ParseTemplateOptions {
+            always_attempt_html_to_r3_ast_conversion: true,
+            ..ParseTemplateOptions::default()
+        };
+        let attempted = parse_template("<p>}</p>", "t.html", &always);
+        assert_eq!(attempted.nodes.len(), 1);
+        assert!(attempted.errors.iter().any(|e| e.msg.starts_with("Unexpected closing block")));
+    }
+
+    #[test]
+    fn preserve_whitespaces_keeps_insignificant_whitespace_nodes() {
+        let src = "<p>a</p>\n  <p>b</p>";
+        let removed = parse_template(src, "t.html", &ParseTemplateOptions::default());
+        assert_eq!(removed.nodes.len(), 2, "whitespace-only text is removed by default");
+        let kept = parse_template(
+            src,
+            "t.html",
+            &ParseTemplateOptions { preserve_whitespaces: true, ..Default::default() },
+        );
+        assert_eq!(kept.nodes.len(), 3);
+        assert!(kept.preserve_whitespaces);
+    }
+
+    #[test]
+    fn leading_trivia_moves_the_text_span_start_past_whitespace() {
+        // `leadingTriviaChars` (default `LEADING_TRIVIA_CHARS`): the span starts at `h`, the full start
+        // stays at the first character.
+        let parsed = parse_template(
+            "  \n hello",
+            "t.html",
+            &ParseTemplateOptions { preserve_whitespaces: true, ..Default::default() },
+        );
+        let text = match &parsed.nodes[0] {
+            t::Node::Text(t) => t,
+            other => panic!("expected text, got {other:?}"),
+        };
+        assert_eq!(text.source_span.start.offset, 4);
+        assert_eq!(text.source_span.full_start.offset, 0);
+        assert_eq!(text.source_span.to_source_string(), "hello");
+    }
+
+    #[test]
+    fn collect_comment_nodes_fills_comment_nodes() {
+        let parsed = parse_template(
+            "<!-- one --><p></p>",
+            "t.html",
+            &ParseTemplateOptions { collect_comment_nodes: true, ..Default::default() },
+        );
+        let comments = parsed.comment_nodes.expect("comment nodes requested");
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].value, "one"); // trimmed, as Angular's `_consumeComment` does
+    }
+
+    #[test]
+    fn selectorless_option_turns_capitalised_tags_into_component_nodes() {
+        let plain = parse_template("<Foo></Foo>", "t.html", &ParseTemplateOptions::default());
+        assert!(matches!(plain.nodes[0], t::Node::Element(_)), "{:?}", plain.nodes);
+        let selectorless = parse_template(
+            "<Foo></Foo>",
+            "t.html",
+            &ParseTemplateOptions { enable_selectorless: Some(true), ..Default::default() },
+        );
+        assert!(matches!(selectorless.nodes[0], t::Node::Component(_)), "{:?}", selectorless.nodes);
+    }
+
+    #[test]
+    fn block_syntax_can_be_turned_off() {
+        let on = parse_template("@if (a) {x}", "t.html", &ParseTemplateOptions::default());
+        assert!(matches!(on.nodes[0], t::Node::IfBlock(_)));
+        let off = parse_template(
+            "@if (a) {x}",
+            "t.html",
+            &ParseTemplateOptions { enable_block_syntax: Some(false), ..Default::default() },
+        );
+        assert!(!off.nodes.iter().any(|n| matches!(n, t::Node::IfBlock(_))), "{:?}", off.nodes);
+    }
+
+    #[test]
+    fn unsupported_options_are_reported_not_ignored() {
+        let parsed = parse_template(
+            "<p></p>",
+            "t.html",
+            &ParseTemplateOptions {
+                range: Some(LexerRange { start_pos: 0, start_line: 0, start_col: 0, end_pos: 3 }),
+                escaped_string: true,
+                enable_i18n_legacy_message_id_format: true,
+                preserve_significant_whitespace: Some(false),
+                ..Default::default()
+            },
+        );
+        let messages: Vec<&str> = parsed.errors.iter().map(|e| e.msg.as_str()).collect();
+        assert_eq!(messages.len(), 4, "{messages:?}");
+        for name in ["range", "escapedString", "enableI18nLegacyMessageIdFormat", "preserveSignificantWhitespace"] {
+            assert!(messages.iter().any(|m| m.contains(name)), "no error for {name}: {messages:?}");
+        }
+        // The template is still converted.
+        assert_eq!(element(&parsed.nodes[0]).name, "p");
     }
 }

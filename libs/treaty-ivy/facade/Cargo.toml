@@ -3,7 +3,7 @@ name = "treaty_ivy"
 version = "0.1.0"
 edition = "2024"
 
-# Treaty's direct-to-Ivy Angular compiler, ported from Angular 22.1 packages/compiler.
+# Treaty's direct-to-Ivy Angular compiler, ported from Angular main at 78d2a67d (tools/render3-sync/ANGULAR_REF) packages/compiler.
 # See migration/PORT-ARCHITECTURE.md and migration/render3-specs/.
 
 [features]

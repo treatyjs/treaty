@@ -1398,7 +1398,7 @@ fn to_r3_directive_meta(obj: Props) -> Result<R3DirectiveMetadata, String> {
         name,
         ty: class_ref_from(type_expr)?,
         type_argument_count: 0,
-        type_source_span: ParseSourceSpan::new(0, 0),
+        type_source_span: ParseSourceSpan::synthetic(),
         deps: Deps::None,
         selector: find_prop(obj, "selector").and_then(string_value),
         queries: read_queries(obj, "queries")?,

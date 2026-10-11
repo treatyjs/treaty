@@ -90,6 +90,43 @@ pub struct SplitInterpolation {
     pub offsets: Vec<usize>,
 }
 
+/// One token of an interpolated text node or attribute value: Angular's `InterpolatedTextToken` /
+/// `InterpolatedAttributeToken`, i.e. an ml_parser `TEXT`, `INTERPOLATION` or `ENCODED_ENTITY`
+/// token reduced to what interpolation parsing reads (its kind, `parts` and `sourceSpan`).
+///
+/// The tokens of a value are passed to [`Parser::parse_interpolation`] so that each expression is
+/// parsed with its own token span (the error location) and so that expression offsets account for
+/// HTML entities that were decoded in the text.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InterpolatedToken {
+    /// `true` for an `ENCODED_ENTITY` token, whose `parts` are `[decoded, encoded]`.
+    pub is_encoded_entity: bool,
+    pub parts: Vec<String>,
+    pub source_span: ParseSourceSpan,
+}
+
+/// `getIndexMapForOriginalTemplate`: maps an index into the decoded interpolated input to the
+/// index of the same position in the original (encoded) template text, for every token boundary.
+fn index_map_for_original_template(tokens: &[InterpolatedToken]) -> std::collections::HashMap<usize, usize> {
+    let mut offset_map = std::collections::HashMap::new();
+    let mut consumed_in_original = 0usize;
+    let mut consumed_in_input = 0usize;
+    for token in tokens {
+        if token.is_encoded_entity {
+            let decoded = token.parts.first().map_or(0, |p| p.encode_utf16().count());
+            let encoded = token.parts.get(1).map_or(0, |p| p.encode_utf16().count());
+            consumed_in_original += encoded;
+            consumed_in_input += decoded;
+        } else {
+            let length: usize = token.parts.iter().map(|p| p.encode_utf16().count()).sum();
+            consumed_in_input += length;
+            consumed_in_original += length;
+        }
+        offset_map.insert(consumed_in_input, consumed_in_original);
+    }
+    offset_map
+}
+
 /// `TemplateBindingParseResult` — bindings + warnings + errors from
 /// [`Parser::parse_template_bindings`].
 #[derive(Clone, Debug, PartialEq)]
@@ -158,10 +195,7 @@ fn get_parse_error(
     }
     let location = get_location(parse_source_span);
     let msg = format!("Parser Error: {message}{location_text}[{input}] in {location}");
-    ParseError {
-        span: parse_source_span.clone(),
-        msg,
-    }
+    ParseError::new(parse_source_span.clone(), msg)
 }
 
 // ---------------------------------------------------------------------------
@@ -345,9 +379,11 @@ impl Parser {
         input: &str,
         parse_source_span: ParseSourceSpan,
         absolute_offset: i32,
+        interpolated_tokens: Option<&[InterpolatedToken]>,
     ) -> Option<AstWithSource> {
         let mut errors: Vec<ParseError> = Vec::new();
-        let split = self.split_interpolation(input, &parse_source_span, &mut errors);
+        let split =
+            self.split_interpolation(input, &parse_source_span, &mut errors, interpolated_tokens);
         if split.expressions.is_empty() {
             return None;
         }
@@ -355,6 +391,12 @@ impl Parser {
         let mut expression_nodes: Vec<AstNode> = Vec::new();
 
         for i in 0..split.expressions.len() {
+            // If we have a token for the specific expression, it is preferable to use it because it
+            // allows more accurate error locations. The expressions are always at the odd indexes
+            // inside the tokens (`interpolatedTokens?.[i * 2 + 1]?.sourceSpan`).
+            let expression_span = interpolated_tokens
+                .and_then(|tokens| tokens.get(i * 2 + 1))
+                .map(|token| token.source_span.clone());
             let expression_text = &split.expressions[i].text;
             let (source_to_lex, has_comments) = self.strip_comments(expression_text);
             let tokens = self.lexer.tokenize(&source_to_lex);
@@ -370,8 +412,8 @@ impl Parser {
             }
 
             let ast = ParseAst::new(
-                input,
-                parse_source_span.clone(),
+                if expression_span.is_some() { expression_text } else { input },
+                expression_span.clone().unwrap_or_else(|| parse_source_span.clone()),
                 absolute_offset,
                 tokens,
                 ParseFlags::NONE,
@@ -461,7 +503,10 @@ impl Parser {
         input: &str,
         parse_source_span: &ParseSourceSpan,
         errors: &mut Vec<ParseError>,
+        interpolated_tokens: Option<&[InterpolatedToken]>,
     ) -> SplitInterpolation {
+        let input_to_template_index_map =
+            interpolated_tokens.map(index_map_for_original_template);
         let units: Vec<u16> = input.encode_utf16().collect();
         let mut strings: Vec<InterpolationPiece> = Vec::new();
         let mut expressions: Vec<InterpolationPiece> = Vec::new();
@@ -512,10 +557,13 @@ impl Parser {
                     start: full_start,
                     end: full_end,
                 });
-                // No ENCODED_ENTITY remap is performed (no interpolatedTokens are
-                // threaded in this port); the offset is just the expr-start.
-                let offset = full_start + interp_start.len();
-                offsets.push(offset);
+                // The offset of the expression within the ORIGINAL template text: the decoded index
+                // `fullStart` mapped back through any encoded entities, plus the `{{` marker.
+                let start_in_original_template = input_to_template_index_map
+                    .as_ref()
+                    .and_then(|map| map.get(&full_start).copied())
+                    .unwrap_or(full_start);
+                offsets.push(start_in_original_template + interp_start.len());
 
                 i = full_end;
                 at_interpolation = false;
@@ -2395,7 +2443,7 @@ mod tests {
     use super::*;
 
     fn pss() -> ParseSourceSpan {
-        ParseSourceSpan { start: 0, end: 0 }
+        ParseSourceSpan::synthetic()
     }
 
     fn parse_binding(input: &str) -> AstWithSource {
@@ -2785,7 +2833,7 @@ mod tests {
     #[test]
     fn interpolation_basic() {
         let p = Parser::default();
-        let r = p.parse_interpolation("{{ a }}{{ b }}", pss(), 0);
+        let r = p.parse_interpolation("{{ a }}{{ b }}", pss(), 0, None);
         let r = r.expect("should produce interpolation");
         match &r.ast.kind {
             ExprKind::Interpolation {
@@ -2802,14 +2850,14 @@ mod tests {
     #[test]
     fn interpolation_none_when_no_braces() {
         let p = Parser::default();
-        assert!(p.parse_interpolation("plain text", pss(), 0).is_none());
+        assert!(p.parse_interpolation("plain text", pss(), 0, None).is_none());
     }
 
     #[test]
     fn interpolation_blank_is_error() {
         let p = Parser::default();
         let mut errors = Vec::new();
-        let split = p.split_interpolation("{{ }}", &pss(), &mut errors);
+        let split = p.split_interpolation("{{ }}", &pss(), &mut errors, None);
         assert_eq!(split.expressions.len(), 1);
         assert!(!errors.is_empty());
         assert!(errors[0].msg.contains("Blank expressions"));

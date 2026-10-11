@@ -1106,7 +1106,7 @@ fn lower_host_property_value(
     let parser = crate::expression::parser::Parser::default();
     let parsed = parser.parse_binding(
         value,
-        crate::expression::ast::ParseSourceSpan { start: 0, end: 0 },
+        crate::expression::ast::ParseSourceSpan::synthetic(),
         0,
     );
     let resolver =
@@ -1150,7 +1150,7 @@ fn lower_host_listener_value(
     let parser = crate::expression::parser::Parser::default();
     let parsed = parser.parse_action(
         value,
-        crate::expression::ast::ParseSourceSpan { start: 0, end: 0 },
+        crate::expression::ast::ParseSourceSpan::synthetic(),
         0,
     );
     let references_event = parsed.ast.references_dollar_event();
@@ -2901,7 +2901,7 @@ mod tests {
     }
 
     fn span() -> ParseSourceSpan {
-        ParseSourceSpan::new(0, 0)
+        ParseSourceSpan::synthetic()
     }
 
     fn directive_meta(name: &str, selector: &str) -> R3DirectiveMetadata {

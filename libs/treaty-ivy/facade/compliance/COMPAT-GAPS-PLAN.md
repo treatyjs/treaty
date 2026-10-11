@@ -7,7 +7,7 @@ compile-time lowering of legacy → new Ivy instructions, default-on, opt-out pe
 sub-transform).
 
 Reference: Angular at `tools/angular-ref`. Compliance harness at
-`libs/treaty-ivy/facade/compliance` (matchGolden 170/185, 15 DIFF).
+`libs/treaty-ivy/facade/compliance` (full bucket 189/189 PASS, 0 DIFF; partial bucket 207 PASS of 351 runnable, 144 DIFF; the per-case list is in `COMPLIANCE-REPORT.md`; figures as of commit 4bec1e5).
 
 ---
 
@@ -148,4 +148,4 @@ G1–G3, which are required for real apps to run at all.
 3. G3 NgModule schemas.
 4. Modernizer options plumbing + `*ngIf/*ngFor/*ngSwitch` → `@if/@for/@switch` lowering,
    then signal-input/query lowering.
-5. Compliance DIFFs G4–G6 (raise matchGolden 170→185) as fidelity polish.
+5. Compliance DIFFs G4–G6 (raise the partial-bucket PASS count, 207 of 351 as of commit 4bec1e5) as fidelity polish.

@@ -3,7 +3,7 @@
 //!
 //! PORT TARGET: `migration/render3-specs/08-control_flow.md`
 //! Source: `tools/angular-ref/packages/compiler/src/render3/r3_control_flow.ts`
-//! (Angular 22.1.0-next.0).
+//! (Angular main, 78d2a67d).
 //!
 //! This module is a pure tree transform: it takes [`crate::ml_parser`] `Block` /
 //! `BlockParameter` HTML AST nodes (plus the connected sibling blocks the caller
@@ -33,7 +33,7 @@
 
 use crate::expression::ast::{AstNode, AstWithSource, ExprKind, ParseSourceSpan};
 use crate::expression::parser::Parser;
-use crate::ml_parser::{self as html, ParseError, ParseSourceSpan as MlSpan};
+use crate::ml_parser::{self as html, ParseError, ParseLocation, ParseSourceSpan as MlSpan};
 use crate::template::r3_ast as t;
 
 // ---------------------------------------------------------------------------
@@ -195,27 +195,15 @@ pub(crate) fn match_surrounding_whitespace(input: &str) -> Option<(String, Strin
 }
 
 // ---------------------------------------------------------------------------
-// Span helpers: convert ml_parser location spans to r3_ast offset spans, and do
-// offset arithmetic (mirroring `ParseSourceSpan`/`moveBy` in the TS source).
+// Span helpers. The r3 AST carries the shared `parse_util::ParseSourceSpan` (locations, not
+// bare offsets), so an ml_parser span is used as-is and sub-spans are built with the same
+// `new ParseSourceSpan(start, end)` / `location.moveBy(n)` calls the TS source makes. Lengths
+// that move a location are UTF-16 code-unit counts, like JavaScript `string.length`.
 // ---------------------------------------------------------------------------
 
-/// Convert an [`crate::ml_parser::ParseSourceSpan`] to an
-/// [`crate::expression::ast::ParseSourceSpan`] by taking char offsets.
+/// The ml_parser span, carried unchanged onto the r3 node (both use the shared type).
 pub(crate) fn r3_span(span: &MlSpan) -> ParseSourceSpan {
-    ParseSourceSpan {
-        start: span.start.offset as u32,
-        end: span.end.offset as u32,
-    }
-}
-
-/// `new ParseSourceSpan(start, end)` over r3 offset spans.
-pub(crate) fn span_of(start: u32, end: u32) -> ParseSourceSpan {
-    ParseSourceSpan { start, end }
-}
-
-/// `span.start.moveBy(n)` — advance an offset by `n` chars.
-pub(crate) fn move_by(offset: u32, n: i64) -> u32 {
-    (offset as i64 + n).max(0) as u32
+    span.clone()
 }
 
 /// Build the [`t::BlockSpans`] for a block node from its ml_parser spans plus an
@@ -335,7 +323,10 @@ pub fn create_if_block<V: ChildVisitor>(
 
     let mut whole_source_span = r3_span(&ast.source_span);
     if let Some(last_branch) = branches.last() {
-        whole_source_span = span_of(if_block_start.start, last_branch.spans.source_span.end);
+        whole_source_span = ParseSourceSpan::new(
+            if_block_start.start.clone(),
+            last_branch.spans.source_span.end.clone(),
+        );
     }
 
     let node = t::IfBlock {
@@ -405,12 +396,12 @@ pub fn create_for_loop<V: ChildVisitor>(
         .as_ref()
         .and_then(|e| e.spans.end_source_span.clone())
         .or_else(|| ast.end_source_span.as_ref().map(r3_span));
-    let source_span = span_of(
-        ast.source_span.start.offset as u32,
+    let source_span = ParseSourceSpan::new(
+        ast.source_span.start.clone(),
         end_span
             .as_ref()
-            .map(|s| s.end)
-            .unwrap_or(ast.source_span.end.offset as u32),
+            .map(|s| s.end.clone())
+            .unwrap_or_else(|| ast.source_span.end.clone()),
     );
 
     let (track_expression, track_keyword_span) = match params.track_by {
@@ -464,9 +455,11 @@ pub fn create_switch_block<V: ChildVisitor>(
 ) -> (Option<t::SwitchBlock>, Vec<ParseError>) {
     let mut errors = validate_switch_block(ast);
     let primary_expression = if !ast.parameters.is_empty() {
-        parse_block_parameter_to_binding(&ast.parameters[0], parser, None)
+        parse_block_parameter_to_binding(&ast.parameters[0], parser, None, &mut errors)
     } else {
-        parser.parse_binding("", r3_span(&ast.source_span), 0)
+        let binding = parser.parse_binding("", r3_span(&ast.source_span), 0);
+        errors.extend(binding.errors.iter().cloned());
+        binding
     };
 
     let mut groups: Vec<t::SwitchBlockCaseGroup> = Vec::new();
@@ -506,7 +499,7 @@ pub fn create_switch_block<V: ChildVisitor>(
 
         if is_case {
             expression = Some(
-                parse_block_parameter_to_binding(&node.parameters[0], parser, None)
+                parse_block_parameter_to_binding(&node.parameters[0], parser, None, &mut errors)
                     .ast
                     .as_ref()
                     .clone(),
@@ -514,7 +507,7 @@ pub fn create_switch_block<V: ChildVisitor>(
         } else if node.name == "default never" {
             if !node.parameters.is_empty() {
                 expression = Some(
-                    parse_block_parameter_to_binding(&node.parameters[0], parser, None)
+                    parse_block_parameter_to_binding(&node.parameters[0], parser, None, &mut errors)
                         .ast
                         .as_ref()
                         .clone(),
@@ -569,9 +562,14 @@ pub fn create_switch_block<V: ChildVisitor>(
         let mut start_source_span = r3_span(&node.start_source_span);
         if let Some(first_start) = first_case_start.take() {
             // Build a span that spans all fall-through cases up to the body case.
-            source_span = span_of(first_start.start, node.source_span.end.offset as u32);
-            start_source_span =
-                span_of(first_start.start, node.start_source_span.end.offset as u32);
+            source_span = ParseSourceSpan::new(
+                first_start.start.clone(),
+                node.source_span.end.clone(),
+            );
+            start_source_span = ParseSourceSpan::new(
+                first_start.start.clone(),
+                node.start_source_span.end.clone(),
+            );
         }
 
         let children = visitor.visit_children(&node.children);
@@ -672,16 +670,16 @@ fn parse_for_loop_parameters(
         .next()
         .unwrap_or("")
         .to_string();
-    let var_start = expression_param.source_span.start.offset as u32;
-    let variable_span = span_of(
-        var_start,
-        move_by(var_start, variable_name.chars().count() as i64),
+    let var_start = expression_param.source_span.start.clone();
+    let variable_span = ParseSourceSpan::new(
+        var_start.clone(),
+        var_start.move_by(variable_name.encode_utf16().count() as isize),
     );
 
     // Seed context with the 6 ambient reserved variables: each gets an empty span
     // at the end of the block's start span.
-    let ambient_end = block.start_source_span.end.offset as u32;
-    let ambient_span = span_of(ambient_end, ambient_end);
+    let ambient_end = block.start_source_span.end.clone();
+    let ambient_span = ParseSourceSpan::new(ambient_end.clone(), ambient_end);
     let mut context: Vec<t::Variable> = ALLOWED_FOR_LOOP_LET_VARIABLES
         .iter()
         .map(|name| t::Variable {
@@ -706,6 +704,7 @@ fn parse_for_loop_parameters(
             expression_param,
             parser,
             Some(&raw_expression),
+            errors,
         ),
         context: Vec::new(), // filled below (after secondary params) to mirror order.
     };
@@ -713,12 +712,12 @@ fn parse_for_loop_parameters(
     for param in secondary_params {
         if let Some((full_match, capture1)) = match_for_loop_let(&param.expression) {
             // variablesSpan = [start.moveBy(letMatch[0].length - letMatch[1].length), end]
-            let full_len = full_match.chars().count() as i64;
-            let cap_len = capture1.chars().count() as i64;
-            let param_start = param.source_span.start.offset as u32;
-            let variables_span = span_of(
-                move_by(param_start, full_len - cap_len),
-                param.source_span.end.offset as u32,
+            let full_len = full_match.encode_utf16().count() as isize;
+            let cap_len = capture1.encode_utf16().count() as isize;
+            let param_start = param.source_span.start.clone();
+            let variables_span = ParseSourceSpan::new(
+                param_start.move_by(full_len - cap_len),
+                param.source_span.end.clone(),
             );
             parse_let_parameters(
                 &param.source_span,
@@ -764,15 +763,18 @@ fn parse_for_loop_parameters(
                 ));
             } else {
                 let expression =
-                    parse_block_parameter_to_binding(param, parser, Some(&track_capture));
+                    parse_block_parameter_to_binding(param, parser, Some(&track_capture), errors);
                 if matches!(expression.ast.kind, ExprKind::EmptyExpr) {
                     errors.push(ParseError::new(
                         block.start_source_span.clone(),
                         "@for loop must have a \"track\" expression",
                     ));
                 }
-                let param_start = param.source_span.start.offset as u32;
-                let keyword_span = span_of(param_start, move_by(param_start, "track".len() as i64));
+                let param_start = param.source_span.start.clone();
+                let keyword_span = ParseSourceSpan::new(
+                    param_start.clone(),
+                    param_start.move_by("track".len() as isize),
+                );
                 // Build the *real* ml_parser keyword span ([start, start.moveBy(5)])
                 // so track-by validation errors carry a faithful file-backed span.
                 let ml_keyword_span = MlSpan::new(
@@ -838,7 +840,7 @@ pub fn parse_let_parameters(
     default_implicit_variable_name: Option<&str>,
 ) {
     let parts: Vec<&str> = expression.split(',').collect();
-    let mut start_span = span.start;
+    let mut start_span: ParseLocation = span.start.clone();
 
     for part in parts {
         let expression_parts: Vec<&str> = part.split('=').collect();
@@ -866,9 +868,12 @@ pub fn parse_let_parameters(
 
             let key_span = match match_surrounding_whitespace(expression_parts[0]) {
                 Some((key_leading, key_name)) => {
-                    let lead = key_leading.chars().count() as i64;
-                    let key_len = key_name.chars().count() as i64;
-                    span_of(move_by(start_span, lead), move_by(start_span, lead + key_len))
+                    let lead = key_leading.encode_utf16().count() as isize;
+                    let key_len = key_name.encode_utf16().count() as isize;
+                    ParseSourceSpan::new(
+                        start_span.move_by(lead),
+                        start_span.move_by(lead + key_len),
+                    )
                 }
                 None => span.clone(),
             };
@@ -878,19 +883,22 @@ pub fn parse_let_parameters(
                 if let Some((value_leading, implicit)) =
                     match_surrounding_whitespace(expression_parts[1])
                 {
-                    let key0_len = expression_parts[0].chars().count() as i64;
-                    let lead = value_leading.chars().count() as i64;
-                    let impl_len = implicit.chars().count() as i64;
-                    value_span = Some(span_of(
-                        move_by(start_span, key0_len + 1 + lead),
-                        move_by(start_span, key0_len + 1 + lead + impl_len),
+                    let key0_len = expression_parts[0].encode_utf16().count() as isize;
+                    let lead = value_leading.encode_utf16().count() as isize;
+                    let impl_len = implicit.encode_utf16().count() as isize;
+                    value_span = Some(ParseSourceSpan::new(
+                        start_span.move_by(key0_len + 1 + lead),
+                        start_span.move_by(key0_len + 1 + lead + impl_len),
                     ));
                 }
             }
 
-            let variable_source_span = span_of(
-                key_span.start,
-                value_span.as_ref().map(|s| s.end).unwrap_or(key_span.end),
+            let variable_source_span = ParseSourceSpan::new(
+                key_span.start.clone(),
+                value_span
+                    .as_ref()
+                    .map(|s| s.end.clone())
+                    .unwrap_or_else(|| key_span.end.clone()),
             );
             context.push(t::Variable {
                 name,
@@ -902,7 +910,7 @@ pub fn parse_let_parameters(
         }
 
         // Advance past this part and the comma.
-        start_span = move_by(start_span, part.chars().count() as i64 + 1);
+        start_span = start_span.move_by(part.encode_utf16().count() as isize + 1);
     }
 }
 
@@ -1021,48 +1029,36 @@ fn validate_switch_block(ast: &html::Block) -> Vec<ParseError> {
 // ---------------------------------------------------------------------------
 
 /// Parses a block parameter into a binding AST. Mirrors `parseBlockParameterToBinding`.
+/// `parseBlockParameterToBinding`: parse a block parameter as a binding. Angular parses these with
+/// the `BindingParser`, so the expression errors land in the transform's error list; they are
+/// pushed to `errors` here.
 fn parse_block_parameter_to_binding(
     ast: &html::BlockParameter,
     parser: &Parser,
     part: Option<&str>,
+    errors: &mut Vec<ParseError>,
 ) -> AstWithSource {
-    let expr_chars: Vec<char> = ast.expression.chars().collect();
+    // `ast.expression.lastIndexOf(part)` and `.slice(start, end)`: positions are UTF-16 code units, as
+    // in the TypeScript source. `lastIndexOf` returns -1 when absent, which `Math.max(0, …)` clamps.
+    use treaty_ivy_core::parse_util::{byte_to_utf16_offset, utf16_len, utf16_to_byte_offset};
+    let expression = ast.expression.as_str();
     let (start, end) = match part {
         Some(part) => {
-            // `lastIndexOf(part)` over chars (mirrors the TS comment about avoiding
-            // the regex `d` flag).
-            let start = char_last_index_of(&expr_chars, part).max(0);
-            (start, start + part.chars().count())
+            let start = expression
+                .rfind(part)
+                .map(|byte| byte_to_utf16_offset(expression, byte))
+                .unwrap_or(0);
+            (start, start + utf16_len(part))
         }
-        None => (0, expr_chars.len()),
+        None => (0, utf16_len(expression)),
     };
-
-    let sliced: String = expr_chars[start..end.min(expr_chars.len())].iter().collect();
+    let start_byte = utf16_to_byte_offset(expression, start);
+    let end_byte = utf16_to_byte_offset(expression, end.min(utf16_len(expression)));
+    let sliced: &str = &expression[start_byte..end_byte.max(start_byte)];
     let absolute_offset = ast.source_span.start.offset + start;
-    parser.parse_binding(&sliced, r3_span(&ast.source_span), absolute_offset as i32)
-}
-
-/// `String.prototype.lastIndexOf(part)` over a char slice; returns the char index
-/// of the last occurrence, or `-1` (here represented as a clamp to 0 by the caller
-/// via `.max(0)`; we return `0` when not found to mirror `Math.max(0, -1)`).
-fn char_last_index_of(haystack: &[char], needle: &str) -> usize {
-    let needle: Vec<char> = needle.chars().collect();
-    if needle.is_empty() {
-        return haystack.len();
-    }
-    if needle.len() > haystack.len() {
-        return 0;
-    }
-    let mut i = haystack.len() - needle.len();
-    loop {
-        if haystack[i..i + needle.len()] == needle[..] {
-            return i;
-        }
-        if i == 0 {
-            return 0;
-        }
-        i -= 1;
-    }
+    let binding = parser.parse_binding(sliced, r3_span(&ast.source_span), absolute_offset as i32);
+    errors.extend(binding.errors.iter().cloned());
+    binding
 }
 
 /// Result of [`parse_conditional_block_parameters`].
@@ -1086,7 +1082,7 @@ fn parse_conditional_block_parameters(
         return None;
     }
 
-    let expression = parse_block_parameter_to_binding(&block.parameters[0], parser, None)
+    let expression = parse_block_parameter_to_binding(&block.parameters[0], parser, None, errors)
         .ast
         .as_ref()
         .clone();
@@ -1118,12 +1114,14 @@ fn parse_conditional_block_parameters(
             Some((group1, group2)) => {
                 let name = group2.trim().to_string();
                 if is_identifier(&name) {
-                    let variable_start = move_by(
-                        param.source_span.start.offset as u32,
-                        group1.chars().count() as i64,
+                    let variable_start = param
+                        .source_span
+                        .start
+                        .move_by(group1.encode_utf16().count() as isize);
+                    let variable_span = ParseSourceSpan::new(
+                        variable_start.clone(),
+                        variable_start.move_by(name.encode_utf16().count() as isize),
                     );
-                    let variable_span =
-                        span_of(variable_start, move_by(variable_start, name.chars().count() as i64));
                     expression_alias = Some(t::Variable {
                         name: name.clone(),
                         value: name,
@@ -1364,7 +1362,7 @@ mod tests {
         let nodes = parse_html("@for (x of y; track x) {}");
         let block = blocks(&nodes).remove(0);
         let source = block.source_span.clone();
-        let span = span_of(0, 20);
+        let span = ParseSourceSpan::new(source.start.clone(), source.start.move_by(20));
 
         // `@error` style: a bare name takes the implicit `$error` variable.
         let mut context: Vec<t::Variable> = Vec::new();

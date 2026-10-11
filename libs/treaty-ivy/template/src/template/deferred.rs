@@ -4,7 +4,7 @@
 //! `prefetch on …`, `hydrate on …`, `hydrate never`).
 //!
 //! PORT TARGET: `migration/render3-specs/09-deferred.md`
-//! Sources (Angular 22.1.0-next.0, `packages/compiler/src/render3`):
+//! Sources (Angular main, 78d2a67d, `packages/compiler/src/render3`):
 //! - `r3_deferred_blocks.ts`
 //! - `r3_deferred_triggers.ts`
 //!
@@ -54,22 +54,15 @@ const CHAR_COMMA: u32 = b',' as u32;
 // Span helpers.
 // ---------------------------------------------------------------------------
 
-/// Convert an ml_parser span (rich, line/col) to the offset-only r3/expression span.
+/// The ml_parser span, carried unchanged onto the r3 node (both use the shared
+/// `parse_util::ParseSourceSpan`).
 fn to_r3_span(span: &MlSpan) -> R3Span {
-    R3Span {
-        start: span.start.offset as u32,
-        end: span.end.offset as u32,
-    }
+    span.clone()
 }
 
-/// `new ParseSourceSpan(start, end)` from two ml_parser locations, then converted.
-/// We build the ml_parser span first (so the `move_by` line/col bookkeeping stays
-/// faithful) and downcast to the offset-only form.
+/// `new ParseSourceSpan(start, end)` over two locations (`moveBy` keeps line/col exact).
 fn r3_span_between(start: &crate::ml_parser::ParseLocation, end: &crate::ml_parser::ParseLocation) -> R3Span {
-    R3Span {
-        start: start.offset as u32,
-        end: end.offset as u32,
-    }
+    R3Span::new(start.clone(), end.clone())
 }
 
 // ---------------------------------------------------------------------------
@@ -608,6 +601,8 @@ pub fn parse_when_trigger(
                 to_r3_span(source_span),
                 (source_span.start.offset + start) as i32,
             );
+            // Angular parses this with the `BindingParser`, so its expression errors are reported.
+            errors.extend(parsed.errors.iter().cloned());
             let trigger = t::DeferredTrigger {
                 kind: t::DeferredTriggerKind::When {
                     value: aws_into_ast(parsed),
@@ -912,6 +907,7 @@ fn create_viewport_trigger(
     source_span_for_binding: R3Span,
     binding_absolute_base: i32,
     validator: ReferenceTriggerValidator,
+    errors: &mut Vec<MlParseError>,
 ) -> TriggerResult<t::DeferredTrigger> {
     validator.validate(OnTriggerType::Viewport, parameters)?;
 
@@ -931,6 +927,7 @@ fn create_viewport_trigger(
             source_span_for_binding,
             absolute_offset,
         );
+        errors.extend(parsed.errors.iter().cloned());
         let ast = aws_into_ast(parsed);
 
         let ExprKind::LiteralMap { keys, values } = &ast.kind else {
@@ -1174,7 +1171,7 @@ impl<'a, 'e> OnTriggerParser<'a, 'e> {
         let ident_str = identifier.to_string_value().unwrap_or_default();
         let name_span = r3_span_between(
             &trigger_name_start,
-            &trigger_name_start.move_by(ident_str.chars().count() as isize),
+            &trigger_name_start.move_by(ident_str.encode_utf16().count() as isize),
         );
         let end_span =
             trigger_name_start.move_by((self.token().end - identifier.index) as isize);
@@ -1196,14 +1193,14 @@ impl<'a, 'e> OnTriggerParser<'a, 'e> {
         } else {
             None
         };
-        let source_span = R3Span {
-            start: if is_first_trigger {
-                self.span.start.offset as u32
+        let source_span = R3Span::new(
+            if is_first_trigger {
+                self.span.start.clone()
             } else {
-                trigger_name_start.offset as u32
+                trigger_name_start.clone()
             },
-            end: end_span.offset as u32,
-        };
+            end_span.clone(),
+        );
 
         // Spans for the idle case ("first-trigger gets the keyword spans", null otherwise).
         let spans_first_aware = t::TriggerSpans {
@@ -1256,6 +1253,7 @@ impl<'a, 'e> OnTriggerParser<'a, 'e> {
                     to_r3_span(self.span),
                     binding_base,
                     self.validator,
+                    self.errors,
                 )
                 .map(|tr| (t::TriggerKey::Viewport, tr))
             }
@@ -1398,16 +1396,18 @@ fn token_char_code(token: &Token) -> u32 {
 /// returns the char index, or `usize::MAX` for the TS `-1` (no params). Callers slice
 /// with [`slice_from`], which treats `usize::MAX`/out-of-range as "empty".
 pub fn get_trigger_parameters_start(value: &str, start_position: usize) -> usize {
-    let chars: Vec<char> = value.chars().collect();
+    // Positions are UTF-16 code units. Walk the characters with their unit offsets.
     let mut has_found_separator = false;
-    let mut i = start_position;
-    while i < chars.len() {
-        if is_separator_char(chars[i]) {
-            has_found_separator = true;
-        } else if has_found_separator {
-            return i;
+    let mut units = 0usize;
+    for ch in value.chars() {
+        if units >= start_position {
+            if is_separator_char(ch) {
+                has_found_separator = true;
+            } else if has_found_separator {
+                return units;
+            }
         }
-        i += 1;
+        units += ch.len_utf16();
     }
     // TS returns -1; we use usize::MAX as the sentinel.
     usize::MAX
@@ -1462,7 +1462,7 @@ fn matches_time_number(s: &str) -> bool {
 /// Char-based `String.indexOf(needle)` returning a char index.
 fn char_index_of(haystack: &str, needle: &str) -> Option<usize> {
     let byte_idx = haystack.find(needle)?;
-    Some(haystack[..byte_idx].chars().count())
+    Some(treaty_ivy_core::parse_util::byte_to_utf16_offset(haystack, byte_idx))
 }
 
 /// `value.slice(start)` with char semantics; `start == usize::MAX` (the `-1` sentinel)
@@ -1471,18 +1471,15 @@ fn slice_from(value: &str, start: usize) -> &str {
     if start == usize::MAX {
         return "";
     }
-    let mut indices = value.char_indices();
-    match indices.nth(start) {
-        Some((byte_idx, _)) => &value[byte_idx..],
-        None => "",
-    }
+    // `start` is a UTF-16 code-unit offset (JavaScript `slice`); out of range gives "".
+    &value[treaty_ivy_core::parse_util::utf16_to_byte_offset(value, start)..]
 }
 
-/// `value.slice(from, to)` with char semantics.
+/// `value.slice(from, to)` with UTF-16 code-unit offsets.
 fn slice_range(value: &str, from: usize, to: usize) -> &str {
-    let chars: Vec<(usize, char)> = value.char_indices().collect();
-    let start_byte = chars.get(from).map(|(b, _)| *b).unwrap_or(value.len());
-    let end_byte = chars.get(to).map(|(b, _)| *b).unwrap_or(value.len());
+    // `from` and `to` are UTF-16 code-unit offsets; past the end clamps to the end.
+    let start_byte = treaty_ivy_core::parse_util::utf16_to_byte_offset(value, from);
+    let end_byte = treaty_ivy_core::parse_util::utf16_to_byte_offset(value, to);
     if start_byte > end_byte {
         return "";
     }
@@ -1707,5 +1704,16 @@ mod tests {
         assert!(is_connected_defer_loop_block("loading"));
         assert!(is_connected_defer_loop_block("error"));
         assert!(!is_connected_defer_loop_block("defer"));
+    }
+
+    #[test]
+    fn trigger_helpers_use_utf16_offsets() {
+        // `é` is one UTF-16 unit and `😀` is two: `when` starts at unit 4, byte 7.
+        assert_eq!(char_index_of("é😀 when x", "when"), Some(4));
+        assert_eq!(slice_from("é😀 when x", 4), "when x");
+        assert_eq!(slice_range("é😀 when x", 4, 8), "when");
+        assert_eq!(slice_from("é😀", 99), "");
+        // The separator after `é😀 ` is at unit 3; the parameters start at the next word.
+        assert_eq!(get_trigger_parameters_start("é😀 x", 0), 4);
     }
 }

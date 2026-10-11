@@ -3,7 +3,7 @@
 //! `@let`, selectorless `Component`/`Directive`, plus the visitor.
 //!
 //! PORT TARGET: `migration/render3-specs/06-r3_ast.md`
-//! Source: `tools/angular-ref/packages/compiler/src/render3/r3_ast.ts` (Angular 22.1.0-next.0)
+//! Source: `tools/angular-ref/packages/compiler/src/render3/r3_ast.ts` (Angular main, 78d2a67d)
 //!
 //! Per `migration/PORT-ARCHITECTURE.md` (and matching the already-ported
 //! [`crate::expression::ast`]), this IR is OWNED and ARENA-FREE: `Box`/`Vec`/`String`
@@ -28,14 +28,33 @@ use crate::expression::ast::{
 };
 
 // ---------------------------------------------------------------------------
-// Local placeholder for the not-yet-ported i18n module.
+// i18n metadata (`i18n/i18n_ast.ts` `I18nMeta`).
 // ---------------------------------------------------------------------------
 
-/// Placeholder for `i18n/i18n_ast.I18nMeta` (the union of `Message | Node`), carried as an
-/// optional annotation on many template nodes. Real port lives in the future `i18n` module;
-/// kept opaque here so this module compiles standalone.
+/// `i18n.I18nMeta` (`i18n/i18n_ast.ts`): the i18n information attached to a template node. Angular's
+/// union is `Message | TagPlaceholder | BlockPlaceholder | IcuPlaceholder`; a node carries the `Message`
+/// when it is an i18n root, and the placeholder when it is a child of one.
+///
+/// Populated by the transform (see the `i18n` fields below for which nodes are populated). Consumers
+/// that only need to know whether a node is an i18n root test `is_some()` on the field, as the
+/// instruction emitter does; consumers that need the content read the variant.
 #[derive(Clone, Debug, PartialEq)]
-pub struct I18nMeta;
+pub enum I18nMeta {
+    Message(crate::i18n::Message),
+    TagPlaceholder(crate::i18n::TagPlaceholder),
+    BlockPlaceholder(crate::i18n::BlockPlaceholder),
+    IcuPlaceholder(crate::i18n::IcuPlaceholder),
+}
+
+impl I18nMeta {
+    /// The message, when this is the root `Message` of an i18n node.
+    pub fn message(&self) -> Option<&crate::i18n::Message> {
+        match self {
+            I18nMeta::Message(m) => Some(m),
+            _ => None,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // The top-level tagged node enum (replaces the TS class hierarchy + double dispatch).
@@ -65,15 +84,21 @@ pub enum Node {
     // Deferred triggers are visitable nodes too (TS `DeferredTrigger implements Node`).
     DeferredTrigger(DeferredTrigger),
     // Control-flow blocks.
-    DeferredBlock(DeferredBlock),
+    /// Boxed: the payload is large (its triggers and spans), and an inline payload would make every
+    /// [`Node`] several kilobytes, which overflows the stack in deeply nested templates.
+    DeferredBlock(Box<DeferredBlock>),
     DeferredBlockPlaceholder(DeferredBlockPlaceholder),
     DeferredBlockLoading(DeferredBlockLoading),
     DeferredBlockError(DeferredBlockError),
-    SwitchBlock(SwitchBlock),
+    /// Boxed: the payload is large (its triggers and spans), and an inline payload would make every
+    /// [`Node`] several kilobytes, which overflows the stack in deeply nested templates.
+    SwitchBlock(Box<SwitchBlock>),
     SwitchBlockCase(SwitchBlockCase),
     SwitchBlockCaseGroup(SwitchBlockCaseGroup),
     SwitchExhaustiveCheck(SwitchExhaustiveCheck),
-    ForLoopBlock(ForLoopBlock),
+    /// Boxed: the payload is large (its triggers and spans), and an inline payload would make every
+    /// [`Node`] several kilobytes, which overflows the stack in deeply nested templates.
+    ForLoopBlock(Box<ForLoopBlock>),
     ForLoopBlockEmpty(ForLoopBlockEmpty),
     IfBlock(IfBlock),
     IfBlockBranch(IfBlockBranch),
@@ -154,8 +179,9 @@ pub struct Comment {
 // Attributes, events, refs, variables.
 // ---------------------------------------------------------------------------
 
-/// `t.TextAttribute` — a static attribute (`<div a="b">`). `value_span` is absent when there
-/// is no value (`<div a>`); `key_span` is absent for synthetic attributes from ICU expansions.
+/// `t.TextAttribute` — a static attribute (`<div a="b">`). `value_span` is absent for a bare
+/// attribute (`<div a>`) and present for an empty one (`<div a="">`); see the field docs. `key_span`
+/// is absent for synthetic attributes from ICU expansions.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TextAttribute {
     pub name: String,
@@ -164,6 +190,10 @@ pub struct TextAttribute {
     /// `readonly keySpan: ParseSourceSpan | undefined` — optional here (differs from
     /// `BoundAttribute`/`Variable`/`Reference`, where it is required; spec §7.3).
     pub key_span: Option<ParseSourceSpan>,
+    /// Angular's optional `valueSpan`. It is `None` (`undefined` in TypeScript) for a bare
+    /// attribute with no `=` (`<input disabled>`), and `Some` whenever the source has an `=`, even
+    /// with an empty value (`<input disabled="">`, whose span is the empty value). Consumers that
+    /// need to tell a bare attribute from an empty one must test this field, not `value.is_empty()`.
     pub value_span: Option<ParseSourceSpan>,
     pub i18n: Option<I18nMeta>,
 }
@@ -1059,7 +1089,7 @@ mod tests {
     };
 
     fn span() -> ParseSourceSpan {
-        ParseSourceSpan { start: 0, end: 0 }
+        ParseSourceSpan::synthetic()
     }
 
     fn num(n: f64) -> AstNode {
@@ -1146,7 +1176,7 @@ mod tests {
             i18n: None,
         };
         let mut v = TextCollector::default();
-        v.visit_node(&Node::ForLoopBlock(block));
+        v.visit_node(&Node::ForLoopBlock(Box::new(block)));
         assert_eq!(v.log, vec!["body", "empty"]);
     }
 
@@ -1205,7 +1235,7 @@ mod tests {
         };
 
         let mut v = Rec::default();
-        v.visit_node(&Node::DeferredBlock(block));
+        v.visit_node(&Node::DeferredBlock(Box::new(block)));
         // hydrate trigger, then regular trigger, then child text, then placeholder text.
         assert_eq!(
             v.log,
@@ -1221,9 +1251,9 @@ mod tests {
             target_or_phase: Some("tp".to_string()),
             ty,
             handler: AstWithSource::new(num(0.0), None, String::new(), 0, vec![]),
-            source_span: PSS { start: 0, end: 0 },
-            handler_span: PSS { start: 0, end: 0 },
-            key_span: PSS { start: 0, end: 0 },
+            source_span: PSS::synthetic(),
+            handler_span: PSS::synthetic(),
+            key_span: PSS::synthetic(),
         };
         let reg = BoundEvent::from_parsed_event(mk(ParsedEventType::Regular));
         assert_eq!(reg.target.as_deref(), Some("tp"));
@@ -1247,15 +1277,15 @@ mod tests {
             security_context: SecurityContext::None,
             value: AstWithSource::new(num(7.0), None, String::new(), 0, vec![]),
             unit: Some("px".to_string()),
-            source_span: PSS { start: 0, end: 0 },
-            key_span: Some(PSS { start: 1, end: 2 }),
+            source_span: PSS::synthetic(),
+            key_span: Some(PSS::from_offsets(1, 2)),
             value_span: None,
         };
         let attr = BoundAttribute::from_bound_element_property(prop, None);
         assert_eq!(attr.name, "p");
         assert_eq!(attr.kind, BindingType::Property);
         assert_eq!(attr.unit.as_deref(), Some("px"));
-        assert_eq!(attr.key_span, PSS { start: 1, end: 2 });
+        assert_eq!(attr.key_span, PSS::from_offsets(1, 2));
     }
 
     #[test]

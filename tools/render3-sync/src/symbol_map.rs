@@ -663,11 +663,12 @@ pub const MODULE_MAP: &[ModuleMapping] = &[
     // ---- classified by the mapping sweep (every other Angular compiler file) ----------------
     // Rows below were added so that every TS file under ANGULAR_COMPILER_SRC_ROOT is either mapped
     // here or listed in OUT_OF_SCOPE_FILES. Pipeline phases with no more specific home are planned
-    // to be ported inside `template/src/view/template.rs`; `render3/r3_boundaries.ts` and
-    // `render3/r3_content_blocks.ts` are planned for the new `template/src/template/boundary.rs`.
+    // to be ported inside `template/src/view/template.rs`; `render3/r3_boundaries.ts` is planned for
+    // `template/src/template/boundary.rs`, and `render3/r3_content_blocks.ts` is ported in
+    // `template/src/template/content_block.rs`.
     ModuleMapping {
         ts_file: "parse_util.ts",
-        rust_file: "core/src/expression/ast.rs",
+        rust_file: "core/src/parse_util.rs",
         kind: PortKind::Logic,
         spec: None,
         anchor_symbols: &[],
@@ -1059,7 +1060,7 @@ pub const MODULE_MAP: &[ModuleMapping] = &[
     },
     ModuleMapping {
         ts_file: "render3/r3_content_blocks.ts",
-        rust_file: "template/src/template/boundary.rs",
+        rust_file: "template/src/template/content_block.rs",
         kind: PortKind::Logic,
         spec: None,
         anchor_symbols: &[],

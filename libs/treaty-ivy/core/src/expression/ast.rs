@@ -12,28 +12,13 @@
 //! Virtual `visit()` dispatch becomes a `match` in [`AstVisitor::walk`].
 
 // ---------------------------------------------------------------------------
-// Local placeholder types for not-yet-ported sibling modules.
+// Shared source-location types (`parse_util.ts`).
 // ---------------------------------------------------------------------------
-//
-// These mirror `parse_util.ts` (`ParseSourceSpan`, `ParseError`) and `core`
-// (`SecurityContext`). They are intentionally minimal stubs so this module
-// compiles standalone; replace with real ports when those modules land.
 
-/// Placeholder for `parse_util.ParseSourceSpan` (location-based span: file +
-/// offset + line/col). Distinct from [`AbsoluteSourceSpan`], which is an
-/// offset-only pair. Real port lives in the future `parse_util` module.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ParseSourceSpan {
-    pub start: u32,
-    pub end: u32,
-}
-
-/// Placeholder for `parse_util.ParseError`. Real port lives in `parse_util`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ParseError {
-    pub span: ParseSourceSpan,
-    pub msg: String,
-}
+// `ParseSourceSpan`, `ParseError`, `ParseLocation` and `ParseErrorLevel` are the single shared
+// definitions in [`crate::parse_util`]; they are re-exported here so that `expression::ast::*`
+// keeps its historical names. Spans are UTF-16 code-unit offsets, like Angular's.
+pub use crate::parse_util::{ParseError, ParseErrorLevel, ParseLocation, ParseSourceSpan};
 
 /// Placeholder for `core.SecurityContext` (re-exported from
 /// `schema/dom_security_schema`). Real port lives in `core`.
@@ -58,8 +43,8 @@ pub enum SecurityContext {
 /// `ParseSpan` — a relative [start, end) offset pair within the parsed source
 /// fragment. Mirrors `expression_parser/ast.ts#ParseSpan`.
 ///
-/// Offsets are `u32` (OXC convention). Angular uses JS `number` (UTF-16 code
-/// units); a UTF-16->UTF-8 remap is only required at the OXC boundary, not here.
+/// Offsets are `u32` and count UTF-16 code units, as Angular's JS `number` offsets do (see
+/// [`crate::parse_util`]). Byte offsets from OXC must be converted before they reach this type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ParseSpan {
     pub start: u32,
@@ -667,8 +652,8 @@ impl AstWithSource {
     /// `span = ParseSpan(0, source?.length ?? 0)` and
     /// `sourceSpan = AbsoluteSourceSpan(absoluteOffset, source===null ? absoluteOffset : absoluteOffset + source.length)`.
     ///
-    /// NOTE: Angular's `source.length` is UTF-16 code units; here we use the
-    /// byte length. A UTF-16<->UTF-8 remap is only required at the OXC boundary.
+    /// `source.length` is counted in UTF-16 code units, as in Angular (`String.length`), so the
+    /// absolute offsets are in the same unit as every other span in the pipeline.
     pub fn new(
         ast: AstNode,
         source: Option<String>,
@@ -676,7 +661,7 @@ impl AstWithSource {
         absolute_offset: u32,
         errors: Vec<ParseError>,
     ) -> Self {
-        let len = source.as_ref().map_or(0, |s| s.len() as u32);
+        let len = source.as_ref().map_or(0, |s| s.encode_utf16().count() as u32);
         let span = ParseSpan::new(0, len);
         let source_span = match &source {
             None => AbsoluteSourceSpan::new(absolute_offset, absolute_offset),
@@ -1318,8 +1303,8 @@ mod tests {
             name: "x".to_string(),
             expression: AstWithSource::new(num(0.0), None, String::new(), 0, vec![]),
             ty,
-            source_span: ParseSourceSpan { start: 0, end: 0 },
-            key_span: ParseSourceSpan { start: 0, end: 0 },
+            source_span: ParseSourceSpan::synthetic(),
+            key_span: ParseSourceSpan::synthetic(),
             value_span: None,
         };
         assert!(mk(ParsedPropertyType::LiteralAttr).is_literal());
@@ -1334,5 +1319,28 @@ mod tests {
         let a = num(5.0);
         let b = a.clone();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn ast_with_source_measures_source_in_utf16_units() {
+        // "é" is 2 UTF-8 bytes / 1 UTF-16 unit; "😀" is 4 bytes / 2 units. Angular's
+        // `source.length` counts UTF-16 units, so the span is 4 units, not 7 bytes.
+        let aws = AstWithSource::new(num(0.0), Some("é😀".to_string()), String::new(), 10, vec![]);
+        assert_eq!(aws.span, ParseSpan::new(0, 3));
+        assert_eq!(aws.source_span, AbsoluteSourceSpan::new(10, 13));
+    }
+
+    #[test]
+    fn parse_source_span_offsets_are_utf16_units() {
+        use crate::parse_util::{ParseLocation, ParseSourceFile};
+        // A span over the `😀` of "é😀x" starts at UTF-16 offset 1 and ends at 3.
+        let file = ParseSourceFile::new("é😀x", "t.html");
+        let span = ParseSourceSpan::new(
+            ParseLocation::new(file.clone(), 1, 0, 1),
+            ParseLocation::new(file, 3, 0, 3),
+        );
+        assert_eq!(span.to_source_string(), "😀");
+        assert_eq!(span.start.byte_offset(), "é".len());
+        assert_eq!(span.end.byte_offset(), "é😀".len());
     }
 }

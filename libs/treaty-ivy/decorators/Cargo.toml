@@ -7,7 +7,7 @@ edition = "2024"
 # the compile_*_from_metadata instruction emitter, @Pipe/@NgModule emit, and the
 # DecoratorCompiler trait + DecoratorRegistry plugin join. Depends on
 # treaty_ivy_core (IR + emit) and treaty_ivy_template (template lowering, the
-# template-definition builder, query generation). Ported from Angular 22.1
+# template-definition builder, query generation). Ported from Angular main at 78d2a67d
 # packages/compiler.
 
 # This crate is ENGINE-NEUTRAL — it names no `oxc_*`/`swc_*` type (its public `ClassMeta` carries the

@@ -1,6 +1,6 @@
 //! `treaty_ivy` — Treaty's direct-to-Ivy Angular compiler.
 //!
-//! Ported from Angular 22.1's `packages/compiler` (vendored at `tools/angular-ref`).
+//! Ported from Angular main at `78d2a67d` (`tools/render3-sync/ANGULAR_REF`)'s `packages/compiler` (vendored at `tools/angular-ref`).
 //! Per-module port specs live in `migration/render3-specs/`; architecture in
 //! `migration/PORT-ARCHITECTURE.md`.
 //!

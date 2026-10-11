@@ -6,7 +6,7 @@ edition = "2024"
 # The HTML/template -> instruction-IR layer of Treaty's direct-to-Ivy Angular
 # compiler: ml_parser, the template AST + transform + control-flow / defer
 # lowerings, the t2 binder, the template-definition builder + query generation,
-# and i18n. Depends on treaty_ivy_core. Ported from Angular 22.1 packages/compiler.
+# and i18n. Depends on treaty_ivy_core. Ported from Angular main at 78d2a67d (tools/render3-sync/ANGULAR_REF) packages/compiler.
 #
 # Engine-neutral: this crate names NO `oxc_*`/`swc_*` type. Its `oxc`/`swc` features
 # are pure pass-throughs that select the matching backend feature of `treaty_ivy_core`
@@ -17,6 +17,11 @@ edition = "2024"
 default = ["oxc"]
 oxc = ["treaty_ivy_core/oxc"]
 swc = ["treaty_ivy_core/swc"]
+# Parse-only use: the HTML parser, the render3 transform and `parse_template` (the Angular
+# `parseTemplate` entry point). It enables NO emit backend, so it links no `oxc_*` and no `swc_*`
+# crate. It is the same as building with `default-features = false`; the name states the intent.
+# `oxc` and `swc` stay the only way to add a JavaScript emitter.
+parse-only = []
 
 [dependencies]
 treaty_ivy_core = { path = "../core", default-features = false }

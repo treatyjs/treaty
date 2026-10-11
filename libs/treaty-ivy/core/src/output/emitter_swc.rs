@@ -46,7 +46,7 @@
 
 use std::cell::RefCell;
 
-use crate::output::source_map::{byte_offset_to_line_col, utf16_columns, SourceMapBuilder};
+use crate::output::source_map::{utf16_columns, utf16_offset_to_line_col, SourceMapBuilder};
 use crate::output_ast::{
     self as o, ArrowBody, BinaryOperator, ExprKind, ImportUrl, LiteralMapEntry, LiteralValue,
     ParseSourceSpan, StmtKind, StmtModifier, UnaryOperator,
@@ -127,7 +127,7 @@ pub fn build_definition_map(
         let gen_byte = search_from + rel;
         search_from = gen_byte + anchor.token.len();
         let generated = generated_byte_to_line_col(full_code, gen_byte);
-        let original = byte_offset_to_line_col(source_content, anchor.span.start);
+        let original = utf16_offset_to_line_col(source_content, anchor.span.start.offset);
         builder.add_segment(generated, src_index, original);
     }
     builder.to_json()
@@ -163,7 +163,7 @@ fn build_source_map(
         let gen_byte = search_from + rel;
         search_from = gen_byte + anchor.token.len();
         let generated = generated_byte_to_line_col(code, gen_byte);
-        let original = byte_offset_to_line_col(source_content, anchor.span.start);
+        let original = utf16_offset_to_line_col(source_content, anchor.span.start.offset);
         builder.add_segment(generated, src_index, original);
     }
     builder

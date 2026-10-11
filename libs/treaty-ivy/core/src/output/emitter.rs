@@ -34,14 +34,11 @@
 //! with no `output_ast`-level payload to lower); it emits a clearly-named
 //! `__unsupported_WrappedNode` identifier so emission never aborts.
 
-// At least one emit backend must be selected. `oxc` (default) compiles the `Lowerer` below
-// (the only `oxc_*`-AST consumer in this crate); `swc` routes the public functions to the
-// engine-neutral printer in `emitter_swc.rs`. Both may be on at once (the `--features swc`
-// gate build keeps `oxc` from `default`); the public dispatch then prefers the neutral printer.
-#[cfg(not(any(feature = "oxc", feature = "swc")))]
-compile_error!(
-    "treaty_ivy_core needs an emit backend feature: `oxc` (default) or `swc` (see SWC-BACKEND-PLAN)"
-);
+// The `oxc` feature compiles the `Lowerer` below (the only `oxc_*`-AST consumer in this crate); `swc`
+// routes the public functions to the engine-neutral printer in `emitter_swc.rs`. Both may be on at once
+// (the `--features swc` gate build keeps `oxc` from `default`); the public dispatch then prefers the
+// neutral printer. With NEITHER feature (the parse-only configuration) this module compiles to its
+// non-emitting core and the public `emit_*` functions are absent: a parse-only consumer uses no emitter.
 
 // --- oxc emit backend imports ------------------------------------------------
 // Compiled ONLY for the oxc emit path (`oxc` on, `swc` off). Under `--no-default-features
@@ -69,11 +66,12 @@ use oxc_codegen::Codegen;
 use oxc_span::{SourceType, SPAN};
 
 #[cfg(all(feature = "oxc", not(feature = "swc")))]
-use crate::output::source_map::{byte_offset_to_line_col, utf16_columns, SourceMapBuilder};
+use crate::output::source_map::{utf16_columns, utf16_offset_to_line_col, SourceMapBuilder};
 
 // `o::Stmt` / `o::Expr` appear in EVERY public function signature (both the oxc and the swc
 // dispatch variants), so the neutral IR alias is always in scope; the rest of the IR surface
 // is only named by the oxc `Lowerer`.
+#[cfg(any(feature = "oxc", feature = "swc"))]
 use crate::output_ast as o;
 #[cfg(all(feature = "oxc", not(feature = "swc")))]
 use crate::output_ast::{
@@ -245,7 +243,7 @@ fn build_source_map(
         search_from = gen_byte + anchor.token.len();
 
         let generated = generated_byte_to_line_col(code, gen_byte);
-        let original = byte_offset_to_line_col(source_content, anchor.span.start);
+        let original = utf16_offset_to_line_col(source_content, anchor.span.start.offset);
         builder.add_segment(generated, src_index, original);
     }
     builder
@@ -350,7 +348,7 @@ pub fn build_definition_map(
         let gen_byte = search_from + rel;
         search_from = gen_byte + anchor.token.len();
         let generated = generated_byte_to_line_col(full_code, gen_byte);
-        let original = byte_offset_to_line_col(source_content, anchor.span.start);
+        let original = utf16_offset_to_line_col(source_content, anchor.span.start.offset);
         builder.add_segment(generated, src_index, original);
     }
     builder.to_json()
@@ -2242,7 +2240,8 @@ mod tests {
 
     #[test]
     fn with_map_anchors_span_carrying_var_decl() {
-        use crate::output::source_map::{byte_offset_to_line_col, decode_mappings};
+        use crate::output::source_map::{decode_mappings, utf16_offset_to_line_col};
+        use crate::parse_util::ParseSourceFile;
         // A DeclareVar carrying an original-source span anchors its emitted `name` token.
         let source = "let myVar = 1;";
         let var_byte = source.find("myVar").unwrap();
@@ -2254,7 +2253,8 @@ mod tests {
             },
             StmtModifier::FINAL,
         );
-        stmt.meta.span = Some(ParseSourceSpan::new(var_byte, var_byte + 5));
+        let file = ParseSourceFile::new(source, "src.ts");
+        stmt.meta.span = Some(ParseSourceSpan::from_byte_range(file, var_byte, var_byte + 5));
 
         let (_code, map) = emit_statements_with_map(
             std::slice::from_ref(&stmt),
@@ -2271,7 +2271,7 @@ mod tests {
         let rest = &map[s..];
         let mappings = &rest[..rest.find('"').unwrap()];
         let decoded = decode_mappings(mappings).expect("decode");
-        let expected = byte_offset_to_line_col(source, var_byte);
+        let expected = utf16_offset_to_line_col(source, var_byte);
         assert!(
             decoded.iter().any(|&(_, _, _, sl, sc)| sl == expected.line && sc == expected.column),
             "no segment for myVar; decoded {decoded:?}; map {map}"
@@ -2279,9 +2279,45 @@ mod tests {
     }
 
     #[test]
+    fn with_map_anchor_column_is_utf16_after_multibyte_source() {
+        use crate::output::source_map::decode_mappings;
+        use crate::parse_util::ParseSourceFile;
+        // `é` is 2 UTF-8 bytes and 1 UTF-16 unit, `😀` is 4 bytes and 2 units. `myVar` is at byte 22
+        // but at UTF-16 column 19, and the source map column is UTF-16 (the v3 spec's unit).
+        let source = "const é😀 = 1; let myVar = 1;";
+        let var_byte = source.find("myVar").unwrap();
+        assert_eq!(var_byte, 22);
+        let mut stmt = Stmt::with_modifiers(
+            StmtKind::DeclareVar {
+                name: "myVar".to_string(),
+                value: Some(num(1.0)),
+                ty: None,
+            },
+            StmtModifier::FINAL,
+        );
+        let file = ParseSourceFile::new(source, "src.ts");
+        stmt.meta.span = Some(ParseSourceSpan::from_byte_range(file, var_byte, var_byte + 5));
+
+        let (_code, map) = emit_statements_with_map(
+            std::slice::from_ref(&stmt),
+            "out.js",
+            "src.ts",
+            source,
+        );
+        let key = "\"mappings\":\"";
+        let s = map.find(key).unwrap() + key.len();
+        let rest = &map[s..];
+        let decoded = decode_mappings(&rest[..rest.find('"').unwrap()]).expect("decode");
+        assert!(
+            decoded.iter().any(|&(_, _, _, sl, sc)| sl == 0 && sc == 19),
+            "expected original line 0, UTF-16 column 19; decoded {decoded:?}; map {map}"
+        );
+    }
+
+    #[test]
     fn localized_string_emits_dollar_localize_tagged_template() {
         use crate::output_ast::{I18nMeta, LiteralPiece, ParseSourceSpan, PlaceholderPiece};
-        let sp = ParseSourceSpan::new(0, 0);
+        let sp = ParseSourceSpan::synthetic();
         let ls = o::Expr::bare(ExprKind::LocalizedString {
             meta: I18nMeta {
                 description: Some("greeting".to_string()),

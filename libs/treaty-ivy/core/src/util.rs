@@ -13,7 +13,7 @@
 
 use crate::output_ast::{self as o, Expr, LeadingComment, Stmt, Type};
 
-/// `compiler_facade_interface.ts` `FactoryTarget` enum. Discriminants pinned to the v22.1 source
+/// `compiler_facade_interface.ts` `FactoryTarget` enum. Discriminants pinned to the Angular main (78d2a67d) source
 /// (`Directive = 0 … Service = 5`). Shared across the render3 emitters (`factory.rs`,
 /// `view/compiler.rs`, `pipe_module_injector.rs`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

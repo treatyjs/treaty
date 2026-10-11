@@ -335,6 +335,12 @@ fn base64_value(b: u8) -> Option<u8> {
     BASE64.iter().position(|&c| c == b).map(|i| i as u8)
 }
 
+/// Convert a UTF-16 code-unit offset in `text` (the offset unit of every span in the pipeline, see
+/// [`crate::parse_util`]) into a zero-based (line, UTF-16 column) position.
+pub fn utf16_offset_to_line_col(text: &str, utf16_offset: usize) -> LineCol {
+    byte_offset_to_line_col(text, crate::parse_util::utf16_to_byte_offset(text, utf16_offset))
+}
+
 /// Convert a byte offset in `text` into a zero-based (line, UTF-16 column) position.
 /// Lines are split on `\n`; the column is the number of UTF-16 code units before the
 /// offset on its line. Used to translate the front-end's byte-offset spans into the

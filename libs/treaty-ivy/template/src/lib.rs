@@ -39,3 +39,9 @@ pub mod binder;
 pub mod dom_security_schema;
 pub mod i18n;
 pub mod view;
+
+// The parse-only entry point (`parseTemplate`), re-exported at the crate root so a consumer that only
+// parses templates imports one path and needs no emitter (see `parse-only` in Cargo.toml).
+pub use view::template::{
+    parse_template, LexerRange, ParseTemplateOptions, ParsedTemplate, LEADING_TRIVIA_CHARS,
+};

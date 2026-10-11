@@ -2546,6 +2546,8 @@ fn compile_program_with_source(
         std::collections::HashMap::new();
     let mut errors: Vec<String> = Vec::new();
     let mut produced = 0usize;
+    // The authoring source as a `ParseSourceFile`: the class-name anchors carry locations into it.
+    let source_file = treaty_ivy_core::parse_util::ParseSourceFile::new(source.unwrap_or(""), "");
     for item in &decorated {
         match compile_decorated_class(
             item.class,
@@ -2562,6 +2564,7 @@ fn compile_program_with_source(
             &module_with_providers,
             emit_partial_component,
             &ng,
+            &source_file,
         ) {
             Ok(emit) => {
                 errors.extend(emit.errors.clone());
@@ -3148,6 +3151,7 @@ fn compile_decorated_class(
     module_with_providers: &std::collections::HashMap<String, String>,
     emit_partial_component: bool,
     ng: &NgFacts,
+    source_file: &std::rc::Rc<treaty_ivy_core::parse_util::ParseSourceFile>,
 ) -> Result<ClassEmit, String> {
     let (class_name, class_name_span) = match &class.name {
         // The neutral `ClassWithDecorators::name_span` is the class NAME identifier's byte span — the
@@ -3155,7 +3159,8 @@ fn compile_decorated_class(
         // value-preserving span: it never changes emitted bytes, only the map).
         Some(name) => (
             name.clone(),
-            ParseSourceSpan::new(
+            ParseSourceSpan::from_byte_range(
+                source_file.clone(),
                 class.name_span.start as usize,
                 class.name_span.end as usize,
             ),
@@ -3643,7 +3648,7 @@ fn directive_emit(
         name: class_name.clone(),
         ty: class_ref_spanned(&class_name, class_name_span),
         type_argument_count: 0,
-        type_source_span: ParseSourceSpan::new(0, 0),
+        type_source_span: ParseSourceSpan::synthetic(),
         deps: Deps::None,
         selector: selector.clone(),
         queries: content_queries,
