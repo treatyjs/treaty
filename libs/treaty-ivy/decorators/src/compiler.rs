@@ -762,11 +762,18 @@ impl R3ComponentDeferMetadata {
     }
 }
 
-/// `changeDetection: ChangeDetectionStrategy | o.Expression | null` (union → enum).
+/// `changeDetection: ChangeDetectionStrategy | o.Expression | null` (union → enum), plus Treaty's
+/// explicit-`Eager` marker.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChangeDetection {
-    /// Statically-resolved numeric strategy (global compilation).
+    /// Statically-resolved numeric strategy (global compilation). `Strategy(ChangeDetectionStrategy::Default)`
+    /// is the omitted default. Do not use `Strategy(ChangeDetectionStrategy::Eager)` to request Eager: that
+    /// alias is the same value as `Default` (`1`), so it is omitted like `Default`. Use [`Self::Eager`].
     Strategy(ChangeDetectionStrategy),
+    /// An explicit `ChangeDetectionStrategy.Eager` (`core.ts`: `Eager = 1`). It is its own variant because
+    /// `Default` and `Eager` share the value `1` but must emit differently: `Default` is omitted (Treaty's
+    /// OnPush-by-default convention), and `Eager` emits `changeDetection: 1` so the component really runs eager.
+    Eager,
     /// Unresolved expression (local compilation) — emitted verbatim.
     Expr(Expr),
 }
@@ -2217,12 +2224,15 @@ where
 
     // Change detection. INTENTIONAL DIVERGENCE from Angular's `render3/view/compiler.ts` ("Setting
     // change detection flag"), which omits OnPush and emits any other numeric strategy. Treaty is
-    // OnPush-only by design: every component runs OnPush, and `Default`/`Eager` (= 1) are never
-    // emitted. Here OnPush (= 0) is emitted as `changeDetection: 0`, and `Default` (and its `Eager`
-    // alias) is omitted. The runtime reads an absent field as OnPush (`definition.ts`:
-    // `onPush: changeDetection !== Eager`), so an omitted strategy is OnPush too. Do NOT sync this
-    // rule to Angular's: that would emit `changeDetection: 1` for `Default` components and undo the
-    // OnPush-only design. See `tools/render3-sync/README.md` ("Intentional divergences").
+    // OnPush by default, and this is the rule:
+    //   * no option, or explicit legacy `Default`: omitted (OnPush at runtime; the runtime reads an
+    //     absent field as OnPush, `definition.ts`: `onPush: changeDetection !== Eager`);
+    //   * explicit `OnPush` (= 0): `changeDetection: 0`;
+    //   * explicit `Eager` (= 1, the new name): `changeDetection: 1`, so the component runs eager.
+    // Only the explicit `Eager` name opts out of OnPush. Angular's rule would also emit `1` for `Default`,
+    // which Treaty does not do: that would undo the OnPush default. `Default` and `Eager` share the value
+    // `1`, so the choice is carried by `ChangeDetection::Eager`, not by the number. See
+    // `tools/render3-sync/README.md` ("Intentional divergences").
     if let Some(cd) = &meta.change_detection {
         match cd {
             ChangeDetection::Strategy(strategy) => {
@@ -2232,6 +2242,12 @@ where
                         Some(o::literal(LiteralValue::Number(*strategy as i32 as f64), None)),
                     );
                 }
+            }
+            ChangeDetection::Eager => {
+                definition_map.set(
+                    "changeDetection",
+                    Some(o::literal(LiteralValue::Number(ChangeDetectionStrategy::Eager as i32 as f64), None)),
+                );
             }
             // Unresolved expression (local compilation): emit as-is.
             ChangeDetection::Expr(expr) => {
@@ -3029,7 +3045,7 @@ mod tests {
 
     #[test]
     fn onpush_emits_change_detection_zero_default_is_omitted() {
-        // Treaty is OnPush-only (intentional; see the emit rule above). OnPush (= 0) →
+        // Treaty is OnPush by default (intentional; see the emit rule above). OnPush (= 0) →
         // `changeDetection: 0`; Default is omitted, and the runtime treats an omitted field as OnPush.
         let mut meta = component_meta("C", "c");
         meta.change_detection = Some(ChangeDetection::Strategy(ChangeDetectionStrategy::OnPush));
@@ -3051,6 +3067,32 @@ mod tests {
         assert!(
             !emit_expression(&compiled.expression).contains("changeDetection"),
             "Default should omit changeDetection"
+        );
+    }
+
+    #[test]
+    fn eager_emits_change_detection_one_and_is_distinct_from_default() {
+        // The explicit `Eager` (= 1) is honoured: `changeDetection: 1`. It is `ChangeDetection::Eager`, not
+        // `Strategy(Eager)`, because the alias has the same value as `Default` and Default is omitted.
+        let mut tb = StubTemplateBuilder;
+        let mut hb = StubHostBindingsBuilder;
+        let mut pool = Vec::new();
+        let mut meta = component_meta("C", "c");
+        meta.change_detection = Some(ChangeDetection::Eager);
+        let compiled = compile_component_from_metadata(&mut meta, &mut tb, &mut hb, &mut pool);
+        let js = emit_expression(&compiled.expression);
+        assert!(
+            js.contains("changeDetection: 1") || js.contains("changeDetection:1"),
+            "Eager should emit changeDetection: 1: {js}"
+        );
+
+        // The alias through `Strategy` is the omitted Default, so the two spellings must not diverge silently.
+        let mut meta = component_meta("C", "c");
+        meta.change_detection = Some(ChangeDetection::Strategy(ChangeDetectionStrategy::Eager));
+        let compiled = compile_component_from_metadata(&mut meta, &mut tb, &mut hb, &mut pool);
+        assert!(
+            !emit_expression(&compiled.expression).contains("changeDetection"),
+            "Strategy(Eager) is the Default alias and must stay omitted"
         );
     }
 

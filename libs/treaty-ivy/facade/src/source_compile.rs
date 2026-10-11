@@ -2967,18 +2967,22 @@ fn member_name(e: &NExpr) -> Option<&str> {
 }
 
 /// Treaty's `changeDetection` convention, shared by the source front-end and the ng-analyze facts path so
-/// both give the same strategy for a class. Treaty is OnPush-only by design, and this deliberately diverges
-/// from Angular's `render3/view/compiler.ts` (see the emit rule in `decorators/src/compiler.rs`):
+/// both give the same strategy for a class. OnPush by default, and this deliberately diverges from
+/// Angular's `render3/view/compiler.ts` (see the emit rule in `decorators/src/compiler.rs`):
 ///   * an explicit `ChangeDetectionStrategy.OnPush` -> OnPush (emitted as `changeDetection: 0`);
-///   * an explicit `Default` or `Eager` (= 1, the alias) -> Default (omitted; the runtime reads it as OnPush);
+///   * an explicit `ChangeDetectionStrategy.Eager` -> Eager (emitted as `changeDetection: 1`), whatever the
+///     `modernize.on_push` flag says;
+///   * an explicit legacy `Default` (or any other member) -> Default (omitted; the runtime reads it as OnPush),
+///     whatever the flag says;
 ///   * no explicit strategy -> Default (omitted), or OnPush under the `modernize.on_push` opt-in.
 /// `explicit` is the member written in source (`None` when absent or not a member expression).
-fn change_detection_strategy(explicit: Option<&str>, on_push: bool) -> ChangeDetectionStrategy {
+fn change_detection_strategy(explicit: Option<&str>, on_push: bool) -> ChangeDetection {
     match explicit {
-        Some("OnPush") => ChangeDetectionStrategy::OnPush,
-        Some(_) => ChangeDetectionStrategy::Default,
-        None if on_push => ChangeDetectionStrategy::OnPush,
-        None => ChangeDetectionStrategy::Default,
+        Some("OnPush") => ChangeDetection::Strategy(ChangeDetectionStrategy::OnPush),
+        Some("Eager") => ChangeDetection::Eager,
+        Some(_) => ChangeDetection::Strategy(ChangeDetectionStrategy::Default),
+        None if on_push => ChangeDetection::Strategy(ChangeDetectionStrategy::OnPush),
+        None => ChangeDetection::Strategy(ChangeDetectionStrategy::Default),
     }
 }
 
@@ -3304,7 +3308,7 @@ struct DirectiveExtract {
     /// Whether the template is an INLINE `template:` string (vs an external `templateUrl`).
     inline_template_is_some: bool,
     standalone: bool,
-    change_detection: ChangeDetectionStrategy,
+    change_detection: ChangeDetection,
     styles: Vec<String>,
     encapsulation: ViewEncapsulation,
     animations: Option<Expr>,
@@ -3404,7 +3408,7 @@ fn treaty_directive_extract(
         .map(|e| matches!(e, NExpr::Boolean(b) if *b))
         .unwrap_or(true);
 
-    // changeDetection: Treaty's OnPush-only convention (see `change_detection_strategy`).
+    // changeDetection: Treaty's OnPush-by-default convention (see `change_detection_strategy`).
     let change_detection = change_detection_strategy(
         obj.and_then(|o| find_prop(o, "changeDetection")).and_then(member_name),
         modernize.on_push,
@@ -4110,7 +4114,7 @@ fn resolve_module_with_providers_imports(
 fn compile_component_meta(
     base: R3DirectiveMetadata,
     template_html: &str,
-    change_detection: ChangeDetectionStrategy,
+    change_detection: ChangeDetection,
     imported_names: &[String],
     selector_candidates: &[crate::binder::SelectorDirective],
     styles: Vec<String>,
@@ -4288,7 +4292,7 @@ fn compile_component_meta(
         view_providers,
         relative_context_file_path: String::new(),
         i18n_use_external_ids: false,
-        change_detection: Some(ChangeDetection::Strategy(change_detection)),
+        change_detection: Some(change_detection),
         relative_template_path: None,
         has_directive_dependencies,
         raw_imports: None,
@@ -4343,7 +4347,7 @@ fn compile_component_meta_partial(
     base: R3DirectiveMetadata,
     template_html: &str,
     is_inline: bool,
-    change_detection: ChangeDetectionStrategy,
+    change_detection: ChangeDetection,
     encapsulation: ViewEncapsulation,
     imported_names: &[String],
     selector_candidates: &[crate::binder::SelectorDirective],
@@ -6665,7 +6669,7 @@ export class BCmp {}
     #[test]
     fn change_detection_default_is_omitted() {
         // DEFAULT (no `changeDetection` in source, modernizer OFF): the strategy is Default, which is
-        // OMITTED from the emitted definition (Treaty's OnPush-only convention; the runtime reads an
+        // OMITTED from the emitted definition (Treaty's OnPush-by-default convention; the runtime reads an
         // absent field as OnPush). No `changeDetection:` key.
         let src = r#"@Component({selector:"a",standalone:true,template:'<div>{{x}}</div>'}) export class C { x = 1; }"#;
         let out = compile_component_source(src);
@@ -6711,28 +6715,48 @@ export class BCmp {}
     }
 
     #[test]
-    fn explicit_default_and_eager_are_omitted_and_on_push_flag_does_not_override_them() {
-        // Treaty is OnPush-only: an explicit `Default` or its `Eager` alias is omitted (never `1`), and
-        // the `on_push` flag does not turn an explicit Default into OnPush output. Both are `1`.
-        for member in ["Default", "Eager"] {
-            let src = format!(
-                r#"@Component({{selector:"a",standalone:true,changeDetection:ChangeDetectionStrategy.{member},template:'<div>{{{{x}}}}</div>'}}) export class C {{ x = 1; }}"#
-            );
-            let out = compile_component_source(&src);
-            assert!(out.errors.is_empty(), "errors: {:?}", out.errors);
-            assert!(
-                !out.code.contains("changeDetection"),
-                "explicit {member} must be omitted; got: {}",
-                out.code
-            );
-            let on = compile_modernized(&src, ModernizeOptions { on_push: true, ..Default::default() });
-            assert!(on.errors.is_empty(), "errors: {:?}", on.errors);
-            assert!(
-                !on.code.contains("changeDetection"),
-                "explicit {member} with the on_push flag must be omitted; got: {}",
-                on.code
-            );
-        }
+    fn explicit_default_is_omitted_and_on_push_flag_does_not_override_it() {
+        // Treaty is OnPush by default: an explicit legacy `Default` is omitted (never `1`), and the `on_push`
+        // flag does not turn it into OnPush output.
+        let src = r#"@Component({selector:"a",standalone:true,changeDetection:ChangeDetectionStrategy.Default,template:'<div>{{x}}</div>'}) export class C { x = 1; }"#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "errors: {:?}", out.errors);
+        assert!(
+            !out.code.contains("changeDetection"),
+            "explicit Default must be omitted; got: {}",
+            out.code
+        );
+        let on = compile_modernized(src, ModernizeOptions { on_push: true, ..Default::default() });
+        assert!(on.errors.is_empty(), "errors: {:?}", on.errors);
+        assert!(
+            !on.code.contains("changeDetection"),
+            "explicit Default with the on_push flag must be omitted; got: {}",
+            on.code
+        );
+    }
+
+    #[test]
+    fn explicit_eager_emits_one_and_on_push_flag_does_not_override_it() {
+        // The new `Eager` name opts out of OnPush: `changeDetection: 1`, with the `on_push` flag off and on.
+        let src = r#"@Component({selector:"a",standalone:true,changeDetection:ChangeDetectionStrategy.Eager,template:'<div>{{x}}</div>'}) export class C { x = 1; }"#;
+        let out = compile_component_source(src);
+        assert!(out.errors.is_empty(), "errors: {:?}", out.errors);
+        let flat = normalize_ws(&out.code);
+        assert!(
+            flat.contains("changeDetection: 1"),
+            "explicit Eager must emit changeDetection: 1 with the modernizer OFF; got: {flat}"
+        );
+        let on = compile_modernized(src, ModernizeOptions { on_push: true, ..Default::default() });
+        assert!(on.errors.is_empty(), "errors: {:?}", on.errors);
+        let flat_on = normalize_ws(&on.code);
+        assert!(
+            flat_on.contains("changeDetection: 1"),
+            "explicit Eager must emit changeDetection: 1 even with the on_push flag; got: {flat_on}"
+        );
+        assert!(
+            !flat_on.contains("changeDetection: 0"),
+            "the on_push flag must not override an explicit Eager; got: {flat_on}"
+        );
     }
 
     // -----------------------------------------------------------------------

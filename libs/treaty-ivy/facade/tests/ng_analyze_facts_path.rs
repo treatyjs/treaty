@@ -85,26 +85,29 @@ fn encapsulation_change_detection_and_standalone_match() {
 }
 
 /// The `changeDetection` truth table on the facts path, with Treaty's own extraction as the oracle. Treaty is
-/// OnPush-only: an explicit OnPush (or the `on_push` opt-in with no explicit member) emits `changeDetection: 0`,
-/// while an absent, explicit `Default` or explicit `Eager` option emits nothing. ng-analyze reports an absent
-/// option and an explicit OnPush alike, so the facts path must read the decorator object to tell them apart.
+/// OnPush by default: an explicit OnPush (or the `on_push` opt-in with no explicit member) emits `changeDetection: 0`,
+/// an explicit `Eager` emits `changeDetection: 1` (the flag does not override it), and an absent or explicit
+/// legacy `Default` emits nothing. ng-analyze reports an absent option and an explicit OnPush alike, and reports
+/// `Default` and `Eager` alike (both `1`), so the facts path must read the decorator object to tell them apart.
 #[test]
 fn change_detection_truth_table_matches_treaty_extraction() {
     use treaty_ivy::decorators::registry::ModernizeOptions;
     use treaty_ivy::source_compile::{compile_component_source_with_options, CompileOptions};
-    // (`changeDetection` option as written, `modernize.on_push`, whether `changeDetection: 0` is emitted)
+    // (`changeDetection` option as written, `modernize.on_push`, the `changeDetection` value emitted, if any)
     let on_push_opt = "changeDetection: ChangeDetectionStrategy.OnPush, ";
     let default_opt = "changeDetection: ChangeDetectionStrategy.Default, ";
     let eager_opt = "changeDetection: ChangeDetectionStrategy.Eager, ";
-    let cases: [(&str, bool, bool); 6] = [
-        ("", false, false),
-        (on_push_opt, false, true),
-        (default_opt, false, false),
-        (eager_opt, false, false),
-        ("", true, true),
-        (default_opt, true, false),
+    let cases: [(&str, bool, Option<&str>); 8] = [
+        ("", false, None),
+        (on_push_opt, false, Some("0")),
+        (default_opt, false, None),
+        (eager_opt, false, Some("1")),
+        ("", true, Some("0")),
+        (default_opt, true, None),
+        (on_push_opt, true, Some("0")),
+        (eager_opt, true, Some("1")),
     ];
-    for (option, on_push, expect_zero) in cases {
+    for (option, on_push, expected) in cases {
         let src = "import {Component, ChangeDetectionStrategy} from '@angular/core';\n\
                    @Component({selector: 'app-c', OPTION template: '<p>{{ x }}</p>'})\n\
                    export class C { x = 1; }"
@@ -125,12 +128,16 @@ fn change_detection_truth_table_matches_treaty_extraction() {
             "facts path diverged from Treaty's extraction for option `{option}`, on_push={on_push}"
         );
         let flat = facts.code.split_whitespace().collect::<Vec<_>>().join(" ");
-        assert_eq!(
-            flat.contains("changeDetection: 0"),
-            expect_zero,
-            "option `{option}`, on_push={on_push}: {flat}"
-        );
-        assert_eq!(flat.contains("changeDetection"), expect_zero, "option `{option}`: {flat}");
+        match expected {
+            Some(value) => assert!(
+                flat.contains(&format!("changeDetection: {value}")),
+                "option `{option}`, on_push={on_push}: expected changeDetection: {value}; got: {flat}"
+            ),
+            None => assert!(
+                !flat.contains("changeDetection"),
+                "option `{option}`, on_push={on_push}: changeDetection must be omitted; got: {flat}"
+            ),
+        }
     }
 }
 

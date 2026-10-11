@@ -10,9 +10,10 @@
 //! Conventions applied here, on top of the RAW facts (see the bridge's `facts` module):
 //!   * the filename-derived default selector for a selectorless `@Component`;
 //!   * `signals` = the explicit option only (ngtsc's `isSignal`);
-//!   * `changeDetection`: Treaty's OnPush-only convention (`change_detection_strategy`, shared with the
-//!     source front-end). ng-analyze reports an absent option and an explicit `OnPush` alike as `None`, so the
-//!     decorator object is read for the explicit member;
+//!   * `changeDetection`: Treaty's convention (`change_detection_strategy`, shared with the source front-end):
+//!     OnPush by default, an explicit `Eager` honoured. ng-analyze reports an absent option and an explicit
+//!     `OnPush` alike as `None`, and `Default` and `Eager` alike (`1`), so the decorator object's explicit member
+//!     is read first;
 //!   * `modernize.signal_inputs` lowers decorator inputs to signal inputs;
 //!   * `forwardRef` in `imports:` closure-wraps the dependencies, read from the decorator object.
 
@@ -236,14 +237,14 @@ pub(super) fn facts_directive_extract(
         },
     };
 
-    // The bridge's `changeDetection` is `Default`/`Eager`/`1` when written, and `None` for both an absent
-    // option and an explicit `OnPush` (ng-analyze reports the two alike). The decorator object tells them
-    // apart, so the explicit member is read from it when the facts carry none.
-    let explicit_cd = c.and_then(|c| c.change_detection.clone()).or_else(|| {
-        obj.and_then(|o| find_prop(o, "changeDetection"))
-            .and_then(member_name)
-            .map(str::to_string)
-    });
+    // The bridge reports an evaluated strategy as a number, so `Default` and `Eager` (both `1`) arrive as the
+    // same name, and an explicit `OnPush` arrives as `None`, as an absent option does. The decorator object
+    // holds the member as written, so it is read FIRST and the facts' name is only the fallback.
+    let explicit_cd = obj
+        .and_then(|o| find_prop(o, "changeDetection"))
+        .and_then(member_name)
+        .map(str::to_string)
+        .or_else(|| c.and_then(|c| c.change_detection.clone()));
     let change_detection = change_detection_strategy(explicit_cd.as_deref(), modernize.on_push);
 
     let mut styles = c.map(|c| c.styles.clone()).unwrap_or_default();

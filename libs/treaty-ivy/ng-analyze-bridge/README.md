@@ -48,11 +48,13 @@ metadata (`treaty_ivy::source_compile::facts_emit`):
 - a selectorless `@Component` takes the filename-derived default selector;
 - `signals` is the explicit `signals` option only, the same as Treaty's own extraction and ngtsc's `isSignal`
   (`directive/src/shared.ts`). A signal input or query does not set it;
-- `changeDetection` follows Treaty's OnPush-only convention (`change_detection_strategy`, shared with the
-  source front-end): explicit `OnPush` is OnPush; explicit `Default`/`Eager` is Default; absent is Default, or
-  OnPush under the `modernize.on_push` opt-in. The bridge reports absent and explicit `OnPush` alike, so the
-  decorator object is read to tell them apart. This deliberately diverges from Angular's compiler (see
-  `decorators/src/compiler.rs`);
+- `changeDetection` follows Treaty's convention (`change_detection_strategy`, shared with the source
+  front-end): OnPush by default. Explicit `OnPush` is OnPush; explicit `Eager` is Eager (`changeDetection: 1`,
+  whatever the `modernize.on_push` flag says); explicit legacy `Default` (or any other member) is Default
+  (omitted); absent is Default, or OnPush under the `modernize.on_push` opt-in. The bridge reports absent and
+  explicit `OnPush` alike, and reports `Default` and `Eager` alike (both `1`), so the decorator object's member
+  is read first to tell them apart; the bridge's name is only the fallback. This deliberately diverges from
+  Angular's compiler (see `decorators/src/compiler.rs`);
 - `modernize.signal_inputs` lowers decorator inputs to signal inputs;
 - `forwardRef` in `imports:` closure-wraps the dependencies (read from the decorator object).
 
@@ -63,7 +65,8 @@ The adapter also corrects three ng-analyze reports, each covered by an adapter t
 
 - `template` holds the loaded content of a `templateUrl`; the inline `template` is reported only when
   no `templateUrl` is declared;
-- `changeDetection` holds the evaluated number (`1`); it is mapped back to `Default`;
+- `changeDetection` holds the evaluated number (`1`); it is mapped back to `Default`, which is why the explicit
+  `Eager` name is read from the decorator object (see above);
 - an entry of `host` that does not fold is dropped from `host_metadata`; the complete `host_properties`
   list is read instead, so it is kept as an expression.
 

@@ -111,8 +111,8 @@ Once the port and the map are up to date for a new Angular commit:
   so an export never fans out to every owner of the file. Tests check that every anchor is a real
   export of its file.
 - A file that is ported inside a larger Rust file names that file as its `rust_file`. The planned
-  home of the pipeline phases is `template/src/view/template.rs`. `boundary.rs` is planned for
-  `r3_boundaries.ts` and `r3_content_blocks.ts` and is `pending` until it exists.
+  home of the pipeline phases is `template/src/view/template.rs`. `boundary.rs` holds
+  the port of `r3_boundaries.ts`, and `content_block.rs` the port of `r3_content_blocks.ts`.
 - `kind: Mechanical` is set only when the emitter's output shape matches the committed item. The
   emitter does not guess: anything outside its subset is an `unsupported` entry.
 
@@ -121,14 +121,19 @@ Once the port and the map are up to date for a new Angular commit:
 Treaty deliberately differs from Angular in the places below. A sync that reports one of them as drift
 must NOT "fix" it by copying Angular. Each is a design decision, not a gap.
 
-- **Change detection is OnPush-only** (`decorators/src/compiler.rs`, the `changeDetection` emit rule;
+- **Change detection is OnPush by default** (`decorators/src/compiler.rs`, the `changeDetection` emit rule;
   `facade/src/source_compile.rs`, `change_detection_strategy`; `facade/src/linker.rs`,
-  `read_change_detection`). Angular's `render3/view/compiler.ts` omits OnPush and emits any other numeric
-  strategy, so `Default` and `Eager` would get `changeDetection: 1`. Treaty instead emits OnPush as
-  `changeDetection: 0` and omits `Default`/`Eager`, so every Treaty component runs OnPush. The runtime
-  reads an omitted field as OnPush (`definition.ts`: `onPush: changeDetection !== Eager`). The
-  `ChangeDetectionStrategy.Eager` alias and `ViewEncapsulation.ExperimentalIsolatedShadowDom` are still
-  ported, because they mirror `core.ts`; only the emit and extraction behaviour diverges.
+  `read_change_detection`; `facade/src/partial_component_emit.rs`). Angular's `render3/view/compiler.ts`
+  omits OnPush and emits any other numeric strategy, so `Default` would get `changeDetection: 1`. Treaty
+  does not do that. The rule is:
+  - no option, or explicit legacy `Default`: omitted, which the runtime reads as OnPush (`definition.ts`:
+    `onPush: changeDetection !== Eager`), and the modernizer `on_push` flag does not change an explicit `Default`;
+  - explicit `OnPush`: `changeDetection: 0`;
+  - explicit `Eager` (the new name): `changeDetection: 1`, so the component runs eager. The modernizer
+    `on_push` flag does not override it.
+  `Default` and `Eager` share the value `1`, so the explicit `Eager` is carried as its own Treaty value
+  (`ChangeDetection::Eager`), not as the `ChangeDetectionStrategy` alias. The mirrored `ChangeDetectionStrategy`
+  enum keeps the `Eager` alias, because it mirrors `core.ts`; only the emit and extraction behaviour diverges.
 
 ## Known limits
 
@@ -139,11 +144,7 @@ must NOT "fix" it by copying Angular. Each is a design decision, not a gap.
   hand-written as consts or newtypes, so their shape is not mechanical.
 - The `R3` identifier check is order-insensitive, because the committed port groups names by
   purpose rather than in TS order. It compares the variant set and each variant's wire string.
-- Two `core.ts` rows are `pending` and are NOT caused by the 78d2a67 bump (`core.ts` is identical
-  at the old and new refs). `ViewEncapsulation` lacks `ExperimentalIsolatedShadowDom = 4` and
-  `ChangeDetectionStrategy` lacks the `Eager = 1` alias, both in `decorators/src/compiler.rs`. They
-  are listed by `codegen-verify` and do not block. Porting them removes the marker, and the gate
-  then requires it to be removed.
+- No rows are currently `pending`: `codegen-verify` checks all mechanical rows with 0 pending.
 - `config.ts` (`ENABLE_TEMPLATE_SOURCE_LOCATIONS`) has no Rust consumer: Treaty emits no
   source-location instructions. The row is a pointer for drift only.
 - `AttributeMarker` and `SelectorFlags` are partial ports (only the markers and flag bits the Rust

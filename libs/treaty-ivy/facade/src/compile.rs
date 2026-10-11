@@ -913,7 +913,7 @@ pub fn compile_component_with(
         i18n_use_external_ids: false,
         // This authoring model has no `@Component` decorator to read a `changeDetection` from, so it
         // defaults to `ChangeDetectionStrategy.Default` — OMITTED from the emitted definition. Treaty is
-        // OnPush-only (intentional divergence; see the emit rule in `decorators/src/compiler.rs`), and the
+        // OnPush by default (intentional divergence; see the emit rule in `decorators/src/compiler.rs`), and the
         // runtime reads the omitted field as OnPush. OnPush is opt-in via the signal modernizer
         // (`ModernizeOptions::on_push`), which this minimal selectorless entry point does not thread.
         change_detection: Some(ChangeDetection::Strategy(ChangeDetectionStrategy::Default)),

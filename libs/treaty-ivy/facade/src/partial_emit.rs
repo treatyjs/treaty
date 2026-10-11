@@ -1307,6 +1307,52 @@ mod tests {
     }
 
     #[test]
+    fn component_partial_change_detection_truth_table() {
+        // The partial declaration's `changeDetection` member, and what it links to, for each source option with the
+        // modernizer `on_push` flag off and on. An explicit `Eager` declares `ChangeDetectionStrategy.Eager` and
+        // links to `changeDetection: 1`; `Default` declares `Default` and is omitted once linked.
+        use crate::decorators::registry::ModernizeOptions;
+        let cases: [(&str, bool, &str, Option<&str>); 7] = [
+            ("", false, "Default", None),
+            ("", true, "OnPush", Some("changeDetection: 0")),
+            ("changeDetection: ChangeDetectionStrategy.OnPush, ", false, "OnPush", Some("changeDetection: 0")),
+            ("changeDetection: ChangeDetectionStrategy.Default, ", false, "Default", None),
+            ("changeDetection: ChangeDetectionStrategy.Default, ", true, "Default", None),
+            ("changeDetection: ChangeDetectionStrategy.Eager, ", false, "Eager", Some("changeDetection: 1")),
+            ("changeDetection: ChangeDetectionStrategy.Eager, ", true, "Eager", Some("changeDetection: 1")),
+        ];
+        for (option, on_push, member, linked) in cases {
+            let src = format!(
+                "import {{ Component, ChangeDetectionStrategy }} from '@angular/core';\n@Component({{ selector: 'app-x', {option}template: '<div>{{{{x}}}}</div>' }})\nexport class X {{ x = 1; }}"
+            );
+            let opts = CompileOptions {
+                emit_partial_component: true,
+                modernize: ModernizeOptions { on_push, ..Default::default() },
+                ..CompileOptions::default()
+            };
+            let compiled = compile_component_source_with_options(&src, opts);
+            assert!(compiled.errors.is_empty(), "compile errors: {:?}", compiled.errors);
+            let partial = emit_partial(&compiled.code);
+            let f = flat(&partial.code);
+            let expected_member = format!("changeDetection: i0.ChangeDetectionStrategy.{member}");
+            assert!(f.contains(&expected_member), "option `{option}`, on_push={on_push}: {f}");
+            let relinked = link_partial(&partial.code, "x.ts");
+            assert!(relinked.errors.is_empty(), "relink errors: {:?}", relinked.errors);
+            let linked_flat = flat(&relinked.code);
+            match linked {
+                Some(token) => assert!(
+                    linked_flat.contains(token),
+                    "option `{option}`, on_push={on_push}: linked output lacks `{token}`: {linked_flat}"
+                ),
+                None => assert!(
+                    !linked_flat.contains("changeDetection"),
+                    "option `{option}`, on_push={on_push}: linked output must omit changeDetection: {linked_flat}"
+                ),
+            }
+        }
+    }
+
+    #[test]
     fn fields_match_real_ng_packagr_di_golden() {
         // GATE: compile the REAL vendored compliance corpus input
         // `r3_view_compiler_di/di/injectable_factory.ts` through the partial pipeline and diff the
