@@ -2215,14 +2215,18 @@ where
         );
     }
 
-    // Change detection (`render3/view/compiler.ts`, "Setting change detection flag"): a numeric
-    // strategy is emitted only when it is NOT `ChangeDetectionStrategy.OnPush`. The runtime treats an
-    // absent `changeDetection` as OnPush (`definition.ts`: `onPush: changeDetection !== Eager`), so
-    // OnPush is omitted and Default (= 1) is emitted as `changeDetection: 1`.
+    // Change detection. INTENTIONAL DIVERGENCE from Angular's `render3/view/compiler.ts` ("Setting
+    // change detection flag"), which omits OnPush and emits any other numeric strategy. Treaty is
+    // OnPush-only by design: every component runs OnPush, and `Default`/`Eager` (= 1) are never
+    // emitted. Here OnPush (= 0) is emitted as `changeDetection: 0`, and `Default` (and its `Eager`
+    // alias) is omitted. The runtime reads an absent field as OnPush (`definition.ts`:
+    // `onPush: changeDetection !== Eager`), so an omitted strategy is OnPush too. Do NOT sync this
+    // rule to Angular's: that would emit `changeDetection: 1` for `Default` components and undo the
+    // OnPush-only design. See `tools/render3-sync/README.md` ("Intentional divergences").
     if let Some(cd) = &meta.change_detection {
         match cd {
             ChangeDetection::Strategy(strategy) => {
-                if *strategy != ChangeDetectionStrategy::OnPush {
+                if *strategy != ChangeDetectionStrategy::Default {
                     definition_map.set(
                         "changeDetection",
                         Some(o::literal(LiteralValue::Number(*strategy as i32 as f64), None)),
@@ -3024,29 +3028,29 @@ mod tests {
     }
 
     #[test]
-    fn onpush_is_omitted_and_default_emits_change_detection_one() {
-        // `render3/view/compiler.ts`: `typeof changeDetection === 'number' && !== OnPush` → set it.
-        // OnPush (= 0) is the runtime default when the field is absent, so it is omitted.
+    fn onpush_emits_change_detection_zero_default_is_omitted() {
+        // Treaty is OnPush-only (intentional; see the emit rule above). OnPush (= 0) →
+        // `changeDetection: 0`; Default is omitted, and the runtime treats an omitted field as OnPush.
+        let mut meta = component_meta("C", "c");
+        meta.change_detection = Some(ChangeDetection::Strategy(ChangeDetectionStrategy::OnPush));
         let mut tb = StubTemplateBuilder;
         let mut hb = StubHostBindingsBuilder;
         let mut pool = Vec::new();
-
-        let mut meta = component_meta("C", "c");
-        meta.change_detection = Some(ChangeDetection::Strategy(ChangeDetectionStrategy::OnPush));
         let compiled = compile_component_from_metadata(&mut meta, &mut tb, &mut hb, &mut pool);
+        let js = emit_expression(&compiled.expression);
+        assert!(js.contains("changeDetection"), "OnPush should emit changeDetection: {js}");
         assert!(
-            !emit_expression(&compiled.expression).contains("changeDetection"),
-            "OnPush should omit changeDetection"
+            js.contains("changeDetection: 0") || js.contains("changeDetection:0"),
+            "OnPush should emit changeDetection: 0: {js}"
         );
 
-        // Default (1) is emitted: the runtime treats `changeDetection !== Eager` as OnPush.
+        // Default (1) is omitted (intentional Treaty behaviour, not Angular's `changeDetection: 1`).
         let mut meta = component_meta("C", "c");
         meta.change_detection = Some(ChangeDetection::Strategy(ChangeDetectionStrategy::Default));
         let compiled = compile_component_from_metadata(&mut meta, &mut tb, &mut hb, &mut pool);
-        let js = emit_expression(&compiled.expression);
         assert!(
-            js.contains("changeDetection: 1") || js.contains("changeDetection:1"),
-            "Default should emit changeDetection: 1: {js}"
+            !emit_expression(&compiled.expression).contains("changeDetection"),
+            "Default should omit changeDetection"
         );
     }
 

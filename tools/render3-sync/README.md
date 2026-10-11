@@ -116,6 +116,20 @@ Once the port and the map are up to date for a new Angular commit:
 - `kind: Mechanical` is set only when the emitter's output shape matches the committed item. The
   emitter does not guess: anything outside its subset is an `unsupported` entry.
 
+## Intentional divergences
+
+Treaty deliberately differs from Angular in the places below. A sync that reports one of them as drift
+must NOT "fix" it by copying Angular. Each is a design decision, not a gap.
+
+- **Change detection is OnPush-only** (`decorators/src/compiler.rs`, the `changeDetection` emit rule;
+  `facade/src/source_compile.rs`, `change_detection_strategy`; `facade/src/linker.rs`,
+  `read_change_detection`). Angular's `render3/view/compiler.ts` omits OnPush and emits any other numeric
+  strategy, so `Default` and `Eager` would get `changeDetection: 1`. Treaty instead emits OnPush as
+  `changeDetection: 0` and omits `Default`/`Eager`, so every Treaty component runs OnPush. The runtime
+  reads an omitted field as OnPush (`definition.ts`: `onPush: changeDetection !== Eager`). The
+  `ChangeDetectionStrategy.Eager` alias and `ViewEncapsulation.ExperimentalIsolatedShadowDom` are still
+  ported, because they mirror `core.ts`; only the emit and extraction behaviour diverges.
+
 ## Known limits
 
 - `spec` paths (`migration/render3-specs/*.md`) point at files that are not in this repository.

@@ -2957,6 +2957,31 @@ fn is_forward_ref_call(expr: &NExpr) -> bool {
 
 /// Whether a standalone `@Component({imports: [...]})` array carries any `forwardRef(() => X)` entry.
 ///
+/// The member name of a `ChangeDetectionStrategy.X` expression (`X`), `None` for any other form. A bare
+/// identifier or a non-member value is not read, so it counts as "no explicit strategy" (as it always has).
+fn member_name(e: &NExpr) -> Option<&str> {
+    match e {
+        NExpr::Member { property, .. } => Some(property.as_str()),
+        _ => None,
+    }
+}
+
+/// Treaty's `changeDetection` convention, shared by the source front-end and the ng-analyze facts path so
+/// both give the same strategy for a class. Treaty is OnPush-only by design, and this deliberately diverges
+/// from Angular's `render3/view/compiler.ts` (see the emit rule in `decorators/src/compiler.rs`):
+///   * an explicit `ChangeDetectionStrategy.OnPush` -> OnPush (emitted as `changeDetection: 0`);
+///   * an explicit `Default` or `Eager` (= 1, the alias) -> Default (omitted; the runtime reads it as OnPush);
+///   * no explicit strategy -> Default (omitted), or OnPush under the `modernize.on_push` opt-in.
+/// `explicit` is the member written in source (`None` when absent or not a member expression).
+fn change_detection_strategy(explicit: Option<&str>, on_push: bool) -> ChangeDetectionStrategy {
+    match explicit {
+        Some("OnPush") => ChangeDetectionStrategy::OnPush,
+        Some(_) => ChangeDetectionStrategy::Default,
+        None if on_push => ChangeDetectionStrategy::OnPush,
+        None => ChangeDetectionStrategy::Default,
+    }
+}
+
 /// Angular's component handler wraps a standalone component's `dependencies` array in a `() => [...]`
 /// closure (`DeclarationListEmitMode.Closure`) whenever any resolved import may be forward-declared.
 /// It cannot tell directly whether a `Reference` came through a `forwardRef`, so it flags the
@@ -3379,24 +3404,11 @@ fn treaty_directive_extract(
         .map(|e| matches!(e, NExpr::Boolean(b) if *b))
         .unwrap_or(true);
 
-    // changeDetection. In Angular main `OnPush` is the default (`render3/partial/api.ts`: "Defaults
-    // to `ChangeDetectionStrategy.OnPush`"), and the runtime reads an absent field as OnPush
-    // (`definition.ts`: `onPush: changeDetection !== ChangeDetectionStrategy.Eager`). The compiler
-    // (`render3/view/compiler.ts`) omits OnPush and emits any other numeric strategy, so:
-    //   * no `changeDetection` in source, or an explicit `OnPush`  -> OnPush -> omitted;
-    //   * an explicit `Default` (or its `Eager` alias, both = 1)    -> `changeDetection: 1`.
-    // The `modernize.on_push` opt-in therefore produces the same (omitted) definition as the default.
-    let change_detection = obj
-        .and_then(|o| find_prop(o, "changeDetection"))
-        .and_then(|e| match e {
-            NExpr::Member { property, .. } => Some(property.as_str()),
-            _ => None,
-        })
-        .map(|name| match name {
-            "Default" | "Eager" => ChangeDetectionStrategy::Default,
-            _ => ChangeDetectionStrategy::OnPush,
-        })
-        .unwrap_or(ChangeDetectionStrategy::OnPush);
+    // changeDetection: Treaty's OnPush-only convention (see `change_detection_strategy`).
+    let change_detection = change_detection_strategy(
+        obj.and_then(|o| find_prop(o, "changeDetection")).and_then(member_name),
+        modernize.on_push,
+    );
 
     // styles: ['...', ...] — inline component styles. Threaded into the definition `styles:[...]`
     // array (and, for emulated encapsulation, scoped) by the emitter. The HOST-RESOLVED `styleUrls`/
@@ -6652,9 +6664,9 @@ export class BCmp {}
 
     #[test]
     fn change_detection_default_is_omitted() {
-        // DEFAULT (no `changeDetection` in source, modernizer OFF): the strategy is Angular's
-        // runtime `Default`, which is OMITTED from the emitted definition — byte-matching the
-        // @angular/compiler oracle. No `changeDetection:` key.
+        // DEFAULT (no `changeDetection` in source, modernizer OFF): the strategy is Default, which is
+        // OMITTED from the emitted definition (Treaty's OnPush-only convention; the runtime reads an
+        // absent field as OnPush). No `changeDetection:` key.
         let src = r#"@Component({selector:"a",standalone:true,template:'<div>{{x}}</div>'}) export class C { x = 1; }"#;
         let out = compile_component_source(src);
         assert!(out.errors.is_empty(), "errors: {:?}", out.errors);
@@ -6666,42 +6678,61 @@ export class BCmp {}
     }
 
     #[test]
-    fn modernizer_on_push_is_the_default_and_is_omitted() {
-        // The `on_push` modernizer flag used to emit `changeDetection: 0`. OnPush is Angular main's
-        // default (`partial/api.ts`), so the compiler omits it (`render3/view/compiler.ts` emits only
-        // a non-OnPush strategy): the flag now yields the same definition as no flag at all.
+    fn modernizer_on_push_emits_change_detection_zero() {
+        // OPT-IN `on_push` modernizer (the signals-by-default -> OnPush design): a source with NO
+        // `changeDetection` emits `changeDetection: 0` (OnPush).
         let src = r#"@Component({selector:"a",standalone:true,template:'<div>{{x}}</div>'}) export class C { x = 1; }"#;
         let on = compile_modernized(src, ModernizeOptions { on_push: true, ..Default::default() });
         assert!(on.errors.is_empty(), "errors: {:?}", on.errors);
         assert!(
-            !on.code.contains("changeDetection"),
-            "OnPush is the default and must be omitted; got: {}",
+            on.code.contains("changeDetection"),
+            "on_push flag must emit changeDetection; got: {}",
             on.code
+        );
+        let flat = normalize_ws(&on.code);
+        assert!(
+            flat.contains("changeDetection: 0"),
+            "on_push must emit OnPush (changeDetection: 0); got: {flat}"
         );
     }
 
     #[test]
-    fn explicit_on_push_is_omitted_and_explicit_default_emits_one() {
-        // `render3/view/compiler.ts`: `changeDetection` is set only when the strategy is not OnPush.
-        // An explicit OnPush is therefore omitted (runtime-equivalent to the default), while an
-        // explicit `Default` (= 1, the `Eager` alias) is emitted so the runtime keeps it non-OnPush.
-        let on_push = r#"@Component({selector:"a",standalone:true,changeDetection:ChangeDetectionStrategy.OnPush,template:'<div>{{x}}</div>'}) export class C { x = 1; }"#;
-        let out = compile_component_source(on_push);
-        assert!(out.errors.is_empty(), "errors: {:?}", out.errors);
-        assert!(
-            !out.code.contains("changeDetection"),
-            "explicit OnPush must be omitted; got: {}",
-            out.code
-        );
-
-        let default = r#"@Component({selector:"a",standalone:true,changeDetection:ChangeDetectionStrategy.Default,template:'<div>{{x}}</div>'}) export class C { x = 1; }"#;
-        let out = compile_component_source(default);
+    fn explicit_on_push_emits_regardless_of_flag() {
+        // An EXPLICIT `@Component({changeDetection: ChangeDetectionStrategy.OnPush})` emits
+        // `changeDetection: 0` even with the modernizer OFF — the source's explicit choice wins.
+        let src = r#"@Component({selector:"a",standalone:true,changeDetection:ChangeDetectionStrategy.OnPush,template:'<div>{{x}}</div>'}) export class C { x = 1; }"#;
+        let out = compile_component_source(src);
         assert!(out.errors.is_empty(), "errors: {:?}", out.errors);
         let flat = normalize_ws(&out.code);
         assert!(
-            flat.contains("changeDetection: 1"),
-            "explicit Default must emit changeDetection: 1; got: {flat}"
+            flat.contains("changeDetection: 0"),
+            "explicit OnPush must emit changeDetection: 0 even with modernizer OFF; got: {flat}"
         );
+    }
+
+    #[test]
+    fn explicit_default_and_eager_are_omitted_and_on_push_flag_does_not_override_them() {
+        // Treaty is OnPush-only: an explicit `Default` or its `Eager` alias is omitted (never `1`), and
+        // the `on_push` flag does not turn an explicit Default into OnPush output. Both are `1`.
+        for member in ["Default", "Eager"] {
+            let src = format!(
+                r#"@Component({{selector:"a",standalone:true,changeDetection:ChangeDetectionStrategy.{member},template:'<div>{{{{x}}}}</div>'}}) export class C {{ x = 1; }}"#
+            );
+            let out = compile_component_source(&src);
+            assert!(out.errors.is_empty(), "errors: {:?}", out.errors);
+            assert!(
+                !out.code.contains("changeDetection"),
+                "explicit {member} must be omitted; got: {}",
+                out.code
+            );
+            let on = compile_modernized(&src, ModernizeOptions { on_push: true, ..Default::default() });
+            assert!(on.errors.is_empty(), "errors: {:?}", on.errors);
+            assert!(
+                !on.code.contains("changeDetection"),
+                "explicit {member} with the on_push flag must be omitted; got: {}",
+                on.code
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

@@ -912,9 +912,11 @@ pub fn compile_component_with(
         relative_context_file_path: String::new(),
         i18n_use_external_ids: false,
         // This authoring model has no `@Component` decorator to read a `changeDetection` from, so it
-        // takes Angular main's default, `ChangeDetectionStrategy.OnPush` (`partial/api.ts`), which the
-        // compiler OMITS from the emitted definition (`render3/view/compiler.ts`).
-        change_detection: Some(ChangeDetection::Strategy(ChangeDetectionStrategy::OnPush)),
+        // defaults to `ChangeDetectionStrategy.Default` — OMITTED from the emitted definition. Treaty is
+        // OnPush-only (intentional divergence; see the emit rule in `decorators/src/compiler.rs`), and the
+        // runtime reads the omitted field as OnPush. OnPush is opt-in via the signal modernizer
+        // (`ModernizeOptions::on_push`), which this minimal selectorless entry point does not thread.
+        change_detection: Some(ChangeDetection::Strategy(ChangeDetectionStrategy::Default)),
         relative_template_path: None,
         has_directive_dependencies: false,
         raw_imports: None,

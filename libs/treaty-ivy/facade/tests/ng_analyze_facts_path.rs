@@ -84,6 +84,56 @@ fn encapsulation_change_detection_and_standalone_match() {
     );
 }
 
+/// The `changeDetection` truth table on the facts path, with Treaty's own extraction as the oracle. Treaty is
+/// OnPush-only: an explicit OnPush (or the `on_push` opt-in with no explicit member) emits `changeDetection: 0`,
+/// while an absent, explicit `Default` or explicit `Eager` option emits nothing. ng-analyze reports an absent
+/// option and an explicit OnPush alike, so the facts path must read the decorator object to tell them apart.
+#[test]
+fn change_detection_truth_table_matches_treaty_extraction() {
+    use treaty_ivy::decorators::registry::ModernizeOptions;
+    use treaty_ivy::source_compile::{compile_component_source_with_options, CompileOptions};
+    // (`changeDetection` option as written, `modernize.on_push`, whether `changeDetection: 0` is emitted)
+    let on_push_opt = "changeDetection: ChangeDetectionStrategy.OnPush, ";
+    let default_opt = "changeDetection: ChangeDetectionStrategy.Default, ";
+    let eager_opt = "changeDetection: ChangeDetectionStrategy.Eager, ";
+    let cases: [(&str, bool, bool); 6] = [
+        ("", false, false),
+        (on_push_opt, false, true),
+        (default_opt, false, false),
+        (eager_opt, false, false),
+        ("", true, true),
+        (default_opt, true, false),
+    ];
+    for (option, on_push, expect_zero) in cases {
+        let src = "import {Component, ChangeDetectionStrategy} from '@angular/core';\n\
+                   @Component({selector: 'app-c', OPTION template: '<p>{{ x }}</p>'})\n\
+                   export class C { x = 1; }"
+            .replace("OPTION", option);
+        let opts = CompileOptions {
+            modernize: ModernizeOptions {
+                on_push,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // The counters are process-global and this binary runs tests in parallel, so the facts path's use
+        // is not asserted here; `facts_path_is_used_for_supported_components` covers that.
+        let facts = compile_component_source_with_options(&src, opts);
+        let treaty = with_treaty_extraction(|| compile_component_source_with_options(&src, opts));
+        assert_eq!(
+            facts.code, treaty.code,
+            "facts path diverged from Treaty's extraction for option `{option}`, on_push={on_push}"
+        );
+        let flat = facts.code.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert_eq!(
+            flat.contains("changeDetection: 0"),
+            expect_zero,
+            "option `{option}`, on_push={on_push}: {flat}"
+        );
+        assert_eq!(flat.contains("changeDetection"), expect_zero, "option `{option}`: {flat}");
+    }
+}
+
 #[test]
 fn directive_with_host_directives_and_export_as_match() {
     both_ways(

@@ -10,7 +10,9 @@
 //! Conventions applied here, on top of the RAW facts (see the bridge's `facts` module):
 //!   * the filename-derived default selector for a selectorless `@Component`;
 //!   * `signals` = the explicit option only (ngtsc's `isSignal`);
-//!   * `changeDetection`: only `Default`/`Eager` differ from OnPush;
+//!   * `changeDetection`: Treaty's OnPush-only convention (`change_detection_strategy`, shared with the
+//!     source front-end). ng-analyze reports an absent option and an explicit `OnPush` alike as `None`, so the
+//!     decorator object is read for the explicit member;
 //!   * `modernize.signal_inputs` lowers decorator inputs to signal inputs;
 //!   * `forwardRef` in `imports:` closure-wraps the dependencies, read from the decorator object.
 
@@ -234,10 +236,15 @@ pub(super) fn facts_directive_extract(
         },
     };
 
-    let change_detection = match c.and_then(|c| c.change_detection.as_deref()) {
-        Some("Default") | Some("Eager") | Some("1") => ChangeDetectionStrategy::Default,
-        _ => ChangeDetectionStrategy::OnPush,
-    };
+    // The bridge's `changeDetection` is `Default`/`Eager`/`1` when written, and `None` for both an absent
+    // option and an explicit `OnPush` (ng-analyze reports the two alike). The decorator object tells them
+    // apart, so the explicit member is read from it when the facts carry none.
+    let explicit_cd = c.and_then(|c| c.change_detection.clone()).or_else(|| {
+        obj.and_then(|o| find_prop(o, "changeDetection"))
+            .and_then(member_name)
+            .map(str::to_string)
+    });
+    let change_detection = change_detection_strategy(explicit_cd.as_deref(), modernize.on_push);
 
     let mut styles = c.map(|c| c.styles.clone()).unwrap_or_default();
     if let Some(resolved) = resolved {
