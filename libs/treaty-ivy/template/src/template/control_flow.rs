@@ -117,7 +117,7 @@ fn match_for_loop_track(input: &str) -> Option<String> {
 
 /// `FOR_LOOP_LET_PATTERN = /^let\s+([\S\s]*)/`. Returns `(full_match, capture1)`,
 /// mirroring `letMatch[0]` (whole match) and `letMatch[1]` (the captured rest).
-pub(crate) fn match_for_loop_let(input: &str) -> Option<(String, String)> {
+fn match_for_loop_let(input: &str) -> Option<(String, String)> {
     let rest = input.strip_prefix("let")?;
     if !rest.chars().next()?.is_whitespace() {
         return None;
@@ -156,8 +156,30 @@ fn match_conditional_alias(input: &str) -> Option<(String, String)> {
     Some((group1, group2))
 }
 
+/// `ELSE_IF_PATTERN = /^else[^\S\r\n]+if/` — `else`, then one-or-more whitespace
+/// that is not `\r`/`\n`, then `if`.
+fn is_else_if(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("else") else {
+        return false;
+    };
+    let mut count = 0;
+    let mut byte = 0;
+    for c in rest.chars() {
+        if c.is_whitespace() && c != '\r' && c != '\n' {
+            count += 1;
+            byte += c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if count == 0 {
+        return false;
+    }
+    rest[byte..].starts_with("if")
+}
+
 /// `IDENTIFIER_PATTERN = /^[$A-Z_][0-9A-Z_$]*$/i` — a valid JavaScript identifier.
-pub(crate) fn is_identifier(name: &str) -> bool {
+fn is_identifier(name: &str) -> bool {
     let mut chars = name.chars();
     let Some(first) = chars.next() else {
         return false;
@@ -171,7 +193,7 @@ pub(crate) fn is_identifier(name: &str) -> bool {
 /// `CHARACTERS_IN_SURROUNDING_WHITESPACE_PATTERN = /(\s*)(\S+)(\s*)/`. Returns
 /// `(leading_whitespace, non_whitespace)` — the first match (not anchored), so it
 /// finds the first whitespace-then-nonwhitespace run anywhere in the string.
-pub(crate) fn match_surrounding_whitespace(input: &str) -> Option<(String, String)> {
+fn match_surrounding_whitespace(input: &str) -> Option<(String, String)> {
     // Find the first non-whitespace char; everything before it (whitespace) is
     // group1. Since `\s*` is greedy but can be empty and the regex is unanchored,
     // the match begins at offset 0: group1 = leading run of whitespace from the
@@ -201,7 +223,7 @@ pub(crate) fn match_surrounding_whitespace(input: &str) -> Option<(String, Strin
 
 /// Convert an [`crate::ml_parser::ParseSourceSpan`] to an
 /// [`crate::expression::ast::ParseSourceSpan`] by taking char offsets.
-pub(crate) fn r3_span(span: &MlSpan) -> ParseSourceSpan {
+fn r3_span(span: &MlSpan) -> ParseSourceSpan {
     ParseSourceSpan {
         start: span.start.offset as u32,
         end: span.end.offset as u32,
@@ -209,19 +231,19 @@ pub(crate) fn r3_span(span: &MlSpan) -> ParseSourceSpan {
 }
 
 /// `new ParseSourceSpan(start, end)` over r3 offset spans.
-pub(crate) fn span_of(start: u32, end: u32) -> ParseSourceSpan {
+fn span_of(start: u32, end: u32) -> ParseSourceSpan {
     ParseSourceSpan { start, end }
 }
 
 /// `span.start.moveBy(n)` — advance an offset by `n` chars.
-pub(crate) fn move_by(offset: u32, n: i64) -> u32 {
+fn move_by(offset: u32, n: i64) -> u32 {
     (offset as i64 + n).max(0) as u32
 }
 
 /// Build the [`t::BlockSpans`] for a block node from its ml_parser spans plus an
 /// explicit (already-converted) `source_span` (which sometimes differs from the
 /// block's own span, e.g. the merged outer `@if` span).
-pub(crate) fn block_spans(block: &html::Block, source_span: ParseSourceSpan) -> t::BlockSpans {
+fn block_spans(block: &html::Block, source_span: ParseSourceSpan) -> t::BlockSpans {
     t::BlockSpans {
         name_span: r3_span(&block.name_span),
         source_span,
@@ -242,10 +264,10 @@ pub fn is_connected_for_loop_block(name: &str) -> bool {
 
 /// Predicate that determines if a block with a specific name can be connected to an
 /// `@if` block. Mirrors `isConnectedIfLoopBlock` (true iff `name === 'else'` or it
-/// is `else if`; the lexer normalises that name). (The TS name "IfLoop" is a known upstream misnomer —
+/// matches `ELSE_IF_PATTERN`). (The TS name "IfLoop" is a known upstream misnomer —
 /// there is no `@if` loop; this port uses the accurate `is_connected_if_block`.)
 pub fn is_connected_if_block(name: &str) -> bool {
-    name == "else" || name == "else if"
+    name == "else" || is_else_if(name)
 }
 
 // ---------------------------------------------------------------------------
@@ -298,7 +320,7 @@ pub fn create_if_block<V: ChildVisitor>(
     }
 
     for block in connected_blocks {
-        if block.name == "else if" {
+        if is_else_if(&block.name) {
             if let Some(params) = parse_conditional_block_parameters(block, &mut errors, parser) {
                 let children = visitor.visit_children(&block.children);
                 branches.push(t::IfBlockBranch {
@@ -720,38 +742,13 @@ fn parse_for_loop_parameters(
                 move_by(param_start, full_len - cap_len),
                 param.source_span.end.offset as u32,
             );
-            parse_let_parameters(
+            parse_let_parameter(
                 &param.source_span,
                 &capture1,
                 &variables_span,
+                &item_name,
                 &mut context,
                 errors,
-                &|name, variable_name, source_span, context, errors| {
-                    if !ALLOWED_FOR_LOOP_LET_VARIABLES.contains(&variable_name) {
-                        errors.push(ParseError::new(
-                            source_span.clone(),
-                            format!(
-                                "Unknown \"let\" parameter variable \"{}\". The allowed variables are: {}",
-                                variable_name,
-                                allowed_let_variables_joined()
-                            ),
-                        ));
-                    } else if name == item_name {
-                        errors.push(ParseError::new(
-                            source_span.clone(),
-                            format!(
-                                "Invalid @for loop \"let\" parameter. Variable cannot be called \"{item_name}\""
-                            ),
-                        ));
-                    } else if context.iter().any(|v| v.name == name) {
-                        errors.push(ParseError::new(
-                            source_span.clone(),
-                            format!("Duplicate \"let\" parameter variable \"{variable_name}\""),
-                        ));
-                    }
-                },
-                "@for loop",
-                None,
             );
             continue;
         }
@@ -817,60 +814,71 @@ fn validate_track_by_expression(
     }
 }
 
-/// Callback that validates one parsed `let` variable before it is added (the `validateLet` argument
-/// of `parseLetParameters`): `(name, variableName, sourceSpan, context-so-far, errors)`.
-pub type ValidateLet<'a> = &'a dyn Fn(&str, &str, &MlSpan, &[t::Variable], &mut Vec<ParseError>);
-
-/// Parses the `let` parameter of a `@for` or `@error` block. Port of `parseLetParameters` from
-/// `render3/util.ts`.
-///
-/// `validate_let` runs for each well-formed `<name> = <variable>` pair (it may report errors); the
-/// variable is still added afterwards, as in Angular. `default_implicit_variable_name` is used for a
-/// bare `let name` with no `=` (`@error` uses `$error`); without it such a part is an error.
-pub fn parse_let_parameters(
+/// Parses the `let` parameter of a `@for` loop block. Mirrors `parseLetParameter`.
+fn parse_let_parameter(
     source_span: &MlSpan,
     expression: &str,
     span: &ParseSourceSpan,
+    loop_item_name: &str,
     context: &mut Vec<t::Variable>,
     errors: &mut Vec<ParseError>,
-    validate_let: ValidateLet<'_>,
-    message_prefix: &str,
-    default_implicit_variable_name: Option<&str>,
 ) {
     let parts: Vec<&str> = expression.split(',').collect();
     let mut start_span = span.start;
 
     for part in parts {
         let expression_parts: Vec<&str> = part.split('=').collect();
-        let name = expression_parts[0].trim().to_string();
+        let name = if expression_parts.len() == 2 {
+            expression_parts[0].trim().to_string()
+        } else {
+            String::new()
+        };
         let variable_name = if expression_parts.len() == 2 {
             expression_parts[1].trim().to_string()
         } else {
-            default_implicit_variable_name.unwrap_or("").to_string()
+            String::new()
         };
 
         if name.is_empty() || variable_name.is_empty() {
             errors.push(ParseError::new(
                 source_span.clone(),
-                format!(
-                    "Invalid {message_prefix} \"let\" parameter. Parameter should match the pattern \"<name> = <variable name>\""
-                ),
+                "Invalid @for loop \"let\" parameter. Parameter should match the pattern \"<name> = <variable name>\"",
             ));
-        } else if !is_identifier(&name) {
+        } else if !ALLOWED_FOR_LOOP_LET_VARIABLES.contains(&variable_name.as_str()) {
             errors.push(ParseError::new(
                 source_span.clone(),
-                "\"let\" parameter must be a valid JavaScript identifier",
+                format!(
+                    "Unknown \"let\" parameter variable \"{}\". The allowed variables are: {}",
+                    variable_name,
+                    allowed_let_variables_joined()
+                ),
+            ));
+        } else if name == loop_item_name {
+            errors.push(ParseError::new(
+                source_span.clone(),
+                format!(
+                    "Invalid @for loop \"let\" parameter. Variable cannot be called \"{loop_item_name}\""
+                ),
+            ));
+        } else if context.iter().any(|v| v.name == name) {
+            errors.push(ParseError::new(
+                source_span.clone(),
+                format!("Duplicate \"let\" parameter variable \"{variable_name}\""),
             ));
         } else {
-            validate_let(&name, &variable_name, source_span, context, errors);
-
-            let key_span = match match_surrounding_whitespace(expression_parts[0]) {
-                Some((key_leading, key_name)) => {
+            let key_span = match (
+                match_surrounding_whitespace(expression_parts[0]),
+                expression_parts.len() == 2,
+            ) {
+                (Some((key_leading, key_name)), true) => {
                     let lead = key_leading.chars().count() as i64;
                     let key_len = key_name.chars().count() as i64;
-                    span_of(move_by(start_span, lead), move_by(start_span, lead + key_len))
+                    span_of(
+                        move_by(start_span, lead),
+                        move_by(start_span, lead + key_len),
+                    )
                 }
-                None => span.clone(),
+                _ => span.clone(),
             };
 
             let mut value_span: Option<ParseSourceSpan> = None;
@@ -888,14 +896,14 @@ pub fn parse_let_parameters(
                 }
             }
 
-            let variable_source_span = span_of(
+            let combined_source_span = span_of(
                 key_span.start,
                 value_span.as_ref().map(|s| s.end).unwrap_or(key_span.end),
             );
             context.push(t::Variable {
                 name,
                 value: variable_name,
-                source_span: variable_source_span,
+                source_span: combined_source_span,
                 key_span,
                 value_span,
             });
@@ -936,7 +944,7 @@ fn validate_if_connected_blocks(connected_blocks: &[html::Block]) -> Vec<ParseEr
                 ));
             }
             has_else = true;
-        } else if block.name != "else if" {
+        } else if !is_else_if(&block.name) {
             errors.push(ParseError::new(
                 block.start_source_span.clone(),
                 format!("Unrecognized conditional block @{}", block.name),
@@ -1103,7 +1111,7 @@ fn parse_conditional_block_parameters(
                     format!("Unrecognized conditional parameter \"{}\"", param.expression),
                 ));
             }
-            Some(_) if block.name != "if" && block.name != "else if" => {
+            Some(_) if block.name != "if" && !is_else_if(&block.name) => {
                 errors.push(ParseError::new(
                     param.source_span.clone(),
                     "\"as\" expression is only allowed on `@if` and `@else if` blocks",
@@ -1273,7 +1281,6 @@ mod tests {
         assert!(!is_connected_for_loop_block("else"));
         assert!(is_connected_if_block("else"));
         assert!(is_connected_if_block("else if"));
-        assert!(!is_connected_if_block("else  if"));
         assert!(!is_connected_if_block("elseif"));
         assert!(!is_connected_if_block("else\nif")); // newline not allowed between
     }
@@ -1357,50 +1364,6 @@ mod tests {
         // has one (empty) parameter, so it parses as an empty expression with no
         // shape error. Just assert it does not panic and returns a branch.
         let _ = errors;
-    }
-
-    #[test]
-    fn let_parameters_validate_and_default_implicit_name() {
-        let nodes = parse_html("@for (x of y; track x) {}");
-        let block = blocks(&nodes).remove(0);
-        let source = block.source_span.clone();
-        let span = span_of(0, 20);
-
-        // `@error` style: a bare name takes the implicit `$error` variable.
-        let mut context: Vec<t::Variable> = Vec::new();
-        let mut errors: Vec<ParseError> = Vec::new();
-        parse_let_parameters(
-            &source,
-            "err, retry = $reset",
-            &span,
-            &mut context,
-            &mut errors,
-            &|_, _, _, _, _| {},
-            "@error",
-            Some("$error"),
-        );
-        assert!(errors.is_empty(), "{errors:?}");
-        assert_eq!(context.len(), 2);
-        assert_eq!((context[0].name.as_str(), context[0].value.as_str()), ("err", "$error"));
-        assert_eq!((context[1].name.as_str(), context[1].value.as_str()), ("retry", "$reset"));
-        assert!(context[1].value_span.is_some());
-
-        // Without a default a bare name is an error, and a non-identifier name is rejected.
-        let mut context: Vec<t::Variable> = Vec::new();
-        let mut errors: Vec<ParseError> = Vec::new();
-        parse_let_parameters(
-            &source,
-            "bare, 1x = $index",
-            &span,
-            &mut context,
-            &mut errors,
-            &|_, _, _, _, _| {},
-            "@for loop",
-            None,
-        );
-        assert!(errors.iter().any(|e| e.msg.contains("Invalid @for loop \"let\" parameter")));
-        assert!(errors.iter().any(|e| e.msg.contains("must be a valid JavaScript identifier")));
-        assert!(context.is_empty());
     }
 
     #[test]

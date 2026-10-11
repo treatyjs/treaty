@@ -29,15 +29,9 @@ use super::ast::{
     ArrowFunctionIdentifierParameter, ArrowFunctionParameter, AstNode, AstWithSource,
     AbsoluteSourceSpan, BinaryOperation, BindingPipeType, ExprKind, LiteralMapKey, LiteralValue,
     ParseError, ParseSourceSpan, ParseSpan, TemplateBinding, TemplateBindingIdentifier,
-    TemplateLiteralElement, UnaryOperator, unwrap_write_target,
+    TemplateLiteralElement,
 };
 use super::lexer::{Lexer, StringTokenKind, Token, TokenType, TokenValue, EOF};
-
-/// Maps the `'++'` / `'--'` operator text to [`UnaryOperator`] (`Unary.createPrefixUpdate` /
-/// `createPostfixUpdate` take the operator string in TS).
-fn increment_decrement_operator(operator: &str) -> UnaryOperator {
-    if operator == "++" { UnaryOperator::Increment } else { UnaryOperator::Decrement }
-}
 use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
@@ -1256,17 +1250,14 @@ impl<'e> ParseAst<'e> {
         while self.next().token_type() == TokenType::Operator
             && self.next().is_operator("**")
         {
-            // Disallow a unary/!/typeof/void operand directly left of `**`. `++`/`--` are excluded:
-            // JS classifies them as update expressions, which are allowed on the left of `**`
-            // (`a++ ** 2` is valid, `-a ** 2` is not).
-            let needs_parens = match &result.kind {
-                ExprKind::Unary { operator, .. } => !operator.is_update(),
-                ExprKind::PrefixNot { .. }
-                | ExprKind::TypeofExpression { .. }
-                | ExprKind::VoidExpression { .. } => true,
-                _ => false,
-            };
-            if needs_parens {
+            // Disallow a unary/!/typeof/void operand directly left of `**`.
+            if matches!(
+                result.kind,
+                ExprKind::Unary { .. }
+                    | ExprKind::PrefixNot { .. }
+                    | ExprKind::TypeofExpression { .. }
+                    | ExprKind::VoidExpression { .. }
+            ) {
                 self.error(
                     "Unary operator used immediately before exponentiation expression. Parenthesis must be used to disambiguate operator precedence",
                     None,
@@ -1309,21 +1300,6 @@ impl<'e> ParseAst<'e> {
                         ExprKind::PrefixNot {
                             expression: Box::new(result),
                         },
-                    );
-                }
-                "++" | "--" => {
-                    self.advance();
-                    let operand = self.parse_prefix();
-                    let span = self.span(start, None);
-                    let source_span = self.source_span(start, None);
-                    if !self.validate_increment_decrement_target(&operand) {
-                        return AstNode::new(span, source_span, ExprKind::EmptyExpr);
-                    }
-                    return AstNode::create_prefix_update(
-                        span,
-                        source_span,
-                        increment_decrement_operator(&operator),
-                        operand,
                     );
                 }
                 _ => {}
@@ -1391,50 +1367,9 @@ impl<'e> ParseAst<'e> {
             } else if self.next().is_template_literal_part() {
                 result = self.parse_tagged_template_literal(result, start);
             } else {
-                break;
+                return result;
             }
         }
-
-        if self.next().is_operator("++") || self.next().is_operator("--") {
-            // Capture the operator before advancing.
-            let operator = if self.next().is_operator("++") { "++" } else { "--" };
-            self.advance();
-            let span = self.span(start, None);
-            let source_span = self.source_span(start, None);
-            if !self.validate_increment_decrement_target(&result) {
-                return AstNode::new(span, source_span, ExprKind::EmptyExpr);
-            }
-            return AstNode::create_postfix_update(
-                span,
-                source_span,
-                increment_decrement_operator(operator),
-                result,
-            );
-        }
-        result
-    }
-
-    /// `validateIncrementDecrementTarget(operand)`: `++` / `--` need a read target (a property or
-    /// keyed read, looking through parentheses and non-null assertions). Reports an error and
-    /// returns `false` otherwise.
-    fn validate_increment_decrement_target(&mut self, operand: &AstNode) -> bool {
-        if !self.parse_flags.contains_action() {
-            self.error("Bindings cannot contain assignments", None);
-            return false;
-        }
-
-        let target = unwrap_write_target(operand);
-        match &target.kind {
-            ExprKind::PropertyRead { .. } | ExprKind::KeyedRead { .. } => return true,
-            ExprKind::EmptyExpr => {}
-            ExprKind::SafePropertyRead { .. } | ExprKind::SafeKeyedRead { .. } => {
-                self.error("The '?.' operator cannot be used in the assignment", None);
-            }
-            _ => {
-                self.error("The expression cannot be used in the assignment", None);
-            }
-        }
-        false
     }
 
     fn parse_primary(&mut self) -> AstNode {
@@ -2066,8 +2001,9 @@ impl<'e> ParseAst<'e> {
                 let expression = self.parse_pipe();
                 if matches!(expression.kind, ExprKind::EmptyExpr) {
                     self.error("Template literal interpolation cannot be empty", None);
+                } else {
+                    expressions.push(expression);
                 }
-                expressions.push(expression);
                 self.rbraces_expected -= 1;
             } else {
                 self.advance();
@@ -2609,85 +2545,6 @@ mod tests {
             }
             other => panic!("expected LiteralMap, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn prefix_and_postfix_update_expressions() {
-        let r = parse_action("++a.b");
-        assert!(r.errors.is_empty(), "errors: {:?}", r.errors);
-        match &r.ast.kind {
-            ExprKind::Unary {
-                operator,
-                is_prefix,
-                ..
-            } => {
-                assert_eq!(*operator, UnaryOperator::Increment);
-                assert!(*is_prefix);
-            }
-            other => panic!("expected Unary, got {other:?}"),
-        }
-
-        let r = parse_action("a[0]--");
-        assert!(r.errors.is_empty(), "errors: {:?}", r.errors);
-        match &r.ast.kind {
-            ExprKind::Unary {
-                operator,
-                expr,
-                is_prefix,
-            } => {
-                assert_eq!(*operator, UnaryOperator::Decrement);
-                assert!(!*is_prefix);
-                assert!(matches!(expr.kind, ExprKind::KeyedRead { .. }));
-            }
-            other => panic!("expected postfix Unary, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn update_expression_target_validation() {
-        // Bindings may not contain assignments (including `++` / `--`).
-        let r = parse_binding("a++");
-        assert!(r.errors.iter().any(|e| e.msg.contains("Bindings cannot contain assignments")));
-
-        // Only property / keyed reads are writable.
-        let r = parse_action("1++");
-        assert!(r
-            .errors
-            .iter()
-            .any(|e| e.msg.contains("The expression cannot be used in the assignment")));
-
-        // Safe navigation cannot be written.
-        let r = parse_action("a?.b++");
-        assert!(r
-            .errors
-            .iter()
-            .any(|e| e.msg.contains("The '?.' operator cannot be used in the assignment")));
-
-        // Parentheses and non-null assertions are looked through (`unwrapWriteTarget`).
-        let r = parse_action("(a.b)!++");
-        assert!(r.errors.is_empty(), "errors: {:?}", r.errors);
-    }
-
-    #[test]
-    fn update_expression_is_allowed_as_exponent_base() {
-        // JS allows update expressions as the base of `**`; plain unary operators are rejected.
-        assert!(parse_action("a++ ** 2").errors.is_empty());
-        assert!(parse_action("++a ** 2").errors.is_empty());
-        let r = parse_action("-a ** 2");
-        assert!(r
-            .errors
-            .iter()
-            .any(|e| e.msg.contains("Unary operator used immediately before exponentiation")));
-    }
-
-    #[test]
-    fn template_literal_empty_interpolation_is_still_an_error() {
-        // The interpolation is pushed even when empty (after reporting the error), as Angular does.
-        let r = parse_binding("`a${}b`");
-        assert!(r
-            .errors
-            .iter()
-            .any(|e| e.msg.contains("Template literal interpolation cannot be empty")));
     }
 
     #[test]

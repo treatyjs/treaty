@@ -7,7 +7,7 @@ edition = "2024"
 # Pure-Rust JS engine. The 1.0.0 release is broken both ways (temporal-on pulls a broken
 # temporal_rs 0.1.2; temporal-off leaves ungated Temporal intrinsic refs), so track git main,
 # which keeps itself compiling.
-nova_vm = { git = "https://github.com/trynova/nova", rev = "4eea7c6f" }
+nova_vm = { git = "https://github.com/trynova/nova", rev = "bece61ac" }
 serde_json = "1.0.150"
 
 # TypeScript -> JavaScript transpilation for the macro / server-fn render-time path. The macro

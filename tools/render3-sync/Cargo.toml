@@ -1,5 +1,5 @@
 # render3-sync — deterministic (NO-AI) drift/sync harness keeping Treaty's Rust/oxc
-# render3 port 1:1 with Angular's `packages/compiler`. See tools/render3-sync/README.md.
+# render3 port 1:1 with Angular's `packages/compiler`. See migration/RENDER3-SYNC-PLAN.md.
 #
 # STANDALONE: this crate carries its OWN empty [workspace] table so it detaches from the
 # parent Treaty workspace (`D:/dev/treaty/Cargo.toml`). It is built/tested in isolation

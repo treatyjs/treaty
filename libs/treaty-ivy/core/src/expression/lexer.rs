@@ -595,7 +595,10 @@ impl Scanner {
                 Some(self.scan_template_literal_part(start))
             }
             chars::HASH => Some(self.scan_private_identifier()),
-            chars::PLUS | chars::MINUS => Some(self.scan_plus_or_minus(start, peek)),
+            chars::PLUS => Some(self.scan_complex_operator(start, "+", chars::EQ, "=", None, None)),
+            chars::MINUS => {
+                Some(self.scan_complex_operator(start, "-", chars::EQ, "=", None, None))
+            }
             chars::SLASH => {
                 if self.is_start_of_regex() {
                     Some(self.scan_regex(index))
@@ -658,21 +661,6 @@ impl Scanner {
     fn scan_character(&mut self, start: i32, code: u32) -> Token {
         self.advance();
         new_character_token(start, self.index, code)
-    }
-
-    /// `scanPlusOrMinus(start, code)`: `+`, `+=`, `++`, and the `-` equivalents.
-    fn scan_plus_or_minus(&mut self, start: i32, code: u32) -> Token {
-        let ch = if code == chars::PLUS { "+" } else { "-" };
-        self.advance();
-        let mut op = String::from(ch);
-        if self.peek == code {
-            op.push_str(ch);
-            self.advance();
-        } else if self.peek == chars::EQ {
-            op.push('=');
-            self.advance();
-        }
-        new_operator_token(start, self.index, &op)
     }
 
     fn scan_operator(&mut self, start: i32, str: &str) -> Token {
@@ -1167,23 +1155,6 @@ mod tests {
 
     fn ttypes(text: &str) -> Vec<TokenType> {
         tokenize(text).iter().map(|t| t.token_type()).collect()
-    }
-
-    #[test]
-    fn plus_and_minus_scan_as_single_operator_tokens() {
-        // `scanPlusOrMinus`: `++`, `--`, `+=`, `-=`, and the bare `+` / `-`.
-        for (text, op) in [
-            ("++", "++"),
-            ("--", "--"),
-            ("+=", "+="),
-            ("-=", "-="),
-            ("+", "+"),
-            ("-", "-"),
-        ] {
-            let toks = tokenize(text);
-            assert_eq!(toks.len(), 1, "{text}: {toks:?}");
-            assert!(toks[0].is_operator(op), "{text}: {toks:?}");
-        }
     }
 
     #[test]

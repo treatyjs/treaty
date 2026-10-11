@@ -29,7 +29,7 @@
 //! module controls exactly. Synthetic block spans reuse the originating element's spans; they affect
 //! only diagnostics / source maps, never the generated instructions.
 
-use crate::ml_parser::{Attribute, Block, BlockParameter, Element, Node, ParseSourceSpan};
+use crate::ml_parser::{self as html, Attribute, Block, BlockParameter, Element, Node, ParseSourceSpan};
 
 /// The legacy structural-directive prefix (`*ngIf="…"`).
 const STAR: char = '*';
@@ -389,7 +389,6 @@ fn make_block(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ml_parser as html;
 
     fn parse(src: &str) -> Vec<Node> {
         let r = html::parse(src, "t.html");

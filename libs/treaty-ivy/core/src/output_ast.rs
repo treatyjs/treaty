@@ -192,23 +192,11 @@ pub fn none_type() -> Type {
 // Operators.
 // ---------------------------------------------------------------------------
 
-/// `UnaryOperator` enum (`output_ast.ts`). `Increment` / `Decrement` (`++` / `--`) were added on
-/// Angular main (2026-10-10); they are printed as prefix or postfix depending on
-/// [`ExprKind::Unary::is_prefix`].
+/// `UnaryOperator` enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnaryOperator {
     Minus,
     Plus,
-    Increment,
-    Decrement,
-}
-
-impl UnaryOperator {
-    /// `true` for the update operators `++` / `--` (`UnaryOperatorExpr` updates may be prefix or
-    /// postfix; `+` / `-` are always prefix).
-    pub fn is_update(self) -> bool {
-        matches!(self, UnaryOperator::Increment | UnaryOperator::Decrement)
-    }
 }
 
 /// `BinaryOperator` enum — ALL 31 variants in source order.
@@ -377,14 +365,11 @@ impl TemplateLiteralElement {
 /// `LiteralMapEntry` union: `LiteralMapPropertyAssignment` | `LiteralMapSpreadAssignment`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LiteralMapEntry {
-    /// `LiteralMapPropertyAssignment { key, value, quoted, leadingComments }`.
+    /// `LiteralMapPropertyAssignment { key, value, quoted }`.
     Property {
         key: String,
         value: Expr,
         quoted: bool,
-        /// `leadingComments`: comments printed before this entry (e.g. the `@ts-ignore` that guards a
-        /// `ctorParameters` `type` in `r3_class_metadata_compiler.ts`). Empty when there are none.
-        leading_comments: Vec<LeadingComment>,
     },
     /// `LiteralMapSpreadAssignment { expression }`.
     Spread { expression: Expr },
@@ -596,13 +581,11 @@ pub enum ExprKind {
         params: Vec<FnParam>,
         body: ArrowBody,
     },
-    /// `UnaryOperatorExpr { operator, expr, parens, isPrefix }`. `is_prefix` is `false` only for a
-    /// postfix update (`x++`, `x--`); every other operator is printed in prefix position.
+    /// `UnaryOperatorExpr { operator, expr, parens }`.
     Unary {
         op: UnaryOperator,
         expr: Box<Expr>,
         parens: bool,
-        is_prefix: bool,
     },
     /// `ParenthesizedExpr { expr }`.
     Parenthesized(Box<Expr>),
@@ -966,18 +949,12 @@ impl Expr {
             }
             (
                 Unary {
-                    op: o1,
-                    expr: e1,
-                    is_prefix: p1,
-                    ..
+                    op: o1, expr: e1, ..
                 },
                 Unary {
-                    op: o2,
-                    expr: e2,
-                    is_prefix: p2,
-                    ..
+                    op: o2, expr: e2, ..
                 },
-            ) => o1 == o2 && e1.is_equivalent(e2) && p1 == p2,
+            ) => o1 == o2 && e1.is_equivalent(e2),
             (Parenthesized(a), Parenthesized(b)) => a.is_equivalent(b),
             (
                 Binary {
@@ -1334,12 +1311,7 @@ pub fn spread(expr: Expr) -> Expr {
 pub fn literal_map(values: Vec<(String, bool, Expr)>, value_type: Option<Type>) -> Expr {
     let entries = values
         .into_iter()
-        .map(|(key, quoted, value)| LiteralMapEntry::Property {
-            key,
-            value,
-            quoted,
-            leading_comments: Vec::new(),
-        })
+        .map(|(key, quoted, value)| LiteralMapEntry::Property { key, value, quoted })
         .collect();
     Expr::bare(ExprKind::LiteralMap {
         entries,
@@ -1347,21 +1319,13 @@ pub fn literal_map(values: Vec<(String, bool, Expr)>, value_type: Option<Type>) 
     })
 }
 
-/// `unary(operator, expr, type?)` → `UnaryOperatorExpr` (defaults type to NUMBER_TYPE). Prefix.
+/// `unary(operator, expr, type?)` → `UnaryOperatorExpr` (defaults type to NUMBER_TYPE).
 pub fn unary(op: UnaryOperator, expr: Expr, ty: Option<Type>) -> Expr {
-    unary_with_prefix(op, expr, ty, true)
-}
-
-/// `new UnaryOperatorExpr(operator, expr, type, sourceSpan, parens, leadingComments, isPrefix)`
-/// with an explicit `isPrefix`. Use `is_prefix = false` for a postfix update such as `x++`.
-/// Defaults the type to NUMBER_TYPE, like [`unary`].
-pub fn unary_with_prefix(op: UnaryOperator, expr: Expr, ty: Option<Type>, is_prefix: bool) -> Expr {
     Expr::with_type(
         ExprKind::Unary {
             op,
             expr: Box::new(expr),
             parens: true,
-            is_prefix,
         },
         Some(ty.unwrap_or_else(number_type)),
     )
@@ -1946,30 +1910,6 @@ mod tests {
         let el = TemplateLiteralElement::new("a`b${c}", None);
         // backtick and ${ escaped, backslashes doubled (none here).
         assert_eq!(el.raw_text, "a\\`b$\\{c}");
-    }
-
-    #[test]
-    fn unary_update_operators_and_prefix_flag() {
-        // `++` / `--` are update operators; `+` / `-` are not.
-        assert!(UnaryOperator::Increment.is_update());
-        assert!(UnaryOperator::Decrement.is_update());
-        assert!(!UnaryOperator::Plus.is_update());
-        assert!(!UnaryOperator::Minus.is_update());
-
-        // `unary` is prefix; `unary_with_prefix(.., false)` is postfix.
-        let prefix = unary(UnaryOperator::Increment, variable("x", None), None);
-        let postfix = unary_with_prefix(UnaryOperator::Increment, variable("x", None), None, false);
-        match (&prefix.kind, &postfix.kind) {
-            (ExprKind::Unary { is_prefix: a, .. }, ExprKind::Unary { is_prefix: b, .. }) => {
-                assert!(*a);
-                assert!(!*b);
-            }
-            _ => panic!("expected Unary"),
-        }
-        // Prefix and postfix forms of the same operand are NOT equivalent (Angular compares
-        // `isPrefix` in `UnaryOperatorExpr.isEquivalent`).
-        assert!(!prefix.is_equivalent(&postfix));
-        assert!(prefix.is_equivalent(&unary(UnaryOperator::Increment, variable("x", None), None)));
     }
 
     #[test]

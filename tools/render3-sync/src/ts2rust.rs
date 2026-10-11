@@ -2,11 +2,9 @@
 //! the **mechanical subset only** — the parts of `packages/compiler` that are pure data and can be
 //! transpiled deterministically, byte-for-byte, with no judgement calls:
 //!
-//!   * (a) the `ɵɵ*` instruction table from `render3/r3_identifiers.ts` — the `Identifiers` class
-//!     of `static x: o.ExternalReference = {name: 'ɵɵx', moduleName: CORE}` fields — emitted in the
-//!     SHAPE the committed `core/src/identifiers.rs` really has: a `pub enum R3` with one variant per
-//!     field (PascalCase of the field name) and the `R3::name()` match that maps each variant to its
-//!     wire string (`ɵɵx`, or `""` for the `core` namespace). See [`variant_name`].
+//!   * (a) the `ɵɵ*` instruction name table from `render3/r3_identifiers.ts` — the `Identifiers`
+//!     class of `static x: o.ExternalReference = {name: 'ɵɵx', moduleName: CORE}` fields — emitted
+//!     as a Rust `&[(&str, &str)]` const table (field name -> wire name).
 //!   * (b) numeric enums / flags (`AttributeMarker`, `SelectorFlags`, `ChangeDetectionStrategy`,
 //!     `ViewEncapsulation`, `RenderFlags`, …) — emitted as Rust `#[repr(i64)] enum`s whose
 //!     discriminants are IDENTICAL to the TS, evaluating `1 << 0`, `0b1000`, `A | B`, member
@@ -17,7 +15,7 @@
 //! Everything else is **REFUSED**: the emitter never guesses. A construct outside the subset (a
 //! function body, an object with a non-literal value, a string enum, a member reference it cannot
 //! resolve, …) becomes an [`Unsupported`] entry in the [`CodegenReport`] and is omitted from the
-//! emitted Rust. Determinism over coverage (see `tools/render3-sync/README.md`).
+//! emitted Rust. Determinism over coverage (see `migration/RENDER3-SYNC-PLAN.md`).
 //!
 //! [`diff_against`] compares the emitted Rust against a committed Rust source so the harness can
 //! prove the port is still 1:1 (pillar-3 verification) or surface the exact textual drift.
@@ -40,8 +38,8 @@ use similar::{ChangeTag, TextDiff};
 pub enum EmittedKind {
     /// A numeric enum / flag set -> Rust `#[repr(i64)] enum`.
     Enum,
-    /// The `Identifiers` `ɵɵ*` table -> Rust `pub enum R3` plus its `name()` match (fragments).
-    R3Identifiers,
+    /// The `Identifiers` `ɵɵ*` table -> Rust `&[(&str, &str)]` const.
+    IdentifierTable,
     /// `const T = {a: 1, ...}` -> Rust `&[(&str, i64)]` const.
     NumberMap,
     /// `const T = ['a', ...]` -> Rust `&[&str]` const.
@@ -166,10 +164,7 @@ fn emit_declaration(decl: &Declaration, report: &mut CodegenReport) {
     match decl {
         Declaration::TSEnumDeclaration(e) => emit_enum(e, report),
         Declaration::ClassDeclaration(c) => {
-            let name =
-                c.id.as_ref()
-                    .map(|id| id.name.as_str())
-                    .unwrap_or("<class>");
+            let name = c.id.as_ref().map(|id| id.name.as_str()).unwrap_or("<class>");
             // The only mechanical class shape is Angular's `Identifiers` ɵɵ* table.
             match try_emit_identifier_table(name, &c.body.body) {
                 Ok(item) => report.emitted.push(item),
@@ -186,8 +181,7 @@ fn emit_declaration(decl: &Declaration, report: &mut CodegenReport) {
                     _ => {
                         report.unsupported.push(Unsupported {
                             name: "<destructuring>".into(),
-                            reason: "destructuring const bindings are not a mechanical table"
-                                .into(),
+                            reason: "destructuring const bindings are not a mechanical table".into(),
                         });
                         continue;
                     }
@@ -213,8 +207,7 @@ fn emit_declaration(decl: &Declaration, report: &mut CodegenReport) {
                     }
                     _ => report.unsupported.push(Unsupported {
                         name: name.to_string(),
-                        reason: "const initializer is not a literal object/array lookup table"
-                            .into(),
+                        reason: "const initializer is not a literal object/array lookup table".into(),
                     }),
                 }
             }
@@ -223,9 +216,8 @@ fn emit_declaration(decl: &Declaration, report: &mut CodegenReport) {
             let name = f.id.as_ref().map(|id| id.name.as_str()).unwrap_or("<fn>");
             report.unsupported.push(Unsupported {
                 name: name.to_string(),
-                reason:
-                    "function bodies are not mechanically transpilable (control flow / ownership)"
-                        .into(),
+                reason: "function bodies are not mechanically transpilable (control flow / ownership)"
+                    .into(),
             });
         }
         Declaration::TSInterfaceDeclaration(i) => report.unsupported.push(Unsupported {
@@ -320,7 +312,10 @@ fn render_enum(name: &str, members: &[(String, i64)]) -> String {
 
     let mut out = String::new();
     let _ = writeln!(out, "#[repr(i64)]");
-    let _ = writeln!(out, "#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]");
+    let _ = writeln!(
+        out,
+        "#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]"
+    );
     let _ = writeln!(out, "pub enum {name} {{");
     for (m_name, value) in &variants {
         let _ = writeln!(out, "    {m_name} = {value},");
@@ -331,7 +326,10 @@ fn render_enum(name: &str, members: &[(String, i64)]) -> String {
         let _ = writeln!(out, "\nimpl {name} {{");
         for (alias, canonical) in &aliases {
             // TS allows duplicate enum values; mirror the alias as a const of the same type.
-            let _ = writeln!(out, "    pub const {alias}: {name} = {name}::{canonical};");
+            let _ = writeln!(
+                out,
+                "    pub const {alias}: {name} = {name}::{canonical};"
+            );
         }
         out.push_str("}\n");
     }
@@ -344,28 +342,23 @@ fn render_enum(name: &str, members: &[(String, i64)]) -> String {
 // ---------------------------------------------------------------------------------------------
 
 /// Try to read a class as Angular's `Identifiers` table: every member must be a `static` property
-/// whose initializer is an object literal `{name: <string|null>, moduleName: <ident|string>}`.
-///
-/// The emitted Rust is two fragments in the shape `core/src/identifiers.rs` commits:
-///   * `pub enum R3 { Variant, … }` — one variant per field, in source order;
-///   * `pub fn name(self) -> &'static str { match self { R3::Variant => "wire", … } }`.
-/// The wire name is copied verbatim (preserving the `ɵ` U+0275 prefix); a `null` name (the `core`
-/// namespace entry) maps to `""`.
-fn try_emit_identifier_table(name: &str, elements: &[ClassElement]) -> Result<Emitted, String> {
-    let mut rows: Vec<(String, String, String)> = Vec::new();
+/// whose initializer is an object literal `{name: <string|null>, moduleName: <ident|string>}`. The
+/// emitted Rust is a `&[(&str, &str)]` of `(field_name, wire_name)` — wire name copied verbatim
+/// (preserving the `ɵ` U+0275 prefix), empty string for a `null` name (the `core` namespace entry).
+fn try_emit_identifier_table(
+    name: &str,
+    elements: &[ClassElement],
+) -> Result<Emitted, String> {
+    let mut rows: Vec<(String, String)> = Vec::new();
 
     for el in elements {
         let ClassElement::PropertyDefinition(prop) = el else {
-            return Err(
-                "class has a non-property member (method / static block); not a pure \
+            return Err("class has a non-property member (method / static block); not a pure \
                         identifier table"
-                    .into(),
-            );
+                .into());
         };
         if !prop.r#static {
-            return Err(
-                "class has a non-static member; the Identifiers table is all static".into(),
-            );
+            return Err("class has a non-static member; the Identifiers table is all static".into());
         }
         let field = match &prop.key {
             PropertyKey::StaticIdentifier(id) => id.name.to_string(),
@@ -381,68 +374,48 @@ fn try_emit_identifier_table(name: &str, elements: &[ClassElement]) -> Result<Em
             ));
         };
 
-        let wire =
-            extract_external_reference_name(obj).map_err(|e| format!("field `{field}`: {e}"))?;
-        let variant = variant_name(&field).map_err(|e| format!("field `{field}`: {e}"))?;
-        rows.push((field, variant, wire));
+        let wire = extract_external_reference_name(obj)
+            .map_err(|e| format!("field `{field}`: {e}"))?;
+        rows.push((field, wire));
     }
 
     if rows.is_empty() {
         return Err("class has no static identifier fields".into());
     }
-    let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-    for (field, variant, _) in &rows {
-        if !seen.insert(variant.as_str()) {
-            return Err(format!(
-                "two fields map to the same variant `{variant}` (at `{field}`)"
-            ));
-        }
-    }
 
     let mut out = String::new();
-    let _ = writeln!(out, "pub enum R3 {{");
-    for (_, variant, _) in &rows {
-        let _ = writeln!(out, "    {variant},");
+    let _ = writeln!(
+        out,
+        "/// `(field name, ɵɵ wire name)` rows of Angular's `{name}` instruction table."
+    );
+    let _ = writeln!(
+        out,
+        "pub const {}: &[(&str, &str)] = &[",
+        to_screaming_snake(name)
+    );
+    for (field, wire) in &rows {
+        let _ = writeln!(
+            out,
+            "    ({:?}, {:?}),",
+            field, wire
+        );
     }
-    out.push_str("}\n");
-    out.push('\n');
-    let _ = writeln!(out, "    pub fn name(self) -> &'static str {{");
-    let _ = writeln!(out, "        match self {{");
-    for (_, variant, wire) in &rows {
-        let _ = writeln!(out, "            R3::{variant} => {:?},", wire);
-    }
-    let _ = writeln!(out, "        }}");
-    out.push_str("    }\n");
+    out.push_str("];\n");
 
     Ok(Emitted {
         name: name.to_string(),
-        kind: EmittedKind::R3Identifiers,
+        kind: EmittedKind::IdentifierTable,
         rust: out,
     })
-}
-
-/// The `R3` variant name for an `Identifiers` field. Ordinary fields are PascalCase of the field
-/// name (`namespaceHTML` -> `NamespaceHTML`, `core` -> `Core`). The one field whose name starts with
-/// the `ɵ` prefix, `ɵɵdefineInjectable`, is named by its purpose, as the committed port does. Any
-/// other non-ASCII field name refuses rather than guessing a variant name.
-pub fn variant_name(field: &str) -> Result<String, String> {
-    const PREFIXED: &[(&str, &str)] = &[("ɵɵdefineInjectable", "DefineInjectableField")];
-    if let Some((_, v)) = PREFIXED.iter().find(|(f, _)| *f == field) {
-        return Ok((*v).to_string());
-    }
-    if !field.is_ascii() {
-        return Err("non-ASCII field name has no variant-name rule".into());
-    }
-    let mut chars = field.chars();
-    let first = chars.next().ok_or_else(|| "empty field name".to_string())?;
-    Ok(format!("{}{}", first.to_ascii_uppercase(), chars.as_str()))
 }
 
 /// From an object literal `{name: 'ɵɵx', moduleName: CORE}`, extract the `name` value as the wire
 /// string. `name: null` (the `core` namespace entry) yields `""`. The `moduleName` is required to
 /// be present (so we don't silently accept a differently-shaped object) but its value is not
 /// emitted — every render3 identifier resolves against `@angular/core`.
-fn extract_external_reference_name(obj: &oxc_ast::ast::ObjectExpression) -> Result<String, String> {
+fn extract_external_reference_name(
+    obj: &oxc_ast::ast::ObjectExpression,
+) -> Result<String, String> {
     let mut name_value: Option<String> = None;
     let mut saw_module_name = false;
 
@@ -470,11 +443,7 @@ fn extract_external_reference_name(obj: &oxc_ast::ast::ObjectExpression) -> Resu
                     _ => return Err("`moduleName` is not an identifier or string".into()),
                 }
             }
-            other => {
-                return Err(format!(
-                    "unexpected key `{other}` (expected name/moduleName)"
-                ));
-            }
+            other => return Err(format!("unexpected key `{other}` (expected name/moduleName)")),
         }
     }
 
@@ -508,16 +477,13 @@ fn try_emit_number_map(
             PropertyKey::StringLiteral(s) => s.value.to_string(),
             _ => return Err("object has a computed/non-string key".into()),
         };
-        let value = eval_int(&p.value, &[]).map_err(|e| format!("value of `{key}`: {e}"))?;
+        let value = eval_int(&p.value, &[])
+            .map_err(|e| format!("value of `{key}`: {e}"))?;
         rows.push((key, value));
     }
 
     let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "pub const {}: &[(&str, i64)] = &[",
-        to_screaming_snake(name)
-    );
+    let _ = writeln!(out, "pub const {}: &[(&str, i64)] = &[", to_screaming_snake(name));
     for (k, v) in &rows {
         let _ = writeln!(out, "    ({:?}, {}),", k, v);
     }
@@ -586,10 +552,7 @@ fn eval_int(expr: &Expression, prior: &[(String, i64)]) -> Result<i64, String> {
                 UnaryOperator::UnaryNegation => Ok(-arg),
                 UnaryOperator::UnaryPlus => Ok(arg),
                 UnaryOperator::BitwiseNot => Ok(!arg),
-                _ => Err(format!(
-                    "unsupported unary operator `{}`",
-                    u.operator.as_str()
-                )),
+                _ => Err(format!("unsupported unary operator `{}`", u.operator.as_str())),
             }
         }
         Expression::BinaryExpression(b) => {
@@ -613,7 +576,9 @@ fn eval_int(expr: &Expression, prior: &[(String, i64)]) -> Result<i64, String> {
         // Bare back-reference to an earlier member of the same enum: `Foo` in `Bar = Foo | 1`.
         Expression::Identifier(id) => resolve_member(id.name.as_str(), prior),
         // Qualified back-reference: `SelectorFlags.NOT` — only resolvable against the same enum.
-        Expression::StaticMemberExpression(m) => resolve_member(m.property.name.as_str(), prior),
+        Expression::StaticMemberExpression(m) => {
+            resolve_member(m.property.name.as_str(), prior)
+        }
         _ => Err("not an integer constant expression".into()),
     }
 }
@@ -665,11 +630,7 @@ mod tests {
     #[test]
     fn emits_matching_rust_enum_for_synthetic_attribute_marker() {
         let report = emit_rust("export enum AttributeMarker { Classes = 1, Styles = 2 }");
-        assert!(
-            report.is_fully_mechanical(),
-            "no refusals: {:?}",
-            report.unsupported
-        );
+        assert!(report.is_fully_mechanical(), "no refusals: {:?}", report.unsupported);
         assert_eq!(report.emitted.len(), 1);
         assert_eq!(report.emitted[0].kind, EmittedKind::Enum);
         let expected = "\
@@ -713,14 +674,9 @@ pub enum AttributeMarker {
         assert!(r.contains("OnPush = 0,"), "{r}");
         assert!(r.contains("Default = 1,"), "{r}");
         // `Eager` must be an alias const, not a duplicate variant.
+        assert!(!r.contains("Eager = 1,"), "Eager should not be a variant: {r}");
         assert!(
-            !r.contains("Eager = 1,"),
-            "Eager should not be a variant: {r}"
-        );
-        assert!(
-            r.contains(
-                "pub const Eager: ChangeDetectionStrategy = ChangeDetectionStrategy::Default;"
-            ),
+            r.contains("pub const Eager: ChangeDetectionStrategy = ChangeDetectionStrategy::Default;"),
             "{r}"
         );
     }
@@ -737,7 +693,7 @@ pub enum AttributeMarker {
     }
 
     #[test]
-    fn emits_identifier_table_in_the_committed_r3_shape() {
+    fn emits_identifier_table_preserving_wire_names() {
         let src = "export class Identifiers {
             static core = {name: null, moduleName: CORE};
             static element = {name: 'ɵɵelement', moduleName: CORE};
@@ -745,56 +701,13 @@ pub enum AttributeMarker {
         }";
         let report = emit_rust(src);
         assert!(report.is_fully_mechanical(), "{:?}", report.unsupported);
-        assert_eq!(report.emitted[0].kind, EmittedKind::R3Identifiers);
+        assert_eq!(report.emitted[0].kind, EmittedKind::IdentifierTable);
         let r = &report.rust;
-        // The committed core/src/identifiers.rs shape: an `R3` enum with one variant per field...
-        assert!(
-            r.starts_with("pub enum R3 {\n    Core,\n    Element,\n    ElementStart,\n}\n"),
-            "{r}"
-        );
-        // ...and the `name()` match that maps each variant to its wire string.
-        assert!(
-            r.contains("    pub fn name(self) -> &'static str {\n        match self {\n"),
-            "{r}"
-        );
+        assert!(r.contains("pub const IDENTIFIERS: &[(&str, &str)] = &["), "{r}");
         // null name -> empty string; ɵ prefix preserved verbatim.
-        assert!(r.contains("            R3::Core => \"\",\n"), "{r}");
-        assert!(
-            r.contains("            R3::Element => \"\u{275}\u{275}element\",\n"),
-            "{r}"
-        );
-        assert!(
-            r.contains("            R3::ElementStart => \"\u{275}\u{275}elementStart\",\n"),
-            "{r}"
-        );
-    }
-
-    #[test]
-    fn variant_names_follow_the_committed_port() {
-        assert_eq!(variant_name("core").unwrap(), "Core");
-        assert_eq!(variant_name("namespaceHTML").unwrap(), "NamespaceHTML");
-        assert_eq!(
-            variant_name("ɵɵdefineInjectable").unwrap(),
-            "DefineInjectableField"
-        );
-        // Any other non-ASCII name refuses instead of inventing a variant name.
-        assert!(variant_name("ɵɵother").is_err());
-    }
-
-    #[test]
-    fn identifier_table_refuses_duplicate_variants() {
-        // `elementStart` and `ElementStart` both PascalCase to the same variant.
-        let src = "export class Identifiers {
-            static elementStart = {name: 'ɵɵelementStart', moduleName: CORE};
-            static ElementStart = {name: 'ɵɵother', moduleName: CORE};
-        }";
-        let report = emit_rust(src);
-        assert!(report.emitted.is_empty());
-        assert!(
-            report.unsupported[0].reason.contains("same variant"),
-            "{:?}",
-            report.unsupported
-        );
+        assert!(r.contains("(\"core\", \"\"),"), "{r}");
+        assert!(r.contains("(\"element\", \"\u{275}\u{275}element\"),"), "{r}");
+        assert!(r.contains("(\"elementStart\", \"\u{275}\u{275}elementStart\"),"), "{r}");
     }
 
     #[test]
@@ -802,21 +715,13 @@ pub enum AttributeMarker {
         let report = emit_rust("export const PAIRS = {a: 1, b: 2};");
         assert!(report.is_fully_mechanical(), "{:?}", report.unsupported);
         assert_eq!(report.emitted[0].kind, EmittedKind::NumberMap);
-        assert!(
-            report.rust.contains("pub const PAIRS: &[(&str, i64)] = &["),
-            "{}",
-            report.rust
-        );
+        assert!(report.rust.contains("pub const PAIRS: &[(&str, i64)] = &["), "{}", report.rust);
         assert!(report.rust.contains("(\"a\", 1),"), "{}", report.rust);
 
         let report = emit_rust("export const NAMES = ['foo', 'bar'];");
         assert!(report.is_fully_mechanical(), "{:?}", report.unsupported);
         assert_eq!(report.emitted[0].kind, EmittedKind::StringList);
-        assert!(
-            report.rust.contains("pub const NAMES: &[&str] = &["),
-            "{}",
-            report.rust
-        );
+        assert!(report.rust.contains("pub const NAMES: &[&str] = &["), "{}", report.rust);
         assert!(report.rust.contains("\"foo\","), "{}", report.rust);
     }
 
@@ -828,21 +733,13 @@ pub enum AttributeMarker {
                    export const CFG = makeConfig();";
         let report = emit_rust(src);
         assert!(!report.is_fully_mechanical());
-        assert!(
-            report.emitted.is_empty(),
-            "nothing should be emitted: {:?}",
-            report.emitted
-        );
+        assert!(report.emitted.is_empty(), "nothing should be emitted: {:?}", report.emitted);
         let names: Vec<&str> = report.unsupported.iter().map(|u| u.name.as_str()).collect();
         assert!(names.contains(&"compile"), "{names:?}");
         assert!(names.contains(&"Mode"), "{names:?}");
         assert!(names.contains(&"CFG"), "{names:?}");
         // The string-enum refusal must name the offending member, not silently coerce it.
-        let mode = report
-            .unsupported
-            .iter()
-            .find(|u| u.name == "Mode")
-            .unwrap();
+        let mode = report.unsupported.iter().find(|u| u.name == "Mode").unwrap();
         assert!(mode.reason.contains("Read"), "{}", mode.reason);
     }
 

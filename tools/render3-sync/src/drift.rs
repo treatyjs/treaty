@@ -14,10 +14,7 @@
 //!     [`Modified`](ChangeKind::Modified), and present on both with an equal hash is unchanged
 //!     (omitted from the report);
 //!   * each changed symbol is mapped to its Rust owner(s); unmapped changes are still reported and
-//!     drive an [`UpdateMap`](TaskAction::UpdateMap) task so the map itself is kept honest;
-//!   * exports listed in `symbol_map::OUT_OF_SCOPE_SYMBOLS` are skipped entirely;
-//!   * a compiler file that is neither mapped nor out of scope is reported in
-//!     `DriftReport::unclassified_files` (see `build_report`).
+//!     drive an [`UpdateMap`](TaskAction::UpdateMap) task so the map itself is kept honest.
 //!
 //! Body hashing uses the symbol's exact source span text (normalized for line endings), so a pure
 //! whitespace/CRLF reflow does not register as drift but any token change does. The hash is a
@@ -73,11 +70,7 @@ pub fn fingerprint_exports(source: &str) -> BTreeMap<String, SymbolFingerprint> 
                 let body_hash = fnv1a(name.as_bytes());
                 out.insert(
                     name.clone(),
-                    SymbolFingerprint {
-                        name,
-                        kind: ExportKind::Variable,
-                        body_hash,
-                    },
+                    SymbolFingerprint { name, kind: ExportKind::Variable, body_hash },
                 );
             }
             continue;
@@ -108,22 +101,10 @@ fn collect_declaration(
             insert(out, e.id.name.as_str(), ExportKind::Enum, e.span, source);
         }
         Declaration::TSInterfaceDeclaration(i) => {
-            insert(
-                out,
-                i.id.name.as_str(),
-                ExportKind::Interface,
-                i.span,
-                source,
-            );
+            insert(out, i.id.name.as_str(), ExportKind::Interface, i.span, source);
         }
         Declaration::TSTypeAliasDeclaration(t) => {
-            insert(
-                out,
-                t.id.name.as_str(),
-                ExportKind::TypeAlias,
-                t.span,
-                source,
-            );
+            insert(out, t.id.name.as_str(), ExportKind::TypeAlias, t.span, source);
         }
         Declaration::VariableDeclaration(v) => {
             // Each declarator is hashed by its OWN span so two consts in one `export const a=1,b=2;`
@@ -148,14 +129,7 @@ fn insert(
 ) {
     let text = span.source_text(source);
     let body_hash = fnv1a(&normalize(text));
-    out.insert(
-        name.to_string(),
-        SymbolFingerprint {
-            name: name.to_string(),
-            kind,
-            body_hash,
-        },
-    );
+    out.insert(name.to_string(), SymbolFingerprint { name: name.to_string(), kind, body_hash });
 }
 
 /// Normalize source text for hashing so that a pure line-ending reflow (CRLF<->LF) or trailing
@@ -208,9 +182,6 @@ pub fn diff_file(ts_file: &str, old_source: &str, new_source: &str) -> ChangedFi
 
     let mut symbols = Vec::new();
     for name in names {
-        if symbol_map::out_of_scope_symbol(&norm_file, name).is_some() {
-            continue;
-        }
         let change = match (old.get(name), new.get(name)) {
             (None, Some(_)) => ChangeKind::Added,
             (Some(_), None) => ChangeKind::Removed,
@@ -221,25 +192,24 @@ pub fn diff_file(ts_file: &str, old_source: &str, new_source: &str) -> ChangedFi
         symbols.push(attribute_symbol(name, &norm_file, change));
     }
 
-    ChangedFile {
-        ts_file: norm_file,
-        mapped,
-        symbols,
-    }
+    ChangedFile { ts_file: norm_file, mapped, symbols }
 }
 
 /// Build a [`ChangedSymbol`], resolving the Rust owner(s) of `symbol`.
 ///
-/// Resolution order (most specific first), see [`symbol_map::owners_for_export`]:
-///   1. the anchor rows OF THIS FILE that list the symbol — pins the exact owning module;
-///   2. fall back to the file's rows (the TS file's Rust port) for a non-anchor export of a mapped
-///      file;
+/// Resolution order (most specific first):
+///   1. the symbol's own anchor mapping (`anchor_symbols` lists it) — pins the exact owning module;
+///   2. fall back to the file-level mapping (the TS file's Rust port), which is correct for any
+///      non-anchor export of a mapped file;
 ///   3. nothing — an unmapped export, reported with empty `rust_files` so it drives an `UpdateMap`.
 ///
 /// `kind` is taken from the resolved owner(s): if any owner is [`PortKind::Mechanical`] the symbol
 /// is a codegen candidate, else [`PortKind::Logic`]; `None` when unmapped.
 fn attribute_symbol(symbol: &str, ts_file: &str, change: ChangeKind) -> ChangedSymbol {
-    let owners = symbol_map::owners_for_export(ts_file, symbol);
+    let mut owners = symbol_map::rust_modules_for_symbol(symbol);
+    if owners.is_empty() {
+        owners = symbol_map::rust_modules_for_ts(ts_file);
+    }
 
     let mut rust_files: Vec<String> = owners.iter().map(|m| m.rust_file.to_string()).collect();
     rust_files.sort();
@@ -253,13 +223,7 @@ fn attribute_symbol(symbol: &str, ts_file: &str, change: ChangeKind) -> ChangedS
         Some(PortKind::Logic)
     };
 
-    ChangedSymbol {
-        symbol: symbol.to_string(),
-        ts_file: ts_file.to_string(),
-        change,
-        rust_files,
-        kind,
-    }
+    ChangedSymbol { symbol: symbol.to_string(), ts_file: ts_file.to_string(), change, rust_files, kind }
 }
 
 /// A single (old, new) snapshot pair for one TS file, the input unit of [`build_report`].
@@ -279,43 +243,20 @@ pub struct FileSnapshot<'a> {
 ///
 /// `old_ref`/`new_ref` are recorded verbatim (git sha/tag or any caller-chosen label). Each snapshot
 /// is diffed via [`diff_file`]; files whose exports are unchanged are dropped, so the report lists
-/// only real drift. A snapshot whose file is neither mapped nor out of scope is listed in
-/// `unclassified_files` and gets an `UpdateMap` task. The derived [`PortTask`] list (one per Rust
-/// owner, one `UpdateMap` per unmapped export or file) is the pillar-1 deliverable.
+/// only real drift. The derived [`PortTask`] list (one per Rust owner, plus one `UpdateMap` per
+/// unmapped file) is the pillar-1 deliverable.
 pub fn build_report(old_ref: &str, new_ref: &str, snapshots: &[FileSnapshot<'_>]) -> DriftReport {
     let mut files: Vec<ChangedFile> = Vec::new();
-    let mut unclassified_files: Vec<String> = Vec::new();
     for snap in snapshots {
-        if symbol_map::classify_ts_file(snap.ts_file) == symbol_map::FileClass::Unclassified {
-            unclassified_files.push(snap.ts_file.to_string());
-        }
         let cf = diff_file(snap.ts_file, snap.old_source, snap.new_source);
         if !cf.symbols.is_empty() {
             files.push(cf);
         }
     }
     files.sort_by(|a, b| a.ts_file.cmp(&b.ts_file));
-    unclassified_files.sort();
-    unclassified_files.dedup();
 
-    let mut tasks = derive_tasks(&files);
-    tasks.extend(
-        unclassified_files
-            .iter()
-            .map(|f| crate::report::unclassified_task(f)),
-    );
-    tasks.sort_by(|a, b| {
-        a.rust_file
-            .cmp(&b.rust_file)
-            .then_with(|| a.ts_files.cmp(&b.ts_files))
-    });
-    DriftReport {
-        old_ref: old_ref.to_string(),
-        new_ref: new_ref.to_string(),
-        files,
-        tasks,
-        unclassified_files,
-    }
+    let tasks = derive_tasks(&files);
+    DriftReport { old_ref: old_ref.to_string(), new_ref: new_ref.to_string(), files, tasks }
 }
 
 /// Group the per-symbol changes into a deduplicated, actionable task list.
@@ -354,11 +295,7 @@ fn derive_tasks(files: &[ChangedFile]) -> Vec<PortTask> {
                     rust_file: rust_file.clone(),
                     ts_files: Vec::new(),
                     symbols: Vec::new(),
-                    action: if mechanical {
-                        TaskAction::Codegen
-                    } else {
-                        TaskAction::ManualPort
-                    },
+                    action: if mechanical { TaskAction::Codegen } else { TaskAction::ManualPort },
                     spec: spec_for_rust_file(rust_file),
                 });
                 // If ANY contributing symbol is hand-ported logic, the whole module needs a manual
@@ -517,14 +454,8 @@ mod tests {
         let added = by_name["buildWidgetB"];
         assert_eq!(added.change, ChangeKind::Added);
 
-        assert!(
-            !by_name.contains_key("SHARED"),
-            "unchanged const must not be reported"
-        );
-        assert!(
-            !by_name.contains_key("Helper"),
-            "reflow-only class must not be reported"
-        );
+        assert!(!by_name.contains_key("SHARED"), "unchanged const must not be reported");
+        assert!(!by_name.contains_key("Helper"), "reflow-only class must not be reported");
 
         // Both map (file-level) to core/src/identifiers.rs — a Mechanical table.
         for s in [modified, added] {
@@ -565,10 +496,7 @@ mod tests {
             vec!["buildWidgetA".to_string(), "buildWidgetB".to_string()]
         );
         assert_eq!(task.ts_files, vec!["render3/r3_identifiers.ts".to_string()]);
-        assert_eq!(
-            task.spec.as_deref(),
-            Some("migration/render3-specs/14-identifiers.md")
-        );
+        assert_eq!(task.spec.as_deref(), Some("migration/render3-specs/14-identifiers.md"));
 
         // The report round-trips through JSON (the harness emits it as an artifact).
         let json = serde_json::to_string_pretty(&report).expect("serialize");
@@ -615,20 +543,11 @@ mod tests {
         );
         assert_eq!(report.files.len(), 1);
         assert!(!report.files[0].mapped);
-        // One symbol-level UpdateMap task for the export, one file-level task for the file itself.
-        assert_eq!(report.tasks.len(), 2, "{:?}", report.tasks);
-        let symbol_task = report
-            .tasks
-            .iter()
-            .find(|t| !t.symbols.is_empty())
-            .expect("symbol task");
-        assert_eq!(symbol_task.action, TaskAction::UpdateMap);
-        assert!(symbol_task.rust_file.is_empty());
-        assert_eq!(symbol_task.symbols, vec!["brandNewThing".to_string()]);
-        assert_eq!(
-            report.unclassified_files,
-            vec!["render3/brand_new_feature.ts".to_string()]
-        );
+        assert_eq!(report.tasks.len(), 1);
+        let task = &report.tasks[0];
+        assert_eq!(task.action, TaskAction::UpdateMap);
+        assert!(task.rust_file.is_empty());
+        assert_eq!(task.symbols, vec!["brandNewThing".to_string()]);
     }
 
     #[test]
@@ -649,60 +568,18 @@ mod tests {
 
     #[test]
     fn anchor_symbol_pins_specific_owner() {
-        // `ViewEncapsulation` is an anchor of core.ts -> decorators/src/compiler.rs (Mechanical).
-        // Anchor resolution must win over the file's other rows.
+        // `AttributeMarker` is an anchor of core.ts -> output_ast.rs (Mechanical), even though its
+        // own file (core.ts) also maps file-level. Anchor resolution must win and be Mechanical.
         let cf = diff_file(
             "core.ts",
-            "export enum ViewEncapsulation { Emulated = 0 }",
-            "export enum ViewEncapsulation { Emulated = 0, None = 2 }",
+            "export enum AttributeMarker { NamespaceURI = 0 }",
+            "export enum AttributeMarker { NamespaceURI = 0, Classes = 1 }",
         );
         assert_eq!(cf.symbols.len(), 1);
         let s = &cf.symbols[0];
-        assert_eq!(s.symbol, "ViewEncapsulation");
+        assert_eq!(s.symbol, "AttributeMarker");
         assert_eq!(s.change, ChangeKind::Modified);
-        assert_eq!(s.rust_files, vec!["decorators/src/compiler.rs".to_string()]);
+        assert!(s.rust_files.contains(&"core/src/output_ast.rs".to_string()));
         assert_eq!(s.kind, Some(PortKind::Mechanical));
-    }
-
-    #[test]
-    fn anchors_do_not_leak_across_files() {
-        // `TokenType` is anchored by the expression lexer AND by ml_parser/tokens.ts. A change to the
-        // HTML tokens file must attribute to the HTML owner only, never to the expression lexer.
-        let cf = diff_file(
-            "ml_parser/tokens.ts",
-            "export enum TokenType { Text = 0 }",
-            "export enum TokenType { Text = 0, Extra = 1 }",
-        );
-        let s = &cf.symbols[0];
-        assert_eq!(s.rust_files, vec!["template/src/ml_parser.rs".to_string()]);
-    }
-
-    #[test]
-    fn out_of_scope_symbol_changes_are_ignored() {
-        // `Type` is out of scope in core.ts: it must not appear in any changed file.
-        let cf = diff_file(
-            "core.ts",
-            "export const Type = Function;",
-            "export const Type = Object;",
-        );
-        assert!(cf.symbols.is_empty(), "{:?}", cf.symbols);
-    }
-
-    #[test]
-    fn unclassified_snapshot_is_listed_and_not_clean() {
-        let report = build_report(
-            "a",
-            "b",
-            &[FileSnapshot {
-                ts_file: "brand_new_unclassified.ts",
-                old_source: "",
-                new_source: "export const X = 1;",
-            }],
-        );
-        assert_eq!(
-            report.unclassified_files,
-            vec!["brand_new_unclassified.ts".to_string()]
-        );
-        assert!(!report.is_clean());
     }
 }

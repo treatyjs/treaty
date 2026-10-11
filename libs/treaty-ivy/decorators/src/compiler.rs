@@ -117,20 +117,12 @@ fn content_attr() -> String {
 // `core` enums (`../../core`), reproduced locally with their runtime discriminants.
 // ---------------------------------------------------------------------------
 
-/// `render3/view/config.ts` `ENABLE_TEMPLATE_SOURCE_LOCATIONS`: the global default for adding source
-/// locations to template elements. Angular's `setEnableTemplateSourceLocations` /
-/// `getTemplateSourceLocationsEnabled` accessors were removed upstream, and the flag is read as
-/// `meta.enableTemplateSourceLocations || ENABLE_TEMPLATE_SOURCE_LOCATIONS`. Treaty has no
-/// `attachSourceLocations` phase, so the flag has no effect yet.
-pub const ENABLE_TEMPLATE_SOURCE_LOCATIONS: bool = false;
-
-/// `core.ViewEncapsulation` — discriminants pinned to the runtime enum (`core.ts`).
+/// `core.ViewEncapsulation` — discriminants pinned to the runtime enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewEncapsulation {
     Emulated = 0,
     None = 2,
     ShadowDom = 3,
-    ExperimentalIsolatedShadowDom = 4,
 }
 
 impl ViewEncapsulation {
@@ -139,20 +131,11 @@ impl ViewEncapsulation {
     }
 }
 
-/// `core.ChangeDetectionStrategy` — `OnPush = 0`, `Default = 1`, plus the `Eager = 1` alias that
-/// `core.ts` declares (a duplicate discriminant is not legal in a Rust enum, so it is an associated
-/// const of the same type, as `render3-sync`'s enum emitter renders it).
+/// `core.ChangeDetectionStrategy` — `OnPush = 0`, `Default = 1`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChangeDetectionStrategy {
     OnPush = 0,
     Default = 1,
-}
-
-impl ChangeDetectionStrategy {
-    /// `ChangeDetectionStrategy.Eager` (`core.ts`): an alias of `Default` (both are `1`). The name is
-    /// Angular's, so it is kept in its TypeScript spelling.
-    #[allow(non_upper_case_globals)]
-    pub const Eager: ChangeDetectionStrategy = ChangeDetectionStrategy::Default;
 }
 
 /// `core.InputFlags` — bitflags. `bitflags` is unavailable, so a `u16` newtype.
@@ -762,18 +745,11 @@ impl R3ComponentDeferMetadata {
     }
 }
 
-/// `changeDetection: ChangeDetectionStrategy | o.Expression | null` (union → enum), plus Treaty's
-/// explicit-`Eager` marker.
+/// `changeDetection: ChangeDetectionStrategy | o.Expression | null` (union → enum).
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChangeDetection {
-    /// Statically-resolved numeric strategy (global compilation). `Strategy(ChangeDetectionStrategy::Default)`
-    /// is the omitted default. Do not use `Strategy(ChangeDetectionStrategy::Eager)` to request Eager: that
-    /// alias is the same value as `Default` (`1`), so it is omitted like `Default`. Use [`Self::Eager`].
+    /// Statically-resolved numeric strategy (global compilation).
     Strategy(ChangeDetectionStrategy),
-    /// An explicit `ChangeDetectionStrategy.Eager` (`core.ts`: `Eager = 1`). It is its own variant because
-    /// `Default` and `Eager` share the value `1` but must emit differently: `Default` is omitted (Treaty's
-    /// OnPush-by-default convention), and `Eager` emits `changeDetection: 1` so the component really runs eager.
-    Eager,
     /// Unresolved expression (local compilation) — emitted verbatim.
     Expr(Expr),
 }
@@ -959,9 +935,9 @@ struct HostPureState {
     /// deferred var-counting pass does.
     var_cursor: usize,
     /// Hoisted factories, de-duped structurally: `(factory_body, minted_name)`. Holds both
-    /// pure-literal factories (`_cN`) and arrow factories (`$arrowFnN$`).
+    /// pure-literal factories (`$cN$`) and arrow factories (`$arrowFnN$`).
     interned: Vec<(Expr, String)>,
-    /// Counter seeding the minted `_cN` pure-literal factory reference names (Angular `CONSTANT_PREFIX`).
+    /// Counter seeding the minted `$cN$` pure-literal factory reference names.
     next_const: usize,
     /// Counter seeding the minted `$arrowFnN$` arrow factory reference names (a separate Angular
     /// namespace — `getSharedFunctionReference` vs `getSharedConstant`).
@@ -1040,7 +1016,7 @@ impl crate::expression_converter::PipeSlotAllocator for HostPureFunctions {
             return Some(name.clone());
         }
         // Arrow factories and pure-literal factories live in independent reference namespaces
-        // (`getSharedFunctionReference` → `$arrowFnN$`, `getSharedConstant` → `_cN`).
+        // (`getSharedFunctionReference` → `$arrowFnN$`, `getSharedConstant` → `$cN$`).
         let name = if is_arrow {
             let n = state.next_arrow;
             state.next_arrow = n + 1;
@@ -1048,7 +1024,7 @@ impl crate::expression_converter::PipeSlotAllocator for HostPureFunctions {
         } else {
             let n = state.next_const;
             state.next_const = n + 1;
-            format!("_c{n}")
+            format!("$c{n}$")
         };
         state.interned.push((factory.clone(), name.clone()));
         Some(name)
@@ -1056,16 +1032,11 @@ impl crate::expression_converter::PipeSlotAllocator for HostPureFunctions {
 }
 
 /// `class.X`/`style.X` host bindings reserve TWO host vars; every other regular binding reserves ONE
-/// (Angular `bindingCount`). Animation string host attrs, animation value bindings and listeners are
-/// create-block ops that consume no host vars. Mirrors the per-binding accounting in
-/// [`DefaultHostBindingsBuilder::build`].
+/// (Angular `bindingCount`). Animation string host attrs and listeners are create-block ops that
+/// consume no host vars. Mirrors the per-binding accounting in [`DefaultHostBindingsBuilder::build`].
 fn host_binding_var_count(prop: &str) -> usize {
-    // A whole-element `[class]` / `[style]` host binding is a ClassMap / StyleMap (two var slots), like
-    // the `class.x` / `style.x` styling bindings.
-    if prop.starts_with("class.") || prop.starts_with("style.") || prop == "class" || prop == "style" {
+    if prop.starts_with("class.") || prop.starts_with("style.") {
         2
-    } else if prop.starts_with("animate.") {
-        0
     } else {
         1
     }
@@ -1159,123 +1130,11 @@ fn lower_host_listener_value(
     (converted, references_event)
 }
 
-/// `calcPossibleSecurityContexts` (`binding_parser.ts`): the security contexts a property or attribute
-/// can take over the elements a selector can match. With no selector (`None`) every element name in
-/// the DOM schema is possible (`allKnownElementNames`), and a selector without an element name matches
-/// every element too, less any element named by a `:not(...)`.
-fn possible_security_contexts(
-    selector: Option<&str>,
-    prop: &str,
-    is_attribute: bool,
-) -> Vec<SecurityContext> {
-    use treaty_ivy_template::dom_security_schema::{
-        security_context_for_element, ALL_KNOWN_ELEMENT_NAMES,
-    };
-    let all_known = || ALL_KNOWN_ELEMENT_NAMES.iter().map(|e| e.to_string()).collect::<Vec<_>>();
-    let mut out = Vec::new();
-    match selector {
-        None => {
-            for element in all_known() {
-                out.push(security_context_for_element(&element, prop, is_attribute));
-            }
-        }
-        Some(selector) => {
-            for css in parse_css_selectors(selector) {
-                let elements = match &css.element {
-                    Some(element) => vec![element.clone()],
-                    None => all_known(),
-                };
-                // `:not(elem)` removes an element name only for a pure element `:not` selector.
-                let not_elements: Vec<&str> = css
-                    .not_selectors
-                    .iter()
-                    .filter(|n| n.attrs.is_empty() && n.class_names.is_empty())
-                    .filter_map(|n| n.element.as_deref())
-                    .collect();
-                for element in elements.iter().filter(|e| !not_elements.contains(&e.as_str())) {
-                    out.push(security_context_for_element(element, prop, is_attribute));
-                }
-            }
-        }
-    }
-    out
-}
-
-/// `calcHostBindingSecurityContexts` (`template/pipeline/src/ingest.ts`): the contexts of a host
-/// property (or host attribute) binding. Host bindings can run on a concrete host whose element name
-/// differs from the directive's selector, so the concrete host's contexts win whenever they disagree
-/// with the declaring selector.
-fn host_binding_security_contexts(
-    selector: &str,
-    name: &str,
-    is_attribute: bool,
-) -> Vec<SecurityContext> {
-    use treaty_ivy_template::dom_security_schema::mapped_prop_name;
-    let declaring = possible_security_contexts(Some(selector), name, is_attribute);
-    let concrete = possible_security_contexts(None, mapped_prop_name(name), is_attribute);
-    let concrete_non_none: Vec<SecurityContext> = concrete
-        .iter()
-        .filter(|c| **c != SecurityContext::None)
-        .cloned()
-        .collect();
-    let has_concrete_none = concrete_non_none.len() != concrete.len();
-    if has_concrete_none && !concrete_non_none.is_empty() {
-        return concrete;
-    }
-    if concrete_non_none.iter().any(|c| !declaring.contains(c)) {
-        return concrete;
-    }
-    declaring
-        .into_iter()
-        .filter(|c| *c != SecurityContext::None)
-        .collect()
-}
-
-/// `isAriaAttribute` (`util/attributes.ts`): an `aria-` name longer than its prefix.
-fn is_aria_host_attribute(name: &str) -> bool {
-    name.starts_with("aria-") && name.len() > "aria-".len()
-}
-
-/// The sanitizer a host binding is wrapped in (`resolve_sanitizers.ts`): a composite URL context (URL
-/// and/or RESOURCE_URL with a NONE alternative, or both) is resolved at runtime by
-/// `ɵɵsanitizeUrlOrResourceUrl`; otherwise the single non-NONE context picks its sanitizer.
-fn host_sanitizer(contexts: &[SecurityContext]) -> Option<R3> {
-    let has_url = contexts.contains(&SecurityContext::Url);
-    let has_resource = contexts.contains(&SecurityContext::ResourceUrl);
-    let has_none = contexts.contains(&SecurityContext::None);
-    let only_url_contexts = contexts
-        .iter()
-        .all(|c| matches!(c, SecurityContext::Url | SecurityContext::ResourceUrl | SecurityContext::None));
-    if only_url_contexts && ((has_url || has_resource) && has_none || (has_url && has_resource)) {
-        return Some(R3::SanitizeUrlOrResourceUrl);
-    }
-    // `getOnlySecurityContext`: an ambiguous set (more than one non-NONE context) is an error in
-    // Angular; here the first non-NONE context is used, as the classic TDB did.
-    let only = if contexts.len() < 2 {
-        contexts.first().cloned().unwrap_or(SecurityContext::None)
-    } else {
-        contexts
-            .iter()
-            .find(|c| **c != SecurityContext::None)
-            .cloned()
-            .unwrap_or(SecurityContext::None)
-    };
-    match only {
-        SecurityContext::Html => Some(R3::SanitizeHtml),
-        SecurityContext::Style => Some(R3::SanitizeStyle),
-        SecurityContext::Script => Some(R3::SanitizeScript),
-        SecurityContext::Url => Some(R3::SanitizeUrl),
-        SecurityContext::ResourceUrl => Some(R3::SanitizeResourceUrl),
-        SecurityContext::AttributeNoBinding => Some(R3::ValidateAttribute),
-        SecurityContext::None => None,
-    }
-}
-
 impl HostBindingsBuilder for DefaultHostBindingsBuilder {
     fn build(
         &mut self,
         host: &mut R3HostMetadata,
-        selector: &str,
+        _selector: &str,
         name: &str,
         legacy_optional_chaining: bool,
         definition_map: &mut DefinitionMap,
@@ -1411,8 +1270,6 @@ impl HostBindingsBuilder for DefaultHostBindingsBuilder {
         // `style.X`/`class.X` styling binding reserves TWO (the bound value plus styling bookkeeping).
         let mut style_stmts: Vec<Stmt> = Vec::new();
         let mut class_stmts: Vec<Stmt> = Vec::new();
-        let mut style_map_stmts: Vec<Stmt> = Vec::new();
-        let mut class_map_stmts: Vec<Stmt> = Vec::new();
 
         // Pure-literal extraction (`generatePureLiteralStructures`): a literal array/object host
         // binding value becomes a `ɵɵpureFunctionN` whose `varOffset` is assigned AFTER every regular
@@ -1420,49 +1277,11 @@ impl HostBindingsBuilder for DefaultHostBindingsBuilder {
         let regular_bindings: usize =
             host.properties.keys().map(|p| host_binding_var_count(p)).sum();
         let pures = HostPureFunctions::new(regular_bindings);
-        // `[animate.enter]`/`[animate.leave]` value bindings: Angular's `ingestHostBinding` routes
-        // `property.isAnimation` to `BindingKind.Animation`, which `binding_specialization` turns into
-        // an `AnimationBinding` (VALUE) and `convert_animations` appends to the CREATE block as
-        // `ɵɵanimateEnter(function <Cls>_HostBindings_animateenter_cb() { <spill>; return <value>; })`.
-        // Animations reserve no host vars and are created after the listeners (same create group).
-        let mut animate_stmts: Vec<Stmt> = Vec::new();
 
         for (prop, value_src) in host.properties.iter() {
             let converted = lower_host_property_value(value_src, &pures, legacy_optional_chaining);
             let value = converted.expr;
             let spill = converted.stmts;
-
-            if prop.starts_with("animate.") {
-                // Angular `convert_animations` `getAnimationOp`: `=== 'animate.enter' ? ENTER : LEAVE`.
-                let reference = if prop == "animate.enter" {
-                    R3::AnimationEnter
-                } else {
-                    R3::AnimationLeave
-                };
-                // `naming.ts`: `${unit.fnName}_${name.replace('.', '')}_cb`, with the host unit's
-                // `fnName` being `<Cls>_HostBindings`.
-                let cb_name = format!("{name}_HostBindings_{}_cb", prop.replace('.', ""));
-                let mut body = spill;
-                body.push(Stmt::bare(StmtKind::Return(value)));
-                let callback = o::fn_(Vec::new(), body, None, Some(cb_name));
-                animate_stmts.push(host_instruction(reference, vec![callback]));
-                continue;
-            }
-
-            // A whole-element `[class]="exp"` / `[style]="exp"` host binding is a ClassMap / StyleMap
-            // (`style_binding_specialization.ts`), flushed before the per-key styling props.
-            if prop == "class" {
-                host_vars += 2;
-                class_map_stmts.extend(spill);
-                class_map_stmts.push(host_instruction(R3::ClassMap, vec![value]));
-                continue;
-            }
-            if prop == "style" {
-                host_vars += 2;
-                style_map_stmts.extend(spill);
-                style_map_stmts.push(host_instruction(R3::StyleMap, vec![value]));
-                continue;
-            }
 
             if let Some(cls) = prop.strip_prefix("class.") {
                 host_vars += 2;
@@ -1475,18 +1294,10 @@ impl HostBindingsBuilder for DefaultHostBindingsBuilder {
             }
             if let Some(sty) = prop.strip_prefix("style.") {
                 host_vars += 2;
-                // `host_style_property_parsing.ts`: a CSS custom property (`--x`) is namespaced
-                // (`--%NS%x`), any other style name is hyphenated (`backgroundColor` →
-                // `background-color`).
-                let sty = if sty.starts_with("--") {
-                    treaty_ivy_core::util::namespace_css_variable(sty)
-                } else {
-                    hyphenate_style_prop(sty)
-                };
                 style_stmts.extend(spill);
                 style_stmts.push(host_instruction(
                     R3::StyleProp,
-                    vec![o::literal(LiteralValue::String(sty), None), value],
+                    vec![o::literal(LiteralValue::String(sty.to_string()), None), value],
                 ));
                 continue;
             }
@@ -1496,13 +1307,10 @@ impl HostBindingsBuilder for DefaultHostBindingsBuilder {
             host_vars += 1;
             update_stmts.extend(spill);
             let stmt = if let Some(attr) = prop.strip_prefix("attr.") {
-                let contexts = host_binding_security_contexts(selector, attr, true);
-                let mut params =
-                    vec![o::literal(LiteralValue::String(attr.to_string()), None), value.clone()];
-                if let Some(sanitizer) = host_sanitizer(&contexts) {
-                    params.push(o::import_expr(sanitizer.reference(), None));
-                }
-                host_instruction(R3::Attribute, params)
+                host_instruction(
+                    R3::Attribute,
+                    vec![o::literal(LiteralValue::String(attr.to_string()), None), value],
+                )
             } else if prop.starts_with('@') {
                 // Legacy synthetic (animation) host property. The bound name keeps the `@` prefix
                 // verbatim — `ɵɵsyntheticHostProperty("@myAnim", …)` — matching Angular's
@@ -1513,31 +1321,14 @@ impl HostBindingsBuilder for DefaultHostBindingsBuilder {
                     vec![o::literal(LiteralValue::String(prop.clone()), None), value],
                 )
             } else {
-                // Host bindings are DomOnly (`ingestHostBinding`). A DomOnly `[aria-x]` property is specialized
-                // to an Attribute op (`binding_specialization.ts`), otherwise `reifyDomProperty` remaps the name
-                // (`tabindex` → `tabIndex`). Either way the op carries the security sanitizer of the property.
-                let contexts = host_binding_security_contexts(selector, prop, false);
-                let (reference, name) = if is_aria_host_attribute(prop) {
-                    (R3::Attribute, prop.clone())
-                } else {
-                    (
-                        R3::DomProperty,
-                        treaty_ivy_template::view::template::remap_dom_property(prop).to_string(),
-                    )
-                };
-                let mut params = vec![o::literal(LiteralValue::String(name), None), value.clone()];
-                if let Some(sanitizer) = host_sanitizer(&contexts) {
-                    params.push(o::import_expr(sanitizer.reference(), None));
-                }
-                host_instruction(reference, params)
+                host_instruction(
+                    R3::DomProperty,
+                    vec![o::literal(LiteralValue::String(prop.clone()), None), value],
+                )
             };
             update_stmts.push(stmt);
         }
-        create_stmts.extend(animate_stmts);
-        // Styling flush (`ordering.ts` UPDATE_HOST_ORDERING): the whole-element StyleMap then ClassMap
-        // (keep-last), then the per-key StyleProp, then ClassProp.
-        update_stmts.extend(style_map_stmts);
-        update_stmts.extend(class_map_stmts);
+        // Styling flush: all style bindings, then all class bindings (Angular's styling order).
         update_stmts.extend(style_stmts);
         update_stmts.extend(class_stmts);
 
@@ -2101,10 +1892,7 @@ where
             // `() => { …initializers…; return [ …consts… ]; }`.
             let mut body = tpl.consts_initializers.clone();
             body.push(Stmt::bare(StmtKind::Return(o::literal_arr(tpl.consts.clone(), None))));
-            definition_map.set(
-                "consts",
-                Some(o::arrow_fn(Vec::new(), ArrowBody::Block(body), Some(o::dynamic_type()))),
-            );
+            definition_map.set("consts", Some(o::arrow_fn(Vec::new(), ArrowBody::Block(body), None)));
         } else {
             definition_map.set("consts", Some(o::literal_arr(tpl.consts.clone(), None)));
         }
@@ -2169,17 +1957,10 @@ where
     let mut has_styles = meta.external_styles.as_ref().is_some_and(|s| !s.is_empty());
 
     if !meta.styles.is_empty() {
-        // `render3/view/compiler.ts`: `namespacedStyles = meta.styles.map(namespaceCssVariables)`, then
-        // the (possibly shimmed) namespaced styles are emitted.
-        let namespaced_styles: Vec<String> = meta
-            .styles
-            .iter()
-            .map(|s| crate::shadow_css::namespace_css_variables(s))
-            .collect();
         let style_values: Vec<String> = if meta.encapsulation == ViewEncapsulation::Emulated {
-            compile_styles(&namespaced_styles, &content_attr(), &host_attr())
+            compile_styles(&meta.styles, &content_attr(), &host_attr())
         } else {
-            namespaced_styles
+            meta.styles.clone()
         };
         let mut style_nodes: Vec<Expr> = Vec::new();
         for style in &style_values {
@@ -2222,17 +2003,10 @@ where
         );
     }
 
-    // Change detection. INTENTIONAL DIVERGENCE from Angular's `render3/view/compiler.ts` ("Setting
-    // change detection flag"), which omits OnPush and emits any other numeric strategy. Treaty is
-    // OnPush by default, and this is the rule:
-    //   * no option, or explicit legacy `Default`: omitted (OnPush at runtime; the runtime reads an
-    //     absent field as OnPush, `definition.ts`: `onPush: changeDetection !== Eager`);
-    //   * explicit `OnPush` (= 0): `changeDetection: 0`;
-    //   * explicit `Eager` (= 1, the new name): `changeDetection: 1`, so the component runs eager.
-    // Only the explicit `Eager` name opts out of OnPush. Angular's rule would also emit `1` for `Default`,
-    // which Treaty does not do: that would undo the OnPush default. `Default` and `Eager` share the value
-    // `1`, so the choice is carried by `ChangeDetection::Eager`, not by the number. See
-    // `tools/render3-sync/README.md` ("Intentional divergences").
+    // Change detection. Angular v21 (`compiler.ts` setting-change-detection block):
+    // a numeric strategy is emitted only when it differs from `ChangeDetectionStrategy.Default`
+    // (the implicit runtime default). OnPush (= 0) is therefore emitted as `changeDetection: 0`,
+    // while Default (= 1) is omitted.
     if let Some(cd) = &meta.change_detection {
         match cd {
             ChangeDetection::Strategy(strategy) => {
@@ -2242,12 +2016,6 @@ where
                         Some(o::literal(LiteralValue::Number(*strategy as i32 as f64), None)),
                     );
                 }
-            }
-            ChangeDetection::Eager => {
-                definition_map.set(
-                    "changeDetection",
-                    Some(o::literal(LiteralValue::Number(ChangeDetectionStrategy::Eager as i32 as f64), None)),
-                );
             }
             // Unresolved expression (local compilation): emit as-is.
             ChangeDetection::Expr(expr) => {
@@ -2457,7 +2225,7 @@ fn create_host_directives_feature_arg(host_directives: &[R3HostDirectiveMetadata
         o::fn_(
             Vec::new(),
             vec![Stmt::bare(StmtKind::Return(o::literal_arr(expressions, None)))],
-            Some(o::dynamic_type()),
+            None,
             None,
         )
     } else {
@@ -2489,14 +2257,14 @@ fn compile_declaration_list(list: Expr, mode: DeclarationListEmitMode) -> Expr {
         DeclarationListEmitMode::Direct => list,
         // `() => [MyDir]`.
         DeclarationListEmitMode::Closure => {
-            o::arrow_fn(Vec::new(), ArrowBody::Expr(Box::new(list)), Some(o::dynamic_type()))
+            o::arrow_fn(Vec::new(), ArrowBody::Expr(Box::new(list)), None)
         }
         // `() => [MyDir].map(ng.resolveForwardRef)`.
         DeclarationListEmitMode::ClosureResolved => {
             let resolved = list
                 .prop("map")
                 .call_fn(vec![import_r3(R3::ResolveForwardRef)], false);
-            o::arrow_fn(Vec::new(), ArrowBody::Expr(Box::new(resolved)), Some(o::dynamic_type()))
+            o::arrow_fn(Vec::new(), ArrowBody::Expr(Box::new(resolved)), None)
         }
         DeclarationListEmitMode::RuntimeResolved => {
             panic!("Unsupported with an array of pre-resolved dependencies")
@@ -2517,7 +2285,7 @@ fn compile_declaration_list(list: Expr, mode: DeclarationListEmitMode) -> Expr {
 // used in the `dependencies` array.
 // ---------------------------------------------------------------------------
 
-use crate::expression::ast::{AstNode, AstVisitor, BindingPipeType, ExprKind as AstExprKind, SecurityContext};
+use crate::expression::ast::{AstNode, AstVisitor, BindingPipeType, ExprKind as AstExprKind};
 
 /// Walk the component template AST and return one class-reference [`Expr`] per distinct pipe
 /// referenced by name in a binding expression, in first-use order.
@@ -2863,7 +2631,7 @@ pub fn compile_defer_resolver_function(meta: &R3DeferResolverFunctionMetadata) -
     o::arrow_fn(
         Vec::new(),
         ArrowBody::Expr(Box::new(o::literal_arr(dep_expressions, None))),
-        Some(o::dynamic_type()),
+        None,
     )
 }
 
@@ -2873,7 +2641,7 @@ fn dynamic_import_then(import_path: String, prop: &str) -> Expr {
     let inner_fn = o::arrow_fn(
         vec![FnParam::new("m", Some(o::dynamic_type()))],
         ArrowBody::Expr(Box::new(o::variable("m", None).prop(prop))),
-        Some(o::dynamic_type()),
+        None,
     );
     let dynamic_import = Expr::bare(ExprKind::DynamicImport {
         url: o::ImportUrl::Str(import_path),
@@ -3045,8 +2813,8 @@ mod tests {
 
     #[test]
     fn onpush_emits_change_detection_zero_default_is_omitted() {
-        // Treaty is OnPush by default (intentional; see the emit rule above). OnPush (= 0) →
-        // `changeDetection: 0`; Default is omitted, and the runtime treats an omitted field as OnPush.
+        // Angular v21 emits the numeric strategy only when it differs from
+        // ChangeDetectionStrategy.Default. OnPush (= 0) → `changeDetection: 0`.
         let mut meta = component_meta("C", "c");
         meta.change_detection = Some(ChangeDetection::Strategy(ChangeDetectionStrategy::OnPush));
         let mut tb = StubTemplateBuilder;
@@ -3060,39 +2828,13 @@ mod tests {
             "OnPush should emit changeDetection: 0: {js}"
         );
 
-        // Default (1) is omitted (intentional Treaty behaviour, not Angular's `changeDetection: 1`).
+        // Default (1) is the implicit runtime default → omitted.
         let mut meta = component_meta("C", "c");
         meta.change_detection = Some(ChangeDetection::Strategy(ChangeDetectionStrategy::Default));
         let compiled = compile_component_from_metadata(&mut meta, &mut tb, &mut hb, &mut pool);
         assert!(
             !emit_expression(&compiled.expression).contains("changeDetection"),
             "Default should omit changeDetection"
-        );
-    }
-
-    #[test]
-    fn eager_emits_change_detection_one_and_is_distinct_from_default() {
-        // The explicit `Eager` (= 1) is honoured: `changeDetection: 1`. It is `ChangeDetection::Eager`, not
-        // `Strategy(Eager)`, because the alias has the same value as `Default` and Default is omitted.
-        let mut tb = StubTemplateBuilder;
-        let mut hb = StubHostBindingsBuilder;
-        let mut pool = Vec::new();
-        let mut meta = component_meta("C", "c");
-        meta.change_detection = Some(ChangeDetection::Eager);
-        let compiled = compile_component_from_metadata(&mut meta, &mut tb, &mut hb, &mut pool);
-        let js = emit_expression(&compiled.expression);
-        assert!(
-            js.contains("changeDetection: 1") || js.contains("changeDetection:1"),
-            "Eager should emit changeDetection: 1: {js}"
-        );
-
-        // The alias through `Strategy` is the omitted Default, so the two spellings must not diverge silently.
-        let mut meta = component_meta("C", "c");
-        meta.change_detection = Some(ChangeDetection::Strategy(ChangeDetectionStrategy::Eager));
-        let compiled = compile_component_from_metadata(&mut meta, &mut tb, &mut hb, &mut pool);
-        assert!(
-            !emit_expression(&compiled.expression).contains("changeDetection"),
-            "Strategy(Eager) is the Default alias and must stay omitted"
         );
     }
 
@@ -3286,63 +3028,10 @@ mod tests {
     }
 
     #[test]
-    fn host_dom_property_gets_its_security_sanitizer_and_dom_name() {
-        // `host: { '[innerHTML]': 'h', '[tabindex]': '1' }`: `innerHTML` is HTML on every element, so it is
-        // wrapped in `ɵɵsanitizeHtml`; `tabindex` reifies to the DOM name `tabIndex` (DomOnly host).
-        let mut meta = directive_meta("D", "[d]");
-        meta.host.properties.insert("innerHTML".to_string(), "h".to_string());
-        meta.host.properties.insert("tabindex".to_string(), "1".to_string());
-        let mut hb = DefaultHostBindingsBuilder;
-        let compiled = compile_directive_from_metadata(&meta, &mut hb);
-        let js = emit_expression(&compiled.expression);
-        assert!(js.contains("ɵɵdomProperty(\"innerHTML\", ctx.h, i0.ɵɵsanitizeHtml)"), "got: {js}");
-        assert!(js.contains("\"tabIndex\""), "tabindex must reify to tabIndex: {js}");
-
-        // A DomOnly `[aria-readonly]` host property is specialized to an attribute (`binding_specialization.ts`).
-        let mut meta = directive_meta("D", "[d]");
-        meta.host.properties.insert("aria-readonly".to_string(), "r".to_string());
-        let mut hb = DefaultHostBindingsBuilder;
-        let compiled = compile_directive_from_metadata(&meta, &mut hb);
-        let js = emit_expression(&compiled.expression);
-        assert!(js.contains("ɵɵattribute(\"aria-readonly\", ctx.r)"), "aria must be an attribute: {js}");
-    }
-
-    #[test]
-    fn host_property_bindings_chain_into_one_instruction() {
-        // `host: { '[title]': 't', '[id]': 'i' }` ⇒ `ɵɵdomProperty("title", ctx.t)("id", ctx.i)`: consecutive
-        // host instructions fold into one chained call (Angular `chainOperationsInList`).
-        let mut meta = directive_meta("D", "[d]");
-        meta.host.properties.insert("title".to_string(), "t".to_string());
-        meta.host.properties.insert("id".to_string(), "i".to_string());
-        let mut hb = DefaultHostBindingsBuilder;
-        let compiled = compile_directive_from_metadata(&meta, &mut hb);
-        let js = emit_expression(&compiled.expression);
-        assert!(js.contains("ɵɵdomProperty(\"title\", ctx.t)(\"id\", ctx.i)"), "not chained: {js}");
-    }
-
-    #[test]
-    fn host_class_and_style_property_reify_to_class_map_and_style_map() {
-        // `host: { '[class]': 'c', '[style]': 's' }` is a whole-element ClassMap / StyleMap (`ɵɵclassMap(ctx.c)`,
-        // `ɵɵstyleMap(ctx.s)`), each reserving two host vars (`style_binding_specialization.ts`), not a
-        // `ɵɵdomProperty("class")`. The styleMap is flushed before the classMap.
-        let mut meta = directive_meta("D", "[d]");
-        meta.host.properties.insert("class".to_string(), "c".to_string());
-        meta.host.properties.insert("style".to_string(), "s".to_string());
-        let mut hb = DefaultHostBindingsBuilder;
-        let compiled = compile_directive_from_metadata(&meta, &mut hb);
-        let js = emit_expression(&compiled.expression);
-        assert!(js.contains("ɵɵclassMap(ctx.c)"), "missing classMap: {js}");
-        assert!(js.contains("ɵɵstyleMap(ctx.s)"), "missing styleMap: {js}");
-        assert!(!js.contains("ɵɵdomProperty(\"class\""), "class must not be a domProperty: {js}");
-        assert!(js.find("ɵɵstyleMap").unwrap() < js.find("ɵɵclassMap").unwrap(), "{js}");
-        assert!(js.contains("hostVars: 4") || js.contains("hostVars:4"), "expected hostVars: 4: {js}");
-    }
-
-    #[test]
     fn host_property_array_literal_extracts_pure_function() {
         // `host: { '[id]': '["red", id]' }` — a literal array host-binding value runs Angular's
         // host-bindings `generatePureLiteralStructures`: the array is extracted into a hoisted
-        // factory const and the binding becomes `ɵɵdomProperty("id", ɵɵpureFunction1(1, _c0, ctx.id))`
+        // factory const and the binding becomes `ɵɵdomProperty("id", ɵɵpureFunction1(1, $c0$, ctx.id))`
         // with `hostVars: 3` (1 regular binding + 1+1 pure-function slots).
         let mut meta = directive_meta("D", "[d]");
         meta.host.properties.insert("id".to_string(), "[\"red\", id]".to_string());
@@ -3350,7 +3039,7 @@ mod tests {
         let compiled = compile_directive_from_metadata(&meta, &mut hb);
         let js = emit_expression(&compiled.expression);
 
-        assert!(js.contains("ɵɵpureFunction1(1, _c0, ctx.id)"), "missing pureFunction call: {js}");
+        assert!(js.contains("ɵɵpureFunction1(1, $c0$, ctx.id)"), "missing pureFunction call: {js}");
         assert!(
             js.contains("hostVars: 3") || js.contains("hostVars:3"),
             "expected hostVars: 3: {js}"
@@ -3359,7 +3048,7 @@ mod tests {
         assert!(!js.contains("ɵɵdomProperty(\"id\", [\"red\""), "literal not extracted: {js}");
         // The factory const is hoisted as a sibling statement (ConstantPool.statements).
         let stmts = crate::output::emitter::emit_statements(&compiled.statements);
-        assert!(stmts.contains("_c0"), "factory const not hoisted: {stmts}");
+        assert!(stmts.contains("$c0$"), "factory const not hoisted: {stmts}");
         assert!(stmts.contains("[\"red\", a0]"), "factory body wrong: {stmts}");
     }
 
@@ -3730,85 +3419,5 @@ mod tests {
             "missing sanitized handler name: {js}"
         );
         assert!(!js.contains("ɵɵlistener("), "must not use ɵɵlistener: {js}");
-    }
-
-    #[test]
-    fn host_animate_enter_value_binding_emits_create_block_callback() {
-        // `host: { '[animate.enter]': "disabled ? undefined : 'enter-class'" }` → CREATE-block
-        // `ɵɵanimateEnter(function TestCmp_HostBindings_animateenter_cb() { return ctx.disabled ?
-        // undefined : "enter-class"; })` (mirrors r3_compiler_compliance/components_and_directives/
-        // host_animate_enter). It is NOT a `ɵɵdomProperty` update, and reserves no host var.
-        let mut meta = directive_meta("TestCmp", "test-cmp");
-        meta.host.properties.insert(
-            "animate.enter".to_string(),
-            "disabled ? undefined : 'enter-class'".to_string(),
-        );
-        let mut hb = DefaultHostBindingsBuilder;
-        let compiled = compile_directive_from_metadata(&meta, &mut hb);
-        let js = emit_expression(&compiled.expression);
-        assert!(
-            js.contains("ɵɵanimateEnter(function TestCmp_HostBindings_animateenter_cb() {"),
-            "missing ɵɵanimateEnter callback: {js}"
-        );
-        assert!(
-            js.contains("return ctx.disabled ? undefined : \"enter-class\";")
-                || js.contains("return ctx.disabled ? undefined : 'enter-class';"),
-            "callback must return the lowered expression: {js}"
-        );
-        assert!(!js.contains("ɵɵdomProperty"), "animate must not be a domProperty: {js}");
-        assert!(!js.contains("hostVars"), "animate value must reserve no host vars: {js}");
-        assert!(!js.contains("animate.enter\""), "raw key must not appear as a property name: {js}");
-    }
-
-    #[test]
-    fn host_animate_leave_value_binding_emits_animate_leave_callback() {
-        // `host: { '[animate.leave]': 'fade' }` → `ɵɵanimateLeave(function ..._animateleave_cb() {
-        // return ctx.fade; })` in the create block.
-        let mut meta = directive_meta("ChildComponent", "child-component");
-        meta.host
-            .properties
-            .insert("animate.leave".to_string(), "fade".to_string());
-        let mut hb = DefaultHostBindingsBuilder;
-        let compiled = compile_directive_from_metadata(&meta, &mut hb);
-        let js = emit_expression(&compiled.expression);
-        assert!(
-            js.contains("ɵɵanimateLeave(function ChildComponent_HostBindings_animateleave_cb() {"),
-            "missing ɵɵanimateLeave callback: {js}"
-        );
-        assert!(js.contains("return ctx.fade;"), "callback must return ctx.fade: {js}");
-        assert!(!js.contains("ɵɵdomProperty"), "animate must not be a domProperty: {js}");
-    }
-
-    #[test]
-    fn host_style_property_names_are_hyphenated_and_custom_properties_namespaced() {
-        // `host_style_property_parsing.ts`: `style.backgroundColor` → `background-color`; a CSS custom
-        // property `style.--my-color` → `--%NS%my-color` (`namespaceCssVariable`).
-        let mut meta = directive_meta("TestCmp", "test-cmp");
-        meta.host
-            .properties
-            .insert("style.backgroundColor".to_string(), "'red'".to_string());
-        meta.host
-            .properties
-            .insert("style.--my-color".to_string(), "'blue'".to_string());
-        let mut hb = DefaultHostBindingsBuilder;
-        let compiled = compile_directive_from_metadata(&meta, &mut hb);
-        let js = emit_expression(&compiled.expression);
-        assert!(js.contains("ɵɵstyleProp(\"background-color\""), "not hyphenated: {js}");
-        assert!(js.contains("(\"--%NS%my-color\", \"blue\")"), "custom property not namespaced: {js}");
-    }
-
-    #[test]
-    fn component_styles_namespace_css_variables() {
-        // `render3/view/compiler.ts`: `namespacedStyles = meta.styles.map(namespaceCssVariables)`.
-        let mut meta = component_meta("C", "c");
-        meta.styles = vec![":host { --bg: red; color: var(--bg); }".to_string()];
-        meta.encapsulation = ViewEncapsulation::None;
-        let mut tb = StubTemplateBuilder;
-        let mut hb = StubHostBindingsBuilder;
-        let mut pool = Vec::new();
-        let compiled = compile_component_from_metadata(&mut meta, &mut tb, &mut hb, &mut pool);
-        let js = emit_expression(&compiled.expression);
-        assert!(js.contains("--%NS%bg"), "style variables not namespaced: {js}");
-        assert!(!js.contains("--bg:"), "raw variable must not survive: {js}");
     }
 }

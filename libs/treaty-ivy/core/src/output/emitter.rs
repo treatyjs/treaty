@@ -60,8 +60,7 @@ use oxc_ast::ast::{
     BindingPattern, Declaration, Expression, FormalParameterKind, FunctionBody, FunctionType,
     ImportOrExportKind, LogicalOperator, NumberBase, ObjectPropertyKind, PropertyKey, PropertyKind,
     RegExp, RegExpFlags, RegExpPattern, SimpleAssignmentTarget, Statement, TemplateElement,
-    TemplateElementValue, TemplateLiteral, UnaryOperator as OxUn, UpdateOperator,
-    VariableDeclarationKind,
+    TemplateElementValue, TemplateLiteral, UnaryOperator as OxUn, VariableDeclarationKind,
 };
 #[cfg(all(feature = "oxc", not(feature = "swc")))]
 use oxc_codegen::Codegen;
@@ -785,27 +784,14 @@ impl<'a> Lowerer<'a> {
                 self.ast.expression_unary(SPAN, OxUn::LogicalNot, arg)
             }
 
-            ExprKind::Unary { op, expr, is_prefix, .. } => match op {
-                UnaryOperator::Plus => {
-                    let arg = self.lower_expr(expr);
-                    self.ast.expression_unary(SPAN, OxUn::UnaryPlus, arg)
-                }
-                UnaryOperator::Minus => {
-                    let arg = self.lower_expr(expr);
-                    self.ast.expression_unary(SPAN, OxUn::UnaryNegation, arg)
-                }
-                // `++x` / `x++` / `--x` / `x--` are UpdateExpressions in ESTree, not unary
-                // expressions. Prefix-ness is carried by `is_prefix` (Angular `UnaryOperatorExpr.isPrefix`).
-                UnaryOperator::Increment | UnaryOperator::Decrement => {
-                    let operator = if *op == UnaryOperator::Increment {
-                        UpdateOperator::Increment
-                    } else {
-                        UpdateOperator::Decrement
-                    };
-                    let argument = self.lower_simple_assignment_target(expr);
-                    self.ast.expression_update(SPAN, operator, *is_prefix, argument)
-                }
-            },
+            ExprKind::Unary { op, expr, .. } => {
+                let arg = self.lower_expr(expr);
+                let oxc_op = match op {
+                    UnaryOperator::Plus => OxUn::UnaryPlus,
+                    UnaryOperator::Minus => OxUn::UnaryNegation,
+                };
+                self.ast.expression_unary(SPAN, oxc_op, arg)
+            }
 
             ExprKind::Typeof(inner) => {
                 let arg = self.lower_expr(inner);
@@ -1123,7 +1109,7 @@ impl<'a> Lowerer<'a> {
 
     fn lower_map_entry(&self, entry: &LiteralMapEntry) -> ObjectPropertyKind<'a> {
         match entry {
-            LiteralMapEntry::Property { key, value, quoted, .. } => {
+            LiteralMapEntry::Property { key, value, quoted } => {
                 // A `quoted` key emits as a string-literal property name (`{"foo": …}`); otherwise
                 // an identifier name (`{foo: …}`). Angular's emitter (`AbstractJsEmitterVisitor`'s
                 // `visitLiteralMapExpr`) keys on the entry's `quoted` flag — i18n `goog.getMsg`
@@ -1183,19 +1169,16 @@ impl<'a> Lowerer<'a> {
     }
 
     fn lower_assignment_target(&self, lhs: &o::Expr) -> AssignmentTarget<'a> {
-        AssignmentTarget::from(self.lower_simple_assignment_target(lhs))
-    }
-
-    /// The `SimpleAssignmentTarget` (identifier or member) for a write / update target. Shared by
-    /// [`Self::lower_assignment_target`] and the `++` / `--` UpdateExpression lowering.
-    fn lower_simple_assignment_target(&self, lhs: &o::Expr) -> SimpleAssignmentTarget<'a> {
         match &lhs.kind {
-            ExprKind::ReadVar { name } => self
-                .ast
-                .simple_assignment_target_assignment_target_identifier(
-                    SPAN,
-                    self.ast.ident(name),
-                ),
+            ExprKind::ReadVar { name } => {
+                let simple: SimpleAssignmentTarget = self
+                    .ast
+                    .simple_assignment_target_assignment_target_identifier(
+                        SPAN,
+                        self.ast.ident(name),
+                    );
+                AssignmentTarget::from(simple)
+            }
             ExprKind::ReadProp {
                 receiver,
                 name,
@@ -1204,7 +1187,8 @@ impl<'a> Lowerer<'a> {
                 let obj = self.lower_expr(receiver);
                 let prop = self.ast.identifier_name(SPAN, self.ast.ident(name));
                 let member = self.ast.alloc_static_member_expression(SPAN, obj, prop, *optional);
-                SimpleAssignmentTarget::StaticMemberExpression(member)
+                let simple = SimpleAssignmentTarget::StaticMemberExpression(member);
+                AssignmentTarget::from(simple)
             }
             ExprKind::ReadKey {
                 receiver,
@@ -1215,15 +1199,19 @@ impl<'a> Lowerer<'a> {
                 let idx = self.lower_expr(index);
                 let member =
                     self.ast.alloc_computed_member_expression(SPAN, obj, idx, *optional);
-                SimpleAssignmentTarget::ComputedMemberExpression(member)
+                let simple = SimpleAssignmentTarget::ComputedMemberExpression(member);
+                AssignmentTarget::from(simple)
             }
-            // Unsupported target — fall back to a placeholder identifier target.
-            _ => self
-                .ast
-                .simple_assignment_target_assignment_target_identifier(
-                    SPAN,
-                    self.ast.ident("__unsupported_assign_target"),
-                ),
+            _ => {
+                // Unsupported LHS — fall back to a placeholder identifier target.
+                let simple: SimpleAssignmentTarget = self
+                    .ast
+                    .simple_assignment_target_assignment_target_identifier(
+                        SPAN,
+                        self.ast.ident("__unsupported_assign_target"),
+                    );
+                AssignmentTarget::from(simple)
+            }
         }
     }
 
@@ -2016,41 +2004,6 @@ mod tests {
 
         let key = variable("arr", None).key(num(2.0));
         assert!(emit_expression(&key).contains("arr[2]"));
-    }
-
-    /// The expression statement text without its trailing `;\n` (`emit_expression` prints a statement).
-    fn js_text(e: &o::Expr) -> String {
-        emit_expression(e).trim_end_matches(";\n").to_string()
-    }
-
-    #[test]
-    fn emits_increment_and_decrement_prefix_and_postfix() {
-        // `++x` / `--x` are prefix updates; `x++` / `x--` postfix (UpdateExpression, not unary).
-        let pre_inc = o::unary_with_prefix(UnaryOperator::Increment, variable("x", None), None, true);
-        assert_eq!(js_text(&pre_inc), "++x");
-        let post_inc =
-            o::unary_with_prefix(UnaryOperator::Increment, variable("x", None), None, false);
-        assert_eq!(js_text(&post_inc), "x++");
-        let pre_dec = o::unary_with_prefix(UnaryOperator::Decrement, variable("x", None), None, true);
-        assert_eq!(js_text(&pre_dec), "--x");
-        let post_dec =
-            o::unary_with_prefix(UnaryOperator::Decrement, variable("x", None), None, false);
-        assert_eq!(js_text(&post_dec), "x--");
-        // Member targets: `this.a.b++`-style writes lower to a member update.
-        let member_post = o::unary_with_prefix(
-            UnaryOperator::Increment,
-            variable("obj", None).prop("count"),
-            None,
-            false,
-        );
-        assert_eq!(js_text(&member_post), "obj.count++");
-        let keyed_pre = o::unary_with_prefix(
-            UnaryOperator::Decrement,
-            variable("arr", None).key(num(0.0)),
-            None,
-            true,
-        );
-        assert_eq!(js_text(&keyed_pre), "--arr[0]");
     }
 
     #[test]

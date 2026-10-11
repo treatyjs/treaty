@@ -208,7 +208,6 @@ fn convert_expr(expr: &NExpr) -> Option<Expr> {
                             key: key.clone(),
                             value: convert_expr(value)?,
                             quoted: *quoted,
-                            leading_comments: Vec::new(),
                         });
                     }
                     // `{...defaults}` — an object spread carries its argument through as `...expr`.
@@ -1537,9 +1536,8 @@ fn read_encapsulation(obj: Props) -> ViewEncapsulation {
     }
 }
 
-/// `parseChangeDetectionStrategy` — `ChangeDetectionStrategy.X` member → the strategy. Absent → v22 default
-/// OnPush (else Default). `Eager` is read as [`ChangeDetection::Eager`] and is emitted as `changeDetection: 1`;
-/// it is not the `Default` alias, which is omitted (see the emit rule in `decorators/src/compiler.rs`).
+/// `parseChangeDetectionStrategy` — `ChangeDetectionStrategy.X` member → the strategy. `Eager`
+/// aliases `Default` (both `= 1`). Absent → v22 default OnPush (else Eager/Default).
 fn read_change_detection(obj: Props, major: u32, placeholder: bool) -> ChangeDetection {
     if let Some(expr) = find_prop(obj, "changeDetection") {
         let name = match expr {
@@ -1549,9 +1547,7 @@ fn read_change_detection(obj: Props, major: u32, placeholder: bool) -> ChangeDet
         };
         let strategy = match name {
             Some("OnPush") => ChangeDetectionStrategy::OnPush,
-            Some("Eager") => return ChangeDetection::Eager,
-            // Legacy `Default` (and any other member) is the omitted runtime default: Treaty is OnPush by default,
-            // and the runtime reads the omitted field as OnPush.
+            // `Default` and its alias `Eager` are the omitted runtime default.
             _ => ChangeDetectionStrategy::Default,
         };
         return ChangeDetection::Strategy(strategy);
@@ -2273,11 +2269,8 @@ mod tests {
             "got: {}",
             out.code
         );
-        // The declaration's explicit `ChangeDetectionStrategy.Eager` is honoured: `changeDetection: 1`.
-        // (This input is an Eager declaration, so its expectation is the Eager row of the truth table.)
-        let flat = out.code.split_whitespace().collect::<Vec<_>>().join(" ");
-        assert!(flat.contains("changeDetection: 1"), "got: {}", out.code);
-        assert!(!flat.contains("changeDetection: 0"), "got: {}", out.code);
+        // Eager == Default == omitted change detection.
+        assert!(!out.code.contains("changeDetection"), "got: {}", out.code);
         assert_no_declare(&out.code);
         assert_reparses(&out.code);
     }
@@ -2313,40 +2306,6 @@ mod tests {
             out.code, src,
             "non-declare module must pass through byte-identical"
         );
-    }
-
-    #[test]
-    fn links_component_change_detection_truth_table() {
-        // A partial declaration's `changeDetection` (or its absence), by library version. Absent is OnPush for a
-        // v22+ declaration and Default (omitted) before it. Explicit `OnPush` -> `0`; explicit legacy `Default`
-        // -> omitted, whatever the version; explicit `Eager` -> `1`, whatever the version.
-        let cases: [(&str, &str, Option<&str>); 8] = [
-            ("21.2.15", "", None),
-            ("21.2.15", ", changeDetection: i0.ChangeDetectionStrategy.OnPush", Some("changeDetection: 0")),
-            ("21.2.15", ", changeDetection: i0.ChangeDetectionStrategy.Default", None),
-            ("21.2.15", ", changeDetection: i0.ChangeDetectionStrategy.Eager", Some("changeDetection: 1")),
-            ("22.0.0", "", Some("changeDetection: 0")),
-            ("22.0.0", ", changeDetection: i0.ChangeDetectionStrategy.OnPush", Some("changeDetection: 0")),
-            ("22.0.0", ", changeDetection: i0.ChangeDetectionStrategy.Default", None),
-            ("22.0.0", ", changeDetection: i0.ChangeDetectionStrategy.Eager", Some("changeDetection: 1")),
-        ];
-        for (version, option, expected) in cases {
-            let src = format!(
-                r#"C.ɵcmp = i0.ɵɵngDeclareComponent({{
-                    minVersion: "14.0.0", version: "{version}", type: C, isStandalone: true,
-                    selector: "app-c", ngImport: i0, template: '<p>{{{{ x }}}}</p>', isInline: true{option}
-                }});"#
-            );
-            let out = link_partial(&src, "x.mjs");
-            assert!(out.errors.is_empty(), "errors: {:?}", out.errors);
-            assert_no_declare(&out.code);
-            assert_reparses(&out.code);
-            let flat = out.code.split_whitespace().collect::<Vec<_>>().join(" ");
-            match expected {
-                Some(token) => assert!(flat.contains(token), "version {version}{option}: {flat}"),
-                None => assert!(!flat.contains("changeDetection"), "version {version}{option}: {flat}"),
-            }
-        }
     }
 
     #[test]

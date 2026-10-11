@@ -180,6 +180,7 @@ impl DirectiveMeta {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ForeignComponentMeta {
     pub name: String,
+    pub ref_key: String,
 }
 
 /// `t2_api.DirectiveOwner` — `Element | Template | Component | Directive | HostElement`.
@@ -218,12 +219,6 @@ pub enum ScopedNode {
     DeferredBlockError(usize),
     DeferredBlockLoading(usize),
     DeferredBlockPlaceholder(usize),
-    /// `@boundary` (`t2_binder.ts` `visitBoundaryBlock` → `ingestScopedNode`).
-    BoundaryBlock(usize),
-    /// An `@error` branch of a `@boundary` (its context variables are declared in this scope).
-    BoundaryErrorBlock(usize),
-    /// `@content` (`t2_binder.ts` `visitContentBlock`).
-    ContentBlock(usize),
     Content(usize),
     HostElement(usize),
 }
@@ -1000,35 +995,6 @@ impl<'a, 't> Visitor for ScopeBuilder<'a, 't> {
 
     fn visit_content(&mut self, content: &Content) {
         self.ingest_scoped_node_dispatch_content(content);
-    }
-
-    /// `visitBoundaryBlock`: the primary block is a scope, then each `@error` branch is its own scope.
-    fn visit_boundary_block(&mut self, block: &t::BoundaryBlock) {
-        self.ingest_simple(ScopedNode::BoundaryBlock(addr(block)), &block.children);
-        for error_block in &block.error_blocks {
-            self.visit_boundary_error_block(error_block);
-        }
-    }
-
-    /// `visitBoundaryErrorBlock`: the context variables (`$error`, `$reset`, `let` aliases) and children.
-    fn visit_boundary_error_block(&mut self, block: &t::BoundaryErrorBlock) {
-        let node = ScopedNode::BoundaryErrorBlock(addr(block));
-        let child = self.arena.alloc(Some(self.current), Some(node));
-        let parent = self.current;
-        self.current = child;
-        for v in &block.context_variables {
-            self.visit_variable(v);
-        }
-        for c in &block.children {
-            self.visit_node(c);
-        }
-        self.current = parent;
-        self.arena.scopes[parent].child_scopes.insert(node, child);
-    }
-
-    /// `visitContentBlock`: a scope over the block's children.
-    fn visit_content_block(&mut self, block: &t::ContentBlock) {
-        self.ingest_simple(ScopedNode::ContentBlock(addr(block)), &block.children);
     }
 }
 
@@ -1981,17 +1947,6 @@ impl<'a, 't> Visitor for TemplateBinder<'a, 't> {
         self.visit_expr(&text.value);
     }
 
-    /// `TemplateBinder.visitBoundaryErrorBlock` → `ingestScopedNode` (`t2_binder.ts`): context
-    /// variables, then the `when` expression (its pipes and references bind against the branch), then
-    /// the children.
-    fn visit_boundary_error_block(&mut self, block: &t::BoundaryErrorBlock) {
-        self.visit_all_variables(&block.context_variables);
-        if let Some(expression) = &block.expression {
-            self.visit_expr(expression);
-        }
-        self.visit_all(&block.children);
-    }
-
     fn visit_variable(&mut self, variable: &Variable) {
         self.register_symbol(addr(variable));
     }
@@ -2792,53 +2747,6 @@ mod tests {
         assert!(bound
             .get_eagerly_used_pipes()
             .contains(&"eagerPipe".to_string()));
-    }
-
-    /// `TemplateBinder.visitBoundaryErrorBlock` → `ingestScopedNode` → `expression.visit(this)`: a pipe
-    /// inside an `@error (when …)` expression is recorded as used (it was skipped before this port).
-    #[test]
-    fn boundary_error_when_expression_pipes_are_bound() {
-        use crate::template::r3_ast::{BoundaryBlock, BoundaryErrorBlock};
-        let pipe = AstNode::new(
-            ParseSpan::new(0, 0),
-            AbsoluteSourceSpan::new(0, 0),
-            ExprKind::BindingPipe {
-                name_span: AbsoluteSourceSpan::new(0, 0),
-                exp: Box::new(implicit_read("err")),
-                name: "whenPipe".to_string(),
-                args: vec![],
-                pipe_type: crate::expression::ast::BindingPipeType::ReferencedByName,
-            },
-        );
-        let error_block = BoundaryErrorBlock {
-            children: vec![],
-            context_variables: vec![],
-            expression: Some(pipe),
-            spans: crate::template::r3_ast::BlockSpans {
-                name_span: span(),
-                source_span: span(),
-                start_source_span: span(),
-                end_source_span: None,
-            },
-            i18n: None,
-        };
-        let nodes = vec![Node::BoundaryBlock(BoundaryBlock {
-            children: vec![],
-            error_blocks: vec![error_block],
-            main_block_span: span(),
-            spans: crate::template::r3_ast::BlockSpans {
-                name_span: span(),
-                source_span: span(),
-                start_source_span: span(),
-                end_source_span: None,
-            },
-            i18n: None,
-        })];
-        let bound = R3TargetBinder::new(None).bind(Target {
-            template: Some(&nodes),
-            host: None,
-        });
-        assert!(bound.get_used_pipes().contains(&"whenPipe".to_string()));
     }
 
     #[test]

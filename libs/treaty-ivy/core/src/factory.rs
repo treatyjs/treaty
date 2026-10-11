@@ -318,11 +318,10 @@ pub fn compile_factory_function(meta: &R3FactoryMetadata) -> R3CompiledExpressio
     }
 
     // `function ${name}_Factory(t) { <body> }`.
-    // `o.fn(..., o.DYNAMIC_TYPE, ...)` (Angular main replaced `INFERRED_TYPE` with `DYNAMIC_TYPE`).
     let mut factory_fn: Expr = o::fn_(
         vec![FnParam::new(T_NAME, Some(o::dynamic_type()))],
         body,
-        Some(o::dynamic_type()),
+        Some(o::inferred_type()),
         Some(format!("{}_Factory", base.name)),
     );
 
@@ -341,8 +340,7 @@ pub fn compile_factory_function(meta: &R3FactoryMetadata) -> R3CompiledExpressio
             }),
             Stmt::bare(StmtKind::Return(factory_fn)),
         ];
-        // The IIFE arrow is typed `o.DYNAMIC_TYPE` on Angular main.
-        factory_fn = o::arrow_fn(vec![], ArrowBody::Block(iife_body), Some(o::dynamic_type()))
+        factory_fn = o::arrow_fn(vec![], ArrowBody::Block(iife_body), None)
             // `.callFn([], undefined, /* pure */ true)`.
             .call_fn(vec![], true);
     }
@@ -428,10 +426,10 @@ impl MaybeForwardRef {
     }
 }
 
-/// `generateForwardRef(expr)` → `forwardRef(() => expr)` (the arrow is typed `DYNAMIC_TYPE`).
+/// `generateForwardRef(expr)` → `forwardRef(() => expr)`.
 fn generate_forward_ref(expr: Expr) -> Expr {
     import_r3(R3::ForwardRef).call_fn(
-        vec![o::arrow_fn(vec![], ArrowBody::Expr(Box::new(expr)), Some(o::dynamic_type()))],
+        vec![o::arrow_fn(vec![], ArrowBody::Expr(Box::new(expr)), None)],
         false,
     )
 }
@@ -1034,48 +1032,6 @@ mod tests {
         // [token, flags] where flags = OPTIONAL = 8.
         assert_eq!(call_args.len(), 2);
         assert!(matches!(&call_args[1].kind, ExprKind::Literal(LiteralValue::Number(n)) if *n == 8.0));
-    }
-
-    #[test]
-    fn factory_fn_and_iife_are_dynamic_typed() {
-        // Angular main: `o.fn(..., o.DYNAMIC_TYPE, ...)` for the factory function and
-        // `o.arrowFn([], body, o.DYNAMIC_TYPE)` for the base-factory IIFE (was INFERRED_TYPE / untyped).
-        let meta = ctor_meta("Sub", FactoryDeps::Inherit, FactoryTarget::Directive);
-        let compiled = compile_factory_function(&meta);
-        let (callee, _args, _pure) = match &compiled.expression.kind {
-            ExprKind::Invoke { callee, args, pure, .. } => (callee, args, *pure),
-            other => panic!("expected IIFE invoke, got {other:?}"),
-        };
-        assert_eq!(callee.meta.ty.as_deref(), Some(&o::dynamic_type()));
-        let inner_fn = match &callee.kind {
-            ExprKind::Arrow {
-                body: ArrowBody::Block(stmts),
-                ..
-            } => match &stmts[1].kind {
-                StmtKind::Return(f) => f,
-                other => panic!("expected return, got {other:?}"),
-            },
-            other => panic!("expected arrow fn, got {other:?}"),
-        };
-        assert_eq!(inner_fn.meta.ty.as_deref(), Some(&o::dynamic_type()));
-    }
-
-    #[test]
-    fn plain_factory_fn_is_dynamic_typed() {
-        let meta = ctor_meta("Plain", FactoryDeps::Deps(vec![]), FactoryTarget::Directive);
-        let compiled = compile_factory_function(&meta);
-        assert_eq!(compiled.expression.meta.ty.as_deref(), Some(&o::dynamic_type()));
-    }
-
-    #[test]
-    fn generate_forward_ref_arrow_is_dynamic_typed() {
-        // `forwardRef(() => expr)` wrapping, reached through `convert_from_maybe_forward_ref`.
-        let wrapped = generate_forward_ref(external_ref("Dep"));
-        let arrow = match &wrapped.kind {
-            ExprKind::Invoke { args, .. } => &args[0],
-            other => panic!("expected forwardRef call, got {other:?}"),
-        };
-        assert_eq!(arrow.meta.ty.as_deref(), Some(&o::dynamic_type()));
     }
 
     #[test]

@@ -62,7 +62,8 @@ use crate::expression::ast::{
 use crate::expression::parser::Parser as ExprParser;
 use crate::ml_parser as html;
 use crate::ml_parser::{ParseError, ParseErrorLevel, ParseSourceSpan};
-use crate::template::{boundary, content_block, control_flow, deferred};
+use crate::template::control_flow;
+use crate::template::deferred;
 use crate::template::r3_ast as t;
 
 use std::collections::HashSet;
@@ -329,9 +330,6 @@ impl<'b> HtmlAstToIvyAst<'b> {
             html::Node::Directive(_) => {}
             html::Node::Attribute(_) => {}
             html::Node::LetDeclaration(d) => out.push(self.visit_let_declaration(d)),
-            // Start-tag comments live on `Element.comments` / `Component.comments` and are never
-            // children; they are collected by the element/component visitors (see `visit_element`).
-            html::Node::StartTagComment(_) => {}
         }
     }
 
@@ -486,17 +484,6 @@ impl<'b> HtmlAstToIvyAst<'b> {
             })
         };
 
-        // `collectCommentNodes`: comments written inside the start tag are collected after the
-        // element's children (Angular `visitElement` `element.comments.forEach`).
-        if self.options.collect_comment_nodes {
-            for comment in &element.comments {
-                self.comment_nodes.push(t::Comment {
-                    value: comment.value.clone(),
-                    source_span: to_offset_span(&comment.source_span),
-                });
-            }
-        }
-
         if prepared.element_has_inline_template {
             parsed_element = self.wrap_in_template(
                 parsed_element,
@@ -638,17 +625,6 @@ impl<'b> HtmlAstToIvyAst<'b> {
             i18n: component_i18n,
         });
 
-        // `collectCommentNodes`: start-tag comments of a selectorless component (Angular
-        // `visitComponent` `component.comments.forEach`).
-        if self.options.collect_comment_nodes {
-            for comment in &component.comments {
-                self.comment_nodes.push(t::Comment {
-                    value: comment.value.clone(),
-                    source_span: to_offset_span(&comment.source_span),
-                });
-            }
-        }
-
         if prepared.element_has_inline_template {
             node = self.wrap_in_template(
                 node,
@@ -780,28 +756,6 @@ impl<'b> HtmlAstToIvyAst<'b> {
                 let (n, e) = control_flow::create_switch_block(block, self, &parser);
                 (n.map(t::Node::SwitchBlock), e)
             }
-            "content" => {
-                // `createContentBlock(block, this)`: the body is re-entered through the visitor.
-                let visitor: &mut Self = self;
-                let mut transform = |children: &[html::Node]| visitor.visit_all(children, children);
-                let (n, e) = content_block::create_content_block(block, &mut transform);
-                (n.map(t::Node::ContentBlock), e)
-            }
-            "boundary" => {
-                let connected = self.find_connected_blocks(
-                    index,
-                    context,
-                    boundary::is_connected_boundary_error_block,
-                );
-                // `createBoundaryBlock(block, connected, this, bindingParser)`.
-                let result = {
-                    let visitor: &mut Self = self;
-                    let mut transform =
-                        |children: &[html::Node]| visitor.visit_all(children, children);
-                    boundary::create_boundary_block(block, &connected, &mut transform, &parser)
-                };
-                (result.0.map(t::Node::BoundaryBlock), result.1)
-            }
             "for" => {
                 let connected = self.find_connected_blocks(
                     index,
@@ -818,13 +772,7 @@ impl<'b> HtmlAstToIvyAst<'b> {
                 (n.map(t::Node::IfBlock), e)
             }
             other => {
-                let (error_message, mark_processed) = if boundary::is_connected_boundary_error_block(other)
-                {
-                    (
-                        format!("@{other} block can only be used after an @defer or @boundary block."),
-                        true,
-                    )
-                } else if deferred::is_connected_defer_loop_block(other)
+                let (error_message, mark_processed) = if deferred::is_connected_defer_loop_block(other)
                 {
                     (
                         format!("@{other} block can only be used after an @defer block."),
@@ -1399,8 +1347,6 @@ impl<'b> HtmlAstToIvyAst<'b> {
         } else if identifier.is_empty() {
             self.report_error("Variable does not have a name", source_span);
         }
-        // `binding_parser.ts`: a `let-x` with no value reads the context's `$implicit` property.
-        let value = if value.is_empty() { "$implicit" } else { value };
         variables.push(t::Variable {
             name: identifier.to_string(),
             value: value.to_string(),
@@ -1897,7 +1843,6 @@ impl NonBindableVisitor {
                 | html::Node::ExpansionCase(_)
                 | html::Node::Attribute(_)
                 | html::Node::BlockParameter(_)
-                | html::Node::StartTagComment(_)
                 | html::Node::Directive(_) => {}
                 html::Node::Block(b) => out.extend(self.visit_block(b)),
                 html::Node::Component(c) => out.push(self.visit_component(c)),
@@ -2294,7 +2239,7 @@ impl BindingParser {
     /// [`SecurityContext::None`] (the schema default for unknown elements/attributes).
     pub fn create_bound_element_property(
         &mut self,
-        element_name: Option<&str>,
+        _element_name: Option<&str>,
         prop: &ParsedProperty,
         _skip_validation: bool,
         _map_property_name: bool,
@@ -2302,18 +2247,6 @@ impl BindingParser {
         const SEP: char = '.';
         let mut unit: Option<String> = None;
         let parts: Vec<&str> = prop.name.split(SEP).collect();
-        // `calcPossibleSecurityContexts` for a concrete element selector: the schema lookup on the
-        // element's local tag name and namespace (`:svg:a` -> `a` in `svg`). An absent element name
-        // has no single context and stays `None` (see the module note).
-        let schema_context = |property: &str| -> SecurityContext {
-            match element_name {
-                Some(el) => {
-                    let (ns, local) = crate::ml_parser::split_ns_name(el);
-                    crate::dom_security_schema::check_security_context(&local, property, ns.as_deref())
-                }
-                None => SecurityContext::None,
-            }
-        };
 
         let (ty, name, security): (BindingType, String, SecurityContext) = if parts.len() > 1 {
             match parts[0] {
@@ -2325,11 +2258,7 @@ impl BindingParser {
                         let local = &bound_name[idx + 1..];
                         bound_name = format!("{ns}:{local}");
                     }
-                    // `securityContexts` for an `attr.` binding: looked up on the name before the
-                    // `ns:name` merge (`boundPropertyName`), with `isAttribute = true`.
-                    let raw_attr_name = parts[1..].join(".");
-                    let security = schema_context(&raw_attr_name);
-                    (BindingType::Attribute, bound_name, security)
+                    (BindingType::Attribute, bound_name, SecurityContext::None)
                 }
                 "class" => (
                     BindingType::Class,
@@ -2351,10 +2280,10 @@ impl BindingParser {
                 ),
                 // A dotted name that is not one of the special prefixes falls through to the plain
                 // property path below.
-                _ => fallthrough_property(prop, schema_context(&prop.name)),
+                _ => fallthrough_property(prop),
             }
         } else {
-            fallthrough_property(prop, schema_context(&prop.name))
+            fallthrough_property(prop)
         };
 
         BoundElementProperty {
@@ -2406,12 +2335,7 @@ impl BindingParser {
                 TemplateBinding::Variable { key, value, .. } => {
                     parsed_variables.push(ParsedVariable {
                         name: key.source.clone(),
-                        // `binding_parser.ts` `parseInlineTemplateBinding`: a microsyntax `let item`
-                        // (no `= value`) reads the context's `$implicit`, like `let-item`.
-                        value: value
-                            .map(|v| v.source)
-                            .filter(|source| !source.is_empty())
-                            .unwrap_or_else(|| "$implicit".to_string()),
+                        value: value.map(|v| v.source).unwrap_or_default(),
                         source_span: prop_span.clone(),
                         key_span: prop_span.clone(),
                         value_span: None,
@@ -2458,16 +2382,13 @@ impl BindingParser {
 /// The "not a special case" branch of `createBoundElementProperty`: the full property name, a
 /// `TwoWay` or `Property` binding type, and the schema-derived security context (`None` here —
 /// the DOM security schema is not ported). `mapPropertyName`/validation are no-ops in this port.
-fn fallthrough_property(
-    prop: &ParsedProperty,
-    security: SecurityContext,
-) -> (BindingType, String, SecurityContext) {
+fn fallthrough_property(prop: &ParsedProperty) -> (BindingType, String, SecurityContext) {
     let ty = if prop.ty == ParsedPropertyType::TwoWay {
         BindingType::TwoWay
     } else {
         BindingType::Property
     };
-    (ty, prop.name.clone(), security)
+    (ty, prop.name.clone(), SecurityContext::None)
 }
 
 // ===========================================================================
@@ -2526,46 +2447,6 @@ mod tests {
             "expected interpolated text to become BoundText, got {:?}",
             element.children[0]
         );
-    }
-
-    #[test]
-    fn let_without_value_defaults_to_implicit_context_property() {
-        // `binding_parser.ts`: `let-item` (no `=`) reads the context's `$implicit`; `let-i="index"` keeps its
-        // explicit property.
-        let nodes = parse_html(r#"<ng-template let-item let-i="index"><span>x</span></ng-template>"#);
-        let mut bp = BindingParser::new();
-        let result = html_ast_to_render3_ast(&nodes, &mut bp, Render3ParseOptions::default());
-
-        let template = match &result.nodes[0] {
-            t::Node::Template(t) => t,
-            other => panic!("expected Template, got {other:?}"),
-        };
-        let pairs: Vec<(&str, &str)> = template
-            .variables
-            .iter()
-            .map(|v| (v.name.as_str(), v.value.as_str()))
-            .collect();
-        assert_eq!(pairs, vec![("item", "$implicit"), ("i", "index")]);
-    }
-
-    #[test]
-    fn microsyntax_let_without_value_defaults_to_implicit_context_property() {
-        // `*ngFor="let outer of items"`: the `let outer` binding has no `= value`, so the desugared
-        // template variable reads the context's `$implicit` (Angular `parseInlineTemplateBinding`).
-        let nodes = parse_html(r#"<ul *ngFor="let outer of items; let i = index"><li>x</li></ul>"#);
-        let mut bp = BindingParser::new();
-        let result = html_ast_to_render3_ast(&nodes, &mut bp, Render3ParseOptions::default());
-
-        let template = match &result.nodes[0] {
-            t::Node::Template(t) => t,
-            other => panic!("expected Template, got {other:?}"),
-        };
-        let pairs: Vec<(&str, &str)> = template
-            .variables
-            .iter()
-            .map(|v| (v.name.as_str(), v.value.as_str()))
-            .collect();
-        assert_eq!(pairs, vec![("outer", "$implicit"), ("i", "index")]);
     }
 
     #[test]

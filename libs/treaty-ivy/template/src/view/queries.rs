@@ -535,9 +535,7 @@ fn create_queries_function(
                 collapse_advance_statements(update_statements),
             ),
         ],
-        // `query_generation.ts`: the query function's declared return type is `DYNAMIC_TYPE` (it was
-        // `INFERRED_TYPE` before main).
-        Some(o::dynamic_type()),
+        Some(o::inferred_type()),
         fn_name,
     )
 }

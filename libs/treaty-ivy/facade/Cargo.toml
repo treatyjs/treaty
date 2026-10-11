@@ -25,9 +25,6 @@ edition = "2024"
 # backend here is that port's parser half + its parity gate; the alias below stays on oxc until the
 # walk is neutralized so the default + swc builds both compile.
 default = ["oxc"]
-# `ng-analyze` takes the component/directive metadata from Angular's own decorator analyser (through the
-# bridge) where it can, and from Treaty's extractor everywhere else. Off by default.
-ng-analyze = ["dep:treaty_ivy_ng_bridge", "treaty_ivy_ng_bridge/analyze"]
 # `oxc` pulls in the OXC PARSE backend (`src/parse/oxc.rs`, the only facade file that `use`s `oxc_`)
 # + its `oxc_*` parser crates. With the source/linker/partial-emit WALK now reading the engine-neutral
 # `ParseOutput` (no live oxc `Program`), the oxc crates are confined to that one feature-gated module,
@@ -56,11 +53,6 @@ swc = [
 treaty_ivy_core = { path = "../core", default-features = false }
 treaty_ivy_template = { path = "../template", default-features = false }
 treaty_ivy_decorators = { path = "../decorators", default-features = false }
-# Plain-data decorator facts (dependency-free leaf crate; see libs/treaty-ivy/facts).
-treaty_ivy_facts = { path = "../facts" }
-# Opt-in bridge to Angular's own decorator analyser (`ng-analyze`). Compiled only with the `ng-analyze`
-# feature; see libs/treaty-ivy/ng-analyze-bridge/README.md.
-treaty_ivy_ng_bridge = { path = "../ng-analyze-bridge", optional = true }
 # OXC PARSE backend crates — compiled ONLY under `--features oxc` (the default). Confined to
 # `src/parse/oxc.rs` now that the AOT/linker/partial-emit walks read the engine-neutral IR.
 oxc_allocator = { version = "0.133.0", optional = true }

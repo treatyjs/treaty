@@ -1,9 +1,0 @@
-[package]
-name = "treaty_ivy_facts"
-version = "0.1.0"
-edition = "2024"
-
-# Plain-data decorator FACTS shared by Treaty's own source front-end and the opt-in ng-analyze bridge
-# (`treaty_ivy_ng_bridge`). No dependencies: no oxc, no ng-analyze, no other treaty crate. Keeping the
-# fact types in their own leaf crate lets the facade record facts without depending on the bridge.
-[dependencies]

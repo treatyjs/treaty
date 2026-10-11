@@ -42,6 +42,7 @@ use crate::factory::{
     MaybeForwardRef, R3ConstructorFactoryMetadata, R3DependencyMetadata, R3FactoryMetadata,
     R3InjectableMetadata,
 };
+use crate::identifiers::R3;
 use crate::output_ast::{self as o, Expr, FnParam, LiteralValue, ParseSourceSpan};
 use crate::template::template_transform::{
     html_ast_to_render3_ast, BindingParser, Render3ParseOptions,
@@ -53,20 +54,10 @@ use crate::view::compiler::{
     DefaultHostBindingsBuilder, Deps, HostValue, Lifecycle, OrderedMap, QueryPredicate,
     R3ComponentDeferMetadata, R3ComponentMetadata, R3DirectiveMetadata,
     R3ForeignComponentMetadata, R3HostDirectiveMetadata, R3HostMetadata, R3InputMetadata,
-    R3QueryMetadata, R3TemplateDependencyMetadata, ViewEncapsulation,
+    R3QueryMetadata, R3TemplateDependency, R3TemplateDependencyMetadata, TemplateBuilder,
+    TemplateBuilderResult, ViewEncapsulation,
 };
 use crate::util::R3Reference as DirRef;
-
-// Decorator facts (raw, plain-data) read through this front-end's own helpers; see the module doc.
-mod const_fold;
-mod decorator_facts;
-pub use decorator_facts::{decorator_facts_of_source, lower_to_text};
-// The ng-analyze facts path (opt-in feature `ng-analyze`): component/directive metadata from the bridge's facts.
-mod facts_emit;
-pub use facts_emit::{ng_analyze_counters, reset_ng_analyze_counters, NgAnalyzeCounters};
-#[cfg(feature = "ng-analyze")]
-pub use facts_emit::with_treaty_extraction;
-use facts_emit::NgFacts;
 
 /// Helper to build a `CompiledComponent` carrying a single fatal error and no code.
 fn err(msg: impl Into<String>) -> CompiledComponent {
@@ -359,19 +350,6 @@ fn convert_expr(expr: &NExpr) -> Option<Expr> {
             Some(callee.call_fn(out_args, false))
         }
         NExpr::Parenthesized(inner) => convert_expr(inner),
-        // `new Callee(args)` → `InstantiateExpr`. ngtsc keeps any expression as written, so a `new` inside an
-        // arrow body (`useFactory: (d) => new Svc(d)`) lowers the same way.
-        NExpr::New { callee, args } => {
-            let callee = convert_expr(callee)?;
-            let mut out = Vec::with_capacity(args.len());
-            for a in args {
-                match a {
-                    NArg::Expr(e, _) => out.push(convert_expr(e)?),
-                    NArg::Spread(..) => return None,
-                }
-            }
-            Some(callee.instantiate(out))
-        }
         // Conditional `c ? t : f` — appears in transform/host-handler bodies (`v => v ? 1 : 0`).
         NExpr::Conditional {
             test,
@@ -673,22 +651,20 @@ fn decorator_string_alias(dec: &DecoratorInfo) -> Option<String> {
     }
 }
 
-/// Parse an `@Input(...)` decorator's first argument into `(alias, transform, required)`. ngtsc accepts
-/// two forms: a string `@Input('publicName')` (alias only), or an options object
+/// Parse an `@Input(...)` decorator's first argument into `(alias, transform)`. ngtsc accepts two
+/// forms: a string `@Input('publicName')` (alias only), or an options object
 /// `@Input({alias?: 'publicName', transform?: fn, required?: bool})`. Returns the public-name alias
-/// (when present), the transform function expression (when present and convertible) and the
-/// `required` flag (`false` unless the object sets `required: true`). A transform we cannot
-/// structurally convert (e.g. an inline arrow body) is dropped rather than mis-emitted.
-fn input_decorator_options(dec: &DecoratorInfo) -> (Option<String>, Option<Expr>, bool) {
+/// (when present) and the transform function expression (when present and convertible). A transform
+/// we cannot structurally convert (e.g. an inline arrow body) is dropped rather than mis-emitted.
+fn input_decorator_options(dec: &DecoratorInfo) -> (Option<String>, Option<Expr>) {
     match dec.arguments.first().map(NArg::expr) {
-        Some(NExpr::String(s)) => (Some(s.clone()), None, false),
+        Some(NExpr::String(s)) => (Some(s.clone()), None),
         Some(NExpr::Object(props)) => {
             let alias = object_props_get(props, "alias").and_then(string_value);
             let transform = object_props_get(props, "transform").and_then(convert_expr);
-            let required = matches!(object_props_get(props, "required"), Some(NExpr::Boolean(true)));
-            (alias, transform, required)
+            (alias, transform)
         }
-        _ => (None, None, false),
+        _ => (None, None),
     }
 }
 
@@ -704,98 +680,6 @@ const UNSUPPORTED_DECORATOR_KEYS: &[&str] = &[
 /// and signal initializers ride on. (`MemberKind::Accessor` is an `accessor x = …;` auto-accessor.)
 fn is_property_like(member: &MemberInfo) -> bool {
     matches!(member.kind, MemberKind::Property | MemberKind::Accessor)
-}
-
-/// The decorator-level `inputs: [...]` and `outputs: [...]` arrays of a `@Component`/`@Directive`
-/// object, read into the same maps [`collect_io`] fills. ngtsc reads both (`parseInputsArray` and
-/// `parseOutputsArray` in `ngtsc/annotations/directive/src/shared.ts`); Treaty read only the member
-/// decorators until this was added.
-///
-/// Call this BEFORE [`collect_io`]: member decorators then override an entry for the same class
-/// property, which is `{...inputsFromMeta, ...inputsFromFields}` in ngtsc (a key keeps its first
-/// position and takes the later value, as [`OrderedMap::insert`] does).
-///
-/// Input entries are the string form `'prop'` / `'prop: publicName'` (`parseMappingString`) or the
-/// object form `{name, alias?, required?, transform?}`. Output entries are the string form only
-/// (`parseMappingStringArray`). A value of any other shape is refused, as ngtsc refuses it.
-fn collect_decorator_io_arrays(
-    obj: Option<&ObjLit>,
-    inputs: &mut OrderedMap<String, R3InputMetadata>,
-    outputs: &mut OrderedMap<String, String>,
-    modernize: ModernizeOptions,
-) -> Result<(), String> {
-    let Some(obj) = obj else { return Ok(()) };
-    if let Some(e) = find_prop(obj, "inputs") {
-        let NExpr::Array(elements) = e else {
-            return Err("@Directive.inputs must be an array literal".to_string());
-        };
-        for el in elements {
-            let crate::parse::NArrayElement::Expr(value) = el else {
-                continue;
-            };
-            let (field, binding, required, transform) = match value {
-                NExpr::String(text) => {
-                    let (field, binding) = parse_mapping_string(text);
-                    (field, binding, false, None)
-                }
-                NExpr::Object(props) => {
-                    let name = object_props_get(props, "name").and_then(string_value).ok_or_else(|| {
-                        "@Directive.inputs object entry must have a string `name` property".to_string()
-                    })?;
-                    let alias = object_props_get(props, "alias").and_then(string_value);
-                    let required = matches!(object_props_get(props, "required"), Some(NExpr::Boolean(true)));
-                    let transform = match object_props_get(props, "transform") {
-                        None => None,
-                        Some(t) => Some(convert_expr(t).ok_or("unsupported `inputs` transform expression form")?),
-                    };
-                    let binding = alias.unwrap_or_else(|| name.clone());
-                    (name, binding, required, transform)
-                }
-                _ => {
-                    return Err(
-                        "@Directive.inputs array can only contain strings or object literals".to_string(),
-                    )
-                }
-            };
-            inputs.insert(
-                field.clone(),
-                R3InputMetadata {
-                    class_property_name: field,
-                    binding_property_name: binding,
-                    required,
-                    // A decorator-array input is a decorator input: the modernizer lowers it exactly as a
-                    // classic `@Input` member (ngtsc's array form is never signal-based by itself).
-                    is_signal: modernize.signal_inputs,
-                    transform_function: transform,
-                },
-            );
-        }
-    }
-    if let Some(e) = find_prop(obj, "outputs") {
-        let NExpr::Array(elements) = e else {
-            return Err("@Directive.outputs must be an array literal".to_string());
-        };
-        for el in elements {
-            let crate::parse::NArrayElement::Expr(value) = el else {
-                continue;
-            };
-            let NExpr::String(text) = value else {
-                return Err("@Directive.outputs array can only contain strings".to_string());
-            };
-            let (field, binding) = parse_mapping_string(text);
-            outputs.insert(field, binding);
-        }
-    }
-    Ok(())
-}
-
-/// ngtsc's `parseMappingString`: `'prop'` maps the property to itself, `'prop: publicName'` maps it to
-/// `publicName`. Returns `(property, publicName)`.
-fn parse_mapping_string(text: &str) -> (String, String) {
-    let mut parts = text.splitn(2, ':').map(str::trim);
-    let field = parts.next().unwrap_or_default().to_string();
-    let binding = parts.next().map(str::to_string).unwrap_or_else(|| field.clone());
-    (field, binding)
 }
 
 /// Extract inputs/outputs from the class body and populate the metadata maps.
@@ -828,17 +712,15 @@ fn collect_io(
         let mut decorated_output = false;
         let mut decorator_alias: Option<String> = None;
         let mut decorator_transform: Option<Expr> = None;
-        let mut decorator_required = false;
         for dec in &member.decorators {
             if let Some(name) = decorator_name(dec) {
                 match name {
                     "Input" => {
                         decorated_input = true;
                         // `@Input('alias')` (string) OR `@Input({alias?, transform?})` (object).
-                        let (alias, transform, required) = input_decorator_options(dec);
+                        let (alias, transform) = input_decorator_options(dec);
                         decorator_alias = alias;
                         decorator_transform = transform;
-                        decorator_required = required;
                     }
                     "Output" => {
                         decorated_output = true;
@@ -859,8 +741,8 @@ fn collect_io(
             //
             // MODERNIZER (`signal_inputs`): a classic `@Input` is lowered to a signal `input()` at
             // COMPILE TIME — the emitted `inputs` map carries the `InputFlags.SignalBased` bit and
-            // the definition is the one a hand-written `input()` gets (no `signals` flag: it is the explicit
-            // option only, see `treaty_directive_extract`). This is an emit-time remapping only; the author's `@Input x;` declaration is untouched. The public name /
+            // the directive is marked `signals: true` (see `is_signal` below). This is an emit-time
+            // remapping only; the author's `@Input x;` declaration is untouched. The public name /
             // alias / transform are preserved exactly. A `model()`-style input is NOT synthesized
             // (a classic `@Input` has no paired `Change` output), matching `input()` (one-way).
             let public_name = decorator_alias.clone().unwrap_or_else(|| member_name.clone());
@@ -869,25 +751,23 @@ fn collect_io(
                 R3InputMetadata {
                     class_property_name: member_name.clone(),
                     binding_property_name: public_name,
-                    required: decorator_required,
+                    required: false,
                     is_signal: modernize.signal_inputs,
                     transform_function: decorator_transform,
                 },
             );
+            continue;
         }
-        // A member can carry BOTH `@Input` and `@Output` (ngtsc registers both: `parseInputFields` and
-        // `parseOutputFields` each read every member). So the output is recorded below, not skipped here.
         if decorated_output {
             // Outputs key on the property name; the value is the public name (alias or property).
             //
             // MODERNIZER (`signal_outputs`): a classic `@Output` lowers to `output()`. The emitted
             // `outputs` metadata is identical for both forms (an output carries no per-output signal
-            // flag in `ɵɵdefineComponent/Directive`), so the lowering is byte-faithful to a hand-authored
-            // `output()` by construction.
+            // flag in `ɵɵdefineComponent/Directive`), so the only OBSERVABLE effect is on the
+            // `signals: true` decision (see `is_signal`), keeping the lowering byte-faithful to a
+            // hand-authored `output()`.
             let public_name = decorator_alias.unwrap_or_else(|| member_name.clone());
             outputs.insert(member_name.clone(), public_name);
-        }
-        if decorated_input || decorated_output {
             continue;
         }
 
@@ -951,24 +831,15 @@ fn signal_query_kind(name: &str) -> Option<(bool /*first*/, bool /*is_content*/)
     }
 }
 
-/// Returns the query function name of a signal-query call: `foo(...)`, or `viewChild.required(...)` /
-/// `contentChild.required(...)`. `.required` exists only on the single-result queries. It changes the
-/// query's TYPE (`Signal<T>` rather than `Signal<T | undefined>`), not its metadata: Angular's
-/// `R3QueryMetadata` has no `required` field, so the required form lowers exactly like the plain call.
+/// Returns the callee identifier name of a call expression `foo(...)`, if the callee is a bare
+/// identifier. (Signal queries are never `.required`, unlike `input`/`model`.)
 fn call_callee_name(expr: &NExpr) -> Option<&str> {
-    let NExpr::Call { callee, .. } = expr else {
-        return None;
-    };
-    match callee.as_ref() {
-        NExpr::Identifier(id) => Some(id.as_str()),
-        NExpr::Member { object, property } if property.as_str() == "required" => match object.as_ref() {
-            NExpr::Identifier(base) if base == "viewChild" || base == "contentChild" => {
-                Some(base.as_str())
-            }
-            _ => None,
-        },
-        _ => None,
+    if let NExpr::Call { callee, .. } = expr {
+        if let NExpr::Identifier(id) = callee.as_ref() {
+            return Some(id.as_str());
+        }
     }
+    None
 }
 
 /// Parse the `descendants` boolean from a query options object literal (2nd arg). Faithful to
@@ -1202,37 +1073,6 @@ fn order_queries_for_emit(queries: &mut Vec<R3QueryMetadata>) {
 // R2 — host bindings (`host: {...}` object, `@HostBinding`/`@HostListener` members).
 // ---------------------------------------------------------------------------
 
-/// The DOM property names Angular's host-binding reification remaps (`reify.ts`, `DOM_PROPERTY_REMAPPING`).
-/// Host bindings are compiled in DomOnly mode (`ingestHostBinding`), so every `ɵɵdomProperty` name goes
-/// through this table. `class` and `style` are not in it for host bindings: `[class]`/`[style]` are class and
-/// style bindings before reification, so they are left alone here.
-const HOST_DOM_PROPERTY_REMAPPING: &[(&str, &str)] = &[
-    ("for", "htmlFor"),
-    ("formaction", "formAction"),
-    ("innerHtml", "innerHTML"),
-    ("readonly", "readOnly"),
-    ("tabindex", "tabIndex"),
-];
-
-/// The raw host key for a property binding: `[prop]` with `prop` remapped through
-/// [`HOST_DOM_PROPERTY_REMAPPING`] (`'[tabindex]'` is emitted as `ɵɵdomProperty("tabIndex", …)`, as Angular
-/// does). Any other key is returned unchanged.
-pub(super) fn host_property_key(prop: &str) -> String {
-    let name = HOST_DOM_PROPERTY_REMAPPING
-        .iter()
-        .find(|(from, _)| *from == prop)
-        .map_or(prop, |(_, to)| to);
-    format!("[{name}]")
-}
-
-/// [`host_property_key`] for a raw `host` object key: a `[prop]` key is remapped, anything else is kept.
-pub(super) fn host_property_key_or_plain(key: &str) -> String {
-    match key.strip_prefix('[').and_then(|k| k.strip_suffix(']')) {
-        Some(prop) => host_property_key(prop),
-        None => key.to_string(),
-    }
-}
-
 /// Parse the `@Component`/`@Directive` `host: {...}` object literal into the
 /// `OrderedMap<String, HostValue>` that [`parse_host_bindings`] consumes. Faithful to ngtsc's
 /// `extractHostBindings`: each property key is the raw host key (`'(click)'`, `'[id]'`, `'class'`,
@@ -1253,20 +1093,9 @@ fn parse_host_object(expr: &NExpr) -> Result<OrderedMap<String, HostValue>, Stri
                 return Err("unsupported `host` spread/shorthand".to_string())
             }
         };
-        // A string is taken as is. Any other value is an expression, which ngtsc keeps as a `WrappedNodeExpr`
-        // (`evaluateHostExpressionBindings`: a `DynamicValue` becomes an expression). `parse_host_bindings`
-        // accepts an expression only for a plain attribute (`hostAttrs`); a `[prop]`, `(event)`, `class` or
-        // `style` key with an expression is refused there, as ngtsc refuses it.
-        // A `[prop]` key takes the DOM property name Angular emits (see `host_property_key`).
-        let key = host_property_key_or_plain(key);
-        let value = match string_value(value) {
-            Some(s) => HostValue::Str(s),
-            None => HostValue::Expr(
-                convert_expr(value)
-                    .ok_or_else(|| format!("`host` value for '{key}' must be a string or an expression"))?,
-            ),
-        };
-        out.insert(key, value);
+        let value = string_value(value)
+            .ok_or_else(|| format!("`host` value for '{key}' must be a string"))?;
+        out.insert(key.clone(), HostValue::Str(value));
     }
     Ok(out)
 }
@@ -1325,7 +1154,7 @@ fn collect_member_host_bindings(class: &ClassWithDecorators, host: &mut MemberHo
                         member_name.to_string()
                     };
                     host.entries
-                        .insert(host_property_key(&host_prop), HostValue::Str(value));
+                        .insert(format!("[{host_prop}]"), HostValue::Str(value));
                 }
                 Some("HostListener") => {
                     if let Some((event, handler)) = host_listener_entry(dec, member_name) {
@@ -1574,25 +1403,8 @@ pub fn compile_component_source(ts_source: &str) -> CompiledComponent {
             false,
             None,
             false,
-            ClassShape::Assignments,
         )
     })
-}
-
-/// Where a decorated class's Ivy definitions are written, in the FULL (AOT) emit.
-///
-/// * [`ClassShape::Assignments`] (the default): `X.ɵfac = …; X.ɵcmp = …;` statements after the class. This
-///   is the shape every existing consumer reads (the `.d.ts` writer in `ng-packagr`'s `component_dts`, the
-///   bundler plugins' `IVY_DEFINITION` checks, the linker round trip).
-/// * [`ClassShape::StaticMembers`]: `static ɵfac = …; static ɵcmp = …;` members INSIDE the class body, which
-///   is the shape Angular's compiler produces (ngtsc adds the statics to the class, and the compliance goldens
-///   show them there). Hoisted constant-pool statements still come before the class, and `@NgModule` scope
-///   side effects still come after it. The partial (`compilationMode: "partial"`) emit is never changed.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ClassShape {
-    #[default]
-    Assignments,
-    StaticMembers,
 }
 
 /// Per-file Angular compiler options that influence the emit but are NOT expressible in the source.
@@ -1628,9 +1440,6 @@ pub struct CompileOptions {
     /// afterwards to invert those (and to convert the component/directive `ɵfac` to
     /// `ɵɵngDeclareFactory`). Threaded from `compilationMode` by `treaty_packagr`.
     pub emit_partial_component: bool,
-    /// Where the definitions are written (see [`ClassShape`]). `Assignments` by default, so every
-    /// default emit is byte-identical to the classic output.
-    pub class_shape: ClassShape,
 }
 
 /// Like [`compile_component_source`] but honouring per-file [`CompileOptions`]. With
@@ -1655,7 +1464,6 @@ pub fn compile_component_source_with_options(
             options.jit_mode,
             None,
             options.emit_partial_component,
-            options.class_shape,
         )
     })
 }
@@ -1688,7 +1496,6 @@ pub fn compile_component_source_with_resolved(
             false,
             None,
             false,
-            ClassShape::Assignments,
         )
     })
 }
@@ -1721,7 +1528,6 @@ pub fn compile_component_source_with_options_and_resolved(
             options.jit_mode,
             None,
             options.emit_partial_component,
-            options.class_shape,
         )
     })
 }
@@ -1880,7 +1686,6 @@ fn compile_component_source_full(
             false,
             selector_registry,
             false,
-            ClassShape::Assignments,
         );
         CompiledComponentWithMap {
             code: compiled.code,
@@ -2006,16 +1811,11 @@ use crate::decorators::registry::CompiledDef as ClassEmit;
 /// constructor (or a parameterless one) yields the empty-deps form Angular generates for a
 /// parameterless constructor: `function X_Factory(t) { return new (t || X)(); }`.
 fn class_factory(class: &ClassWithDecorators, class_name: &str, target: FactoryTarget) -> R3FactoryMetadata {
-    class_factory_from_deps(class_name, extract_ctor_deps(class), target)
-}
-
-/// The constructor factory of `class_name` injecting `deps` (from either extractor).
-fn class_factory_from_deps(class_name: &str, deps: FactoryDeps, target: FactoryTarget) -> R3FactoryMetadata {
     R3FactoryMetadata::Constructor(R3ConstructorFactoryMetadata {
         name: class_name.to_string(),
         ty: directive_ref(class_name),
         type_argument_count: 0,
-        deps,
+        deps: extract_ctor_deps(class),
         target,
     })
 }
@@ -2123,28 +1923,6 @@ fn decorator_first_arg_expr(dec: &DecoratorInfo) -> Option<Expr> {
 /// `X.<static_member> = <def_expression>;`. The `def_expression`'s `ɵɵdefine*({...})` argument block
 /// is preserved byte-for-byte — only the `X.<member> =` assignment is added around it.
 fn class_static_statements(emit: ClassEmit) -> Vec<o::Stmt> {
-    let parts = class_static_parts(emit);
-    let mut stmts = parts.hoisted;
-    stmts.extend(parts.members.into_iter().map(|(member, value)| {
-        o::variable(&parts.class_name, None).prop(member).set(value).to_stmt()
-    }));
-    stmts.extend(parts.after);
-    stmts
-}
-
-/// A decorated class's Ivy statics, split by where they are written. `hoisted` (constant-pool consts and
-/// the factory's helper functions) precede the definitions; `members` are the `static`-able
-/// `X.<member> = value` assignments in emit order (`ɵfac` first, then the definition); `after` (the `@NgModule`
-/// scope side effects) follow them. [`class_static_statements`] writes them as the default assignments;
-/// [`ClassShape::StaticMembers`] writes `members` inside the class body.
-struct ClassStatics {
-    class_name: String,
-    hoisted: Vec<o::Stmt>,
-    members: Vec<(String, Expr)>,
-    after: Vec<o::Stmt>,
-}
-
-fn class_static_parts(emit: ClassEmit) -> ClassStatics {
     let ClassEmit {
         class_name,
         static_member,
@@ -2155,27 +1933,38 @@ fn class_static_parts(emit: ClassEmit) -> ClassStatics {
         ..
     } = emit;
 
-    let mut hoisted: Vec<o::Stmt> = Vec::new();
-    let mut members: Vec<(String, Expr)> = Vec::new();
+    let mut stmts: Vec<o::Stmt> = Vec::new();
 
     // Constant-pool consts the definition references are hoisted BEFORE the assignments.
     if !extra_after_def {
-        hoisted.extend(extra_statements.clone());
+        stmts.extend(extra_statements.clone());
     }
 
     if let Some(factory) = factory {
         let fac = compile_factory_function(&factory);
         // The factory may itself hoist a `ɵX_BaseFactory` const (inherited-deps case); emit those
         // first so the `ɵfac` assignment that references them is well-formed.
-        hoisted.extend(fac.statements);
-        members.push(("\u{0275}fac".to_string(), fac.expression));
+        stmts.extend(fac.statements);
+        stmts.push(
+            o::variable(&class_name, None)
+                .prop("\u{0275}fac")
+                .set(fac.expression)
+                .to_stmt(),
+        );
     }
 
-    members.push((static_member.to_string(), def_expression));
+    stmts.push(
+        o::variable(&class_name, None)
+            .prop(static_member)
+            .set(def_expression)
+            .to_stmt(),
+    );
 
     // `@NgModule` scope side effects run AFTER the definition is assigned.
-    let after = if extra_after_def { extra_statements } else { Vec::new() };
-    ClassStatics { class_name, hoisted, members, after }
+    if extra_after_def {
+        stmts.extend(extra_statements);
+    }
+    stmts
 }
 
 /// Assemble the COMPLETE ES module: the original source with every Angular decorator stripped and
@@ -2196,7 +1985,6 @@ fn assemble_module(
     summary: &ParseOutput,
     mut class_emits: std::collections::HashMap<usize, (ClassEmit, u32, u32)>,
     emit_partial_component: bool,
-    class_shape: ClassShape,
 ) -> String {
     // Map a top-level statement start offset → the decorated class declared there (its `stmt_span`),
     // so the assembler can recover the class for member-decorator stripping + partial metadata.
@@ -2262,60 +2050,10 @@ fn assemble_module(
                 .get(&stmt_start)
                 .map(|class| member_decorator_strip_spans(class))
                 .unwrap_or_default();
-            // The static-member shape needs the class's closing `}` as its last source byte; a class whose
-            // statement does not end in one keeps the assignment shape rather than being mis-spliced.
-            let static_members = class_shape == ClassShape::StaticMembers
-                && !emit_partial_component
-                && source.as_bytes().get(stmt_end.wrapping_sub(1)) == Some(&b'}');
-            let parts = class_static_parts(emit);
-            if static_members {
-                // Constant-pool consts come before the class, where the static initialisers can reach them.
-                let hoisted = strip_i0_import_line(&crate::output::emitter::emit_statements(&parts.hoisted));
-                out.push_str(hoisted.trim_end_matches('\n'));
-                if !hoisted.trim().is_empty() {
-                    out.push('\n');
-                }
-                if content_start < dec_start {
-                    out.push_str(&source[content_start..dec_start]);
-                }
-                push_slice_excising_spans(&mut out, source, dec_end..stmt_end - 1, &member_strips);
-                if !out.ends_with('\n') {
-                    out.push('\n');
-                }
-                // The `ɵinj`-style assignments that follow the definition (`@NgModule`) are members too; only the
-                // scope side effects that are not `X.ɵ… =` assignments stay after the class.
-                let mut members = parts.members;
-                let mut after = Vec::new();
-                for stmt in parts.after {
-                    match class_static_assignment(&stmt, &parts.class_name) {
-                        Some(member) => members.push(member),
-                        None => after.push(stmt),
-                    }
-                }
-                for (member, value) in members {
-                    out.push_str("  ");
-                    out.push_str(&static_member_text(&parts.class_name, &member, value));
-                    out.push('\n');
-                }
-                out.push('}');
-                if !after.is_empty() {
-                    let after = strip_i0_import_line(&crate::output::emitter::emit_statements(&after));
-                    out.push('\n');
-                    out.push_str(after.trim_end_matches('\n'));
-                }
-                out.push('\n');
-            } else {
             push_slice_excising_spans(&mut out, source, dec_end..stmt_end, &member_strips);
             // Statics: emitted via the shared lowering, then spliced in WITHOUT the leading
             // `import * as i0` line (added once at module scope below).
-            let statics = {
-                let mut stmts = parts.hoisted;
-                stmts.extend(parts.members.into_iter().map(|(member, value)| {
-                    o::variable(&parts.class_name, None).prop(member).set(value).to_stmt()
-                }));
-                stmts.extend(parts.after);
-                stmts
-            };
+            let statics = class_static_statements(emit);
             let block = crate::output::emitter::emit_statements(&statics);
             let block = strip_i0_import_line(&block);
             if !out.ends_with('\n') {
@@ -2323,7 +2061,6 @@ fn assemble_module(
             }
             out.push_str(block.trim_end_matches('\n'));
             out.push('\n');
-            }
             // PARTIAL mode: emit the dev-only `i0.ɵɵngDeclareClassMetadata({…})` companion statement
             // AFTER the class statics (matching ng-packagr). Built from the ORIGINAL class + source so
             // the decorator args / ctor-param decorators are carried verbatim. The Full emit path never
@@ -2393,31 +2130,6 @@ fn is_import_declaration_text(text: &str) -> bool {
 
 /// Strip the single leading `import * as i0 from "@angular/core";` line `emit_statements` prepends,
 /// leaving just the statement bodies (the module-scope import is emitted once by [`assemble_module`]).
-/// The source of `static <member> = <value>;` for a class body. The assignment is printed by the shared
-/// statement emitter (the same printer the assignment shape uses) and its `X.<member> = ` head is replaced, so
-/// the value text is identical in both shapes.
-fn static_member_text(class_name: &str, member: &str, value: Expr) -> String {
-    let stmt = o::variable(class_name, None).prop(member).set(value).to_stmt();
-    let block = strip_i0_import_line(&crate::output::emitter::emit_statements(&[stmt]));
-    let block = block.trim();
-    let head = format!("{class_name}.{member} = ");
-    let body = block
-        .strip_prefix(&head)
-        .unwrap_or_else(|| panic!("definition statement does not start with `{head}`: {block}"));
-    let body = body.strip_suffix(';').unwrap_or(body);
-    format!("static {member} = {body};")
-}
-
-/// `X.ɵ<name> = value` as a `(member, value)` pair when `stmt` is exactly that assignment on the class
-/// `class_name`; `None` for any other statement.
-fn class_static_assignment(stmt: &o::Stmt, class_name: &str) -> Option<(String, Expr)> {
-    let o::StmtKind::Expression(expr) = &stmt.kind else { return None };
-    let o::ExprKind::Binary { op: o::BinaryOperator::Assign, lhs, rhs } = &expr.kind else { return None };
-    let o::ExprKind::ReadProp { receiver, name, .. } = &lhs.kind else { return None };
-    let o::ExprKind::ReadVar { name: receiver_name } = &receiver.kind else { return None };
-    (receiver_name == class_name && name.starts_with('\u{0275}')).then(|| (name.clone(), rhs.as_ref().clone()))
-}
-
 fn strip_i0_import_line(block: &str) -> String {
     let lines = block.lines();
     if let Some(first) = lines.clone().next() {
@@ -2448,30 +2160,8 @@ fn compile_program_with_source(
     jit_mode: bool,
     selector_registry: Option<&SelectorRegistry>,
     emit_partial_component: bool,
-    class_shape: ClassShape,
 ) -> CompiledComponent {
-    // Same-file constants in decorator metadata are folded first (see `const_fold`), so every reader below
-    // sees the literal the author's identifier stands for.
-    let folded;
-    let summary = match source {
-        Some(src) => {
-            folded = const_fold::fold_same_file_consts(summary, src);
-            &folded
-        }
-        None => summary,
-    };
     let imported_names = collect_imported_names(summary);
-
-    // The ng-analyze facts for this source (feature `ng-analyze`; `NgFacts::Off` otherwise).
-    let (ng_classes, ng_file_error) = match source {
-        Some(src) => facts_emit::bridge_facts(src, summary, resolved),
-        None => (None, None),
-    };
-    let ng = match (&ng_classes, &ng_file_error) {
-        (Some(classes), _) => NgFacts::Classes(classes),
-        (None, Some(e)) => NgFacts::FileError(e),
-        (None, None) => NgFacts::Off,
-    };
 
     // Walk every decorated class in SOURCE ORDER. R1: collect EVERY decorated class (not just the
     // first) so multi-class files emit each definition.
@@ -2561,7 +2251,6 @@ fn compile_program_with_source(
             jit_mode,
             &module_with_providers,
             emit_partial_component,
-            &ng,
         ) {
             Ok(emit) => {
                 errors.extend(emit.errors.clone());
@@ -2618,7 +2307,7 @@ fn compile_program_with_source(
         None
     };
 
-    let code = assemble_module(source, summary, emits, emit_partial_component, class_shape);
+    let code = assemble_module(source, summary, emits, emit_partial_component);
 
     if let Some((ctx, map_out)) = map {
         if let Some((def_expr, member)) = single_def {
@@ -2957,35 +2646,6 @@ fn is_forward_ref_call(expr: &NExpr) -> bool {
 
 /// Whether a standalone `@Component({imports: [...]})` array carries any `forwardRef(() => X)` entry.
 ///
-/// The member name of a `ChangeDetectionStrategy.X` expression (`X`), `None` for any other form. A bare
-/// identifier or a non-member value is not read, so it counts as "no explicit strategy" (as it always has).
-fn member_name(e: &NExpr) -> Option<&str> {
-    match e {
-        NExpr::Member { property, .. } => Some(property.as_str()),
-        _ => None,
-    }
-}
-
-/// Treaty's `changeDetection` convention, shared by the source front-end and the ng-analyze facts path so
-/// both give the same strategy for a class. OnPush by default, and this deliberately diverges from
-/// Angular's `render3/view/compiler.ts` (see the emit rule in `decorators/src/compiler.rs`):
-///   * an explicit `ChangeDetectionStrategy.OnPush` -> OnPush (emitted as `changeDetection: 0`);
-///   * an explicit `ChangeDetectionStrategy.Eager` -> Eager (emitted as `changeDetection: 1`), whatever the
-///     `modernize.on_push` flag says;
-///   * an explicit legacy `Default` (or any other member) -> Default (omitted; the runtime reads it as OnPush),
-///     whatever the flag says;
-///   * no explicit strategy -> Default (omitted), or OnPush under the `modernize.on_push` opt-in.
-/// `explicit` is the member written in source (`None` when absent or not a member expression).
-fn change_detection_strategy(explicit: Option<&str>, on_push: bool) -> ChangeDetection {
-    match explicit {
-        Some("OnPush") => ChangeDetection::Strategy(ChangeDetectionStrategy::OnPush),
-        Some("Eager") => ChangeDetection::Eager,
-        Some(_) => ChangeDetection::Strategy(ChangeDetectionStrategy::Default),
-        None if on_push => ChangeDetection::Strategy(ChangeDetectionStrategy::OnPush),
-        None => ChangeDetection::Strategy(ChangeDetectionStrategy::Default),
-    }
-}
-
 /// Angular's component handler wraps a standalone component's `dependencies` array in a `() => [...]`
 /// closure (`DeclarationListEmitMode.Closure`) whenever any resolved import may be forward-declared.
 /// It cannot tell directly whether a `Reference` came through a `forwardRef`, so it flags the
@@ -3033,25 +2693,20 @@ fn parse_injectable_deps(expr: &NExpr) -> Result<Vec<R3DependencyMetadata>, Stri
 
 /// Parse a single `@Injectable` `deps` entry into [`R3DependencyMetadata`].
 fn parse_injectable_dep(expr: &NExpr) -> Result<R3DependencyMetadata, String> {
-    // `[token, ...qualifier-markers]`, with the markers in ANY position: `[new Optional(), Dep]` and
-    // `[Dep, new Optional()]` are the same dependency (ngtsc reads each element by its shape, not by its
-    // index; see `usefactory_with_deps.ts`). The first element that is not a marker is the token.
+    // `[token, ...qualifier-markers]`.
     if let NExpr::Array(elements) = expr {
-        let mut token: Option<R3DependencyMetadata> = None;
-        let mut markers: Vec<&NExpr> = Vec::new();
+        let mut dep = R3DependencyMetadata::default();
+        let mut first = true;
         for el in elements {
             let crate::parse::NArrayElement::Expr(inner) = el else {
                 continue;
             };
-            if is_injectable_dep_marker(inner) {
-                markers.push(inner);
-            } else if token.is_none() {
-                token = Some(injectable_dep_token(inner)?);
+            if first {
+                dep = injectable_dep_token(inner)?;
+                first = false;
+                continue;
             }
-        }
-        let mut dep = token.ok_or_else(|| "`deps` entry has no token".to_string())?;
-        for marker in markers {
-            apply_injectable_dep_marker(marker, &mut dep);
+            apply_injectable_dep_marker(inner, &mut dep);
         }
         return Ok(dep);
     }
@@ -3081,13 +2736,6 @@ fn injectable_dep_token(expr: &NExpr) -> Result<R3DependencyMetadata, String> {
         token: Some(token),
         ..Default::default()
     })
-}
-
-/// Whether an `@Injectable` `deps` element is a qualifier marker (`new Optional()`, `new Self()`,
-/// `new SkipSelf()`, `new Host()`) rather than the token.
-fn is_injectable_dep_marker(expr: &NExpr) -> bool {
-    matches!(expr, NExpr::New { callee, .. }
-        if ["Optional", "Self", "SkipSelf", "Host"].iter().any(|name| new_callee_is(callee, name)))
 }
 
 /// Apply a trailing `@Injectable` `deps` qualifier marker (`new Optional()`/`new Self()`/
@@ -3147,7 +2795,6 @@ fn compile_decorated_class(
     jit_mode: bool,
     module_with_providers: &std::collections::HashMap<String, String>,
     emit_partial_component: bool,
-    ng: &NgFacts,
 ) -> Result<ClassEmit, String> {
     let (class_name, class_name_span) = match &class.name {
         // The neutral `ClassWithDecorators::name_span` is the class NAME identifier's byte span — the
@@ -3198,43 +2845,6 @@ fn compile_decorated_class(
     let has_injectable = class_decorator(class, "Injectable").is_some();
     if has_pipe && has_injectable {
         return compile_pipe_and_injectable(class, &meta);
-    }
-
-    // The ng-analyze facts path (feature `ng-analyze`): a component or directive whose facts the bridge
-    // supplies is compiled from them, through the same emit tail. Anything else falls through to the
-    // Treaty extraction below, and each fallback is counted by reason.
-    if matches!(kind, TopLevel::Component | TopLevel::Directive) {
-        match ng {
-            NgFacts::Off => {}
-            NgFacts::FileError(reason) => {
-                facts_emit::record_fallback(&format!("ng-analyze file error: {reason}"));
-            }
-            NgFacts::Classes(list) => match facts_emit::facts_for_class(list, class.span.start as usize) {
-                None => facts_emit::record_fallback("ng-analyze: no facts for the class"),
-                Some(facts) => {
-                    let resolved = resolved_content.and_then(|m| m.get(&meta.class_name));
-                    match facts_emit::facts_directive_extract(facts, kind, object, resolved, default_selector, modernize) {
-                        Ok(extract) => {
-                            facts_emit::record_hit();
-                            return directive_emit(
-                                extract,
-                                class,
-                                kind,
-                                meta.class_name.clone(),
-                                meta.class_name_span.clone(),
-                                auto_import_candidates,
-                                sibling_directives,
-                                legacy_optional_chaining,
-                                modernize,
-                                class_decl_positions,
-                                emit_partial_component,
-                            );
-                        }
-                        Err(reason) => facts_emit::record_fallback(&format!("facts: {reason}")),
-                    }
-                }
-            },
-        }
     }
 
     let kind = AngularDecoratorKind::from(kind);
@@ -3296,52 +2906,30 @@ fn compile_pipe_and_injectable(
         errors: pipe_emit.errors,
     })
 }
-/// The metadata ONE `@Component` / `@Directive` class contributes, extracted from its decorator object
-/// and class members. Two extractors produce it with this one shape: [`treaty_directive_extract`] (Treaty's
-/// own walk over the parse IR, the default) and, with the `ng-analyze` feature, the bridge's facts. The
-/// shared emit tail, [`directive_emit`], consumes either.
-struct DirectiveExtract {
-    selector: Option<String>,
-    /// The template HTML (inline `template:`, or the host-resolved `templateUrl` content). `None` for a
-    /// directive.
-    template_html: Option<String>,
-    /// Whether the template is an INLINE `template:` string (vs an external `templateUrl`).
-    inline_template_is_some: bool,
-    standalone: bool,
-    change_detection: ChangeDetection,
-    styles: Vec<String>,
-    encapsulation: ViewEncapsulation,
-    animations: Option<Expr>,
-    foreign_imports: Option<Vec<R3ForeignComponentMetadata>>,
-    view_providers: Option<Expr>,
-    preserve_whitespaces: Option<bool>,
-    host: R3HostMetadata,
-    host_directives: Option<Vec<R3HostDirectiveMetadata>>,
-    export_as: Option<Vec<String>>,
-    providers: Option<Expr>,
-    inputs: OrderedMap<String, R3InputMetadata>,
-    outputs: OrderedMap<String, String>,
-    content_queries: Vec<R3QueryMetadata>,
-    view_queries: Vec<R3QueryMetadata>,
-    is_signal: bool,
-    uses_on_changes: bool,
-    /// `imports:` carries a `forwardRef(() => …)` (closure-wraps the component's dependencies).
-    import_has_forward_ref: bool,
-    /// The constructor dependencies the factory injects.
-    ctor_deps: FactoryDeps,
-}
-
-/// Treaty's own extraction for a `@Component` / `@Directive` (the default path). Reads the decorator
-/// object and the class members through the parse IR and the existing helpers, in the same order as
-/// always, so the first error reported is unchanged.
-fn treaty_directive_extract(
+/// Compile a `@Component` or `@Directive` class. Shares the common metadata extraction (selector,
+/// inputs/outputs, queries, host bindings, `hostDirectives`, `exportAs`) and then routes to the
+/// component emitter (`compile_component_from_metadata`, with template) or the directive emitter
+/// (`compile_directive_from_metadata`, no template).
+#[allow(clippy::too_many_arguments)]
+fn compile_component_or_directive(
     class: &ClassWithDecorators,
     kind: TopLevel,
     obj: Option<&ObjLit>,
-    resolved: Option<&crate::decorators::registry::ResolvedComponentContent>,
+    class_name: String,
+    class_name_span: ParseSourceSpan,
+    auto_import_candidates: &[String],
+    sibling_directives: &[crate::binder::SelectorDirective],
+    resolved_content: Option<&ResolvedContentMap>,
     default_selector: Option<&str>,
+    legacy_optional_chaining: bool,
     modernize: ModernizeOptions,
-) -> Result<DirectiveExtract, String> {
+    class_decl_positions: &std::collections::HashMap<String, u32>,
+    emit_partial_component: bool,
+) -> Result<ClassEmit, String> {
+    // The host-resolved external content for THIS class (keyed by class name), if the caller wired
+    // the resolution channel and supplied an entry. Used to back `templateUrl`/`styleUrls`.
+    let resolved = resolved_content.and_then(|m| m.get(&class_name));
+
     // Reject decorator-level metadata we cannot yet model.
     if let Some(obj) = obj {
         for k in UNSUPPORTED_DECORATOR_KEYS {
@@ -3354,12 +2942,12 @@ fn treaty_directive_extract(
     // selector.
     //
     // A `@Component` that declares its own `selector` keeps it verbatim. A SELECTORLESS `@Component`
-    // (no `selector` key) adopts `default_selector` when the caller supplied one — the Treaty convention's
-    // filename-derived kebab tag — so a bootstrapped selectorless `.ts` component renders a real host
-    // element instead of Angular's `ng-component` no-selector default. The fallback applies ONLY to a
-    // component (`default_selector` is threaded as `None` for the `@Directive` path, and for the
-    // golden-corpus / inline compile entries), so a selectorless directive and the golden corpus emit
-    // byte-identically (`selector: None`).
+    // (no `selector` key) adopts `default_selector` when the caller supplied one — the Treaty
+    // convention's filename-derived kebab tag — so a bootstrapped selectorless `.ts` component
+    // renders a real host element instead of Angular's `ng-component` no-selector default. The
+    // fallback applies ONLY to a component (`default_selector` is threaded as `None` for the
+    // `@Directive` path, and for the golden-corpus / inline compile entries), so a selectorless
+    // directive and the golden corpus emit byte-identically (`selector: None`).
     let selector = obj
         .and_then(|o| find_prop(o, "selector"))
         .and_then(string_value)
@@ -3376,8 +2964,12 @@ fn treaty_directive_extract(
     //     for this class — file reading is the bundler's job (rust-core / ts-shim boundary). When a
     //     `templateUrl` is declared but no resolved template was supplied, this is a clear error (NOT
     //     a silent empty template).
-    let has_template_url = obj.and_then(|o| find_prop(o, "templateUrl")).is_some();
-    let inline_template = obj.and_then(|o| find_prop(o, "template")).and_then(string_value);
+    let has_template_url = obj
+        .and_then(|o| find_prop(o, "templateUrl"))
+        .is_some();
+    let inline_template = obj
+        .and_then(|o| find_prop(o, "template"))
+        .and_then(string_value);
     // Whether the template is an INLINE `template:` string (vs an external `templateUrl` whose
     // resolved content backs `template_html`). Used by the partial emit to decide `isInline`.
     let inline_template_is_some = inline_template.is_some();
@@ -3408,11 +3000,26 @@ fn treaty_directive_extract(
         .map(|e| matches!(e, NExpr::Boolean(b) if *b))
         .unwrap_or(true);
 
-    // changeDetection: Treaty's OnPush-by-default convention (see `change_detection_strategy`).
-    let change_detection = change_detection_strategy(
-        obj.and_then(|o| find_prop(o, "changeDetection")).and_then(member_name),
-        modernize.on_push,
-    );
+    // changeDetection (OnPush vs Default). Angular's runtime default is `Default`, which is
+    // OMITTED from the emitted definition; an explicit `OnPush` emits `changeDetection: 0`.
+    // So when the source `@Component` has no `changeDetection` property we default to `Default`
+    // (omitted) — matching the golden — and only emit `OnPush` when the source EXPLICITLY declares
+    // it, OR the opt-in `modernize.on_push` flag (the signals-by-default design) is set.
+    let change_detection = obj
+        .and_then(|o| find_prop(o, "changeDetection"))
+        .and_then(|e| match e {
+            NExpr::Member { property, .. } => Some(property.as_str()),
+            _ => None,
+        })
+        .map(|name| match name {
+            "OnPush" => ChangeDetectionStrategy::OnPush,
+            _ => ChangeDetectionStrategy::Default,
+        })
+        .unwrap_or(if modernize.on_push {
+            ChangeDetectionStrategy::OnPush
+        } else {
+            ChangeDetectionStrategy::Default
+        });
 
     // styles: ['...', ...] — inline component styles. Threaded into the definition `styles:[...]`
     // array (and, for emulated encapsulation, scoped) by the emitter. The HOST-RESOLVED `styleUrls`/
@@ -3453,7 +3060,10 @@ fn treaty_directive_extract(
 
     // R2: host bindings — the `host: {...}` object merged with `@HostBinding`/`@HostListener`
     // members, parsed into the `R3HostMetadata` the `DefaultHostBindingsBuilder` consumes.
-    let host = build_host_metadata(obj.and_then(|o| find_prop(o, "host")), class)?;
+    let host = match build_host_metadata(obj.and_then(|o| find_prop(o, "host")), class) {
+        Ok(host) => host,
+        Err(e) => return Err(e),
+    };
 
     // R2: hostDirectives -> HostDirectivesFeature.
     let host_directives = obj
@@ -3494,8 +3104,9 @@ fn treaty_directive_extract(
     // inputs / outputs.
     let mut inputs: OrderedMap<String, R3InputMetadata> = OrderedMap::new();
     let mut outputs: OrderedMap<String, String> = OrderedMap::new();
-    collect_decorator_io_arrays(obj, &mut inputs, &mut outputs, modernize)?;
-    collect_io(class, &mut inputs, &mut outputs, modernize)?;
+    if let Err(e) = collect_io(class, &mut inputs, &mut outputs, modernize) {
+        return Err(e);
+    }
 
     // Queries: signal-based member initializers (`viewChild`/…) AND R3 decorator members
     // (`@ViewChild`/…). Both feed the SAME `R3QueryMetadata` lists. Angular emits single-result
@@ -3507,133 +3118,21 @@ fn treaty_directive_extract(
     order_queries_for_emit(&mut content_queries);
     order_queries_for_emit(&mut view_queries);
 
-    // `signals: true` comes from the EXPLICIT decorator option only. ngtsc reads the `signals` flag of
-    // the decorator and nothing else (`ngtsc/annotations/directive/src/shared.ts`, `let isSignal = false;`
-    // then `isSignal = resolved` from `directive.get('signals')`), and the compiler emits the definition's
-    // `signals: true` only from `meta.isSignal` (`render3/view/compiler.ts`). A signal input or signal query
-    // does NOT set it: no golden with a signal input and no explicit option carries `signals: true`
-    // (`components_and_directives/signals/*.js` are the only goldens that do, and they set it explicitly).
-    let is_signal = obj
+    let has_signal_query = content_queries
+        .iter()
+        .chain(view_queries.iter())
+        .any(|q| q.is_signal);
+    // `signals: true` may be declared EXPLICITLY in the decorator metadata even when the
+    // class has no signal inputs/queries (Angular's signal-component opt-in). Read it as a
+    // boolean literal and OR it with the member-derived signal detection so an explicit
+    // `signals: true` forces the `signals:true` field on, and signal inputs/queries still
+    // force it on without the decorator flag.
+    let explicit_signals = obj
         .and_then(|o| find_prop(o, "signals"))
-        .map(|e| matches!(e, NExpr::Boolean(true)))
+        .map(|e| matches!(e, NExpr::Boolean(b) if *b))
         .unwrap_or(false);
-
-    let preserve_whitespaces = obj
-        .and_then(|o| find_prop(o, "preserveWhitespaces"))
-        .and_then(|e| match e {
-            NExpr::Boolean(b) => Some(*b),
-            _ => None,
-        });
-
-    // Closure-wrap inputs: a literal `forwardRef(() => …)` in this standalone component's
-    // `imports:` array (see `compile_component_meta` for the decision).
-    let import_has_forward_ref = imports_has_forward_ref(obj);
-
-    Ok(DirectiveExtract {
-        selector,
-        template_html,
-        inline_template_is_some,
-        standalone,
-        change_detection,
-        styles,
-        encapsulation,
-        animations,
-        foreign_imports,
-        view_providers,
-        preserve_whitespaces,
-        host,
-        host_directives,
-        export_as,
-        providers,
-        inputs,
-        outputs,
-        content_queries,
-        view_queries,
-        is_signal,
-        uses_on_changes: class_uses_on_changes(class),
-        import_has_forward_ref,
-        ctor_deps: extract_ctor_deps(class),
-    })
-}
-
-/// Compiles one `@Component` / `@Directive` class through Treaty's own extraction, then the shared emit
-/// tail. Its behaviour is the pre-refactor inline code, unchanged.
-#[allow(clippy::too_many_arguments)]
-fn compile_component_or_directive(
-    class: &ClassWithDecorators,
-    kind: TopLevel,
-    obj: Option<&ObjLit>,
-    class_name: String,
-    class_name_span: ParseSourceSpan,
-    auto_import_candidates: &[String],
-    sibling_directives: &[crate::binder::SelectorDirective],
-    resolved_content: Option<&ResolvedContentMap>,
-    default_selector: Option<&str>,
-    legacy_optional_chaining: bool,
-    modernize: ModernizeOptions,
-    class_decl_positions: &std::collections::HashMap<String, u32>,
-    emit_partial_component: bool,
-) -> Result<ClassEmit, String> {
-    // The host-resolved external content for THIS class (keyed by class name), if the caller wired
-    // the resolution channel and supplied an entry. Used to back `templateUrl`/`styleUrls`.
-    let resolved = resolved_content.and_then(|m| m.get(&class_name));
-    let extract = treaty_directive_extract(class, kind, obj, resolved, default_selector, modernize)?;
-    directive_emit(
-        extract,
-        class,
-        kind,
-        class_name,
-        class_name_span,
-        auto_import_candidates,
-        sibling_directives,
-        legacy_optional_chaining,
-        modernize,
-        class_decl_positions,
-        emit_partial_component,
-    )
-}
-
-/// The shared emit tail of a `@Component` / `@Directive`: builds the base directive metadata from an
-/// extraction and drives the component or directive emitter (full or partial).
-#[allow(clippy::too_many_arguments)]
-fn directive_emit(
-    extract: DirectiveExtract,
-    class: &ClassWithDecorators,
-    kind: TopLevel,
-    class_name: String,
-    class_name_span: ParseSourceSpan,
-    auto_import_candidates: &[String],
-    sibling_directives: &[crate::binder::SelectorDirective],
-    legacy_optional_chaining: bool,
-    modernize: ModernizeOptions,
-    class_decl_positions: &std::collections::HashMap<String, u32>,
-    emit_partial_component: bool,
-) -> Result<ClassEmit, String> {
-    let DirectiveExtract {
-        selector,
-        template_html,
-        inline_template_is_some,
-        standalone,
-        change_detection,
-        styles,
-        encapsulation,
-        animations,
-        foreign_imports,
-        view_providers,
-        preserve_whitespaces,
-        host,
-        host_directives,
-        export_as,
-        providers,
-        inputs,
-        outputs,
-        content_queries,
-        view_queries,
-        is_signal,
-        uses_on_changes,
-        import_has_forward_ref,
-        ctor_deps,
-    } = extract;
+    let is_signal =
+        explicit_signals || inputs.iter().any(|(_, m)| m.is_signal) || has_signal_query;
 
     // Build the base directive metadata. The class-name reference carries the original
     // class-id span so the additive source map can anchor the emitted `type: <ClassName>`
@@ -3649,7 +3148,9 @@ fn directive_emit(
         queries: content_queries,
         view_queries,
         host,
-        lifecycle: Lifecycle { uses_on_changes },
+        lifecycle: Lifecycle {
+            uses_on_changes: class_uses_on_changes(class),
+        },
         inputs,
         outputs,
         uses_inheritance: false,
@@ -3672,11 +3173,17 @@ fn directive_emit(
                 .filter(|d| d.name != class_name)
                 .cloned()
                 .collect();
-            let factory = class_factory_from_deps(&class_name, ctor_deps.clone(), FactoryTarget::Component);
+            let factory = class_factory(class, &class_name, FactoryTarget::Component);
             // PARTIAL mode: emit `ɵɵngDeclareComponent` from the metadata + the ORIGINAL template
             // string (no instruction lowering / decompilation). The DI-family `ɵfac` is still emitted
             // as AOT here and inverted to `ɵɵngDeclareFactory` by the caller's `emit_partial` pass.
             if emit_partial_component {
+                let preserve_whitespaces = obj
+                    .and_then(|o| find_prop(o, "preserveWhitespaces"))
+                    .and_then(|e| match e {
+                        NExpr::Boolean(b) => Some(*b),
+                        _ => None,
+                    });
                 return compile_component_meta_partial(
                     base,
                     &template_html.unwrap_or_default(),
@@ -3695,8 +3202,10 @@ fn directive_emit(
                     factory,
                 );
             }
-            // `own_position` detects a dependency class declared LATER in the file (see
-            // `compile_component_meta`).
+            // Closure-wrap inputs: a literal `forwardRef(() => …)` in this standalone component's
+            // `imports:` array, and the component's own source position (used to detect a dependency
+            // class declared LATER in the file). See `compile_component_meta` for the decision.
+            let import_has_forward_ref = imports_has_forward_ref(obj);
             let own_position = class.span.start;
             compile_component_meta(
                 base,
@@ -3727,10 +3236,8 @@ fn directive_emit(
                 animations,
                 foreign_imports,
                 view_providers,
-                import_has_forward_ref,
-                class_decl_positions,
             );
-            let factory = class_factory_from_deps(&class_name, ctor_deps, FactoryTarget::Directive);
+            let factory = class_factory(class, &class_name, FactoryTarget::Directive);
             // PARTIAL mode: emit `ɵɵngDeclareDirective` from the directive base (no template / view
             // metadata). The `ɵfac` is inverted to `ɵɵngDeclareFactory` by the caller's `emit_partial`.
             if emit_partial_component {
@@ -4110,11 +3617,146 @@ fn resolve_module_with_providers_imports(
         None
     }
 }
+/// A [`TemplateBuilder`] that recognises foreign-component usages and emits a creation-time
+/// `ɵɵforeignComponent` instruction for them, delegating everything else to the classic
+/// [`RealTemplateBuilder`].
+///
+/// Angular's pipeline (`ingest.ts` `ingestElement` → `reify.ts` `OpKind.ForeignComponent`)
+/// short-circuits a matched foreign element to a single creation op:
+///   `ɵɵforeignComponent(slot, foreignComponentRef, { …props })`
+/// with NO update block (foreign components react to directly-passed signal props), so the view
+/// has `vars: 0` and no per-element attribute `consts`. The instruction args are
+/// `[literal(slot), component, props?]`; `props` is a `literalMap` of the element's static
+/// attributes (string-literal values) followed by its bound inputs (converted against `ctx`),
+/// each key quoted iff it contains `-`/`.` (Angular's `isUnsafeObjectKey`). We only take this
+/// path when the WHOLE template is exactly one such matched element (the shape Angular's
+/// `foreignImports` corpus exercises); any other template falls through to the real builder
+/// untouched, so nothing else can regress.
+#[derive(Debug, Default)]
+struct ForeignAwareTemplateBuilder {
+    inner: RealTemplateBuilder,
+}
+
+impl ForeignAwareTemplateBuilder {
+    /// If `meta`'s template is a single element matching one of the component's `foreignImports`,
+    /// build the `ɵɵforeignComponent` template-function result. Returns `None` otherwise.
+    fn try_foreign<D: R3TemplateDependency>(
+        meta: &R3ComponentMetadata<D>,
+    ) -> Option<TemplateBuilderResult> {
+        let foreign = meta.foreign_imports.as_ref()?;
+        if foreign.is_empty() {
+            return None;
+        }
+
+        // Exactly one significant template node (ignore inter-element whitespace text), and it must
+        // be a plain element whose tag matches a foreign import by name.
+        let element = sole_element(&meta.template.nodes)?;
+        let matched = foreign.iter().find(|f| f.name == element.name)?;
+
+        // Build the `{ …attrs, …inputs }` props literal map (or `None` when empty), faithfully
+        // mirroring `ingestElement`'s foreign-component branch: static attributes first (in source
+        // order) then bound inputs (in source order).
+        let mut props: Vec<(String, bool, Expr)> = Vec::new();
+        for attr in &element.attributes {
+            props.push((
+                attr.name.clone(),
+                is_unsafe_object_key(&attr.name),
+                o::literal(LiteralValue::String(attr.value.clone()), None),
+            ));
+        }
+        for input in &element.inputs {
+            let converted = crate::expression_converter::convert_property_binding(
+                &input.value,
+                o::variable("ctx", None),
+                "0",
+            );
+            props.push((
+                input.name.clone(),
+                is_unsafe_object_key(&input.name),
+                converted.expr,
+            ));
+        }
+
+        // `ɵɵforeignComponent(0, <component>, { …props })` in the creation block.
+        let mut args = vec![
+            o::literal(LiteralValue::Number(0.0), None),
+            matched.component.clone(),
+        ];
+        if !props.is_empty() {
+            args.push(o::literal_map(props, None));
+        }
+        let create_stmt = o::import_expr(R3::ForeignComponent.reference(), None)
+            .call_fn(args, false)
+            .to_stmt();
+
+        // `function <Name>_Template(rf, ctx) { if (rf & 1) { …create } }` — no update block.
+        let cond = o::variable("rf", None).bitwise_and(o::literal(LiteralValue::Number(1.0), None));
+        let body = vec![o::if_stmt(cond, vec![create_stmt], None)];
+        let template_fn = o::fn_(
+            vec![FnParam::new("rf", None), FnParam::new("ctx", None)],
+            body,
+            None,
+            Some(format!("{}_Template", meta.base.name)),
+        );
+
+        Some(TemplateBuilderResult {
+            template_fn,
+            // One data slot for the foreign component; no binding vars; no element consts.
+            decls: 1,
+            vars: 0,
+            consts: Vec::new(),
+            consts_initializers: Vec::new(),
+            content_selectors: None,
+            pool_statements: Vec::new(),
+        })
+    }
+}
+
+impl TemplateBuilder for ForeignAwareTemplateBuilder {
+    fn build<D: R3TemplateDependency>(
+        &mut self,
+        meta: &R3ComponentMetadata<D>,
+        all_deferrable_deps_fn: Option<&Expr>,
+        deferred_deps: &std::collections::HashMap<(u32, u32), Expr>,
+    ) -> TemplateBuilderResult {
+        if let Some(result) = Self::try_foreign(meta) {
+            return result;
+        }
+        self.inner.build(meta, all_deferrable_deps_fn, deferred_deps)
+    }
+}
+
+/// Angular's `isUnsafeObjectKey` (`render3/util.ts`): an object-literal key must be quoted iff it
+/// contains a `-` or `.` (otherwise it is a bare JS identifier).
+fn is_unsafe_object_key(key: &str) -> bool {
+    key.contains('-') || key.contains('.')
+}
+
+/// The sole significant element of a template node list, ignoring whitespace-only text nodes.
+/// Returns `None` if there is not exactly one element (or any non-text sibling is present).
+fn sole_element(nodes: &[crate::template::r3_ast::Node]) -> Option<&crate::template::r3_ast::Element> {
+    use crate::template::r3_ast::Node;
+    let mut found: Option<&crate::template::r3_ast::Element> = None;
+    for node in nodes {
+        match node {
+            Node::Text(t) if t.value.trim().is_empty() => {}
+            Node::Element(el) => {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(el);
+            }
+            _ => return None,
+        }
+    }
+    found
+}
+
 #[allow(clippy::too_many_arguments)]
 fn compile_component_meta(
     base: R3DirectiveMetadata,
     template_html: &str,
-    change_detection: ChangeDetection,
+    change_detection: ChangeDetectionStrategy,
     imported_names: &[String],
     selector_candidates: &[crate::binder::SelectorDirective],
     styles: Vec<String>,
@@ -4292,7 +3934,7 @@ fn compile_component_meta(
         view_providers,
         relative_context_file_path: String::new(),
         i18n_use_external_ids: false,
-        change_detection: Some(change_detection),
+        change_detection: Some(ChangeDetection::Strategy(change_detection)),
         relative_template_path: None,
         has_directive_dependencies,
         raw_imports: None,
@@ -4304,7 +3946,7 @@ fn compile_component_meta(
         imported_directive_names: imported_names.to_vec(),
     };
 
-    let mut template_builder = RealTemplateBuilder;
+    let mut template_builder = ForeignAwareTemplateBuilder::default();
     // R2: the production host-bindings generator (was `StubHostBindingsBuilder`). For a component
     // with no host bindings it is a no-op (emits no `hostBindings`/`hostAttrs`/`hostVars`), so this
     // is byte-identical to the stub for the existing no-host cases.
@@ -4347,7 +3989,7 @@ fn compile_component_meta_partial(
     base: R3DirectiveMetadata,
     template_html: &str,
     is_inline: bool,
-    change_detection: ChangeDetection,
+    change_detection: ChangeDetectionStrategy,
     encapsulation: ViewEncapsulation,
     imported_names: &[String],
     selector_candidates: &[crate::binder::SelectorDirective],
@@ -4494,163 +4136,6 @@ AuthService.\u{0275}prov = i0.\u{0275}\u{0275}defineInjectable({
     /// Collapse all runs of ASCII whitespace (incl. the emitter's tabs/newlines used to
     /// pretty-print object/array literals) to a single space so multi-line emitted code can be
     /// matched against the single-line golden `features:` excerpts.
-    // ---- Part 2 (Angular-parity fixes): decorator io arrays, member @Input+@Output, explicit signals,
-    // same-file constants, expression host values, marker-first deps, DOM host property names, `new`.
-
-    #[test]
-    fn decorator_inputs_and_outputs_arrays_are_read() {
-        // ngtsc reads `inputs`/`outputs` on the decorator (`parseInputsArray` / `parseOutputsArray`).
-        let src = r#"@Directive({selector:"[a]", standalone:false, inputs:['foo', 'bar: baz', {name:'qux', alias:'quxAlias', required:true}], outputs:['evt', 'o2: pub']}) export class D {}"#;
-        let out = compile_component_source(src);
-        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
-        let flat = normalize_ws(&out.code);
-        assert!(flat.contains("inputs: { foo: \"foo\", bar: [ 0, \"baz\", \"bar\" ], qux: [ 0, \"quxAlias\", \"qux\" ] }"), "decorator inputs; got: {flat}");
-        assert!(flat.contains("outputs: { evt: \"evt\", o2: \"pub\" }"), "decorator outputs; got: {flat}");
-    }
-
-    #[test]
-    fn decorator_inputs_array_is_overridden_by_a_member_of_the_same_name() {
-        // `{...inputsFromMeta, ...inputsFromFields}`: the member wins for the same property.
-        let src = r#"@Directive({selector:"[a]", standalone:false, inputs:['foo: fromArray']}) export class D { @Input('fromMember') foo = 1; }"#;
-        let out = compile_component_source(src);
-        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
-        let flat = normalize_ws(&out.code);
-        assert!(flat.contains("inputs: { foo: [ 0, \"fromMember\", \"foo\" ] }"), "member should override; got: {flat}");
-    }
-
-    #[test]
-    fn member_with_input_and_output_keeps_both() {
-        // ngtsc registers a member's @Input and its @Output independently (`parseInputFields` and
-        // `parseOutputFields` each read every member). Treaty used to `continue` after the input.
-        let src = r#"@Component({selector:"a",standalone:false,template:""}) export class C { @Input() @Output() mixed = 1; }"#;
-        let out = compile_component_source(src);
-        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
-        let flat = normalize_ws(&out.code);
-        assert!(flat.contains("inputs: { mixed: \"mixed\" }"), "missing input; got: {flat}");
-        assert!(flat.contains("outputs: { mixed: \"mixed\" }"), "missing output; got: {flat}");
-    }
-
-    #[test]
-    fn signal_input_does_not_set_the_signals_flag_without_the_option() {
-        // ngtsc's `isSignal` is the explicit `signals` option only (`directive/src/shared.ts`), and the compiler
-        // emits `signals: true` only from it. A hand-written `input()` therefore emits no flag.
-        let src = r#"@Component({selector:"a",standalone:false,template:""}) export class C { x = input(); }"#;
-        let out = compile_component_source(src);
-        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
-        assert!(!out.code.contains("signals: true"), "implicit signals flag; got: {}", out.code);
-        assert!(out.code.contains("i0.\u{0275}\u{0275}defineComponent"), "missing definition; got: {}", out.code);
-    }
-
-    #[test]
-    fn same_file_string_constants_are_folded_into_decorator_metadata() {
-        // A const template, a concatenation, a template literal with substitutions, and const styles entries.
-        let src = r#"const GREET = 'Hi'; const TPL = `<b>${GREET}</b>` + "!"; @Component({selector:"a", template: TPL, styles: [GREET, `x`], standalone: false}) export class C {}"#;
-        let out = compile_component_source(src);
-        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
-        let flat = normalize_ws(&out.code);
-        assert!(flat.contains("styles: [\"Hi\", \"x\"]"), "const styles; got: {flat}");
-        assert!(flat.contains("i0.\u{0275}\u{0275}elementStart(0, \"b\")"), "const template; got: {flat}");
-        assert!(flat.contains("\"Hi\""), "substituted text; got: {flat}");
-        assert!(flat.contains("decls: 3"), "const template decls; got: {flat}");
-    }
-
-    #[test]
-    fn same_file_constants_fold_selector_pipe_name_and_export_as() {
-        let cmp = r#"const SEL = 'my-sel'; const EX = 'ex'; @Component({selector: SEL, template: '', exportAs: EX}) export class C {}"#;
-        let out = compile_component_source(cmp);
-        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
-        let flat = normalize_ws(&out.code);
-        assert!(flat.contains("selectors: [[\"my-sel\"]]"), "const selector; got: {flat}");
-        assert!(flat.contains("exportAs: [\"ex\"]"), "const exportAs; got: {flat}");
-        let pipe = r#"const NAME = 'pipeName'; @Pipe({name: NAME, standalone: false}) export class P { transform(v) { return v; } }"#;
-        let out = compile_component_source(pipe);
-        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
-        assert!(normalize_ws(&out.code).contains("name: \"pipeName\""), "const pipe name; got: {}", out.code);
-    }
-
-    #[test]
-    fn non_literal_host_value_is_kept_as_an_expression() {
-        // ngtsc accepts an expression for a plain host attribute (`host_with_ts_expression_node.ts`: `hostAttrs: ["foo", BAR_CONST]`).
-        let src = r#"const BAR = 'bar'; @Component({selector:"a",standalone:false,template:"",host:{'foo': BAR}}) export class C {}"#;
-        let out = compile_component_source(src);
-        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
-        assert!(normalize_ws(&out.code).contains("hostAttrs: [\"foo\", BAR]"), "expression host attribute; got: {}", out.code);
-        // A property binding keeps the string requirement: ngtsc rejects a non-string `[prop]` value.
-        let bad = r#"const BAR = 'bar'; @Component({selector:"a",standalone:false,template:"",host:{'[foo]': BAR}}) export class C {}"#;
-        let out = compile_component_source(bad);
-        assert!(!out.errors.is_empty(), "a non-string property binding must be refused");
-    }
-
-    #[test]
-    fn host_property_names_take_angulars_dom_property_remapping() {
-        // Host bindings are DomOnly (`ingestHostBinding`), so `reifyDomProperty` remaps `tabindex` to `tabIndex`.
-        let src = r#"@Directive({selector:"[my-dir]", host: { '[title]': 'myTitle', '[tabindex]': '1', '[id]': 'myId' }, standalone:false}) export class MyDirective { myTitle = 'hello'; myId = 'x'; }"#;
-        let out = compile_component_source(src);
-        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
-        let flat = normalize_ws(&out.code);
-        assert!(flat.contains("i0.\u{0275}\u{0275}domProperty(\"title\", ctx.myTitle)(\"tabIndex\", 1)(\"id\", ctx.myId)"), "remapped host names; got: {flat}");
-    }
-
-    #[test]
-    fn injectable_deps_read_qualifier_markers_in_any_position() {
-        // `[new Optional(), Dep]` is the same dependency as `[Dep, new Optional()]` (`usefactory_with_deps.ts`).
-        let src = r#"@Injectable({useFactory: (d: SomeDep) => new Made(d), deps: [[new Optional(), SomeDep]]}) export class S {}"#;
-        let out = compile_component_source(src);
-        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
-        assert!(out.code.contains("\u{0275}\u{0275}inject(SomeDep, 8)"), "optional flag before the token; got: {}", out.code);
-    }
-
-    #[test]
-    fn use_factory_arrow_with_a_new_expression_body_compiles() {
-        // `useFactory: (dep) => new MyAlternateService(dep)` is the golden `usefactory_with_deps` shape.
-        let src = r#"@Injectable({useFactory: (d: SomeDep) => new Made(d), deps: [SomeDep]}) export class S {}"#;
-        let out = compile_component_source(src);
-        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
-        assert!(out.code.contains("new Made(d)"), "new expression body; got: {}", out.code);
-    }
-
-    fn compile_static_members(src: &str) -> CompiledComponent {
-        super::compile_component_source_with_options(
-            src,
-            super::CompileOptions {
-                class_shape: super::ClassShape::StaticMembers,
-                ..Default::default()
-            },
-        )
-    }
-
-    #[test]
-    fn static_member_shape_writes_definitions_inside_the_class_body() {
-        // `ClassShape::StaticMembers`: `static ɵfac`/`static ɵcmp` inside the class, as in Angular's goldens.
-        let src = r#"@Component({selector:"a",standalone:false,template:"<b>{{x}}</b>"}) export class C { x = 1; }"#;
-        let out = compile_static_members(src);
-        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
-        let flat = normalize_ws(&out.code);
-        assert!(flat.contains("export class C { x = 1; static \u{0275}fac = function C_Factory(__ngFactoryType__)"), "static ɵfac in body; got: {flat}");
-        assert!(flat.contains("static \u{0275}cmp = i0.\u{0275}\u{0275}defineComponent({"), "static ɵcmp in body; got: {flat}");
-        assert!(!flat.contains("C.\u{0275}cmp ="), "no assignment shape in this mode; got: {flat}");
-        // The default shape is unchanged for the same source.
-        assert!(compile_component_source(src).code.contains("C.\u{0275}cmp ="));
-    }
-
-    #[test]
-    fn static_member_shape_keeps_ngmodule_scope_after_the_class() {
-        // The `@NgModule` definitions (`ɵmod`, `ɵinj`) are members; the scope side effect (`ɵɵsetNgModuleScope`)
-        // runs after the definition, so it stays after the class.
-        let src = r#"import {NgModule} from '@angular/core'; class Foo {} class Bar {} @NgModule({declarations: [Foo], imports: [Bar]}) export class M {}"#;
-        let out = compile_static_members(src);
-        assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
-        let flat = normalize_ws(&out.code);
-        assert!(flat.contains("static \u{0275}mod = i0.\u{0275}\u{0275}defineNgModule({ type: M })"), "static ɵmod; got: {flat}");
-        assert!(flat.contains("static \u{0275}inj = "), "static ɵinj; got: {flat}");
-        assert!(!flat.contains("M.\u{0275}inj ="), "no assignment-shape ɵinj; got: {flat}");
-        let class_close = flat.find("static \u{0275}inj = ").unwrap();
-        let tail = &flat[class_close..];
-        let brace = tail.find("}").unwrap();
-        let after_class = &tail[brace..];
-        assert!(after_class.contains("setNgModuleScope"), "scope side effect must follow the class; got: {flat}");
-    }
-
     fn normalize_ws(s: &str) -> String {
         s.split_whitespace().collect::<Vec<_>>().join(" ")
     }
@@ -4925,18 +4410,15 @@ AuthService.\u{0275}prov = i0.\u{0275}\u{0275}defineInjectable({
         let out = compile_component_source(src);
         assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
         let code = &out.code;
-        // Collect every pool-constant reference (Angular's `_cN` name, `ConstantPool`'s `CONSTANT_PREFIX`)
-        // and require a `const <ref> =` declaration for each.
+        // Collect every `$cN$` reference and require a `const $cN$ =` declaration for each.
         let mut refs: Vec<String> = Vec::new();
         let bytes = code.as_bytes();
         let mut i = 0;
         while i < bytes.len() {
-            let at_word_start = i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_' || bytes[i - 1] == b'$');
-            if at_word_start && bytes[i..].starts_with(b"_c") {
-                let digits = bytes[i + 2..].iter().take_while(|b| b.is_ascii_digit()).count();
-                if digits > 0 {
-                    refs.push(code[i..i + 2 + digits].to_string());
-                    i += 2 + digits;
+            if bytes[i] == b'$' && code[i..].starts_with("$c") {
+                if let Some(end) = code[i + 1..].find('$') {
+                    refs.push(code[i..i + 1 + end + 1].to_string());
+                    i += end + 2;
                     continue;
                 }
             }
@@ -4944,7 +4426,7 @@ AuthService.\u{0275}prov = i0.\u{0275}\u{0275}defineInjectable({
         }
         refs.sort();
         refs.dedup();
-        assert!(!refs.is_empty(), "expected at least one _cN factory ref; got: {code}");
+        assert!(!refs.is_empty(), "expected at least one $cN$ factory ref; got: {code}");
         for r in &refs {
             let decl = format!("const {r} =");
             assert!(
@@ -5840,25 +5322,6 @@ AuthService.\u{0275}prov = i0.\u{0275}\u{0275}defineInjectable({
     // -----------------------------------------------------------------------
 
     #[test]
-    fn required_signal_queries_lower_like_the_plain_call() {
-        // `viewChild.required(...)` / `contentChild.required(...)` change only the query's type; the
-        // emitted query is the same `ɵɵviewQuerySignal` / `ɵɵcontentQuerySignal` as `viewChild(...)`.
-        let src = r#"
-            import {Component, viewChild, contentChild} from '@angular/core';
-            @Component({ selector: 'req-query', template: '<div #a></div>' })
-            export class ReqQueryComponent {
-                first = viewChild.required<any>('a');
-                content = contentChild.required<any>('b');
-            }
-        "#;
-        let out = compile_component_source(src);
-        assert!(out.errors.is_empty(), "errors: {:?}", out.errors);
-        let flat = normalize_ws(&out.code);
-        assert!(flat.contains("viewQuerySignal"), "required viewChild not lowered: {flat}");
-        assert!(flat.contains("contentQuerySignal"), "required contentChild not lowered: {flat}");
-    }
-
-    #[test]
     fn decorator_view_queries_emit_view_query_fn() {
         let src = r#"
             @Component({
@@ -6476,7 +5939,6 @@ export class BCmp {}
                 modernize,
                 jit_mode: false,
                 emit_partial_component: false,
-                class_shape: ClassShape::Assignments,
             },
         )
     }
@@ -6511,7 +5973,7 @@ export class BCmp {}
     #[test]
     fn modernizer_lowers_classic_input_to_signal() {
         // ON: a classic `@Input()` lowers to a signal input — the flag-array form carrying
-        // `InputFlags.SignalBased` (bit 0 → flags = 1); the def carries no `signals` flag (explicit only).
+        // `InputFlags.SignalBased` (bit 0 → flags = 1) and the def is marked `signals: true`.
         let src = r#"@Component({selector:"a",standalone:false,template:""}) export class C { @Input() foo = 1; }"#;
         let out = compile_modernized(src, ModernizeOptions { signal_inputs: true, ..Default::default() });
         assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
@@ -6521,9 +5983,7 @@ export class BCmp {}
             flat.contains("inputs: { foo: [1, \"foo\"] }"),
             "expected signal-flagged input array; got: {flat}"
         );
-        // The modernized input is the same definition a hand-written `input()` gets: no explicit `signals`
-        // option, so no `signals: true` (ngtsc's `isSignal` is the explicit option only).
-        assert!(!flat.contains("signals: true"), "modernized signal input must not set signals:true; got: {flat}");
+        assert!(flat.contains("signals: true"), "modernized signal input must set signals:true; got: {flat}");
     }
 
     #[test]
@@ -6668,9 +6128,9 @@ export class BCmp {}
 
     #[test]
     fn change_detection_default_is_omitted() {
-        // DEFAULT (no `changeDetection` in source, modernizer OFF): the strategy is Default, which is
-        // OMITTED from the emitted definition (Treaty's OnPush-by-default convention; the runtime reads an
-        // absent field as OnPush). No `changeDetection:` key.
+        // DEFAULT (no `changeDetection` in source, modernizer OFF): the strategy is Angular's
+        // runtime `Default`, which is OMITTED from the emitted definition — byte-matching the
+        // @angular/compiler oracle. No `changeDetection:` key.
         let src = r#"@Component({selector:"a",standalone:true,template:'<div>{{x}}</div>'}) export class C { x = 1; }"#;
         let out = compile_component_source(src);
         assert!(out.errors.is_empty(), "errors: {:?}", out.errors);
@@ -6683,8 +6143,8 @@ export class BCmp {}
 
     #[test]
     fn modernizer_on_push_emits_change_detection_zero() {
-        // OPT-IN `on_push` modernizer (the signals-by-default -> OnPush design): a source with NO
-        // `changeDetection` emits `changeDetection: 0` (OnPush).
+        // OPT-IN `on_push` modernizer (the signals-by-default → OnPush design, now opt-in): a
+        // source with NO `changeDetection` now emits `changeDetection: 0` (OnPush).
         let src = r#"@Component({selector:"a",standalone:true,template:'<div>{{x}}</div>'}) export class C { x = 1; }"#;
         let on = compile_modernized(src, ModernizeOptions { on_push: true, ..Default::default() });
         assert!(on.errors.is_empty(), "errors: {:?}", on.errors);
@@ -6711,51 +6171,6 @@ export class BCmp {}
         assert!(
             flat.contains("changeDetection: 0"),
             "explicit OnPush must emit changeDetection: 0 even with modernizer OFF; got: {flat}"
-        );
-    }
-
-    #[test]
-    fn explicit_default_is_omitted_and_on_push_flag_does_not_override_it() {
-        // Treaty is OnPush by default: an explicit legacy `Default` is omitted (never `1`), and the `on_push`
-        // flag does not turn it into OnPush output.
-        let src = r#"@Component({selector:"a",standalone:true,changeDetection:ChangeDetectionStrategy.Default,template:'<div>{{x}}</div>'}) export class C { x = 1; }"#;
-        let out = compile_component_source(src);
-        assert!(out.errors.is_empty(), "errors: {:?}", out.errors);
-        assert!(
-            !out.code.contains("changeDetection"),
-            "explicit Default must be omitted; got: {}",
-            out.code
-        );
-        let on = compile_modernized(src, ModernizeOptions { on_push: true, ..Default::default() });
-        assert!(on.errors.is_empty(), "errors: {:?}", on.errors);
-        assert!(
-            !on.code.contains("changeDetection"),
-            "explicit Default with the on_push flag must be omitted; got: {}",
-            on.code
-        );
-    }
-
-    #[test]
-    fn explicit_eager_emits_one_and_on_push_flag_does_not_override_it() {
-        // The new `Eager` name opts out of OnPush: `changeDetection: 1`, with the `on_push` flag off and on.
-        let src = r#"@Component({selector:"a",standalone:true,changeDetection:ChangeDetectionStrategy.Eager,template:'<div>{{x}}</div>'}) export class C { x = 1; }"#;
-        let out = compile_component_source(src);
-        assert!(out.errors.is_empty(), "errors: {:?}", out.errors);
-        let flat = normalize_ws(&out.code);
-        assert!(
-            flat.contains("changeDetection: 1"),
-            "explicit Eager must emit changeDetection: 1 with the modernizer OFF; got: {flat}"
-        );
-        let on = compile_modernized(src, ModernizeOptions { on_push: true, ..Default::default() });
-        assert!(on.errors.is_empty(), "errors: {:?}", on.errors);
-        let flat_on = normalize_ws(&on.code);
-        assert!(
-            flat_on.contains("changeDetection: 1"),
-            "explicit Eager must emit changeDetection: 1 even with the on_push flag; got: {flat_on}"
-        );
-        assert!(
-            !flat_on.contains("changeDetection: 0"),
-            "the on_push flag must not override an explicit Eager; got: {flat_on}"
         );
     }
 
@@ -7026,27 +6441,9 @@ mod corpus_dump {
     #[test]
     #[ignore = "corpus dump; run explicitly with TREATY_IVY_CORPUS_DUMP set"]
     fn dump_corpus() {
-        // The dump compiles the whole corpus through the recursive-descent front-end, which needs far
-        // more stack than the libtest default (2 MiB) for the deepest corpus templates. Run it on a
-        // thread with a 256 MiB stack so it needs no `RUST_MIN_STACK` environment variable.
-        std::thread::Builder::new()
-            .name("corpus-dump".to_string())
-            .stack_size(256 * 1024 * 1024)
-            .spawn(dump_corpus_on_big_stack)
-            .expect("spawn corpus dump thread")
-            .join()
-            .expect("corpus dump thread panicked");
-    }
-
-    fn dump_corpus_on_big_stack() {
         let Ok(dump_path) = std::env::var("TREATY_IVY_CORPUS_DUMP") else {
             eprintln!("TREATY_IVY_CORPUS_DUMP not set; skipping corpus dump");
             return;
-        };
-        // The class shape the dump scores (see `ClassShape`). Default: the assignment shape.
-        let class_shape = match std::env::var("TREATY_IVY_CORPUS_CLASS_SHAPE").as_deref() {
-            Ok("static") => super::ClassShape::StaticMembers,
-            _ => super::ClassShape::Assignments,
         };
         // libs/treaty-ivy/facade -> repo root -> tools/angular-ref/.../test_cases.
         let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -7060,8 +6457,6 @@ mod corpus_dump {
         let mut test_case_files = Vec::new();
         collect_test_cases(&corpus, &mut test_case_files);
 
-        #[cfg(feature = "ng-analyze")]
-        super::reset_ng_analyze_counters();
         let mut json = String::from("{\n");
         let mut first = true;
         let mut count = 0usize;
@@ -7094,9 +6489,6 @@ mod corpus_dump {
                         // The compliance corpus is the FULL/local AOT scoring set; partial component
                         // emit is never exercised here, so the default AOT emit is byte-unchanged.
                         emit_partial_component: false,
-                        // `TREATY_IVY_CORPUS_CLASS_SHAPE=static` scores the corpus against the static-member
-                        // shape (`ClassShape::StaticMembers`); the default dump keeps the assignment shape.
-                        class_shape: class_shape,
                     },
                 );
                 if !first {
@@ -7119,15 +6511,6 @@ mod corpus_dump {
         }
         json.push_str("\n}\n");
         std::fs::write(&dump_path, json).expect("write corpus dump");
-        // With `--features ng-analyze` the dump also reports how many component/directive classes took their
-        // metadata from the bridge's facts and how many fell back to Treaty's extraction, by reason.
-        #[cfg(feature = "ng-analyze")]
-        {
-            let c = super::ng_analyze_counters();
-            eprintln!("NG_ANALYZE_COUNTERS facts_used={} fallbacks={:?}", c.facts_used, c.fallbacks);
-        }
         eprintln!("wrote {count} corpus entries to {dump_path}");
-        #[cfg(feature = "ng-analyze")]
-        eprintln!("ng-analyze facts path: {:?}", super::ng_analyze_counters());
     }
 }
