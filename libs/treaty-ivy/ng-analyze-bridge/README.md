@@ -1,10 +1,10 @@
 # `treaty_ivy_ng_bridge` — Angular's own decorator analyser, as an opt-in source of Treaty's decorator facts
 
-**Status: experimental and opt-in.** The default build does not use it. With `--features ng-analyze` the
-component and directive metadata comes from Angular's Rust analyser (`ng-analyze`) where it can, and from
-Treaty's own extractor everywhere else. **Enabling it in this workspace is currently blocked** (see
-[Blocker](#blocker-the-workspace-cannot-resolve-ng-analyze-yet)); what is verified below was built and
-tested in a scratch copy of the workspace with that one change applied.
+**Status: enabled in the workspace, experimental, opt-in.** The default build does not use it. With
+`--features ng-analyze` (on `treaty_ivy`) the component and directive metadata comes from Angular's Rust
+analyser (`ng-analyze`) where it can, and from Treaty's own extractor everywhere else. The workspace resolves
+with the bridge in its graph (see [Resolved: the workspace resolves](#resolved-the-workspace-resolves-with-the-bridge)).
+Every number below was measured in the real tree.
 
 ## What is reused from Angular
 
@@ -46,8 +46,8 @@ The facts are raw (what the author wrote). The facade applies these conventions 
 metadata (`treaty_ivy::source_compile::facts_emit`):
 
 - a selectorless `@Component` takes the filename-derived default selector;
-- `signals` is the explicit option OR any signal input or query (Treaty's emit convention; ngtsc's
-  `isSignal` is the explicit option only);
+- `signals` is the explicit `signals` option only, the same as Treaty's own extraction and ngtsc's `isSignal`
+  (`directive/src/shared.ts`). A signal input or query does not set it;
 - `changeDetection` is reduced to `Default`/`Eager` versus everything else (OnPush);
 - `modernize.signal_inputs` lowers decorator inputs to signal inputs;
 - `forwardRef` in `imports:` closure-wraps the dependencies (read from the decorator object).
@@ -71,55 +71,67 @@ converter, query selector lists split as `query_generation.ts` does, `changeDete
 semantic value, empty `providers` equal to absent) and diffs them field by field. A difference fails the
 test unless `classify` gives it a written reason.
 
-Measured at Angular `78d2a67d`:
+Measured at Angular `78d2a67d`, after the Part 2 fixes:
 
 | | count |
 | --- | --- |
 | corpus `.ts` files | 644 |
 | files with decorated classes | 636 |
 | classes compared (matched by name and occurrence) | 1121 |
-| both extractors extract the class | 1112 |
+| both extractors extract the class | 1117 |
 | both refuse the class (both fall back) | 4 |
 | bridge refuses or omits, Treaty extracts | 1 (`@NgModule({jit: true})`: ng-analyze reports no class; the facade falls back) |
-| Treaty refuses, bridge extracts | 5 (see below) |
+| Treaty refuses, bridge extracts | **0** (was 5 before the Part 2 fixes) |
 | un-explained differences | **0** |
-| field differences accepted with a written reason | 29 (see the table below) |
+| field differences accepted with a written reason | **8** (was 29 before the Part 2 fixes) |
 
-Explained differences, grouped by field, with the reason each one is expected:
+The 8 accepted differences, each with the reason `classify` records:
 
 | Field | Count | Which extractor is right, and why |
 | --- | --- | --- |
-| `directive.signals_emitted` | 16 | **Treaty defect (open).** Treaty emits `signals: true` for a class that has a signal input or query but no explicit `signals` option. ngtsc's `isSignal` is the explicit option only (`directive/src/shared.ts`, lines 401-408). No full golden expects the implicit flag (the 14 corpus classes that get it are partial or signal-only goldens), so the Angular source is the evidence. Kept as Treaty's convention in the facts path until the owner decides. |
-| `directive.inputs.presence` | 4 | **Treaty defect.** Decorator-level `inputs: [...]` is not read by Treaty; ngtsc reads it (`directive/src/shared.ts`, `inputsField`). |
-| `directive.outputs.presence` | 1 | **Treaty defect.** A member with both `@Input` and `@Output` loses its output in `collect_io`. |
 | `directive.inputs.transform` | 6 | **Treaty right.** ng-analyze reports a signal input's `transform`; Angular's definition does not capture it (golden `signal_inputs/should not capture the transform function`). |
-| `pipe.name` | 1 | **Treaty right.** ng-analyze substitutes the class name for an absent pipe `name`; ngtsc errors. The bridge cannot tell the two apart, so pipes stay on Treaty's path. |
+| `pipe.name` | 1 | **Treaty right.** ng-analyze substitutes the class name for an absent pipe `name`; ngtsc errors. The bridge cannot tell the two apart. |
 | `ng_module.imports` | 1 | **Neither, by design.** A `ModuleWithProviders` call is resolved to its module by ngtsc; Treaty resolves it at emit, not in its facts. |
-| Treaty refuses an identifier-valued `template` (`template: CONST`) | 3 | **ng-analyze right.** ngtsc evaluates the constant. |
-| Treaty refuses a non-literal `host` value | 1 | **ng-analyze right.** ngtsc accepts it as an expression. |
-| Namespace-member `hostDirectives` (`ns.Dir`) | 0 in the corpus | Found by a probe, not the corpus. Treaty drops the entry silently; ngtsc resolves it. The bridge leaves the name empty (no local binding), so the facade falls back. Covered by `host_directive_names_are_local_bindings` and a parity row (`Treaty defect`). |
-| Treaty refuses `deps` with its qualifier first (`[new Optional(), Dep]`) | 1 | **ng-analyze right.** ngtsc reads the markers in any position. |
 
-Treaty defects are kept visible here. They are not hidden by changing Treaty's extractor in the parity
-task.
+Treaty defects found by the parity test, and their state now (each has a unit test in the facade, and its
+entry was removed from `classify`, so the test enforces agreement):
 
-## Golden results with the feature on and off (same moment)
+| Defect | Angular behaviour | State |
+| --- | --- | --- |
+| Decorator-level `inputs: [...]` / `outputs: [...]` ignored | read by `parseInputsArray` / `parseOutputsArray` (`directive/src/shared.ts`) | **fixed** (`collect_decorator_io_arrays`) |
+| A member with `@Input` and `@Output` loses the output | both registered (`parseInputFields`, `parseOutputFields`) | **fixed** (`collect_io`) |
+| `signals: true` emitted implicitly for signal inputs/queries | `isSignal` is the explicit option only | **fixed** in both emit paths; the modernizer test follows it |
+| Identifier-valued `template`, `selector`, `exportAs`, `styles`, pipe `name` refused | evaluated (`non_literal_template*.ts`) | **fixed** for same-file constants (`source_compile/const_fold.rs`); cross-file constants stay bridge-only |
+| Non-literal `host` value refused | an expression is kept (`hostAttrs: ["foo", BAR]`, `host_with_ts_expression_node.ts`) | **fixed** for plain attributes; `[prop]`/`(event)` keep the string requirement, as ngtsc |
+| `deps` with the qualifier first (`[new Optional(), Dep]`) refused | markers read in any position | **fixed** |
+| Namespace-member `hostDirectives` (`ns.Dir`) dropped silently | resolved by ngtsc | **open** (Treaty drops it; the bridge leaves the name empty, so the facade falls back). Covered by `host_directive_names_are_local_bindings` |
+
+Not found by the parity test, found by the golden work: a `useFactory` arrow whose body is `new X(...)` was
+refused (Treaty had no `new` in `convert_expr`), and host property names were not DOM-remapped
+(`[tabindex]` must emit `"tabIndex"`, Angular's `DOM_PROPERTY_REMAPPING` for DomOnly host bindings). Both are
+fixed in the facade.
+
+## Golden results with the feature on and off (same moment, same tree)
 
 | Bucket | Feature off | Feature on |
 | --- | --- | --- |
 | Full (`corpus_dump`, compile-verified) | 189 PASS / 0 DIFF of 189 runnable | **189 PASS / 0 DIFF** of 189 runnable |
-| Partial (template goldens, `expectEmit`) | 346 runnable, **173 PASS** | 349 runnable, **176 PASS** |
+| Partial (template goldens, `expectEmit`) | 351 runnable, **207 PASS**, 144 DIFF | 351 runnable, **207 PASS**, 144 DIFF |
 
-Partial-bucket cases that change outcome: **3 gained** (`should support inline non-literal templates`,
-`… using string concatenation`, `… using substitution`: the identifier template is now evaluated, and the
-classes compile). **0 lost.** Corpus outputs whose text changed under the feature: 5 (the three templates
-above, `property_decorators.ts` and `order_bindings.ts`, where the bridge reads the extra member output and
-the decorator `inputs:` array). Those two are still DIFF.
+Feature on versus off, per case: 0 gained, 0 lost. Before the same-file constant folding the bridge gained
+three cases (`should support inline non-literal templates`, `… using string concatenation`, `… using
+substitution`); Treaty now passes them with the feature off, so the bridge has nothing left to add there.
+The bridge's remaining value on the corpus is the parity check, not a golden gain.
 
-With the feature on, `facts_used` was 733 component and directive classes. Fallbacks (classes that stay on
-Treaty's extractor) were counted by reason with `ng_analyze_counters()`: an unresolved external template or
-stylesheet (ng-analyze's file-level error, 10 classes; the corpus dump passes no resolved content),
-`foreignImports` (a Treaty-only key, 4), and a non-literal `host` value (1).
+The partial bucket's DIFF list is the same with the feature on and off (144 cases). The class-shape group
+(`ClassShape` in the facade: `static ɵfac`/`static ɵcmp` inside the class body, as Angular's goldens show) is not
+the default yet, because `libs/packagr/src/component_dts.rs` reads the assignment form. With
+`TREATY_IVY_CORPUS_CLASS_SHAPE=static` the corpus is scored against the static shape: 213 PASS, 138 DIFF, and no
+case moves the other way.
+
+With the feature on, `ng_analyze_counters()` on the corpus dump reports **734 facts-path classes** and 14
+fallbacks: 10 classes whose external `templateUrl`/`styleUrls` the dump does not resolve (ng-analyze's file
+error; the corpus dump passes no resolved content) and 4 classes with a `foreignImports` key (a Treaty-only key).
 
 Facade differential tests (`facade/tests/ng_analyze_facts_path.rs`) compile each snippet twice in one
 process, once through the facts path and once with `with_treaty_extraction`: all 10 produce identical code
@@ -128,9 +140,34 @@ and errors.
 ## Scope of the emit path
 
 With the feature on, the facts path emits **components and directives**. Pipes, injectables and NgModules
-are still extracted by Treaty's walk, and their facts are produced and checked by the parity test. The
-extraction and the emit tail are split so the two extractors feed the same `DirectiveExtract`, and the
-feature-off output was checked byte for byte against the pre-refactor facade (identical corpus dump).
+are still extracted by Treaty's walk, and their facts are produced and checked by the parity test. Wiring them
+through the facts path was analysed and not done, for three measured reasons:
+
+- **Pipes**: ng-analyze reports the class name for an absent `name`, so its pipe name cannot be used as
+  the emit input without the decorator object. Treaty's own reading is the right one, so the facts add nothing.
+- **Injectables**: the facts match Treaty's extraction field for field on the corpus (0 differences), so a
+  facts path would change no output. The facts also drop the `forwardRef` wrapper flag, which the emit needs.
+- **NgModules**: the facts omit a `ModuleWithProviders` call in `imports` (ngtsc resolves it); a facts path would
+  need to fall back for any call element, and the registry's `CompileCtx` (in `treaty_ivy_decorators`, not
+  owned by this crate) has no field to carry the facts to the plugins. That field is the exact edit needed.
+
+## Resolved: the workspace resolves with the bridge
+
+The blocker was `libs/runtime`'s `nova_vm` pin: `bece61ac` pins `hashbrown =0.17.0`, while `oxc_allocator`
+0.144 (through ng-analyze) needs `^0.17.1`. The fix is the nova rev `4eea7c6f` (upstream `main`, `hashbrown
+=0.17.1`) plus a lock update for `hashbrown`. The runtime's behaviour at the new rev is unchanged: 483 tests pass
+before and after, the node-conformance suite is unchanged (51 unit tests; corpus 68 pass, 0 fail, 6 skipped),
+and no runtime source changed. Enabling the bridge then needed only: the bridge as a workspace member, the
+optional dependency and the `ng-analyze` feature on `treaty_ivy`.
+
+## Tests
+
+- `cargo test -p treaty_ivy_facts` and `cargo test -p treaty_ivy_ng_bridge`: span conversion (non-ASCII),
+  nothing needs ng-analyze.
+- `cargo test -p treaty_ivy_ng_bridge --features analyze`: adapter tests on small sources and on the
+  assessment fixtures in `tests/fixtures/project` (18 tests).
+- `cargo test -p treaty_ivy --features ng-analyze --test ng_analyze_parity -- --nocapture` (with
+  `NG_ANALYZE_PARITY_REPORT=<path>` for the JSON report) and `--test ng_analyze_facts_path`.
 
 ## Pinned rev and how to bump it
 
@@ -142,40 +179,3 @@ in `tools/render3-sync/ANGULAR_REF`. **Bump both together.** Then:
    `classify` (in the parity test), and any new un-explained one is a finding, not a reason to widen it.
 3. Check the oxc and Rust requirements: ng-analyze declares no `rust-version`, and its oxc 0.144 crates
    and `oxc_resolver` 11.24.3 declare `rust-version = "1.95.0"`, the pinned toolchain.
-
-## Blocker: the workspace cannot resolve ng-analyze yet
-
-ng-analyze pulls in `oxc_allocator` 0.144, which needs `hashbrown ^0.17.1`. The workspace's
-`libs/runtime` depends on `nova_vm` at rev `bece61ac`, whose manifest pins `hashbrown = "=0.17.0"`. Cargo
-locks optional dependencies too, so an optional `ng-analyze` edge anywhere in the workspace makes the whole
-workspace fail to resolve, the default build included. Verified: `cargo metadata` fails once the bridge is a
-member or a dependency of `treaty_ivy`, and succeeds without it.
-
-The fix is outside this crate: bump `libs/runtime`'s `nova_vm` rev. Upstream nova `main` at
-`4eea7c6fae180a8a2eed45c3f6acd0d9256522b1` pins `hashbrown = "=0.17.1"`, which satisfies both oxc versions.
-With that rev in a scratch copy and `cargo update -p hashbrown@0.17.0 --precise 0.17.1`, the workspace
-resolves with the bridge included. With that rev, `cargo check -p treaty_runtime` passes in the scratch
-copy (check only; the runtime's own tests were not run), so the runtime owner still needs to confirm its
-behaviour at that rev.
-
-Once that lands, enable the bridge by adding to `libs/treaty-ivy/facade/Cargo.toml`:
-
-```toml
-treaty_ivy_ng_bridge = { path = "../ng-analyze-bridge", optional = true }
-# in [features]
-ng-analyze = ["dep:treaty_ivy_ng_bridge", "treaty_ivy_ng_bridge/analyze"]
-```
-
-and adding `libs/treaty-ivy/ng-analyze-bridge` to the root `[workspace] members`. The default and `swc`
-features are not changed by either edit.
-
-## Tests
-
-- `cargo test -p treaty_ivy_facts` and `cargo test -p treaty_ivy_ng_bridge`: span conversion (non-ASCII),
-  nothing needs ng-analyze.
-- `cargo test -p treaty_ivy_ng_bridge --features analyze`: adapter tests on small sources and on the
-  assessment fixtures in `tests/fixtures/project` (signal `viewChild.required`, `@Input({required})`,
-  cross-file constant selector and options, cross-file directive import, host values, multi-decorator
-  classes, non-ASCII spans).
-- `cargo test -p treaty_ivy --features ng-analyze --test ng_analyze_parity -- --nocapture` (with
-  `NG_ANALYZE_PARITY_REPORT=<path>` for the JSON report) and `--test ng_analyze_facts_path`.

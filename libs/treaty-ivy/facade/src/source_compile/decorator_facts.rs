@@ -33,6 +33,8 @@ pub fn decorator_facts_of_source(source: &str) -> Vec<DecoratorFacts> {
     let summary = ParsingBackend::default().parse_module(source, SourceKind::TypeScriptModule, |m| {
         m.summary().clone()
     });
+    // The same same-file constant folding the compile path applies, so the facts describe what it reads.
+    let summary = const_fold::fold_same_file_consts(&summary, source);
     summary.classes.iter().filter_map(facts_of_class).collect()
 }
 
@@ -144,7 +146,12 @@ fn facts_of_class(class: &ClassWithDecorators) -> Option<DecoratorFacts> {
         facts.constructor_deps = ctor_deps(class);
     }
     if facts.unsupported.is_empty() {
-        fill_members(class, &mut facts);
+        let directive_obj = class
+            .decorators
+            .iter()
+            .filter(|dec| matches!(decorator_name(dec), Some("Component") | Some("Directive")))
+            .find_map(|dec| dec.object.as_ref());
+        fill_members(class, &mut facts, directive_obj);
     }
     Some(facts)
 }
@@ -214,9 +221,15 @@ fn host_object(expr: &NExpr) -> Result<Vec<(String, HostValue)>, String> {
     for p in props {
         match p {
             NObjectProp::KeyValue { key, value, .. } => {
-                let s = string_value(value)
-                    .ok_or_else(|| format!("`host` value for '{key}' must be a string"))?;
-                out.push((key.clone(), HostValue::Str(s)));
+                let entry = match string_value(value) {
+                    Some(s) => HostValue::Str(s),
+                    None => {
+                        let x = convert_expr(value)
+                            .ok_or_else(|| format!("`host` value for '{key}' must be a string or an expression"))?;
+                        HostValue::Expr(print_text(&x))
+                    }
+                };
+                out.push((key.clone(), entry));
             }
             NObjectProp::Other(_) => return Err("unsupported `host` computed key".to_string()),
             NObjectProp::Spread(_) => return Err("unsupported `host` spread/shorthand".to_string()),
@@ -409,13 +422,16 @@ fn ctor_deps(class: &ClassWithDecorators) -> Option<Vec<DepFact>> {
 
 /// Member-level facts: inputs and outputs (through `collect_io`), queries (through the query
 /// collectors), `@HostBinding`/`@HostListener` entries, and `ngOnChanges`.
-fn fill_members(class: &ClassWithDecorators, facts: &mut DecoratorFacts) {
+fn fill_members(class: &ClassWithDecorators, facts: &mut DecoratorFacts, directive_obj: Option<&ObjLit>) {
     let Some(dir) = facts.directive.as_mut() else { return };
     dir.uses_on_changes = class_uses_on_changes(class);
 
     let mut inputs: OrderedMap<String, R3InputMetadata> = OrderedMap::new();
     let mut outputs: OrderedMap<String, String> = OrderedMap::new();
-    if collect_io(class, &mut inputs, &mut outputs, ModernizeOptions::default()).is_err() {
+    // The decorator-level arrays first, then the members (members override, as in the emit path).
+    let io = collect_decorator_io_arrays(directive_obj, &mut inputs, &mut outputs, ModernizeOptions::default())
+        .and_then(|()| collect_io(class, &mut inputs, &mut outputs, ModernizeOptions::default()));
+    if io.is_err() {
         facts.unsupported.push("unsupported member decorator".to_string());
         return;
     }

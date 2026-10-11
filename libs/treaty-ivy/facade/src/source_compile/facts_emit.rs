@@ -9,7 +9,7 @@
 //!
 //! Conventions applied here, on top of the RAW facts (see the bridge's `facts` module):
 //!   * the filename-derived default selector for a selectorless `@Component`;
-//!   * `signals` = the explicit option OR any signal input/query (Treaty's emit convention);
+//!   * `signals` = the explicit option only (ngtsc's `isSignal`);
 //!   * `changeDetection`: only `Default`/`Eager` differ from OnPush;
 //!   * `modernize.signal_inputs` lowers decorator inputs to signal inputs;
 //!   * `forwardRef` in `imports:` closure-wraps the dependencies, read from the decorator object.
@@ -306,8 +306,8 @@ pub(super) fn facts_directive_extract(
     order_queries_for_emit(&mut content_queries);
     order_queries_for_emit(&mut view_queries);
 
-    let has_signal_query = content_queries.iter().chain(view_queries.iter()).any(|q| q.is_signal);
-    let is_signal = d.signals || inputs.iter().any(|(_, m)| m.is_signal) || has_signal_query;
+    // The explicit `signals` option only (ngtsc's `isSignal`; see `treaty_directive_extract`).
+    let is_signal = d.signals;
 
     // The `imports:` closure-wrap decision reads the decorator object (as Treaty's does).
     let import_has_forward_ref = imports_has_forward_ref(obj);
@@ -351,10 +351,13 @@ fn build_host(d: &DirectiveFacts) -> Result<R3HostMetadata, String> {
     for (key, value) in d.host_object.iter().flatten() {
         match value {
             FactHostValue::Str(s) => {
-                raw.insert(key.clone(), HostValue::Str(s.clone()));
+                raw.insert(host_property_key_or_plain(key), HostValue::Str(s.clone()));
             }
-            FactHostValue::Expr(_) => {
-                return Err(format!("`host` value for '{key}' must be a string"));
+            // An expression value is lowered and kept, as `parse_host_object` keeps it.
+            FactHostValue::Expr(text) => {
+                let expr = lower_expr(text)
+                    .ok_or_else(|| format!("`host` value for '{key}' must be a string or an expression"))?;
+                raw.insert(host_property_key_or_plain(key), HostValue::Expr(expr));
             }
         }
     }
@@ -381,7 +384,7 @@ fn build_host(d: &DirectiveFacts) -> Result<R3HostMetadata, String> {
                 } else {
                     b.member.clone()
                 };
-                raw.insert(format!("[{host_prop}]"), HostValue::Str(value));
+                raw.insert(host_property_key(&host_prop), HostValue::Str(value));
             }
             Member::Listener(l) => {
                 let handler = format!("{}({})", l.method, l.args.join(","));

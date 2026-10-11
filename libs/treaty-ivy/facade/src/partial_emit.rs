@@ -979,10 +979,9 @@ mod tests {
         // documented differences remain (see notes), neither a round-trip break:
         //   * `minVersion`: Angular bumps it to "17.1.0" for model() inputs; we stamp the family-wide
         //     "14.0.0" (the linker accepts both — `is_placeholder_version` keys on the version).
-        //   * top-level `isSignal: true`: this compiler derives `base.is_signal` from signal inputs,
-        //     so it emits `isSignal` (and the AOT define emits `signals: true`) where real Angular —
-        //     which sets the directive-level signal flag only for signal-based components — omits it.
-        //     It is round-trip-consistent (relinked AOT == direct AOT).
+        //   * top-level `isSignal`: the directive-level flag is the explicit `signals` option only (ngtsc's
+        //     `isSignal`, `directive/src/shared.ts`), so a model()-only directive emits no top-level
+        //     `isSignal`, as the real golden does. The per-input `isSignal` above is unaffected.
         let src = "import { Directive, model } from '@angular/core';\n\
                    @Directive({})\n\
                    export class TestDir { counter = model(0); name = model.required<string>(); }";

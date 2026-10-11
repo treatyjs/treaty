@@ -25,46 +25,15 @@ use treaty_ivy_ng_bridge::facts::{
 /// and Treaty's extractor is wrong. Those are kept visible here, not hidden by changing Treaty's
 /// extractor in this task.
 /// Why Treaty's refusal of a class is expected while the bridge extracts it. `None` when unexplained.
-fn explain_refusal(reason: &str, source: &str, b: &DecoratorFacts) -> Option<&'static str> {
-    if reason == "component has no inline string `template`"
-        && b.component.as_ref().is_some_and(|c| c.template.is_some())
-    {
-        return Some("Treaty defect: an identifier-valued `template` is refused; ngtsc evaluates the constant");
-    }
-    if reason.starts_with("`host` value for") && source.contains("host") {
-        return Some("Treaty defect: a non-literal `host` value is refused; ngtsc accepts it as an expression");
-    }
-    if reason == "unsupported `deps` token expression form" && b.injectable.as_ref().is_some_and(|i| i.deps.is_some()) {
-        return Some("Treaty defect: a `deps` entry with its qualifier first (`[new Optional(), Dep]`) is refused; ngtsc reads markers in any position");
-    }
+fn explain_refusal(_reason: &str, _source: &str, _b: &DecoratorFacts) -> Option<&'static str> {
+    // Every refusal the bridge extracts is now extracted by Treaty too (same-file constants, expression
+    // `host` values and qualifier-first `deps` are read). A new refusal is an unexplained difference.
     None
 }
 
 fn classify(field: &str, rel: &str, source: &str, tv: &str, bv: &str) -> Option<&'static str> {
     let _ = rel;
     match field {
-        // Treaty's collect_io reads only member decorators and signal initializers, so the decorator's
-        // own `inputs: [...]` array is dropped. ngtsc reads it (directive/src/shared.ts, `inputsField`).
-        "directive.inputs.presence" if tv.ends_with("present=false") && source.contains("inputs:") => Some(
-            "Treaty defect: decorator-level `inputs: [...]` array is ignored by Treaty; ngtsc reads it",
-        ),
-        // A member carrying both @Input and @Output: Treaty's collect_io takes the input and `continue`s,
-        // so the output is lost. ngtsc registers both.
-        "directive.outputs.presence" if tv.ends_with("present=false") && source.lines().any(|l| l.contains("@Input") && l.contains("@Output")) => {
-            Some("Treaty defect: a member with both @Input and @Output loses its output (collect_io `continue`s after the input)")
-        }
-        // A namespace-member host directive (`hostDirectives: [ns.Dir]`): Treaty's reader drops the entry
-        // silently, leaving no hostDirectives at all. ngtsc resolves it. The bridge leaves the name empty
-        // (no local binding), so the facade refuses the entry instead of emitting it.
-        "directive.host_directives" if tv == "None" && bv.contains("name=\"\"") => Some(
-            "Treaty defect: a namespace-member hostDirectives entry (`ns.Dir`) is dropped silently by Treaty; ngtsc resolves it",
-        ),
-        // Treaty emits `signals: true` when a class has a signal input or query even without the explicit
-        // option; ngtsc's `isSignal` is the explicit option only (`directive/src/shared.ts`). No full golden
-        // expects the implicit flag, so the ngtsc reading is the one this classification follows.
-        "directive.signals_emitted" if tv == "true" && bv == "false" => Some(
-            "Treaty defect (open): Treaty emits `signals: true` for a class with signal members and no explicit option; ngtsc's isSignal is the explicit option only",
-        ),
         // ng-analyze substitutes the class name for an absent pipe `name` (its `read_optional_string`
         // fallback). ngtsc reports an error for a nameless pipe, so Treaty's None is the correct fact.
         // `imports: [provideX()]` where `provideX(): ModuleWithProviders<M>`: ngtsc resolves the call to
@@ -246,7 +215,6 @@ fn diff_class(t: &DecoratorFacts, b: &DecoratorFacts) -> Vec<(String, String, St
     // Sections are compared by presence; the `kind` label depends on decorator order, which the two
     // extractors do not record the same way for multi-decorator classes.
     diff_directive(t.directive.as_ref(), b.directive.as_ref(), &mut push);
-    diff_effective_signals(t, b, &mut push);
     diff_component(t.component.as_ref(), b.component.as_ref(), &mut push);
     diff_pipe(t.pipe.as_ref(), b.pipe.as_ref(), &mut push);
     diff_injectable(t.injectable.as_ref(), b.injectable.as_ref(), &mut push);
@@ -363,16 +331,6 @@ fn diff_outputs(t: &[treaty_ivy_ng_bridge::facts::OutputFact], b: &[treaty_ivy_n
 /// The `signals` flag Treaty EMITS (explicit option OR any signal input/query) against ngtsc's, which
 /// is the explicit option only (`directive/src/shared.ts`, `isSignal`). The raw facts agree; this
 /// compares what each extractor makes of them.
-fn diff_effective_signals(t: &treaty_ivy_ng_bridge::facts::DecoratorFacts, b: &treaty_ivy_ng_bridge::facts::DecoratorFacts, push: &mut impl FnMut(&str, String, String)) {
-    let (Some(td), Some(bd)) = (t.directive.as_ref(), b.directive.as_ref()) else { return };
-    let effective = |d: &DirectiveFacts| {
-        d.signals
-            || d.inputs.iter().any(|i| i.is_signal)
-            || d.content_queries.iter().chain(d.view_queries.iter()).any(|q| q.is_signal)
-    };
-    push("directive.signals_emitted", format!("{}", effective(td)), format!("{}", bd.signals));
-}
-
 fn diff_component(
     t: Option<&ComponentFacts>,
     b: Option<&ComponentFacts>,
