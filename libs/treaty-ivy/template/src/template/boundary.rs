@@ -7,8 +7,9 @@
 use crate::expression::ast::AstNode;
 use crate::expression::parser::Parser;
 use crate::ml_parser::{self as html, ParseError, ParseSourceSpan as MlSpan};
+use crate::expression::ast::ParseSourceSpan;
 use crate::template::control_flow::{
-    block_spans, match_for_loop_let, move_by, parse_let_parameters, r3_span, span_of,
+    block_spans, match_for_loop_let, parse_let_parameters, r3_span,
 };
 use crate::template::deferred::ChildTransform;
 use crate::template::r3_ast as t;
@@ -73,8 +74,8 @@ pub fn create_boundary_block(
         }
 
         // `emptySpan` at the end of the `@error (…) {` start tag: the implicit variables sit there.
-        let end_offset = block.start_source_span.end.offset as u32;
-        let empty_span = span_of(end_offset, end_offset);
+        let end_location = block.start_source_span.end.clone();
+        let empty_span = ParseSourceSpan::new(end_location.clone(), end_location);
         let mut context_variables: Vec<t::Variable> = vec![
             implicit_variable("$error", &empty_span),
             implicit_variable("$reset", &empty_span),
@@ -86,14 +87,14 @@ pub fn create_boundary_block(
             if let_match.is_some() || is_alias_parameter(&param.expression) {
                 let (expression_to_parse, variables_span) = match &let_match {
                     Some((full, capture)) => {
-                        let param_start = param.source_span.start.offset as u32;
-                        let full_len = full.chars().count() as i64;
-                        let cap_len = capture.chars().count() as i64;
+                        let param_start = param.source_span.start.clone();
+                        let full_len = full.encode_utf16().count() as isize;
+                        let cap_len = capture.encode_utf16().count() as isize;
                         (
                             capture.clone(),
-                            span_of(
-                                move_by(param_start, full_len - cap_len),
-                                param.source_span.end.offset as u32,
+                            ParseSourceSpan::new(
+                                param_start.move_by(full_len - cap_len),
+                                param.source_span.end.clone(),
                             ),
                         )
                     }
@@ -142,8 +143,12 @@ pub fn create_boundary_block(
                     let parsed = parser.parse_binding(
                         &param.expression[start..end],
                         r3_span(&param.source_span),
-                        (param.source_span.start.offset + start) as i32,
+                        (param.source_span.start.offset
+                            + treaty_ivy_core::parse_util::utf16_len(&param.expression[..start]))
+                            as i32,
                     );
+                    // Angular parses this with the `BindingParser`: its expression errors are reported.
+                    errors.extend(parsed.errors.iter().cloned());
                     expression = Some(*parsed.ast);
                 }
                 continue;
@@ -193,9 +198,9 @@ pub fn create_boundary_block(
 
     // The whole span runs from the `@boundary` start tag to the end of the last `@error` block.
     let whole_source_span = match error_blocks.last() {
-        Some((last, _)) => span_of(
-            ast.start_source_span.start.offset as u32,
-            last.spans.source_span.end,
+        Some((last, _)) => ParseSourceSpan::new(
+            ast.start_source_span.start.clone(),
+            last.spans.source_span.end.clone(),
         ),
         None => r3_span(&ast.source_span),
     };

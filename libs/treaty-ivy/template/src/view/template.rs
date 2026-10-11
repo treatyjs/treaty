@@ -35,6 +35,8 @@ use crate::expression_converter::{
     LocalResolver, PipeSlotAllocator, PipeSlots,
 };
 use crate::identifiers::R3;
+use crate::ml_parser::{ParseError, ParseSourceSpan};
+use crate::template::r3_ast as t;
 use crate::output_ast as o;
 use crate::output_ast::{Expr, FnParam, Stmt, StmtKind, StmtModifier};
 use crate::template::r3_ast::{
@@ -200,6 +202,13 @@ pub struct ConstantPool {
     /// `<ng-content>` slots requested during the walk, awaiting their Angular `projectionSlotIndex`
     /// (see [`TemplateDefinitionBuilder::finalize_projection_indices`]).
     pending_projections: Vec<PendingProjection>,
+    /// The const-pool index of the message of each static `i18n-<attr>` attribute, keyed by the
+    /// attribute's source offset and name (Angular's `i18nMessage` on a `TextAttribute`). Filled by the
+    /// root's i18n-attribute prepass, which runs before any other message is interned, so attribute
+    /// messages precede block messages in the initializers (`i18n_const_collection.ts` order).
+    i18n_attr_consts: std::collections::HashMap<(usize, String), usize>,
+    /// The next `i18n_<n>` name index (see [`ConstantPool::next_i18n_name_index`]).
+    i18n_name_seq: usize,
 }
 
 /// An `<ng-content>` slot awaiting its projection slot index.
@@ -276,6 +285,20 @@ impl ConstantPool {
         self.initializers.extend(initializers);
         self.entries.push(value);
         self.entries.len() - 1
+    }
+
+    /// Add i18n initializer statements WITHOUT a const-array entry: a static `i18n-<attr>` message is
+    /// read only from its attribute array (`["title", i18n_1]`), never as a top-level `consts` entry.
+    pub fn add_initializers(&mut self, initializers: Vec<Stmt>) {
+        self.initializers.extend(initializers);
+    }
+
+    /// The next i18n message name index (`pool.uniqueName('i18n_')`): one per message, whether or not the
+    /// message is a const-array entry, so every `i18n_<n>` variable is distinct.
+    pub fn next_i18n_name_index(&mut self) -> usize {
+        let index = self.i18n_name_seq;
+        self.i18n_name_seq += 1;
+        index
     }
 
     pub fn entries(&self) -> &[Expr] {
@@ -3729,6 +3752,8 @@ impl TemplateDefinitionBuilder {
         // walk already interned the enclosing `[Template,"if"]` const), which mis-orders the pool.
         if self.is_root {
             self.prepass_descendant_local_ref_consts(&nodes);
+            // Static i18n attribute messages come before every block message (see `ConstantPool`).
+            self.prepass_i18n_attribute_consts(&nodes);
         }
 
         // Classify every top-level `@let` in this view (external / pipe-bearing) so the inline walk
@@ -3980,6 +4005,45 @@ impl TemplateDefinitionBuilder {
         self.serialize_attrs_index(attributes, binding_names, &[])
     }
 
+    /// The const-pool index of a static `i18n-<attr>` attribute's message, if it has one.
+    fn i18n_attr_const(&self, attr: &TextAttribute) -> Option<usize> {
+        let key = (attr.source_span.start.offset, attr.name.clone());
+        self.const_pool.borrow().i18n_attr_consts.get(&key).copied()
+    }
+
+    /// Intern the message of every static `i18n-<attr>` attribute in `nodes` (elements and components of
+    /// this view; a nested template or block body is a child view, handled by the caller).
+    fn intern_view_i18n_attr_consts(&mut self, nodes: &[Node]) {
+        for node in nodes {
+            match node {
+                Node::Element(el) => {
+                    for attr in &el.attributes {
+                        let Some(message) = attr.i18n.as_ref().and_then(|m| m.message()) else {
+                            continue;
+                        };
+                        let index = self.intern_i18n_attr_message(message);
+                        let key = (attr.source_span.start.offset, attr.name.clone());
+                        self.const_pool.borrow_mut().i18n_attr_consts.insert(key, index);
+                    }
+                    self.intern_view_i18n_attr_consts(&el.children);
+                }
+                Node::Component(c) => self.intern_view_i18n_attr_consts(&c.children),
+                _ => {}
+            }
+        }
+    }
+
+    /// Angular's i18n-attribute messages for the whole component, depth-first by view (the same walk
+    /// order as [`Self::prepass_descendant_local_ref_consts`]). Root only.
+    fn prepass_i18n_attribute_consts(&mut self, root_nodes: &[Node]) {
+        self.intern_view_i18n_attr_consts(root_nodes);
+        let mut bodies: std::collections::VecDeque<Vec<Node>> = std::collections::VecDeque::new();
+        Self::collect_child_view_bodies(root_nodes, &mut bodies);
+        for view_nodes in bodies {
+            self.prepass_i18n_attribute_consts(&view_nodes);
+        }
+    }
+
     /// The general attribute serializer, parameterised by the extra structural-directive
     /// *template-binding* names (`template_names`) that a desugared `*dir` contributes under the
     /// `AttributeMarker.Template` (`4`) group. Element/`<ng-content>` paths pass an empty slice; the
@@ -4056,7 +4120,12 @@ impl TemplateDefinitionBuilder {
                 }
                 _ => {
                     plain.push(str_lit(&attr.name));
-                    plain.push(str_lit(&attr.value));
+                    // A static `i18n-<attr>` attribute's value is its translated message: the read of
+                    // that message's const (`["title", i18n_1]`), not the authored text.
+                    match self.i18n_attr_const(attr) {
+                        Some(index) => plain.push(o::variable(format!("i18n_{index}"), None)),
+                        None => plain.push(str_lit(&attr.value)),
+                    }
                 }
             }
         }
@@ -4729,7 +4798,8 @@ impl TemplateDefinitionBuilder {
             // The element is marked for translation: its content is lowered as an i18n block
             // (`ɵɵi18nStart`/`ɵɵi18nEnd` + `ɵɵi18nExp`/`ɵɵi18nApply`) rather than the normal
             // text / bound-text path.
-            self.build_i18n_block(&element.children);
+            let meta = element.i18n.as_ref().and_then(|m| m.message());
+            self.build_i18n_block(&element.children, meta);
         } else if in_i18n_create {
             // Inside an i18n block: this element's text content is part of the message; only its
             // nested element/template/control-flow children get create ops (i18n-aware walk).
@@ -4769,7 +4839,7 @@ impl TemplateDefinitionBuilder {
     /// emitter (see the inline scope comments at the unhandled node arm and the message-meta
     /// construction below): the i18n placeholder-registry / ICU-context lowering, and a parsed
     /// `I18nMeta` carrying the message metadata. The text + interpolation path is fully handled.
-    fn build_i18n_block(&mut self, children: &[Node]) {
+    fn build_i18n_block(&mut self, children: &[Node], meta: Option<&crate::i18n::Message>) {
         use crate::i18n;
 
         let slot = self.allocate_data_slot();
@@ -4809,12 +4879,13 @@ impl TemplateDefinitionBuilder {
             }
         }
 
-        // SCOPE BOUNDARY: the `i18n` attribute value (`meaning|description@@id`) cannot be threaded
-        // here because the r3_ast `I18nMeta` marker is an opaque zero-field struct (`pub struct
-        // I18nMeta;`) — it carries no parsed metadata. So meaning/description/customId are empty. When
-        // the upstream marker is fleshed out to carry the parsed meta, it would feed `Message::new`
-        // and `compute_msg_id`; until then the metadata is structurally unavailable.
-        let message = i18n::Message::new(nodes, "", "", "");
+        // The message metadata is the transform's (`I18nMetaVisitor`'s) root message on the element: the
+        // parsed `i18n="meaning|description@@id"` attribute. The nodes are this builder's own, so only the
+        // three metadata strings are taken from the transform.
+        let (meaning, description, custom_id) = meta
+            .map(|m| (m.meaning.clone(), m.description.clone(), m.custom_id.clone()))
+            .unwrap_or_default();
+        let message = i18n::Message::new(nodes, meaning, description, custom_id);
 
         // Build the interpolation placeholder params (`I18nMessageOp.params`): each interpolation maps
         // its public placeholder name to the runtime magic string `\u{FFFD}<index>\u{FFFD}` plus the
@@ -5182,6 +5253,28 @@ impl TemplateDefinitionBuilder {
         message: &crate::i18n::Message,
         params: &[crate::i18n::I18nPlaceholderParam],
     ) -> usize {
+        let (i18n_const, _) = self.build_i18n_message_const(message, params);
+        self.const_pool
+            .borrow_mut()
+            .add_const_with_initializers(i18n_const.const_entry, i18n_const.initializers)
+    }
+
+    /// The `let`/`if` initializers of a static `i18n-<attr>` message (`i18n_const_collection.ts`, the
+    /// attribute case). They are emitted, but the message is NOT a `consts` entry: the attribute array
+    /// reads it as `i18n_<index>`. Returns that name index.
+    fn intern_i18n_attr_message(&mut self, message: &crate::i18n::Message) -> usize {
+        let (i18n_const, index) = self.build_i18n_message_const(message, &[]);
+        self.const_pool.borrow_mut().add_initializers(i18n_const.initializers);
+        index
+    }
+
+    /// Build the closure/`$localize` const of an i18n message (see [`Self::intern_i18n_message`]). Returns
+    /// the const and its name index (`i18n_<index>`).
+    fn build_i18n_message_const(
+        &mut self,
+        message: &crate::i18n::Message,
+        params: &[crate::i18n::I18nPlaceholderParam],
+    ) -> (crate::i18n::I18nConst, usize) {
         use crate::i18n;
 
         // The `$localize` meta block carries only the AUTHORED description / meaning / custom id
@@ -5200,7 +5293,7 @@ impl TemplateDefinitionBuilder {
         // The `$localize` substitution expressions: the placeholder magic strings, in placeholder
         // order. Without these the emitted tagged template drops the `${…}` substitution entirely.
         let mut expressions: Vec<o::Expr> = Vec::new();
-        let no_span = o::ParseSourceSpan::new(0, 0);
+        let no_span = o::ParseSourceSpan::synthetic();
         let mut param_by_name = std::collections::HashMap::new();
         for p in params {
             param_by_name.insert(p.name.clone(), p.value.clone());
@@ -5242,7 +5335,7 @@ impl TemplateDefinitionBuilder {
         });
 
         // The message's const ordinal — Angular numbers `i18n_n` from the const-array position.
-        let index = self.const_pool.borrow().entries().len();
+        let index = self.const_pool.borrow_mut().next_i18n_name_index();
 
         // Two context-dependent emit forms Angular's own compiler chooses between (proven by the
         // goldens). (1) `bare_name`: a message that brackets control-flow blocks
@@ -5268,10 +5361,9 @@ impl TemplateDefinitionBuilder {
                 file_suffix: i18n::file_based_i18n_suffix(""),
             },
         );
-        self.const_pool
-            .borrow_mut()
-            .add_const_with_initializers(i18n_const.const_entry, i18n_const.initializers)
+        (i18n_const, index)
     }
+
 
     /// Lower a bound input (`[name]="value"`) into the matching update-block binding instruction,
     /// advancing the update cursor to the host element's `slot` first. The instruction is selected
@@ -7351,7 +7443,10 @@ impl TemplateDefinitionBuilder {
         // hoist it under that name, and pass the reference as the third `ɵɵdefer` argument. Blocks
         // with no lazy deps carry no entry and keep the `null` resolver.
         let resolver_fn_ref: Option<Expr> = {
-            let key = (deferred.main_block_span.start, deferred.main_block_span.end);
+            let key = (
+                deferred.main_block_span.start.offset as u32,
+                deferred.main_block_span.end.offset as u32,
+            );
             self.deferred_deps.get(&key).cloned().map(|deps_fn| {
                 let fn_name = format!("{}_Defer_{}_DepsFn", self.base_name, defer_slot);
                 self.hoisted_fns.push(Stmt::with_modifiers(
@@ -8632,6 +8727,192 @@ fn remap_placeholder_slots_in_expr(
 // Tests.
 // ---------------------------------------------------------------------------
 
+// ===========================================================================
+// parseTemplate — port of `render3/view/template.ts` (`parseTemplate`, `ParseTemplateOptions`,
+// `ParsedTemplate`). The single public entry point for parse-only consumers: it runs the HTML
+// parser, the whitespace pass and the render3 transform with Angular's option semantics, and
+// returns every diagnostic in one list.
+// ===========================================================================
+
+/// `LEADING_TRIVIA_CHARS` (`render3/view/template.ts`): the characters a text or element span skips
+/// when it starts at a token, so spans start at the first significant character.
+pub const LEADING_TRIVIA_CHARS: [char; 4] = [' ', '\n', '\r', '\t'];
+
+/// Angular's `LexerRange` (`ml_parser/lexer.ts`): a sub-range of the template to lex. Not supported by
+/// this port; see [`ParseTemplateOptions::range`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LexerRange {
+    pub start_pos: usize,
+    pub start_line: usize,
+    pub start_col: usize,
+    pub end_pos: usize,
+}
+
+/// `ParseTemplateOptions` (`render3/view/template.ts`). `Default` is Angular's `{}`: insignificant
+/// whitespace removed, block and `@let` syntax on, selectorless off.
+///
+/// Angular's `ParsedTemplate` has no `interpolationConfig`, and neither do these options: the
+/// interpolation markers are `{{` and `}}` (as in the reference at commit 78d2a67d).
+///
+/// Options marked **unsupported** are not implemented by this port. Setting one to a non-default
+/// value does not change the parse; [`parse_template`] reports it as an error in
+/// [`ParsedTemplate::errors`], so it is never silently ignored.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ParseTemplateOptions {
+    /// Angular `preserveWhitespaces`: keep insignificant whitespace text nodes (default `false`).
+    pub preserve_whitespaces: bool,
+    /// Angular `preserveLineEndings`: keep `\r\n` as written instead of normalising to `\n`.
+    pub preserve_line_endings: bool,
+    /// Angular `preserveSignificantWhitespace` (default `true`). **Unsupported** when `Some(false)`.
+    pub preserve_significant_whitespace: Option<bool>,
+    /// Angular `range`. **Unsupported**: when `Some`, an error is reported and the whole template is
+    /// still parsed.
+    pub range: Option<LexerRange>,
+    /// Angular `escapedString` (the template is the body of an escaped JavaScript string).
+    /// **Unsupported**: when `true`, an error is reported.
+    pub escaped_string: bool,
+    /// Angular `leadingTriviaChars`. `None` means [`LEADING_TRIVIA_CHARS`], as in `parseTemplate`.
+    pub leading_trivia_chars: Option<Vec<char>>,
+    /// Angular `enableI18nLegacyMessageIdFormat`. **Unsupported** (the i18n meta pass is folded into
+    /// the transform and does not compute legacy message ids): when `true`, an error is reported.
+    pub enable_i18n_legacy_message_id_format: bool,
+    /// Angular `i18nNormalizeLineEndingsInICUs`.
+    pub i18n_normalize_line_endings_in_icus: bool,
+    /// Angular `alwaysAttemptHtmlToR3AstConversion`: convert to the r3 AST even when the HTML parser
+    /// reported errors (Angular returns no nodes in that case by default).
+    pub always_attempt_html_to_r3_ast_conversion: bool,
+    /// Angular `collectCommentNodes`: fill [`ParsedTemplate::comment_nodes`].
+    pub collect_comment_nodes: bool,
+    /// Angular `enableBlockSyntax` (default `true`): `@` control-flow blocks.
+    pub enable_block_syntax: Option<bool>,
+    /// Angular `enableLetSyntax` (default `true`): `@let` declarations.
+    pub enable_let_syntax: Option<bool>,
+    /// Angular `enableSelectorless` (default `false`): `<Foo>` / `@Foo` component and directive
+    /// usages. Also sets the expression parser's direct pipe references, as `makeBindingParser` does.
+    pub enable_selectorless: Option<bool>,
+}
+
+/// `ParsedTemplate` (`render3/view/template.ts`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ParsedTemplate {
+    /// `preserveWhitespaces` as given in the options.
+    pub preserve_whitespaces: bool,
+    /// Every diagnostic, in Angular's order: the binding and transform errors, then the HTML parser
+    /// errors, then errors about unsupported options. Angular uses `null` for "none"; here it is empty.
+    pub errors: Vec<ParseError>,
+    pub nodes: Vec<t::Node>,
+    pub style_urls: Vec<String>,
+    pub styles: Vec<String>,
+    pub ng_content_selectors: Vec<String>,
+    /// `Some` iff `collectCommentNodes` was set (empty when the parse was abandoned).
+    pub comment_nodes: Option<Vec<t::Comment>>,
+}
+
+/// `parseTemplate(template, templateUrl, options)`: parse an Angular template into the render3 AST.
+///
+/// Parse-only consumers depend on `treaty_ivy_template` with `default-features = false,
+/// features = ["parse-only"]`; this function needs no emitter.
+///
+/// ```
+/// use treaty_ivy_template::{parse_template, ParseTemplateOptions};
+///
+/// let parsed = parse_template("<p>{{ name }}</p>", "app.html", &ParseTemplateOptions::default());
+/// assert!(parsed.errors.is_empty());
+/// assert_eq!(parsed.nodes.len(), 1);
+/// ```
+///
+/// This runs what Angular's `parseTemplate` runs, in the same order: the HTML parser with
+/// `tokenizeExpansionForms: true` and the block, `@let` and selectorless flags from `options`;
+/// an early return with no nodes when the HTML parse failed (unless
+/// `always_attempt_html_to_r3_ast_conversion`); the whitespace pass unless `preserve_whitespaces`;
+/// and the render3 transform with the binding parser.
+///
+/// The i18n meta pass (`I18nMetaVisitor`) is not a separate step here: its i18n metadata is read
+/// inline by the transform. Its early-return on errors is therefore not reproduced.
+pub fn parse_template(
+    template: &str,
+    template_url: &str,
+    options: &ParseTemplateOptions,
+) -> ParsedTemplate {
+    let mut unsupported = Vec::new();
+    let mut report_unsupported = |message: &str| {
+        unsupported.push(ParseError::new(
+            ParseSourceSpan::synthetic(),
+            format!("ParseTemplateOptions: {message} is not supported by treaty_ivy_template"),
+        ));
+    };
+    if options.range.is_some() {
+        report_unsupported("range");
+    }
+    if options.escaped_string {
+        report_unsupported("escapedString");
+    }
+    if options.enable_i18n_legacy_message_id_format {
+        report_unsupported("enableI18nLegacyMessageIdFormat");
+    }
+    if options.preserve_significant_whitespace == Some(false) {
+        report_unsupported("preserveSignificantWhitespace: false");
+    }
+
+    let selectorless = options.enable_selectorless.unwrap_or(false);
+    let tokenize_options = crate::ml_parser::TokenizeOptions {
+        tokenize_expansion_forms: true,
+        tokenize_blocks: options.enable_block_syntax.unwrap_or(true),
+        tokenize_let: options.enable_let_syntax.unwrap_or(true),
+        selectorless_enabled: selectorless,
+        preserve_line_endings: options.preserve_line_endings,
+        i18n_normalize_line_endings_in_icus: options.i18n_normalize_line_endings_in_icus,
+        leading_trivia_chars: options
+            .leading_trivia_chars
+            .clone()
+            .unwrap_or_else(|| LEADING_TRIVIA_CHARS.to_vec()),
+    };
+    let parse_result =
+        crate::ml_parser::HtmlParser::parse(template, template_url, &tokenize_options);
+
+    let abandon = !options.always_attempt_html_to_r3_ast_conversion
+        && !parse_result.errors.is_empty();
+    if abandon {
+        let mut errors = parse_result.errors;
+        errors.extend(unsupported);
+        return ParsedTemplate {
+            preserve_whitespaces: options.preserve_whitespaces,
+            errors,
+            nodes: Vec::new(),
+            style_urls: Vec::new(),
+            styles: Vec::new(),
+            ng_content_selectors: Vec::new(),
+            comment_nodes: options.collect_comment_nodes.then(Vec::new),
+        };
+    }
+
+    let mut binding_parser = crate::template::template_transform::BindingParser::with_selectorless(selectorless);
+    let r3 = crate::template::template_transform::html_ast_to_render3_ast_with_whitespace(
+        &parse_result.root_nodes,
+        &mut binding_parser,
+        crate::template::template_transform::Render3ParseOptions {
+            collect_comment_nodes: options.collect_comment_nodes,
+        },
+        !options.preserve_whitespaces,
+    );
+
+    // Angular: `errors = [...bindingParser.errors, ...transformer.errors]` (already merged into
+    // `r3.errors`), then `errors.push(...parseResult.errors, ...i18nMetaResult.errors)`.
+    let mut errors = r3.errors;
+    errors.extend(parse_result.errors);
+    errors.extend(unsupported);
+
+    ParsedTemplate {
+        preserve_whitespaces: options.preserve_whitespaces,
+        errors,
+        nodes: r3.nodes,
+        style_urls: r3.style_urls,
+        styles: r3.styles,
+        ng_content_selectors: r3.ng_content_selectors,
+        comment_nodes: r3.comment_nodes,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8642,7 +8923,7 @@ mod tests {
     use crate::template::r3_ast::{BoundText, Element, Node, Text};
 
     fn t_span() -> ParseSourceSpan {
-        ParseSourceSpan { start: 0, end: 0 }
+        ParseSourceSpan::synthetic()
     }
 
     /// Parse a template string and run the real HTML -> r3 transform and template builder over it
@@ -8672,6 +8953,26 @@ mod tests {
         let mut builder = TemplateDefinitionBuilder::new(&input);
         let func = builder.build_template_function(&input);
         emit_with_hoisted(&builder, &func)
+    }
+
+    /// The component's `consts` for `src`: the i18n initializer statements (`consts: () => { … }`)
+    /// followed by the const array, as the definition emits them.
+    fn compile_template_consts(src: &str) -> String {
+        use crate::template::template_transform::{html_ast_to_render3_ast, Render3ParseOptions};
+        let parsed = crate::ml_parser::parse(src, "test.html");
+        assert!(parsed.errors.is_empty(), "html parse errors: {:?}", parsed.errors);
+        let mut bp = crate::template::template_transform::BindingParser::new();
+        let r3 = html_ast_to_render3_ast(&parsed.root_nodes, &mut bp, Render3ParseOptions::default());
+        assert!(r3.errors.is_empty(), "r3 transform errors: {:?}", r3.errors);
+        let input = TemplateCompilationInput::new("C_Template", r3.nodes);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let _func = builder.build_template_function(&input);
+        let mut out = String::new();
+        for stmt in builder.const_pool().initializers() {
+            out.push_str(&crate::output::emitter::emit_statements(std::slice::from_ref(stmt)));
+        }
+        out.push_str(&emit_expression(&builder.const_pool().to_const_array().unwrap()));
+        out
     }
 
     /// Emit the root view function PLUS its hoisted nested-view functions concatenated, mirroring
@@ -10415,7 +10716,7 @@ mod tests {
             start_source_span: t_span(),
             end_source_span: None,
             is_void: false,
-            i18n: Some(crate::template::r3_ast::I18nMeta),
+            i18n: Some(crate::template::r3_ast::I18nMeta::Message(crate::i18n::Message::new(Vec::new(), "", "", ""))),
         })]
     }
 
@@ -10522,7 +10823,7 @@ mod tests {
             exhaustive_check: None,
         };
         let input =
-            TemplateCompilationInput::new("Test_Template", i18n_div(vec![Node::SwitchBlock(block)]))
+            TemplateCompilationInput::new("Test_Template", i18n_div(vec![Node::SwitchBlock(Box::new(block))]))
                 .with_dom_only(false);
         let mut builder = TemplateDefinitionBuilder::new(&input);
         let func = builder.build_template_function(&input);
@@ -10587,7 +10888,7 @@ mod tests {
             spans: block_spans(),
             i18n: None,
         };
-        let input = TemplateCompilationInput::new("Test_Template", vec![Node::ForLoopBlock(block)]);
+        let input = TemplateCompilationInput::new("Test_Template", vec![Node::ForLoopBlock(Box::new(block))]);
         let mut builder = TemplateDefinitionBuilder::new(&input);
         let func = builder.build_template_function(&input);
         let out = emit_with_hoisted(&builder, &func);
@@ -10645,7 +10946,7 @@ mod tests {
             spans: block_spans(),
             i18n: None,
         };
-        let input = TemplateCompilationInput::new("Test_Template", vec![Node::ForLoopBlock(block)]);
+        let input = TemplateCompilationInput::new("Test_Template", vec![Node::ForLoopBlock(Box::new(block))]);
         let mut builder = TemplateDefinitionBuilder::new(&input);
         let func = builder.build_template_function(&input);
         let out = emit_with_hoisted(&builder, &func);
@@ -10684,7 +10985,7 @@ mod tests {
             spans: block_spans(),
             i18n: None,
         };
-        let input = TemplateCompilationInput::new("Test_Template", vec![Node::ForLoopBlock(block)]);
+        let input = TemplateCompilationInput::new("Test_Template", vec![Node::ForLoopBlock(Box::new(block))]);
         let mut builder = TemplateDefinitionBuilder::new(&input);
         let func = builder.build_template_function(&input);
         let out = emit_expression(&func);
@@ -10729,7 +11030,7 @@ mod tests {
             spans: block_spans(),
             i18n: None,
         };
-        let input = TemplateCompilationInput::new("Test_Template", vec![Node::ForLoopBlock(block)]);
+        let input = TemplateCompilationInput::new("Test_Template", vec![Node::ForLoopBlock(Box::new(block))]);
         let mut builder = TemplateDefinitionBuilder::new(&input);
         let func = builder.build_template_function(&input);
         let out = emit_expression(&func);
@@ -10779,7 +11080,7 @@ mod tests {
             spans: block_spans(),
             i18n: None,
         };
-        let input = TemplateCompilationInput::new("Test_Template", vec![Node::ForLoopBlock(block)]);
+        let input = TemplateCompilationInput::new("Test_Template", vec![Node::ForLoopBlock(Box::new(block))]);
         let mut builder = TemplateDefinitionBuilder::new(&input);
         let func = builder.build_template_function(&input);
         let out = emit_expression(&func);
@@ -10814,7 +11115,7 @@ mod tests {
             spans: block_spans(),
             i18n: None,
         };
-        let input = TemplateCompilationInput::new("Test_Template", vec![Node::ForLoopBlock(block)]);
+        let input = TemplateCompilationInput::new("Test_Template", vec![Node::ForLoopBlock(Box::new(block))]);
         let mut builder = TemplateDefinitionBuilder::new(&input);
         let func = builder.build_template_function(&input);
         let out = emit_expression(&func);
@@ -10851,7 +11152,7 @@ mod tests {
             exhaustive_check: None,
             spans: block_spans(),
         };
-        let input = TemplateCompilationInput::new("Test_Template", vec![Node::SwitchBlock(block)]);
+        let input = TemplateCompilationInput::new("Test_Template", vec![Node::SwitchBlock(Box::new(block))]);
         let mut builder = TemplateDefinitionBuilder::new(&input);
         let func = builder.build_template_function(&input);
         let out = emit_with_hoisted(&builder, &func);
@@ -10940,7 +11241,7 @@ mod tests {
             inputs: vec![],
             outputs: vec![],
             directives: vec![],
-            children: vec![Node::ForLoopBlock(for_block)],
+            children: vec![Node::ForLoopBlock(Box::new(for_block))],
             references: vec![],
             is_self_closing: false,
             source_span: t_span(),
@@ -11113,7 +11414,7 @@ mod tests {
             start_source_span: t_span(),
             end_source_span: None,
             is_void: false,
-            i18n: Some(I18nMeta),
+            i18n: Some(I18nMeta::Message(crate::i18n::Message::new(Vec::new(), "", "", ""))),
         })]
     }
 
@@ -11159,7 +11460,7 @@ mod tests {
             start_source_span: t_span(),
             end_source_span: None,
             is_void: false,
-            i18n: Some(I18nMeta),
+            i18n: Some(I18nMeta::Message(crate::i18n::Message::new(Vec::new(), "", "", ""))),
         })]
     }
 
@@ -11277,7 +11578,7 @@ mod tests {
             start_source_span: t_span(),
             end_source_span: None,
             is_void: false,
-            i18n: Some(I18nMeta),
+            i18n: Some(I18nMeta::Message(crate::i18n::Message::new(Vec::new(), "", "", ""))),
         })]
     }
 
@@ -11368,7 +11669,7 @@ mod tests {
             start_source_span: t_span(),
             end_source_span: None,
             is_void: false,
-            i18n: Some(I18nMeta),
+            i18n: Some(I18nMeta::Message(crate::i18n::Message::new(Vec::new(), "", "", ""))),
         })]
     }
 
@@ -11443,7 +11744,7 @@ mod tests {
             is_void: false,
             i18n: None,
         });
-        let defer = Node::DeferredBlock(DeferredBlock {
+        let defer = Node::DeferredBlock(Box::new(DeferredBlock {
             children: vec![span_el],
             triggers,
             prefetch_triggers: DeferredBlockTriggers::default(),
@@ -11460,7 +11761,7 @@ mod tests {
             },
             defined_name: None,
             i18n: None,
-        });
+        }));
         let input = TemplateCompilationInput::new("MyApp_Template", vec![defer]);
         let mut builder = TemplateDefinitionBuilder::new(&input);
         let func = builder.build_template_function(&input);
@@ -11521,7 +11822,7 @@ mod tests {
             reference: Some("go".to_string()),
         }));
         main.push_order(TriggerKey::Interaction);
-        let block = Node::DeferredBlock(DeferredBlock {
+        let block = Node::DeferredBlock(Box::new(DeferredBlock {
             children: vec![],
             triggers: main,
             prefetch_triggers: DeferredBlockTriggers::default(),
@@ -11548,7 +11849,7 @@ mod tests {
             },
             defined_name: None,
             i18n: None,
-        });
+        }));
         let go_ref = Reference {
             name: "go".to_string(),
             value: String::new(),
@@ -11596,7 +11897,7 @@ mod tests {
         hydrate.immediate = Some(trig(DeferredTriggerKind::Immediate));
         hydrate.push_order(TriggerKey::Immediate);
         let block = |triggers, hydrate_triggers| {
-            Node::DeferredBlock(DeferredBlock {
+            Node::DeferredBlock(Box::new(DeferredBlock {
                 children: vec![],
                 triggers,
                 prefetch_triggers: DeferredBlockTriggers::default(),
@@ -11613,7 +11914,7 @@ mod tests {
                 },
                 defined_name: None,
                 i18n: None,
-            })
+            }))
         };
         // Two sibling hydrating defers: the runtime activator is emitted once, before the first defer.
         let nodes = vec![block(main.clone(), hydrate.clone()), block(main, hydrate)];
@@ -11940,7 +12241,7 @@ mod tests {
             spans: block_spans(),
             i18n: None,
         };
-        let input = TemplateCompilationInput::new("Test_Template", vec![Node::ForLoopBlock(block)]);
+        let input = TemplateCompilationInput::new("Test_Template", vec![Node::ForLoopBlock(Box::new(block))]);
         let mut builder = TemplateDefinitionBuilder::new(&input);
         let func = builder.build_template_function(&input);
         let out = emit_expression(&func);
@@ -11979,7 +12280,7 @@ mod tests {
             exhaustive_check: None,
             spans: block_spans(),
         };
-        let input = TemplateCompilationInput::new("Test_Template", vec![Node::SwitchBlock(block)]);
+        let input = TemplateCompilationInput::new("Test_Template", vec![Node::SwitchBlock(Box::new(block))]);
         let mut builder = TemplateDefinitionBuilder::new(&input);
         let func = builder.build_template_function(&input);
         let out = emit_expression(&func);
@@ -12408,6 +12709,41 @@ mod tests {
         assert!(out.contains("\u{0275}\u{0275}element(2, \"circle\")"), "got: {out}");
     }
 
+    /// A static `i18n-<attr>` attribute (`meaning_description_template.js`): its message is an
+    /// initializer (`let i18n_0; if (…) … else { i18n_0 = $localize\`:m|d@@id:Hi\`; }`) read from the
+    /// element's attribute array as `["title", i18n_0]`. It is NOT a `consts` entry of its own.
+    #[test]
+    fn static_i18n_attribute_reads_its_message_from_the_attribute_array() {
+        let out = compile_template_consts("<div i18n-title=\"m|d@@id\" title=\"Hi\"></div>");
+        assert!(out.contains("let i18n_0;"), "got: {out}");
+        assert!(out.contains("i18n_0 = $localize`:m|d@@id:Hi`;"), "got: {out}");
+        assert!(out.contains("[\"title\", i18n_0]"), "got: {out}");
+        // Only the attribute array is a const entry: the message itself is not returned on its own.
+        assert!(!out.contains("return [i18n_0"), "got: {out}");
+    }
+
+    /// `do not create translation for empty attributes` (`meta.ts`): a valueless `title` gets no message,
+    /// so no initializer is emitted and the attribute keeps its empty string value.
+    #[test]
+    fn empty_i18n_attribute_gets_no_translation() {
+        let out = compile_template_consts("<div i18n-title=\"m|d\" title></div>");
+        assert!(!out.contains("let i18n_"), "got: {out}");
+        assert!(!out.contains("i18n_0"), "got: {out}");
+    }
+
+    /// Attribute messages are initializers ahead of block messages (`i18n_const_collection.ts` order), and
+    /// each `i18n_<n>` name is unique even though attribute messages take no `consts` slot.
+    #[test]
+    fn attribute_messages_precede_block_messages_with_unique_names() {
+        let out = compile_template_consts(
+            "<span i18n-title=\"a\" title=\"Attr\"></span><div i18n=\"b\">Block</div>",
+        );
+        let attr = out.find("let i18n_0;").expect("attribute message declared first");
+        let block = out.find("let i18n_1;").expect("block message declared second");
+        assert!(attr < block, "got: {out}");
+        assert!(out.contains("[i18n_1, [\"title\", i18n_0]]"), "got: {out}");
+    }
+
     /// MathML (`mathml_template.js`): `ɵɵnamespaceMathML()` before `math`, `ɵɵnamespaceHTML()` after.
     #[test]
     fn mathml_subtree_emits_mathml_namespace() {
@@ -12464,5 +12800,135 @@ mod tests {
 
         let two_roots = vec![svg.clone(), svg];
         assert_eq!(emit_expression(&single_root_tag(&two_roots, &[])).trim(), "null;");
+    }
+}
+
+#[cfg(test)]
+mod parse_template_tests {
+    use super::*;
+
+    fn element(node: &t::Node) -> &t::Element {
+        match node {
+            t::Node::Element(e) => e,
+            other => panic!("expected element, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn returns_nodes_and_every_diagnostic_in_one_list() {
+        // A binding error (`a b`) is produced by the transform; it is reported with the nodes.
+        let parsed = parse_template("<p>{{ a b }}</p>", "t.html", &ParseTemplateOptions::default());
+        assert_eq!(parsed.nodes.len(), 1);
+        assert_eq!(parsed.errors.len(), 1, "{:?}", parsed.errors);
+        assert!(parsed.errors[0].msg.starts_with("Parser Error:"));
+        assert_eq!(parsed.errors[0].span.start.line, 0);
+        assert!(parsed.comment_nodes.is_none());
+    }
+
+    #[test]
+    fn html_errors_abandon_the_parse_unless_always_attempted() {
+        // `}` in text is an HTML parse error ("Unexpected closing block").
+        let default = parse_template("<p>}</p>", "t.html", &ParseTemplateOptions::default());
+        assert!(default.nodes.is_empty(), "{:?}", default.nodes);
+        assert_eq!(default.errors.len(), 1, "{:?}", default.errors);
+        assert!(default.errors[0].msg.starts_with("Unexpected closing block"));
+
+        let always = ParseTemplateOptions {
+            always_attempt_html_to_r3_ast_conversion: true,
+            ..ParseTemplateOptions::default()
+        };
+        let attempted = parse_template("<p>}</p>", "t.html", &always);
+        assert_eq!(attempted.nodes.len(), 1);
+        assert!(attempted.errors.iter().any(|e| e.msg.starts_with("Unexpected closing block")));
+    }
+
+    #[test]
+    fn preserve_whitespaces_keeps_insignificant_whitespace_nodes() {
+        let src = "<p>a</p>\n  <p>b</p>";
+        let removed = parse_template(src, "t.html", &ParseTemplateOptions::default());
+        assert_eq!(removed.nodes.len(), 2, "whitespace-only text is removed by default");
+        let kept = parse_template(
+            src,
+            "t.html",
+            &ParseTemplateOptions { preserve_whitespaces: true, ..Default::default() },
+        );
+        assert_eq!(kept.nodes.len(), 3);
+        assert!(kept.preserve_whitespaces);
+    }
+
+    #[test]
+    fn leading_trivia_moves_the_text_span_start_past_whitespace() {
+        // `leadingTriviaChars` (default `LEADING_TRIVIA_CHARS`): the span starts at `h`, the full start
+        // stays at the first character.
+        let parsed = parse_template(
+            "  \n hello",
+            "t.html",
+            &ParseTemplateOptions { preserve_whitespaces: true, ..Default::default() },
+        );
+        let text = match &parsed.nodes[0] {
+            t::Node::Text(t) => t,
+            other => panic!("expected text, got {other:?}"),
+        };
+        assert_eq!(text.source_span.start.offset, 4);
+        assert_eq!(text.source_span.full_start.offset, 0);
+        assert_eq!(text.source_span.to_source_string(), "hello");
+    }
+
+    #[test]
+    fn collect_comment_nodes_fills_comment_nodes() {
+        let parsed = parse_template(
+            "<!-- one --><p></p>",
+            "t.html",
+            &ParseTemplateOptions { collect_comment_nodes: true, ..Default::default() },
+        );
+        let comments = parsed.comment_nodes.expect("comment nodes requested");
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].value, "one"); // trimmed, as Angular's `_consumeComment` does
+    }
+
+    #[test]
+    fn selectorless_option_turns_capitalised_tags_into_component_nodes() {
+        let plain = parse_template("<Foo></Foo>", "t.html", &ParseTemplateOptions::default());
+        assert!(matches!(plain.nodes[0], t::Node::Element(_)), "{:?}", plain.nodes);
+        let selectorless = parse_template(
+            "<Foo></Foo>",
+            "t.html",
+            &ParseTemplateOptions { enable_selectorless: Some(true), ..Default::default() },
+        );
+        assert!(matches!(selectorless.nodes[0], t::Node::Component(_)), "{:?}", selectorless.nodes);
+    }
+
+    #[test]
+    fn block_syntax_can_be_turned_off() {
+        let on = parse_template("@if (a) {x}", "t.html", &ParseTemplateOptions::default());
+        assert!(matches!(on.nodes[0], t::Node::IfBlock(_)));
+        let off = parse_template(
+            "@if (a) {x}",
+            "t.html",
+            &ParseTemplateOptions { enable_block_syntax: Some(false), ..Default::default() },
+        );
+        assert!(!off.nodes.iter().any(|n| matches!(n, t::Node::IfBlock(_))), "{:?}", off.nodes);
+    }
+
+    #[test]
+    fn unsupported_options_are_reported_not_ignored() {
+        let parsed = parse_template(
+            "<p></p>",
+            "t.html",
+            &ParseTemplateOptions {
+                range: Some(LexerRange { start_pos: 0, start_line: 0, start_col: 0, end_pos: 3 }),
+                escaped_string: true,
+                enable_i18n_legacy_message_id_format: true,
+                preserve_significant_whitespace: Some(false),
+                ..Default::default()
+            },
+        );
+        let messages: Vec<&str> = parsed.errors.iter().map(|e| e.msg.as_str()).collect();
+        assert_eq!(messages.len(), 4, "{messages:?}");
+        for name in ["range", "escapedString", "enableI18nLegacyMessageIdFormat", "preserveSignificantWhitespace"] {
+            assert!(messages.iter().any(|m| m.contains(name)), "no error for {name}: {messages:?}");
+        }
+        // The template is still converted.
+        assert_eq!(element(&parsed.nodes[0]).name, "p");
     }
 }

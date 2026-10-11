@@ -14,24 +14,12 @@
 use std::rc::Rc;
 
 // ---------------------------------------------------------------------------
-// ParseSourceSpan placeholder (real one lives in `parse_util`; minimal here).
+// Source spans: the shared `parse_util` model (Angular's `o.Expression.sourceSpan` is a
+// `ParseSourceSpan`). Byte-offset producers (oxc spans of the TypeScript source) convert with
+// `ParseLocation::from_byte_offset`.
 // ---------------------------------------------------------------------------
 
-/// Minimal placeholder for `parse_util::ParseSourceSpan`. Real port carries
-/// `ParseLocation` start/end + details; here we only need a structurally-comparable
-/// span so nodes can hold `Option<ParseSourceSpan>`. Equality of spans is *ignored*
-/// by `is_equivalent`, so its `PartialEq` is for completeness only.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParseSourceSpan {
-    pub start: usize,
-    pub end: usize,
-}
-
-impl ParseSourceSpan {
-    pub fn new(start: usize, end: usize) -> Self {
-        ParseSourceSpan { start, end }
-    }
-}
+pub use crate::parse_util::ParseSourceSpan;
 
 // ---------------------------------------------------------------------------
 // i18n stub types (real ones live in `../i18n/i18n_ast` + `../render3/view/i18n/meta`).
@@ -1766,7 +1754,7 @@ mod tests {
     fn is_equivalent_ignores_type_and_span() {
         let a = Expr::with_type(ExprKind::ReadVar { name: "v".into() }, Some(number_type()));
         let mut b = Expr::bare(ExprKind::ReadVar { name: "v".into() });
-        b.meta.span = Some(ParseSourceSpan::new(0, 3));
+        b.meta.span = Some(ParseSourceSpan::synthetic());
         assert!(a.is_equivalent(&b));
 
         let c = Expr::bare(ExprKind::ReadVar { name: "w".into() });

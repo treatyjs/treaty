@@ -34,14 +34,11 @@
 //! with no `output_ast`-level payload to lower); it emits a clearly-named
 //! `__unsupported_WrappedNode` identifier so emission never aborts.
 
-// At least one emit backend must be selected. `oxc` (default) compiles the `Lowerer` below
-// (the only `oxc_*`-AST consumer in this crate); `swc` routes the public functions to the
-// engine-neutral printer in `emitter_swc.rs`. Both may be on at once (the `--features swc`
-// gate build keeps `oxc` from `default`); the public dispatch then prefers the neutral printer.
-#[cfg(not(any(feature = "oxc", feature = "swc")))]
-compile_error!(
-    "treaty_ivy_core needs an emit backend feature: `oxc` (default) or `swc` (see SWC-BACKEND-PLAN)"
-);
+// The `oxc` feature compiles the `Lowerer` below (the only `oxc_*`-AST consumer in this crate); `swc`
+// routes the public functions to the engine-neutral printer in `emitter_swc.rs`. Both may be on at once
+// (the `--features swc` gate build keeps `oxc` from `default`); the public dispatch then prefers the
+// neutral printer. With NEITHER feature (the parse-only configuration) this module compiles to its
+// non-emitting core and the public `emit_*` functions are absent: a parse-only consumer uses no emitter.
 
 // --- oxc emit backend imports ------------------------------------------------
 // Compiled ONLY for the oxc emit path (`oxc` on, `swc` off). Under `--no-default-features
@@ -69,11 +66,18 @@ use oxc_codegen::Codegen;
 use oxc_span::{SourceType, SPAN};
 
 #[cfg(all(feature = "oxc", not(feature = "swc")))]
-use crate::output::source_map::{byte_offset_to_line_col, utf16_columns, SourceMapBuilder};
+#[cfg(all(feature = "oxc", not(feature = "swc")))]
+use crate::output::comments::{comment_lines, expr_comment_text, expr_has_identifier_head};
+#[cfg(all(feature = "oxc", not(feature = "swc")))]
+use crate::output::emit_options::current_emit_options;
+use crate::output::emit_options::{with_emit_options, EmitOptions};
+#[cfg(all(feature = "oxc", not(feature = "swc")))]
+use crate::output::source_map::{utf16_columns, utf16_offset_to_line_col, SourceMapBuilder};
 
 // `o::Stmt` / `o::Expr` appear in EVERY public function signature (both the oxc and the swc
 // dispatch variants), so the neutral IR alias is always in scope; the rest of the IR surface
 // is only named by the oxc `Lowerer`.
+#[cfg(any(feature = "oxc", feature = "swc"))]
 use crate::output_ast as o;
 #[cfg(all(feature = "oxc", not(feature = "swc")))]
 use crate::output_ast::{
@@ -110,7 +114,7 @@ pub fn emit_statements(stmts: &[o::Stmt]) -> String {
     let lowerer = Lowerer::new(&allocator);
     let mut lowered = lowerer.ast.vec_with_capacity(stmts.len());
     for stmt in stmts {
-        lowered.push(lowerer.lower_stmt(stmt));
+        lowerer.lower_stmt_into(stmt, &mut lowered);
     }
     // Prepend `import * as iN from "module";` for every external module referenced
     // while lowering. This must run AFTER lowering so the import manager has seen
@@ -123,6 +127,16 @@ pub fn emit_statements(stmts: &[o::Stmt]) -> String {
         body.push(stmt);
     }
     lowerer.codegen(body)
+}
+
+/// [`emit_statements`] with explicit [`EmitOptions`]: the options apply to this call only.
+pub fn emit_statements_with(stmts: &[o::Stmt], opts: &EmitOptions) -> String {
+    with_emit_options(*opts, || emit_statements(stmts))
+}
+
+/// [`emit_expression`] with explicit [`EmitOptions`]: the options apply to this call only.
+pub fn emit_expression_with(expr: &o::Expr, opts: &EmitOptions) -> String {
+    with_emit_options(*opts, || emit_expression(expr))
 }
 
 /// Lower a single `output_ast` expression to JS and return the printed source.
@@ -198,7 +212,7 @@ fn emit_with_anchors_stmts(stmts: &[o::Stmt]) -> (String, Vec<EmittedAnchor>) {
     let lowerer = Lowerer::with_anchor_tracking(&allocator);
     let mut lowered = lowerer.ast.vec_with_capacity(stmts.len());
     for stmt in stmts {
-        lowered.push(lowerer.lower_stmt(stmt));
+        lowerer.lower_stmt_into(stmt, &mut lowered);
     }
     let mut body = lowerer.ast.vec();
     for import in lowerer.namespace_import_stmts() {
@@ -245,7 +259,7 @@ fn build_source_map(
         search_from = gen_byte + anchor.token.len();
 
         let generated = generated_byte_to_line_col(code, gen_byte);
-        let original = byte_offset_to_line_col(source_content, anchor.span.start);
+        let original = utf16_offset_to_line_col(source_content, anchor.span.start.offset);
         builder.add_segment(generated, src_index, original);
     }
     builder
@@ -350,7 +364,7 @@ pub fn build_definition_map(
         let gen_byte = search_from + rel;
         search_from = gen_byte + anchor.token.len();
         let generated = generated_byte_to_line_col(full_code, gen_byte);
-        let original = byte_offset_to_line_col(source_content, anchor.span.start);
+        let original = utf16_offset_to_line_col(source_content, anchor.span.start.offset);
         builder.add_segment(generated, src_index, original);
     }
     builder.to_json()
@@ -402,6 +416,9 @@ struct Lowerer<'a> {
     /// `Some` when this lowering pass should record source-map anchors for span-carrying
     /// nodes; `None` for the plain `emit_*` path (zero overhead, no behavioural change).
     anchors: Option<RefCell<Vec<EmittedAnchor>>>,
+    /// The rendered lines of every leading comment lowered into a marker (`__treaty_lc<N>__`), indexed
+    /// by `N`. `codegen` resolves the markers after printing (see [`resolve_comment_markers`]).
+    comment_lines: RefCell<Vec<Vec<String>>>,
 }
 
 /// Maps module specifiers (`@angular/core`, ...) to stable namespace import aliases
@@ -435,6 +452,7 @@ impl<'a> Lowerer<'a> {
             ast: AstBuilder::new(allocator),
             imports: RefCell::new(ImportManager::default()),
             anchors: None,
+            comment_lines: RefCell::new(Vec::new()),
         }
     }
 
@@ -445,6 +463,7 @@ impl<'a> Lowerer<'a> {
             ast: AstBuilder::new(allocator),
             imports: RefCell::new(ImportManager::default()),
             anchors: Some(RefCell::new(Vec::new())),
+            comment_lines: RefCell::new(Vec::new()),
         }
     }
 
@@ -512,6 +531,7 @@ impl<'a> Lowerer<'a> {
             body,
         );
         let code = Codegen::new().build(&program).code;
+        let code = resolve_comment_markers(&code, &self.comment_lines.borrow());
         // Two value-preserving text post-passes over the printed source, each of
         // which skips string / template / comment (/ regex) spans so only real code
         // tokens are touched:
@@ -522,6 +542,13 @@ impl<'a> Lowerer<'a> {
         //     around a lone simple arrow parameter (`(x) =>` -> `x =>`).
         let code = normalize_numeric_literals(&code);
         let code = drop_single_param_arrow_parens(&code);
+        // `EmitOptions::escape_non_ascii` (default off): TypeScript's string-literal escaping. oxc has no
+        // such switch, so the printed string literals are rewritten here (identifiers and comments are not).
+        let code = if current_emit_options().escape_non_ascii {
+            escape_non_ascii_string_literals(&code)
+        } else {
+            code
+        };
         // NOTE: the i18n runtime placeholder magic strings (`�0�`, `�#1�`, …) carry a RAW U+FFFD
         // code point, which is exactly what `@angular/compiler`'s real emitter (and oxc_codegen)
         // produce. We deliberately do NOT escape it to `�`: the escaped spelling only ever
@@ -552,6 +579,25 @@ impl<'a> Lowerer<'a> {
     }
 
     // -- statements -------------------------------------------------------
+
+    /// Lower `stmt`, pushing it into `out`. A statement with leading comments is preceded by one marker
+    /// statement per comment (`__treaty_lc<N>__;`), which [`resolve_comment_markers`] replaces with the
+    /// comment's lines on their own lines before the statement.
+    fn lower_stmt_into(&self, stmt: &o::Stmt, out: &mut ArenaVec<'a, Statement<'a>>) {
+        for comment in &stmt.meta.leading_comments {
+            let marker = self.register_comment(comment_lines(comment));
+            let expr = self.ident_expr(&format!("__treaty_lc{marker}__"));
+            out.push(self.ast.statement_expression(SPAN, expr));
+        }
+        out.push(self.lower_stmt(stmt));
+    }
+
+    /// Record a comment's rendered lines and return its marker index.
+    fn register_comment(&self, lines: Vec<String>) -> usize {
+        let mut table = self.comment_lines.borrow_mut();
+        table.push(lines);
+        table.len() - 1
+    }
 
     fn lower_stmt(&self, stmt: &o::Stmt) -> Statement<'a> {
         match &stmt.kind {
@@ -646,7 +692,7 @@ impl<'a> Lowerer<'a> {
     fn block(&self, stmts: &[o::Stmt]) -> Statement<'a> {
         let mut body = self.ast.vec_with_capacity(stmts.len());
         for s in stmts {
-            body.push(self.lower_stmt(s));
+            self.lower_stmt_into(s, &mut body);
         }
         self.ast.statement_block(SPAN, body)
     }
@@ -655,7 +701,7 @@ impl<'a> Lowerer<'a> {
     fn lower_fn_body(&self, stmts: &[o::Stmt]) -> ArenaBox<'a, FunctionBody<'a>> {
         let mut body = self.ast.vec_with_capacity(stmts.len());
         for s in stmts {
-            body.push(self.lower_stmt(s));
+            self.lower_stmt_into(s, &mut body);
         }
         self.ast.alloc_function_body(SPAN, self.ast.vec(), body)
     }
@@ -679,6 +725,17 @@ impl<'a> Lowerer<'a> {
     // -- expressions ------------------------------------------------------
 
     fn lower_expr(&self, expr: &o::Expr) -> Expression<'a> {
+        let mut lowered = self.lower_expr_bare(expr);
+        if !expr.meta.leading_comments.is_empty() && expr_has_identifier_head(expr) {
+            // An expression comment is printed inline before the expression's leftmost identifier, so the
+            // marker is that identifier's name prefix (`__treaty_lc<N>__goog`).
+            let marker = self.register_comment(vec![expr_comment_text(&expr.meta.leading_comments)]);
+            prefix_head_identifier(self, &mut lowered, &format!("__treaty_lc{marker}__"));
+        }
+        lowered
+    }
+
+    fn lower_expr_bare(&self, expr: &o::Expr) -> Expression<'a> {
         match &expr.kind {
             ExprKind::ReadVar { name } => {
                 // A read of a named variable prints exactly `name`; if the front-end
@@ -1354,6 +1411,198 @@ fn parse_js_number(tok: &str) -> Option<f64> {
     }
     // Decimal / scientific: Rust's f64 parser matches JS's grammar for these.
     tok.parse::<f64>().ok()
+}
+
+/// Put the marker `prefix` in front of the leftmost identifier of a lowered expression (the printed first
+/// token), so the marker lands directly before that identifier. Mirrors [`expr_has_identifier_head`].
+#[cfg(all(feature = "oxc", not(feature = "swc")))]
+fn prefix_head_identifier<'a>(lowerer: &Lowerer<'a>, expr: &mut Expression<'a>, prefix: &str) -> bool {
+    match expr {
+        Expression::Identifier(id) => {
+            let renamed = format!("{prefix}{}", id.name);
+            id.name = lowerer.ast.ident(&renamed);
+            true
+        }
+        Expression::CallExpression(call) => prefix_head_identifier(lowerer, &mut call.callee, prefix),
+        Expression::StaticMemberExpression(member) => {
+            prefix_head_identifier(lowerer, &mut member.object, prefix)
+        }
+        Expression::ComputedMemberExpression(member) => {
+            prefix_head_identifier(lowerer, &mut member.object, prefix)
+        }
+        _ => false,
+    }
+}
+
+/// Replace every comment marker (`__treaty_lc<N>__`) in printed `code` with the comment `table[N]`.
+///
+/// A marker that is alone on its line and followed by `;` is a statement marker: its lines go on their own
+/// lines at the same indentation. Any other marker is an expression marker: its text goes inline, followed
+/// by a space, directly before the identifier it prefixes (the same place the swc printer puts it).
+#[cfg(all(feature = "oxc", not(feature = "swc")))]
+fn resolve_comment_markers(code: &str, table: &[Vec<String>]) -> String {
+    const PREFIX: &str = "__treaty_lc";
+    if table.is_empty() || !code.contains(PREFIX) {
+        return code.to_string();
+    }
+    let mut out = String::with_capacity(code.len());
+    let mut rest = code;
+    while let Some(pos) = rest.find(PREFIX) {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos + PREFIX.len()..];
+        let digits = after.bytes().take_while(u8::is_ascii_digit).count();
+        let index = after[..digits].parse::<usize>().ok();
+        let lines = index.and_then(|i| table.get(i));
+        let (Some(lines), true) = (lines, after[digits..].starts_with("__")) else {
+            out.push_str(PREFIX);
+            rest = after;
+            continue;
+        };
+        let tail = &after[digits + 2..];
+        let line_start = out.rfind('\n').map_or(0, |i| i + 1);
+        let at_line_start = out[line_start..].bytes().all(|b| b == b'\t' || b == b' ');
+        if at_line_start && tail.starts_with(';') {
+            let indent = out[line_start..].to_string();
+            out.push_str(&lines.join(&format!("\n{indent}")));
+            rest = &tail[1..];
+        } else {
+            out.push_str(&lines.join(" "));
+            out.push(' ');
+            rest = tail;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// [`EmitOptions::escape_non_ascii`] for the oxc backend: rewrite every string literal in `code` the way
+/// the TypeScript printer does. Each non-ASCII UTF-16 code unit becomes `\uXXXX`, and oxc's `\xHH`
+/// control escapes become `\u00HH` (NUL keeps `\0` / `\x00`). Template literal bodies are left alone
+/// (TypeScript prints `rawText` verbatim), though their `${…}` substitutions are scanned as code. Code,
+/// identifiers and comments are copied unchanged.
+#[cfg(all(feature = "oxc", not(feature = "swc")))]
+fn escape_non_ascii_string_literals(code: &str) -> String {
+    enum Mode {
+        /// Code. `brace_depth` counts `{` opened inside it; `in_subst` is a template `${…}` body.
+        Code { brace_depth: usize, in_subst: bool },
+        /// Inside a `"…"` or `'…'` literal opened by this quote.
+        Str(char),
+        /// Inside a template literal's raw text.
+        Tpl,
+    }
+    let mut out = String::with_capacity(code.len());
+    let mut stack = vec![Mode::Code { brace_depth: 0, in_subst: false }];
+    let mut it = code.chars().peekable();
+    while let Some(c) = it.next() {
+        match stack.last_mut().expect("mode stack is never empty") {
+            Mode::Code { brace_depth, in_subst } => match c {
+                '"' | '\'' => {
+                    out.push(c);
+                    stack.push(Mode::Str(c));
+                }
+                '`' => {
+                    out.push(c);
+                    stack.push(Mode::Tpl);
+                }
+                '/' if it.peek() == Some(&'/') => {
+                    out.push(c);
+                    while let Some(&n) = it.peek() {
+                        if n == '\n' {
+                            break;
+                        }
+                        out.push(n);
+                        it.next();
+                    }
+                }
+                '/' if it.peek() == Some(&'*') => {
+                    out.push(c);
+                    out.push(it.next().expect("peeked"));
+                    let mut prev = '\0';
+                    for n in it.by_ref() {
+                        out.push(n);
+                        if prev == '*' && n == '/' {
+                            break;
+                        }
+                        prev = n;
+                    }
+                }
+                '{' => {
+                    *brace_depth += 1;
+                    out.push(c);
+                }
+                '}' if *in_subst && *brace_depth == 0 => {
+                    stack.pop();
+                    out.push(c);
+                }
+                '}' => {
+                    *brace_depth = brace_depth.saturating_sub(1);
+                    out.push(c);
+                }
+                other => out.push(other),
+            },
+            Mode::Str(quote) => {
+                let quote = *quote;
+                match c {
+                    '\\' => match it.next() {
+                        Some('x') => {
+                            let hex: String = it.by_ref().take(2).collect();
+                            match u16::from_str_radix(&hex, 16) {
+                                Ok(0) if hex.len() == 2 => out.push_str("\\x00"),
+                                Ok(unit) if hex.len() == 2 => {
+                                    out.push_str(&crate::output::emit_options::utf16_escape(unit));
+                                }
+                                _ => {
+                                    out.push_str("\\x");
+                                    out.push_str(&hex);
+                                }
+                            }
+                        }
+                        Some(n) => {
+                            out.push('\\');
+                            out.push(n);
+                        }
+                        None => out.push('\\'),
+                    },
+                    c if c == quote => {
+                        out.push(c);
+                        stack.pop();
+                    }
+                    // oxc prints a TAB raw inside a string; TypeScript escapes it (and the other C0 controls).
+                    '\t' => out.push_str("\\t"),
+                    '\u{0B}' => out.push_str("\\v"),
+                    '\u{0C}' => out.push_str("\\f"),
+                    '\u{08}' => out.push_str("\\b"),
+                    c if (c as u32) < 0x20 => out.push_str(&crate::output::emit_options::utf16_escape(c as u16)),
+                    c if !c.is_ascii() => {
+                        let mut buf = [0u16; 2];
+                        for unit in c.encode_utf16(&mut buf) {
+                            out.push_str(&crate::output::emit_options::utf16_escape(*unit));
+                        }
+                    }
+                    c => out.push(c),
+                }
+            }
+            Mode::Tpl => match c {
+                '\\' => {
+                    out.push(c);
+                    if let Some(n) = it.next() {
+                        out.push(n);
+                    }
+                }
+                '`' => {
+                    out.push(c);
+                    stack.pop();
+                }
+                '$' if it.peek() == Some(&'{') => {
+                    out.push(c);
+                    out.push(it.next().expect("peeked"));
+                    stack.push(Mode::Code { brace_depth: 0, in_subst: true });
+                }
+                c => out.push(c),
+            },
+        }
+    }
+    out
 }
 
 /// Rewrite each minified numeric literal in `code` to its plain-decimal Angular form.
@@ -2242,7 +2491,8 @@ mod tests {
 
     #[test]
     fn with_map_anchors_span_carrying_var_decl() {
-        use crate::output::source_map::{byte_offset_to_line_col, decode_mappings};
+        use crate::output::source_map::{decode_mappings, utf16_offset_to_line_col};
+        use crate::parse_util::ParseSourceFile;
         // A DeclareVar carrying an original-source span anchors its emitted `name` token.
         let source = "let myVar = 1;";
         let var_byte = source.find("myVar").unwrap();
@@ -2254,7 +2504,8 @@ mod tests {
             },
             StmtModifier::FINAL,
         );
-        stmt.meta.span = Some(ParseSourceSpan::new(var_byte, var_byte + 5));
+        let file = ParseSourceFile::new(source, "src.ts");
+        stmt.meta.span = Some(ParseSourceSpan::from_byte_range(file, var_byte, var_byte + 5));
 
         let (_code, map) = emit_statements_with_map(
             std::slice::from_ref(&stmt),
@@ -2271,7 +2522,7 @@ mod tests {
         let rest = &map[s..];
         let mappings = &rest[..rest.find('"').unwrap()];
         let decoded = decode_mappings(mappings).expect("decode");
-        let expected = byte_offset_to_line_col(source, var_byte);
+        let expected = utf16_offset_to_line_col(source, var_byte);
         assert!(
             decoded.iter().any(|&(_, _, _, sl, sc)| sl == expected.line && sc == expected.column),
             "no segment for myVar; decoded {decoded:?}; map {map}"
@@ -2279,9 +2530,45 @@ mod tests {
     }
 
     #[test]
+    fn with_map_anchor_column_is_utf16_after_multibyte_source() {
+        use crate::output::source_map::decode_mappings;
+        use crate::parse_util::ParseSourceFile;
+        // `é` is 2 UTF-8 bytes and 1 UTF-16 unit, `😀` is 4 bytes and 2 units. `myVar` is at byte 22
+        // but at UTF-16 column 19, and the source map column is UTF-16 (the v3 spec's unit).
+        let source = "const é😀 = 1; let myVar = 1;";
+        let var_byte = source.find("myVar").unwrap();
+        assert_eq!(var_byte, 22);
+        let mut stmt = Stmt::with_modifiers(
+            StmtKind::DeclareVar {
+                name: "myVar".to_string(),
+                value: Some(num(1.0)),
+                ty: None,
+            },
+            StmtModifier::FINAL,
+        );
+        let file = ParseSourceFile::new(source, "src.ts");
+        stmt.meta.span = Some(ParseSourceSpan::from_byte_range(file, var_byte, var_byte + 5));
+
+        let (_code, map) = emit_statements_with_map(
+            std::slice::from_ref(&stmt),
+            "out.js",
+            "src.ts",
+            source,
+        );
+        let key = "\"mappings\":\"";
+        let s = map.find(key).unwrap() + key.len();
+        let rest = &map[s..];
+        let decoded = decode_mappings(&rest[..rest.find('"').unwrap()]).expect("decode");
+        assert!(
+            decoded.iter().any(|&(_, _, _, sl, sc)| sl == 0 && sc == 19),
+            "expected original line 0, UTF-16 column 19; decoded {decoded:?}; map {map}"
+        );
+    }
+
+    #[test]
     fn localized_string_emits_dollar_localize_tagged_template() {
         use crate::output_ast::{I18nMeta, LiteralPiece, ParseSourceSpan, PlaceholderPiece};
-        let sp = ParseSourceSpan::new(0, 0);
+        let sp = ParseSourceSpan::synthetic();
         let ls = o::Expr::bare(ExprKind::LocalizedString {
             meta: I18nMeta {
                 description: Some("greeting".to_string()),
@@ -2308,5 +2595,136 @@ mod tests {
         // Placeholder meta block on the second part.
         assert!(out.contains(":PH:!"), "got: {out}");
         assert!(out.contains("${"), "got: {out}");
+    }
+}
+
+#[cfg(all(test, feature = "oxc", not(feature = "swc")))]
+mod escape_non_ascii_tests {
+    //! The oxc backend's `EmitOptions::escape_non_ascii` cases. The same expected text is asserted for the
+    //! swc printer in `emitter_swc::escape_non_ascii_tests`, so the two backends stay byte-identical.
+    use super::*;
+    use crate::output::emit_options::EmitOptions;
+
+    const ON: EmitOptions = EmitOptions { escape_non_ascii: true };
+
+    fn str_lit(s: &str) -> o::Expr {
+        crate::output_ast::literal(LiteralValue::String(s.to_string()), None)
+    }
+
+    fn call_with(arg: o::Expr) -> o::Expr {
+        crate::output_ast::variable("f", None).call_fn(vec![arg], false)
+    }
+
+    fn print_on(arg: &str) -> String {
+        emit_expression_with(&call_with(str_lit(arg)), &ON)
+    }
+
+    #[test]
+    fn bmp_non_ascii_is_escaped_as_utf16_units() {
+        assert_eq!(print_on("é"), "f(\"\\u00E9\");\n");
+        assert_eq!(print_on("\u{FFFD}0\u{FFFD}"), "f(\"\\uFFFD0\\uFFFD\");\n");
+        assert_eq!(print_on("\u{00A0}"), "f(\"\\u00A0\");\n");
+    }
+
+    #[test]
+    fn astral_characters_become_surrogate_pairs() {
+        assert_eq!(print_on("🚀"), "f(\"\\uD83D\\uDE80\");\n");
+    }
+
+    #[test]
+    fn existing_backslash_u_text_is_escaped_backslash_not_reinterpreted() {
+        assert_eq!(print_on("\\uFFFD"), "f(\"\\\\uFFFD\");\n");
+    }
+
+    #[test]
+    fn control_characters_follow_typescript_table() {
+        assert_eq!(print_on("\u{07}"), "f(\"\\u0007\");\n");
+        assert_eq!(print_on("\u{1B}"), "f(\"\\u001B\");\n");
+        assert_eq!(print_on("\t\n\r"), "f(\"\\t\\n\\r\");\n");
+        assert_eq!(print_on("\u{0}"), "f(\"\\0\");\n");
+        assert_eq!(print_on("\u{0}1"), "f(\"\\x001\");\n");
+    }
+
+    #[test]
+    fn ascii_and_quotes_are_unchanged() {
+        assert_eq!(print_on("say \"hi\""), "f(\"say \\\"hi\\\"\");\n");
+        assert_eq!(print_on("plain"), "f(\"plain\");\n");
+    }
+
+    #[test]
+    fn identifiers_with_non_ascii_letters_stay_raw() {
+        let expr = crate::output_ast::variable("ɵɵdefine", None).call_fn(vec![], false);
+        assert_eq!(emit_expression_with(&expr, &ON), "ɵɵdefine();\n");
+    }
+
+    #[test]
+    fn template_raw_text_stays_raw_but_substitutions_are_escaped() {
+        let tpl = o::Expr::bare(o::ExprKind::TemplateLiteral {
+            elements: vec![
+                o::TemplateLiteralElement { text: "é ".into(), raw_text: "é ".into() },
+                o::TemplateLiteralElement { text: String::new(), raw_text: String::new() },
+            ],
+            expressions: vec![str_lit("ü")],
+        });
+        assert_eq!(emit_expression_with(&tpl, &ON), "`é ${\"\\u00FC\"}`;\n");
+    }
+
+    #[test]
+    fn default_option_keeps_raw_characters() {
+        assert_eq!(emit_expression_with(&call_with(str_lit("é")), &EmitOptions::default()), "f(\"é\");\n");
+    }
+}
+
+#[cfg(all(test, feature = "oxc", not(feature = "swc")))]
+mod leading_comment_tests {
+    //! Leading comments on statements and expressions (`@angular/compiler` output AST `leadingComments`).
+    //! The swc printer is pinned to the same bytes in `emitter_swc::leading_comment_tests`.
+    use super::*;
+    use crate::output_ast::{LiteralValue, StmtKind, StmtModifier};
+
+    /// `const MSG = /* @ts-ignore */ goog.getMsg("x");` with a JSDoc above the statement.
+    fn commented_program() -> Vec<o::Stmt> {
+        let mut call = o::variable("goog", None).prop("getMsg").call_fn(
+            vec![o::literal(LiteralValue::String("x".into()), None)],
+            false,
+        );
+        call.meta.leading_comments = vec![o::leading_comment("@ts-ignore", true, true)];
+        let mut decl = o::Stmt::with_modifiers(
+            StmtKind::DeclareVar { name: "MSG".into(), value: Some(call), ty: None },
+            StmtModifier::FINAL,
+        );
+        decl.meta.leading_comments = vec![o::js_doc_comment(vec![o::JsDocTag {
+            tag_name: Some("desc".into()),
+            text: Some("Hello".into()),
+        }])];
+        vec![decl]
+    }
+
+    const COMMENTED_PROGRAM_JS: &str =
+        "/**\n * @desc Hello\n */\nconst MSG = /* @ts-ignore */ goog.getMsg(\"x\");\n";
+
+    #[test]
+    fn statement_jsdoc_and_inline_expression_comment_print_like_angular() {
+        assert_eq!(emit_statements(&commented_program()), COMMENTED_PROGRAM_JS);
+    }
+
+    #[test]
+    fn expression_comment_is_dropped_only_when_it_has_no_identifier_head() {
+        // A literal has no identifier to attach to, so the comment would have no printed position: the
+        // literal prints without it (both emitters agree on this).
+        let mut lit = o::literal(LiteralValue::Number(1.0), None);
+        lit.meta.leading_comments = vec![o::leading_comment("note", true, true)];
+        let out = emit_expression(&lit);
+        assert!(!out.contains("note"), "got: {out}");
+    }
+
+    #[test]
+    fn plain_multiline_and_single_line_statement_comments() {
+        let mut stmt = o::Stmt::bare(StmtKind::Expression(o::variable("a", None)));
+        stmt.meta.leading_comments = vec![
+            o::leading_comment("one", true, true),
+            o::leading_comment("two\nthree", false, true),
+        ];
+        assert_eq!(emit_statements(&[stmt]), "/* one */\n// two\n// three\na;\n");
     }
 }

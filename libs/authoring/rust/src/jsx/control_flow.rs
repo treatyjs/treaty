@@ -480,7 +480,7 @@ mod tests {
     }
 
     #[test]
-    fn forEach_render_list_lowers_to_for() {
+    fn for_each_render_list_lowers_to_for() {
         // `xs.forEach(x => list.push(<li/>))` is the statement form of a render-list map; it lowers
         // its pushed JSX into `@for`.
         let out = lower("<ul>{xs.forEach(x => { list.push(<li>{x}</li>); })}</ul>");

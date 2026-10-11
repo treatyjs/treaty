@@ -14,218 +14,19 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 // ---------------------------------------------------------------------------
-// Spans (port of `parse_util.ts`: ParseSourceFile / ParseLocation / ParseSourceSpan /
-// ParseError). These are owned; `ParseSourceFile` is shared via `Rc` so cloning a cursor
-// or span is cheap.
+// Spans and diagnostics (port of `parse_util.ts`). The single shared definitions live in
+// `treaty_ivy_core::parse_util`; they are re-exported here so `ml_parser::ParseSourceSpan`
+// and friends keep their historical paths. Offsets are UTF-16 code units, as in Angular.
 // ---------------------------------------------------------------------------
 
-/// A parsed source file: its full content and an identifying URL.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParseSourceFile {
-    pub content: String,
-    pub url: String,
-}
+pub use treaty_ivy_core::parse_util::{
+    ParseContext, ParseError, ParseErrorLevel, ParseLocation, ParseSourceFile, ParseSourceSpan,
+};
 
-impl ParseSourceFile {
-    pub fn new(content: impl Into<String>, url: impl Into<String>) -> Rc<ParseSourceFile> {
-        Rc::new(ParseSourceFile {
-            content: content.into(),
-            url: url.into(),
-        })
-    }
-}
-
-/// A location within a [`ParseSourceFile`]: a byte/char offset plus 0-based line and column.
-#[derive(Debug, Clone)]
-pub struct ParseLocation {
-    pub file: Rc<ParseSourceFile>,
-    /// Offset measured in `char`s (UTF code points), matching JS string indexing semantics
-    /// closely enough for ASCII-heavy templates.
-    pub offset: usize,
-    pub line: usize,
-    pub col: usize,
-}
-
-impl PartialEq for ParseLocation {
-    fn eq(&self, other: &Self) -> bool {
-        self.offset == other.offset && self.line == other.line && self.col == other.col
-    }
-}
-
-impl ParseLocation {
-    pub fn new(file: Rc<ParseSourceFile>, offset: usize, line: usize, col: usize) -> Self {
-        ParseLocation {
-            file,
-            offset,
-            line,
-            col,
-        }
-    }
-
-    /// `moveBy(delta)` — returns a new location advanced by `delta` characters, recomputing
-    /// line/column from the underlying file content.
-    pub fn move_by(&self, delta: isize) -> ParseLocation {
-        let chars: Vec<char> = self.file.content.chars().collect();
-        let len = chars.len();
-        let mut offset = self.offset as isize + delta;
-        if offset < 0 {
-            offset = 0;
-        }
-        if offset as usize > len {
-            offset = len as isize;
-        }
-        let target = offset as usize;
-
-        // Recompute line/col by walking from the smaller of (self.offset, target).
-        let mut line = self.line;
-        let mut col = self.col;
-        if target >= self.offset {
-            let mut i = self.offset;
-            while i < target {
-                if chars[i] == '\n' {
-                    line += 1;
-                    col = 0;
-                } else {
-                    col += 1;
-                }
-                i += 1;
-            }
-        } else {
-            // Walk backwards.
-            let mut i = self.offset;
-            while i > target {
-                i -= 1;
-                if chars[i] == '\n' {
-                    line = line.saturating_sub(1);
-                    // Column becomes the length of the previous line; recompute it.
-                    let mut c = 0;
-                    let mut j = i;
-                    while j > 0 && chars[j - 1] != '\n' {
-                        j -= 1;
-                        c += 1;
-                    }
-                    col = c;
-                } else {
-                    col = col.saturating_sub(1);
-                }
-            }
-        }
-        ParseLocation::new(self.file.clone(), target, line, col)
-    }
-
-    /// Returns the source text on the same line, starting `max_chars` before this location.
-    pub fn get_context(&self, max_chars: usize, max_lines: usize) -> Option<(String, String)> {
-        let _ = max_lines;
-        let chars: Vec<char> = self.file.content.chars().collect();
-        if self.offset > chars.len() {
-            return None;
-        }
-        let mut start = self.offset;
-        let mut count = 0;
-        while start > 0 && count < max_chars {
-            start -= 1;
-            count += 1;
-            if chars[start] == '\n' {
-                start += 1;
-                break;
-            }
-        }
-        let before: String = chars[start..self.offset].iter().collect();
-        let mut end = self.offset;
-        while end < chars.len() && end - self.offset < max_chars && chars[end] != '\n' {
-            end += 1;
-        }
-        let after: String = chars[self.offset..end].iter().collect();
-        Some((before, after))
-    }
-}
-
-/// A span between two [`ParseLocation`]s within the same file. `full_start` is the start
-/// including any leading trivia that was trimmed from `start`.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ParseSourceSpan {
-    pub start: ParseLocation,
-    pub end: ParseLocation,
-    pub full_start: ParseLocation,
-    pub details: Option<String>,
-}
-
-impl ParseSourceSpan {
-    pub fn new(start: ParseLocation, end: ParseLocation) -> Self {
-        let full_start = start.clone();
-        ParseSourceSpan {
-            start,
-            end,
-            full_start,
-            details: None,
-        }
-    }
-
-    pub fn with_full_start(
-        start: ParseLocation,
-        end: ParseLocation,
-        full_start: ParseLocation,
-        details: Option<String>,
-    ) -> Self {
-        ParseSourceSpan {
-            start,
-            end,
-            full_start,
-            details,
-        }
-    }
-
-    /// The source text covered by this span (`start.offset..end.offset`).
-    pub fn to_source_string(&self) -> String {
-        let chars: Vec<char> = self.start.file.content.chars().collect();
-        let s = self.start.offset.min(chars.len());
-        let e = self.end.offset.min(chars.len());
-        if s >= e {
-            return String::new();
-        }
-        chars[s..e].iter().collect()
-    }
-}
-
-/// Severity level for a [`ParseError`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ParseErrorLevel {
-    Warning,
-    Error,
-}
-
-/// A diagnostic produced during tokenization or parsing.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ParseError {
-    pub span: ParseSourceSpan,
-    pub msg: String,
-    pub level: ParseErrorLevel,
-    /// `TreeError.elementName` — the name of the element/block this error relates to, if any.
-    pub element_name: Option<String>,
-}
-
-impl ParseError {
-    pub fn new(span: ParseSourceSpan, msg: impl Into<String>) -> Self {
-        ParseError {
-            span,
-            msg: msg.into(),
-            level: ParseErrorLevel::Error,
-            element_name: None,
-        }
-    }
-
-    pub fn tree_error(
-        element_name: Option<String>,
-        span: ParseSourceSpan,
-        msg: impl Into<String>,
-    ) -> Self {
-        ParseError {
-            span,
-            msg: msg.into(),
-            level: ParseErrorLevel::Error,
-            element_name,
-        }
-    }
+/// The UTF-16 length of `text[..byte_index]`: converts a byte index found in `text` into the UTF-16
+/// offset that spans use.
+pub(crate) fn utf16_len_before(text: &str, byte_index: usize) -> usize {
+    treaty_ivy_core::parse_util::byte_to_utf16_offset(text, byte_index)
 }
 
 // ---------------------------------------------------------------------------
@@ -694,14 +495,15 @@ impl Default for TokenizeOptions {
 }
 
 // ---------------------------------------------------------------------------
-// Character cursor (port of `PlainCharacterCursor`). Operates over a `Vec<char>` to
-// match JS code-point indexing.
+// Character cursor (port of `PlainCharacterCursor`). Operates over the UTF-16 code units of the
+// content, exactly as Angular's cursor does (`charCodeAt` / `offset++`), so every offset it
+// produces is a UTF-16 offset: an astral character occupies two positions.
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
 struct Cursor {
     file: Rc<ParseSourceFile>,
-    input: Rc<Vec<char>>,
+    input: Rc<Vec<u16>>,
     end: usize,
     peek: i64,
     offset: usize,
@@ -716,7 +518,7 @@ struct CursorError {
 }
 
 impl Cursor {
-    fn new(file: Rc<ParseSourceFile>, input: Rc<Vec<char>>) -> Self {
+    fn new(file: Rc<ParseSourceFile>, input: Rc<Vec<u16>>) -> Self {
         let end = input.len();
         let mut c = Cursor {
             file,
@@ -775,7 +577,7 @@ impl Cursor {
     }
 
     fn get_chars(&self, start: &Cursor) -> String {
-        self.input[start.offset..self.offset].iter().collect()
+        String::from_utf16_lossy(&self.input[start.offset..self.offset])
     }
 
     fn location(&self) -> ParseLocation {
@@ -873,7 +675,7 @@ impl<'a> Tokenizer<'a> {
         get_tag_definition: &'a TagDefResolver,
         options: &TokenizeOptions,
     ) -> Self {
-        let input: Rc<Vec<char>> = Rc::new(file.content.chars().collect());
+        let input: Rc<Vec<u16>> = Rc::new(file.content.encode_utf16().collect());
         let leading_trivia = options
             .leading_trivia_chars
             .iter()
@@ -1407,8 +1209,21 @@ impl<'a> Tokenizer<'a> {
         Ok(())
     }
 
+    /// `readChar`: the next character of the input. The cursor steps over UTF-16 code units; a
+    /// surrogate pair is read as one character (so the text never holds half of it), and it still
+    /// advances the cursor by both units so every offset stays a UTF-16 offset.
     fn read_char(&mut self) -> TResult<String> {
-        let ch = char::from_u32(self.cursor.peek()).unwrap_or('\u{fffd}');
+        let unit = self.cursor.peek();
+        if (0xD800..0xDC00).contains(&unit) && self.cursor.chars_left() >= 2 {
+            let next = self.cursor.char_at(self.cursor.offset + 1);
+            if (0xDC00..0xE000).contains(&next) {
+                let text = String::from_utf16_lossy(&[unit as u16, next as u16]);
+                self.cursor.advance()?;
+                self.cursor.advance()?;
+                return Ok(text);
+            }
+        }
+        let ch = char::from_u32(unit).unwrap_or('\u{fffd}');
         self.cursor.advance()?;
         Ok(ch.to_string())
     }
@@ -2748,11 +2563,9 @@ impl<'a> TreeBuilder<'a> {
         while let Some(container) = self.container_stack.pop() {
             if matches!(container.kind, ContainerKind::Block) {
                 let block = container.block.as_ref().unwrap();
-                self.errors.push(ParseError::tree_error(
-                    Some(block.name.clone()),
+                self.errors.push(ParseError::new(
                     block.source_span.clone(),
-                    format!("Unclosed block \"{}\"", block.name),
-                ));
+                    format!("Unclosed block \"{}\"", block.name)));
             }
             let node = container.into_node();
             self.commit_node(node);
@@ -2813,11 +2626,9 @@ impl<'a> TreeBuilder<'a> {
         }
 
         if self.peek.kind != TokenType::ExpansionFormEnd {
-            self.errors.push(ParseError::tree_error(
-                None,
+            self.errors.push(ParseError::new(
                 self.peek.source_span.clone(),
-                "Invalid ICU message. Missing '}'.",
-            ));
+                "Invalid ICU message. Missing '}'."));
             return;
         }
         let source_span = ParseSourceSpan::with_full_start(
@@ -2839,11 +2650,9 @@ impl<'a> TreeBuilder<'a> {
     fn parse_expansion_case(&mut self) -> Option<ExpansionCase> {
         let value = self.advance();
         if self.peek.kind != TokenType::ExpansionCaseExpStart {
-            self.errors.push(ParseError::tree_error(
-                None,
+            self.errors.push(ParseError::new(
                 self.peek.source_span.clone(),
-                "Invalid ICU message. Missing '{'.",
-            ));
+                "Invalid ICU message. Missing '{'."));
             return None;
         }
         let start = self.advance();
@@ -2902,11 +2711,9 @@ impl<'a> TreeBuilder<'a> {
                         return Some(exp);
                     }
                 } else {
-                    self.errors.push(ParseError::tree_error(
-                        None,
+                    self.errors.push(ParseError::new(
                         start.source_span.clone(),
-                        "Invalid ICU message. Missing '}'.",
-                    ));
+                        "Invalid ICU message. Missing '}'."));
                     return None;
                 }
             }
@@ -2915,21 +2722,17 @@ impl<'a> TreeBuilder<'a> {
                 if stack.last() == Some(&TokenType::ExpansionFormStart) {
                     stack.pop();
                 } else {
-                    self.errors.push(ParseError::tree_error(
-                        None,
+                    self.errors.push(ParseError::new(
                         start.source_span.clone(),
-                        "Invalid ICU message. Missing '}'.",
-                    ));
+                        "Invalid ICU message. Missing '}'."));
                     return None;
                 }
             }
 
             if self.peek.kind == TokenType::Eof {
-                self.errors.push(ParseError::tree_error(
-                    None,
+                self.errors.push(ParseError::new(
                     start.source_span.clone(),
-                    "Invalid ICU message. Missing '}'.",
-                ));
+                    "Invalid ICU message. Missing '}'."));
                 return None;
             }
 
@@ -3031,14 +2834,12 @@ impl<'a> TreeBuilder<'a> {
                 || get_ns_prefix(Some(&full_name)).is_some()
                 || tag_def.is_void)
             {
-                self.errors.push(ParseError::tree_error(
-                    Some(full_name.clone()),
+                self.errors.push(ParseError::new(
                     start_tag_token.source_span.clone(),
                     format!(
                         "Only void, custom and foreign elements can be self closed \"{}\"",
                         start_tag_token.parts.get(1).cloned().unwrap_or_default()
-                    ),
-                ));
+                    )));
             }
         } else if self.peek.kind == TokenType::TagOpenEnd {
             self.advance();
@@ -3086,11 +2887,9 @@ impl<'a> TreeBuilder<'a> {
             self.pop_container(Some(&full_name), ContainerKind::Element, Some(span));
         } else if start_tag_token.kind == TokenType::IncompleteTagOpen {
             self.pop_container(Some(&full_name), ContainerKind::Element, None);
-            self.errors.push(ParseError::tree_error(
-                Some(full_name.clone()),
+            self.errors.push(ParseError::new(
                 span,
-                format!("Opening tag \"{full_name}\" not terminated."),
-            ));
+                format!("Opening tag \"{full_name}\" not terminated.")));
         }
     }
 
@@ -3149,11 +2948,9 @@ impl<'a> TreeBuilder<'a> {
             self.pop_container(Some(&full_name), ContainerKind::Component, Some(span));
         } else if start_token.kind == TokenType::IncompleteComponentOpen {
             self.pop_container(Some(&full_name), ContainerKind::Component, None);
-            self.errors.push(ParseError::tree_error(
-                Some(full_name.clone()),
+            self.errors.push(ParseError::new(
                 span,
-                format!("Opening tag \"{full_name}\" not terminated."),
-            ));
+                format!("Opening tag \"{full_name}\" not terminated.")));
         }
     }
 
@@ -3195,11 +2992,9 @@ impl<'a> TreeBuilder<'a> {
             let suffix =
                 ". It may happen when the tag has already been closed by another tag.".to_string();
             let err_msg = format!("Unexpected closing tag \"{full_name}\"{suffix}");
-            self.errors.push(ParseError::tree_error(
-                Some(full_name),
+            self.errors.push(ParseError::new(
                 end_token.source_span.clone(),
-                err_msg,
-            ));
+                err_msg));
         }
     }
 
@@ -3297,11 +3092,9 @@ impl<'a> TreeBuilder<'a> {
                 end_source_span = Some(self.peek.source_span.clone());
                 self.advance();
             } else {
-                self.errors.push(ParseError::tree_error(
-                    None,
+                self.errors.push(ParseError::new(
                     name_token.source_span.clone(),
-                    "Unterminated directive definition",
-                ));
+                    "Unterminated directive definition"));
             }
         }
 
@@ -3377,25 +3170,21 @@ impl<'a> TreeBuilder<'a> {
         if !self.pop_container(None, ContainerKind::Block, Some(token.source_span.clone())) {
             if self.container_stack.len() < initial_len {
                 let node_name = top_name.unwrap_or_default();
-                self.errors.push(ParseError::tree_error(
-                    None,
+                self.errors.push(ParseError::new(
                     token.source_span.clone(),
                     format!(
                         "Unexpected closing block. The block may have been closed earlier. \
                          Did you forget to close the <{node_name}> element? \
                          If you meant to write the `}}` character, you should use the \"&#125;\" \
                          HTML entity instead."
-                    ),
-                ));
+                    )));
                 return;
             }
-            self.errors.push(ParseError::tree_error(
-                None,
+            self.errors.push(ParseError::new(
                 token.source_span.clone(),
                 "Unexpected closing block. The block may have been closed earlier. \
                  If you meant to write the `}` character, you should use the \"&#125;\" \
-                 HTML entity instead.",
-            ));
+                 HTML entity instead."));
         }
     }
 
@@ -3436,37 +3225,31 @@ impl<'a> TreeBuilder<'a> {
             false,
         );
         self.pop_container(None, ContainerKind::Block, None);
-        self.errors.push(ParseError::tree_error(
-            Some(name.clone()),
+        self.errors.push(ParseError::new(
             span,
             format!(
                 "Incomplete block \"{name}\". If you meant to write the @ character, \
                  you should use the \"&#64;\" HTML entity instead."
-            ),
-        ));
+            )));
     }
 
     fn consume_let(&mut self, start_token: Token) {
         let name = start_token.parts.first().cloned().unwrap_or_default();
 
         if self.peek.kind != TokenType::LetValue {
-            self.errors.push(ParseError::tree_error(
-                Some(name.clone()),
+            self.errors.push(ParseError::new(
                 start_token.source_span.clone(),
-                format!("Invalid @let declaration \"{name}\". Declaration must have a value."),
-            ));
+                format!("Invalid @let declaration \"{name}\". Declaration must have a value.")));
             return;
         }
         let value_token = self.advance();
 
         if self.peek.kind != TokenType::LetEnd {
-            self.errors.push(ParseError::tree_error(
-                Some(name.clone()),
+            self.errors.push(ParseError::new(
                 start_token.source_span.clone(),
                 format!(
                     "Unterminated @let declaration \"{name}\". Declaration must be terminated with a semicolon."
-                ),
-            ));
+                )));
             return;
         }
         let end_token = self.advance();
@@ -3480,7 +3263,10 @@ impl<'a> TreeBuilder<'a> {
         );
 
         let span_text = start_token.source_span.to_source_string();
-        let start_offset = span_text.rfind(&name).map(|i| i as isize).unwrap_or(0);
+        let start_offset = span_text
+            .rfind(&name)
+            .map(|i| crate::ml_parser::utf16_len_before(&span_text, i) as isize)
+            .unwrap_or(0);
         let name_start = start_token.source_span.start.move_by(start_offset);
         let name_span = ParseSourceSpan::new(name_start, start_token.source_span.end.clone());
 
@@ -3503,7 +3289,10 @@ impl<'a> TreeBuilder<'a> {
 
         if !name.is_empty() {
             let span_text = token.source_span.to_source_string();
-            let start_offset = span_text.rfind(&name).map(|i| i as isize).unwrap_or(0);
+            let start_offset = span_text
+            .rfind(&name)
+            .map(|i| crate::ml_parser::utf16_len_before(&span_text, i) as isize)
+            .unwrap_or(0);
             let name_start = token.source_span.start.move_by(start_offset);
             let name_span = ParseSourceSpan::new(name_start, token.source_span.end.clone());
             let value_span = ParseSourceSpan::new(
@@ -3519,14 +3308,12 @@ impl<'a> TreeBuilder<'a> {
             })));
         }
 
-        self.errors.push(ParseError::tree_error(
-            Some(name),
+        self.errors.push(ParseError::new(
             token.source_span.clone(),
             format!(
                 "Incomplete @let declaration{name_string}. \
                  @let declarations must be written as `@let <name> = <value>;`"
-            ),
-        ));
+            )));
     }
 
     fn consume_element_end_tag(&mut self, end_tag_token: Token) {
@@ -3534,14 +3321,12 @@ impl<'a> TreeBuilder<'a> {
             self.get_element_full_name(&end_tag_token, self.closest_element_like_parent_name().as_deref());
 
         if (self.get_tag_definition)(&full_name).is_void {
-            self.errors.push(ParseError::tree_error(
-                Some(full_name.clone()),
+            self.errors.push(ParseError::new(
                 end_tag_token.source_span.clone(),
                 format!(
                     "Void elements do not have end tags \"{}\"",
                     end_tag_token.parts.get(1).cloned().unwrap_or_default()
-                ),
-            ));
+                )));
         } else if !self.pop_container(
             Some(&full_name),
             ContainerKind::Element,
@@ -3552,11 +3337,9 @@ impl<'a> TreeBuilder<'a> {
                  closed by another tag. For more info see \
                  https://www.w3.org/TR/html5/syntax.html#closing-elements-that-have-implied-end-tags"
             );
-            self.errors.push(ParseError::tree_error(
-                Some(full_name),
+            self.errors.push(ParseError::new(
                 end_tag_token.source_span.clone(),
-                err_msg,
-            ));
+                err_msg));
         }
     }
 
@@ -4104,5 +3887,517 @@ mod tests {
             Node::Text(t) => assert_eq!(t.value, "& \u{00A9}"),
             other => panic!("expected text, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn spans_are_utf16_offsets_and_columns_after_non_bmp_characters() {
+        // `é` is one UTF-16 unit, `😀` two (four UTF-8 bytes). The element starts at offset 3 on
+        // line 1, column 3 of "é😀<b>…" when preceded by a line break.
+        let src = "é😀\n<b>x</b>";
+        let result = parse(src, "test.html");
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(result.root_nodes.len(), 2);
+        let b = first_element_at(&result, 0);
+        assert_eq!(b.source_span.start.offset, 4);
+        assert_eq!((b.source_span.start.line, b.source_span.start.col), (1, 0));
+        assert_eq!(b.source_span.to_source_string(), "<b>x</b>");
+        let text = match &b.children[0] {
+            Node::Text(t) => t,
+            other => panic!("expected text, got {other:?}"),
+        };
+        assert_eq!(text.source_span.start.offset, 7);
+        assert_eq!(text.source_span.to_source_string(), "x");
+        assert_eq!(text.source_span.start.byte_offset(), "é😀\n<b>".len());
+
+        // Same line: the column counts UTF-16 units, so `<b>` after `é😀` starts at column 3.
+        let same_line = parse("é😀<b>x</b>", "test.html");
+        let el = first_element_at(&same_line, 0);
+        assert_eq!((el.source_span.start.line, el.source_span.start.col), (0, 3));
+        assert_eq!(el.source_span.start.offset, 3);
+    }
+
+    fn first_element_at(result: &ParseTreeResult, index: usize) -> &Element {
+        match result.root_nodes.iter().filter(|n| matches!(n, Node::Element(_))).nth(index) {
+            Some(Node::Element(e)) => e,
+            other => panic!("expected element, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn astral_characters_survive_text_attribute_and_comment_tokens() {
+        let result = parse("<p title=\"😀\">a😀b<!-- 😀 --></p>", "test.html");
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        let p = first_element_at(&result, 0);
+        assert_eq!(p.attrs[0].value, "😀");
+        assert_eq!(p.attrs[0].value_span.as_ref().unwrap().to_source_string(), "😀");
+        match &p.children[0] {
+            Node::Text(t) => assert_eq!(t.value, "a😀b"),
+            other => panic!("expected text, got {other:?}"),
+        }
+        match &p.children[1] {
+            // Angular trims the comment text (`text.parts[0].trim()`).
+            Node::Comment(c) => assert_eq!(c.value.as_deref(), Some("😀")),
+            other => panic!("expected comment, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Ported from Angular's `test/ml_parser/lexer_spec.ts` (`describe('blocks')`) and
+    // `test/ml_parser/html_parser_spec.ts` (block error cases), at commit 78d2a67d.
+    // -----------------------------------------------------------------------
+
+    fn spec_tokens(src: &str) -> Vec<(TokenType, Vec<String>)> {
+        spec_tokens_with(src, &TokenizeOptions::default())
+    }
+
+    fn spec_tokens_with(src: &str, opts: &TokenizeOptions) -> Vec<(TokenType, Vec<String>)> {
+        let r = tokenize(src, "someUrl", &get_html_tag_definition, opts);
+        r.tokens.into_iter().map(|t| (t.kind, t.parts)).collect()
+    }
+
+    fn spec_errors(src: &str, opts: &TokenizeOptions) -> Vec<(String, String)> {
+        let r = tokenize(src, "someUrl", &get_html_tag_definition, opts);
+        r.errors
+            .iter()
+            .map(|e| (e.msg.clone(), format!("{}:{}", e.span.start.line, e.span.start.col)))
+            .collect()
+    }
+
+    fn tk(kind: TokenType, parts: &[&str]) -> (TokenType, Vec<String>) {
+        (kind, parts.iter().map(|p| p.to_string()).collect())
+    }
+
+    #[test]
+    fn spec_blocks_without_parameters() {
+        let expected = vec![
+            tk(TokenType::BlockOpenStart, &["if"]),
+            tk(TokenType::BlockOpenEnd, &[]),
+            tk(TokenType::Text, &["hello"]),
+            tk(TokenType::BlockClose, &[]),
+            tk(TokenType::Eof, &[]),
+        ];
+        assert_eq!(spec_tokens("@if {hello}"), expected);
+        assert_eq!(spec_tokens("@if () {hello}"), expected);
+        assert_eq!(spec_tokens("@if(){hello}"), expected);
+    }
+
+    #[test]
+    fn spec_default_never_forms() {
+        let expected = vec![
+            tk(TokenType::BlockOpenStart, &["default never"]),
+            tk(TokenType::BlockOpenEnd, &[]),
+            tk(TokenType::BlockClose, &[]),
+            tk(TokenType::Eof, &[]),
+        ];
+        assert_eq!(spec_tokens("@default never;"), expected);
+        assert_eq!(spec_tokens("@default                  never;"), expected);
+        assert_eq!(spec_tokens("@default never ;"), expected);
+        assert_eq!(
+            spec_tokens("@default never(expr);"),
+            vec![
+                tk(TokenType::BlockOpenStart, &["default never"]),
+                tk(TokenType::BlockParameter, &["expr"]),
+                tk(TokenType::BlockOpenEnd, &[]),
+                tk(TokenType::BlockClose, &[]),
+                tk(TokenType::Eof, &[]),
+            ]
+        );
+    }
+
+    #[test]
+    fn spec_block_with_parameters_and_semicolons() {
+        assert_eq!(
+            spec_tokens("@for (item of items; track item.id) {hello}"),
+            vec![
+                tk(TokenType::BlockOpenStart, &["for"]),
+                tk(TokenType::BlockParameter, &["item of items"]),
+                tk(TokenType::BlockParameter, &["track item.id"]),
+                tk(TokenType::BlockOpenEnd, &[]),
+                tk(TokenType::Text, &["hello"]),
+                tk(TokenType::BlockClose, &[]),
+                tk(TokenType::Eof, &[]),
+            ]
+        );
+        assert_eq!(
+            spec_tokens("@for (item of items;;;;;) {hello}"),
+            vec![
+                tk(TokenType::BlockOpenStart, &["for"]),
+                tk(TokenType::BlockParameter, &["item of items"]),
+                tk(TokenType::BlockOpenEnd, &[]),
+                tk(TokenType::Text, &["hello"]),
+                tk(TokenType::BlockClose, &[]),
+                tk(TokenType::Eof, &[]),
+            ]
+        );
+        let for_abc = spec_tokens("@for(a; b; c){hello}");
+        assert_eq!(for_abc, spec_tokens("@for      (a; b; c)      {hello}"));
+        assert_eq!(for_abc, spec_tokens("@for(a; b; c)      {hello}"));
+        assert_eq!(for_abc, spec_tokens("@for      (a; b; c){hello}"));
+    }
+
+    #[test]
+    fn spec_block_name_normalization_and_trailing_whitespace() {
+        assert_eq!(
+            spec_tokens("@else            if {hello}")[0],
+            tk(TokenType::BlockOpenStart, &["else if"])
+        );
+        assert_eq!(
+            spec_tokens("@else if (foo !== 2) {hello}")[1],
+            tk(TokenType::BlockParameter, &["foo !== 2"])
+        );
+        assert_eq!(
+            spec_tokens("@defer                        {hello}"),
+            vec![
+                tk(TokenType::BlockOpenStart, &["defer"]),
+                tk(TokenType::BlockOpenEnd, &[]),
+                tk(TokenType::Text, &["hello"]),
+                tk(TokenType::BlockClose, &[]),
+                tk(TokenType::Eof, &[]),
+            ]
+        );
+    }
+
+    #[test]
+    fn spec_block_parameters_with_quotes_braces_and_calls() {
+        let input = r#"@for (a === ";"; b === ')'; c === "("; d === '}'; e === "{") {hello}"#;
+        assert_eq!(
+            spec_tokens(input)[1..6].to_vec(),
+            vec![
+                tk(TokenType::BlockParameter, &[r#"a === ";""#]),
+                tk(TokenType::BlockParameter, &["b === ')'"]),
+                tk(TokenType::BlockParameter, &[r#"c === "(""#]),
+                tk(TokenType::BlockParameter, &["d === '}'"]),
+                tk(TokenType::BlockParameter, &[r#"e === "{""#]),
+            ]
+        );
+        assert_eq!(
+            spec_tokens("@defer (on a({a: 1, b: 2}, false, {c: 3}); when b({d: 4})) {hello}")[1..3]
+                .to_vec(),
+            vec![
+                tk(TokenType::BlockParameter, &["on a({a: 1, b: 2}, false, {c: 3})"]),
+                tk(TokenType::BlockParameter, &["when b({d: 4})"]),
+            ]
+        );
+        assert_eq!(
+            spec_tokens(r#"@if (condition === "';'") {hello}"#)[1],
+            tk(TokenType::BlockParameter, &[r#"condition === "';'""#])
+        );
+        assert_eq!(
+            spec_tokens(r#"@if (condition === "\";") {hello}"#)[1],
+            tk(TokenType::BlockParameter, &[r#"condition === "\";""#])
+        );
+    }
+
+    #[test]
+    fn spec_unclosed_and_stray_parentheses_in_block_open() {
+        assert_eq!(
+            spec_tokens("@if (a === b {hello}"),
+            vec![
+                tk(TokenType::IncompleteBlockOpen, &["if"]),
+                tk(TokenType::BlockParameter, &["a === b {hello}"]),
+                tk(TokenType::Eof, &[]),
+            ]
+        );
+        assert_eq!(
+            spec_tokens("@if a === b) {hello}"),
+            vec![
+                tk(TokenType::IncompleteBlockOpen, &["if a"]),
+                tk(TokenType::Text, &["=== b) {hello"]),
+                tk(TokenType::BlockClose, &[]),
+                tk(TokenType::Eof, &[]),
+            ]
+        );
+        assert_eq!(
+            spec_tokens("@if ({invalid: true) hello}"),
+            vec![
+                tk(TokenType::IncompleteBlockOpen, &["if"]),
+                tk(TokenType::BlockParameter, &["{invalid: true"]),
+                tk(TokenType::Text, &["hello"]),
+                tk(TokenType::BlockClose, &[]),
+                tk(TokenType::Eof, &[]),
+            ]
+        );
+    }
+
+    #[test]
+    fn spec_invalid_quotes_in_block_parameters_report_eof() {
+        let opts = TokenizeOptions::default();
+        assert_eq!(
+            spec_errors(r#"@if (a === ") {hello}"#, &opts),
+            vec![("Unexpected character \"EOF\"".to_string(), "0:21".to_string())]
+        );
+        assert_eq!(
+            spec_errors(r#"@if (a === "hi') {hello}"#, &opts),
+            vec![("Unexpected character \"EOF\"".to_string(), "0:24".to_string())]
+        );
+    }
+
+    #[test]
+    fn spec_html_inside_blocks() {
+        assert_eq!(
+            spec_tokens("@if (a === 1) {foo <b>bar</b> baz}"),
+            vec![
+                tk(TokenType::BlockOpenStart, &["if"]),
+                tk(TokenType::BlockParameter, &["a === 1"]),
+                tk(TokenType::BlockOpenEnd, &[]),
+                tk(TokenType::Text, &["foo "]),
+                tk(TokenType::TagOpenStart, &["", "b"]),
+                tk(TokenType::TagOpenEnd, &[]),
+                tk(TokenType::Text, &["bar"]),
+                tk(TokenType::TagClose, &["", "b"]),
+                tk(TokenType::Text, &[" baz"]),
+                tk(TokenType::BlockClose, &[]),
+                tk(TokenType::Eof, &[]),
+            ]
+        );
+        let tokens = spec_tokens(r#"@if (a === 1) {<div a="}" b="{"></div>}"#);
+        assert_eq!(tokens[3], tk(TokenType::TagOpenStart, &["", "div"]));
+        assert_eq!(tokens[5], tk(TokenType::AttrQuote, &["\""]));
+        assert_eq!(tokens[6], tk(TokenType::AttrValueText, &["}"]));
+        assert_eq!(tokens[tokens.len() - 2], tk(TokenType::BlockClose, &[]));
+    }
+
+    #[test]
+    fn spec_at_sign_without_a_block_name_is_text() {
+        for (src, text) in [
+            ("@", "@"),
+            (" @", " @"),
+            ("@ ", "@ "),
+            ("@\nfoo", "@\nfoo"),
+            ("foo bar @ baz clink", "foo bar @ baz clink"),
+            ("@ if", "@ if"),
+        ] {
+            assert_eq!(
+                spec_tokens(src),
+                vec![tk(TokenType::Text, &[text]), tk(TokenType::Eof, &[])],
+                "input {src:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn spec_unknown_block_names_are_text_not_blocks() {
+        // `widget` is not a supported block, so the lexer does not start a block for `@widget`
+        // (Angular's `_isBlockStart` checks `SUPPORTED_BLOCKS`). The text ends at the stray `}`.
+        assert_eq!(
+            spec_tokens("@widget {x}"),
+            vec![
+                tk(TokenType::Text, &["@widget {x"]),
+                tk(TokenType::BlockClose, &[]),
+                tk(TokenType::Eof, &[]),
+            ]
+        );
+    }
+
+    #[test]
+    fn spec_stray_brace_errors_from_the_html_parser() {
+        let errors = parse("hello}", "TestComp").errors;
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(
+            errors[0].msg,
+            "Unexpected closing block. The block may have been closed earlier. If you meant to write the `}` character, you should use the \"&#125;\" HTML entity instead."
+        );
+        assert_eq!((errors[0].span.start.line, errors[0].span.start.col), (0, 5));
+
+        let errors = parse("@defer {<strong>hello}", "TestComp").errors;
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(
+            errors[0].msg,
+            "Unexpected closing block. The block may have been closed earlier. Did you forget to close the <strong> element? If you meant to write the `}` character, you should use the \"&#125;\" HTML entity instead."
+        );
+        assert_eq!(errors[0].span.start.col, 21);
+
+        let errors = parse("@defer {hello", "TestComp").errors;
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].msg, "Unclosed block \"defer\"");
+        assert_eq!((errors[0].span.start.line, errors[0].span.start.col), (0, 0));
+    }
+
+    #[test]
+    fn spec_stray_brace_inside_a_block_closes_the_block_early() {
+        // Braces do not nest in block bodies: the first `}` closes the block, so `z}` is text
+        // followed by a second, stray block close (which the parser reports).
+        assert_eq!(
+            spec_tokens("@if (a) {x {y} z}"),
+            vec![
+                tk(TokenType::BlockOpenStart, &["if"]),
+                tk(TokenType::BlockParameter, &["a"]),
+                tk(TokenType::BlockOpenEnd, &[]),
+                tk(TokenType::Text, &["x {y"]),
+                tk(TokenType::BlockClose, &[]),
+                tk(TokenType::Text, &[" z"]),
+                tk(TokenType::BlockClose, &[]),
+                tk(TokenType::Eof, &[]),
+            ]
+        );
+        let opts = TokenizeOptions::default();
+        let errors = Parser::new(Box::new(get_html_tag_definition))
+            .parse("@if (a) {x {y} z}", "TestComp", &opts)
+            .errors;
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].msg.starts_with("Unexpected closing block."), "{}", errors[0].msg);
+        assert_eq!(errors[0].span.start.col, 16);
+    }
+
+    #[test]
+    fn spec_parser_reports_incomplete_blocks_as_block_nodes() {
+        let result = parse("This is the @if({alias: \"foo\"}) block with params", "TestComp");
+        assert_eq!(result.errors.len(), 1);
+        assert_eq!(
+            result.errors[0].msg,
+            "Incomplete block \"if\". If you meant to write the @ character, you should use the \"&#64;\" HTML entity instead."
+        );
+        assert_eq!(result.errors[0].span.start.col, 12);
+        assert!(matches!(&result.root_nodes[1], Node::Block(b) if b.name == "if" && b.parameters.len() == 1));
+    }
+
+    #[test]
+    fn spec_attribute_containing_block_syntax_is_an_attribute_value() {
+        assert_eq!(
+            spec_tokens(r#"<div a="@if (foo) {}"></div>"#),
+            vec![
+                tk(TokenType::TagOpenStart, &["", "div"]),
+                tk(TokenType::AttrName, &["", "a"]),
+                tk(TokenType::AttrQuote, &["\""]),
+                tk(TokenType::AttrValueText, &["@if (foo) {}"]),
+                tk(TokenType::AttrQuote, &["\""]),
+                tk(TokenType::TagOpenEnd, &[]),
+                tk(TokenType::TagClose, &["", "div"]),
+                tk(TokenType::Eof, &[]),
+            ]
+        );
+    }
+
+    #[test]
+    fn spec_nested_blocks() {
+        let src = "@if (a) {hello a@if {hello unnamed@if (b) {hello b@if (c) {hello c}}}}";
+        assert_eq!(
+            spec_tokens(src),
+            vec![
+                tk(TokenType::BlockOpenStart, &["if"]),
+                tk(TokenType::BlockParameter, &["a"]),
+                tk(TokenType::BlockOpenEnd, &[]),
+                tk(TokenType::Text, &["hello a"]),
+                tk(TokenType::BlockOpenStart, &["if"]),
+                tk(TokenType::BlockOpenEnd, &[]),
+                tk(TokenType::Text, &["hello unnamed"]),
+                tk(TokenType::BlockOpenStart, &["if"]),
+                tk(TokenType::BlockParameter, &["b"]),
+                tk(TokenType::BlockOpenEnd, &[]),
+                tk(TokenType::Text, &["hello b"]),
+                tk(TokenType::BlockOpenStart, &["if"]),
+                tk(TokenType::BlockParameter, &["c"]),
+                tk(TokenType::BlockOpenEnd, &[]),
+                tk(TokenType::Text, &["hello c"]),
+                tk(TokenType::BlockClose, &[]),
+                tk(TokenType::BlockClose, &[]),
+                tk(TokenType::BlockClose, &[]),
+                tk(TokenType::BlockClose, &[]),
+                tk(TokenType::Eof, &[]),
+            ]
+        );
+    }
+
+    #[test]
+    fn spec_block_containing_an_expansion_and_an_interpolation() {
+        let opts = TokenizeOptions {
+            tokenize_expansion_forms: true,
+            ..TokenizeOptions::default()
+        };
+        assert_eq!(
+            spec_tokens_with("@defer {{one.two, three, =4 {four} =5 {five} foo {bar} }}", &opts),
+            vec![
+                tk(TokenType::BlockOpenStart, &["defer"]),
+                tk(TokenType::BlockOpenEnd, &[]),
+                tk(TokenType::ExpansionFormStart, &[]),
+                tk(TokenType::RawText, &["one.two"]),
+                tk(TokenType::RawText, &["three"]),
+                tk(TokenType::ExpansionCaseValue, &["=4"]),
+                tk(TokenType::ExpansionCaseExpStart, &[]),
+                tk(TokenType::Text, &["four"]),
+                tk(TokenType::ExpansionCaseExpEnd, &[]),
+                tk(TokenType::ExpansionCaseValue, &["=5"]),
+                tk(TokenType::ExpansionCaseExpStart, &[]),
+                tk(TokenType::Text, &["five"]),
+                tk(TokenType::ExpansionCaseExpEnd, &[]),
+                tk(TokenType::ExpansionCaseValue, &["foo"]),
+                tk(TokenType::ExpansionCaseExpStart, &[]),
+                tk(TokenType::Text, &["bar"]),
+                tk(TokenType::ExpansionCaseExpEnd, &[]),
+                tk(TokenType::ExpansionFormEnd, &[]),
+                tk(TokenType::BlockClose, &[]),
+                tk(TokenType::Eof, &[]),
+            ]
+        );
+        assert_eq!(
+            spec_tokens("@defer {{{message}}}"),
+            vec![
+                tk(TokenType::BlockOpenStart, &["defer"]),
+                tk(TokenType::BlockOpenEnd, &[]),
+                tk(TokenType::Text, &[""]),
+                tk(TokenType::Interpolation, &["{{", "message", "}}"]),
+                tk(TokenType::Text, &[""]),
+                tk(TokenType::BlockClose, &[]),
+                tk(TokenType::Eof, &[]),
+            ]
+        );
+    }
+
+    #[test]
+    fn spec_incomplete_block_starts_inside_text() {
+        // `@` after a word still starts a block; the block name must be a supported block.
+        assert_eq!(
+            spec_tokens("My email frodo@for.com"),
+            vec![
+                tk(TokenType::Text, &["My email frodo"]),
+                tk(TokenType::IncompleteBlockOpen, &["for"]),
+                tk(TokenType::Text, &[".com"]),
+                tk(TokenType::Eof, &[]),
+            ]
+        );
+        assert_eq!(
+            spec_tokens("My favorite console is @switch"),
+            vec![
+                tk(TokenType::Text, &["My favorite console is "]),
+                tk(TokenType::IncompleteBlockOpen, &["switch"]),
+                tk(TokenType::Eof, &[]),
+            ]
+        );
+        assert_eq!(
+            spec_tokens("Use the @for() block"),
+            vec![
+                tk(TokenType::Text, &["Use the "]),
+                tk(TokenType::IncompleteBlockOpen, &["for"]),
+                tk(TokenType::Text, &["block"]),
+                tk(TokenType::Eof, &[]),
+            ]
+        );
+        assert_eq!(
+            spec_tokens(r#"This is the @if({alias: "foo"}) expression"#),
+            vec![
+                tk(TokenType::Text, &["This is the "]),
+                tk(TokenType::IncompleteBlockOpen, &["if"]),
+                tk(TokenType::BlockParameter, &[r#"{alias: "foo"}"#]),
+                tk(TokenType::Text, &["expression"]),
+                tk(TokenType::Eof, &[]),
+            ]
+        );
+    }
+
+    #[test]
+    fn spec_with_block_tokenization_off_blocks_and_stray_braces_are_text() {
+        // `tokenizeBlocks: false` (Angular's `_tokenizeBlocks`): `@if` and `}` are plain text.
+        let opts = TokenizeOptions {
+            tokenize_blocks: false,
+            ..TokenizeOptions::default()
+        };
+        assert_eq!(
+            spec_tokens_with("@if (a) {x} z}", &opts),
+            vec![tk(TokenType::Text, &["@if (a) {x} z}"]), tk(TokenType::Eof, &[])]
+        );
+        let errors = Parser::new(Box::new(get_html_tag_definition))
+            .parse("@if (a) {x} z}", "TestComp", &opts)
+            .errors;
+        assert!(errors.is_empty(), "{errors:?}");
     }
 }

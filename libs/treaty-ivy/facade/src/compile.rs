@@ -578,7 +578,10 @@ fn collect_defer_blocks<'a>(
                 }
             }
             Node::DeferredBlock(d) => {
-                let span = (d.main_block_span.start, d.main_block_span.end);
+                let span = (
+                    d.main_block_span.start.offset as u32,
+                    d.main_block_span.end.offset as u32,
+                );
                 out.push((d, span));
                 // Recurse into the main body + secondary views for nested `@defer` blocks.
                 collect_defer_blocks(&d.children, out);
@@ -790,7 +793,7 @@ fn base_metadata(selector: &str, class_name: &str) -> R3DirectiveMetadata {
         type_argument_count: 0,
         // The type source span only drives diagnostics / `.d.ts` location info, neither of which
         // this emit-only pipeline produces; an empty span is faithful for the emitted definition.
-        type_source_span: ParseSourceSpan::new(0, 0),
+        type_source_span: ParseSourceSpan::synthetic(),
         deps: Deps::None,
         selector: Some(selector.to_string()),
         queries: Vec::new(),

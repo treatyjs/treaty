@@ -80,9 +80,11 @@ fn parse_content_block_variables(
     };
 
     let variables_raw_string = raw_names;
+    // Locations are UTF-16 offsets; the search below works on byte indices and converts at the end.
     let variables_start_offset = vars_param
         .expression
         .find(&variables_raw_string)
+        .map(|byte| treaty_ivy_core::parse_util::utf16_len(&vars_param.expression[..byte]))
         .unwrap_or(0) as i64;
     let variables_start_location = vars_param.source_span.start.move_by(variables_start_offset as isize);
 
@@ -101,14 +103,16 @@ fn parse_content_block_variables(
             .find(&var_name)
             .map(|i| i + search_index)
             .unwrap_or(search_index);
-        let var_start = variables_start_location.move_by(index as isize);
+        let var_start = variables_start_location.move_by(
+            treaty_ivy_core::parse_util::utf16_len(&variables_raw_string[..index]) as isize,
+        );
 
         let var_span: MlSpan;
         if let Some(eq_index) = var_name.find('=') {
             let name_part = var_name[..eq_index].trim().to_string();
             let full_var_span = MlSpan::new(
                 var_start.clone(),
-                var_start.move_by(var_name.chars().count() as isize),
+                var_start.move_by(treaty_ivy_core::parse_util::utf16_len(&var_name) as isize),
             );
             errors.push(ParseError::new(
                 full_var_span,
@@ -117,12 +121,12 @@ fn parse_content_block_variables(
             var_name = name_part;
             var_span = MlSpan::new(
                 var_start.clone(),
-                var_start.move_by(var_name.chars().count() as isize),
+                var_start.move_by(treaty_ivy_core::parse_util::utf16_len(&var_name) as isize),
             );
         } else {
             var_span = MlSpan::new(
                 var_start.clone(),
-                var_start.move_by(var_name.chars().count() as isize),
+                var_start.move_by(treaty_ivy_core::parse_util::utf16_len(&var_name) as isize),
             );
         }
 

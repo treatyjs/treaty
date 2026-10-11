@@ -14,6 +14,8 @@ const {
   stripSourceMappingAnnotations,
   verifyUniqueFunctions,
   verifyUniqueFactory,
+  verifyPlaceholdersIntegrity,
+  verifyUniqueConsts,
   ExpectEmitMismatch,
   ExpectEmitInvalid,
   UnsupportedMacro,
@@ -135,9 +137,63 @@ test('SelectorFlags and QueryFlags unions are OR-ed', () => {
   assert.equal(replaceMacros('__QueryFlags.descendants__|__QueryFlags.isStatic__'), '3');
 });
 
-test('an i18n macro is UnsupportedMacro (skipped), never evaluated to a guess', () => {
-  assert.throws(() => replaceMacros("__i18nMsg__('hi', [], {}, {})"), UnsupportedMacro);
-  assert.throws(() => replaceMacros("__i18nIcuMsg__('x', [])"), UnsupportedMacro);
+test('__i18nMsg__ expands to Angular\'s closure/$localize block with meaning and description', () => {
+  const out = replaceMacros("__i18nMsg__('introduction', [], {}, {meaning: 'm', desc: 'd'})");
+  assert.match(out, /let \$I18N_0\$;/);
+  assert.match(out, /\* @desc d\n\s*\* @meaning m/);
+  assert.match(out, /const \$MSG_EXTERNAL_1\$ = \/\* @ts-ignore \*\/ goog\.getMsg\("introduction"\);/);
+  assert.match(out, /\$I18N_0\$ = \$localize `:m\|d:introduction`;/);
+});
+
+test('__i18nMsg__ placeholders become $localize substitutions with the upper-cased key', () => {
+  const out = replaceMacros(
+    "__i18nMsg__('hi {$startTag}x{$closeTag}', [['startTag', 'ph1'], ['closeTag', 'ph2', 'id9']], {}, {})",
+  );
+  assert.match(out, /goog\.getMsg\("hi \{\$startTag\}x\{\$closeTag\}", \{ "startTag": "ph1",\s*"closeTag": "ph2" \}\)/);
+  assert.match(out, /\$localize `hi \$\{"ph1"\}:START_TAG:x\$\{"ph2"\}:CLOSE_TAG@@id9:`/);
+});
+
+test('the message index restarts for every golden', () => {
+  assert.match(replaceMacros("__i18nMsg__('x', [], {}, {})"), /let \$I18N_0\$;/);
+  assert.match(replaceMacros("__i18nMsg__('x', [], {}, {})"), /let \$I18N_0\$;/);
+});
+
+test('__i18nIcuMsg__ is a postprocess of the message variable, as in Angular', () => {
+  const out = replaceMacros("__i18nIcuMsg__('x', [['ph', 'v']], {})");
+  assert.match(out, /\$I18N_0\$ = \$r3\$\.ɵɵi18nPostprocess\(\$\$I18N_0\$\$, \{ "ph": "v" \}\);/);
+});
+
+test('a malformed i18n macro argument is an invalid golden (skipped), never a pass', () => {
+  assert.throws(() => replaceMacros("__i18nMsg__('x', [['ph']], {}, {})"), ExpectEmitInvalid);
+  assert.throws(() => replaceMacros("__i18nMsg__('x', [], {bogus: 'y'}, {})"), ExpectEmitInvalid);
+  assert.throws(() => replaceMacros("__i18nMsg__('x', [], {}, {desc: 1})"), ExpectEmitInvalid);
+});
+
+test('an expanded i18n golden matches generated code that uses the same structure', () => {
+  const golden = replaceMacros("__i18nMsg__('Hello', [], {}, {meaning: 'greet'})");
+  // The generated file names the variables differently; the golden's $name$ placeholders bind to them.
+  const generated = golden.replace(/\$I18N_0\$/g, 'i18n_0').replace(/\$MSG_EXTERNAL_1\$/g, 'ext_1');
+  assert.doesNotThrow(() => expectEmit(generated, golden, 'i18n'));
+});
+
+test('a generated $localize text that differs from the golden is a mismatch', () => {
+  const golden = replaceMacros("__i18nMsg__('Hello', [], {}, {meaning: 'greet'})");
+  assert.throws(
+    () => expectEmit('i0 = $localize `:other:Hello`;', golden, 'i18n'),
+    ExpectEmitMismatch,
+  );
+});
+
+test('verifyPlaceholdersIntegrity: every {$name} must have a placeholder entry, and the counts must agree', () => {
+  const ok = 'const MSG = goog.getMsg("a {$x} b", { "x": i0 });';
+  assert.equal(verifyPlaceholdersIntegrity(ok), true);
+  assert.equal(verifyPlaceholdersIntegrity('const MSG = goog.getMsg("a {$x} b", {});'), false);
+  assert.equal(verifyPlaceholdersIntegrity('const MSG = goog.getMsg("a {$x} b", { "y": i0 });'), false);
+});
+
+test('verifyUniqueConsts: a duplicate goog.getMsg constant name is an error', () => {
+  assert.equal(verifyUniqueConsts('const A = goog.getMsg("a"); const B = goog.getMsg("b");'), true);
+  assert.equal(verifyUniqueConsts('const A = goog.getMsg("a"); const A = goog.getMsg("b");'), false);
 });
 
 test('source-map SOURCE annotations are removed and counted, keeping the generated text', () => {

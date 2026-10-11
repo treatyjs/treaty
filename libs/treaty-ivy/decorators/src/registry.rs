@@ -109,8 +109,11 @@ pub type SelectorRegistry = std::collections::HashMap<String, String>;
 /// remappings, so turning a flag off restores the classic emit exactly.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ModernizeOptions {
-    /// Lower classic `@Input(...)` members to signal `input()` inputs: the emitted `inputs` map
-    /// carries the `InputFlags.SignalBased` bit and the directive is marked `signals: true`.
+    /// Lower classic `@Input(...)` members to signal `input()` inputs: each lowered input in the
+    /// emitted `inputs` map carries the `InputFlags.SignalBased` bit (`isSignal`). The directive-level
+    /// `signals: true` flag is NOT set by this option: it comes only from an explicit `signals: true`
+    /// in the decorator, as in ngtsc (`directive/src/shared.ts`), so a signal input alone does not
+    /// emit it.
     pub signal_inputs: bool,
     /// Lower classic `@Output(...)` members to `output()` outputs. (Outputs carry no per-output
     /// signal flag in the emit; this exists for symmetry / future-proofing and to drive the
@@ -121,10 +124,12 @@ pub struct ModernizeOptions {
     /// r3 AST, reusing the proven block control-flow lowering.
     pub control_flow: bool,
     /// Opt into `ChangeDetectionStrategy.OnPush` for compiled components (the signals-by-default
-    /// design). When OFF, a component whose source declares no `changeDetection` defaults to
-    /// `ChangeDetectionStrategy.Default` — OMITTED from the emit, byte-matching the Angular default.
-    /// An EXPLICIT `@Component({changeDetection: OnPush})` in source still emits OnPush regardless
-    /// of this flag; this flag only governs the IMPLICIT default for sources that declare none.
+    /// design). This governs only the IMPLICIT default, for a component whose source declares no
+    /// `changeDetection`: ON emits `changeDetection: 0` (OnPush), and OFF emits no `changeDetection`
+    /// field, which the runtime reads as OnPush. Both are deliberate Treaty divergences from Angular,
+    /// whose default is `ChangeDetectionStrategy.Default` (`changeDetection: 1` when emitted). An
+    /// EXPLICIT `@Component({changeDetection: …})` in source is emitted as written regardless of this
+    /// flag. See "Intentional divergences" in `tools/render3-sync/README.md`.
     pub on_push: bool,
 }
 

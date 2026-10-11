@@ -1,7 +1,7 @@
 //! Pipe (`ɵpipe`), NgModule (`ɵmod`/`ɵinj`), injector, and class-metadata codegen.
 //!
 //! PORT TARGET: `migration/render3-specs/16-pipe_module_injector.md`
-//! Sources (Angular 22.1.0-next.0), under `packages/compiler/src/render3/`:
+//! Sources (Angular main, 78d2a67d), under `packages/compiler/src/render3/`:
 //!   * `r3_pipe_compiler.ts`         — `compilePipeFromMetadata` / `createPipeType`
 //!   * `r3_module_compiler.ts`       — `compileNgModule` / `createNgModuleType` (+ scope IIFE)
 //!   * `r3_injector_compiler.ts`     — `compileInjector` / `createInjectorType`

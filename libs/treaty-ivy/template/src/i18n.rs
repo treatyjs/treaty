@@ -1,6 +1,6 @@
 //! i18n CORE infrastructure.
 //!
-//! Ported from Angular 22.1's `packages/compiler/src/i18n` (vendored at
+//! Ported from Angular main at `78d2a67d` (`tools/render3-sync/ANGULAR_REF`)'s `packages/compiler/src/i18n` (vendored at
 //! `tools/angular-ref`):
 //!   - `digest.ts`            -> [`compute_msg_id`], [`fingerprint`], `hash32`, `mix`
 //!   - `i18n_ast.ts`          -> [`Message`], [`Node`] (owned Rust enums/structs)
@@ -11,7 +11,7 @@
 //! message and compute its `$localize` id. Wiring into the template transform
 //! is deferred to a later round.
 //!
-//! The owned offset-only [`ParseSourceSpan`] type (`i18n_ast.ts`'s `Node.sourceSpan`,
+//! The shared [`ParseSourceSpan`] type (`i18n_ast.ts`'s `Node.sourceSpan`,
 //! ported as the architecture's `{ start, end }` span) is provided here for the i18n
 //! AST + the connected template transform; ICU placeholder back-references and the
 //! legacy XLIFF1 SHA1 digest remain intentionally omitted until a consumer needs them.
@@ -20,22 +20,10 @@
 //! Angular's `parseI18nMeta` `descIndex`/`idIndex` logic exactly.
 
 // ---------------------------------------------------------------------------
-// Source span (owned, offset-only) — ported from `parse_util.ParseSourceSpan`.
+// Source span: the shared `parse_util::ParseSourceSpan` (`i18n_ast.ts`'s `Node.sourceSpan`).
 // ---------------------------------------------------------------------------
 
-/// Offset-only source span (`i18n_ast.ts` `Node.sourceSpan`), mirroring the
-/// architecture's owned `{ start, end }` span used by the expression/template ASTs.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ParseSourceSpan {
-    pub start: u32,
-    pub end: u32,
-}
-
-impl ParseSourceSpan {
-    pub fn new(start: u32, end: u32) -> Self {
-        ParseSourceSpan { start, end }
-    }
-}
+pub use treaty_ivy_core::parse_util::ParseSourceSpan;
 
 // ---------------------------------------------------------------------------
 // i18n AST (owned)  — ported from i18n_ast.ts
@@ -135,6 +123,19 @@ pub struct Message {
     pub meaning: String,
     pub description: String,
     pub custom_id: String,
+    /// `Message.placeholders` (`placeholderToContent`): every named placeholder of the message, with
+    /// the text it stands for and its source span, in creation order. ICU expansion variables
+    /// (`VAR_SELECT`, …) are read from here by the render3 transform.
+    pub placeholders: Vec<(String, MessagePlaceholder)>,
+    /// `Message.placeholderToMessage`: the sub-message of each nested (non-top-level) ICU placeholder.
+    pub placeholder_to_message: Vec<(String, Message)>,
+}
+
+/// `i18n.MessagePlaceholder`: the source text a placeholder stands for and the span it came from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MessagePlaceholder {
+    pub text: String,
+    pub source_span: ParseSourceSpan,
 }
 
 impl Message {
@@ -150,6 +151,8 @@ impl Message {
             meaning: meaning.into(),
             description: description.into(),
             custom_id: custom_id.into(),
+            placeholders: Vec::new(),
+            placeholder_to_message: Vec::new(),
         }
     }
 
@@ -707,6 +710,7 @@ pub use treaty_ivy_core::digest::{compute_msg_id, fingerprint};
 // ---------------------------------------------------------------------------
 
 use crate::identifiers::R3;
+use crate::ml_parser as html;
 use crate::output_ast as o;
 use crate::output_ast::{ArrowBody, Expr, FnParam, LiteralValue, Stmt, StmtKind, StmtModifier};
 
@@ -935,10 +939,14 @@ pub fn build_i18n_const(
         get_msg_args.push(opts);
     }
 
-    let goog_get_msg = o::variable("goog", None)
+    // `goog.getMsg(…)` carries `tsIgnoreComment()` (`goog` may be unavailable externally), so the call is
+    // printed as `/* @ts-ignore */ goog.getMsg(…)`.
+    let mut goog_get_msg = o::variable("goog", None)
         .prop("getMsg")
         .call_fn(get_msg_args, false);
-    let goog_stmt = Stmt::with_modifiers(
+    goog_get_msg.meta.leading_comments = vec![treaty_ivy_core::util::ts_ignore_comment()];
+    // `const MSG_… = goog.getMsg(…)` carries the message's JSDoc (`i18nMetaToJSDoc`), above the statement.
+    let mut goog_stmt = Stmt::with_modifiers(
         StmtKind::DeclareVar {
             name: closure_name.clone(),
             value: Some(goog_get_msg),
@@ -946,15 +954,17 @@ pub fn build_i18n_const(
         },
         StmtModifier::FINAL,
     );
+    goog_stmt.meta.leading_comments = vec![i18n_meta_to_jsdoc(message)];
     let closure_assign = Stmt::bare(StmtKind::Expression(
         main_var.clone().set(o::variable(closure_name, None)),
     ));
     let true_case = vec![goog_stmt, closure_assign];
 
-    // `createLocalizeStatements`: `$i18n_n$ = $localize\`…\`;`.
-    let false_case = vec![Stmt::bare(StmtKind::Expression(
-        main_var.clone().set(localize_expr),
-    ))];
+    // `createLocalizeStatements`: `$i18n_n$ = $localize\`…\`;` (an `ExpressionStatement` with `tsIgnoreComment()`,
+    // because `$localize` might not be available internally).
+    let mut localize_stmt = Stmt::bare(StmtKind::Expression(main_var.clone().set(localize_expr)));
+    localize_stmt.meta.leading_comments = vec![treaty_ivy_core::util::ts_ignore_comment()];
+    let false_case = vec![localize_stmt];
 
     // `createClosureModeGuard()`: `typeof ngI18nClosureMode !== "undefined" && ngI18nClosureMode`.
     let guard = o::typeof_expr(o::variable(NG_I18N_CLOSURE_MODE, None))
@@ -986,6 +996,23 @@ pub fn build_i18n_const(
     }
 }
 
+/// `i18nMetaToJSDoc(message)` (`render3/view/i18n/meta.ts`): `@desc <description>` when the message has a
+/// description, otherwise `@suppress {msgDescriptions}` (so the closure compiler does not warn about a
+/// missing `@desc`); then `@meaning <meaning>` when present.
+pub fn i18n_meta_to_jsdoc(message: &Message) -> treaty_ivy_core::output_ast::LeadingComment {
+    use treaty_ivy_core::output_ast::{js_doc_comment, JsDocTag};
+    let mut tags = Vec::new();
+    if !message.description.is_empty() {
+        tags.push(JsDocTag { tag_name: Some("desc".into()), text: Some(message.description.clone()) });
+    } else {
+        tags.push(JsDocTag { tag_name: Some("suppress".into()), text: Some("{msgDescriptions}".into()) });
+    }
+    if !message.meaning.is_empty() {
+        tags.push(JsDocTag { tag_name: Some("meaning".into()), text: Some(message.meaning.clone()) });
+    }
+    js_doc_comment(tags)
+}
+
 /// Wrap a `consts` entry list whose i18n entries are read-vars and a set of initializer
 /// statements into the `() => { …initializers…; return [ …consts… ]; }` arrow form Angular emits
 /// for any template carrying i18n. Mirrors the `consts: () => {…}` branch of
@@ -994,6 +1021,416 @@ pub fn consts_initializer_arrow(initializers: Vec<Stmt>, consts: Vec<Expr>) -> E
     let mut body = initializers;
     body.push(Stmt::bare(StmtKind::Return(o::literal_arr(consts, None))));
     o::arrow_fn(Vec::<FnParam>::new(), ArrowBody::Block(body), None)
+}
+
+// ---------------------------------------------------------------------------
+// I18nVisitor — port of `i18n/i18n_parser.ts` (`_I18nVisitor`, `createI18nMessageFactory`,
+// `extractPlaceholderName`). Converts HTML nodes (text, interpolations, elements, ICU expansions,
+// control-flow blocks) into an i18n [`Message`] with Angular's placeholder naming and ordering.
+// The `visitNodeFn` back-reference hook is not needed by the transform and is omitted.
+// ---------------------------------------------------------------------------
+
+/// One element of the `_CUSTOM_PH_EXP` pattern (see [`extract_placeholder_name`]).
+#[derive(Clone, Copy)]
+enum PhPiece {
+    /// A literal string.
+    Lit(&'static str),
+    /// `[\s\S]*`: any text, greedy (longest first).
+    Any,
+    /// The opening quote, `"` or `'`, recorded for the closing quote.
+    OpenQuote,
+    /// `([\s\S]*?)`: the name, lazy (shortest first).
+    Name,
+    /// `\1`: the closing quote, equal to the opening one.
+    CloseQuote,
+}
+
+/// `extractPlaceholderName(input)`: the name given by a `// i18n(ph="NAME")` comment inside an
+/// interpolation, or `None`. This is the `_CUSTOM_PH_EXP` regular expression
+/// `//[\s\S]*i18n[\s\S]*\([\s\S]*ph[\s\S]*=[\s\S]*("|')([\s\S]*?)\1[\s\S]*\)` (`input.split(...)[2]`),
+/// matched leftmost with the same greedy and lazy backtracking.
+pub fn extract_placeholder_name(input: &str) -> Option<String> {
+    use PhPiece::*;
+    const PIECES: [PhPiece; 15] = [
+        Lit("//"),
+        Any,
+        Lit("i18n"),
+        Any,
+        Lit("("),
+        Any,
+        Lit("ph"),
+        Any,
+        Lit("="),
+        Any,
+        OpenQuote,
+        Name,
+        CloseQuote,
+        Any,
+        Lit(")"),
+    ];
+    struct Matcher<'a> {
+        s: &'a str,
+        quote: Option<char>,
+        name: Option<String>,
+    }
+    impl Matcher<'_> {
+        /// Char boundaries from `pos` onwards, plus the end of the input.
+        fn boundaries(&self, pos: usize) -> Vec<usize> {
+            let mut out: Vec<usize> = self.s.char_indices().map(|(i, _)| i).filter(|&i| i >= pos).collect();
+            out.push(self.s.len());
+            out
+        }
+        fn run(&mut self, k: usize, pos: usize) -> bool {
+            if k == PIECES.len() {
+                return true;
+            }
+            match PIECES[k] {
+                PhPiece::Lit(lit) => {
+                    self.s[pos..].starts_with(lit) && self.run(k + 1, pos + lit.len())
+                }
+                PhPiece::Any => {
+                    let mut ends = self.boundaries(pos);
+                    ends.reverse();
+                    ends.into_iter().any(|end| self.run(k + 1, end))
+                }
+                PhPiece::OpenQuote => {
+                    for q in ['"', '\''] {
+                        if self.s[pos..].starts_with(q) {
+                            self.quote = Some(q);
+                            if self.run(k + 1, pos + 1) {
+                                return true;
+                            }
+                        }
+                    }
+                    false
+                }
+                PhPiece::Name => {
+                    for end in self.boundaries(pos) {
+                        self.name = Some(self.s[pos..end].to_string());
+                        if self.run(k + 1, end) {
+                            return true;
+                        }
+                    }
+                    false
+                }
+                PhPiece::CloseQuote => {
+                    let q = self.quote.unwrap_or('"');
+                    self.s[pos..].starts_with(q) && self.run(k + 1, pos + q.len_utf8())
+                }
+            }
+        }
+    }
+    for (start, _) in input.match_indices("//") {
+        let mut matcher = Matcher { s: input, quote: None, name: None };
+        if matcher.run(0, start) {
+            return matcher.name;
+        }
+    }
+    None
+}
+
+/// Mutable state of one `toI18nMessage` run (`I18nMessageVisitorContext`).
+struct I18nVisitContext {
+    is_icu: bool,
+    icu_depth: usize,
+    registry: PlaceholderRegistry,
+    placeholder_to_content: Vec<(String, MessagePlaceholder)>,
+    placeholder_to_message: Vec<(String, Message)>,
+}
+
+impl I18nVisitContext {
+    fn set_content(&mut self, name: &str, text: String, source_span: ParseSourceSpan) {
+        let value = MessagePlaceholder { text, source_span };
+        if let Some(entry) = self.placeholder_to_content.iter_mut().find(|(n, _)| n == name) {
+            entry.1 = value;
+        } else {
+            self.placeholder_to_content.push((name.to_string(), value));
+        }
+    }
+}
+
+/// `_I18nVisitor` with the options of `createI18nMessageFactory`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct I18nVisitor {
+    /// Angular `retainEmptyTokens`.
+    pub retain_empty_tokens: bool,
+    /// Angular `preserveExpressionWhitespace`. Only the preserved form is ported: with `false`,
+    /// Angular re-serialises each interpolation expression (`serializeExpression`), which is not
+    /// implemented here, so the expression text is kept as written.
+    pub preserve_expression_whitespace: bool,
+}
+
+impl Default for I18nVisitor {
+    fn default() -> Self {
+        I18nVisitor { retain_empty_tokens: false, preserve_expression_whitespace: true }
+    }
+}
+
+impl I18nVisitor {
+    /// `toI18nMessage(nodes, meaning, description, customId)`.
+    pub fn to_i18n_message(
+        &self,
+        nodes: &[html::Node],
+        meaning: &str,
+        description: &str,
+        custom_id: &str,
+    ) -> Message {
+        let mut ctx = I18nVisitContext {
+            is_icu: nodes.len() == 1 && matches!(nodes[0], html::Node::Expansion(_)),
+            icu_depth: 0,
+            registry: PlaceholderRegistry::new(),
+            placeholder_to_content: Vec::new(),
+            placeholder_to_message: Vec::new(),
+        };
+        let mut out = Vec::new();
+        for node in nodes {
+            if let Some(n) = self.visit_node(node, &mut ctx) {
+                out.push(n);
+            }
+        }
+        let mut message = Message::new(out, meaning, description, custom_id);
+        message.placeholders = ctx.placeholder_to_content;
+        message.placeholder_to_message = ctx.placeholder_to_message;
+        message
+    }
+
+    /// Visit one HTML node (`html.visitAll(this, …)` filters out the nodes that yield nothing).
+    fn visit_node(&self, node: &html::Node, ctx: &mut I18nVisitContext) -> Option<Node> {
+        match node {
+            html::Node::Element(el) => Some(self.visit_element_like(
+                &el.name,
+                &el.attrs,
+                &el.directives,
+                &el.children,
+                el.source_span.clone(),
+                el.start_source_span.clone(),
+                el.end_source_span.clone(),
+                ctx,
+                false,
+            )),
+            html::Node::Component(c) => {
+                let is_void = c
+                    .tag_name
+                    .as_deref()
+                    .is_some_and(|t| crate::ml_parser::get_html_tag_definition(t).is_void);
+                Some(self.visit_element_like(
+                    &c.full_name,
+                    &c.attrs,
+                    &c.directives,
+                    &c.children,
+                    c.source_span.clone(),
+                    c.start_source_span.clone(),
+                    c.end_source_span.clone(),
+                    ctx,
+                    is_void,
+                ))
+            }
+            html::Node::Text(text) => {
+                if text.tokens.len() == 1 {
+                    Some(Node::Text(Text { value: text.value.clone() }))
+                } else {
+                    self.visit_text_with_interpolation(&text.tokens, &text.source_span, ctx)
+                }
+            }
+            html::Node::Expansion(icu) => self.visit_expansion(icu, ctx),
+            html::Node::Block(block) => Some(self.visit_block(block, ctx)),
+            // Comments, `@let` declarations, attributes and parameters contribute no node here.
+            _ => None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn visit_element_like(
+        &self,
+        name: &str,
+        attrs: &[html::Attribute],
+        directives: &[html::Directive],
+        children: &[html::Node],
+        source_span: ParseSourceSpan,
+        start_source_span: ParseSourceSpan,
+        end_source_span: Option<ParseSourceSpan>,
+        ctx: &mut I18nVisitContext,
+        component_is_void: bool,
+    ) -> Node {
+        let child_nodes: Vec<Node> = children.iter().filter_map(|c| self.visit_node(c, ctx)).collect();
+        // Attributes are not visited (translatable ones are top-level messages); they only name the
+        // placeholder. Duplicates overwrite, as in the TypeScript object.
+        let mut attr_map: Vec<(String, String)> = Vec::new();
+        let all_attrs = attrs.iter().chain(directives.iter().flat_map(|d| d.attrs.iter()));
+        for attr in all_attrs {
+            if let Some(entry) = attr_map.iter_mut().find(|(n, _)| *n == attr.name) {
+                entry.1 = attr.value.clone();
+            } else {
+                attr_map.push((attr.name.clone(), attr.value.clone()));
+            }
+        }
+        let is_void = if component_is_void {
+            true
+        } else {
+            crate::ml_parser::get_html_tag_definition(name).is_void
+        };
+        let start_name = ctx.registry.start_tag_placeholder_name(name, &attr_map, is_void);
+        ctx.set_content(&start_name, start_source_span.to_source_string(), start_source_span.clone());
+        let mut close_name = String::new();
+        if !is_void {
+            close_name = ctx.registry.close_tag_placeholder_name(name);
+            let close_text = format!("</{name}>");
+            let close_span = end_source_span.clone().unwrap_or_else(|| source_span.clone());
+            ctx.set_content(&close_name, close_text, close_span);
+        }
+        Node::TagPlaceholder(TagPlaceholder {
+            tag: name.to_string(),
+            start_name,
+            close_name,
+            children: child_nodes,
+            is_void,
+        })
+    }
+
+    /// `visitExpansion`: a top-level or nested ICU becomes an [`Icu`] node (a nested one also gets a
+    /// `VAR_<type>` expression placeholder); an ICU inside other content becomes an [`IcuPlaceholder`]
+    /// whose own message is kept in `placeholderToMessage`.
+    fn visit_expansion(&self, icu: &html::Expansion, ctx: &mut I18nVisitContext) -> Option<Node> {
+        ctx.icu_depth += 1;
+        let mut cases: Vec<(String, Node)> = Vec::new();
+        for case in &icu.cases {
+            let expression: Vec<Node> = case
+                .expression
+                .iter()
+                .filter_map(|n| self.visit_node(n, ctx))
+                .collect();
+            let container = Node::Container(Container { children: expression });
+            if let Some(entry) = cases.iter_mut().find(|(k, _)| *k == case.value) {
+                entry.1 = container;
+            } else {
+                cases.push((case.value.clone(), container));
+            }
+        }
+        ctx.icu_depth -= 1;
+        let mut i18n_icu = Icu {
+            expression: icu.switch_value.clone(),
+            icu_type: icu.r#type.clone(),
+            cases,
+            expression_placeholder: None,
+        };
+        if ctx.is_icu || ctx.icu_depth > 0 {
+            let exp_ph = ctx.registry.unique_placeholder(&format!("VAR_{}", icu.r#type));
+            i18n_icu.expression_placeholder = Some(exp_ph.clone());
+            ctx.set_content(&exp_ph, icu.switch_value.clone(), icu.switch_value_source_span.clone());
+            return Some(Node::Icu(i18n_icu));
+        }
+        // A top-level ICU inside other content: a placeholder whose translation is a sub-message.
+        let ph_name = ctx.registry.placeholder_name("ICU", &icu.source_span.to_source_string());
+        let sub = self.to_i18n_message(&[html::Node::Expansion(Box::new(icu.clone()))], "", "", "");
+        ctx.placeholder_to_message.push((ph_name.clone(), sub));
+        Some(Node::IcuPlaceholder(IcuPlaceholder { value: i18n_icu, name: ph_name }))
+    }
+
+    /// `visitBlock`: a `@switch` contributes its children as a container; any other block is a
+    /// `BlockPlaceholder` with its start and close markers.
+    fn visit_block(&self, block: &html::Block, ctx: &mut I18nVisitContext) -> Node {
+        let children: Vec<Node> = block.children.iter().filter_map(|c| self.visit_node(c, ctx)).collect();
+        if block.name == "switch" {
+            return Node::Container(Container { children });
+        }
+        let parameters: Vec<String> = block.parameters.iter().map(|p| p.expression.clone()).collect();
+        let start_name = ctx.registry.start_block_placeholder_name(&block.name, &parameters);
+        let close_name = ctx.registry.close_block_placeholder_name(&block.name);
+        ctx.set_content(
+            &start_name,
+            block.start_source_span.to_source_string(),
+            block.start_source_span.clone(),
+        );
+        let (close_text, close_span) = match &block.end_source_span {
+            Some(end) => (end.to_source_string(), end.clone()),
+            None => ("}".to_string(), block.source_span.clone()),
+        };
+        ctx.set_content(&close_name, close_text, close_span);
+        Node::BlockPlaceholder(BlockPlaceholder {
+            name: block.name.clone(),
+            parameters,
+            start_name,
+            close_name,
+            children,
+        })
+    }
+
+    /// `_visitTextWithInterpolation`: text and encoded-entity tokens merge into `Text`; each
+    /// interpolation becomes a named `Placeholder`. Without interpolation the single text node is
+    /// returned. (`previousI18n` reuse of source spans is for the second, attribute pass and is not
+    /// needed for the first pass.)
+    fn visit_text_with_interpolation(
+        &self,
+        tokens: &[crate::ml_parser::Token],
+        source_span: &ParseSourceSpan,
+        ctx: &mut I18nVisitContext,
+    ) -> Option<Node> {
+        let _ = source_span;
+        let mut nodes: Vec<Node> = Vec::new();
+        let mut has_interpolation = false;
+        for token in tokens {
+            match token.kind {
+                crate::ml_parser::TokenType::Interpolation | crate::ml_parser::TokenType::AttrValueInterpolation => {
+                    has_interpolation = true;
+                    let expression = token.parts.get(1).cloned().unwrap_or_default();
+                    let base_name = extract_placeholder_name(&expression).unwrap_or_else(|| "INTERPOLATION".to_string());
+                    let ph_name = ctx.registry.placeholder_name(&base_name, &expression);
+                    let text: String = token.parts.concat();
+                    ctx.set_content(&ph_name, text, token.source_span.clone());
+                    nodes.push(Node::Placeholder(Placeholder { value: expression, name: ph_name }));
+                }
+                _ => {
+                    let part = token.parts.first().cloned().unwrap_or_default();
+                    if !part.is_empty() || self.retain_empty_tokens {
+                        match nodes.last_mut() {
+                            Some(Node::Text(prev)) => prev.value.push_str(&part),
+                            _ => nodes.push(Node::Text(Text { value: part })),
+                        }
+                    }
+                }
+            }
+        }
+        if has_interpolation {
+            Some(Node::Container(Container { children: nodes }))
+        } else {
+            nodes.into_iter().next()
+        }
+    }
+}
+
+/// The i18n message of a translatable attribute (`i18n-<attr>`): `visitAttribute` of
+/// `_I18nVisitor`. A value without interpolation is one text node; otherwise its value tokens become
+/// text and placeholders, as for a text node.
+pub fn to_i18n_message_for_attribute(
+    attr: &html::Attribute,
+    meaning: &str,
+    description: &str,
+    custom_id: &str,
+) -> Message {
+    let visitor = I18nVisitor::default();
+    let mut ctx = I18nVisitContext {
+        is_icu: false,
+        icu_depth: 0,
+        registry: PlaceholderRegistry::new(),
+        placeholder_to_content: Vec::new(),
+        placeholder_to_message: Vec::new(),
+    };
+    let node = match &attr.value_tokens {
+        Some(tokens) if tokens.len() != 1 => {
+            let span = attr.value_span.clone().unwrap_or_else(|| attr.source_span.clone());
+            visitor.visit_text_with_interpolation(tokens, &span, &mut ctx)
+        }
+        _ => Some(Node::Text(Text { value: attr.value.clone() })),
+    };
+    let mut message = Message::new(node.into_iter().collect(), meaning, description, custom_id);
+    message.placeholders = ctx.placeholder_to_content;
+    message.placeholder_to_message = ctx.placeholder_to_message;
+    message
+}
+
+/// `createI18nMessageFactory(...)` followed by a call: the i18n message of a list of HTML nodes.
+pub fn to_i18n_message(nodes: &[html::Node], meaning: &str, description: &str, custom_id: &str) -> Message {
+    I18nVisitor::default().to_i18n_message(nodes, meaning, description, custom_id)
 }
 
 #[cfg(test)]
@@ -1247,5 +1684,82 @@ mod tests {
             "",
         );
         assert_eq!(msg.message_string(), "Hello {$INTERPOLATION}");
+    }
+
+    fn message_of(src: &str) -> Message {
+        let parsed = crate::ml_parser::parse(src, "t.html");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        to_i18n_message(&parsed.root_nodes, "", "", "")
+    }
+
+    fn placeholder_texts(m: &Message) -> Vec<(String, String)> {
+        m.placeholders.iter().map(|(n, p)| (n.clone(), p.text.clone())).collect()
+    }
+
+    #[test]
+    fn element_placeholders_follow_angular_insertion_order() {
+        // Children are visited before the element's own start/close placeholders are recorded.
+        let m = message_of("<div>a {{ b }} c</div>");
+        assert_eq!(
+            placeholder_texts(&m),
+            vec![
+                ("INTERPOLATION".to_string(), "{{ b }}".to_string()),
+                ("START_TAG_DIV".to_string(), "<div>".to_string()),
+                ("CLOSE_TAG_DIV".to_string(), "</div>".to_string()),
+            ]
+        );
+        assert!(matches!(&m.nodes[0], Node::TagPlaceholder(t) if t.tag == "div" && !t.is_void));
+    }
+
+    #[test]
+    fn top_level_icu_records_its_switch_variable_and_cases() {
+        let m = message_of("{count, plural, =0 {none} other {many}}");
+        assert_eq!(placeholder_texts(&m), vec![("VAR_PLURAL".to_string(), "count".to_string())]);
+        let Node::Icu(icu) = &m.nodes[0] else { panic!("expected icu, got {:?}", m.nodes) };
+        assert_eq!(icu.expression, "count");
+        assert_eq!(icu.icu_type, "plural");
+        assert_eq!(icu.expression_placeholder.as_deref(), Some("VAR_PLURAL"));
+        assert_eq!(icu.cases.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(), vec!["=0", "other"]);
+    }
+
+    #[test]
+    fn icu_case_interpolation_is_recorded_before_the_switch_variable() {
+        // The `VAR_<type>` placeholder is created after the cases are visited, as in `visitExpansion`.
+        let m = message_of("{count, select, 0 {no emails} other {{{count}} emails}}");
+        assert_eq!(
+            placeholder_texts(&m),
+            vec![
+                ("INTERPOLATION".to_string(), "{{count}}".to_string()),
+                ("VAR_SELECT".to_string(), "count".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn custom_placeholder_name_comes_from_an_i18n_ph_comment() {
+        let m = message_of("<p>{{ a // i18n(ph=\"FOO\") }}</p>");
+        assert!(placeholder_texts(&m).iter().any(|(n, t)| n == "FOO" && t == "{{ a // i18n(ph=\"FOO\") }}"), "{:?}", m.placeholders);
+        assert_eq!(extract_placeholder_name("a // i18n(ph=\"NAME\")"), Some("NAME".to_string()));
+        assert_eq!(extract_placeholder_name("a // i18n(ph='x y')"), Some("x y".to_string()));
+        assert_eq!(extract_placeholder_name("a // note"), None);
+        assert_eq!(extract_placeholder_name("a + b"), None);
+    }
+
+    #[test]
+    fn nested_icu_becomes_a_placeholder_with_its_own_message() {
+        let m = message_of("<p>{a, select, x {y} other {z}}</p>");
+        let Node::TagPlaceholder(p) = &m.nodes[0] else { panic!("expected tag, got {:?}", m.nodes) };
+        assert!(matches!(&p.children[0], Node::IcuPlaceholder(ph) if ph.name == "ICU"));
+        assert_eq!(m.placeholder_to_message.len(), 1);
+        assert_eq!(m.placeholder_to_message[0].0, "ICU");
+        assert_eq!(placeholder_texts(&m.placeholder_to_message[0].1), vec![("VAR_SELECT".to_string(), "a".to_string())]);
+    }
+
+    #[test]
+    fn block_placeholders_carry_their_marker_text() {
+        let m = message_of("<p>@if (a) {x}</p>");
+        let texts = placeholder_texts(&m);
+        assert!(texts.iter().any(|(_, t)| t == "@if (a) {"), "{texts:?}");
+        assert!(texts.iter().any(|(_, t)| t == "}"), "{texts:?}");
     }
 }

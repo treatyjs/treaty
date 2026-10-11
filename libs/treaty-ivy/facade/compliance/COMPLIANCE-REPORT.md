@@ -21,7 +21,7 @@ This harness runs Treaty's Rust/OXC Angular compiler (`render3` crate, via the
 | Skipped (un-runnable) | 471 |
 | **Pass-rate (of runnable subset)** | **100.0%** (189/189) |
 | Pass-rate (of full corpus) | 28.6% (189/660) |
-| **Partial-golden bucket** (separate; no full golden) | **59.0%** PASS (207/351 runnable, 448 candidates, 144 DIFF, 97 skipped) |
+| **Partial-golden bucket** (separate; no full golden) | **57.1%** PASS (238/417 runnable, 448 candidates, 179 DIFF, 31 skipped) |
 
 ### How a case is run and matched
 
@@ -267,35 +267,41 @@ Cases with no full `ɵɵdefine*` golden: a template-function golden (for example
 
 Reported separately so the full-golden numbers above stay comparable. i18n macros and
 i18n extra checks are skipped (they need Angular's message serializer). The `// SOURCE:`
-source-map assertions are not verified: 191 assertion(s) in 37 passing case(s).
+source-map assertions are not verified: 191 assertion(s) in 43 passing case(s).
 
 | Metric | Value |
 | --- | --- |
 | Candidates (no full golden) | 448 |
-| Runnable | 351 |
-| PASS | 207 |
-| DIFF | 144 |
-| Skipped | 97 |
+| Runnable | 417 |
+| PASS | 238 |
+| DIFF | 179 |
+| Skipped | 31 |
 
 ### Partial DIFF categories
 
 | Count | Category (token at which the golden stops matching) |
 | --- | --- |
-| 78 | `token-outside-instruction` |
-| 22 | `class-shape (static ɵ members / class body)` |
+| 121 | `token-outside-instruction` |
 | 9 | `placeholder-binding` |
 | 4 | `missing-instruction:ɵɵdomProperty` |
+| 4 | `args-of:ɵɵelement` |
 | 3 | `args-of:ɵɵtextInterpolate1` |
+| 3 | `args-of:ɵɵelementStart` |
 | 3 | `missing-instruction:ɵɵelementStart` |
 | 2 | `args-of:ɵɵtextInterpolate` |
 | 2 | `args-of:ɵɵrestoreView` |
 | 2 | `args-of:ɵɵdomProperty` |
 | 2 | `missing-instruction:ɵɵproperty` |
 | 2 | `args-of:ɵɵstyleProp` |
+| 2 | `missing-instruction:ɵɵi18n` |
 | 2 | `args-of:ɵɵnextContext` |
 | 1 | `missing-instruction:ɵɵExternalStylesFeature` |
-| 1 | `args-of:ɵɵelementStart` |
+| 1 | `args-of:ɵɵdomElement` |
 | 1 | `missing-instruction:ɵɵadvance` |
+| 1 | `missing-instruction:ɵɵi18nStart` |
+| 1 | `args-of:ɵɵi18nStart` |
+| 1 | `missing-instruction:ɵɵelement` |
+| 1 | `args-of:ɵɵinjectAttribute` |
 | 1 | `args-of:ɵɵdeferOnInteraction` |
 | 1 | `args-of:ɵɵpipe` |
 | 1 | `missing-instruction:ɵɵtextInterpolate1` |
@@ -305,20 +311,17 @@ source-map assertions are not verified: 191 assertion(s) in 37 passing case(s).
 | 1 | `args-of:ɵɵsanitizeHtml` |
 | 1 | `args-of:ɵɵlistener` |
 | 1 | `args-of:ɵɵproperty` |
+| 1 | `class-shape (static ɵ members / class body)` |
 | 1 | `missing-instruction:ɵɵreference` |
 
 ### Partial skip reasons
 
 | Count | Reason |
 | --- | --- |
-| 47 | `partial:macro:__i18nMsg__` |
 | 11 | `partial:fe:host/hostDirectives` |
-| 9 | `partial:macro:__i18nIcuMsg__` |
 | 8 | `partial:golden-untokenizable` |
-| 7 | `partial:macro:__i18nMsgWithPostprocess__` |
 | 6 | `partial:fe:directive-only` |
 | 3 | `partial:full-define-golden(default file, not in full bucket)` |
-| 3 | `partial:extra-check:i18n` |
 | 1 | `partial:expects-errors` |
 | 1 | `partial:fe:other(Cannot translate attribute "title" becau)` |
 | 1 | `partial:expected-missing` |
@@ -331,12 +334,30 @@ source-map assertions are not verified: 191 assertion(s) in 37 passing case(s).
   - missing "," after "...ɵɵconditionalCreate(0, MyApp_Case_0_Template, 1, 1"
 - `args-of:ɵɵdeferOnInteraction` — r3_view_compiler_deferred/should generate a deferred block with an interaction trigger in a parent view
   - missing "1" after "\t\ti0.ɵɵdeferOnInteraction("
+- `args-of:ɵɵdomElement` — r3_view_compiler_i18n/should support i18n nodes with ICUs inside
+  - missing "(" after "\t\ti0.ɵɵdomElement"
 - `args-of:ɵɵdomProperty` — r3_view_compiler_bindings/host_bindings/should chain multiple host property bindings in the presence of other bindings
   - missing "(" after "\t\t\ti0.ɵɵdomProperty(\"title\", \"my title\")"
 - `args-of:ɵɵdomProperty` — r3_view_compiler_template/should handle a bindings on plain ng-template elements
   - missing "(" after "\t\t\ti0.ɵɵdomProperty(\"p\", ctx.p1)"
+- `args-of:ɵɵelement` — r3_view_compiler_i18n/icu_logic/should handle icus in different contexts
+  - missing "(" after "\t\ti0.ɵɵelement"
+- `args-of:ɵɵelement` — r3_view_compiler_i18n/icu_logic/should handle icus with interpolations
+  - missing "(" after "\t\ti0.ɵɵelement"
+- `args-of:ɵɵelement` — r3_view_compiler_i18n/icu_logic/should handle multiple icus that share same placeholder
+  - missing "(" after "\t\ti0.ɵɵelement"
+- `args-of:ɵɵelement` — r3_view_compiler_i18n/nested_nodes/should ignore i18n attributes on self-closing tags
+  - missing "1" after "\t\ti0.ɵɵelement(0, \"img\","
+- `args-of:ɵɵelementStart` — r3_view_compiler_i18n/element_attributes/should correctly bind to context in nested template
+  - missing "(" after "\t\ti0.ɵɵelementStart(0, \"div\")"
+- `args-of:ɵɵelementStart` — r3_view_compiler_i18n/icu_logic/should generate i18n instructions for icus generated outside of i18n blocks
+  - missing "5" after "\t\ti0.ɵɵelementStart(0, \"div\","
 - `args-of:ɵɵelementStart` — r3_view_compiler_listener/should generate a two-way binding to a @for loop variable that is a signal
   - missing "1" after "\t\ti0.ɵɵelementStart(0, \"input\","
+- `args-of:ɵɵi18nStart` — r3_view_compiler_i18n/ng-container_ng-template/should handle structural directives with same placeholder
+  - missing "4" after "\t\ti0.ɵɵi18nStart(0, 0,"
+- `args-of:ɵɵinjectAttribute` — r3_view_compiler_di/di/should create factory methods
+  - missing "'name'" after "...actoryType__ || MyComponent)(i0.ɵɵinjectAttribute("
 - `args-of:ɵɵlistener` — r3_view_compiler_bindings/host_bindings/should properly compiler host listeners with an argument
   - missing "\"dragover\"" after "\t\t\ti0.ɵɵlistener("
 - `args-of:ɵɵnextContext` — r3_view_compiler_control_flow/should expose the alias to nested conditional blocks
@@ -367,51 +388,9 @@ source-map assertions are not verified: 191 assertion(s) in 37 passing case(s).
   - missing "(" after "\t\t\ti0.ɵɵtextInterpolate1(\" \","
 - `args-of:ɵɵtextInterpolate1` — r3_view_compiler/safe_access/should handle deep safe property reads inside templates with legacyOptionalChaining
   - missing "==" after "\t\t\ti0.ɵɵtextInterpolate1(\"Safe Property: \", ctx.p"
-- `class-shape (static ɵ members / class body)` — r3_compiler_compliance/class_metadata/should capture Angular property decorators
-  - missing "static" after "\n"
-- `class-shape (static ɵ members / class body)` — r3_compiler_compliance/class_metadata/should capture constructor parameters
-  - missing "static" after "\n"
 - `class-shape (static ɵ members / class body)` — r3_compiler_compliance/components_and_directives/should support nested component declarations
   - missing "class" after "\n"
-- `class-shape (static ɵ members / class body)` — r3_compiler_compliance/components_and_directives/standalone/should optimize injector imports
-  - missing "static" after "\n"
-- `class-shape (static ɵ members / class body)` — r3_compiler_compliance/elements/should bind to element properties
-  - missing "static" after "\n"
-- `class-shape (static ɵ members / class body)` — r3_compiler_compliance/elements/should handle MathML
-  - missing "static" after "\n"
-- `class-shape (static ɵ members / class body)` — r3_compiler_compliance/elements/should handle SVG
-  - missing "static" after "\n"
-- `class-shape (static ɵ members / class body)` — r3_compiler_compliance/elements/should reserve slots for pure functions
-  - missing "static" after "\n"
-- `class-shape (static ɵ members / class body)` — r3_compiler_compliance/elements/should support namespaced attributes
-  - missing "static" after "\n"
-- `class-shape (static ɵ members / class body)` — r3_compiler_compliance/elements/should translate DOM structure
-  - missing "static" after "\n"
-- `class-shape (static ɵ members / class body)` — r3_compiler_compliance/ng_modules/should handle providers passed in as a variable
-  - missing "static" after "\n"
-- `class-shape (static ɵ members / class body)` — r3_compiler_compliance/ng_modules/should not pass along empty array fields to the declaration
-  - missing "static" after "\n"
-- `class-shape (static ɵ members / class body)` — r3_view_compiler_di/di/should create a factory definition for an injectable
-  - missing "static" after "\n"
-- `class-shape (static ɵ members / class body)` — r3_view_compiler_di/di/should create a factory definition for an injectable with an overloaded constructor
-  - missing "static" after "\n"
-- `class-shape (static ɵ members / class body)` — r3_view_compiler_di/di/should create factory methods
-  - missing "static" after "\n"
-- `class-shape (static ɵ members / class body)` — r3_view_compiler_di/di/should delegate directly to the alternate class factory when setting `useClass` without `deps`
-  - missing "static" after "\n"
-- `class-shape (static ɵ members / class body)` — r3_view_compiler_di/di/should delegate directly to the alternate factory when setting `useFactory` without `deps`
-  - missing "static" after "\n"
-- `class-shape (static ɵ members / class body)` — r3_view_compiler_di/di/should not delegate directly to the alternate class when setting `useClass` with `deps`
-  - missing "static" after "\n"
-- `class-shape (static ɵ members / class body)` — r3_view_compiler_di/di/should not delegate directly to the alternate factory when setting `useFactory` with `deps`
-  - missing "static" after "\n"
-- `class-shape (static ɵ members / class body)` — r3_view_compiler_di/di/should support forward refs in a providedIn clause
-  - missing "static" after "\n"
-- `class-shape (static ɵ members / class body)` — r3_view_compiler_di/di/should unwrap forward refs when delegating to a different class
-  - missing "static" after "\n"
-- `class-shape (static ɵ members / class body)` — r3_view_compiler/should be able to generate the TODO example
-  - missing "static" after "\n"
-- `missing-instruction:ɵɵadvance` — r3_view_compiler_i18n/should support i18n nodes with ICUs inside
+- `missing-instruction:ɵɵadvance` — r3_view_compiler_i18n/ng-container_ng-template/should be able to act as child elements inside i18n block
   - missing "ɵadvance" after "\t\ti0.ɵ"
 - `missing-instruction:ɵɵdomProperty` — r3_view_compiler_bindings/host_bindings/should chain multiple host attribute bindings in the presence of other bindings
   - missing "ɵdomProperty" after "\t\t\ti0.ɵ"
@@ -421,6 +400,8 @@ source-map assertions are not verified: 191 assertion(s) in 37 passing case(s).
   - missing "ɵdomProperty" after "\t\t\ti0.ɵ"
 - `missing-instruction:ɵɵdomProperty` — r3_view_compiler_styling/class_bindings/should support class bindings on structural elements
   - missing "ɵdomProperty" after "\t\t\ti0.ɵ"
+- `missing-instruction:ɵɵelement` — r3_view_compiler_i18n/nested_nodes/should handle i18n attributes in nested templates
+  - missing "ɵelement" after "\t\ti0.ɵ"
 - `missing-instruction:ɵɵelementStart` — r3_view_compiler_deferred/should generate a deferred block with an interaction trigger inside the placeholder
   - missing "ɵelementStart" after "\t\ti0.ɵ"
 - `missing-instruction:ɵɵelementStart` — r3_view_compiler_deferred/should generate a deferred block with implicit trigger references
@@ -428,7 +409,13 @@ source-map assertions are not verified: 191 assertion(s) in 37 passing case(s).
 - `missing-instruction:ɵɵelementStart` — r3_view_compiler_deferred/should generate a deferred block with no dependencies followed by one that has dependencies
   - missing "ɵelementStart" after "\t\t\ti0.ɵ"
 - `missing-instruction:ɵɵExternalStylesFeature` — r3_view_compiler_styling/component_styles/should emit external runtime styles component feature for file-based styles when 'externalRuntimeStyles' option is enabled
-  - missing "ɵExternalStylesFeature" after "MyComponent.ɵ"
+  - missing "ɵExternalStylesFeature" after "  static ɵ"
+- `missing-instruction:ɵɵi18n` — r3_view_compiler_i18n/ng-container_ng-template/should handle single translation message using <ng-template>
+  - missing "ɵi18n" after "\t\ti0.ɵ"
+- `missing-instruction:ɵɵi18n` — r3_view_compiler_i18n/self-closing_i18n_instructions/should be generated within <ng-container> and <ng-template> blocks
+  - missing "ɵi18n" after "\t\ti0.ɵ"
+- `missing-instruction:ɵɵi18nStart` — r3_view_compiler_i18n/ng-container_ng-template/should handle self-closing tags as content
+  - missing "ɵi18nStart" after "\t\ti0.ɵ"
 - `missing-instruction:ɵɵproperty` — r3_view_compiler_bindings/property_bindings/should generate synthetic bindings and listeners on structural directives
   - missing "ɵproperty" after "\t\ti0.ɵ"
 - `missing-instruction:ɵɵproperty` — r3_view_compiler_template/should handle attribute bindings inside an ng-template
@@ -457,6 +444,10 @@ source-map assertions are not verified: 191 assertion(s) in 37 passing case(s).
   - missing "$r3$" after "\n"
 - `placeholder-binding` — r3_view_compiler_deferred/should generate a deferred block with prefetch triggers
   - missing "$r3$" after "\n"
+- `token-outside-instruction` — r3_compiler_compliance/class_metadata/should capture Angular property decorators
+  - missing "__decorate" after "\n"
+- `token-outside-instruction` — r3_compiler_compliance/class_metadata/should capture constructor parameters
+  - missing "(" after "... static ɵfac = function DerivedInjectable_Factory("
 - `token-outside-instruction` — r3_compiler_compliance/components_and_directives/content_projection/should support content projection in both the root and nested templates
   - missing "\"[id=toMainAfter]\"" after "\n"
 - `token-outside-instruction` — r3_compiler_compliance/components_and_directives/content_projection/support projectAs on ng-content
@@ -464,11 +455,13 @@ source-map assertions are not verified: 191 assertion(s) in 37 passing case(s).
 - `token-outside-instruction` — r3_compiler_compliance/components_and_directives/should emit a valid setClassMetadata call in ES5 if a class with a custom decorator is referencing itself inside its own metadata
   - missing "function" after "const token = new InjectionToken("
 - `token-outside-instruction` — r3_compiler_compliance/components_and_directives/should generate debug info statement for component
-  - missing "(" after "Main.ɵfac = function Main_Factory("
+  - missing "(" after "  static ɵfac = function Main_Factory("
 - `token-outside-instruction` — r3_compiler_compliance/components_and_directives/should instantiate pipes in a closure when they are forward referenced
   - missing "(" after "\tdependencies:"
 - `token-outside-instruction` — r3_compiler_compliance/components_and_directives/standalone/should generate dependencies array from imports
   - missing "SomeModule" after "\n"
+- `token-outside-instruction` — r3_compiler_compliance/components_and_directives/standalone/should optimize injector imports
+  - missing "/*" after "  static ɵinj ="
 - `token-outside-instruction` — r3_compiler_compliance/components_and_directives/standalone/should support recursivity in templates
   - missing "dependencies" after ""
 - `token-outside-instruction` — r3_compiler_compliance/components_and_directives/value_composition/should optimize regular expressions without flags
@@ -477,8 +470,14 @@ source-map assertions are not verified: 191 assertion(s) in 37 passing case(s).
   - missing "const" after "\n"
 - `token-outside-instruction` — r3_compiler_compliance/elements/should specify security-sensitive constant attributes as template literals
   - missing "i0" after "\t\t[\"src\","
+- `token-outside-instruction` — r3_compiler_compliance/elements/should support namespaced attributes
+  - missing "0" after "\n"
 - `token-outside-instruction` — r3_compiler_compliance/elements/should support namespaces on attributes
   - missing "0" after "\n"
+- `token-outside-instruction` — r3_compiler_compliance/ng_modules/should handle providers passed in as a variable
+  - missing "/*" after "  static ɵinj ="
+- `token-outside-instruction` — r3_compiler_compliance/ng_modules/should not pass along empty array fields to the declaration
+  - missing "/*" after "  static ɵinj ="
 - `token-outside-instruction` — r3_compiler_compliance/ng_modules/should not process NgModules that are marked `jit`
   - missing "let" after ""
 - `token-outside-instruction` — r3_view_compiler_bindings/attribute_bindings/should handle duplicate bindings
@@ -531,14 +530,62 @@ source-map assertions are not verified: 191 assertion(s) in 37 passing case(s).
   - missing "_forTrack0" after "function"
 - `token-outside-instruction` — r3_view_compiler_deferred/should generate a lazy deferred block with empty and placeholder
   - missing "function" after "\n"
+- `token-outside-instruction` — r3_view_compiler_di/di/should create a factory definition for an injectable
+  - missing "/*" after "  static ɵprov ="
+- `token-outside-instruction` — r3_view_compiler_di/di/should create a factory definition for an injectable with an overloaded constructor
+  - missing "/*" after "  static ɵprov ="
+- `token-outside-instruction` — r3_view_compiler_di/di/should delegate directly to the alternate class factory when setting `useClass` without `deps`
+  - missing "/*" after "  static ɵprov ="
+- `token-outside-instruction` — r3_view_compiler_di/di/should delegate directly to the alternate factory when setting `useFactory` without `deps`
+  - missing "/*" after "  static ɵprov ="
+- `token-outside-instruction` — r3_view_compiler_di/di/should not delegate directly to the alternate class when setting `useClass` with `deps`
+  - missing "/*" after "  static ɵprov ="
+- `token-outside-instruction` — r3_view_compiler_di/di/should not delegate directly to the alternate factory when setting `useFactory` with `deps`
+  - missing "/*" after "  static ɵprov ="
+- `token-outside-instruction` — r3_view_compiler_di/di/should support forward refs in a providedIn clause
+  - missing "/*" after "  static ɵprov ="
+- `token-outside-instruction` — r3_view_compiler_di/di/should unwrap forward refs when delegating to a different class
+  - missing "/*" after "  static ɵprov ="
+- `token-outside-instruction` — r3_view_compiler_i18n/element_attributes/should support complex expressions in interpolation
+  - missing "2" after "\tdecls:"
+- `token-outside-instruction` — r3_view_compiler_i18n/element_attributes/should support complex expressions in interpolation with legacyOptionalChaining
+  - missing "2" after "\tdecls:"
+- `token-outside-instruction` — r3_view_compiler_i18n/element_attributes/should support i18n attributes on explicit <ng-template> elements
+  - missing "(" after "\tconsts:"
+- `token-outside-instruction` — r3_view_compiler_i18n/element_attributes/should support i18n attributes on explicit <ng-template> with structural directives
+  - missing "MyComponent_0_ng_template_0_Template" after "function"
+- `token-outside-instruction` — r3_view_compiler_i18n/element_attributes/should support i18n attributes with interpolations on explicit <ng-template> elements
+  - missing "(" after "\tconsts:"
+- `token-outside-instruction` — r3_view_compiler_i18n/element_attributes/should support i18n attributes with interpolations on explicit <ng-template> elements with structural directives
+  - missing "MyComponent_0_Template" after "  static ɵfac = function"
+- `token-outside-instruction` — r3_view_compiler_i18n/element_attributes/should support interpolation
+  - missing "5" after "\tdecls:"
+- `token-outside-instruction` — r3_view_compiler_i18n/icu_logic/nested with interpolations in "other" blocks
+  - missing "3" after "\tvars:"
+- `token-outside-instruction` — r3_view_compiler_i18n/icu_logic/should attach metadata in case an ICU represents the whole message
+  - missing "\"{VAR_SELECT, select, 1 {one} other {more than one}}\"" after "\t\t\tconst MSG__0 = /* @ts-ignore */ goog.getMsg("
 - `token-outside-instruction` — r3_view_compiler_i18n/icu_logic/should handle ICUs with element tags, as the root message
-  - missing "consts" after ""
-- `token-outside-instruction` — r3_view_compiler_i18n/icu_logic/should handle multiple icus that share same placeholder
-  - missing "if" after "\n"
+  - missing "\"{VAR_SELECT, select, WEBSITE {{START_TAG_STRONG}someText{CLOSE_TAG_STRONG}\\n      }}\"" after "\t\t\tconst MSG__0 = /* @ts-ignore */ goog.getMsg("
+- `token-outside-instruction` — r3_view_compiler_i18n/icu_logic/should handle icus with expressions
+  - missing "2" after "\tvars:"
+- `token-outside-instruction` — r3_view_compiler_i18n/icu_logic/should handle icus with html
+  - missing "\"{VAR_SELECT, select, male {male - {START_BOLD_TEXT}male{CLOSE_BOLD_TEXT}} female {female {START_BOLD_TEXT}female{CLOSE_BOLD_TEXT}} other {{START_TAG_DIV}{START_ITALIC_TEXT}other{CLOSE_ITALIC_TEXT}{CLOSE_TAG_DIV}}}\"" after "\t\t\tconst MSG__0 = /* @ts-ignore */ goog.getMsg("
+- `token-outside-instruction` — r3_view_compiler_i18n/icu_logic/should handle icus with named interpolations
+  - missing "4" after "\tvars:"
+- `token-outside-instruction` — r3_view_compiler_i18n/icu_logic/should handle multiple icus in one block
+  - missing "\"{VAR_SELECT, select, male {male} female {female} other {other}}\"" after "\t\t\tconst MSG__0 = /* @ts-ignore */ goog.getMsg("
+- `token-outside-instruction` — r3_view_compiler_i18n/icu_logic/should handle nested icus
+  - missing "\"{VAR_SELECT_1, select, male {male of age: {VAR_SELECT, select, 10 {ten} 20 {twenty} 30 {thirty} other {other}}} female {female} other {other}}\"" after "\t\t\tconst MSG__0 = /* @ts-ignore */ goog.getMsg("
+- `token-outside-instruction` — r3_view_compiler_i18n/icu_logic/should handle single icus
+  - missing "\"{VAR_SELECT, select, male {male} female {female} other {other}}\"" after "\t\t\tconst MSG__0 = /* @ts-ignore */ goog.getMsg("
 - `token-outside-instruction` — r3_view_compiler_i18n/icu_logic/should handles ICUs with html content that has interpolated attributes
-  - missing "/*" after "\n"
+  - missing "\"{VAR_SELECT, select, other {{START_TAG_SPAN}foo{CLOSE_TAG_SPAN}}}\"" after "\t\t\tconst MSG__0 = /* @ts-ignore */ goog.getMsg("
+- `token-outside-instruction` — r3_view_compiler_i18n/icu_logic/should produce proper messages when `select` or `plural` keywords have spaces after them
+  - missing "\"{VAR_SELECT , select , 1 {one} other {more than one}}\"" after "\t\t\tconst MSG__0 = /* @ts-ignore */ goog.getMsg("
 - `token-outside-instruction` — r3_view_compiler_i18n/icu_logic/should properly escape quotes in content
-  - missing "let" after ""
+  - missing "\"{VAR_SELECT, select, single {'single quotes'} double {\\\"double quotes\\\"} other {other}}\"" after "\t\t\tconst MSG__0 = /* @ts-ignore */ goog.getMsg("
+- `token-outside-instruction` — r3_view_compiler_i18n/icu_logic/should support ICU-only templates
+  - missing "1" after "\tdecls:"
 - `token-outside-instruction` — r3_view_compiler_i18n/line_ending_normalization/should compute normalized legacy ids for messages in inline templates where i18nNormalizeLineEndingsInICUs is false
   - missing ":␟4f9ce2c66b187afd9898b25f6336d1eb2be8b5dc␟7326958852138509669:abc\ndef" after "\t\t\ti18n_0 = $localize'"
 - `token-outside-instruction` — r3_view_compiler_i18n/line_ending_normalization/should compute normalized legacy ids for messages in inline templates where i18nNormalizeLineEndingsInICUs is true
@@ -548,15 +595,49 @@ source-map assertions are not verified: 191 assertion(s) in 37 passing case(s).
 - `token-outside-instruction` — r3_view_compiler_i18n/line_ending_normalization/should normalize line breaks for non-legacy messages in 'inline templates' where i18nNormalizeLineEndingsInICUs is true
   - missing "abc\ndef" after "\t\t\ti18n_0 = $localize'"
 - `token-outside-instruction` — r3_view_compiler_i18n/localize_legacy_message_ids/should add legacy message ids if `enableI18nLegacyMessageIdFormat` is true
-  - missing "/*" after "\n"
-- `token-outside-instruction` — r3_view_compiler_i18n/localize_legacy_message_ids/should not add legacy message ids if `enableI18nLegacyMessageIdFormat` is false
-  - missing "/*" after "\n"
+  - missing ":␟82ec661067f503a3357ecc159b2128325e9208cd␟2908931752694090721:Some & attribute" after "\t\t\ti18n_0 = $localize'"
 - `token-outside-instruction` — r3_view_compiler_i18n/namespaces/should handle namespaces inside i18n blocks
-  - missing "/*" after "\n"
+  - missing "\"</xhtml:div>\"" after "\t\t\t\t\"closeTagXhtmlDiv\":"
 - `token-outside-instruction` — r3_view_compiler_i18n/namespaces/should handle namespaces on i18n block containers
-  - missing "/*" after "\n"
+  - missing "\"</span>\"" after "\t\t\t\t\"closeTagXhtmlSpan\":"
+- `token-outside-instruction` — r3_view_compiler_i18n/nested_nodes/should handle i18n attribute with directives
+  - missing "\"{{ valueA }}\"" after "\t\t\t\t\"interpolation\":"
+- `token-outside-instruction` — r3_view_compiler_i18n/nested_nodes/should handle i18n attributes with bindings and nested elements in content
+  - missing "\"{{ one }}\"" after "\t\t\t\t\"interpolation\":"
+- `token-outside-instruction` — r3_view_compiler_i18n/nested_nodes/should handle i18n attributes with bindings in content
+  - missing "\"{{ one }}\"" after "...FFD0\\uFFFD\" }, { original_code: { \"interpolation\":"
+- `token-outside-instruction` — r3_view_compiler_i18n/nested_nodes/should handle i18n attributes with bindings in content and element attributes
+  - missing "9" after "\tdecls:"
+- `token-outside-instruction` — r3_view_compiler_i18n/nested_nodes/should handle i18n context in nested templates
+  - missing "MyComponent_div_2_div_4_Template" after "function"
+- `token-outside-instruction` — r3_view_compiler_i18n/nested_nodes/should handle interpolations wrapped in backticks
+  - missing "\"{{ count }}\"" after "...FFD0\\uFFFD\" }, { original_code: { \"interpolation\":"
+- `token-outside-instruction` — r3_view_compiler_i18n/nested_nodes/should handle ng-content in i18n block
+  - missing "\"{$startTagNgContent}{$closeTagNgContent}{$startTagNgContent_1}{$closeTagNgContent}\"" after "\t\t\tconst MSG__0 = /* @ts-ignore */ goog.getMsg("
+- `token-outside-instruction` — r3_view_compiler_i18n/nested_nodes/should support interpolations with complex expressions
+  - missing "\" {$interpolation} {$interpolation_1} {$interpolation_2} \"" after "\t\t\tconst MSG__0 = /* @ts-ignore */ goog.getMsg("
+- `token-outside-instruction` — r3_view_compiler_i18n/nested_nodes/should support named interpolations
+  - missing "\" Named interpolation: {$phA} Named interpolation with spaces: {$phB} \"" after "\t\t\tconst MSG__0 = /* @ts-ignore */ goog.getMsg("
+- `token-outside-instruction` — r3_view_compiler_i18n/nested_nodes/when the last element inside an i18n block has i18n attributes
+  - missing "\"{$interpolation}\"" after "\t\t\tconst MSG__0 = /* @ts-ignore */ goog.getMsg("
+- `token-outside-instruction` — r3_view_compiler_i18n/ng-container_ng-template/should correctly propagate i18n context through nested templates
+  - missing "MyComponent_ng_template_2_ng_template_2_ng_template_1_Template" after "function"
+- `token-outside-instruction` — r3_view_compiler_i18n/ng-container_ng-template/should handle ICUs outside of translatable sections
+  - missing "if" after "...tion MyComponent_ng_template_0_Template(rf, ctx) {"
+- `token-outside-instruction` — r3_view_compiler_i18n/ng-container_ng-template/should handle single translation message using <ng-container>
+  - missing "\"{{ valueA | uppercase }}\"" after "...FFD0\\uFFFD\" }, { original_code: { \"interpolation\":"
+- `token-outside-instruction` — r3_view_compiler_i18n/ng-container_ng-template/should handle structural directives
+  - missing "MyComponent_0_ng_template_0_Template" after "function"
+- `token-outside-instruction` — r3_view_compiler_i18n/ng-container_ng-template/should work with ICUs
+  - missing "if" after "...tion MyComponent_ng_template_2_Template(rf, ctx) {"
+- `token-outside-instruction` — r3_view_compiler_i18n/self-closing_i18n_instructions/should be generated for ICU-only i18n blocks
+  - missing "\"{VAR_SELECT, select, 10 {ten} 20 {twenty} other {other}}\"" after "\t\t\tconst MSG__0 = /* @ts-ignore */ goog.getMsg("
+- `token-outside-instruction` — r3_view_compiler_i18n/should allow repeating the same placeholder
+  - missing "\"{{ placeholder }}\"" after "...FD1\\uFFFD]\" }, { original_code: { \"interpolation\":"
+- `token-outside-instruction` — r3_view_compiler_i18n/should support i18n message with multiple pipes
+  - missing "\"{$interpolation} and {$interpolation_1}\"" after "\t\t\tconst MSG__0 = /* @ts-ignore */ goog.getMsg("
 - `token-outside-instruction` — r3_view_compiler_i18n/whitespace_preserving_mode/should keep inner content of i18n block as is
-  - missing "/*" after "\n"
+  - missing "\"\\n    Some text\\n    {$startTagSpan}Text inside span{$closeTagSpan}\\n  \"" after "\t\t\tconst MSG__0 = /* @ts-ignore */ goog.getMsg("
 - `token-outside-instruction` — r3_view_compiler_listener/should chain multiple listeners on the same template
   - missing "consts" after ""
 - `token-outside-instruction` — r3_view_compiler_listener/should generate host listeners for a decorator on a property holding a function
@@ -565,6 +646,8 @@ source-map assertions are not verified: 191 assertion(s) in 37 passing case(s).
   - missing ")" after "...ick\", function Comp_Template_div_click_0_listener("
 - `token-outside-instruction` — r3_view_compiler_listener/should preserve accesses to $event if it is done through `this` in a listener inside a host binding
   - missing ")" after "...er(\"click\", function Dir_click_HostBindingHandler("
+- `token-outside-instruction` — r3_view_compiler_styling/class_bindings/should handle class that shares its name with other const array items
+  - missing "\"class\"" after "\n"
 - `token-outside-instruction` — r3_view_compiler_styling/component_styles/should pass in the component metadata styles into the component definition and shim them using style encapsulation
   - missing "\"div.bar { color: blue; }\\n\"" after "\tselectors: ["
 - `token-outside-instruction` — r3_view_compiler_styling/style_bindings/should not mangle css custom property names
@@ -577,6 +660,8 @@ source-map assertions are not verified: 191 assertion(s) in 37 passing case(s).
   - missing "}" after "\n"
 - `token-outside-instruction` — r3_view_compiler_template/should handle ngFor context variables when used in bindings
   - missing "4" after "\n"
+- `token-outside-instruction` — r3_view_compiler_template/should handle self-closing structural directives
+  - missing "\"*ngIf\"" after "const _c0 = ["
 - `token-outside-instruction` — r3_view_compiler_template/should handle structural directive on ng-template
   - missing "MyComponent_0_ng_template_0_Template" after "function"
 - `token-outside-instruction` — r3_view_compiler_template/should support directive outputs on <ng-template>
@@ -594,25 +679,13 @@ source-map assertions are not verified: 191 assertion(s) in 37 passing case(s).
 - `token-outside-instruction` — r3_view_compiler/should handle binary and unary operators with legacyOptionalChaining
   - missing "(" after "\t\t\t\ttypeof"
 - `token-outside-instruction` — source_mapping/inline_templates/should correctly handle collapsed whitespace in element placeholder i18n message source-mappings (full compile)
-  - missing "\"\\uFFFD#2\\uFFFD\"" after "\t\t\ti18n_0 = $localize' pre-p ${"
+  - missing ":CLOSE_PARAGRAPH: post-p\\n" after "...uFFFD\"}:START_PARAGRAPH: in-p ${\"\\uFFFD/#2\\uFFFD\"}"
 - `token-outside-instruction` — source_mapping/inline_templates/should correctly handle collapsed whitespace in element placeholder i18n message source-mappings (partial compile)
-  - missing "\"\\uFFFD#2\\uFFFD\"" after "\t\t\ti18n_0 = $localize' pre-p ${"
+  - missing ":CLOSE_PARAGRAPH: post-p\\n" after "...uFFFD\"}:START_PARAGRAPH: in-p ${\"\\uFFFD/#2\\uFFFD\"}"
 - `token-outside-instruction` — source_mapping/inline_templates/should correctly handle collapsed whitespace in interpolation placeholder i18n message source-mappings (full compile)
   - missing "  pre-title " after "\t\t\ti18n_0 = $localize'"
 - `token-outside-instruction` — source_mapping/inline_templates/should correctly handle collapsed whitespace in interpolation placeholder i18n message source-mappings (partial compile)
   - missing "  pre-title " after "\t\t\ti18n_0 = $localize'"
-- `token-outside-instruction` — source_mapping/inline_templates/should create placeholder i18n message source-mappings (full compile)
-  - missing "\"\\uFFFD0\\uFFFD\"" after "\t\t\ti18n_0 = $localize'Hello, ${"
-- `token-outside-instruction` — source_mapping/inline_templates/should create placeholder i18n message source-mappings (partial compile)
-  - missing "\"\\uFFFD0\\uFFFD\"" after "\t\t\ti18n_0 = $localize'Hello, ${"
-- `token-outside-instruction` — source_mapping/inline_templates/should create tag (container) placeholder i18n message source-mappings (full compile)
-  - missing "\"\\uFFFD#2\\uFFFD\"" after "\t\t\ti18n_0 = $localize'Hello, ${"
-- `token-outside-instruction` — source_mapping/inline_templates/should create tag (container) placeholder i18n message source-mappings (partial compile)
-  - missing "\"\\uFFFD#2\\uFFFD\"" after "\t\t\ti18n_0 = $localize'Hello, ${"
-- `token-outside-instruction` — source_mapping/inline_templates/should handle encoded entities in i18n message source-mappings (full compile)
-  - missing "\"\\uFFFD0\\uFFFD\"" after "\t\t\ti18n_0 = $localize'Interpolation: ${"
-- `token-outside-instruction` — source_mapping/inline_templates/should handle encoded entities in i18n message source-mappings (partial compile)
-  - missing "\"\\uFFFD0\\uFFFD\"" after "\t\t\ti18n_0 = $localize'Interpolation: ${"
 
 ### Passing partial cases
 
@@ -625,11 +698,16 @@ source-map assertions are not verified: 191 assertion(s) in 37 passing case(s).
 - r3_compiler_compliance/components_and_directives/value_composition/should not optimize sticky regular expressions
 - r3_compiler_compliance/components_and_directives/value_composition/should support number literals with separators
 - r3_compiler_compliance/components_and_directives/value_composition/should support tagged template literals
+- r3_compiler_compliance/elements/should bind to element properties
 - r3_compiler_compliance/elements/should de-duplicate attribute arrays
 - r3_compiler_compliance/elements/should generate self-closing elementContainer instruction for empty <ng-container>
+- r3_compiler_compliance/elements/should handle MathML
+- r3_compiler_compliance/elements/should handle SVG
 - r3_compiler_compliance/elements/should handle SVG with an embedded ng-template
+- r3_compiler_compliance/elements/should reserve slots for pure functions
 - r3_compiler_compliance/elements/should reserve slots for pure functions in host binding function
 - r3_compiler_compliance/elements/should support <ng-container>
+- r3_compiler_compliance/elements/should translate DOM structure
 - r3_compiler_compliance/elements/should validate iframe attributes
 - r3_view_compiler/any/should preserve $any if it is accessed through `this`
 - r3_view_compiler/any/should strip out $any wrappers
@@ -644,6 +722,7 @@ source-map assertions are not verified: 191 assertion(s) in 37 passing case(s).
 - r3_view_compiler/safe_access/should handle property reads requiring temporary variables
 - r3_view_compiler/safe_access/should handle safe keyed reads inside templates
 - r3_view_compiler/safe_access/should handle safe method calls inside templates
+- r3_view_compiler/should be able to generate the TODO example
 - r3_view_compiler/should handle binary and unary operators
 - r3_view_compiler_bindings/attribute_bindings/should chain multiple attribute bindings into a single instruction
 - r3_view_compiler_bindings/attribute_bindings/should chain multiple attribute bindings when there are child elements
@@ -723,6 +802,25 @@ source-map assertions are not verified: 191 assertion(s) in 37 passing case(s).
 - r3_view_compiler_deferred/should generate a deferred block with an interaction trigger in the same view
 - r3_view_compiler_deferred/should generate a deferred block with triggers
 - r3_view_compiler_deferred/should insert hydrate triggers before all other triggers
+- r3_view_compiler_i18n/element_attributes/should add the meaning and description as JsDoc comments and metadata blocks
+- r3_view_compiler_i18n/element_attributes/should not create translations for empty attributes
+- r3_view_compiler_i18n/element_attributes/should sanitize ids and generate proper variable names
+- r3_view_compiler_i18n/element_attributes/should translate static attributes
+- r3_view_compiler_i18n/element_attributes/should translate static attributes when used on an element with structural directive
+- r3_view_compiler_i18n/element_attributes/should work correctly when placed on i18n root node
+- r3_view_compiler_i18n/localize_legacy_message_ids/should not add legacy message ids if `enableI18nLegacyMessageIdFormat` is false
+- r3_view_compiler_i18n/nested_nodes/should generate event listeners instructions before i18n ones
+- r3_view_compiler_i18n/nested_nodes/should handle i18n attributes with plain-text content
+- r3_view_compiler_i18n/nested_nodes/should handle ng-content in i18n block
+- r3_view_compiler_i18n/nested_nodes/should ignore HTML comments within translated text
+- r3_view_compiler_i18n/nested_nodes/should not produce instructions for empty content
+- r3_view_compiler_i18n/nested_nodes/should properly escape quotes in content
+- r3_view_compiler_i18n/ng-container_ng-template/should generate a self-closing container instruction for ng-container inside i18n
+- r3_view_compiler_i18n/ng-container_ng-template/should handle templates in sibling i18n blocks
+- r3_view_compiler_i18n/ng-container_ng-template/should not emit duplicate i18n consts for elements with the same content
+- r3_view_compiler_i18n/ng-container_ng-template/should not generate a self-closing container instruction for ng-container with non-text 
+- r3_view_compiler_i18n/self-closing_i18n_instructions/should be generated with text-only content
+- r3_view_compiler_i18n/self-closing_i18n_instructions/should not be generated in case we have styling instructions
 - r3_view_compiler_listener/should assume $event is referring to the event variable in a listener by default
 - r3_view_compiler_listener/should assume $event is referring to the event variable in a listener by default inside a host binding
 - r3_view_compiler_listener/should chain multiple listeners across elements
@@ -790,8 +888,14 @@ source-map assertions are not verified: 191 assertion(s) in 37 passing case(s).
 - source_mapping/inline_templates/should create (simple string) inline template source-mapping (partial compile)
 - source_mapping/inline_templates/should create correct inline template source-mapping when the source contains escape sequences (full compile)
 - source_mapping/inline_templates/should create correct inline template source-mapping when the source contains escape sequences (partial compile)
+- source_mapping/inline_templates/should create placeholder i18n message source-mappings (full compile)
+- source_mapping/inline_templates/should create placeholder i18n message source-mappings (partial compile)
 - source_mapping/inline_templates/should create simple i18n message source-mapping (full compile)
 - source_mapping/inline_templates/should create simple i18n message source-mapping (partial compile)
+- source_mapping/inline_templates/should create tag (container) placeholder i18n message source-mappings (full compile)
+- source_mapping/inline_templates/should create tag (container) placeholder i18n message source-mappings (partial compile)
+- source_mapping/inline_templates/should handle encoded entities in i18n message source-mappings (full compile)
+- source_mapping/inline_templates/should handle encoded entities in i18n message source-mappings (partial compile)
 - source_mapping/inline_templates/should map *ngFor scenario (full compile)
 - source_mapping/inline_templates/should map a class input binding (full compile)
 - source_mapping/inline_templates/should map a class input binding (partial compile)

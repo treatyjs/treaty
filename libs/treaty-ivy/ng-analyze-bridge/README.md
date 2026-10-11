@@ -123,7 +123,7 @@ fixed in the facade.
 | Bucket | Feature off | Feature on |
 | --- | --- | --- |
 | Full (`corpus_dump`, compile-verified) | 189 PASS / 0 DIFF of 189 runnable | **189 PASS / 0 DIFF** of 189 runnable |
-| Partial (template goldens, `expectEmit`) | 351 runnable, **207 PASS**, 144 DIFF | 351 runnable, **207 PASS**, 144 DIFF |
+| Partial (template goldens, `expectEmit`) | 417 runnable, **238 PASS**, 179 DIFF (default build, stage 6 re-measure) | not re-measured after stage 6; was 207 PASS / 144 DIFF of 351 when this table was written |
 
 Feature on versus off, per case: 0 gained, 0 lost. Before the same-file constant folding the bridge gained
 three cases (`should support inline non-literal templates`, `… using string concatenation`, `… using

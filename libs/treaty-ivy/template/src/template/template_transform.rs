@@ -3,7 +3,7 @@
 //!
 //! PORT TARGET: `migration/render3-specs/07-template_transform.md`
 //! Source: `tools/angular-ref/packages/compiler/src/render3/r3_template_transform.ts`
-//! (Angular 22.1.0-next.0).
+//! (Angular main, 78d2a67d).
 //!
 //! This module walks the [`crate::ml_parser`] HTML AST and produces a
 //! [`crate::template::r3_ast`] template AST. It recognizes Angular-specific binding syntax
@@ -44,22 +44,25 @@
 //!
 //! ## i18n
 //!
-//! Element/component `i18n` markers and `i18n-<attr>` markers are recognized here: the marker
-//! attributes are consumed, their `meaning|description@@id` values are parsed/validated via
-//! [`crate::i18n::parse_i18n_meta`], i18n-root nesting is validated, and the wrapped/hoisted nodes
-//! carry the [`t::I18nMeta`] flag. What is *not* implemented is the standalone `I18nMetaVisitor`
-//! pass that attaches a full `Message` (with placeholders) to the ml_parser `Element`/`Attribute`/
-//! `Expansion` nodes; those node types do not yet carry i18n meta. Because of that, ICU expansions
-//! ([`HtmlAstToIvyAst::visit_expansion`]) have no `Message` to lower and emit nothing — exactly the
-//! TS `if (!expansion.i18n) return null` path — and the parsed meaning/description cannot be stored
-//! on the placeholder-only [`t::I18nMeta`] (which is itself a not-yet-fleshed-out r3_ast type).
+//! The i18n metadata of Angular's `I18nMetaVisitor` is built here, inline, from the parsed nodes
+//! (the ml_parser nodes carry no i18n field of their own):
+//!   - every ICU expansion, inside or outside an i18n block, gets its message from
+//!     [`crate::i18n::to_i18n_message`]; the variables and placeholders of the [`t::Icu`] node come from
+//!     that message (`visitExpansion`), so an ICU outside i18n is no longer dropped;
+//!   - an i18n root element with content gets its message (children plus the `i18n` attribute's
+//!     meaning, description and id) as [`t::I18nMeta::Message`];
+//!   - a static attribute with an `i18n-<attr>` marker gets the message of its value.
+//! Not populated: the `TagPlaceholder`/`BlockPlaceholder`/`IcuPlaceholder` metadata that Angular
+//! attaches to the children of an i18n root, the `i18n` of `BoundAttribute`, `Text`/`BoundText`,
+//! `Template` and block nodes, and i18n roots without content (they stay `None`, as the view
+//! compiler relies on `is_some()` only for roots with content).
 
 use crate::expression::ast::{
     AstWithSource, BindingType, BoundElementProperty, ExprKind, ParseError as ExprParseError,
-    ParseSourceSpan as OffsetSpan, ParsedEvent, ParsedEventType, ParsedProperty,
+    ParsedEvent, ParsedEventType, ParsedProperty,
     ParsedPropertyType, ParsedVariable, SecurityContext,
 };
-use crate::expression::parser::Parser as ExprParser;
+use crate::expression::parser::{InterpolatedToken, Parser as ExprParser};
 use crate::ml_parser as html;
 use crate::ml_parser::{ParseError, ParseErrorLevel, ParseSourceSpan};
 use crate::template::{boundary, content_block, control_flow, deferred};
@@ -71,21 +74,49 @@ use std::collections::HashSet;
 // Span bridging.
 // ===========================================================================
 
-/// Convert a location-based ml_parser span into the offset-only span used by r3_ast.
-fn to_offset_span(span: &ParseSourceSpan) -> OffsetSpan {
-    OffsetSpan {
-        start: span.start.offset as u32,
-        end: span.end.offset as u32,
-    }
+/// The span an expression parser receives. Both the r3 AST and the expression parser use the
+/// shared `parse_util::ParseSourceSpan`, so this is the span itself (kept as a function to keep
+/// the call sites that name the conversion).
+fn to_offset_span(span: &ParseSourceSpan) -> ParseSourceSpan {
+    span.clone()
 }
 
-fn to_offset_span_opt(span: &Option<ParseSourceSpan>) -> Option<OffsetSpan> {
-    span.as_ref().map(to_offset_span)
+fn to_offset_span_opt(span: &Option<ParseSourceSpan>) -> Option<ParseSourceSpan> {
+    span.clone()
 }
 
 /// `span.start.offset` as the absolute offset the expression parser expects.
 fn abs_offset(span: &ParseSourceSpan) -> i32 {
     span.start.offset as i32
+}
+
+/// `I18N_ICU_VAR_PREFIX` (`render3/view/i18n/util.ts`): the placeholder prefix of ICU switch variables.
+const I18N_ICU_VAR_PREFIX: &str = "VAR_";
+
+/// The i18n `Message` of an i18n root (`_generateI18nMessage(node.children, meta)` in
+/// `I18nMetaVisitor`): the children become the message, and the `i18n` attribute value gives the
+/// meaning, description and custom id (`parseI18nMeta`).
+fn root_i18n_message(attrs: &[html::Attribute], children: &[html::Node]) -> crate::i18n::Message {
+    let value = attrs
+        .iter()
+        .find(|a| a.name == "i18n")
+        .map(|a| a.value.as_str())
+        .unwrap_or("");
+    let meta = crate::i18n::parse_i18n_meta(value);
+    crate::i18n::to_i18n_message(children, &meta.meaning, &meta.description, &meta.custom_id)
+}
+
+/// The tokens of an interpolated text node or attribute value, as the expression parser reads them
+/// (Angular's `InterpolatedTextToken[]` / `InterpolatedAttributeToken[]`).
+fn interpolated_tokens(tokens: &[html::Token]) -> Vec<InterpolatedToken> {
+    tokens
+        .iter()
+        .map(|token| InterpolatedToken {
+            is_encoded_entity: token.kind == html::TokenType::EncodedEntity,
+            parts: token.parts.clone(),
+            source_span: token.source_span.clone(),
+        })
+        .collect()
 }
 
 // ===========================================================================
@@ -180,12 +211,29 @@ pub fn html_ast_to_render3_ast(
     binding_parser: &mut BindingParser,
     options: Render3ParseOptions,
 ) -> Render3ParseResult {
+    html_ast_to_render3_ast_with_whitespace(html_nodes, binding_parser, options, true)
+}
+
+/// [`html_ast_to_render3_ast`] with the whitespace pass made explicit. With `remove_whitespace`
+/// true (the public entry point's behaviour) insignificant whitespace is stripped first; Angular's
+/// `parseTemplate` runs that pass itself only when `preserveWhitespaces` is off, so it calls this
+/// with `remove_whitespace = !preserveWhitespaces`.
+pub(crate) fn html_ast_to_render3_ast_with_whitespace(
+    html_nodes: &[html::Node],
+    binding_parser: &mut BindingParser,
+    options: Render3ParseOptions,
+    remove_whitespace: bool,
+) -> Render3ParseResult {
     // Angular default (`preserveWhitespaces = false`): strip insignificant whitespace text nodes
     // and collapse internal whitespace runs before lowering to the r3 AST. See the
     // `WhitespaceVisitor` invocation in `render3/view/template.ts` (run with
     // `preserveSignificantWhitespace = true`, `requireContext = false`). See [`remove_whitespaces`]
     // below for the in-file port of `ml_parser/html_whitespaces.ts`.
-    let trimmed = remove_whitespaces(html_nodes);
+    let trimmed = if remove_whitespace {
+        remove_whitespaces(html_nodes)
+    } else {
+        html_nodes.to_vec()
+    };
 
     let mut transformer = HtmlAstToIvyAst::new(binding_parser, options);
     // `visitAll(this, htmlNodes, htmlNodes)` — context is the siblings array itself.
@@ -277,7 +325,6 @@ impl<'b> HtmlAstToIvyAst<'b> {
             span: span.clone(),
             msg: message.into(),
             level: ParseErrorLevel::Error,
-            element_name: None,
         });
     }
 
@@ -338,10 +385,10 @@ impl<'b> HtmlAstToIvyAst<'b> {
     // ----- visitElement -----------------------------------------------------
 
     fn visit_element(&mut self, element: &html::Element) -> Option<t::Node> {
-        // `isI18nRootElement = isI18nRootNode(element.i18n)`. The standalone `I18nMetaVisitor`
-        // pass that populates `element.i18n` is not modeled on the ml_parser nodes, so the bare
-        // `i18n` attribute marker stands in for it: an element carrying `i18n` is the root of a
-        // translatable section. Mirrors the `inI18nBlock` nesting guard from the TS transform.
+        // `isI18nRootElement = isI18nRootNode(element.i18n)`: an element carrying an `i18n` (or
+        // `i18n-<attr>`) attribute is the root of a translatable section. The ml_parser nodes carry no
+        // i18n field, so the attribute stands in for the `I18nMetaVisitor` mark. Mirrors the
+        // `inI18nBlock` nesting guard from the TS transform.
         let is_i18n_root_element = element.attrs.iter().any(is_i18n_attribute);
         if is_i18n_root_element {
             if self.in_i18n_block {
@@ -378,9 +425,9 @@ impl<'b> HtmlAstToIvyAst<'b> {
         // attributes mark individual attribute translations. Both forms are consumed (dropped
         // from the static attribute list). The bare `i18n` value (`meaning|description@@id`) and
         // every `i18n-<attr>` value are parsed and validated through [`crate::i18n::parse_i18n_meta`]
-        // — this is the standalone `I18nMetaVisitor` work folded inline, since i18n meta is not
-        // modeled on the ml_parser nodes. The element is flagged with `i18n: Some(I18nMeta)` so the
-        // downstream view builder emits the `ɵɵi18nStart`/`ɵɵi18nEnd` instruction stream.
+        // — the `I18nMetaVisitor` meta, read inline. An i18n root with content carries its message in
+        // `i18n` (see `root_i18n_message`); the view builder reads `is_some()` to emit the
+        // `ɵɵi18nStart`/`ɵɵi18nEnd` instruction stream.
         self.parse_i18n_attribute_values(&element.attrs);
         if is_i18n_root_element {
             prepared.attributes.retain(|a| !is_i18n_attribute_name(&a.name));
@@ -408,7 +455,7 @@ impl<'b> HtmlAstToIvyAst<'b> {
         // `ɵɵi18n`/message-const emission — when it actually carries translatable content.
         let has_i18n_content = !children.is_empty();
         let element_i18n: Option<t::I18nMeta> = if is_i18n_root_element && has_i18n_content {
-            Some(t::I18nMeta)
+            Some(t::I18nMeta::Message(root_i18n_message(&element.attrs, &element.children)))
         } else {
             None
         };
@@ -516,9 +563,8 @@ impl<'b> HtmlAstToIvyAst<'b> {
     /// Parse and validate every i18n meta attribute on a node. The bare `i18n` attribute carries
     /// the element-level translation meta; each `i18n-<attr>` attribute carries the meta for the
     /// translation of `<attr>`. Both share the `meaning|description@@id` syntax parsed by
-    /// [`crate::i18n::parse_i18n_meta`]. This folds the standalone `I18nMetaVisitor`'s meta
-    /// extraction inline (i18n meta is not modeled on the ml_parser nodes), validating the
-    /// `i18n-<attr>` markers and surfacing any value-syntax issues.
+    /// [`crate::i18n::parse_i18n_meta`], and the `i18n-<attr>` markers are validated here, with any
+    /// value-syntax issue reported. The messages themselves are built where the nodes are lowered.
     fn parse_i18n_attribute_values(&mut self, attrs: &[html::Attribute]) {
         for attr in attrs {
             let is_marker = attr.name == "i18n";
@@ -601,7 +647,7 @@ impl<'b> HtmlAstToIvyAst<'b> {
                 .retain(|a| !a.name.starts_with("i18n-"));
         }
         let component_i18n: Option<t::I18nMeta> = if is_i18n_root_element {
-            Some(t::I18nMeta)
+            Some(t::I18nMeta::Message(root_i18n_message(&component.attrs, &component.children)))
         } else {
             None
         };
@@ -671,12 +717,21 @@ impl<'b> HtmlAstToIvyAst<'b> {
         if self.processed_nodes.contains(&node_key(&text.source_span)) {
             return None;
         }
-        Some(self.visit_text_with_interpolation(&text.value, &text.source_span))
+        Some(self.visit_text_with_interpolation(&text.value, &text.source_span, &text.tokens))
     }
 
-    fn visit_text_with_interpolation(&mut self, value: &str, span: &ParseSourceSpan) -> t::Node {
+    fn visit_text_with_interpolation(
+        &mut self,
+        value: &str,
+        span: &ParseSourceSpan,
+        tokens: &[html::Token],
+    ) -> t::Node {
         let value_no_ngsp = replace_ngsp(value);
-        match self.binding_parser.parse_interpolation(&value_no_ngsp, span) {
+        let tokens = interpolated_tokens(tokens);
+        match self
+            .binding_parser
+            .parse_interpolation(&value_no_ngsp, span, Some(&tokens))
+        {
             Some(ast) => t::Node::BoundText(t::BoundText {
                 value: *ast.ast,
                 source_span: to_offset_span(span),
@@ -691,13 +746,62 @@ impl<'b> HtmlAstToIvyAst<'b> {
 
     // ----- visitExpansion (ICU) ---------------------------------------------
 
-    fn visit_expansion(&mut self, _expansion: &html::Expansion) -> Option<t::Icu> {
-        // `visitExpansion` builds a `t.Icu` only from `expansion.i18n` (a `Message` attached by the
-        // standalone `I18nMetaVisitor`). That meta is not modeled on the [`crate::ml_parser`]
-        // `Expansion` node, so — exactly like the TS branch `if (!expansion.i18n) return null` —
-        // there is no message to lower and we emit nothing. Wiring real ICU lowering requires the
-        // ml_parser nodes to carry i18n `Message` meta first (see crate-level i18n status).
-        None
+    /// `visitExpansion` (`render3/r3_template_transform.ts`). The ICU's i18n message (the one the
+    /// `I18nMetaVisitor` attaches to every expansion, inside or outside an i18n block) supplies the
+    /// variables and the placeholders: a `VAR_<type>` placeholder becomes a bound variable with the
+    /// switch expression, and any other placeholder becomes a text or bound text of its content.
+    fn visit_expansion(&mut self, expansion: &html::Expansion) -> Option<t::Icu> {
+        let message = crate::i18n::to_i18n_message(
+            &[html::Node::Expansion(Box::new(expansion.clone()))],
+            "",
+            "",
+            "",
+        );
+        let mut vars: Vec<(String, t::BoundText)> = Vec::new();
+        let mut placeholders: Vec<(String, t::IcuPlaceholder)> = Vec::new();
+        for (key, value) in &message.placeholders {
+            if key.starts_with(I18N_ICU_VAR_PREFIX) {
+                // Trailing spaces in `{count, select , …}` are dropped from the key (`key.trim()`).
+                let formatted_key = key.trim().to_string();
+                let ast = self
+                    .binding_parser
+                    .parse_interpolation_expression(&value.text, &value.source_span);
+                vars.push((
+                    formatted_key,
+                    t::BoundText {
+                        value: *ast.ast,
+                        source_span: value.source_span.clone(),
+                        i18n: None,
+                    },
+                ));
+            } else {
+                let placeholder = self.visit_icu_placeholder_text(&value.text, &value.source_span);
+                placeholders.push((key.clone(), placeholder));
+            }
+        }
+        Some(t::Icu {
+            vars,
+            placeholders,
+            source_span: expansion.source_span.clone(),
+            i18n: Some(t::I18nMeta::Message(message)),
+        })
+    }
+
+    /// `_visitTextWithInterpolation(text, sourceSpan, null)` for an ICU placeholder's content: a
+    /// bound text when the text has an interpolation, otherwise a plain text.
+    fn visit_icu_placeholder_text(&mut self, text: &str, span: &ParseSourceSpan) -> t::IcuPlaceholder {
+        let value_no_ngsp = replace_ngsp(text);
+        match self.binding_parser.parse_interpolation(&value_no_ngsp, span, None) {
+            Some(ast) => t::IcuPlaceholder::Bound(t::BoundText {
+                value: *ast.ast,
+                source_span: span.clone(),
+                i18n: None,
+            }),
+            None => t::IcuPlaceholder::Text(t::Text {
+                value: value_no_ngsp,
+                source_span: span.clone(),
+            }),
+        }
     }
 
     // ----- visitComment -----------------------------------------------------
@@ -774,11 +878,11 @@ impl<'b> HtmlAstToIvyAst<'b> {
                     deferred::create_deferred_block(block, &connected, &mut transform, &parser)
                 };
                 let errors = result.errors;
-                (Some(t::Node::DeferredBlock(result.node)), errors)
+                (Some(t::Node::DeferredBlock(Box::new(result.node))), errors)
             }
             "switch" => {
                 let (n, e) = control_flow::create_switch_block(block, self, &parser);
-                (n.map(t::Node::SwitchBlock), e)
+                (n.map(|b| t::Node::SwitchBlock(Box::new(b))), e)
             }
             "content" => {
                 // `createContentBlock(block, this)`: the body is re-entered through the visitor.
@@ -809,7 +913,7 @@ impl<'b> HtmlAstToIvyAst<'b> {
                     control_flow::is_connected_for_loop_block,
                 );
                 let (n, e) = control_flow::create_for_loop(block, &connected, self, &parser);
-                (n.map(t::Node::ForLoopBlock), e)
+                (n.map(|b| t::Node::ForLoopBlock(Box::new(b))), e)
             }
             "if" => {
                 let connected =
@@ -856,7 +960,6 @@ impl<'b> HtmlAstToIvyAst<'b> {
                         span: block.source_span.clone(),
                         msg: error_message,
                         level: ParseErrorLevel::Error,
-                        element_name: None,
                     }],
                 )
             }
@@ -958,7 +1061,7 @@ impl<'b> HtmlAstToIvyAst<'b> {
                 let absolute_value_offset = match &attribute.value_span {
                     Some(vs) => vs.full_start.offset as i32,
                     None => (attribute.source_span.full_start.offset
-                        + attribute.name.chars().count()) as i32,
+                        + treaty_ivy_core::parse_util::utf16_len(&attribute.name)) as i32,
                 };
 
                 let mut parsed_variables: Vec<ParsedVariable> = Vec::new();
@@ -991,7 +1094,22 @@ impl<'b> HtmlAstToIvyAst<'b> {
             }
 
             if !has_binding && !is_template_binding {
-                prepared.attributes.push(visit_attribute(attribute));
+                // `i18n-<attr>` on the same element makes this static attribute translatable: its
+                // message comes from the attribute value (`I18nMetaVisitor.visitAttribute`).
+                let marker = format!("i18n-{}", attribute.name);
+                let mut visited = visit_attribute(attribute);
+                // `do not create translation for empty attributes` (`I18nMetaVisitor._visitElementLike`):
+                // only a non-empty static value gets a message.
+                if let Some(marker) = attrs.iter().find(|a| a.name == marker).filter(|_| !attribute.value.is_empty()) {
+                    let meta = crate::i18n::parse_i18n_meta(&marker.value);
+                    visited.i18n = Some(t::I18nMeta::Message(crate::i18n::to_i18n_message_for_attribute(
+                        attribute,
+                        &meta.meaning,
+                        &meta.description,
+                        &meta.custom_id,
+                    )));
+                }
+                prepared.attributes.push(visited);
             }
         }
 
@@ -1201,6 +1319,7 @@ impl<'b> HtmlAstToIvyAst<'b> {
 
         // No explicit binding: an attribute whose value may contain `{{ }}`.
         let key_span = create_key_span(src_span, "", name);
+        let tokens = attribute.value_tokens.as_deref().map(interpolated_tokens);
         self.binding_parser.parse_property_interpolation(
             name,
             value,
@@ -1208,6 +1327,7 @@ impl<'b> HtmlAstToIvyAst<'b> {
             &attribute.value_span,
             parsed_properties,
             &key_span,
+            tokens.as_deref(),
         )
     }
 
@@ -1467,14 +1587,14 @@ impl<'b> HtmlAstToIvyAst<'b> {
         let mut seen: HashSet<String> = HashSet::new();
         for r in references {
             if !r.value.is_empty() {
-                self.errors.push(offset_error(
-                    "Cannot specify a value for a local reference in this context",
+                self.errors.push(ParseError::new(
                     r.value_span.clone().unwrap_or_else(|| r.source_span.clone()),
+                    "Cannot specify a value for a local reference in this context",
                 ));
             } else if seen.contains(&r.name) {
-                self.errors.push(offset_error(
-                    "Duplicate reference names are not allowed",
+                self.errors.push(ParseError::new(
                     r.source_span.clone(),
+                    "Duplicate reference names are not allowed",
                 ));
             } else {
                 seen.insert(r.name.clone());
@@ -1527,8 +1647,8 @@ fn text_contents(children: &[html::Node]) -> Option<String> {
 
 /// `createKeySpan(srcSpan, prefix, identifier)` — advance past the prefix to compute the key span.
 fn create_key_span(src_span: &ParseSourceSpan, prefix: &str, identifier: &str) -> ParseSourceSpan {
-    let start = src_span.start.move_by(prefix.chars().count() as isize);
-    let end = start.move_by(identifier.chars().count() as isize);
+    let start = src_span.start.move_by(treaty_ivy_core::parse_util::utf16_len(prefix) as isize);
+    let end = start.move_by(treaty_ivy_core::parse_util::utf16_len(identifier) as isize);
     let full_start = start.clone();
     ParseSourceSpan::with_full_start(start, end, full_start, Some(identifier.to_string()))
 }
@@ -1764,20 +1884,6 @@ fn url_scheme(url: &str) -> Option<&str> {
     Some(&url[..end])
 }
 
-/// Build a `ParseError` from an offset span (used where only offset spans are available).
-fn offset_error(msg: &str, span: OffsetSpan) -> ParseError {
-    let file = html::ParseSourceFile::new(String::new(), String::new());
-    ParseError {
-        span: ParseSourceSpan::new(
-            html::ParseLocation::new(file.clone(), span.start as usize, 0, 0),
-            html::ParseLocation::new(file, span.end as usize, 0, 0),
-        ),
-        msg: msg.to_string(),
-        level: ParseErrorLevel::Error,
-        element_name: None,
-    }
-}
-
 // ===========================================================================
 // preparseElement — port of
 // `tools/angular-ref/packages/compiler/src/template_parser/template_preparser.ts`.
@@ -2003,37 +2109,68 @@ impl BindingParser {
         BindingParser::default()
     }
 
+    /// `makeBindingParser(selectorlessEnabled)`: Angular builds the expression `Parser` with
+    /// `supportsDirectPipeReferences = selectorlessEnabled`.
+    pub fn with_selectorless(selectorless_enabled: bool) -> Self {
+        BindingParser {
+            parser: ExprParser::with_direct_pipe_references(
+                treaty_ivy_core::expression::lexer::Lexer::new(),
+                selectorless_enabled,
+            ),
+            errors: Vec::new(),
+        }
+    }
+
     /// Drain the accumulated errors (mirrors reading `bindingParser.errors`).
     pub fn take_errors(&mut self) -> Vec<ParseError> {
         std::mem::take(&mut self.errors)
     }
 
-    fn record_expr_errors(&mut self, errors: &[ExprParseError], html_span: &ParseSourceSpan) {
-        for e in errors {
-            self.errors.push(ParseError {
-                span: html_span.clone(),
-                msg: e.msg.clone(),
-                level: ParseErrorLevel::Error,
-                element_name: None,
-            });
-        }
+    /// Record the expression parser's errors. Each error already carries the span the parser was
+    /// given (the enclosing attribute value, or the token of the interpolated expression), which is
+    /// Angular's `ast.errors` / `ParseError.span`, so it is kept as-is.
+    fn record_expr_errors(&mut self, errors: &[ExprParseError], _html_span: &ParseSourceSpan) {
+        self.errors.extend(errors.iter().cloned());
     }
 
-    /// `parseInterpolation`. Returns `None` when there is no `{{ }}`.
+    /// `parseInterpolation(value, sourceSpan, interpolatedTokens)`. Returns `None` when there is no
+    /// `{{ }}`. The absolute offset is the span's `fullStart` (Angular's `sourceSpan.fullStart.offset`)
+    /// and each expression reports errors at its own token span when `tokens` are given.
     pub fn parse_interpolation(
         &mut self,
         value: &str,
         span: &ParseSourceSpan,
+        tokens: Option<&[InterpolatedToken]>,
     ) -> Option<AstWithSource> {
         let offset_span = to_offset_span(span);
-        let result = self
-            .parser
-            .parse_interpolation(value, offset_span, abs_offset(span));
+        let result = self.parser.parse_interpolation(
+            value,
+            offset_span,
+            span.full_start.offset as i32,
+            tokens,
+        );
         if let Some(aws) = &result {
             let errs = aws.errors.clone();
             self.record_expr_errors(&errs, span);
         }
         result
+    }
+
+    /// `parseInterpolationExpression(expression, sourceSpan)`: an ICU switch expression, parsed as the
+    /// body of an interpolation. Errors are recorded like the other binding parses.
+    pub fn parse_interpolation_expression(
+        &mut self,
+        expression: &str,
+        span: &ParseSourceSpan,
+    ) -> AstWithSource {
+        let aws = self.parser.parse_interpolation_expression(
+            expression,
+            to_offset_span(span),
+            span.start.offset as i32,
+        );
+        let errs = aws.errors.clone();
+        self.record_expr_errors(&errs, span);
+        aws
     }
 
     /// `parseBinding`.
@@ -2067,7 +2204,9 @@ impl BindingParser {
         let offset_span = to_offset_span(span);
         let aws = self.parser.parse_binding(value, offset_span, absolute_offset);
         let errs = aws.errors.clone();
-        self.record_expr_errors(&errs, source_span);
+        // Angular: `parseBinding(expression, isHost, valueSpan || sourceSpan, absoluteOffset)`, so
+        // expression errors are located at the value (or the whole attribute when there is none).
+        self.record_expr_errors(&errs, span);
         let ty = if is_two_way {
             ParsedPropertyType::TwoWay
         } else {
@@ -2093,13 +2232,16 @@ impl BindingParser {
         value_span: &Option<ParseSourceSpan>,
         parsed_properties: &mut Vec<ParsedProperty>,
         key_span: &ParseSourceSpan,
+        tokens: Option<&[InterpolatedToken]>,
     ) -> bool {
         let span = value_span.as_ref().unwrap_or(source_span);
         let offset_span = to_offset_span(span);
-        match self
-            .parser
-            .parse_interpolation(value, offset_span, abs_offset(span))
-        {
+        match self.parser.parse_interpolation(
+            value,
+            offset_span,
+            span.full_start.offset as i32,
+            tokens,
+        ) {
             Some(aws) => {
                 let errs = aws.errors.clone();
                 self.record_expr_errors(&errs, source_span);
@@ -2147,7 +2289,6 @@ impl BindingParser {
                           use an attribute without a value (e.g. @prop) instead."
                         .to_string(),
                     level: ParseErrorLevel::Error,
-                    element_name: None,
                 });
             }
             self.parse_legacy_animation(
@@ -2395,7 +2536,6 @@ impl BindingParser {
                 span: source_span.clone(),
                 msg: e.msg.clone(),
                 level: ParseErrorLevel::Error,
-                element_name: None,
             });
         }
 
@@ -2487,6 +2627,422 @@ mod tests {
             result.errors
         );
         result.root_nodes
+    }
+
+    /// Parse `src` and return every error the binding layer and the r3 transform report.
+    fn transform_errors(src: &str) -> Vec<ParseError> {
+        let nodes = parse_html(src);
+        let mut bp = BindingParser::new();
+        let result = html_ast_to_render3_ast(&nodes, &mut bp, Render3ParseOptions::default());
+        let mut errors = bp.take_errors();
+        errors.extend(result.errors);
+        errors
+    }
+
+    #[test]
+    fn expression_error_points_at_the_interpolation_on_its_line() {
+        // The text node starts on line 0; the `{{` token is on line 1, column 0.
+        let errors = transform_errors("<p>\n{{ a b }}</p>");
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].msg.starts_with("Parser Error:"), "{}", errors[0].msg);
+        assert_eq!((errors[0].span.start.line, errors[0].span.start.col), (1, 0));
+        assert_eq!(errors[0].span.start.offset, 4);
+        assert_eq!(errors[0].span.to_source_string(), "{{ a b }}");
+    }
+
+    #[test]
+    fn expression_error_location_counts_utf16_units_before_it() {
+        // `é` is one UTF-16 unit and `😀` is two, so the `{{` sits at offset 3 + 1 + 2 + 1 + 2 = 9.
+        let errors = transform_errors("<p>é😀\n  {{ a b }}</p>");
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].span.start.offset, 9);
+        assert_eq!((errors[0].span.start.line, errors[0].span.start.col), (1, 2));
+    }
+
+    #[test]
+    fn property_binding_error_is_located_at_the_value() {
+        let errors = transform_errors("<div\n  [title]=\"a b\"></div>");
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].span.to_source_string(), "a b");
+        assert_eq!((errors[0].span.start.line, errors[0].span.start.col), (1, 11));
+    }
+
+    #[test]
+    fn interpolation_expression_offset_accounts_for_decoded_entities() {
+        // `&amp;` decodes to one character but occupies five template units, so `x` is at offset
+        // 3 (`<p>`) + 5 (`&amp;`) + 3 (`{{ `) = 11 in the original template.
+        let nodes = parse_html("<p>&amp;{{ x }}</p>");
+        let mut bp = BindingParser::new();
+        let result = html_ast_to_render3_ast(&nodes, &mut bp, Render3ParseOptions::default());
+        let element = match &result.nodes[0] {
+            t::Node::Element(e) => e,
+            other => panic!("expected Element, got {other:?}"),
+        };
+        let bound = match &element.children[0] {
+            t::Node::BoundText(b) => b,
+            other => panic!("expected BoundText, got {other:?}"),
+        };
+        let ExprKind::Interpolation { expressions, .. } = &bound.value.kind else {
+            panic!("expected interpolation");
+        };
+        assert_eq!(expressions[0].source_span.start, 11);
+    }
+
+    #[test]
+    fn block_microsyntax_and_let_errors_are_reported_at_their_source() {
+        // Block parameters are parsed with the binding parser at the parameter's own span.
+        let if_errors = transform_errors("<p>\n@if (a b) {}</p>");
+        assert_eq!(if_errors.len(), 1, "errors: {if_errors:?}");
+        assert_eq!(if_errors[0].span.to_source_string(), "a b");
+        assert_eq!((if_errors[0].span.start.line, if_errors[0].span.start.col), (1, 5));
+
+        // The `@defer (when …)` trigger reports its expression errors (it used to drop them).
+        let when_errors = transform_errors("<p>\n@defer (when a b) {}</p>");
+        assert_eq!(when_errors.len(), 1, "errors: {when_errors:?}");
+        // Angular passes the trigger parameter's `sourceSpan`, so the span covers `when a b`.
+        assert_eq!(when_errors[0].span.to_source_string(), "when a b");
+        assert_eq!((when_errors[0].span.start.line, when_errors[0].span.start.col), (1, 8));
+
+        // Microsyntax errors are located at the whole attribute (Angular's `sourceSpan`).
+        let micro = transform_errors("<li\n  *ngFor=\"let x of a +\"></li>");
+        assert_eq!(micro.len(), 1, "errors: {micro:?}");
+        assert_eq!(micro[0].span.to_source_string(), "*ngFor=\"let x of a +\"");
+        assert_eq!((micro[0].span.start.line, micro[0].span.start.col), (1, 2));
+
+        // `@let` values are located at the value span.
+        let let_errors = transform_errors("<p>\n@let v = a b;</p>");
+        assert_eq!(let_errors.len(), 1, "errors: {let_errors:?}");
+        assert_eq!(let_errors[0].span.to_source_string(), "a b");
+        assert_eq!((let_errors[0].span.start.line, let_errors[0].span.start.col), (1, 9));
+    }
+
+    /// Collect every source span of the r3 tree (labelled by node kind and field).
+    fn collect_r3_spans(nodes: &[t::Node], out: &mut Vec<(String, ParseSourceSpan)>) {
+        for node in nodes {
+            collect_r3_node_spans(node, out);
+        }
+    }
+
+    fn push_span(out: &mut Vec<(String, ParseSourceSpan)>, label: &str, span: &ParseSourceSpan) {
+        out.push((label.to_string(), span.clone()));
+    }
+
+    fn push_opt_span(
+        out: &mut Vec<(String, ParseSourceSpan)>,
+        label: &str,
+        span: &Option<ParseSourceSpan>,
+    ) {
+        if let Some(span) = span {
+            push_span(out, label, span);
+        }
+    }
+
+    fn collect_block_spans(out: &mut Vec<(String, ParseSourceSpan)>, label: &str, spans: &t::BlockSpans) {
+        push_span(out, &format!("{label}.name"), &spans.name_span);
+        push_span(out, &format!("{label}.source"), &spans.source_span);
+        push_span(out, &format!("{label}.start"), &spans.start_source_span);
+        push_opt_span(out, &format!("{label}.end"), &spans.end_source_span);
+    }
+
+    fn collect_attr_spans(out: &mut Vec<(String, ParseSourceSpan)>, label: &str, a: &t::TextAttribute) {
+        push_span(out, &format!("{label}.source"), &a.source_span);
+        push_opt_span(out, &format!("{label}.key"), &a.key_span);
+        push_opt_span(out, &format!("{label}.value"), &a.value_span);
+    }
+
+    fn collect_r3_node_spans(node: &t::Node, out: &mut Vec<(String, ParseSourceSpan)>) {
+        match node {
+            t::Node::Text(n) => push_span(out, "text", &n.source_span),
+            t::Node::BoundText(n) => push_span(out, "bound-text", &n.source_span),
+            t::Node::Element(e) => {
+                push_span(out, "element.source", &e.source_span);
+                push_span(out, "element.start", &e.start_source_span);
+                push_opt_span(out, "element.end", &e.end_source_span);
+                for a in &e.attributes {
+                    collect_attr_spans(out, "element.attr", a);
+                }
+                for i in &e.inputs {
+                    push_span(out, "element.input.source", &i.source_span);
+                    push_span(out, "element.input.key", &i.key_span);
+                    push_opt_span(out, "element.input.value", &i.value_span);
+                }
+                for o in &e.outputs {
+                    push_span(out, "element.output.source", &o.source_span);
+                    push_span(out, "element.output.handler", &o.handler_span);
+                    push_span(out, "element.output.key", &o.key_span);
+                }
+                for r in &e.references {
+                    push_span(out, "element.ref.source", &r.source_span);
+                    push_span(out, "element.ref.key", &r.key_span);
+                    push_opt_span(out, "element.ref.value", &r.value_span);
+                }
+                collect_r3_spans(&e.children, out);
+            }
+            t::Node::Template(t_node) => {
+                push_span(out, "template.source", &t_node.source_span);
+                push_span(out, "template.start", &t_node.start_source_span);
+                push_opt_span(out, "template.end", &t_node.end_source_span);
+                for v in &t_node.variables {
+                    push_span(out, "template.var.source", &v.source_span);
+                    push_span(out, "template.var.key", &v.key_span);
+                    push_opt_span(out, "template.var.value", &v.value_span);
+                }
+                for a in &t_node.attributes {
+                    collect_attr_spans(out, "template.attr", a);
+                }
+                collect_r3_spans(&t_node.children, out);
+            }
+            t::Node::LetDeclaration(l) => {
+                push_span(out, "let.source", &l.source_span);
+                push_span(out, "let.name", &l.name_span);
+                push_span(out, "let.value", &l.value_span);
+            }
+            t::Node::UnknownBlock(u) => {
+                push_span(out, "unknown.source", &u.source_span);
+                push_span(out, "unknown.name", &u.name_span);
+            }
+            t::Node::IfBlock(b) => {
+                collect_block_spans(out, "if", &b.spans);
+                for branch in &b.branches {
+                    collect_block_spans(out, "if.branch", &branch.spans);
+                    collect_r3_spans(&branch.children, out);
+                }
+            }
+            t::Node::ForLoopBlock(b) => {
+                push_span(out, "for.main", &b.main_block_span);
+                collect_block_spans(out, "for", &b.spans);
+                collect_r3_spans(&b.children, out);
+                if let Some(empty) = &b.empty {
+                    collect_block_spans(out, "for.empty", &empty.spans);
+                    collect_r3_spans(&empty.children, out);
+                }
+            }
+            t::Node::SwitchBlock(b) => {
+                collect_block_spans(out, "switch", &b.spans);
+                for group in &b.groups {
+                    collect_block_spans(out, "switch.group", &group.spans);
+                    for case in &group.cases {
+                        collect_block_spans(out, "switch.case", &case.spans);
+                    }
+                    collect_r3_spans(&group.children, out);
+                }
+            }
+            t::Node::DeferredBlock(b) => {
+                push_span(out, "defer.main", &b.main_block_span);
+                collect_block_spans(out, "defer", &b.spans);
+                collect_r3_spans(&b.children, out);
+                if let Some(p) = &b.placeholder {
+                    collect_block_spans(out, "defer.placeholder", &p.spans);
+                    collect_r3_spans(&p.children, out);
+                }
+            }
+            t::Node::BoundaryBlock(b) => {
+                push_span(out, "boundary.main", &b.main_block_span);
+                collect_block_spans(out, "boundary", &b.spans);
+                collect_r3_spans(&b.children, out);
+                for e in &b.error_blocks {
+                    collect_block_spans(out, "boundary.error", &e.spans);
+                    collect_r3_spans(&e.children, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Line and 0-based column of a UTF-16 offset, computed independently of the parser.
+    fn oracle_line_col(content: &str, utf16_offset: usize) -> (usize, usize) {
+        let (mut line, mut col, mut units) = (0usize, 0usize, 0usize);
+        for ch in content.chars() {
+            if units >= utf16_offset {
+                break;
+            }
+            if ch == '\n' {
+                line += 1;
+                col = 0;
+            } else {
+                col += ch.len_utf16();
+            }
+            units += ch.len_utf16();
+        }
+        (line, col)
+    }
+
+    #[test]
+    fn every_r3_node_kind_carries_line_and_column() {
+        let src = "<section>\n  <p id=\"é\" title=\"x\">{{ a }}</p>\n  @if (b) {\n    \
+                   <i *ngIf=\"c\" [x]=\"d\" (y)=\"e()\" #r>😀</i>\n  } @else {\n    <b>z</b>\n  }\n  \
+                   @for (item of list; track item.id) {\n    <span>{{ item }}</span>\n  } @empty {\n    \
+                   none\n  }\n  @switch (s) {\n    @case (1) { one }\n    @default { other }\n  }\n  \
+                   @defer (on viewport) {\n    <em>d</em>\n  } @placeholder {\n    <u>p</u>\n  }\n  \
+                   @let v = a + 1;\n  @boundary {\n    <q>b</q>\n  } @error {\n    <s>e</s>\n  }\n</section>";
+        let nodes = parse_html(src);
+        let mut bp = BindingParser::new();
+        let result = html_ast_to_render3_ast(&nodes, &mut bp, Render3ParseOptions::default());
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        let mut spans = Vec::new();
+        collect_r3_spans(&result.nodes, &mut spans);
+        for (label, span) in &spans {
+            let start = oracle_line_col(src, span.start.offset);
+            let end = oracle_line_col(src, span.end.offset);
+            assert_eq!((span.start.line, span.start.col), start, "{label}");
+            assert_eq!((span.end.line, span.end.col), end, "{label} end");
+        }
+        assert!(spans.len() > 40, "only {} spans collected", spans.len());
+
+        // Spot-check exact source text and position for one node of each kind.
+        let at = |label: &str| {
+            let (_, span) = spans
+                .iter()
+                .find(|(l, _)| l == label)
+                .unwrap_or_else(|| panic!("no span labelled {label}"));
+            (span.to_source_string(), (span.start.line, span.start.col))
+        };
+        assert_eq!(at("element.attr.value"), ("é".to_string(), (1, 9)));
+        assert_eq!(at("bound-text"), ("{{ a }}".to_string(), (1, 22)));
+        assert_eq!(at("template.start"), ("<i *ngIf=\"c\" [x]=\"d\" (y)=\"e()\" #r>".to_string(), (3, 4)));
+        assert_eq!(at("element.output.handler"), ("e()".to_string(), (3, 30)));
+        assert_eq!(at("text"), ("😀".to_string(), (3, 38)));
+        assert_eq!(at("if.start"), ("@if (b) {".to_string(), (2, 2)));
+        assert_eq!(at("let.value"), ("a + 1".to_string(), (21, 11)));
+        assert_eq!(at("defer.main"), ("@defer (on viewport) {\n    <em>d</em>\n  }".to_string(), (16, 2)));
+    }
+
+    #[test]
+    fn standalone_connected_blocks_report_the_reference_messages() {
+        // Angular's `default:` branch of `visitBlock` (r3_template_transform.ts): a connected block
+        // used on its own gets a "can only be used after" message; `@case`/`@default` have none.
+        let msg = |src: &str| transform_errors(src).into_iter().map(|e| e.msg).collect::<Vec<_>>();
+        assert_eq!(msg("@case (foo) {}"), vec!["Unrecognized block @case.".to_string()]);
+        assert_eq!(msg("@default {}"), vec!["Unrecognized block @default.".to_string()]);
+        assert_eq!(msg("@else {}"), vec!["@else block can only be used after an @if or @else if block.".to_string()]);
+        assert_eq!(msg("@else if (a) {}"), vec!["@else if block can only be used after an @if or @else if block.".to_string()]);
+        assert_eq!(msg("@empty {}"), vec!["@empty block can only be used after an @for block.".to_string()]);
+        assert_eq!(msg("@placeholder {}"), vec!["@placeholder block can only be used after an @defer block.".to_string()]);
+        assert_eq!(msg("@loading {}"), vec!["@loading block can only be used after an @defer block.".to_string()]);
+        assert_eq!(msg("@error {}"), vec!["@error block can only be used after an @defer or @boundary block.".to_string()]);
+    }
+
+    #[test]
+    fn text_attribute_value_span_distinguishes_bare_from_empty() {
+        let nodes = parse_html("<input disabled disabled2=\"\" value=\"v\">");
+        let mut bp = BindingParser::new();
+        let result = html_ast_to_render3_ast(&nodes, &mut bp, Render3ParseOptions::default());
+        let el = match &result.nodes[0] {
+            t::Node::Element(e) => e,
+            other => panic!("expected element, got {other:?}"),
+        };
+        let attr = |name: &str| el.attributes.iter().find(|a| a.name == name).unwrap();
+        // Bare attribute: no `=`, so no value span (Angular's `valueSpan` is undefined).
+        assert_eq!(attr("disabled").value, "");
+        assert!(attr("disabled").value_span.is_none());
+        // Empty quoted attribute: the same empty value, but a value span is present.
+        assert_eq!(attr("disabled2").value, "");
+        let empty = attr("disabled2").value_span.as_ref().expect("value span for disabled2=\"\"");
+        assert_eq!(empty.start.offset, empty.end.offset);
+        assert_eq!(attr("value").value_span.as_ref().unwrap().to_source_string(), "v");
+    }
+
+    #[test]
+    fn icu_outside_i18n_is_lowered_to_an_r3_icu_node() {
+        // `visitExpansion`: the switch variable becomes a `VAR_<type>` bound variable, and the case
+        // content becomes placeholders. The ICU carries its i18n message.
+        let nodes = parse_html("{count, select, 0 {no emails} other {{{count}} emails}}");
+        let mut bp = BindingParser::new();
+        let result = html_ast_to_render3_ast(&nodes, &mut bp, Render3ParseOptions::default());
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        let icu = match &result.nodes[0] {
+            t::Node::Icu(icu) => icu,
+            other => panic!("expected Icu, got {other:?}"),
+        };
+        assert_eq!(icu.vars.len(), 1);
+        assert_eq!(icu.vars[0].0, "VAR_SELECT");
+        assert_eq!(icu.vars[0].1.source_span.to_source_string(), "count");
+        // `parseInterpolationExpression` wraps the switch expression in an interpolation.
+        let ExprKind::Interpolation { expressions, .. } = &icu.vars[0].1.value.kind else {
+            panic!("expected an interpolation, got {:?}", icu.vars[0].1.value.kind);
+        };
+        assert!(matches!(&expressions[0].kind, ExprKind::PropertyRead { name, .. } if name == "count"));
+        assert_eq!(icu.placeholders.len(), 1);
+        assert_eq!(icu.placeholders[0].0, "INTERPOLATION");
+        match &icu.placeholders[0].1 {
+            t::IcuPlaceholder::Bound(b) => assert_eq!(b.source_span.to_source_string(), "{{count}}"),
+            other => panic!("expected bound placeholder, got {other:?}"),
+        }
+        assert_eq!(icu.source_span.to_source_string(), "{count, select, 0 {no emails} other {{{count}} emails}}");
+        let message = icu.i18n.as_ref().and_then(|m| m.message()).expect("icu message");
+        assert_eq!(message.placeholders.len(), 2);
+    }
+
+    #[test]
+    fn i18n_attribute_marker_gives_the_static_attribute_its_message() {
+        let nodes = parse_html(r#"<img alt="Hi {{ name }}" i18n-alt="@@alt-id" title="Plain" i18n-title>"#);
+        let mut bp = BindingParser::new();
+        let result = html_ast_to_render3_ast(&nodes, &mut bp, Render3ParseOptions::default());
+        let el = match &result.nodes[0] {
+            t::Node::Element(e) => e,
+            other => panic!("expected element, got {other:?}"),
+        };
+        // `alt` interpolates in its value, so it is a bound input and carries no static attribute.
+        assert!(el.attributes.iter().all(|a| a.name != "alt"));
+        let title = el.attributes.iter().find(|a| a.name == "title").expect("title attribute");
+        let message = title.i18n.as_ref().and_then(|m| m.message()).expect("attribute message");
+        assert_eq!(message.nodes.len(), 1);
+        assert!(matches!(&message.nodes[0], crate::i18n::Node::Text(t) if t.value == "Plain"));
+        // The `i18n-title` marker is consumed.
+        assert!(el.attributes.iter().all(|a| !a.name.starts_with("i18n-")));
+    }
+
+    #[test]
+    fn icu_switch_expression_errors_are_located_at_the_switch_value() {
+        // `visitExpansion` parses the switch value with `parseInterpolationExpression(value, span)`, so
+        // the error is at the switch value (line 1), not at the start of the ICU.
+        let errors = transform_errors("<p>\n{a b, select, x {y} other {z}}</p>");
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].msg.starts_with("Parser Error:"), "{}", errors[0].msg);
+        assert_eq!(errors[0].span.to_source_string(), "a b");
+        assert_eq!((errors[0].span.start.line, errors[0].span.start.col), (1, 1));
+    }
+
+    #[test]
+    fn block_expressions_after_non_bmp_characters_get_utf16_absolute_offsets() {
+        // Non-ASCII text before a block expression: the expression's absolute offset is in UTF-16
+        // units (the expression lexer and Angular's offsets are UTF-16), not bytes or characters.
+        // The lexer only takes ASCII identifiers, so the non-ASCII text is inside a string literal.
+        let prefix = "@for (item of ['é😀']; track ";
+        let template = format!("{prefix}item.id) {{x}}");
+        let nodes = parse_html(&template);
+        let mut bp = BindingParser::new();
+        let result = html_ast_to_render3_ast(&nodes, &mut bp, Render3ParseOptions::default());
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        let for_block = match &result.nodes[0] {
+            t::Node::ForLoopBlock(b) => b,
+            other => panic!("expected for block, got {other:?}"),
+        };
+        let track = for_block.track_by.as_ref().expect("track expression");
+        let expected = treaty_ivy_core::parse_util::utf16_len(prefix) as u32;
+        assert_eq!(track.ast.source_span.start, expected);
+        assert_eq!(track.ast.source_span.end, expected + "item.id".len() as u32);
+        assert_eq!(&template[prefix.len()..prefix.len() + 7], "item.id");
+    }
+
+    #[test]
+    fn i18n_root_element_carries_its_message_and_meta() {
+        let nodes = parse_html(r#"<div i18n="a meaning|a description@@my-id">Hello {{ name }}</div>"#);
+        let mut bp = BindingParser::new();
+        let result = html_ast_to_render3_ast(&nodes, &mut bp, Render3ParseOptions::default());
+        let element = match &result.nodes[0] {
+            t::Node::Element(e) => e,
+            other => panic!("expected element, got {other:?}"),
+        };
+        let message = element.i18n.as_ref().and_then(|m| m.message()).expect("root message");
+        assert_eq!(message.meaning, "a meaning");
+        assert_eq!(message.description, "a description");
+        assert_eq!(message.custom_id, "my-id");
+        assert_eq!(message.placeholders.len(), 1);
+        assert_eq!(message.placeholders[0].0, "INTERPOLATION");
+        assert_eq!(message.placeholders[0].1.text, "{{ name }}");
+        // The `i18n` attribute is consumed (not a static attribute of the element).
+        assert!(element.attributes.iter().all(|a| a.name != "i18n"));
     }
 
     #[test]

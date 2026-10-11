@@ -238,14 +238,33 @@ test('NEGATIVE: a failing extra check (verifyUniqueFactory) turns a textual pass
   assert.equal(r.cat, 'extra-check:verifyUniqueFactory');
 });
 
-test('an i18n extra check is a skip (not a pass)', () => {
+test('the i18n extra checks run: unique goog.getMsg consts pass', () => {
   const r = scorePartial({
-    golden: '$r3$.ɵɵboundaryCreate(0);',
-    emit: 'i0.ɵɵboundaryCreate(0);',
+    golden: 'const A = goog.getMsg("a");',
+    emit: 'const A = goog.getMsg("a"); const B = goog.getMsg("b");',
     extraChecks: ['verifyUniqueConsts'],
   });
-  assert.equal(r.status, 'skip');
-  assert.equal(r.cat, 'partial:extra-check:i18n');
+  assert.equal(r.status, 'pass');
+});
+
+test('NEGATIVE: a duplicate goog.getMsg const is a DIFF (verifyUniqueConsts), never a pass', () => {
+  const r = scorePartial({
+    golden: 'const A = goog.getMsg("a");',
+    emit: 'const A = goog.getMsg("a"); const A = goog.getMsg("b");',
+    extraChecks: ['verifyUniqueConsts'],
+  });
+  assert.equal(r.status, 'diff');
+  assert.equal(r.cat, 'extra-check:verifyUniqueConsts');
+});
+
+test('NEGATIVE: a message placeholder with no entry is a DIFF (verifyPlaceholdersIntegrity)', () => {
+  const r = scorePartial({
+    golden: 'goog.getMsg("a {$x} b"',
+    emit: 'const M = goog.getMsg("a {$x} b", {});',
+    extraChecks: ['verifyPlaceholdersIntegrity'],
+  });
+  assert.equal(r.status, 'diff');
+  assert.equal(r.cat, 'extra-check:verifyPlaceholdersIntegrity');
 });
 
 test('runPartialBucket counts runnable, PASS and DIFF separately from skips', () => {

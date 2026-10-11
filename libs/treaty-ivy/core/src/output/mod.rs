@@ -2,6 +2,8 @@
 //! `AstBuilder`, then print with `oxc_codegen`. Replaces Angular's hand-rolled
 //! `abstract_emitter`/`abstract_js_emitter`. See `migration/render3-specs/02-abstract_emitter.md`.
 
+pub mod comments;
+pub mod emit_options;
 pub mod emitter;
 /// The engine-neutral printer used as the SWC-backend emitter. It walks the SAME `output_ast` as
 /// the oxc emitter and is tuned to emit byte-identical output, proven by `tools/backend-parity`.

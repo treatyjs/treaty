@@ -81,6 +81,8 @@ import {
   stripSourceMappingAnnotations,
   verifyUniqueFunctions,
   verifyUniqueFactory,
+  verifyPlaceholdersIntegrity,
+  verifyUniqueConsts,
   ExpectEmitMismatch,
   ExpectEmitInvalid,
   UnsupportedMacro,
@@ -887,6 +889,7 @@ function runPartialCase(cand, rust) {
       expected = replaceMacros(expected);
     } catch (err) {
       if (err instanceof UnsupportedMacro) return skip('partial:macro:' + err.macro);
+      if (err instanceof ExpectEmitInvalid) return skip('partial:golden-untokenizable(macro-argument)');
       throw err;
     }
     const stripped = stripSourceMappingAnnotations(expected);
@@ -912,12 +915,15 @@ function runPartialCase(cand, rust) {
 
     for (const check of pair.extraChecks) {
       const [name, ...args] = Array.isArray(check) ? check : [check];
-      if (I18N_EXTRA_CHECKS.has(name)) return skip('partial:extra-check:i18n');
-      if (!PARTIAL_EXTRA_CHECKS.has(name)) return skip(`partial:extra-check:${name}`);
+      if (!PARTIAL_EXTRA_CHECKS.has(name) && !I18N_EXTRA_CHECKS.has(name)) return skip(`partial:extra-check:${name}`);
       const ok =
         name === 'verifyUniqueFunctions'
           ? verifyUniqueFunctions(out.code, ...args)
-          : verifyUniqueFactory(out.code, ...args);
+          : name === 'verifyUniqueFactory'
+            ? verifyUniqueFactory(out.code, ...args)
+            : name === 'verifyPlaceholdersIntegrity'
+              ? verifyPlaceholdersIntegrity(out.code)
+              : verifyUniqueConsts(out.code);
       if (!ok) return { status: 'diff', cat: `extra-check:${name}`, detail: JSON.stringify(args), mappingAssertions };
     }
   }

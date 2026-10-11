@@ -3,7 +3,7 @@
 //!
 //! PORT TARGET: `migration/render3-specs/10-t2_binder.md`
 //! Source: `tools/angular-ref/packages/compiler/src/render3/view/t2_binder.ts` (+ `t2_api.ts`),
-//! Angular 22.1.0-next.0.
+//! Angular main, 78d2a67d.
 //!
 //! Ports the binder over [`crate::template::r3_ast`]: the `Scope`/template-variable resolution,
 //! reference resolution, directive/component matching, and — above all — the Angular 22
@@ -2445,7 +2445,7 @@ mod tests {
     };
 
     fn span() -> ParseSourceSpan {
-        ParseSourceSpan { start: 0, end: 0 }
+        ParseSourceSpan::synthetic()
     }
 
     fn implicit_read(name: &str) -> AstNode {

@@ -1280,7 +1280,7 @@ fn compile_from_parts_inner(
         name: class_name.to_string(),
         ty: class_ref(class_name),
         type_argument_count: 0,
-        type_source_span: ParseSourceSpan::new(0, 0),
+        type_source_span: ParseSourceSpan::synthetic(),
         deps: Deps::None,
         // Filename-derived element selector (kebab/camel/Pascal multi-selector) when the author gives none.
         selector: Some(derived_selector),
@@ -2092,7 +2092,7 @@ function onClick(user) { return save(user); }\n\
     }
 
     #[test]
-    fn treaty_server_block_AFTER_html_region_does_not_leak_into_client_or_map() {
+    fn treaty_server_block_after_html_region_does_not_leak_into_client_or_map() {
         // F2 regression (CLIENT SECRET LEAK): a `server { … }` block placed AFTER the HTML/view
         // region used to leak its body into BOTH the client code AND the source map, because block
         // discovery ran a JS-only text scan over the raw `.treaty` source and the closing `>` of the
