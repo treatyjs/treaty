@@ -202,6 +202,13 @@ pub struct ConstantPool {
     /// `<ng-content>` slots requested during the walk, awaiting their Angular `projectionSlotIndex`
     /// (see [`TemplateDefinitionBuilder::finalize_projection_indices`]).
     pending_projections: Vec<PendingProjection>,
+    /// The const-pool index of the message of each static `i18n-<attr>` attribute, keyed by the
+    /// attribute's source offset and name (Angular's `i18nMessage` on a `TextAttribute`). Filled by the
+    /// root's i18n-attribute prepass, which runs before any other message is interned, so attribute
+    /// messages precede block messages in the initializers (`i18n_const_collection.ts` order).
+    i18n_attr_consts: std::collections::HashMap<(usize, String), usize>,
+    /// The next `i18n_<n>` name index (see [`ConstantPool::next_i18n_name_index`]).
+    i18n_name_seq: usize,
 }
 
 /// An `<ng-content>` slot awaiting its projection slot index.
@@ -278,6 +285,20 @@ impl ConstantPool {
         self.initializers.extend(initializers);
         self.entries.push(value);
         self.entries.len() - 1
+    }
+
+    /// Add i18n initializer statements WITHOUT a const-array entry: a static `i18n-<attr>` message is
+    /// read only from its attribute array (`["title", i18n_1]`), never as a top-level `consts` entry.
+    pub fn add_initializers(&mut self, initializers: Vec<Stmt>) {
+        self.initializers.extend(initializers);
+    }
+
+    /// The next i18n message name index (`pool.uniqueName('i18n_')`): one per message, whether or not the
+    /// message is a const-array entry, so every `i18n_<n>` variable is distinct.
+    pub fn next_i18n_name_index(&mut self) -> usize {
+        let index = self.i18n_name_seq;
+        self.i18n_name_seq += 1;
+        index
     }
 
     pub fn entries(&self) -> &[Expr] {
@@ -3731,6 +3752,8 @@ impl TemplateDefinitionBuilder {
         // walk already interned the enclosing `[Template,"if"]` const), which mis-orders the pool.
         if self.is_root {
             self.prepass_descendant_local_ref_consts(&nodes);
+            // Static i18n attribute messages come before every block message (see `ConstantPool`).
+            self.prepass_i18n_attribute_consts(&nodes);
         }
 
         // Classify every top-level `@let` in this view (external / pipe-bearing) so the inline walk
@@ -3982,6 +4005,45 @@ impl TemplateDefinitionBuilder {
         self.serialize_attrs_index(attributes, binding_names, &[])
     }
 
+    /// The const-pool index of a static `i18n-<attr>` attribute's message, if it has one.
+    fn i18n_attr_const(&self, attr: &TextAttribute) -> Option<usize> {
+        let key = (attr.source_span.start.offset, attr.name.clone());
+        self.const_pool.borrow().i18n_attr_consts.get(&key).copied()
+    }
+
+    /// Intern the message of every static `i18n-<attr>` attribute in `nodes` (elements and components of
+    /// this view; a nested template or block body is a child view, handled by the caller).
+    fn intern_view_i18n_attr_consts(&mut self, nodes: &[Node]) {
+        for node in nodes {
+            match node {
+                Node::Element(el) => {
+                    for attr in &el.attributes {
+                        let Some(message) = attr.i18n.as_ref().and_then(|m| m.message()) else {
+                            continue;
+                        };
+                        let index = self.intern_i18n_attr_message(message);
+                        let key = (attr.source_span.start.offset, attr.name.clone());
+                        self.const_pool.borrow_mut().i18n_attr_consts.insert(key, index);
+                    }
+                    self.intern_view_i18n_attr_consts(&el.children);
+                }
+                Node::Component(c) => self.intern_view_i18n_attr_consts(&c.children),
+                _ => {}
+            }
+        }
+    }
+
+    /// Angular's i18n-attribute messages for the whole component, depth-first by view (the same walk
+    /// order as [`Self::prepass_descendant_local_ref_consts`]). Root only.
+    fn prepass_i18n_attribute_consts(&mut self, root_nodes: &[Node]) {
+        self.intern_view_i18n_attr_consts(root_nodes);
+        let mut bodies: std::collections::VecDeque<Vec<Node>> = std::collections::VecDeque::new();
+        Self::collect_child_view_bodies(root_nodes, &mut bodies);
+        for view_nodes in bodies {
+            self.prepass_i18n_attribute_consts(&view_nodes);
+        }
+    }
+
     /// The general attribute serializer, parameterised by the extra structural-directive
     /// *template-binding* names (`template_names`) that a desugared `*dir` contributes under the
     /// `AttributeMarker.Template` (`4`) group. Element/`<ng-content>` paths pass an empty slice; the
@@ -4058,7 +4120,12 @@ impl TemplateDefinitionBuilder {
                 }
                 _ => {
                     plain.push(str_lit(&attr.name));
-                    plain.push(str_lit(&attr.value));
+                    // A static `i18n-<attr>` attribute's value is its translated message: the read of
+                    // that message's const (`["title", i18n_1]`), not the authored text.
+                    match self.i18n_attr_const(attr) {
+                        Some(index) => plain.push(o::variable(format!("i18n_{index}"), None)),
+                        None => plain.push(str_lit(&attr.value)),
+                    }
                 }
             }
         }
@@ -4731,7 +4798,8 @@ impl TemplateDefinitionBuilder {
             // The element is marked for translation: its content is lowered as an i18n block
             // (`ɵɵi18nStart`/`ɵɵi18nEnd` + `ɵɵi18nExp`/`ɵɵi18nApply`) rather than the normal
             // text / bound-text path.
-            self.build_i18n_block(&element.children);
+            let meta = element.i18n.as_ref().and_then(|m| m.message());
+            self.build_i18n_block(&element.children, meta);
         } else if in_i18n_create {
             // Inside an i18n block: this element's text content is part of the message; only its
             // nested element/template/control-flow children get create ops (i18n-aware walk).
@@ -4771,7 +4839,7 @@ impl TemplateDefinitionBuilder {
     /// emitter (see the inline scope comments at the unhandled node arm and the message-meta
     /// construction below): the i18n placeholder-registry / ICU-context lowering, and a parsed
     /// `I18nMeta` carrying the message metadata. The text + interpolation path is fully handled.
-    fn build_i18n_block(&mut self, children: &[Node]) {
+    fn build_i18n_block(&mut self, children: &[Node], meta: Option<&crate::i18n::Message>) {
         use crate::i18n;
 
         let slot = self.allocate_data_slot();
@@ -4811,12 +4879,13 @@ impl TemplateDefinitionBuilder {
             }
         }
 
-        // SCOPE BOUNDARY: this builder derives the message from the R3 children and keeps an empty
-        // meaning / description / custom id. The transform's own message on the element (`i18n:
-        // Some(I18nMeta::Message(..))`, which carries the parsed `meaning|description@@id`) is not
-        // read here yet; reading it would change the emitted message metadata and is left for a
-        // separate change with its golden checks.
-        let message = i18n::Message::new(nodes, "", "", "");
+        // The message metadata is the transform's (`I18nMetaVisitor`'s) root message on the element: the
+        // parsed `i18n="meaning|description@@id"` attribute. The nodes are this builder's own, so only the
+        // three metadata strings are taken from the transform.
+        let (meaning, description, custom_id) = meta
+            .map(|m| (m.meaning.clone(), m.description.clone(), m.custom_id.clone()))
+            .unwrap_or_default();
+        let message = i18n::Message::new(nodes, meaning, description, custom_id);
 
         // Build the interpolation placeholder params (`I18nMessageOp.params`): each interpolation maps
         // its public placeholder name to the runtime magic string `\u{FFFD}<index>\u{FFFD}` plus the
@@ -5184,6 +5253,28 @@ impl TemplateDefinitionBuilder {
         message: &crate::i18n::Message,
         params: &[crate::i18n::I18nPlaceholderParam],
     ) -> usize {
+        let (i18n_const, _) = self.build_i18n_message_const(message, params);
+        self.const_pool
+            .borrow_mut()
+            .add_const_with_initializers(i18n_const.const_entry, i18n_const.initializers)
+    }
+
+    /// The `let`/`if` initializers of a static `i18n-<attr>` message (`i18n_const_collection.ts`, the
+    /// attribute case). They are emitted, but the message is NOT a `consts` entry: the attribute array
+    /// reads it as `i18n_<index>`. Returns that name index.
+    fn intern_i18n_attr_message(&mut self, message: &crate::i18n::Message) -> usize {
+        let (i18n_const, index) = self.build_i18n_message_const(message, &[]);
+        self.const_pool.borrow_mut().add_initializers(i18n_const.initializers);
+        index
+    }
+
+    /// Build the closure/`$localize` const of an i18n message (see [`Self::intern_i18n_message`]). Returns
+    /// the const and its name index (`i18n_<index>`).
+    fn build_i18n_message_const(
+        &mut self,
+        message: &crate::i18n::Message,
+        params: &[crate::i18n::I18nPlaceholderParam],
+    ) -> (crate::i18n::I18nConst, usize) {
         use crate::i18n;
 
         // The `$localize` meta block carries only the AUTHORED description / meaning / custom id
@@ -5244,7 +5335,7 @@ impl TemplateDefinitionBuilder {
         });
 
         // The message's const ordinal — Angular numbers `i18n_n` from the const-array position.
-        let index = self.const_pool.borrow().entries().len();
+        let index = self.const_pool.borrow_mut().next_i18n_name_index();
 
         // Two context-dependent emit forms Angular's own compiler chooses between (proven by the
         // goldens). (1) `bare_name`: a message that brackets control-flow blocks
@@ -5270,10 +5361,9 @@ impl TemplateDefinitionBuilder {
                 file_suffix: i18n::file_based_i18n_suffix(""),
             },
         );
-        self.const_pool
-            .borrow_mut()
-            .add_const_with_initializers(i18n_const.const_entry, i18n_const.initializers)
+        (i18n_const, index)
     }
+
 
     /// Lower a bound input (`[name]="value"`) into the matching update-block binding instruction,
     /// advancing the update cursor to the host element's `slot` first. The instruction is selected
@@ -8863,6 +8953,26 @@ mod tests {
         let mut builder = TemplateDefinitionBuilder::new(&input);
         let func = builder.build_template_function(&input);
         emit_with_hoisted(&builder, &func)
+    }
+
+    /// The component's `consts` for `src`: the i18n initializer statements (`consts: () => { … }`)
+    /// followed by the const array, as the definition emits them.
+    fn compile_template_consts(src: &str) -> String {
+        use crate::template::template_transform::{html_ast_to_render3_ast, Render3ParseOptions};
+        let parsed = crate::ml_parser::parse(src, "test.html");
+        assert!(parsed.errors.is_empty(), "html parse errors: {:?}", parsed.errors);
+        let mut bp = crate::template::template_transform::BindingParser::new();
+        let r3 = html_ast_to_render3_ast(&parsed.root_nodes, &mut bp, Render3ParseOptions::default());
+        assert!(r3.errors.is_empty(), "r3 transform errors: {:?}", r3.errors);
+        let input = TemplateCompilationInput::new("C_Template", r3.nodes);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let _func = builder.build_template_function(&input);
+        let mut out = String::new();
+        for stmt in builder.const_pool().initializers() {
+            out.push_str(&crate::output::emitter::emit_statements(std::slice::from_ref(stmt)));
+        }
+        out.push_str(&emit_expression(&builder.const_pool().to_const_array().unwrap()));
+        out
     }
 
     /// Emit the root view function PLUS its hoisted nested-view functions concatenated, mirroring
@@ -12597,6 +12707,41 @@ mod tests {
         // Namespace prefixes are stripped from the tag (`:svg:circle` -> `circle`).
         assert!(!out.contains(":svg:"), "got: {out}");
         assert!(out.contains("\u{0275}\u{0275}element(2, \"circle\")"), "got: {out}");
+    }
+
+    /// A static `i18n-<attr>` attribute (`meaning_description_template.js`): its message is an
+    /// initializer (`let i18n_0; if (…) … else { i18n_0 = $localize\`:m|d@@id:Hi\`; }`) read from the
+    /// element's attribute array as `["title", i18n_0]`. It is NOT a `consts` entry of its own.
+    #[test]
+    fn static_i18n_attribute_reads_its_message_from_the_attribute_array() {
+        let out = compile_template_consts("<div i18n-title=\"m|d@@id\" title=\"Hi\"></div>");
+        assert!(out.contains("let i18n_0;"), "got: {out}");
+        assert!(out.contains("i18n_0 = $localize`:m|d@@id:Hi`;"), "got: {out}");
+        assert!(out.contains("[\"title\", i18n_0]"), "got: {out}");
+        // Only the attribute array is a const entry: the message itself is not returned on its own.
+        assert!(!out.contains("return [i18n_0"), "got: {out}");
+    }
+
+    /// `do not create translation for empty attributes` (`meta.ts`): a valueless `title` gets no message,
+    /// so no initializer is emitted and the attribute keeps its empty string value.
+    #[test]
+    fn empty_i18n_attribute_gets_no_translation() {
+        let out = compile_template_consts("<div i18n-title=\"m|d\" title></div>");
+        assert!(!out.contains("let i18n_"), "got: {out}");
+        assert!(!out.contains("i18n_0"), "got: {out}");
+    }
+
+    /// Attribute messages are initializers ahead of block messages (`i18n_const_collection.ts` order), and
+    /// each `i18n_<n>` name is unique even though attribute messages take no `consts` slot.
+    #[test]
+    fn attribute_messages_precede_block_messages_with_unique_names() {
+        let out = compile_template_consts(
+            "<span i18n-title=\"a\" title=\"Attr\"></span><div i18n=\"b\">Block</div>",
+        );
+        let attr = out.find("let i18n_0;").expect("attribute message declared first");
+        let block = out.find("let i18n_1;").expect("block message declared second");
+        assert!(attr < block, "got: {out}");
+        assert!(out.contains("[i18n_1, [\"title\", i18n_0]]"), "got: {out}");
     }
 
     /// MathML (`mathml_template.js`): `ɵɵnamespaceMathML()` before `math`, `ɵɵnamespaceHTML()` after.

@@ -46,6 +46,8 @@
 
 use std::cell::RefCell;
 
+use crate::output::comments::{comment_lines as comment_lines_for, expr_comment_text, expr_has_identifier_head};
+use crate::output::emit_options::{current_emit_options, EmitOptions};
 use crate::output::source_map::{utf16_columns, utf16_offset_to_line_col, SourceMapBuilder};
 use crate::output_ast::{
     self as o, ArrowBody, BinaryOperator, ExprKind, ImportUrl, LiteralMapEntry, LiteralValue,
@@ -58,14 +60,24 @@ use crate::output_ast::{
 
 /// Lower a slice of `output_ast` statements to JS (byte-identical to the oxc emitter).
 pub fn emit_statements(stmts: &[o::Stmt]) -> String {
-    let mut p = Printer::new();
+    emit_statements_with(stmts, &current_emit_options())
+}
+
+/// [`emit_statements`] with explicit [`EmitOptions`].
+pub fn emit_statements_with(stmts: &[o::Stmt], opts: &EmitOptions) -> String {
+    let mut p = Printer::with_options(*opts);
     p.print_program(stmts, None);
     p.finish()
 }
 
 /// Lower a single `output_ast` expression to JS (byte-identical to the oxc emitter).
 pub fn emit_expression(expr: &o::Expr) -> String {
-    let mut p = Printer::new();
+    emit_expression_with(expr, &current_emit_options())
+}
+
+/// [`emit_expression`] with explicit [`EmitOptions`].
+pub fn emit_expression_with(expr: &o::Expr, opts: &EmitOptions) -> String {
+    let mut p = Printer::with_options(*opts);
     p.print_program(&[], Some(expr));
     p.finish()
 }
@@ -317,6 +329,10 @@ struct Printer {
     indent: usize,
     imports: RefCell<ImportManager>,
     anchors: Option<RefCell<Vec<EmittedAnchor>>>,
+    /// [`EmitOptions::escape_non_ascii`]: print string literals the TypeScript-printer way.
+    escape_non_ascii: bool,
+    /// An expression comment waiting for its leading identifier (see [`Printer::print_expr_inner`]).
+    pending_head: Option<String>,
 }
 
 #[derive(Default)]
@@ -336,12 +352,14 @@ impl ImportManager {
 }
 
 impl Printer {
-    fn new() -> Self {
+    fn with_options(opts: EmitOptions) -> Self {
         Printer {
             out: String::new(),
             indent: 0,
             imports: RefCell::new(ImportManager::default()),
             anchors: None,
+            escape_non_ascii: opts.escape_non_ascii,
+            pending_head: None,
         }
     }
 
@@ -351,6 +369,8 @@ impl Printer {
             indent: 0,
             imports: RefCell::new(ImportManager::default()),
             anchors: Some(RefCell::new(Vec::new())),
+            escape_non_ascii: current_emit_options().escape_non_ascii,
+            pending_head: None,
         }
     }
 
@@ -399,20 +419,44 @@ impl Printer {
         let mut body = String::new();
         std::mem::swap(&mut self.out, &mut body);
 
-        for stmt in stmts {
+        // The first top-level item, when it is a bare string-literal expression statement, would
+        // read as a directive (`"use strict";`), so oxc_codegen parenthesises it (`("svg");`,
+        // codegen `Program` "Ensure first string literal is not a directive"). That only applies
+        // when it is the first statement of the program, i.e. when no import line precedes it.
+        let first_is_string = match (stmts.first(), trailing_expr) {
+            (Some(stmt), _) => match &stmt.kind {
+                StmtKind::Expression(expr) => is_string_literal_expr(expr),
+                _ => false,
+            },
+            (None, Some(expr)) => is_string_literal_expr(expr),
+            (None, None) => false,
+        };
+        let mut head_len = 0;
+        let total = stmts.len() + usize::from(trailing_expr.is_some());
+        for index in 0..total {
             self.print_indent();
-            self.print_stmt(stmt);
+            match stmts.get(index) {
+                Some(stmt) => self.print_stmt(stmt),
+                None => self.print_expr_stmt(trailing_expr.expect("index < total")),
+            }
             self.newline();
-        }
-        if let Some(expr) = trailing_expr {
-            self.print_indent();
-            self.print_expr_stmt(expr);
-            self.newline();
+            if index == 0 {
+                head_len = self.out.len();
+            }
         }
 
         std::mem::swap(&mut self.out, &mut body); // self.out is empty again; `body` holds the code
         // Emit imports first.
         let modules = self.imports.borrow().modules.clone();
+        if first_is_string && modules.is_empty() && head_len > 0 {
+            // The head is `"lit";\n` (print_expr_stmt + newline): rewrite it as `("lit");\n`.
+            debug_assert!(body[..head_len].ends_with(";\n"));
+            let (head, rest) = body.split_at(head_len);
+            let literal = head.strip_suffix(";\n").unwrap_or(head);
+            let mut wrapped = format!("({literal});\n");
+            wrapped.push_str(rest);
+            body = wrapped;
+        }
         for (module, alias) in &modules {
             self.push("import * as ");
             self.push(alias);
@@ -436,6 +480,16 @@ impl Printer {
     // -- statements -------------------------------------------------------
 
     fn print_stmt(&mut self, stmt: &o::Stmt) {
+        // Leading comments: each on its own line(s), then the statement at the same indentation. The
+        // oxc emitter gets the same bytes by replacing one marker statement per comment.
+        if !stmt.meta.leading_comments.is_empty() {
+            let indent = "\t".repeat(self.indent);
+            for comment in stmt.meta.leading_comments.iter().map(comment_lines_for) {
+                self.push(&comment.join(&format!("\n{indent}")));
+                self.newline();
+                self.print_indent();
+            }
+        }
         match &stmt.kind {
             StmtKind::Expression(expr) => self.print_expr_stmt(expr),
             StmtKind::Return(expr) => {
@@ -549,9 +603,23 @@ impl Printer {
         }
     }
 
+    /// Emit the parked expression comment (with its separating space), if any.
+    fn print_pending_head(&mut self) {
+        if let Some(text) = self.pending_head.take() {
+            self.push(&text);
+            self.push(" ");
+        }
+    }
+
     fn print_expr_inner(&mut self, expr: &o::Expr) {
+        // An expression comment is printed directly before the expression's leading identifier, so it is
+        // parked here and emitted when that identifier is printed (after any opening parenthesis).
+        if !expr.meta.leading_comments.is_empty() && expr_has_identifier_head(expr) {
+            self.pending_head = Some(expr_comment_text(&expr.meta.leading_comments));
+        }
         match &expr.kind {
             ExprKind::ReadVar { name } => {
+                self.print_pending_head();
                 self.record_anchor(&expr.meta.span, name);
                 self.push(name);
             }
@@ -559,11 +627,15 @@ impl Printer {
             ExprKind::External { value, .. } => match &value.module_name {
                 Some(module) if !module.is_empty() => {
                     let alias = self.imports.borrow_mut().alias_for(module);
+                    self.print_pending_head();
                     self.push(&alias);
                     self.push(".");
                     self.push(&value.name);
                 }
-                _ => self.push(&value.name),
+                _ => {
+                    self.print_pending_head();
+                    self.push(&value.name);
+                }
             },
             ExprKind::Invoke {
                 callee,
@@ -858,6 +930,10 @@ impl Printer {
     /// Print a double-quoted string literal with JS escapes, matching oxc_codegen's string output
     /// (which prefers double quotes) plus the emitter's `�` escape for i18n placeholders.
     fn print_string_literal(&mut self, s: &str) {
+        if self.escape_non_ascii {
+            self.print_string_literal_escaped(s);
+            return;
+        }
         self.push_ch('"');
         let mut chars = s.chars().peekable();
         while let Some(c) = chars.next() {
@@ -893,6 +969,44 @@ impl Printer {
                 _ => self.push_ch(c),
             }
         }
+        self.push_ch('"');
+    }
+
+    /// [`EmitOptions::escape_non_ascii`] form: TypeScript's `escapeNonAsciiString(escapeString(s))`.
+    /// Control characters use TypeScript's table (`\0`/`\x00` for NUL, the named escapes, then
+    /// `\uXXXX`), and every non-ASCII UTF-16 code unit is `\uXXXX`.
+    fn print_string_literal_escaped(&mut self, s: &str) {
+        self.push_ch('"');
+        let mut chars = s.char_indices();
+        let mut out = String::new();
+        while let Some((i, c)) = chars.next() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                '\u{08}' => out.push_str("\\b"),
+                '\u{0C}' => out.push_str("\\f"),
+                '\u{0B}' => out.push_str("\\v"),
+                '\u{00}' => {
+                    // TypeScript: NUL is `\0`, but `\x00` when a decimal digit follows it.
+                    let next_is_digit = s[i + 1..].chars().next().is_some_and(|n| n.is_ascii_digit());
+                    out.push_str(if next_is_digit { "\\x00" } else { "\\0" });
+                }
+                c if (c as u32) < 0x20 => {
+                    out.push_str(&crate::output::emit_options::utf16_escape(c as u16));
+                }
+                c if !c.is_ascii() => {
+                    let mut buf = [0u16; 2];
+                    for unit in c.encode_utf16(&mut buf) {
+                        out.push_str(&crate::output::emit_options::utf16_escape(*unit));
+                    }
+                }
+                c => out.push(c),
+            }
+        }
+        self.push(&out);
         self.push_ch('"');
     }
 
@@ -1132,6 +1246,16 @@ fn expr_is_callee_needing_parens(callee: &o::Expr) -> bool {
 
 /// Does the expression begin with `{` (object literal) or the `function` keyword, requiring a
 /// statement-position / arrow-body wrap?
+/// Is `expr` a string literal once explicit parentheses are looked through? (oxc's
+/// `Expression::without_parentheses` check in its `Program` codegen.)
+fn is_string_literal_expr(expr: &o::Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Literal(LiteralValue::String(_)) => true,
+        ExprKind::Parenthesized(inner) => is_string_literal_expr(inner),
+        _ => false,
+    }
+}
+
 fn expr_starts_with_brace_or_function(expr: &o::Expr) -> bool {
     match &expr.kind {
         ExprKind::LiteralMap { .. } => true,
@@ -1392,5 +1516,180 @@ mod update_expression_tests {
             rhs: Box::new(o::literal(LiteralValue::Number(2.0), None)),
         });
         assert_eq!(js_text(&pow), "a++ ** 2");
+    }
+}
+
+#[cfg(test)]
+mod leading_string_directive_tests {
+    use super::*;
+
+    fn str_lit(s: &str) -> o::Expr {
+        o::literal(LiteralValue::String(s.to_string()), None)
+    }
+
+    /// oxc_codegen parenthesises a string-literal expression statement that is the FIRST statement of
+    /// the program, so it cannot read as a directive (`"use strict";`). The swc printer must match.
+    #[test]
+    fn leading_string_expression_is_parenthesised_like_oxc() {
+        assert_eq!(emit_expression(&str_lit("svg")), "(\"svg\");\n");
+        let stmts = vec![o::Stmt::bare(StmtKind::Expression(str_lit("use strict")))];
+        assert_eq!(emit_statements(&stmts), "(\"use strict\");\n");
+    }
+
+    /// Only the first statement is affected; a later string statement keeps its bare form.
+    #[test]
+    fn later_string_expression_is_not_parenthesised() {
+        let stmts = vec![
+            o::Stmt::bare(StmtKind::Expression(o::variable("a", None))),
+            o::Stmt::bare(StmtKind::Expression(str_lit("x"))),
+        ];
+        assert_eq!(emit_statements(&stmts), "a;\n\"x\";\n");
+    }
+
+    /// A leading string followed by an import line is not the program's first statement, so the
+    /// import (not the string) is first and the string is printed bare.
+    #[test]
+    fn leading_string_after_import_is_not_parenthesised() {
+        let ext = o::import_expr(
+            crate::output_ast::ExternalReference::new(Some("@angular/core".to_string()), "ɵɵdefineComponent"),
+            None,
+        );
+        let stmts = vec![
+            o::Stmt::bare(StmtKind::Expression(str_lit("x"))),
+            o::Stmt::bare(StmtKind::Expression(ext)),
+        ];
+        let out = emit_statements(&stmts);
+        assert!(out.starts_with("import * as i0 from \"@angular/core\";\n"), "got: {out}");
+        assert!(out.contains("\n\"x\";\n"), "got: {out}");
+        assert!(!out.contains("(\"x\")"), "got: {out}");
+    }
+}
+
+#[cfg(test)]
+mod escape_non_ascii_tests {
+    use super::*;
+    use crate::output::emit_options::EmitOptions;
+
+    const ON: EmitOptions = EmitOptions { escape_non_ascii: true };
+
+    fn str_lit(s: &str) -> o::Expr {
+        o::literal(LiteralValue::String(s.to_string()), None)
+    }
+
+    /// `f(<arg>);` so the literal is never the first statement (the directive rule is tested elsewhere).
+    fn call_with(arg: o::Expr) -> o::Expr {
+        o::variable("f", None).call_fn(vec![arg], false)
+    }
+
+    fn print_on(arg: &str) -> String {
+        emit_expression_with(&call_with(str_lit(arg)), &ON)
+    }
+
+    #[test]
+    fn bmp_non_ascii_is_escaped_as_utf16_units() {
+        assert_eq!(print_on("é"), "f(\"\\u00E9\");\n");
+        assert_eq!(print_on("\u{FFFD}0\u{FFFD}"), "f(\"\\uFFFD0\\uFFFD\");\n");
+        assert_eq!(print_on("\u{00A0}"), "f(\"\\u00A0\");\n");
+    }
+
+    #[test]
+    fn astral_characters_become_surrogate_pairs() {
+        assert_eq!(print_on("🚀"), "f(\"\\uD83D\\uDE80\");\n");
+    }
+
+    #[test]
+    fn existing_backslash_u_text_is_escaped_backslash_not_reinterpreted() {
+        // The VALUE is backslash, u, F, F, F, D: printed with the backslash escaped, never as U+FFFD.
+        assert_eq!(print_on("\\uFFFD"), "f(\"\\\\uFFFD\");\n");
+    }
+
+    #[test]
+    fn control_characters_follow_typescript_table() {
+        assert_eq!(print_on("\u{07}"), "f(\"\\u0007\");\n");
+        assert_eq!(print_on("\u{1B}"), "f(\"\\u001B\");\n");
+        assert_eq!(print_on("\t\n\r"), "f(\"\\t\\n\\r\");\n");
+        assert_eq!(print_on("\u{0}"), "f(\"\\0\");\n");
+        assert_eq!(print_on("\u{0}1"), "f(\"\\x001\");\n");
+    }
+
+    #[test]
+    fn ascii_and_quotes_are_unchanged() {
+        assert_eq!(print_on("say \"hi\""), "f(\"say \\\"hi\\\"\");\n");
+        assert_eq!(print_on("plain"), "f(\"plain\");\n");
+    }
+
+    #[test]
+    fn identifiers_with_non_ascii_letters_stay_raw() {
+        let expr = o::variable("ɵɵdefine", None).call_fn(vec![], false);
+        assert_eq!(emit_expression_with(&expr, &ON), "ɵɵdefine();\n");
+    }
+
+    #[test]
+    fn template_raw_text_stays_raw_but_substitutions_are_escaped() {
+        let tpl = o::Expr::bare(ExprKind::TemplateLiteral {
+            elements: vec![
+                o::TemplateLiteralElement { text: "é ".into(), raw_text: "é ".into() },
+                o::TemplateLiteralElement { text: String::new(), raw_text: String::new() },
+            ],
+            expressions: vec![str_lit("ü")],
+        });
+        assert_eq!(emit_expression_with(&tpl, &ON), "`é ${\"\\u00FC\"}`;\n");
+    }
+
+    #[test]
+    fn default_option_keeps_raw_characters() {
+        let off = EmitOptions::default();
+        assert_eq!(emit_expression_with(&call_with(str_lit("é")), &off), "f(\"é\");\n");
+    }
+}
+
+#[cfg(test)]
+mod leading_comment_tests {
+    //! The swc printer's leading comments: pinned to the oxc emitter's bytes (see `emitter::leading_comment_tests`).
+    use super::*;
+    use crate::output_ast::{LiteralValue, StmtKind, StmtModifier};
+
+    /// `const MSG = /* @ts-ignore */ goog.getMsg("x");` with a JSDoc above the statement.
+    fn commented_program() -> Vec<o::Stmt> {
+        let mut call = o::variable("goog", None).prop("getMsg").call_fn(
+            vec![o::literal(LiteralValue::String("x".into()), None)],
+            false,
+        );
+        call.meta.leading_comments = vec![o::leading_comment("@ts-ignore", true, true)];
+        let mut decl = o::Stmt::with_modifiers(
+            StmtKind::DeclareVar { name: "MSG".into(), value: Some(call), ty: None },
+            StmtModifier::FINAL,
+        );
+        decl.meta.leading_comments = vec![o::js_doc_comment(vec![o::JsDocTag {
+            tag_name: Some("desc".into()),
+            text: Some("Hello".into()),
+        }])];
+        vec![decl]
+    }
+
+    const COMMENTED_PROGRAM_JS: &str =
+        "/**\n * @desc Hello\n */\nconst MSG = /* @ts-ignore */ goog.getMsg(\"x\");\n";
+
+    #[test]
+    fn statement_jsdoc_and_inline_expression_comment_print_like_angular() {
+        assert_eq!(emit_statements(&commented_program()), COMMENTED_PROGRAM_JS);
+    }
+
+    #[test]
+    fn expression_comment_is_dropped_only_when_it_has_no_identifier_head() {
+        let mut lit = o::literal(LiteralValue::Number(1.0), None);
+        lit.meta.leading_comments = vec![o::leading_comment("note", true, true)];
+        let out = emit_expression(&lit);
+        assert!(!out.contains("note"), "got: {out}");
+    }
+
+    #[test]
+    fn plain_multiline_and_single_line_statement_comments() {
+        let mut stmt = o::Stmt::bare(StmtKind::Expression(o::variable("a", None)));
+        stmt.meta.leading_comments = vec![
+            o::leading_comment("one", true, true),
+            o::leading_comment("two\nthree", false, true),
+        ];
+        assert_eq!(emit_statements(&[stmt]), "/* one */\n// two\n// three\na;\n");
     }
 }

@@ -939,10 +939,14 @@ pub fn build_i18n_const(
         get_msg_args.push(opts);
     }
 
-    let goog_get_msg = o::variable("goog", None)
+    // `goog.getMsg(…)` carries `tsIgnoreComment()` (`goog` may be unavailable externally), so the call is
+    // printed as `/* @ts-ignore */ goog.getMsg(…)`.
+    let mut goog_get_msg = o::variable("goog", None)
         .prop("getMsg")
         .call_fn(get_msg_args, false);
-    let goog_stmt = Stmt::with_modifiers(
+    goog_get_msg.meta.leading_comments = vec![treaty_ivy_core::util::ts_ignore_comment()];
+    // `const MSG_… = goog.getMsg(…)` carries the message's JSDoc (`i18nMetaToJSDoc`), above the statement.
+    let mut goog_stmt = Stmt::with_modifiers(
         StmtKind::DeclareVar {
             name: closure_name.clone(),
             value: Some(goog_get_msg),
@@ -950,15 +954,17 @@ pub fn build_i18n_const(
         },
         StmtModifier::FINAL,
     );
+    goog_stmt.meta.leading_comments = vec![i18n_meta_to_jsdoc(message)];
     let closure_assign = Stmt::bare(StmtKind::Expression(
         main_var.clone().set(o::variable(closure_name, None)),
     ));
     let true_case = vec![goog_stmt, closure_assign];
 
-    // `createLocalizeStatements`: `$i18n_n$ = $localize\`…\`;`.
-    let false_case = vec![Stmt::bare(StmtKind::Expression(
-        main_var.clone().set(localize_expr),
-    ))];
+    // `createLocalizeStatements`: `$i18n_n$ = $localize\`…\`;` (an `ExpressionStatement` with `tsIgnoreComment()`,
+    // because `$localize` might not be available internally).
+    let mut localize_stmt = Stmt::bare(StmtKind::Expression(main_var.clone().set(localize_expr)));
+    localize_stmt.meta.leading_comments = vec![treaty_ivy_core::util::ts_ignore_comment()];
+    let false_case = vec![localize_stmt];
 
     // `createClosureModeGuard()`: `typeof ngI18nClosureMode !== "undefined" && ngI18nClosureMode`.
     let guard = o::typeof_expr(o::variable(NG_I18N_CLOSURE_MODE, None))
@@ -988,6 +994,23 @@ pub fn build_i18n_const(
         const_entry: main_var,
         initializers,
     }
+}
+
+/// `i18nMetaToJSDoc(message)` (`render3/view/i18n/meta.ts`): `@desc <description>` when the message has a
+/// description, otherwise `@suppress {msgDescriptions}` (so the closure compiler does not warn about a
+/// missing `@desc`); then `@meaning <meaning>` when present.
+pub fn i18n_meta_to_jsdoc(message: &Message) -> treaty_ivy_core::output_ast::LeadingComment {
+    use treaty_ivy_core::output_ast::{js_doc_comment, JsDocTag};
+    let mut tags = Vec::new();
+    if !message.description.is_empty() {
+        tags.push(JsDocTag { tag_name: Some("desc".into()), text: Some(message.description.clone()) });
+    } else {
+        tags.push(JsDocTag { tag_name: Some("suppress".into()), text: Some("{msgDescriptions}".into()) });
+    }
+    if !message.meaning.is_empty() {
+        tags.push(JsDocTag { tag_name: Some("meaning".into()), text: Some(message.meaning.clone()) });
+    }
+    js_doc_comment(tags)
 }
 
 /// Wrap a `consts` entry list whose i18n entries are read-vars and a set of initializer

@@ -340,14 +340,17 @@ const SELECTOR_FLAGS = { NOT: 0b0001, ATTRIBUTE: 0b0010, ELEMENT: 0b0100, CLASS:
 const QUERY_FLAGS = { none: 0b0000, descendants: 0b0001, isStatic: 0b0010, emitDistinctChangesOnly: 0b0100 };
 
 /**
- * Evaluate the expected-file macros that do not need Angular's i18n message serializer, in
- * Angular's order. An i18n macro throws `UnsupportedMacro` (the case is skipped, not passed).
+ * Evaluate the expected-file macros in Angular's order (`expected_file_macros.ts`
+ * `EXPECTED_FILE_MACROS`): the three i18n message macros first, then `__AttributeMarker`,
+ * `__SelectorFlags` and `__QueryFlags`. The i18n macros are evaluated by the port of Angular's
+ * `i18n_helpers.ts` below, so the golden they stand for is the exact text Angular's test expects.
  * @param {string} expectedContent
  * @returns {string}
  */
 export function replaceMacros(expectedContent) {
-  for (const name of ['__i18nMsg__', '__i18nMsgWithPostprocess__', '__i18nIcuMsg__']) {
-    if (expectedContent.includes(name)) throw new UnsupportedMacro(name);
+  resetMessageIndex();
+  for (const [regex, replacer] of I18N_MACROS) {
+    expectedContent = expectedContent.replace(regex, replacer);
   }
   expectedContent = expectedContent.replace(
     /__AttributeMarker\.([^_]+)__/g,
@@ -361,6 +364,257 @@ export function replaceMacros(expectedContent) {
   expectedContent = flagUnion(expectedContent, /__QueryFlags\.([^_]+)__/, QUERY_FLAGS, 'QueryFlag');
   return expectedContent;
 }
+
+// ---------------------------------------------------------------------------
+// i18n message macros (test_helpers/i18n_helpers.ts + expected_file_macros.ts).
+// ---------------------------------------------------------------------------
+
+/** Angular's `msgIndex`: the per-golden counter of `$I18N_<n>$` variables. Reset by `replaceMacros`. */
+let msgIndex = 0;
+
+/** @returns {void} */
+function resetMessageIndex() {
+  msgIndex = 0;
+}
+
+/**
+ * `macroFn(fnName, ...args)`: the macro's call pattern, with optional whitespace around the name,
+ * the parentheses, and every argument and comma.
+ * @param {RegExp} fnName
+ * @param {...RegExp} args
+ * @returns {RegExp}
+ */
+function macroFn(fnName, ...args) {
+  const ws = /[\s\r\n]*/.source;
+  return new RegExp(
+    ws + fnName.source + '\\(' + args.map((r) => `${ws}${r.source}${ws}`).join(',') + '\\)' + ws,
+    'g',
+  );
+}
+
+/** `stringParam()`: a single-quoted string. */
+const STRING_PARAM = /'([^']*?[^\\])'/;
+/** `arrayParam()`: a bracketed array. */
+const ARRAY_PARAM = /(\[.*?\])/;
+/**
+ * `objectParam()`: an object literal with up to six levels of nesting (Angular's pattern, verbatim).
+ */
+const OBJECT_PARAM =
+  /(\{[^{}]*(?:\{[^{}]*(?:\{[^{}]*(?:\{[^{}]*(?:\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}[^{}]*)*\}[^{}]*)*\}[^{}]*)*\}[^{}]*)*\})/;
+
+/**
+ * Evaluate an expected-file argument literal. Angular uses `eval`; the golden corpus is trusted
+ * repository input, and an invalid literal is a malformed golden (a skip), not a mismatch.
+ * @param {string} str
+ * @returns {unknown}
+ */
+function evalLiteral(str) {
+  try {
+    return new Function(`return (${str});`)();
+  } catch (err) {
+    throw new ExpectEmitInvalid(`Invalid macro argument: ${str} (${/** @type {Error} */ (err).message})`);
+  }
+}
+
+/**
+ * `parsePlaceholders`: `[name, identifier, associatedId?]` tuples.
+ * @param {string} str
+ * @returns {Array<[string, string, string?]>}
+ */
+function parsePlaceholders(str) {
+  const placeholders = evalLiteral(str);
+  if (
+    !Array.isArray(placeholders) ||
+    !placeholders.every(
+      (p) =>
+        Array.isArray(p) &&
+        p.length >= 2 &&
+        typeof p[0] === 'string' &&
+        typeof p[1] === 'string' &&
+        (p.length === 2 || typeof p[2] === 'string'),
+    )
+  ) {
+    throw new ExpectEmitInvalid(
+      'Expected an array of Placeholder arrays (`[name: string, identifier: string, associatedId?: string]`) but got ' +
+        str,
+    );
+  }
+  return /** @type {any} */ (placeholders);
+}
+
+/**
+ * `parseOptions`: an object whose only key is `original_code`, a string-valued map.
+ * @param {string} str
+ * @returns {{original_code?: Record<string, string>}}
+ */
+function parseOptions(str) {
+  const inputObj = evalLiteral(str);
+  if (typeof inputObj !== 'object' || inputObj === null) {
+    throw new ExpectEmitInvalid(`Expected an object of properties but got:\n\n${str}.`);
+  }
+  const obj = /** @type {Record<string, unknown>} */ (inputObj);
+  const unexpectedKeys = Object.keys(obj).filter((key) => key !== 'original_code');
+  if (unexpectedKeys.length > 0) {
+    throw new ExpectEmitInvalid(
+      `Expected an i18n options object with \`original_code\`, but got ${unexpectedKeys.join(', ')}`,
+    );
+  }
+  const original = obj['original_code'];
+  if (typeof original !== 'undefined' && typeof original !== 'object') {
+    throw new ExpectEmitInvalid(
+      `Expected an i18n options object with \`original_code\`, as a nested object, but got ${JSON.stringify(obj, null, 4)}`,
+    );
+  }
+  for (const [key, value] of Object.entries(original ?? {})) {
+    if (typeof value !== 'string') {
+      throw new ExpectEmitInvalid(
+        `Expected an object whose values are strings, but property ${key} has type ${typeof value}, when parsing:\n\n${str}`,
+      );
+    }
+  }
+  return /** @type {any} */ (obj);
+}
+
+/**
+ * `parseMetaProperties`: the `{desc, meaning, id}` bag, string-valued.
+ * @param {string} str
+ * @returns {Record<string, string>}
+ */
+function parseMetaProperties(str) {
+  const obj = /** @type {Record<string, unknown>} */ (evalLiteral(str));
+  if (typeof obj !== 'object' || obj === null) {
+    throw new ExpectEmitInvalid(`Expected an object of properties but got:\n\n${str}.`);
+  }
+  for (const key in obj) {
+    if (typeof obj[key] !== 'string') {
+      throw new ExpectEmitInvalid(
+        `Expected an object whose values are strings, but property ${key} has type ${typeof obj[key]}, when parsing:\n\n${str}`,
+      );
+    }
+  }
+  return /** @type {Record<string, string>} */ (obj);
+}
+
+/** `i18nMsg(message, placeholders, options, meta)` (i18n_helpers.ts). */
+function i18nMsg(message, placeholders, options, meta) {
+  const varName = `$I18N_${msgIndex++}$`;
+  const closurePlaceholders = i18nPlaceholdersToString(placeholders);
+  const closureOptions = i18nOptionsToString(options);
+  const locMessageWithPlaceholders = i18nMsgInsertLocalizePlaceholders(message, placeholders);
+  return `
+    let ${varName};
+    if (typeof ngI18nClosureMode !== "undefined" && ngI18nClosureMode) {
+        ${i18nMsgClosureMeta(meta)}
+        const $MSG_EXTERNAL_${msgIndex}$ = /* @ts-ignore */ goog.getMsg("${message}"${closurePlaceholders}${closureOptions});
+        ${varName} = $MSG_EXTERNAL_${msgIndex}$;
+    }
+    else {
+      /* @ts-ignore */
+      ${varName} = $localize \`${i18nMsgLocalizeMeta(meta)}${locMessageWithPlaceholders}\`;
+    }`;
+}
+
+/**
+ * `i18nMsgWithPostprocess(...)`: `String.raw` in Angular, so the text is kept verbatim; the
+ * postprocess variable is `$$<var>$$`, exactly as Angular's template spells it.
+ */
+function i18nMsgWithPostprocess(message, placeholders, options, meta, postprocessPlaceholders) {
+  const varName = `$I18N_${msgIndex}$`;
+  const ppPlaceholders = i18nPlaceholdersToString(postprocessPlaceholders);
+  const inner = i18nMsg(message, placeholders, options, meta);
+  return `
+        ${inner}
+        ${varName} = $r3$.ɵɵi18nPostprocess($${varName}$${ppPlaceholders});
+      `;
+}
+
+/** `i18nIcuMsg(message, placeholders, options)`. */
+function i18nIcuMsg(message, placeholders, options) {
+  return i18nMsgWithPostprocess(message, [], options, {}, placeholders);
+}
+
+/** `i18nPlaceholdersToString`. */
+function i18nPlaceholdersToString(placeholders) {
+  if (placeholders.length === 0) return '';
+  const result = placeholders.map(([name, identifier]) => `"${name}": ${quotedValue(identifier)}`);
+  return `, { ${result.join(',')} }`;
+}
+
+/** `i18nOptionsToString`. */
+function i18nOptionsToString({ original_code: originals = {} } = {}) {
+  if (Object.keys(originals).length === 0) return '';
+  const result = Object.entries(originals).map(([key, value]) => `"${key}": ${quotedValue(value)}`);
+  return `, { original_code: {\n${result.join(',\n')}\n} }`;
+}
+
+/** `i18nMsgInsertLocalizePlaceholders`: `{$name}` becomes `${"identifier"}:UPPER_NAME@@assoc:`. */
+function i18nMsgInsertLocalizePlaceholders(message, placeholders) {
+  if (placeholders.length > 0) {
+    message = message.replace(/{\$(.*?)}/g, (_, name) => {
+      const placeholder = placeholders.find((p) => p[0] === name);
+      if (!placeholder) throw new ExpectEmitInvalid(`No placeholder named ${name}`);
+      // e.g. startDivTag -> START_DIV_TAG
+      const key = name.replace(/[A-Z]/g, (ch) => '_' + ch).toUpperCase();
+      const associated = placeholder.length === 3 ? `@@${placeholder[2]}` : '';
+      return '$' + `{${quotedValue(placeholder[1])}}:${key}${associated}:`;
+    });
+  }
+  return message;
+}
+
+/** `i18nMsgClosureMeta`: the `@desc` / `@meaning` JSDoc on the closure branch. */
+function i18nMsgClosureMeta(meta) {
+  if (!meta) return '';
+  return `
+    /**
+     * ${meta.desc ? '@desc ' + meta.desc : '@suppress {msgDescriptions}'}
+     ${meta.meaning ? '* @meaning ' + meta.meaning : ''}
+     */
+  `;
+}
+
+/** `i18nMsgLocalizeMeta`: the `:meaning|desc@@id:` prefix of the `$localize` template. */
+function i18nMsgLocalizeMeta(meta) {
+  if (!meta) return '';
+  let localizeMeta = '';
+  if (meta.meaning) localizeMeta += `${meta.meaning}|`;
+  if (meta.desc) localizeMeta += meta.desc;
+  if (meta.id) localizeMeta += `@@${meta.id}`;
+  return localizeMeta !== '' ? `:${localizeMeta}:` : '';
+}
+
+/** `quotedValue`: a `$`-prefixed value is an ICU reference and stays unquoted. */
+function quotedValue(value) {
+  return value.startsWith('$') ? value : `"${value.replace(/"/g, '\\"')}"`;
+}
+
+/**
+ * Angular's `EXPECTED_FILE_MACROS` i18n entries, in order. `macroFn` capture groups map one to one
+ * onto the replacer's arguments (the wrapping whitespace has no capture group).
+ */
+const I18N_MACROS = [
+  [
+    macroFn(/__i18nMsg__/, STRING_PARAM, ARRAY_PARAM, OBJECT_PARAM, OBJECT_PARAM),
+    (_match, message, placeholders, options, meta) =>
+      i18nMsg(message, parsePlaceholders(placeholders), parseOptions(options), parseMetaProperties(meta)),
+  ],
+  [
+    macroFn(/__i18nMsgWithPostprocess__/, STRING_PARAM, ARRAY_PARAM, OBJECT_PARAM, OBJECT_PARAM, ARRAY_PARAM),
+    (_match, message, placeholders, options, meta, postProcessPlaceholders) =>
+      i18nMsgWithPostprocess(
+        message,
+        parsePlaceholders(placeholders),
+        parseOptions(options),
+        parseMetaProperties(meta),
+        parsePlaceholders(postProcessPlaceholders),
+      ),
+  ],
+  [
+    macroFn(/__i18nIcuMsg__/, STRING_PARAM, ARRAY_PARAM, OBJECT_PARAM),
+    (_match, message, placeholders, options) =>
+      i18nIcuMsg(message, parsePlaceholders(placeholders), parseOptions(options)),
+  ],
+];
 
 /**
  * Port of `flagUnion`: each macro, and any `|`-joined run of them, becomes the bitwise OR of the
@@ -436,4 +690,68 @@ export function verifyUniqueFunctions(output, functionNamePattern, expectedCount
 export function verifyUniqueFactory(output, type) {
   const matches = output.match(new RegExp(`function ${type}_Factory`, 'g'));
   return matches !== null && matches.length === 1;
+}
+
+// ---------------------------------------------------------------------------
+// i18n extra checks (test_helpers/i18n_checks.ts).
+// ---------------------------------------------------------------------------
+
+/** `EXTRACT_GENERATED_TRANSLATIONS_REGEXP`: `const <name> = goog.getMsg("<msg>", <placeholders>)`. */
+const GENERATED_TRANSLATION = /const\s*(.*?)\s*=\s*goog\.getMsg\("(.*?)",?\s*(.*?)\)/g;
+
+/**
+ * Port of Angular's `extract`: every match of a fresh global copy of `regex`, transformed and
+ * collected into a Set (the transform may throw).
+ * @template T
+ * @param {string} from
+ * @param {RegExp} regex
+ * @param {(match: RegExpExecArray, state: Set<T>) => T} transformFn
+ * @returns {Set<T>}
+ */
+function extract(from, regex, transformFn) {
+  const global = new RegExp(regex.source, 'g');
+  const result = new Set();
+  let item;
+  while ((item = global.exec(from)) !== null) {
+    result.add(transformFn(item, result));
+  }
+  return result;
+}
+
+/**
+ * `verifyPlaceholdersIntegrity(output)`: in every `goog.getMsg` call, the `{$name}` placeholders of
+ * the message are exactly the `"name": ...` keys of its placeholder object.
+ * @param {string} output
+ * @returns {boolean}
+ */
+export function verifyPlaceholdersIntegrity(output) {
+  const translations = extract(output, GENERATED_TRANSLATION, (m) => [m[2], m[3]]);
+  for (const [msg, args] of translations) {
+    const bodyPhs = extract(msg, /{\$(.*?)}/g, (m) => m[1]);
+    const argsPhs = extract(args, /\s+"(.+?)":\s/g, (m) => m[1]);
+    const missing = [...bodyPhs].filter((x) => !argsPhs.has(x));
+    if (bodyPhs.size !== argsPhs.size || missing.length > 0) return false;
+  }
+  return true;
+}
+
+/**
+ * `verifyUniqueConsts(output)`: no two `goog.getMsg` constants share a name (Angular throws; false here).
+ * @param {string} output
+ * @returns {boolean}
+ */
+export function verifyUniqueConsts(output) {
+  // Angular throws on a duplicate; a thrown check is a failed check, so it is reported as `false`.
+  try {
+    extract(output, GENERATED_TRANSLATION, (current, state) => {
+      const key = current[1];
+      if (state.has(key)) {
+        throw new Error(`Duplicate const ${key} found in generated output!`);
+      }
+      return key;
+    });
+    return true;
+  } catch {
+    return false;
+  }
 }

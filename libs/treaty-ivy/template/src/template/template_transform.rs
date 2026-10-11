@@ -1098,7 +1098,9 @@ impl<'b> HtmlAstToIvyAst<'b> {
                 // message comes from the attribute value (`I18nMetaVisitor.visitAttribute`).
                 let marker = format!("i18n-{}", attribute.name);
                 let mut visited = visit_attribute(attribute);
-                if let Some(marker) = attrs.iter().find(|a| a.name == marker) {
+                // `do not create translation for empty attributes` (`I18nMetaVisitor._visitElementLike`):
+                // only a non-empty static value gets a message.
+                if let Some(marker) = attrs.iter().find(|a| a.name == marker).filter(|_| !attribute.value.is_empty()) {
                     let meta = crate::i18n::parse_i18n_meta(&marker.value);
                     visited.i18n = Some(t::I18nMeta::Message(crate::i18n::to_i18n_message_for_attribute(
                         attribute,

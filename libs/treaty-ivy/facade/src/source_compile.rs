@@ -4480,6 +4480,7 @@ mod tests {
         // + `ɵprov` (`ɵɵdefineInjectable` with token/factory/providedIn).
         let golden = "\
 AuthService.\u{0275}fac = function AuthService_Factory(__ngFactoryType__) {
+	/* @ts-ignore */
 	return new (__ngFactoryType__ || AuthService)(i0.\u{0275}\u{0275}inject(HttpClient), i0.\u{0275}\u{0275}inject(Config, 8));
 };
 AuthService.\u{0275}prov = i0.\u{0275}\u{0275}defineInjectable({
@@ -6369,7 +6370,7 @@ export class BCmp {}
         assert!(out.errors.is_empty(), "unexpected errors: {:?}", out.errors);
         let flat = normalize_ws(&out.code);
         assert!(
-            flat.contains("function C_Factory(__ngFactoryType__) { return new (__ngFactoryType__ || C)(i0.\u{0275}\u{0275}directiveInject(ServiceA), i0.\u{0275}\u{0275}directiveInject(ServiceB)); }"),
+            flat.contains("function C_Factory(__ngFactoryType__) { /* @ts-ignore */ return new (__ngFactoryType__ || C)(i0.\u{0275}\u{0275}directiveInject(ServiceA), i0.\u{0275}\u{0275}directiveInject(ServiceB)); }"),
             "expected two-dep directiveInject factory; got: {flat}"
         );
         // The complete emitted module must still parse.
@@ -6428,7 +6429,7 @@ export class BCmp {}
         let flat = normalize_ws(&out.code);
         // ɵfac with the ctor dep via ɵɵinject (injectable target, NOT directiveInject).
         assert!(
-            flat.contains("function MyService_Factory(__ngFactoryType__) { return new (__ngFactoryType__ || MyService)(i0.\u{0275}\u{0275}inject(Dep)); }"),
+            flat.contains("function MyService_Factory(__ngFactoryType__) { /* @ts-ignore */ return new (__ngFactoryType__ || MyService)(i0.\u{0275}\u{0275}inject(Dep)); }"),
             "expected ɵfac injecting the ctor dep via ɵɵinject; got: {flat}"
         );
         assert!(flat.contains("MyService.\u{0275}fac ="), "no ɵfac assignment; got: {flat}");
@@ -7037,7 +7038,14 @@ mod corpus_dump {
         std::thread::Builder::new()
             .name("corpus-dump".to_string())
             .stack_size(256 * 1024 * 1024)
-            .spawn(dump_corpus_on_big_stack)
+            .spawn(|| {
+                // The compliance goldens are printed by the TypeScript printer, which escapes non-ASCII
+                // string literals (`\uFFFD`, `\uD83D\uDE80`). Score against that form (EmitOptions default is off).
+                treaty_ivy_core::output::emit_options::with_emit_options(
+                    treaty_ivy_core::output::emit_options::EmitOptions { escape_non_ascii: true },
+                    dump_corpus_on_big_stack,
+                )
+            })
             .expect("spawn corpus dump thread")
             .join()
             .expect("corpus dump thread panicked");
@@ -7048,10 +7056,12 @@ mod corpus_dump {
             eprintln!("TREATY_IVY_CORPUS_DUMP not set; skipping corpus dump");
             return;
         };
-        // The class shape the dump scores (see `ClassShape`). Default: the assignment shape.
+        // The class shape the dump scores (see `ClassShape`). Default: the STATIC-member shape, which is what
+        // Angular's goldens show (ngtsc puts `static ɵfac`/`static ɵcmp` inside the class body). The product
+        // default stays `ClassShape::Assignments`; `TREATY_IVY_CORPUS_CLASS_SHAPE=assignments` scores that shape.
         let class_shape = match std::env::var("TREATY_IVY_CORPUS_CLASS_SHAPE").as_deref() {
-            Ok("static") => super::ClassShape::StaticMembers,
-            _ => super::ClassShape::Assignments,
+            Ok("assignments") => super::ClassShape::Assignments,
+            _ => super::ClassShape::StaticMembers,
         };
         // libs/treaty-ivy/facade -> repo root -> tools/angular-ref/.../test_cases.
         let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
