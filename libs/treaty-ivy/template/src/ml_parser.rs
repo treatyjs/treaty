@@ -234,10 +234,16 @@ impl ParseError {
 
 mod chars {
     pub const EOF: u32 = 0;
+    // Mirrors Angular chars.ts; not every code point is referenced by this port yet.
+    #[allow(dead_code)]
     pub const BSPACE: u32 = 8;
     pub const TAB: u32 = 9;
     pub const LF: u32 = 10;
+    // Mirrors Angular chars.ts (unused by this port's lexer so far).
+    #[allow(dead_code)]
     pub const VTAB: u32 = 11;
+    // Mirrors Angular chars.ts (form feed is not a separate lexer case in this port).
+    #[allow(dead_code)]
     pub const FF: u32 = 12;
     pub const CR: u32 = 13;
     pub const SPACE: u32 = 32;
@@ -255,11 +261,14 @@ mod chars {
     pub const SLASH: u32 = 47;
     pub const COLON: u32 = 58;
     pub const SEMICOLON: u32 = 59;
+    pub const QUESTION: u32 = 63;
     pub const LT: u32 = 60;
     pub const EQ: u32 = 61;
     pub const GT: u32 = 62;
 
     pub const D0: u32 = 48;
+    // Mirrors Angular chars.ts; kept for the octal-digit helper's parity.
+    #[allow(dead_code)]
     pub const D7: u32 = 55;
     pub const D9: u32 = 57;
 
@@ -274,12 +283,24 @@ mod chars {
     pub const UNDERSCORE: u32 = 95;
 
     pub const A_LO: u32 = 97;
+    // Mirrors Angular chars.ts (escape-sequence letters not lexed by this port).
+    #[allow(dead_code)]
     pub const B_LO: u32 = 98;
     pub const F_LO: u32 = 102;
+    // Mirrors Angular chars.ts (escape-sequence letters not lexed by this port).
+    #[allow(dead_code)]
     pub const N_LO: u32 = 110;
+    // Mirrors Angular chars.ts (escape-sequence letters not lexed by this port).
+    #[allow(dead_code)]
     pub const R_LO: u32 = 114;
+    // Mirrors Angular chars.ts (escape-sequence letters not lexed by this port).
+    #[allow(dead_code)]
     pub const T_LO: u32 = 116;
+    // Mirrors Angular chars.ts (escape-sequence letters not lexed by this port).
+    #[allow(dead_code)]
     pub const U_LO: u32 = 117;
+    // Mirrors Angular chars.ts (escape-sequence letters not lexed by this port).
+    #[allow(dead_code)]
     pub const V_LO: u32 = 118;
     pub const X_LO: u32 = 120;
     pub const Z_LO: u32 = 122;
@@ -306,6 +327,8 @@ mod chars {
     pub fn is_new_line(code: u32) -> bool {
         code == LF || code == CR
     }
+    // Mirrors Angular chars.ts `isOctalDigit`; not called by this port's lexer yet.
+    #[allow(dead_code)]
     pub fn is_octal_digit(code: u32) -> bool {
         D0 <= code && code <= D7
     }
@@ -583,6 +606,7 @@ pub enum TokenType {
     EncodedEntity,
     CommentStart,
     CommentEnd,
+    InElementComment,
     CdataStart,
     CdataEnd,
     AttrName,
@@ -612,6 +636,7 @@ pub enum TokenType {
     DirectiveName,
     DirectiveOpen,
     DirectiveClose,
+    ProcessingInstruction,
     Eof,
 }
 
@@ -624,6 +649,8 @@ pub struct Token {
 }
 
 impl Token {
+    // Mirrors Angular ml_parser `Token` helper; not used by this port's tree builder yet.
+    #[allow(dead_code)]
     fn is_interpolated_text(&self) -> bool {
         matches!(
             self.kind,
@@ -795,7 +822,9 @@ const SUPPORTED_BLOCKS: &[&str] = &[
     "@defer",
     "@placeholder",
     "@loading",
+    "@boundary",
     "@error",
+    "@content",
 ];
 
 type TagDefResolver = dyn Fn(&str) -> TagDefinition;
@@ -915,6 +944,8 @@ impl<'a> Tokenizer<'a> {
                 }
             } else if self.attempt_char_code(chars::SLASH)? {
                 self.consume_tag_close(start)?;
+            } else if self.attempt_char_code(chars::QUESTION)? {
+                self.consume_processing_instruction(start)?;
             } else {
                 self.consume_tag_open(start)?;
             }
@@ -959,7 +990,7 @@ impl<'a> Tokenizer<'a> {
             }
             true
         })?;
-        Ok(self.cursor.get_chars(&name_cursor).trim().to_string())
+        Ok(normalize_block_name(self.cursor.get_chars(&name_cursor).trim()))
     }
 
     fn consume_block_start(&mut self, start: &Cursor) -> TResult<()> {
@@ -1104,23 +1135,47 @@ impl<'a> Tokenizer<'a> {
     fn consume_let_declaration_value(&mut self) -> TResult<()> {
         let start = self.cursor.clone();
         self.begin_token(TokenType::LetValue, Some(start.clone()));
+        // `@let` declarations terminate with a semicolon.
+        self.attempt_until_ignore_quotes(|ch| ch == chars::SEMICOLON)?;
+        let text = self.cursor.get_chars(&start);
+        self.end_token(vec![text], None);
+        Ok(())
+    }
+
+    /// Port of `_attemptUntilIgnoreQuotes`: advance until `predicate` matches the next char
+    /// (or EOF), skipping over quoted sections; a backslash inside quotes escapes the next char.
+    fn attempt_until_ignore_quotes<P: Fn(u32) -> bool>(&mut self, predicate: P) -> TResult<()> {
         while self.cursor.peek() != chars::EOF {
             let ch = self.cursor.peek();
-            if ch == chars::SEMICOLON {
+            if predicate(ch) {
                 break;
             }
             if chars::is_quote(ch) {
                 self.cursor.advance()?;
-                self.attempt_char_code_until_fn(|inner| {
-                    // Note: backslash skipping handled below via separate advance is not
-                    // possible inside a pure predicate; approximate by stopping on quote.
-                    inner == ch
-                })?;
+                while self.cursor.peek() != ch {
+                    if self.cursor.peek() == chars::BACKSLASH {
+                        self.cursor.advance()?;
+                    }
+                    self.cursor.advance()?;
+                }
             }
             self.cursor.advance()?;
         }
-        let text = self.cursor.get_chars(&start);
-        self.end_token(vec![text], None);
+        Ok(())
+    }
+
+    /// Port of `_consumeProcessingInstruction`: `<? … ?>` or `<? … >`, the `<?` already consumed.
+    fn consume_processing_instruction(&mut self, start: &Cursor) -> TResult<()> {
+        self.begin_token(TokenType::ProcessingInstruction, Some(start.clone()));
+        let content_start = self.cursor.clone();
+        self.attempt_until_ignore_quotes(|ch| ch == chars::QUESTION || ch == chars::GT)?;
+        let end_char = self.cursor.peek();
+        let content = self.cursor.get_chars(&content_start);
+        self.cursor.advance()?;
+        if end_char == chars::QUESTION {
+            self.require_char_code(chars::GT)?;
+        }
+        self.end_token(vec![content], None);
         Ok(())
     }
 
@@ -1536,13 +1591,24 @@ impl<'a> Tokenizer<'a> {
         Ok(vec![prefix, name])
     }
 
-    fn consume_single_line_comment(&mut self) -> TResult<()> {
+    fn consume_single_line_comment(&mut self, start: &Cursor) -> TResult<()> {
+        let content_start = self.cursor.clone();
         self.attempt_char_code_until_fn(|code| chars::is_new_line(code) || code == chars::EOF)?;
+
+        let span_end = self.cursor.clone();
+        let content = span_end.get_chars(&content_start);
+
+        self.begin_token(TokenType::InElementComment, Some(start.clone()));
+        self.end_token(vec![content, "single".to_string()], Some(span_end));
+
         self.attempt_char_code_until_fn(is_not_whitespace)?;
         Ok(())
     }
 
-    fn consume_multi_line_comment(&mut self) -> TResult<()> {
+    /// Port of `_consumeMultiLineComment`: the content runs to `*/` (or EOF); the token span
+    /// includes the closing `*/` when present.
+    fn consume_multi_line_comment(&mut self, start: &Cursor) -> TResult<()> {
+        let content_start = self.cursor.clone();
         // Scan to `*/` or EOF.
         loop {
             let code = self.cursor.peek();
@@ -1558,9 +1624,18 @@ impl<'a> Tokenizer<'a> {
             }
             self.cursor.advance()?;
         }
+
+        let content_end = self.cursor.clone();
+        let content = content_end.get_chars(&content_start);
+
+        let mut span_end = content_end;
         if self.attempt_str("*/")? {
+            span_end = self.cursor.clone();
             self.attempt_char_code_until_fn(is_not_whitespace)?;
         }
+
+        self.begin_token(TokenType::InElementComment, Some(start.clone()));
+        self.end_token(vec![content, "multi".to_string()], Some(span_end));
         Ok(())
     }
 
@@ -1722,12 +1797,13 @@ impl<'a> Tokenizer<'a> {
 
     fn consume_tag_attributes(&mut self, selectorless: bool) -> TResult<()> {
         loop {
+            let comment_start = self.cursor.clone();
             if self.attempt_str("//")? {
-                self.consume_single_line_comment()?;
+                self.consume_single_line_comment(&comment_start)?;
                 continue;
             }
             if self.attempt_str("/*")? {
-                self.consume_multi_line_comment()?;
+                self.consume_multi_line_comment(&comment_start)?;
                 continue;
             }
             if is_attribute_terminator(self.cursor.peek()) {
@@ -2066,6 +2142,7 @@ impl<'a> Tokenizer<'a> {
                 || (chars::A_UP <= code && code <= chars::Z_UP)
                 || code == chars::SLASH
                 || code == chars::BANG
+                || code == chars::QUESTION
             {
                 return true;
             }
@@ -2117,6 +2194,26 @@ fn closing_tag_name_for(token: &Token) -> String {
 }
 
 // --- free predicate helpers (port of lexer.ts module functions) ---
+
+/// Port of the `ELSE_IF_PATTERN` / `DEFAULT_NEVER_PATTERN` normalization in `getBlockName`: the
+/// keyword pairs `else if` and `default never` are reported with a single space between them,
+/// whatever whitespace (other than a line break) separated them in the source.
+fn normalize_block_name(name: &str) -> String {
+    fn matches_keyword_pair(name: &str, first: &str, second: &str) -> bool {
+        let Some(rest) = name.strip_prefix(first) else {
+            return false;
+        };
+        let trimmed = rest.trim_start_matches(|c: char| c.is_whitespace() && c != '\r' && c != '\n');
+        trimmed.len() < rest.len() && trimmed.starts_with(second)
+    }
+    if matches_keyword_pair(name, "else", "if") {
+        "else if".to_string()
+    } else if matches_keyword_pair(name, "default", "never") {
+        "default never".to_string()
+    } else {
+        name.to_string()
+    }
+}
 
 fn is_not_whitespace(code: u32) -> bool {
     !chars::is_whitespace(code) || code == chars::EOF
@@ -2287,6 +2384,15 @@ pub struct Attribute {
     pub value_tokens: Option<Vec<Token>>,
 }
 
+/// A comment written inside a start tag (`<div // note` or `<div /* note */`). Port of
+/// `html.StartTagComment`; `r#type` is `"single"` for `//` and `"multi"` for `/* */`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StartTagComment {
+    pub value: String,
+    pub r#type: String,
+    pub source_span: ParseSourceSpan,
+}
+
 /// An HTML element.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Element {
@@ -2299,6 +2405,7 @@ pub struct Element {
     pub start_source_span: ParseSourceSpan,
     pub end_source_span: Option<ParseSourceSpan>,
     pub is_void: bool,
+    pub comments: Vec<StartTagComment>,
 }
 
 /// An HTML comment.
@@ -2340,6 +2447,7 @@ pub struct Component {
     pub source_span: ParseSourceSpan,
     pub start_source_span: ParseSourceSpan,
     pub end_source_span: Option<ParseSourceSpan>,
+    pub comments: Vec<StartTagComment>,
 }
 
 /// A selectorless directive applied to an element/component (`@Dir(...)`).
@@ -2376,6 +2484,7 @@ pub enum Node {
     Component(Box<Component>),
     Directive(Box<Directive>),
     LetDeclaration(Box<LetDeclaration>),
+    StartTagComment(Box<StartTagComment>),
 }
 
 impl Node {
@@ -2392,6 +2501,7 @@ impl Node {
             Node::Component(n) => &n.source_span,
             Node::Directive(n) => &n.source_span,
             Node::LetDeclaration(n) => &n.source_span,
+            Node::StartTagComment(n) => &n.source_span,
         }
     }
 }
@@ -2410,6 +2520,7 @@ pub trait Visitor {
     fn visit_let_declaration(&mut self, _decl: &LetDeclaration) {}
     fn visit_component(&mut self, _component: &Component) {}
     fn visit_directive(&mut self, _directive: &Directive) {}
+    fn visit_start_tag_comment(&mut self, _comment: &StartTagComment) {}
 }
 
 /// Port of `visitAll`.
@@ -2427,6 +2538,7 @@ pub fn visit_all<V: Visitor>(visitor: &mut V, nodes: &[Node]) {
             Node::Component(n) => visitor.visit_component(n),
             Node::Directive(n) => visitor.visit_directive(n),
             Node::LetDeclaration(n) => visitor.visit_let_declaration(n),
+            Node::StartTagComment(n) => visitor.visit_start_tag_comment(n),
         }
     }
 }
@@ -2904,7 +3016,8 @@ impl<'a> TreeBuilder<'a> {
     fn consume_element_start_tag(&mut self, start_tag_token: Token) {
         let mut attrs: Vec<Attribute> = Vec::new();
         let mut directives: Vec<Directive> = Vec::new();
-        self.consume_attributes_and_directives(&mut attrs, &mut directives);
+        let mut comments: Vec<StartTagComment> = Vec::new();
+        self.consume_attributes_and_directives(&mut attrs, &mut directives, &mut comments);
 
         let parent_name = self.closest_element_like_parent_name();
         let full_name = self.get_element_full_name(&start_tag_token, parent_name.as_deref());
@@ -2951,6 +3064,7 @@ impl<'a> TreeBuilder<'a> {
             start_source_span: start_span,
             end_source_span: None,
             is_void: tag_def.is_void,
+            comments,
         };
 
         let is_closed_by_child = self
@@ -2984,7 +3098,8 @@ impl<'a> TreeBuilder<'a> {
         let component_name = start_token.parts.first().cloned().unwrap_or_default();
         let mut attrs: Vec<Attribute> = Vec::new();
         let mut directives: Vec<Directive> = Vec::new();
-        self.consume_attributes_and_directives(&mut attrs, &mut directives);
+        let mut comments: Vec<StartTagComment> = Vec::new();
+        self.consume_attributes_and_directives(&mut attrs, &mut directives, &mut comments);
 
         let closest = self.closest_element_like_parent_name();
         let tag_name = self.get_component_tag_name(&start_token, closest.as_deref());
@@ -3012,6 +3127,7 @@ impl<'a> TreeBuilder<'a> {
             source_span: span.clone(),
             start_source_span: start_span,
             end_source_span: None,
+            comments,
         };
 
         let is_closed_by_child = tag_name
@@ -3045,14 +3161,25 @@ impl<'a> TreeBuilder<'a> {
         &mut self,
         attrs: &mut Vec<Attribute>,
         directives: &mut Vec<Directive>,
+        comments: &mut Vec<StartTagComment>,
     ) {
-        while self.peek.kind == TokenType::AttrName || self.peek.kind == TokenType::DirectiveName {
+        while matches!(
+            self.peek.kind,
+            TokenType::AttrName | TokenType::DirectiveName | TokenType::InElementComment
+        ) {
             if self.peek.kind == TokenType::DirectiveName {
                 let name_token = self.peek.clone();
                 directives.push(self.consume_directive(name_token));
-            } else {
+            } else if self.peek.kind == TokenType::AttrName {
                 let t = self.advance();
                 attrs.push(self.consume_attr(t));
+            } else {
+                let t = self.advance();
+                comments.push(StartTagComment {
+                    value: t.parts.first().cloned().unwrap_or_default(),
+                    r#type: t.parts.get(1).cloned().unwrap_or_default(),
+                    source_span: t.source_span.clone(),
+                });
             }
         }
     }
@@ -3846,6 +3973,136 @@ mod tests {
                 assert!(e.children.is_empty());
             }
             other => panic!("expected br, got {other:?}"),
+        }
+    }
+
+    /// Tokenize with the default HTML tag definitions and the given options.
+    fn lex_with(source: &str, options: &TokenizeOptions) -> Vec<Token> {
+        let result = tokenize(source, "test.html", &get_html_tag_definition, options);
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        result.tokens
+    }
+
+    fn lex(source: &str) -> Vec<Token> {
+        lex_with(source, &TokenizeOptions::default())
+    }
+
+    fn kinds(tokens: &[Token]) -> Vec<TokenType> {
+        tokens.iter().map(|t| t.kind).collect()
+    }
+
+    #[test]
+    fn tokenizes_single_line_comment_inside_start_tag() {
+        // `// note` inside a start tag is an IN_ELEMENT_COMMENT token with content and "single".
+        let tokens = lex("<div // note\n id=\"a\">");
+        let comment = tokens
+            .iter()
+            .find(|t| t.kind == TokenType::InElementComment)
+            .expect("in-element comment token");
+        assert_eq!(comment.parts, vec![" note".to_string(), "single".to_string()]);
+        assert!(kinds(&tokens).contains(&TokenType::AttrName));
+    }
+
+    #[test]
+    fn tokenizes_multi_line_comment_inside_start_tag() {
+        // `/* … */` is a multi comment; its span runs through the closing `*/`.
+        let source = "<div /* a note */ id=\"x\"></div>";
+        let tokens = lex(source);
+        let comment = tokens
+            .iter()
+            .find(|t| t.kind == TokenType::InElementComment)
+            .expect("in-element comment token");
+        assert_eq!(comment.parts, vec![" a note ".to_string(), "multi".to_string()]);
+        let span_text = comment.source_span.start.file.content[comment.source_span.start.offset..comment.source_span.end.offset].to_string();
+        assert_eq!(span_text, "/* a note */");
+    }
+
+    #[test]
+    fn start_tag_comments_are_collected_on_element() {
+        let result = parse("<div // one\n/* two */ id=\"a\"></div>", "test.html");
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        let el = first_element(&result);
+        assert_eq!(el.attrs.len(), 1);
+        assert_eq!(el.comments.len(), 2);
+        assert_eq!(el.comments[0].value, " one");
+        assert_eq!(el.comments[0].r#type, "single");
+        assert_eq!(el.comments[1].value, " two ");
+        assert_eq!(el.comments[1].r#type, "multi");
+    }
+
+    #[test]
+    fn start_tag_comments_are_collected_on_component() {
+        let options = TokenizeOptions {
+            selectorless_enabled: true,
+            ..TokenizeOptions::default()
+        };
+        let result = HtmlParser::parse("<MyComp // hi\n a=\"1\" />", "test.html", &options);
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        match &result.root_nodes[0] {
+            Node::Component(c) => {
+                assert_eq!(c.attrs.len(), 1);
+                assert_eq!(c.comments.len(), 1);
+                assert_eq!(c.comments[0].value, " hi");
+                assert_eq!(c.comments[0].r#type, "single");
+            }
+            other => panic!("expected component, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn processing_instruction_is_its_own_token() {
+        let tokens = lex("<?xml version=\"1.0\"?><p></p>");
+        let pi = tokens
+            .iter()
+            .find(|t| t.kind == TokenType::ProcessingInstruction)
+            .expect("processing instruction token");
+        assert_eq!(pi.parts, vec!["xml version=\"1.0\"".to_string()]);
+    }
+
+    #[test]
+    fn processing_instruction_with_only_gt_terminator() {
+        let tokens = lex("<?php echo 1 >after");
+        assert_eq!(tokens[0].kind, TokenType::ProcessingInstruction);
+        assert_eq!(tokens[0].parts, vec!["php echo 1 ".to_string()]);
+    }
+
+    #[test]
+    fn else_if_and_default_never_block_names_are_normalized() {
+        let tokens = lex("@if (a) {x} @else   if (b) {y} @switch (c) {@default    never;}");
+        let names: Vec<String> = tokens
+            .iter()
+            .filter(|t| t.kind == TokenType::BlockOpenStart)
+            .map(|t| t.parts[0].clone())
+            .collect();
+        assert_eq!(names, vec!["if", "else if", "switch", "default never"]);
+    }
+
+    #[test]
+    fn let_value_skips_semicolons_inside_quotes_and_escapes() {
+        // A `;` inside a quoted string does not terminate the `@let`; an escaped quote does not
+        // end the string early.
+        let result = parse("@let s = 'a;b\\'c;' + x;", "test.html");
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        match &result.root_nodes[0] {
+            Node::LetDeclaration(l) => assert_eq!(l.value, "'a;b\\'c;' + x"),
+            other => panic!("expected let declaration, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tag_start_detection_includes_question_mark() {
+        // `<?` starts a tag-like token, so it is not swallowed as text.
+        let tokens = lex("a <?pi?> b");
+        assert!(kinds(&tokens).contains(&TokenType::ProcessingInstruction));
+    }
+
+    #[test]
+    fn named_entity_decoding_still_resolves() {
+        let result = parse("<p>&amp; &copy;</p>", "test.html");
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        match &first_element(&result).children[0] {
+            Node::Text(t) => assert_eq!(t.value, "& \u{00A9}"),
+            other => panic!("expected text, got {other:?}"),
         }
     }
 }

@@ -33,7 +33,9 @@ use crate::view::compiler::{
     R3TemplateDependencyMetadata, StubHostBindingsBuilder, TemplateBuilder, TemplateBuilderResult,
     ViewEncapsulation,
 };
-use crate::view::template::{TemplateCompilationInput, TemplateDefinitionBuilder};
+use crate::view::template::{
+    ForeignComponentRef, TemplateCompilationInput, TemplateDefinitionBuilder,
+};
 use crate::util::{R3CompiledExpression, R3Reference};
 
 /// The result of compiling one component to its Ivy definition.
@@ -64,9 +66,21 @@ impl TemplateBuilder for RealTemplateBuilder {
         // (`render3/view/compiler.ts`), otherwise the classic `Full` family (`ɵɵelement*`/`ɵɵlistener`/
         // `ɵɵproperty`/`ɵɵtemplate`). Thread that decision into the view builder.
         let dom_only = meta.base.is_standalone && !meta.has_directive_dependencies;
+        // `foreignImports` (Angular `R3ForeignComponentMetadata`): elements matching one of these
+        // tags are lowered to `ɵɵforeignComponent` by the template builder.
+        let foreign_components = meta
+            .foreign_imports
+            .iter()
+            .flatten()
+            .map(|f| ForeignComponentRef {
+                name: f.name.clone(),
+                component: f.component.clone(),
+            })
+            .collect::<Vec<_>>();
         let input = TemplateCompilationInput::new(name, meta.template.nodes.clone())
             .with_dom_only(dom_only)
-            .with_deferred_deps(deferred_deps.clone());
+            .with_deferred_deps(deferred_deps.clone())
+            .with_foreign_components(foreign_components);
         let mut builder = TemplateDefinitionBuilder::new(&input);
         let template_fn = builder.build_template_function(&input);
 
@@ -898,10 +912,10 @@ pub fn compile_component_with(
         relative_context_file_path: String::new(),
         i18n_use_external_ids: false,
         // This authoring model has no `@Component` decorator to read a `changeDetection` from, so it
-        // defaults to `ChangeDetectionStrategy.Default` — which matches Angular's runtime default and
-        // is therefore OMITTED from the emitted definition (byte-matching the @angular/compiler
-        // oracle). OnPush is opt-in via the signal modernizer (`ModernizeOptions::on_push`), which
-        // this minimal selectorless entry point does not thread.
+        // defaults to `ChangeDetectionStrategy.Default` — OMITTED from the emitted definition. Treaty is
+        // OnPush by default (intentional divergence; see the emit rule in `decorators/src/compiler.rs`), and the
+        // runtime reads the omitted field as OnPush. OnPush is opt-in via the signal modernizer
+        // (`ModernizeOptions::on_push`), which this minimal selectorless entry point does not thread.
         change_detection: Some(ChangeDetection::Strategy(ChangeDetectionStrategy::Default)),
         relative_template_path: None,
         has_directive_dependencies: false,

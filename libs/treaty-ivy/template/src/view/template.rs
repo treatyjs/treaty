@@ -38,6 +38,7 @@ use crate::identifiers::R3;
 use crate::output_ast as o;
 use crate::output_ast::{Expr, FnParam, Stmt, StmtKind, StmtModifier};
 use crate::template::r3_ast::{
+    BoundaryBlock,
     BoundAttribute, BoundEvent, BoundText, Content, DeferredBlock, DeferredBlockTriggers,
     DeferredTrigger, DeferredTriggerKind, Element, ForLoopBlock, Icu, IfBlock, LetDeclaration,
     Node, SwitchBlock, SwitchBlockCase, Template, Text, TextAttribute, Visitor,
@@ -120,6 +121,20 @@ pub struct TemplateCompilationInput {
     /// in which case `ɵɵdefer` keeps its `null` resolver — byte-identical to before. Keyed by span
     /// (not document order) so the lookup is correct regardless of nesting / view boundaries.
     pub deferred_deps: std::collections::HashMap<(u32, u32), Expr>,
+    /// The component's `foreignImports` (Angular `R3ForeignComponentMetadata`): an element whose tag
+    /// matches one of these is a foreign component, lowered to `ɵɵforeignComponent` (see
+    /// [`TemplateDefinitionBuilder::build_foreign_component`]). Empty for ordinary templates.
+    pub foreign_components: Vec<ForeignComponentRef>,
+}
+
+/// A foreign component usable from a template: the element tag it is matched by and the
+/// framework-provided component reference that is stored in the component's `consts` array.
+#[derive(Clone, Debug)]
+pub struct ForeignComponentRef {
+    /// The element tag name (`FancyButton`).
+    pub name: String,
+    /// The component reference expression (`frameworkImport(FancyButton)`).
+    pub component: Expr,
 }
 
 impl TemplateCompilationInput {
@@ -129,7 +144,14 @@ impl TemplateCompilationInput {
             nodes,
             dom_only: true,
             deferred_deps: std::collections::HashMap::new(),
+            foreign_components: Vec::new(),
         }
+    }
+
+    /// Set the foreign components the template may use (see [`Self::foreign_components`]).
+    pub fn with_foreign_components(mut self, foreign_components: Vec<ForeignComponentRef>) -> Self {
+        self.foreign_components = foreign_components;
+        self
     }
 
     /// Set the DOM-only compilation mode (see [`Self::dom_only`]) and return `self`, so callers that
@@ -168,11 +190,72 @@ pub struct ConstantPool {
     /// present the definition emits `consts: () => { …initializers…; return [ … ]; }` instead of
     /// the inline `consts: [ … ]` literal array.
     initializers: Vec<Stmt>,
+    /// Element / `<ng-template>` attribute arrays requested during the walk and not yet placed in
+    /// [`Self::entries`]. Angular's `collectElementConsts` adds them after every other const, in
+    /// view-allocation order (see [`TemplateDefinitionBuilder::finalize_pending_consts`]); the walk
+    /// instead returns a placeholder index that the root view rewrites once the walk is complete.
+    pending: Vec<PendingConst>,
+    /// Last view sequence number handed out by [`Self::alloc_view_seq`] (the root view is `0`).
+    last_view_seq: usize,
+    /// `<ng-content>` slots requested during the walk, awaiting their Angular `projectionSlotIndex`
+    /// (see [`TemplateDefinitionBuilder::finalize_projection_indices`]).
+    pending_projections: Vec<PendingProjection>,
 }
+
+/// An `<ng-content>` slot awaiting its projection slot index.
+#[derive(Debug, Clone)]
+struct PendingProjection {
+    view_seq: usize,
+    content_seq: usize,
+    selector: String,
+}
+
+/// An element / `<ng-template>` attribute array awaiting its final position in the const pool.
+#[derive(Debug, Clone)]
+struct PendingConst {
+    /// Allocation order of the view that owns the element (depth-first pre-order, like Angular's
+    /// `ComponentCompilationJob.units`).
+    view_seq: usize,
+    /// Position of the element among its view's element / template ops (document order).
+    op_seq: usize,
+    value: Expr,
+}
+
+/// Sentinel base for a not-yet-placed element attribute const. A walk-time index for a pending
+/// attribute array is `PENDING_CONST_PLACEHOLDER + request_id` and is rewritten to the final
+/// `consts:` index by [`TemplateDefinitionBuilder::finalize_pending_consts`]. Above every other
+/// placeholder base in this file, so no other remap can mistake it for its own value.
+const PENDING_CONST_PLACEHOLDER: usize = 5_000_000_000;
 
 impl ConstantPool {
     pub fn new() -> Self {
         ConstantPool::default()
+    }
+
+    /// Allocate the next view sequence number (one per nested view, in allocation order).
+    pub fn alloc_view_seq(&mut self) -> usize {
+        self.last_view_seq += 1;
+        self.last_view_seq
+    }
+
+    /// Record an `<ng-content>` slot and return the placeholder for its projection slot index.
+    fn push_pending_projection(&mut self, view_seq: usize, content_seq: usize, selector: String) -> usize {
+        self.pending_projections.push(PendingProjection {
+            view_seq,
+            content_seq,
+            selector,
+        });
+        PROJECTION_INDEX_PLACEHOLDER + self.pending_projections.len() - 1
+    }
+
+    /// Record an element attribute array for later placement and return its placeholder index.
+    fn push_pending(&mut self, view_seq: usize, op_seq: usize, value: Expr) -> usize {
+        self.pending.push(PendingConst {
+            view_seq,
+            op_seq,
+            value,
+        });
+        PENDING_CONST_PLACEHOLDER + self.pending.len() - 1
     }
 
     /// Intern an expression, returning its index. De-dupes structurally-equivalent entries
@@ -420,7 +503,7 @@ impl PipeSlotAllocator for BuilderPipes<'_> {
         } else {
             let n = state.next_const_name;
             state.next_const_name = n + 1;
-            format!("$c{n}$")
+            format!("_c{n}")
         };
         state.interned_factories.push((factory.clone(), name.clone()));
         Some(name)
@@ -442,6 +525,52 @@ struct LoopVar {
     source_name: String,
     /// The generated local identifier (`x_r1`, `$index_r2`, …).
     local_name: String,
+    /// When set, a read of `source_name` lowers to this expression inline instead of the local
+    /// identifier (a `@error` `when` alias reads the boundary state inline, as Angular's `Alias`
+    /// variables do).
+    inline: Option<Expr>,
+    /// When set, `source_name` is a property of this view's own context object (`@error (let err)`
+    /// is `ctx.$error`; `retry = $reset` is `ctx.$reset`). Reads lower to `ctx.<prop>` inline, and a
+    /// listener re-roots them at its restored view.
+    context_prop: Option<String>,
+    /// The embedded-view context property this variable is read from (`ctx.$implicit`, `ctx.index`,
+    /// …) when it is a template `let-x="prop"` variable. A listener re-reads it off its restored view
+    /// with this key; `None` keeps the loop-variable default (`$implicit`, or the special `$index`-style
+    /// name).
+    ctx_key: Option<String>,
+}
+
+/// A `@for` / `<ng-template>` context variable declared by an ENCLOSING embedded view that a nested
+/// view reads (Angular's `scope` chain in `generate_variables.ts`). The nested view re-declares it in
+/// its update block by walking up with `ɵɵnextContext()` to `owner_level`.
+#[derive(Debug, Clone)]
+struct AncestorVar {
+    /// The nesting level of the view that declares the variable (`TemplateDefinitionBuilder::view_level`).
+    owner_level: usize,
+    var: LoopVar,
+}
+
+/// Whether a loop variable is a plain context-object read (`const x_rN = ctx.<key>`), the only kind a
+/// nested view can re-declare from an ancestor's context. Computed (`$first`/`$last`/…) and inline /
+/// context-property aliases stay with the view that declares them.
+fn is_plain_context_var(v: &LoopVar) -> bool {
+    v.inline.is_none()
+        && v.context_prop.is_none()
+        && !v.local_name.is_empty()
+        && v.ctx_key
+            .as_deref()
+            .is_some_and(|key| !matches!(key, "$first" | "$last" | "$even" | "$odd"))
+}
+
+impl LoopVar {
+    /// The expression a read of this variable lowers to (in a non-listener context).
+    fn read_expr(&self) -> Expr {
+        match (&self.inline, &self.context_prop) {
+            (Some(expr), _) => expr.clone(),
+            (None, Some(prop)) => o::variable(CONTEXT_NAME, None).prop(prop.clone()),
+            (None, None) => o::variable(self.local_name.clone(), None),
+        }
+    }
 }
 
 /// A `@let` declaration that reserved a `ɵɵdeclareLet` data slot in some view and is therefore
@@ -473,6 +602,34 @@ struct LocalRef {
     /// The pre-assigned generated local identifier (`user_r<id>`), minted when the host element is
     /// built so the `&self` expression resolver can hand it back without mutating the var counter.
     local_name: String,
+    /// The data slot of the element / `<ng-template>` that hosts the `#ref` (Angular `op.handle`, the
+    /// target a `@defer` trigger names). `HOST_SLOT_PLACEHOLDER + ordinal` until the host is reached.
+    host_slot: usize,
+    /// Whether the reference has no export target (`#ref`, not `#ref="exportAs"`). Only these are
+    /// `@defer` trigger targets (Angular `resolveDeferTargetNames`: `ref.target === ''`).
+    plain: bool,
+}
+
+/// Placeholder base for a not-yet-known host element slot of a local ref (see [`LocalRef::host_slot`]).
+/// Above the other placeholder bases in this file so no other remap can mistake it for its own value;
+/// [`TemplateDefinitionBuilder::finalize_host_slots`] rewrites it before any other remap runs.
+const HOST_SLOT_PLACEHOLDER: usize = 6_000_000_000;
+
+/// Base of the `<ng-content>` projection slot index placeholders (see
+/// [`TemplateDefinitionBuilder::finalize_projection_indices`]).
+const PROJECTION_INDEX_PLACEHOLDER: usize = 7_000_000_000;
+
+/// The number of values each placeholder base owns (`base .. base + PLACEHOLDER_WINDOW`). Real slots and
+/// const indices are far smaller, so a window keeps the placeholder bases from matching one another.
+const PLACEHOLDER_WINDOW: usize = 500_000_000;
+
+/// The `@defer` trigger targets a placeholder / main view exposes to its owner (Angular
+/// `resolveDeferTargetNames`' `Scope` of the view): the first element-like op's slot (the default
+/// target of a trigger with no reference) and the plain local refs with their host slots.
+#[derive(Debug, Clone, Default)]
+struct DeferViewTargets {
+    first_slot: Option<usize>,
+    refs: Vec<(String, usize)>,
 }
 
 /// A [`LocalResolver`] that roots the implicit receiver at `ctx` (like [`crate::expression_converter::CtxResolver`])
@@ -493,7 +650,7 @@ impl LocalResolver for LoopVarResolver<'_> {
 
     fn maybe_resolve_local(&self, name: &str) -> Option<Expr> {
         if let Some(v) = self.vars.iter().find(|v| v.source_name == name) {
-            return Some(o::variable(v.local_name.clone(), None));
+            return Some(v.read_expr());
         }
         resolve_local_ref(name, self.local_refs, self.used_local_refs)
     }
@@ -523,6 +680,9 @@ fn resolve_local_ref(
 /// `const ctx_r<level> = ɵɵnextContext();` of the update block.
 struct NestedViewResolver<'a> {
     vars: &'a [LoopVar],
+    /// Ancestor context variables this view reads (re-declared in its update block, see
+    /// [`AncestorVar`]); a read resolves to the local the update block declares for it.
+    ancestor_reads: &'a [AncestorVar],
     /// The shared-context identifier for this view (`ctx_r<level>`).
     ctx_name: String,
     /// Set when the implicit receiver was consulted (an ancestor read occurred).
@@ -542,7 +702,10 @@ impl LocalResolver for NestedViewResolver<'_> {
 
     fn maybe_resolve_local(&self, name: &str) -> Option<Expr> {
         if let Some(v) = self.vars.iter().find(|v| v.source_name == name) {
-            return Some(o::variable(v.local_name.clone(), None));
+            return Some(v.read_expr());
+        }
+        if let Some(a) = self.ancestor_reads.iter().find(|a| a.var.source_name == name) {
+            return Some(a.var.read_expr());
         }
         resolve_local_ref(name, self.local_refs, self.used_local_refs)
     }
@@ -567,6 +730,9 @@ struct ListenerResolver<'a> {
     /// read occurred), so [`TemplateDefinitionBuilder::build_listener`] emits the matching
     /// `const ctx_r<level> = ɵɵnextContext(<hops>);` inside the handler body.
     reads_ancestor: &'a std::cell::Cell<bool>,
+    /// The name the handler captured its restored view under (`ɵɵrestoreView`), when the handler
+    /// reads a context-property alias (`@error (let err)` reads `<restored>.$error`).
+    restored_ctx: Option<String>,
 }
 
 impl LocalResolver for ListenerResolver<'_> {
@@ -585,6 +751,11 @@ impl LocalResolver for ListenerResolver<'_> {
         if name == EVENT_NAME {
             return Some(o::variable(EVENT_NAME, None));
         }
+        if let Some(v) = self.vars.iter().find(|v| v.source_name == name) {
+            if let (Some(prop), Some(restored)) = (&v.context_prop, &self.restored_ctx) {
+                return Some(o::variable(restored.clone(), None).prop(prop.clone()));
+            }
+        }
         // Inside a callback, EVERY in-scope `@let` is read through its `ɵɵreadContextLet` local —
         // even one declared in THIS view — rather than its in-view `ɵɵstoreLet` local
         // (`generate_variables.ts`: `scope.view !== view.xref || isCallback`). A `@let`'s in-view
@@ -594,9 +765,13 @@ impl LocalResolver for ListenerResolver<'_> {
         if let Some((_, local)) = self.context_let_locals.iter().find(|(src, _)| src == name) {
             return Some(o::variable(local.clone(), None));
         }
-        // Otherwise a `@for` loop item / `$index` etc. resolves to its generated loop local.
+        // Otherwise a `@for` loop item / `$index` etc. resolves to its generated loop local. A computed
+        // variable (`$first`, …) is re-declared by the handler from the restored view, so it reads that local.
         if let Some(v) = self.vars.iter().find(|v| v.source_name == name) {
-            return Some(o::variable(v.local_name.clone(), None));
+            if v.inline.is_some() && v.ctx_key.is_some() {
+                return Some(o::variable(v.local_name.clone(), None));
+            }
+            return Some(v.read_expr());
         }
         None
     }
@@ -657,6 +832,34 @@ impl LocalResolver for TrackByReceiverResolver {
 
 fn num(n: f64) -> Expr {
     o::literal(o::LiteralValue::Number(n), None)
+}
+
+/// `ir.Namespace` (`template/pipeline/ir/src/enums.ts`): the element namespace an op is created in.
+/// Drives the `ɵɵnamespaceHTML` / `ɵɵnamespaceSVG` / `ɵɵnamespaceMathML` instructions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Namespace {
+    Html,
+    Svg,
+    Math,
+}
+
+/// `namespaceForKey` (`template/pipeline/src/conversion.ts`): `svg` -> SVG, `math` -> MathML, any other
+/// (or absent) prefix -> HTML.
+pub fn namespace_for_key(key: Option<&str>) -> Namespace {
+    match key {
+        Some("svg") => Namespace::Svg,
+        Some("math") => Namespace::Math,
+        _ => Namespace::Html,
+    }
+}
+
+/// The namespace-switch instruction for `ns` (`reify.ts` `OpKind.Namespace`).
+fn namespace_instruction(ns: Namespace) -> R3 {
+    match ns {
+        Namespace::Html => R3::NamespaceHTML,
+        Namespace::Svg => R3::NamespaceSVG,
+        Namespace::Math => R3::NamespaceMathML,
+    }
 }
 
 /// The `undefined` literal — the value Angular emits for a *valueless* legacy-animation property
@@ -732,6 +935,52 @@ fn local_ref_var_name(name: &str, counter: usize) -> String {
 /// Pop trailing `null` literal arguments off an instruction's parameter list, mirroring the
 /// `while (args[args.length - 1].isEquivalent(o.NULL_EXPR)) args.pop()` tail in Angular's
 /// `instruction.ts` builders (`templateBase` / `conditionalCreate` / …).
+/// Which trigger set a defer op belongs to (Angular `ir.DeferOpModifierKind`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeferOpModifier {
+    Main,
+    Prefetch,
+    Hydrate,
+}
+
+/// Angular `ingestDeferTriggers` kind order: idle, immediate, timer, hover, interaction, viewport, never.
+fn defer_trigger_rank(kind: &DeferredTriggerKind) -> u8 {
+    match kind {
+        DeferredTriggerKind::When { .. } => 7,
+        DeferredTriggerKind::Idle { .. } => 0,
+        DeferredTriggerKind::Immediate => 1,
+        DeferredTriggerKind::Timer { .. } => 2,
+        DeferredTriggerKind::Hover { .. } => 3,
+        DeferredTriggerKind::Interaction { .. } => 4,
+        DeferredTriggerKind::Viewport { .. } => 5,
+        DeferredTriggerKind::Never => 6,
+    }
+}
+
+/// The trigger instruction for a modifier and trigger name (`instruction.ts` `deferTriggerToR3TriggerInstructionsMap`).
+fn defer_on_instruction(modifier: DeferOpModifier, trigger: &str) -> R3 {
+    match (modifier, trigger) {
+        (DeferOpModifier::Main, "Idle") => R3::DeferOnIdle,
+        (DeferOpModifier::Main, "Immediate") => R3::DeferOnImmediate,
+        (DeferOpModifier::Main, "Timer") => R3::DeferOnTimer,
+        (DeferOpModifier::Main, "Hover") => R3::DeferOnHover,
+        (DeferOpModifier::Main, "Interaction") => R3::DeferOnInteraction,
+        (DeferOpModifier::Main, _) => R3::DeferOnViewport,
+        (DeferOpModifier::Prefetch, "Idle") => R3::DeferPrefetchOnIdle,
+        (DeferOpModifier::Prefetch, "Immediate") => R3::DeferPrefetchOnImmediate,
+        (DeferOpModifier::Prefetch, "Timer") => R3::DeferPrefetchOnTimer,
+        (DeferOpModifier::Prefetch, "Hover") => R3::DeferPrefetchOnHover,
+        (DeferOpModifier::Prefetch, "Interaction") => R3::DeferPrefetchOnInteraction,
+        (DeferOpModifier::Prefetch, _) => R3::DeferPrefetchOnViewport,
+        (DeferOpModifier::Hydrate, "Idle") => R3::DeferHydrateOnIdle,
+        (DeferOpModifier::Hydrate, "Immediate") => R3::DeferHydrateOnImmediate,
+        (DeferOpModifier::Hydrate, "Timer") => R3::DeferHydrateOnTimer,
+        (DeferOpModifier::Hydrate, "Hover") => R3::DeferHydrateOnHover,
+        (DeferOpModifier::Hydrate, "Interaction") => R3::DeferHydrateOnInteraction,
+        (DeferOpModifier::Hydrate, _) => R3::DeferHydrateOnViewport,
+    }
+}
+
 fn trim_trailing_nulls(params: &mut Vec<Expr>) {
     while params
         .last()
@@ -838,6 +1087,27 @@ impl I18nCollector {
             Node::SwitchBlock(b) => self.visit_switch_block(b),
             Node::ForLoopBlock(b) => self.visit_for_block(b),
             Node::DeferredBlock(b) => self.visit_deferred_block(b),
+            // `@boundary` (`i18n_parser.ts` `visitBlock`): a `boundary` block placeholder around the
+            // main content, then one `error` block placeholder per connected `@error` block, in
+            // source order (they are siblings of the boundary in the html tree). The `@error`
+            // parameter is its `when` expression; `let` parameters are not part of the signature.
+            Node::BoundaryBlock(b) => {
+                self.push_block_placeholder("boundary", Vec::new(), &b.children);
+                for e in &b.error_blocks {
+                    let params = e.expression.as_ref().map(|x| vec![ast_to_source(x)]).unwrap_or_default();
+                    self.push_block_placeholder("error", params, &e.children);
+                }
+            }
+            // `@content (name; let a, b)` is a block placeholder named `content` whose parameters are
+            // the slot name and the `let` list (`i18n_parser.ts` `visitBlock`).
+            Node::ContentBlock(c) => {
+                let mut params = vec![c.name.clone()];
+                if !c.variables.is_empty() {
+                    let names: Vec<String> = c.variables.iter().map(|v| v.name.clone()).collect();
+                    params.push(format!("let {}", names.join(", ")));
+                }
+                self.push_block_placeholder("content", params, &c.children);
+            }
             Node::Icu(icu) => self.visit_icu(icu),
             // `@let` declarations are update-only and contribute nothing to the message
             // (`i18n_parser.ts` `visitLetDeclaration` returns `null`).
@@ -1502,7 +1772,7 @@ impl I18nSentinelResolver {
                     });
                     // Record each block in SOURCE order so the placeholder-registry suffixes match the
                     // collector, but with its view-creation slot/sub.
-                    let mut record_block =
+                    let record_block =
                         |this: &mut Self,
                          reg: &mut PlaceholderRegistryShim,
                          keyword: &str,
@@ -1798,6 +2068,25 @@ fn ast_to_source(node: &AstNode) -> String {
                 operation.as_str(),
                 ast_to_source(right)
             )
+        }
+        // `expression_parser/serializer.ts` `visitUnary`: a prefix operator gets a separating space
+        // when the operand already starts with the operator's first character (`- -x`, `+ +x`,
+        // `- --x`); a postfix update is written `x++` / `x--`.
+        AstExprKind::Unary { operator, expr, is_prefix } => {
+            use crate::expression::ast::UnaryOperator as UO;
+            let op = match operator {
+                UO::Plus => "+",
+                UO::Minus => "-",
+                UO::Increment => "++",
+                UO::Decrement => "--",
+            };
+            let inner = ast_to_source(expr);
+            if *is_prefix {
+                let space = if inner.starts_with(&op[..1]) { " " } else { "" };
+                format!("{op}{space}{inner}")
+            } else {
+                format!("{inner}{op}")
+            }
         }
         _ => String::new(),
     }
@@ -2247,7 +2536,7 @@ fn pipe_insertion_index(creation: &[Stmt], target_slot: usize) -> Option<usize> 
 /// DOM-property name remapping applied by `reifyDomProperty` (`reify.ts` `DOM_PROPERTY_REMAPPING`):
 /// in DomOnly mode a handful of attribute-style binding names map to their DOM-property spelling
 /// (`class` → `className`, `for` → `htmlFor`, …). Names not in the table pass through unchanged.
-fn remap_dom_property(name: &str) -> &str {
+pub fn remap_dom_property(name: &str) -> &str {
     match name {
         "class" => "className",
         "for" => "htmlFor",
@@ -2355,6 +2644,9 @@ fn chains_onto(first: &Expr, next: &Expr) -> bool {
 /// applied to the prior `Invoke` expression, i.e. `callee(args0)(args1)(args2)…`. Single-element
 /// runs (and any non-call statement, e.g. an interleaved `ɵɵadvance`) pass through unchanged —
 /// which is exactly what breaks a run, so distinct instructions are never chained together.
+/// Maximum number of instructions folded into one chained call (Angular `chaining.ts` `MAX_CHAIN_LENGTH`).
+const MAX_CHAIN_LENGTH: usize = 256;
+
 pub fn chain_statements(stmts: Vec<Stmt>) -> Vec<Stmt> {
     let mut out: Vec<Stmt> = Vec::with_capacity(stmts.len());
     let mut iter = stmts.into_iter().peekable();
@@ -2376,7 +2668,13 @@ pub fn chain_statements(stmts: Vec<Stmt>) -> Vec<Stmt> {
         // first callee (Angular `CHAIN_COMPATIBILITY`: usually the same instruction, but a
         // `conditionalCreate` run continues with `conditionalBranchCreate`).
         let mut chained = false;
-        while let Some(next) = iter.peek() {
+        // Angular `chaining.ts` `MAX_CHAIN_LENGTH`: a run holds at most 256 instructions; the next
+        // compatible instruction starts a new chain.
+        let mut length = 1usize;
+        while length < MAX_CHAIN_LENGTH {
+            let Some(next) = iter.peek() else {
+                break;
+            };
             let Some((next_callee, next_args)) = as_call(next) else {
                 break;
             };
@@ -2387,6 +2685,7 @@ pub fn chain_statements(stmts: Vec<Stmt>) -> Vec<Stmt> {
             // Apply the next call to the prior `Invoke` expression: `…(prevArgs)(nextArgs)`.
             folded = folded.call_fn(next_args, false);
             chained = true;
+            length += 1;
             iter.next();
         }
 
@@ -2418,6 +2717,9 @@ pub fn chain_statements(stmts: Vec<Stmt>) -> Vec<Stmt> {
 pub struct TemplateDefinitionBuilder {
     name: String,
     data_index: usize,
+    /// Whether this view already emitted its `ɵɵenableIncrementalHydrationRuntime()` activator
+    /// (Angular `insert_incremental_hydration_runtime.ts`: one per view, before the first hydrating defer).
+    hydration_runtime_emitted: bool,
     /// Slot the update block has currently advanced to.
     advance_cursor: usize,
     /// Number of binding (var) slots reserved so far (`_bindingSlots` / `allocateBindingSlots`).
@@ -2466,7 +2768,7 @@ pub struct TemplateDefinitionBuilder {
     /// Shared constant-pool entries hoisted to the top level as `const $cN$ = <value>;` declarations
     /// (Angular `ConstantPool.getConstLiteral` → `pool.statements`). Distinct from the per-template
     /// `consts:` array: these are the de-duped, view-global literals an instruction references BY NAME
-    /// (e.g. `ɵɵprojectionDef($c0$)` parsed-selector arrays). Each entry is `(value_expr, name)`; a
+    /// (e.g. `ɵɵprojectionDef(_c0)` parsed-selector arrays). Each entry is `(value_expr, name)`; a
     /// structurally-equivalent value reuses its existing name (Angular returns the SAME reference).
     /// Surfaced alongside [`Self::hoisted_functions`] so they print before the `ɵɵdefineComponent`.
     shared_consts: Vec<(Expr, String)>,
@@ -2493,6 +2795,26 @@ pub struct TemplateDefinitionBuilder {
     /// Per-update-block counter seeding temporary-variable spill names (`tmp_<level>_0`,
     /// `tmp_<level>_1`, …). Reset per view (a fresh builder starts at 0).
     temp_counter: usize,
+    /// This view's allocation sequence number in the component (root `0`; see
+    /// [`ConstantPool::alloc_view_seq`]). Keys the element attribute consts this view requests.
+    view_seq: usize,
+    /// Number of element / `<ng-template>` attribute consts this view has requested so far (its
+    /// element-op ordinal), used as the within-view key for [`PendingConst::op_seq`].
+    attr_const_seq: usize,
+    /// Number of `<ng-content>` slots this view has reached so far (its within-view projection order).
+    content_seq: usize,
+    /// The data slot of the first element-like op (element, container, `<ng-template>`, control-flow
+    /// anchor) created in this view: the default target of a `@defer` trigger with no reference.
+    first_target_slot: Option<usize>,
+    /// The `@defer` targets of the view most recently built by [`Self::build_deferred_view`] (its
+    /// first element slot and plain local refs), read by the owner to resolve its triggers.
+    last_defer_view_targets: DeferViewTargets,
+    /// Context variables of every ENCLOSING embedded view, nearest owner first (Angular's `scope`
+    /// chain). Set by the parent when it builds this view.
+    ancestor_vars: Vec<AncestorVar>,
+    /// The subset of [`Self::ancestor_vars`] this view's own bindings read, in the same order. Set
+    /// before the walk; the update block re-declares each one (see `ancestor_context_prelude`).
+    ancestor_reads: Vec<AncestorVar>,
     /// Template local references (`#user`) declared on elements/templates in THIS view, in
     /// declaration order. A read of one of these names in a same-view update binding lowers to a
     /// generated `const $name$ = ɵɵreference(slot)` local; reads in a listener handler likewise read
@@ -2542,11 +2864,6 @@ pub struct TemplateDefinitionBuilder {
     /// whether the prepended `ɵɵprojectionDef(...)` needs to be emitted in the no-specific-selector
     /// case.
     has_default_projection: bool,
-    /// The number of `<ng-content>` projection slots reached so far in this view. Angular's
-    /// `generateProjectionDefs` assigns every projection op a *unique ascending* `projectionSlotIndex`
-    /// (`op.projectionSlotIndex = projectionSlotIndex++`) — independent of selector dedup — so the
-    /// N-th `<ng-content>` (0-based) carries index N (`ɵɵprojection(slot, N)`, the `0` case elided).
-    projection_count: usize,
     /// Compilation mode for THIS view: `true` → Angular's `DomOnly` instruction family
     /// (`ɵɵdomElement*`/`ɵɵdomListener`/`ɵɵdomProperty`), `false` → the `Full` family
     /// (`ɵɵelement*`/`ɵɵlistener`/`ɵɵproperty`). Set from [`TemplateCompilationInput::dom_only`] and
@@ -2573,6 +2890,12 @@ pub struct TemplateDefinitionBuilder {
     /// `ɵɵelement` unless it has nested element/control-flow children, and its children are walked via
     /// [`Self::visit_i18n_create_children`].
     in_i18n_create: bool,
+    /// The namespace active in this view's create block (`emitNamespaceChanges`,
+    /// `phases/namespace.ts`): starts as HTML and changes only when an element's namespace differs.
+    active_namespace: Namespace,
+    /// Creation-block prelude (`generate_variables.ts` prepends scope variables to `view.create`):
+    /// the `const ctx_r<level> = ɵɵnextContext(n)` a foreign component's creation-time inputs need.
+    create_prelude: Vec<Stmt>,
     /// Per-`@defer`-block lazy dependency resolver thunks, keyed by the block's `main_block_span`
     /// `(start, end)`. Threaded from [`TemplateCompilationInput::deferred_deps`] into the root view
     /// and propagated to every embedded view (a nested `@defer` block lowers in an embedded view),
@@ -2580,6 +2903,9 @@ pub struct TemplateDefinitionBuilder {
     /// nesting. Empty for `@defer`-free templates (and blocks without lazy deps) — leaving the
     /// existing `null`-resolver `ɵɵdefer(…)` path byte-identical.
     deferred_deps: std::collections::HashMap<(u32, u32), Expr>,
+    /// The component's foreign components (see [`TemplateCompilationInput::foreign_components`]),
+    /// shared with every embedded view so a foreign element nested in a control-flow block lowers too.
+    foreign_components: Vec<ForeignComponentRef>,
 }
 
 /// The i18n continuation context threaded into a child view spawned inside an `i18n` block.
@@ -2632,6 +2958,7 @@ impl TemplateDefinitionBuilder {
             const_pool: std::rc::Rc::new(std::cell::RefCell::new(ConstantPool::new())),
             loop_vars: Vec::new(),
             context_lets: Vec::new(),
+            hydration_runtime_emitted: false,
             external_lets: std::collections::HashMap::new(),
             current_nodes: None,
             saved_view_name: None,
@@ -2643,6 +2970,13 @@ impl TemplateDefinitionBuilder {
             is_root: true,
             view_level: 0,
             temp_counter: 0,
+            view_seq: 0,
+            attr_const_seq: 0,
+            content_seq: 0,
+            first_target_slot: None,
+            last_defer_view_targets: DeferViewTargets::default(),
+            ancestor_vars: Vec::new(),
+            ancestor_reads: Vec::new(),
             local_refs: Vec::new(),
             used_local_refs: std::cell::RefCell::new(Vec::new()),
             needs_next_context: std::cell::Cell::new(false),
@@ -2652,12 +2986,14 @@ impl TemplateDefinitionBuilder {
             ng_content_selectors: Vec::new(),
             all_projection_selectors: Vec::new(),
             has_default_projection: false,
-            projection_count: 0,
             dom_only: input.dom_only,
             i18n_child_view: None,
             i18n_block_ctx: None,
             in_i18n_create: false,
+            active_namespace: Namespace::Html,
+            create_prelude: Vec::new(),
             deferred_deps: input.deferred_deps.clone(),
+            foreign_components: input.foreign_components.clone(),
         }
     }
 
@@ -2685,7 +3021,7 @@ impl TemplateDefinitionBuilder {
             state.next_const_name = n + 1;
             n
         };
-        let name = format!("$c{n}$");
+        let name = format!("_c{n}");
         self.shared_consts.push((value.clone(), name.clone()));
         self.hoisted_fns.push(Stmt::with_modifiers(
             StmtKind::DeclareVar {
@@ -2773,6 +3109,7 @@ impl TemplateDefinitionBuilder {
             let ctx_name = self.next_context_var_name();
             let resolver = NestedViewResolver {
                 vars: &self.loop_vars,
+                ancestor_reads: &self.ancestor_reads,
                 ctx_name,
                 needs: &self.needs_next_context,
                 local_refs: &self.local_refs,
@@ -2833,13 +3170,15 @@ impl TemplateDefinitionBuilder {
     /// pre-pass (`preregister_local_ref`) already minted the generated local + a placeholder slot;
     /// fill in the real slot now that the host is reached (patch the first still-placeholder entry of
     /// this name). Falls back to pushing a fresh entry for a ref the pre-pass did not see.
-    fn register_local_ref(&mut self, name: &str, slot: usize) {
+    fn register_local_ref(&mut self, name: &str, slot: usize, host_slot: usize, plain: bool) {
         if let Some(entry) = self
             .local_refs
             .iter_mut()
             .find(|r| r.name == name && r.slot >= LOCAL_REF_SLOT_PLACEHOLDER)
         {
             entry.slot = slot;
+            entry.host_slot = host_slot;
+            entry.plain = plain;
         } else {
             self.var_counter += 1;
             let local_name = local_ref_var_name(name, self.var_counter);
@@ -2847,6 +3186,8 @@ impl TemplateDefinitionBuilder {
                 name: name.to_string(),
                 slot,
                 local_name,
+                host_slot,
+                plain,
             });
         }
     }
@@ -2856,7 +3197,7 @@ impl TemplateDefinitionBuilder {
     /// declared LATER emit `ɵɵreference(placeholder)`; the real slot is filled by
     /// [`Self::register_local_ref`] when the host is reached, and patched into handler bodies by
     /// [`Self::finalize_local_refs`].
-    fn preregister_local_ref(&mut self, name: &str) {
+    fn preregister_local_ref(&mut self, name: &str, plain: bool) {
         let ordinal = self.local_refs.len();
         self.var_counter += 1;
         let local_name = local_ref_var_name(name, self.var_counter);
@@ -2864,12 +3205,298 @@ impl TemplateDefinitionBuilder {
             name: name.to_string(),
             slot: LOCAL_REF_SLOT_PLACEHOLDER + ordinal,
             local_name,
+            host_slot: HOST_SLOT_PLACEHOLDER + ordinal,
+            plain,
         });
     }
 
     /// Patch every placeholder local-ref slot literal (`LOCAL_REF_SLOT_PLACEHOLDER + ordinal`) in the
     /// creation block (listener handler bodies) to the real `ɵɵreference(slot)` slot recorded for that
     /// ordinal in `self.local_refs`. Needed when a handler reads a `#ref` declared after it.
+    /// The context variables a child view inherits from this view and its ancestors (nearest owner
+    /// first): this view's own plain loop variables, then the ones it inherited.
+    fn ancestor_vars_for_child(&self) -> Vec<AncestorVar> {
+        self.loop_vars
+            .iter()
+            .filter(|v| is_plain_context_var(v) && self.view_level >= 1)
+            .map(|v| AncestorVar {
+                owner_level: self.view_level,
+                var: v.clone(),
+            })
+            .chain(self.ancestor_vars.iter().cloned())
+            .collect()
+    }
+
+    /// Which inherited context variables this view's own bindings read (its `ancestor_reads`). A name
+    /// its own loop variables declare shadows the inherited one, and the nearest owner wins.
+    fn compute_ancestor_reads(&self, nodes: &[Node]) -> Vec<AncestorVar> {
+        let mut reads: Vec<AncestorVar> = Vec::new();
+        for anc in &self.ancestor_vars {
+            let name = anc.var.source_name.as_str();
+            if self.loop_vars.iter().any(|v| v.source_name == name)
+                || reads.iter().any(|r| r.var.source_name == name)
+            {
+                continue;
+            }
+            if nodes.iter().any(|n| view_body_references(n, name)) {
+                reads.push(anc.clone());
+            }
+        }
+        reads
+    }
+
+    /// The update-block declarations for [`Self::ancestor_reads`] (Angular `generate_variables.ts`
+    /// scope walk). For each owner, nearest first, `ɵɵnextContext(hops)` walks from the previous
+    /// owner's context: each call moves the runtime context pointer, so the hops are relative. A
+    /// single read is inlined (`const x_r1 = ɵɵnextContext().$implicit`); several reads of one owner
+    /// share one `const ctx_r<owner> = ɵɵnextContext(hops)`. Returns the statements and the level the
+    /// context pointer is left at.
+    fn ancestor_context_prelude(&self) -> (Vec<Stmt>, usize) {
+        let mut stmts: Vec<Stmt> = Vec::new();
+        let mut prev = self.view_level;
+        let reads = &self.ancestor_reads;
+        let mut i = 0;
+        while i < reads.len() {
+            let level = reads[i].owner_level;
+            let mut j = i;
+            while j < reads.len() && reads[j].owner_level == level {
+                j += 1;
+            }
+            let hops = prev - level;
+            let call = |hops: usize| {
+                let args = if hops <= 1 { vec![] } else { vec![num(hops as f64)] };
+                o::import_expr(R3::NextContext.reference(), None).call_fn(args, false)
+            };
+            let group = &reads[i..j];
+            if group.len() == 1 {
+                let key = group[0].var.ctx_key.clone().unwrap_or_default();
+                stmts.push(Stmt::with_modifiers(
+                    StmtKind::DeclareVar {
+                        name: group[0].var.local_name.clone(),
+                        value: Some(call(hops).prop(key)),
+                        ty: None,
+                    },
+                    StmtModifier::FINAL,
+                ));
+            } else {
+                let ctx_name = format!("ctx_r{level}");
+                stmts.push(Stmt::with_modifiers(
+                    StmtKind::DeclareVar {
+                        name: ctx_name.clone(),
+                        value: Some(call(hops)),
+                        ty: None,
+                    },
+                    StmtModifier::FINAL,
+                ));
+                for a in group {
+                    let key = a.var.ctx_key.clone().unwrap_or_default();
+                    stmts.push(Stmt::with_modifiers(
+                        StmtKind::DeclareVar {
+                            name: a.var.local_name.clone(),
+                            value: Some(o::variable(ctx_name.clone(), None).prop(key)),
+                            ty: None,
+                        },
+                        StmtModifier::FINAL,
+                    ));
+                }
+            }
+            prev = level;
+            i = j;
+        }
+        (stmts, prev)
+    }
+
+    /// Record `slot` as this view's first element-like target (see [`Self::first_target_slot`]).
+    fn note_first_target_slot(&mut self, slot: usize) {
+        if self.first_target_slot.is_none() {
+            self.first_target_slot = Some(slot);
+        }
+    }
+
+    /// Resolve a `@defer` trigger target to `(slot expression, view steps)` (Angular
+    /// `resolveDeferTargetNames`). A trigger with no reference targets the placeholder's first
+    /// element-like op, one view up (`-1`). A named trigger looks in the placeholder's plain refs
+    /// first (`-1`), then in this view's plain refs (`0`, the owner is the placeholder's parent).
+    /// A ref declared later in this view is a forward reference: its slot is a
+    /// [`HOST_SLOT_PLACEHOLDER`] resolved by [`Self::finalize_host_slots`].
+    fn defer_trigger_target(
+        &self,
+        reference: Option<&str>,
+        placeholder: Option<&DeferViewTargets>,
+    ) -> Option<(Expr, i64)> {
+        match reference {
+            None => placeholder?
+                .first_slot
+                .map(|slot| (num(slot as f64), -1)),
+            Some(name) => {
+                if let Some((_, host)) = placeholder.and_then(|ph| ph.refs.iter().find(|(n, _)| n == name)) {
+                    return Some((num(*host as f64), -1));
+                }
+                let ordinal = self.local_refs.iter().position(|r| r.plain && r.name == name)?;
+                let host = self.local_refs[ordinal].host_slot;
+                let slot = if host >= HOST_SLOT_PLACEHOLDER {
+                    num((HOST_SLOT_PLACEHOLDER + ordinal) as f64)
+                } else {
+                    num(host as f64)
+                };
+                Some((slot, 0))
+            }
+        }
+    }
+
+    /// Target and options arguments of one `ɵɵdeferOn*` / `ɵɵdeferPrefetchOn*` / `ɵɵdeferHydrateOn*`
+    /// op (Angular `reify.ts` `DeferOn` case): hover and interaction take `(targetSlot[, steps])`,
+    /// viewport takes `(targetSlot, steps | null, options?)`, a hydrate trigger takes no target and a
+    /// hydrate viewport takes only its options.
+    fn defer_trigger_args(
+        &mut self,
+        modifier: DeferOpModifier,
+        kind: &DeferredTriggerKind,
+        placeholder: Option<&DeferViewTargets>,
+    ) -> Vec<Expr> {
+        let (reference, options, viewport) = match kind {
+            DeferredTriggerKind::Hover { reference } | DeferredTriggerKind::Interaction { reference } => {
+                (reference.as_deref(), None, false)
+            }
+            DeferredTriggerKind::Viewport { reference, options } => {
+                (reference.as_deref(), options.as_ref(), true)
+            }
+            _ => return Vec::new(),
+        };
+        if modifier == DeferOpModifier::Hydrate {
+            return match (viewport, options) {
+                (true, Some(opts)) => vec![self.lower_defer_options(opts)],
+                _ => Vec::new(),
+            };
+        }
+        let target = self.defer_trigger_target(reference, placeholder);
+        let steps = target.as_ref().map(|(_, steps)| *steps);
+        let mut args = vec![target.map(|(slot, _)| slot).unwrap_or_else(o::null_expr)];
+        if viewport {
+            match steps {
+                Some(st) if st != 0 => args.push(num(st as f64)),
+                _ if options.is_some() => args.push(o::null_expr()),
+                _ => {}
+            }
+            if let Some(opts) = options {
+                args.push(self.lower_defer_options(opts));
+            }
+        } else if let Some(st) = steps.filter(|st| *st != 0) {
+            args.push(num(st as f64));
+        }
+        args
+    }
+
+    /// A `@defer` trigger's options object as a plain object literal. Angular passes `trigger.options`
+    /// through as written (it is not hoisted into a pure function), so each property value is lowered
+    /// on its own and the map itself is never extracted.
+    fn lower_defer_options(&mut self, options: &AstNode) -> Expr {
+        use crate::expression::ast::{ExprKind, LiteralMapKey};
+        let ExprKind::LiteralMap { keys, values } = &options.kind else {
+            return self.lower_expr(options);
+        };
+        let mut props: Vec<(String, bool, Expr)> = Vec::with_capacity(keys.len());
+        for (key, value) in keys.iter().zip(values.iter()) {
+            if let LiteralMapKey::Property { key, quoted, .. } = key {
+                let lowered = self.lower_expr(value);
+                props.push((key.clone(), *quoted, lowered));
+            }
+        }
+        o::literal_map(props, None)
+    }
+
+    /// Patch every [`HOST_SLOT_PLACEHOLDER`] (a forward `@defer` target ref whose host was not reached
+    /// yet) in this view's creation block to the host element slot, and record the resolved slots on
+    /// the refs. Runs after the walk, when every ref in the view has been registered.
+    fn finalize_host_slots(&mut self) {
+        let hosts: Vec<usize> = self.local_refs.iter().map(|r| r.host_slot).collect();
+        let resolve = move |ordinal: usize| match hosts.get(ordinal) {
+            Some(&host) if host < HOST_SLOT_PLACEHOLDER => host,
+            _ => ordinal,
+        };
+        let mut creation = std::mem::take(&mut self.creation_code);
+        for stmt in &mut creation {
+            remap_placeholder_slots_in_stmt(stmt, HOST_SLOT_PLACEHOLDER, &resolve);
+        }
+        self.creation_code = creation;
+        let resolved: Vec<usize> = (0..self.local_refs.len()).map(|i| resolve(i)).collect();
+        for (r, host) in self.local_refs.iter_mut().zip(resolved) {
+            if r.host_slot >= HOST_SLOT_PLACEHOLDER {
+                r.host_slot = host;
+            }
+        }
+    }
+
+    /// Rank every `<ng-content>` slot in Angular's `generateProjectionDefs` order and rewrite its placeholder
+    /// index, then rebuild the `ɵɵprojectionDef` selector list in that same order. Angular walks `job.units`
+    /// (view allocation order, depth-first) and each unit's ops, so a root `<ng-content>` after a nested
+    /// `<ng-template>` still takes the lower index. Runs on the root only, after the whole walk.
+    fn finalize_projection_indices(&mut self) {
+        let pending = std::mem::take(&mut self.const_pool.borrow_mut().pending_projections);
+        if pending.is_empty() {
+            return;
+        }
+        let mut order: Vec<usize> = (0..pending.len()).collect();
+        order.sort_by_key(|&i| (pending[i].view_seq, pending[i].content_seq));
+        let mut rank = vec![0usize; pending.len()];
+        for (position, &i) in order.iter().enumerate() {
+            rank[i] = position;
+        }
+        self.all_projection_selectors = order.iter().map(|&i| pending[i].selector.clone()).collect();
+        let resolve = move |id: usize| rank.get(id).copied().unwrap_or(id);
+        let remap = |stmts: &mut Vec<Stmt>| {
+            for stmt in stmts.iter_mut() {
+                remap_placeholder_slots_in_stmt(stmt, PROJECTION_INDEX_PLACEHOLDER, &resolve);
+            }
+        };
+        remap(&mut self.creation_code);
+        remap(&mut self.create_prelude);
+        remap(&mut self.update_code);
+        remap(&mut self.hoisted_fns);
+        trim_default_projection_index(&mut self.creation_code);
+        trim_default_projection_index(&mut self.create_prelude);
+        trim_default_projection_index(&mut self.hoisted_fns);
+    }
+
+    /// Place every element / `<ng-template>` attribute const requested during the walk, in Angular's
+    /// `collectElementConsts` order, and rewrite the walk's placeholder indices to the final ones.
+    ///
+    /// Angular adds these consts LAST (after local refs, i18n consts and const expressions), walking
+    /// `job.units` in allocation order (depth-first pre-order over the view tree) and each unit's ops
+    /// in document order, de-duplicating against the consts already present (`addConst`). The walk
+    /// visits nested views in the middle of the root's own ops, so without this pass a nested view's
+    /// attribute array would take an index ahead of the root's later elements. Non-element consts
+    /// (local refs, i18n, defer configs) are already in [`ConstantPool::entries`] in walk order, which
+    /// is their Angular order, so the attribute consts are simply appended in view order.
+    ///
+    /// Runs on the root only, after the whole walk: every nested view's functions have been hoisted
+    /// into [`Self::hoisted_fns`] by then, so the placeholders are rewritten in all of them.
+    fn finalize_pending_consts(&mut self) {
+        let pending = std::mem::take(&mut self.const_pool.borrow_mut().pending);
+        if pending.is_empty() {
+            return;
+        }
+        let mut order: Vec<usize> = (0..pending.len()).collect();
+        order.sort_by_key(|&i| (pending[i].view_seq, pending[i].op_seq));
+        let mut resolved = vec![0usize; pending.len()];
+        {
+            let mut pool = self.const_pool.borrow_mut();
+            for i in order {
+                resolved[i] = pool.intern(pending[i].value.clone());
+            }
+        }
+        let resolve = move |id: usize| resolved.get(id).copied().unwrap_or(id);
+        let remap = |stmts: &mut Vec<Stmt>| {
+            for stmt in stmts.iter_mut() {
+                remap_placeholder_slots_in_stmt(stmt, PENDING_CONST_PLACEHOLDER, &resolve);
+            }
+        };
+        remap(&mut self.creation_code);
+        remap(&mut self.create_prelude);
+        remap(&mut self.update_code);
+        remap(&mut self.hoisted_fns);
+    }
+
     fn finalize_local_refs(&mut self) {
         let slots: Vec<usize> = self.local_refs.iter().map(|r| r.slot).collect();
         if slots.is_empty() {
@@ -3084,6 +3711,7 @@ impl TemplateDefinitionBuilder {
 
         // Capture the node list for in-view `@let`-usage queries during the walk.
         self.current_nodes = Some(nodes.clone());
+        self.ancestor_reads = self.compute_ancestor_reads(&nodes);
 
         // Angular runs `liftLocalRefs` (which interns each element/template's `#ref` const) BEFORE
         // `collectElementConsts` (the attribute consts) — so EVERY local-ref const precedes every
@@ -3094,7 +3722,7 @@ impl TemplateDefinitionBuilder {
         // handler reads a ref declared LATER can resolve it.
         self.prepass_local_ref_consts(&nodes);
 
-        // Then, for the ROOT view, pre-intern every DESCENDANT view's local-ref consts (breadth-first
+        // Then, for the ROOT view, pre-intern every DESCENDANT view's local-ref consts (depth-first
         // by view level) so the WHOLE template's local-ref consts precede every Template/attribute
         // const — Angular's `liftLocalRefs` runs across all views before `collectElementConsts`. A
         // nested view's ref const is otherwise interned only when that view is built (after the root
@@ -3122,6 +3750,13 @@ impl TemplateDefinitionBuilder {
             self.build_i18n_child_view(&child, &nodes);
         } else {
             self.visit_all(&nodes);
+        }
+        if self.is_root {
+            self.finalize_projection_indices();
+        }
+        self.finalize_host_slots();
+        if self.is_root {
+            self.finalize_pending_consts();
         }
 
         // Assign the deferred var (change-detection) offsets for every pipe / arrow / pure-function
@@ -3216,20 +3851,25 @@ impl TemplateDefinitionBuilder {
         // collapse each maximal run of adjacent expression-statements whose call callee is the
         // *same* instruction into one left-folded chained call. Applied to both buffers before
         // they are wrapped in the `rf`-guarded ifs.
-        let creation = chain_statements(std::mem::take(&mut self.creation_code));
+        let mut creation_body: Vec<Stmt> = std::mem::take(&mut self.create_prelude);
+        creation_body.extend(std::mem::take(&mut self.creation_code));
+        let creation = chain_statements(creation_body);
         // Update-block prelude order (Angular `generateNextContextExpr` then `generate_variables`):
         //   1. `const ctx_r<level> = ɵɵnextContext();` — once, when any expression in this nested
         //      view read an ancestor context (`needs_next_context` was set during lowering).
         //   2. embedded-view loop-variable `const`s (`const x_r1 = ctx.$implicit;`).
         // Both precede the chained binding instructions.
         let mut update_body: Vec<Stmt> = Vec::new();
-        if self.needs_next_context.get() {
-            let ctx_name = self.next_context_var_name();
-            // `ɵɵnextContext(n)` — the hop count is the number of view levels walked up. The bare
-            // `ɵɵnextContext()` (Angular elides the `1` argument) covers the common single-level case.
-            let hops = self.view_level; // each level resolves to the immediately-enclosing view here.
+        // The component context is walked to from the view itself, unless an inherited (ancestor)
+        // variable is read: then the ancestor walk moves the context pointer first, and the component
+        // context is walked to from wherever it stopped (Angular's `nextContext` calls chain).
+        let (ancestor_stmts, ancestor_level) = self.ancestor_context_prelude();
+        let inherited = !ancestor_stmts.is_empty();
+        let component_ctx_name = self.next_context_var_name();
+        let component_walk = |hops: usize| {
+            let ctx_name = component_ctx_name.clone();
             let args = if hops <= 1 { vec![] } else { vec![num(hops as f64)] };
-            update_body.push(Stmt::with_modifiers(
+            Stmt::with_modifiers(
                 StmtKind::DeclareVar {
                     name: ctx_name,
                     value: Some(
@@ -3238,9 +3878,18 @@ impl TemplateDefinitionBuilder {
                     ty: None,
                 },
                 StmtModifier::FINAL,
-            ));
+            )
+        };
+        if self.needs_next_context.get() && !inherited {
+            // `ɵɵnextContext(n)` — the hop count is the number of view levels walked up. The bare
+            // `ɵɵnextContext()` (Angular elides the `1` argument) covers the common single-level case.
+            update_body.push(component_walk(self.view_level));
         }
         update_body.extend(std::mem::take(&mut self.update_prelude));
+        update_body.extend(ancestor_stmts);
+        if self.needs_next_context.get() && inherited {
+            update_body.push(component_walk(ancestor_level));
+        }
         // Template local references read by this view's own update bindings materialise as
         // `const <name>_r<id> = ɵɵreference(slot)` at the head of the variable block, before the
         // bindings consume them (`generate_variables.ts` `Reference`). Emitted in first-use order.
@@ -3344,7 +3993,16 @@ impl TemplateDefinitionBuilder {
         template_names: &[String],
     ) -> Option<usize> {
         let entries = self.serialize_attrs_entries(attributes, binding_names, template_names)?;
-        Some(self.const_pool.borrow_mut().intern(o::literal_arr(entries, None)))
+        // Angular's `collectElementConsts` runs after every other const producer and walks the
+        // views in allocation order, so the array is only queued here; the root places it (and
+        // rewrites this placeholder) in `finalize_pending_consts`.
+        let op_seq = self.attr_const_seq;
+        self.attr_const_seq += 1;
+        Some(self.const_pool.borrow_mut().push_pending(
+            self.view_seq,
+            op_seq,
+            o::literal_arr(entries, None),
+        ))
     }
 
     /// Build the raw serialized-attributes array contents (`Vec<Expr>`) without interning, or `None`
@@ -3460,9 +4118,16 @@ impl TemplateDefinitionBuilder {
         };
         let is_default = selector == "*";
         // Angular's `generateProjectionDefs` assigns each `<ng-content>` op a *unique ascending*
-        // `projectionSlotIndex` (0-based, in create-block order), regardless of selector dedup.
-        let projection_index = self.projection_count;
-        self.projection_count += 1;
+        // `projectionSlotIndex` in `job.units` order (view allocation order, then op order). The walk visits
+        // nested views in the middle of the root's ops, so the index is a placeholder that the root ranks
+        // in `finalize_projection_indices`.
+        let content_seq = self.content_seq;
+        self.content_seq += 1;
+        let projection_index = self.const_pool.borrow_mut().push_pending_projection(
+            self.view_seq,
+            content_seq,
+            selector.clone(),
+        );
         // Record EVERY slot's selector in create order (with dups + wildcards) for the
         // `ɵɵprojectionDef` argument (Angular `generateProjectionDefs`).
         self.all_projection_selectors.push(selector.clone());
@@ -3515,10 +4180,8 @@ impl TemplateDefinitionBuilder {
             params.push(num(fb_decls as f64));
             params.push(num(fb_vars as f64));
         } else {
+            // A `0` projection index is trimmed once it is ranked (`finalize_projection_indices`).
             trim_trailing_nulls(&mut params);
-            if params.len() == 2 && params[1].is_equivalent(&num(0.0)) {
-                params.pop();
-            }
         }
         self.creation_code.push(instruction(R3::Projection, params));
     }
@@ -3581,15 +4244,205 @@ impl TemplateDefinitionBuilder {
     /// creation pass, binding refreshes to the update pass. The names of all bound inputs/outputs are
     /// also collected into the element's const attrs array under `AttributeMarker.Bindings` (`3`).
     fn build_element(&mut self, element: &Element) {
+        if let Some(component) = self.foreign_component_for(&element.name) {
+            self.build_foreign_component(element, component);
+            return;
+        }
         self.build_element_inner(element)
+    }
+
+    /// The `foreignImports` entry matched by an element tag (`unsafe-attr` etc. keep their spelling),
+    /// as the component reference to store in `consts`. `None` for an ordinary element.
+    fn foreign_component_for(&self, tag: &str) -> Option<Expr> {
+        self.foreign_components
+            .iter()
+            .find(|f| f.name == tag)
+            .map(|f| f.component.clone())
+    }
+
+    /// Lower a foreign component element (`ingest.ts` `ingestForeignComponent`, `resolve_foreign_content.ts`,
+    /// `reify.ts` `ForeignComponent`).
+    ///
+    /// The element becomes one creation instruction, `ɵɵforeignComponent(slot, constIndex, () => props)`,
+    /// with no update block. `props` are the static attributes, then the bound inputs, then one entry per
+    /// `@content` block / the default children, whose value is a creation-time local read off the
+    /// foreign component through `ɵɵforeignContent(slot, constIndex)` (or `ɵɵforeignContentFn` when the
+    /// block declares `let` variables). Each `@content` block (and the default children) is its own
+    /// embedded view, created as a template before the foreign component. The component reference is
+    /// appended to the component `consts` array, after the content views (Angular `job.addConst`).
+    fn build_foreign_component(&mut self, element: &Element, component: Expr) {
+        // The `@content` blocks become templates named after their property; everything else is the
+        // default `children` view. Content views are built first, as Angular ingests them first.
+        let mut content_blocks: Vec<&crate::template::r3_ast::ContentBlock> = Vec::new();
+        let mut child_nodes: Vec<Node> = Vec::new();
+        for child in &element.children {
+            match child {
+                Node::ContentBlock(block) => content_blocks.push(block),
+                other => child_nodes.push(other.clone()),
+            }
+        }
+
+        // (slot, template fn, decls, vars, property name, declares let-variables)
+        let mut contents: Vec<(usize, Expr, usize, usize, String, bool)> = Vec::new();
+        for block in content_blocks {
+            let slot = self.allocate_data_slot();
+            let fn_name = format!(
+                "{}_{}_{}_Template",
+                self.base_name,
+                capitalize_first(&block.name),
+                slot
+            );
+            // `@content (items; let item, index)`: the content view receives the render arguments as
+            // its context, so `item` / `index` are `ctx[0]` / `ctx[1]` read into locals in the update
+            // block (`generate_variables.ts` numeric context variables).
+            let mut loop_vars: Vec<LoopVar> = Vec::new();
+            let mut prelude: Vec<Stmt> = Vec::new();
+            for (i, var) in block.variables.iter().enumerate() {
+                self.var_counter += 1;
+                let local_name = format!("{}_r{}", var.name, self.var_counter);
+                prelude.push(Stmt::with_modifiers(
+                    StmtKind::DeclareVar {
+                        name: local_name.clone(),
+                        value: Some(o::variable(CONTEXT_NAME, None).key(num(i as f64))),
+                        ty: None,
+                    },
+                    StmtModifier::FINAL,
+                ));
+                loop_vars.push(LoopVar {
+                    source_name: var.name.clone(),
+                    local_name,
+                    inline: None,
+                    context_prop: None,
+                    ctx_key: None,
+                });
+            }
+            let (fn_ref, decls, vars) = self.build_embedded_view(
+                fn_name,
+                block.children.clone(),
+                loop_vars,
+                prelude,
+            );
+            contents.push((
+                slot,
+                fn_ref,
+                decls,
+                vars,
+                block.name.clone(),
+                !block.variables.is_empty(),
+            ));
+        }
+        if !child_nodes.is_empty() {
+            let slot = self.allocate_data_slot();
+            let fn_name = format!("{}_Children_{}_Template", self.base_name, slot);
+            let (fn_ref, decls, vars) =
+                self.build_embedded_view(fn_name, child_nodes, Vec::new(), Vec::new());
+            contents.push((slot, fn_ref, decls, vars, "children".to_string(), false));
+        }
+
+        // The foreign component occupies the next data slot (after its content views).
+        let foreign_slot = self.allocate_data_slot();
+
+        // Props: static attributes (string literals), then bound inputs, then the content locals.
+        let mut props: Vec<(String, bool, Expr)> = Vec::new();
+        // The foreign component's inputs are read in the CREATION block (`ɵɵforeignComponent(…, () =>
+        // ({…}))`), so an ancestor-context read among them needs its `ɵɵnextContext()` there, not in
+        // the update block. Lower them with the update-block flag saved, then move the flag to the
+        // creation prelude.
+        let update_ctx_flag = self.needs_next_context.replace(false);
+        for attr in &element.attributes {
+            props.push((
+                attr.name.clone(),
+                is_unsafe_object_key(&attr.name),
+                o::literal(o::LiteralValue::String(attr.value.clone()), None),
+            ));
+        }
+        for input in &element.inputs {
+            let value = self.lower_expr(&input.value);
+            props.push((input.name.clone(), is_unsafe_object_key(&input.name), value));
+        }
+        if self.needs_next_context.replace(update_ctx_flag) {
+            let ctx_name = self.next_context_var_name();
+            let hops = self.view_level;
+            let args = if hops <= 1 { vec![] } else { vec![num(hops as f64)] };
+            self.create_prelude.push(Stmt::with_modifiers(
+                StmtKind::DeclareVar {
+                    name: ctx_name,
+                    value: Some(o::import_expr(R3::NextContext.reference(), None).call_fn(args, false)),
+                    ty: None,
+                },
+                StmtModifier::FINAL,
+            ));
+        }
+
+        // The component const (`job.addConst`): appended after the content views' own consts.
+        let const_index = self
+            .const_pool
+            .borrow_mut()
+            .add_const_with_initializers(component, Vec::new());
+
+        // Creation block: the content templates (chained), then one `const <name>_rN = ɵɵforeignContent(…)`
+        // per content slot, then `ɵɵforeignComponent`.
+        for (slot, fn_ref, decls, vars, _, _) in &contents {
+            let template = if self.dom_only { R3::DomTemplate } else { R3::TemplateCreate };
+            let params = vec![
+                num(*slot as f64),
+                fn_ref.clone(),
+                num(*decls as f64),
+                num(*vars as f64),
+            ];
+            self.creation_code.push(instruction(template, params));
+        }
+        for (slot, _, _, _, name, parameterized) in &contents {
+            self.var_counter += 1;
+            let local_name = format!("{}_r{}", name, self.var_counter);
+            let reference = if *parameterized {
+                R3::ForeignContentFn
+            } else {
+                R3::ForeignContent
+            };
+            let read = o::import_expr(reference.reference(), None)
+                .call_fn(vec![num(*slot as f64), num(const_index as f64)], false);
+            self.creation_code.push(Stmt::with_modifiers(
+                StmtKind::DeclareVar {
+                    name: local_name.clone(),
+                    value: Some(read),
+                    ty: None,
+                },
+                StmtModifier::FINAL,
+            ));
+            props.push((name.clone(), is_unsafe_object_key(name), o::variable(local_name, None)));
+        }
+
+        let mut params = vec![num(foreign_slot as f64), num(const_index as f64)];
+        if !props.is_empty() {
+            // Angular `reify.ts`: the props are a `() => ({ … })` arrow so they re-evaluate reactively.
+            params.push(o::arrow_fn(
+                Vec::new(),
+                o::ArrowBody::Expr(Box::new(o::literal_map(props, None))),
+                Some(o::dynamic_type()),
+            ));
+        }
+        self.creation_code
+            .push(instruction(R3::ForeignComponent, params));
     }
 
     /// The value expression for a `[style.x]`/`[class.x]` binding. A literal interpolation value
     /// (`"a{{exp}}b"`) is wrapped in the matching `ɵɵinterpolateN(...)` (Angular `interpolate.ts`
     /// reifies `StyleProp`/`ClassProp` interpolation through the value-interpolation family); a
     /// non-interpolation value is passed through as already lowered.
-    fn style_class_binding_value(&mut self, value: &AstNode, already_lowered: Expr) -> Expr {
+    fn style_class_binding_value(
+        &mut self,
+        value: &AstNode,
+        already_lowered: Expr,
+        collapses_singleton: bool,
+    ) -> Expr {
         match &value.kind {
+            AstExprKind::Interpolation { expressions, .. }
+                if collapses_singleton && is_singleton_interpolation(value) =>
+            {
+                // Angular `collapse_singleton_interpolations.ts`: `{{x}}` is just `x`.
+                self.lower_expr(&expressions[0])
+            }
             AstExprKind::Interpolation { strings, expressions } => {
                 // Lower each interpolation expression against this view's scope, in order, then
                 // collate them with the literal string affixes into the `ɵɵinterpolateN` arg list.
@@ -3614,12 +4467,13 @@ impl TemplateDefinitionBuilder {
 
     fn build_element_inner(&mut self, element: &Element) {
         let slot = self.allocate_data_slot();
+        self.note_first_target_slot(slot);
         // Each `#ref` on the element reserves one extra data slot (Angular `liftLocalRefs`:
         // `numSlotsUsed += localRefs.length`). The `ɵɵreference(slot)` slot for ref `k` is
         // `element_slot + 1 + k`. Register each ref so same-view / handler reads resolve to it.
         for r in &element.references {
             let ref_slot = self.allocate_data_slot();
-            self.register_local_ref(&r.name, ref_slot);
+            self.register_local_ref(&r.name, ref_slot, slot, r.value.is_empty());
         }
 
         // Collect the names that go under `AttributeMarker.Bindings` (`3`). Faithful to Angular's
@@ -3653,6 +4507,15 @@ impl TemplateDefinitionBuilder {
             binding_names.push(output.name.clone());
         }
         for input in &element.inputs {
+            // An EMPTY `[class.x]` / `[style.x]` binding (no `=` value) is extracted as a Property name
+            // (Angular `attribute_extraction.ts`, StyleProp/ClassProp with an `EmptyExpr`: the old
+            // compiler treated it as a regular binding for directive matching), with no update op.
+            if matches!(input.kind, BindingType::Class | BindingType::Style)
+                && is_empty_binding_value(&input.value)
+            {
+                binding_names.push(input.name.clone());
+                continue;
+            }
             if matches!(
                 input.kind,
                 BindingType::Class
@@ -3697,7 +4560,10 @@ impl TemplateDefinitionBuilder {
                     synthetic_static_props.push(a.name.clone());
                     false
                 } else {
-                    true
+                    // `ngNonBindable` marks the element non-bindable and is removed from its attributes
+                    // (Angular `binding_specialization.ts`: the Attribute binding is dropped, the target
+                    // element gets `nonBindable = true`), so it never reaches the element's const array.
+                    a.name != "ngNonBindable"
                 }
             })
             .cloned()
@@ -3725,39 +4591,82 @@ impl TemplateDefinitionBuilder {
         // `(event)` output stays in `elementStart … elementEnd` form even with no children.
         // An i18n-marked element always wraps an `ɵɵi18nStart … ɵɵi18nEnd` pair around its content,
         // so it stays in `elementStart … elementEnd` form even when it has no element children.
-        let needs_end = has_children || !element.outputs.is_empty() || element.i18n.is_some();
+        // A control binding (`phases/control_directives.ts`) inserts an `ɵɵcontrolCreate()` right
+        // after the element's start op. That op sits between `ElementStart` and `ElementEnd`, which
+        // blocks the `empty_elements` phase from merging the pair, so such an element always stays
+        // in `elementStart … elementEnd` form (even with no children and no listeners).
+        let control_bindings = element.inputs.iter().filter(|i| is_control_binding(i)).count();
+        let needs_end = has_children
+            || !element.outputs.is_empty()
+            || element.i18n.is_some()
+            || control_bindings > 0;
+
+        // `ingestElement`: the op's tag is the local name (`splitNsName(element.name)[1]`); the
+        // namespace prefix selects the element namespace (`namespaceForKey`).
+        let (ns_key, local_name) = crate::ml_parser::split_ns_name(&element.name);
+        let namespace = namespace_for_key(ns_key.as_deref());
 
         // `element`/`elementStart` reify to `(slot, tag, attributes, localRefs, span)`; the
         // trailing `null` attributes / localRefs args are trimmed (Angular `instruction.ts`).
-        let mut params = vec![
-            num(slot as f64),
-            str_lit(&element.name),
-            attrs_index.map(|i| num(i as f64)).unwrap_or_else(o::null_expr),
+        // The container family takes no tag argument (`elementContainerStart(slot, attrs?, refs?)`).
+        let is_container = element.name == "ng-container";
+        let mut params = vec![num(slot as f64)];
+        if !is_container {
+            params.push(str_lit(&local_name));
+        }
+        params.push(attrs_index.map(|i| num(i as f64)).unwrap_or_else(o::null_expr));
+        params.push(
             local_refs_index
                 .map(|i| num(i as f64))
                 .unwrap_or_else(o::null_expr),
-        ];
+        );
         trim_trailing_nulls(&mut params);
 
         // Creation: the element itself, then its listeners. Angular's `reify` phase picks the
         // DOM-only element family (`ɵɵdomElementStart`/`ɵɵdomElementEnd`/`ɵɵdomElement`) when the
         // component compiles in `DomOnly` mode (standalone, no directive dependencies), and the
         // classic `Full` family (`ɵɵelementStart`/`ɵɵelementEnd`/`ɵɵelement`) otherwise.
-        let (start_ref, single_ref) = if self.dom_only {
-            (R3::DomElementStart, R3::DomElement)
-        } else {
-            (R3::ElementStart, R3::Element)
+        // An `<ng-container>` is a container op (`phases/ng_container.ts` transmutes its `ElementStart` /
+        // `ElementEnd` into `ContainerStart` / `ContainerEnd`), reified to the `elementContainer*` family.
+        let (start_ref, single_ref) = match (self.dom_only, is_container) {
+            (true, false) => (R3::DomElementStart, R3::DomElement),
+            (false, false) => (R3::ElementStart, R3::Element),
+            (true, true) => (R3::DomElementContainerStart, R3::DomElementContainer),
+            (false, true) => (R3::ElementContainerStart, R3::ElementContainer),
         };
+        // `emitNamespaceChanges` (`phases/namespace.ts`): a namespace-switch instruction precedes the
+        // element's start op whenever its namespace differs from the one active in this view.
+        if namespace != self.active_namespace {
+            self.creation_code
+                .push(instruction(namespace_instruction(namespace), vec![]));
+            self.active_namespace = namespace;
+        }
         if needs_end {
             self.creation_code.push(instruction(start_ref, params));
         } else {
             self.creation_code.push(instruction(single_ref, params));
         }
+        // An `ngNonBindable` element brackets its subtree in `ɵɵdisableBindings()` … `ɵɵenableBindings()`
+        // (Angular `phases/nonbindable.ts`: the disable op follows the element start, the enable op
+        // precedes the element end).
+        let non_bindable = element.attributes.iter().any(|a| a.name == "ngNonBindable");
+        if non_bindable && needs_end {
+            self.creation_code.push(instruction(R3::DisableBindings, vec![]));
+        }
+
+        // `ɵɵcontrolCreate()` for each control-eligible binding on this element. Angular's
+        // `addControlInstruction` (`phases/control_directives.ts`) does `insertAfter(controlCreateOp,
+        // targetCreateOp)` where `targetCreateOp` is the FIRST Element/ElementStart op for the xref
+        // (`findCreateInstruction` returns the first match), so the control op sits directly after
+        // the element's start op, before its listeners and children.
+        for _ in 0..control_bindings {
+            self.creation_code.push(instruction(R3::ControlCreate, vec![]));
+        }
 
         // `(event)="handler"` → creation-block listener (`ɵɵdomListener` in DomOnly mode,
         // `ɵɵlistener` in Full mode).
         for output in &element.outputs {
-            self.build_listener(slot, &element.name, output);
+            self.build_listener(slot, &local_name, output);
         }
 
         // Modern animation bindings (`animate.enter`/`[animate.leave]`) reify to a CREATE-block
@@ -3781,7 +4690,8 @@ impl TemplateDefinitionBuilder {
             .iter()
             .filter(|input| !matches!(input.kind, BindingType::Animation))
             .collect();
-        ordered.sort_by_key(|input| update_order_rank(input));
+        let dom_only = self.dom_only;
+        ordered.sort_by_key(|input| update_order_rank(input, dom_only));
         for input in ordered {
             self.build_property(slot, input);
         }
@@ -3793,7 +4703,6 @@ impl TemplateDefinitionBuilder {
         // create op, below). `ɵɵcontrol` is not a chainable instruction, so it stands alone after the
         // (possibly chained) property run for this element. Count the eligible bindings so the create
         // block emits a matching `ɵɵcontrolCreate()` per control op.
-        let control_bindings = element.inputs.iter().filter(|i| is_control_binding(i)).count();
         for _ in 0..control_bindings {
             self.update_code.push(instruction(R3::Control, vec![]));
         }
@@ -3830,21 +4739,17 @@ impl TemplateDefinitionBuilder {
             let children = element.children.clone();
             self.visit_all(&children);
         }
+        if non_bindable && needs_end {
+            self.creation_code.push(instruction(R3::EnableBindings, vec![]));
+        }
         if needs_end {
-            let end_ref = if self.dom_only {
-                R3::DomElementEnd
-            } else {
-                R3::ElementEnd
+            let end_ref = match (self.dom_only, is_container) {
+                (true, false) => R3::DomElementEnd,
+                (false, false) => R3::ElementEnd,
+                (true, true) => R3::DomElementContainerEnd,
+                (false, true) => R3::ElementContainerEnd,
             };
             self.creation_code.push(instruction(end_ref, vec![]));
-        }
-
-        // `ɵɵcontrolCreate()` for each control-eligible binding on this element, emitted after the
-        // element's LAST create op (`ɵɵelement`, or `ɵɵelementEnd` when the element opened a
-        // start/end pair). Angular's `addControlInstruction` does `insertAfter(controlCreateOp,
-        // targetCreateOp)` where `targetCreateOp` is the last Element/ElementEnd op for the xref.
-        for _ in 0..control_bindings {
-            self.creation_code.push(instruction(R3::ControlCreate, vec![]));
         }
     }
 
@@ -4116,6 +5021,9 @@ impl TemplateDefinitionBuilder {
             self.loop_vars.push(LoopVar {
                 source_name: decl.name.clone(),
                 local_name,
+                inline: None,
+                context_prop: None,
+                ctx_key: None,
             });
         }
     }
@@ -4380,17 +5288,32 @@ impl TemplateDefinitionBuilder {
     fn build_property(&mut self, slot: usize, input: &BoundAttribute) {
         use crate::expression::ast::BindingType;
 
-        // Number of interpolation expressions contributing extra var slots.
-        let interp_extra = match &input.value.kind {
-            AstExprKind::Interpolation { expressions, .. } => expressions.len(),
-            _ => 0,
-        };
+        // An empty `[class.x]` / `[style.x]` binding is removed before var counting
+        // (`remove_empty_bindings.ts`): it emits no instruction and reserves no slot.
+        if matches!(input.kind, BindingType::Class | BindingType::Style)
+            && is_empty_binding_value(&input.value)
+        {
+            return;
+        }
 
         // A whole-element `[class]="exp"` / `[style]="exp"` binding (a `Property` whose name is
         // exactly `class`/`style`) is specialized to a `ClassMap`/`StyleMap` op
         // (`style_binding_specialization.ts`).
         let is_style_or_class_map = matches!(input.kind, BindingType::Property | BindingType::TwoWay)
             && (input.name == "class" || input.name == "style");
+        // `collapse_singleton_interpolations.ts` (before var counting) rewrites a `{{x}}`-only value of a
+        // StyleProp / StyleMap / ClassMap op into the bare expression, so it reserves no interpolation slots.
+        let collapses = matches!(input.kind, BindingType::Style) || is_style_or_class_map;
+
+        // Number of interpolation expressions contributing extra var slots.
+        let interp_extra = match &input.value.kind {
+            AstExprKind::Interpolation { expressions, .. }
+                if !(collapses && is_singleton_interpolation(&input.value)) =>
+            {
+                expressions.len()
+            }
+            _ => 0,
+        };
 
         // Reserve var slots per Angular `varsUsedByOp`: property/attribute = 1 (+N), class/style
         // (ClassProp/StyleProp AND ClassMap/StyleMap) = 2 (+N).
@@ -4453,39 +5376,87 @@ impl TemplateDefinitionBuilder {
                 } else {
                     R3::ClassMap
                 };
-                self.update_code.push(instruction(reference, vec![lowered]));
+                // A `class="foo-{{x}}"` / `[style]="a{{x}}"` interpolation reifies its value through
+                // `ɵɵinterpolateN(...)` (Angular `interpolate.ts`, `ClassMap`/`StyleMap` interpolation),
+                // not a raw string concatenation. A non-interpolation value passes through unchanged.
+                let value = self.style_class_binding_value(&input.value, lowered, true);
+                self.update_code.push(instruction(reference, vec![value]));
             }
-            BindingType::Property | BindingType::TwoWay => {
+            BindingType::TwoWay => {
+                // A `[(name)]="expr"` two-way property reifies to `ɵɵtwoWayProperty(name, expr[, sanitizer])`
+                // in both modes (Angular `reify.ts`: `ng.twoWayProperty(op.name, op.expression, op.sanitizer)`).
+                // Its paired `ɵɵtwoWayListener` is the listener op built by `build_listener`.
+                let sanitizer = attribute_sanitizer(&input.security_context, &input.name);
+                let mut params = vec![str_lit(&input.name), lowered];
+                if let Some(sanitizer) = sanitizer {
+                    params.push(o::import_expr(sanitizer.reference(), None));
+                }
+                self.update_code.push(instruction(R3::TwoWayProperty, params));
+            }
+            BindingType::Property => {
+                // A `[name]="a{{x}}b"` interpolation reifies its value through `ɵɵinterpolateN(...)`
+                // (Angular `interpolate.ts`; a singleton `{{x}}` becomes `ɵɵinterpolate(x)`), not a raw
+                // string concatenation. Attribute singletons are collapsed instead (see `update_order_rank`).
+                let lowered = if matches!(input.value.kind, AstExprKind::Interpolation { .. }) {
+                    self.style_class_binding_value(&input.value, lowered, false)
+                } else {
+                    lowered
+                };
                 // A plain `[name]="expr"` property binding reifies to `ɵɵdomProperty` in DomOnly mode
                 // and `ɵɵproperty` in Full mode (`reify.ts` `reifyDomProperty`/`reifyProperty`). In
                 // DomOnly mode the property name is run through `DOM_PROPERTY_REMAPPING` (e.g.
                 // `class` → `className`); in Full mode an ARIA-attribute name (`aria-*`) selects
                 // `ɵɵariaProperty` instead and the DOM remapping is not applied.
-                if self.dom_only {
-                    let name = remap_dom_property(&input.name);
+                // `resolve_sanitizers.ts`: the security-context sanitizer, when one applies, is the
+                // trailing argument of the (DOM)property op (`ɵɵproperty("href", v, ɵɵsanitizeUrl)`).
+                let sanitizer = attribute_sanitizer(&input.security_context, &input.name);
+                let sanitized = |mut params: Vec<Expr>| {
+                    if let Some(sanitizer) = sanitizer {
+                        params.push(o::import_expr(sanitizer.reference(), None));
+                    }
+                    params
+                };
+                if self.dom_only && is_aria_attribute(&input.name) {
+                    // DomOnly `[aria-x]="v"` is an ARIA attribute binding: Angular's
+                    // `binding_specialization.ts` turns it into an Attribute op before reify, so it
+                    // reifies to `ɵɵattribute("aria-x", v)` (no DOM remapping).
                     self.update_code
-                        .push(instruction(R3::DomProperty, vec![str_lit(name), lowered]));
+                        .push(instruction(R3::Attribute, sanitized(vec![str_lit(&input.name), lowered])));
+                } else if self.dom_only {
+                    let name = remap_dom_property(&input.name);
+                    self.update_code.push(instruction(
+                        R3::DomProperty,
+                        sanitized(vec![str_lit(name), lowered]),
+                    ));
                 } else if is_aria_attribute(&input.name) {
                     self.update_code
                         .push(instruction(R3::AriaProperty, vec![str_lit(&input.name), lowered]));
                 } else {
-                    self.update_code
-                        .push(instruction(R3::Property, vec![str_lit(&input.name), lowered]));
+                    self.update_code.push(instruction(
+                        R3::Property,
+                        sanitized(vec![str_lit(&input.name), lowered]),
+                    ));
                 }
             }
             BindingType::Class => {
                 // A `[class.x]="a{{exp}}b"` interpolation reifies its value through
                 // `ɵɵinterpolateN("a", exp, "b")` (Angular `interpolate.ts` `ClassProp` interpolation),
-                // not a raw string concat. A non-interpolation value passes through unchanged.
-                let value = self.style_class_binding_value(&input.value, lowered);
+                // not a raw string concat. A non-interpolation value passes through unchanged. The name
+                // loses any `!important` suffix (Angular `naming.ts` `ClassProp`).
+                let value = self.style_class_binding_value(&input.value, lowered, false);
+                let name = treaty_ivy_core::util::strip_important(&input.name).to_string();
                 self.update_code
-                    .push(instruction(R3::ClassProp, vec![str_lit(&input.name), value]));
+                    .push(instruction(R3::ClassProp, vec![str_lit(&name), value]));
             }
             BindingType::Style => {
                 // As `ClassProp` above: a `[style.x]="a{{exp}}b"` value is wrapped in
                 // `ɵɵinterpolateN(...)`. A `style.x.unit` carries the unit as a trailing argument.
-                let value = self.style_class_binding_value(&input.value, lowered);
-                let mut params = vec![str_lit(&input.name), value];
+                let value = self.style_class_binding_value(&input.value, lowered, true);
+                // Angular `naming.ts` `StyleProp`: the name is hyphenated (CSS custom properties are kept)
+                // and loses any `!important` suffix.
+                let name = treaty_ivy_core::util::strip_important(&treaty_ivy_core::util::normalize_style_prop_name(&input.name))
+                    .to_string();
+                let mut params = vec![str_lit(&name), value];
                 if let Some(unit) = &input.unit {
                     params.push(str_lit(unit));
                 }
@@ -4630,11 +5601,23 @@ impl TemplateDefinitionBuilder {
         let referenced_loop_vars: Vec<LoopVar> = if self.view_level > 0 {
             self.loop_vars
                 .iter()
+                .filter(|v| v.context_prop.is_none())
                 .filter(|v| expr_references_implicit(&output.handler, &v.source_name))
                 .cloned()
                 .collect()
         } else {
             Vec::new()
+        };
+        // A context-property alias (`@error (let err)` / `retry = $reset`) read in the handler is
+        // re-rooted at the restored view, which the handler captures as `const <restored> = …`.
+        let has_context_alias = self.loop_vars.iter().any(|v| {
+            v.context_prop.is_some() && expr_references_implicit(&output.handler, &v.source_name)
+        });
+        let restored_ctx: Option<String> = if has_context_alias {
+            self.var_counter += 1;
+            Some(format!("$restored_{}$", self.var_counter))
+        } else {
+            None
         };
 
         // Pre-mint the shared ancestor-context name (`ctx_r<level>`); it is only EMITTED if the
@@ -4658,6 +5641,7 @@ impl TemplateDefinitionBuilder {
             ctx_name: ctx_name.clone(),
             is_embedded: self.view_level > 0,
             reads_ancestor: &reads_ancestor,
+            restored_ctx: restored_ctx.clone(),
         };
         let converted = convert_action_binding_with(&output.handler, &resolver);
 
@@ -4668,6 +5652,7 @@ impl TemplateDefinitionBuilder {
         let needs_view_restore = !referenced_lets.is_empty()
             || !referenced_refs.is_empty()
             || !referenced_loop_vars.is_empty()
+            || has_context_alias
             || needs_next_context;
 
         // Handler body, in Angular `generate_variables.ts` (callback) order: `ɵɵrestoreView(savedView)`
@@ -4680,13 +5665,18 @@ impl TemplateDefinitionBuilder {
             let saved = self.saved_view_var_name();
             let restore_call = o::import_expr(R3::RestoreView.reference(), None)
                 .call_fn(vec![o::variable(saved, None)], false);
-            if referenced_loop_vars.is_empty() {
+            if referenced_loop_vars.is_empty() && restored_ctx.is_none() {
                 // No loop var to read off it — a bare restore suffices.
                 body.push(restore_call.to_stmt());
             } else {
-                // Capture the restored view so the loop variables can be read off it.
-                self.var_counter += 1;
-                let restored = format!("$restored_{}$", self.var_counter);
+                // Capture the restored view so the loop variables / context aliases can be read off it.
+                let restored = match &restored_ctx {
+                    Some(name) => name.clone(),
+                    None => {
+                        self.var_counter += 1;
+                        format!("$restored_{}$", self.var_counter)
+                    }
+                };
                 body.push(Stmt::with_modifiers(
                     StmtKind::DeclareVar { name: restored.clone(), value: Some(restore_call), ty: None },
                     StmtModifier::FINAL,
@@ -4694,10 +5684,10 @@ impl TemplateDefinitionBuilder {
                 for v in &referenced_loop_vars {
                     // The item reads `ctx.$implicit`; the special vars (`$index`/`$count`/…) read their
                     // own name — the same mapping as `collect_loop_vars`.
-                    let prop = if v.source_name.starts_with('$') {
-                        v.source_name.clone()
-                    } else {
-                        "$implicit".to_string()
+                    let prop = match &v.ctx_key {
+                        Some(key) => key.clone(),
+                        None if v.source_name.starts_with('$') => v.source_name.clone(),
+                        None => "$implicit".to_string(),
                     };
                     body.push(Stmt::with_modifiers(
                         StmtKind::DeclareVar {
@@ -4726,8 +5716,24 @@ impl TemplateDefinitionBuilder {
                 StmtModifier::FINAL,
             ));
         }
+        // A two-way `[(x)]` listener (`ParsedEventType::TwoWay`) sets its target and returns the
+        // event: `ɵɵtwoWayBindingSet(target, $event) || (target = $event); return $event;`
+        // (Angular `ingest.ts` `makeTwoWayListenerHandlerOps` + `transform_two_way_binding_set.ts`).
+        let is_two_way = matches!(output.kind, ParsedEventType::TwoWay);
+        let event_ref = || o::variable(EVENT_NAME, None);
         body.extend(converted.stmts);
-        let ret = if needs_view_restore {
+        let ret = if is_two_way {
+            let target = converted.expr;
+            let set = o::import_expr(R3::TwoWayBindingSet.reference(), None)
+                .call_fn(vec![target.clone(), event_ref()], false)
+                .or(target.set(event_ref()));
+            body.push(set.to_stmt());
+            if needs_view_restore {
+                o::import_expr(R3::ResetView.reference(), None).call_fn(vec![event_ref()], false)
+            } else {
+                event_ref()
+            }
+        } else if needs_view_restore {
             o::import_expr(R3::ResetView.reference(), None).call_fn(vec![converted.expr], false)
         } else {
             converted.expr
@@ -4771,7 +5777,7 @@ impl TemplateDefinitionBuilder {
             slot,
         );
         // Only add the `$event` parameter when the handler AST actually references `$event`.
-        let params = if handler_references_dollar_event(&output.handler) {
+        let params = if is_two_way || handler_references_dollar_event(&output.handler) {
             vec![FnParam::new(EVENT_NAME, None)]
         } else {
             vec![]
@@ -4803,7 +5809,10 @@ impl TemplateDefinitionBuilder {
         // and its event-name argument is the synthetic `@${name}.${phase}` form
         // (`prepareSyntheticListenerName`). A regular listener reifies to `ɵɵdomListener` in DomOnly
         // mode / `ɵɵlistener` otherwise, with the raw event name.
-        let listener_ref = if self.dom_only && !is_legacy_animation_listener {
+        // A two-way listener reifies to `ɵɵtwoWayListener` in both modes (Angular `reify.ts`).
+        let listener_ref = if is_two_way {
+            R3::TwoWayListener
+        } else if self.dom_only && !is_legacy_animation_listener {
             R3::DomListener
         } else {
             R3::Listener
@@ -4829,11 +5838,12 @@ impl TemplateDefinitionBuilder {
     /// [`R3::TemplateRefExtractor`] is appended as the `localRefExtractor`.
     fn build_template(&mut self, template: &Template) {
         let slot = self.allocate_data_slot();
+        self.note_first_target_slot(slot);
         // Each `#ref` on the host reserves one extra data slot (`liftLocalRefs`:
         // `numSlotsUsed += localRefs.length`).
         for r in &template.references {
             let ref_slot = self.allocate_data_slot();
-            self.register_local_ref(&r.name, ref_slot);
+            self.register_local_ref(&r.name, ref_slot, slot, r.value.is_empty());
         }
         // A `<ng-template>`'s own `[prop]` inputs are collected — like an element's — under the
         // `AttributeMarker.Bindings` group of its const attrs (Angular `serializeAttributes`), so
@@ -4892,11 +5902,47 @@ impl TemplateDefinitionBuilder {
             c.interpolations = self.collect_child_i18n_interpolations(&template.children);
             c
         });
+        // A `<ng-template let-x="prop">` variable reads `ctx.<prop>` of the embedded view's context
+        // (`$implicit` for a bare `let-x`). Angular (`generate_variables.ts`) declares each one as
+        // `const x_rN = ctx.<prop>;` at the head of the view's update block and reads it by that name.
+        let mut template_vars: Vec<LoopVar> = Vec::new();
+        let mut template_prelude: Vec<Stmt> = Vec::new();
+        for var in &template.variables {
+            // Angular's `variable_optimization` drops a variable nothing reads (before naming). A
+            // variable read only by a nested view stays in scope for it, and that view re-declares it
+            // (`ancestor_context_prelude`), so this view declares it only when its own bindings read it.
+            if !for_body_references(&template.children, &var.name) {
+                continue;
+            }
+            self.var_counter += 1;
+            let local_name = format!("{}_r{}", var.name, self.var_counter);
+            if template
+                .children
+                .iter()
+                .any(|n| view_body_references(n, &var.name))
+            {
+                template_prelude.push(Stmt::with_modifiers(
+                    StmtKind::DeclareVar {
+                        name: local_name.clone(),
+                        value: Some(o::variable(CONTEXT_NAME, None).prop(var.value.clone())),
+                        ty: None,
+                    },
+                    StmtModifier::FINAL,
+                ));
+            }
+            template_vars.push(LoopVar {
+                source_name: var.name.clone(),
+                local_name,
+                inline: None,
+                context_prop: None,
+                ctx_key: Some(var.value.clone()),
+            });
+        }
         let (fn_ref, decls, vars) = self.build_embedded_view_i18n(
             fn_name,
             template.children.clone(),
-            Vec::new(),
-            Vec::new(),
+            template_vars,
+            template_prelude,
             tmpl_child_i18n,
         );
 
@@ -4908,7 +5954,8 @@ impl TemplateDefinitionBuilder {
             fn_ref,
             num(decls as f64),
             num(vars as f64),
-            str_lit(&tag_name),
+            // `ingestTemplate`: the op's tag is the local name; the namespace only feeds the fn name.
+            str_lit(&crate::ml_parser::split_ns_name(&tag_name).1),
             attrs_index.map(|i| num(i as f64)).unwrap_or_else(o::null_expr),
         ];
         if let Some(refs_idx) = local_refs_index {
@@ -4978,7 +6025,7 @@ impl TemplateDefinitionBuilder {
                 Node::Element(el) => {
                     self.local_refs_index(&el.references);
                     for r in &el.references {
-                        self.preregister_local_ref(&r.name);
+                        self.preregister_local_ref(&r.name, r.value.is_empty());
                     }
                     self.prepass_local_ref_consts(&el.children);
                 }
@@ -4987,7 +6034,7 @@ impl TemplateDefinitionBuilder {
                     // is a separate child view, so we do NOT recurse into its children here.
                     self.local_refs_index(&tmpl.references);
                     for r in &tmpl.references {
-                        self.preregister_local_ref(&r.name);
+                        self.preregister_local_ref(&r.name, r.value.is_empty());
                     }
                 }
                 _ => {}
@@ -4996,8 +6043,8 @@ impl TemplateDefinitionBuilder {
     }
 
     /// Pre-intern the local-reference consts of every DESCENDANT view (control-flow / `<ng-template>`
-    /// / loop bodies), BREADTH-FIRST by view level, into the component-global const pool — AFTER this
-    /// (root) view's own refs and BEFORE the main walk interns any Template/attribute const. Angular's
+    /// / loop bodies), depth-first pre-order over the view tree, into the component-global const pool
+    /// — AFTER this (root) view's own refs and BEFORE the main walk interns any Template/attribute const. Angular's
     /// `liftLocalRefs` runs across the WHOLE template before `collectElementConsts`, so EVERY view's
     /// local-ref consts (root view first, then each child view in creation order) precede every
     /// attribute/`[Template,...]` const in the pool. Our per-view prepass only interns the current
@@ -5010,15 +6057,14 @@ impl TemplateDefinitionBuilder {
     /// and it is const-only: no slot pre-registration / generated-local side effects (those stay
     /// per-view in `prepass_local_ref_consts`).
     fn prepass_descendant_local_ref_consts(&mut self, root_nodes: &[Node]) {
-        // BFS queue of child-view node lists, seeded with the root view's immediate child views.
-        let mut queue: std::collections::VecDeque<Vec<Node>> = std::collections::VecDeque::new();
-        Self::collect_child_view_bodies(root_nodes, &mut queue);
-        while let Some(view_nodes) = queue.pop_front() {
-            // Intern THIS child view's local-ref consts in create (pre-order) order, recursing into
-            // same-view element children but NOT into deeper views (those are enqueued separately so
-            // the breadth-first, view-level ordering is preserved).
+        // Angular's `job.units` is the view allocation order: depth-first pre-order over the view
+        // tree (`ingestTemplate` allocates a child view, then ingests its children before the next
+        // sibling). Intern each child view's refs, then its own descendants, before its next sibling.
+        let mut bodies: std::collections::VecDeque<Vec<Node>> = std::collections::VecDeque::new();
+        Self::collect_child_view_bodies(root_nodes, &mut bodies);
+        for view_nodes in bodies {
             self.intern_view_local_ref_consts(&view_nodes);
-            Self::collect_child_view_bodies(&view_nodes, &mut queue);
+            self.prepass_descendant_local_ref_consts(&view_nodes);
         }
     }
 
@@ -5140,12 +6186,15 @@ impl TemplateDefinitionBuilder {
             .with_dom_only(self.dom_only)
             .with_deferred_deps(self.deferred_deps.clone());
         let mut nested = TemplateDefinitionBuilder::new(&nested_input);
+        nested.foreign_components = self.foreign_components.clone();
         // SHARE the component's single constant pool with the nested view (Angular threads one
         // `ConstantPool` through the whole view tree). The nested view interns its own element-attr /
         // local-ref consts DIRECTLY into this pool, so the const index baked into each nested
         // instruction is the GLOBAL `consts:` index — no post-hoc re-intern (which would renumber the
         // nested consts and leave the instructions pointing at the wrong entry).
         nested.const_pool = std::rc::Rc::clone(&self.const_pool);
+        nested.view_seq = self.const_pool.borrow_mut().alloc_view_seq();
+        nested.ancestor_vars = self.ancestor_vars_for_child();
         nested.i18n_child_view = i18n_child_view;
         // An embedded view is never the root: its hoisted descendant fns bubble up to the root
         // (below) rather than being inlined into this view body, so each is emitted exactly once.
@@ -5166,14 +6215,12 @@ impl TemplateDefinitionBuilder {
         // DOWN into the nested view so a `<ng-content>` reached inside it continues the global
         // numbering, then copy the advanced state back UP so the root's prepended projectionDef sees
         // all of them.
-        nested.projection_count = self.projection_count;
         nested.all_projection_selectors = std::mem::take(&mut self.all_projection_selectors);
         nested.has_default_projection = self.has_default_projection;
         let tmpl_fn = nested.build_template_function(&nested_input);
         let decls = nested.data_index;
         let vars = nested.binding_slots;
         self.var_counter = nested.var_counter;
-        self.projection_count = nested.projection_count;
         self.all_projection_selectors = std::mem::take(&mut nested.all_projection_selectors);
         self.has_default_projection = nested.has_default_projection;
         // The const pool is SHARED (same `Rc<RefCell<ConstantPool>>`): the nested view already
@@ -5231,8 +6278,22 @@ impl TemplateDefinitionBuilder {
         let mut branch_slots: Vec<usize> = Vec::with_capacity(block.branches.len());
         let anchor_slot = self.data_index;
 
+        // Any pipe in a branch condition is consumed by the conditional anchor op (`addPipeToCreationBlock`).
+        // The conditions are lowered BEFORE the branches take their slots: Angular's slot allocation puts
+        // those `ɵɵpipe` ops right after the first branch's create op, ahead of the later branches.
+        self.current_target_slot = anchor_slot;
+        let lowered_conditions: Vec<Option<Expr>> = block
+            .branches
+            .iter()
+            .map(|branch| branch.expression.as_ref().map(|cond| self.lower_expr(cond)))
+            .collect();
+
         for (i, branch) in block.branches.iter().enumerate() {
             let slot = self.allocate_data_slot();
+            self.note_first_target_slot(slot);
+            if i == 0 {
+                self.assign_positional_pipe_slots_for(slot);
+            }
             branch_slots.push(slot);
             let fn_name = format!("{}_Conditional_{}_Template", self.base_name, slot);
             // When this `@if` chain sits inside an `i18n` block, each branch body becomes an i18n
@@ -5259,7 +6320,7 @@ impl TemplateDefinitionBuilder {
             } else {
                 R3::ConditionalBranchCreate
             };
-            let tag = single_root_tag(&branch.children);
+            let tag = single_root_tag(&branch.children, &self.foreign_components);
             // `instruction.ts` `conditionalCreate`/`conditionalBranchCreate` trim trailing `null`
             // arguments, so a text-only branch (no element tag) drops the final `null` tag arg.
             let mut params = vec![num(slot as f64), fn_ref, num(decls as f64), num(vars as f64), tag];
@@ -5284,13 +6345,10 @@ impl TemplateDefinitionBuilder {
             self.allocate_binding_slots(1);
         }
 
-        // Any pipe in a branch condition is consumed by the conditional anchor op (`addPipeToCreationBlock`).
-        self.current_target_slot = anchor_slot;
-        for (idx, branch) in block.branches.iter().enumerate().rev() {
-            let Some(cond) = &branch.expression else {
+        for (idx, cond_expr) in lowered_conditions.into_iter().enumerate().rev() {
+            let Some(cond_expr) = cond_expr else {
                 continue; // default handled above.
             };
-            let cond_expr = self.lower_expr(cond);
             let slot_lit = num(branch_slots[idx] as f64);
             test = cond_expr.conditional(slot_lit, Some(test));
         }
@@ -5299,6 +6357,154 @@ impl TemplateDefinitionBuilder {
         self.advance_to(anchor_slot);
         self.update_code
             .push(instruction(R3::Conditional, vec![test]));
+    }
+
+    /// Lower a `@boundary { … } @error { … }` block (`ingestBoundaryBlock` + `boundary_conditions.ts`
+    /// + `reify.ts`).
+    ///
+    /// Creation: `ɵɵboundaryCreate(slot)` for the boundary container, then one
+    /// `ɵɵconditionalBranchCreate` per branch: the primary block (`<fn>_Primary_<slot>_Template`) and
+    /// each `@error` (`<fn>_Error_<slot>_Template`). Update: `ɵɵboundaryUpdate(slot, matching, primary)`
+    /// where `matching` is `bnd.error === null ? primary : <when-chain over the @error branches>`, the
+    /// fallback being the unconditional `@error` slot or `-1`. `bnd` is `ɵɵgetBoundary(slot)` inline,
+    /// or a `const bnd_rN = ɵɵgetBoundary(slot)` declared at the top of the update block when the
+    /// boundary state is read more than once (the variable is inlined otherwise, as in
+    /// `variable_optimization.ts`).
+    fn build_boundary_block(&mut self, block: &BoundaryBlock) {
+        let boundary_slot = self.allocate_data_slot();
+        self.creation_code
+            .push(instruction(R3::BoundaryCreate, vec![num(boundary_slot as f64)]));
+
+        // Primary branch: the boundary's main content, reified with its single root tag (if any).
+        let primary_slot = self.allocate_data_slot();
+        let primary_name = format!("{}_Primary_{}_Template", self.base_name, primary_slot);
+        let primary_tag = single_root_tag(&block.children, &self.foreign_components);
+        let (primary_ref, primary_decls, primary_vars) = self.build_embedded_view(
+            primary_name,
+            block.children.clone(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let mut primary_params = vec![
+            num(primary_slot as f64),
+            primary_ref,
+            num(primary_decls as f64),
+            num(primary_vars as f64),
+            primary_tag,
+        ];
+        trim_trailing_nulls(&mut primary_params);
+        self.creation_code
+            .push(instruction(R3::ConditionalBranchCreate, primary_params));
+
+        // `@error` branches, in source order. Their context variables (`$error`, `$reset`, and any
+        // `let` aliases) read from this view's own context object.
+        let mut error_slots: Vec<usize> = Vec::with_capacity(block.error_blocks.len());
+        for error_block in &block.error_blocks {
+            let slot = self.allocate_data_slot();
+            error_slots.push(slot);
+            let fn_name = format!("{}_Error_{}_Template", self.base_name, slot);
+            let aliases: Vec<LoopVar> = error_block
+                .context_variables
+                .iter()
+                .map(|v| LoopVar {
+                    source_name: v.name.clone(),
+                    local_name: v.name.clone(),
+                    inline: None,
+                    context_prop: Some(v.value.clone()),
+                    ctx_key: None,
+                })
+                .collect();
+            let (fn_ref, decls, vars) =
+                self.build_embedded_view(fn_name, error_block.children.clone(), aliases, Vec::new());
+            let mut params = vec![
+                num(slot as f64),
+                fn_ref,
+                num(decls as f64),
+                num(vars as f64),
+            ];
+            trim_trailing_nulls(&mut params);
+            self.creation_code
+                .push(instruction(R3::ConditionalBranchCreate, params));
+        }
+
+        // The update block reads the boundary state; one binding slot backs `ɵɵboundaryUpdate`.
+        self.allocate_binding_slots(1);
+
+        // Lower the `when` conditions ONCE. A `$error`-valued alias (`let err` / `$error`) reads
+        // `<bnd>.error`; the state is first referenced through a placeholder variable so the single
+        // lowering is reused whichever way the state ends up being read (Angular `BoundaryStateExpr`).
+        const STATE_PLACEHOLDER: &str = "\u{0}bnd_state";
+        let state_placeholder = o::variable(STATE_PLACEHOLDER.to_string(), None).prop("error");
+        let mut test = self.boundary_test(block, &state_placeholder, &error_slots, primary_slot);
+        let state_read = || {
+            o::import_expr(R3::GetBoundary.reference(), None)
+                .call_fn(vec![num(boundary_slot as f64)], false)
+        };
+        // Read more than once (the `=== null` check plus any `when`) => materialise the state in a
+        // `const` at the top of the update block; otherwise the read is inlined in place.
+        if replace_read_var(&mut test, STATE_PLACEHOLDER, None) > 1 {
+            self.var_counter += 1;
+            let local = format!("bnd_r{}", self.var_counter);
+            replace_read_var(&mut test, STATE_PLACEHOLDER, Some(&o::variable(local.clone(), None)));
+            let prelude = Stmt::with_modifiers(
+                StmtKind::DeclareVar {
+                    name: local,
+                    value: Some(state_read()),
+                    ty: None,
+                },
+                StmtModifier::FINAL,
+            );
+            self.update_code.insert(0, prelude);
+        } else {
+            replace_read_var(&mut test, STATE_PLACEHOLDER, Some(&state_read()));
+        }
+
+        // Update: advance to the boundary slot, then `ɵɵboundaryUpdate(slot, matching, primary)`.
+        self.advance_to(boundary_slot);
+        self.update_code.push(instruction(
+            R3::BoundaryUpdate,
+            vec![num(boundary_slot as f64), test, num(primary_slot as f64)],
+        ));
+    }
+
+    /// Build the `matching` selector of a boundary: `state === null ? primary : <@error chain>`, where
+    /// the chain tests each conditional `@error` in source order and falls back to the unconditional
+    /// `@error` slot (or `-1`). Mirrors `generateBoundaryConditions` (`boundary_conditions.ts`).
+    fn boundary_test(
+        &mut self,
+        block: &BoundaryBlock,
+        state: &Expr,
+        error_slots: &[usize],
+        primary_slot: usize,
+    ) -> Expr {
+        let mut fallback: Expr = num(-1.0);
+        for (error_block, slot) in block.error_blocks.iter().zip(error_slots) {
+            if error_block.expression.is_none() {
+                fallback = num(*slot as f64);
+            }
+        }
+        let mut result = fallback;
+        for (error_block, slot) in block.error_blocks.iter().zip(error_slots).rev() {
+            let Some(expression) = &error_block.expression else {
+                continue;
+            };
+            // Every `$error`-valued context variable of this branch reads the boundary state.
+            let saved = self.loop_vars.len();
+            for v in error_block.context_variables.iter().filter(|v| v.value == "$error") {
+                self.loop_vars.push(LoopVar {
+                    source_name: v.name.clone(),
+                    local_name: v.name.clone(),
+                    inline: Some(state.clone()),
+                    context_prop: None,
+                    ctx_key: None,
+                });
+            }
+            let condition = self.lower_expr(expression);
+            self.loop_vars.truncate(saved);
+            result = condition.conditional(num(*slot as f64), Some(result));
+        }
+        let is_healthy = state.clone().identical(o::null_expr());
+        is_healthy.conditional(num(primary_slot as f64), Some(result))
     }
 
     /// Lower a `@switch` (`SwitchBlock`) onto the same `ɵɵconditional` mechanism.
@@ -5343,7 +6549,7 @@ impl TemplateDefinitionBuilder {
             } else {
                 R3::ConditionalBranchCreate
             };
-            let tag = single_root_tag(&group.children);
+            let tag = single_root_tag(&group.children, &self.foreign_components);
             // `instruction.ts` `conditionalCreate`/`conditionalBranchCreate` trim trailing `null`
             // arguments (exactly as `build_if_block` does), so a case whose body has no single
             // element root (e.g. a multi-node `before<span>…</span>after` body inside `i18n`, whose
@@ -5497,7 +6703,7 @@ impl TemplateDefinitionBuilder {
         let (track_fn, track_uses_component_instance) = self.build_track_fn(block, slot);
 
         // The item element tag (`'li'`) when the body has a single element root, else null.
-        let tag = single_root_tag(&block.children);
+        let tag = single_root_tag(&block.children, &self.foreign_components);
         let attrs = o::null_expr();
 
         let mut params = vec![
@@ -5544,7 +6750,7 @@ impl TemplateDefinitionBuilder {
             params.push(empty_fn);
             params.push(num(empty_decls as f64));
             params.push(num(empty_vars as f64));
-            params.push(single_root_tag(&empty.children));
+            params.push(single_root_tag(&empty.children, &self.foreign_components));
             // `ɵɵrepeaterCreate` trims a trailing `null` empty-view tag (Angular `instruction.ts`).
             trim_trailing_nulls(&mut params);
         } else if track_uses_component_instance {
@@ -5678,34 +6884,125 @@ impl TemplateDefinitionBuilder {
     /// (item, `$index`, `$count`). Unreferenced variables are skipped (and consume no `_rN` index),
     /// matching the `variable_optimization` phase which drops unused embedded-view variables.
     fn collect_loop_vars(&mut self, block: &ForLoopBlock) -> (Vec<LoopVar>, Vec<Stmt>) {
-        // (source name the author writes, ctx property it reads).
+        // (source name the author writes, the context value it reads): the item, the implicit
+        // variables in Angular's fixed order, then the `let` aliases (`let idx = $index`).
         let mut candidates: Vec<(String, String)> =
             vec![(block.item.name.clone(), "$implicit".to_string())];
         for implicit in ["$index", "$count", "$first", "$last", "$even", "$odd"] {
             candidates.push((implicit.to_string(), implicit.to_string()));
         }
+        for v in &block.context_variables {
+            if !candidates.iter().any(|(src, _)| src == &v.name) {
+                candidates.push((v.name.clone(), v.value.clone()));
+            }
+        }
 
-        let mut vars = Vec::new();
-        let mut prelude = Vec::new();
-        for (source_name, ctx_property) in candidates {
+        let mut vars: Vec<LoopVar> = Vec::new();
+        let mut prelude: Vec<Stmt> = Vec::new();
+        // The `$index` / `$count` locals the computed variables read (Angular `ingestForBlock`:
+        // `$first` is `ɵ$index === 0`, `$last` is `ɵ$index === ɵ$count - 1`, …).
+        let mut index_local: Option<String> = None;
+        let mut count_local: Option<String> = None;
+        // Computed variables, by position in `vars`: (source name, context value).
+        let mut computed: Vec<(usize, String, String)> = Vec::new();
+        for (source_name, ctx_value) in candidates {
             if !for_body_references(&block.children, &source_name) {
+                continue;
+            }
+            // Declared in this body only when its own bindings read it; a variable read only by a
+            // nested view is re-declared there (`ancestor_context_prelude`).
+            let declared_here = block
+                .children
+                .iter()
+                .any(|n| view_body_references(n, &source_name));
+            if matches!(ctx_value.as_str(), "$first" | "$last" | "$even" | "$odd") {
+                // A computed variable has no const of its own: it is an inline expression over the
+                // index (and count) local, filled in below.
+                computed.push((vars.len(), source_name.clone(), ctx_value.clone()));
+                vars.push(LoopVar {
+                    source_name,
+                    local_name: String::new(),
+                    inline: None,
+                    context_prop: None,
+                    ctx_key: Some(ctx_value),
+                });
                 continue;
             }
             self.var_counter += 1;
             let local_name = format!("{}_r{}", source_name, self.var_counter);
-            // `const <local> = ctx.<property>;`
-            prelude.push(Stmt::with_modifiers(
-                StmtKind::DeclareVar {
-                    name: local_name.clone(),
-                    value: Some(o::variable(CONTEXT_NAME, None).prop(ctx_property.clone())),
-                    ty: None,
-                },
-                StmtModifier::FINAL,
-            ));
+            if declared_here {
+                // `const <local> = ctx.<property>;`
+                prelude.push(Stmt::with_modifiers(
+                    StmtKind::DeclareVar {
+                        name: local_name.clone(),
+                        value: Some(o::variable(CONTEXT_NAME, None).prop(ctx_value.clone())),
+                        ty: None,
+                    },
+                    StmtModifier::FINAL,
+                ));
+                if ctx_value == "$index" && index_local.is_none() {
+                    index_local = Some(local_name.clone());
+                }
+                if ctx_value == "$count" && count_local.is_none() {
+                    count_local = Some(local_name.clone());
+                }
+            }
             vars.push(LoopVar {
                 source_name,
                 local_name,
+                inline: None,
+                context_prop: None,
+                ctx_key: Some(ctx_value),
             });
+        }
+
+        if !computed.is_empty() {
+            let needs_count = computed.iter().any(|(_, _, value)| value == "$last");
+            // Shared index / count locals for the computed variables, declared on demand.
+            let mut hidden_const = |this: &mut Self, prop: &str| -> String {
+                this.var_counter += 1;
+                let name = format!("{}_r{}", prop, this.var_counter);
+                prelude.push(Stmt::with_modifiers(
+                    StmtKind::DeclareVar {
+                        name: name.clone(),
+                        value: Some(o::variable(CONTEXT_NAME, None).prop(prop.to_string())),
+                        ty: None,
+                    },
+                    StmtModifier::FINAL,
+                ));
+                name
+            };
+            let index = match index_local {
+                Some(name) => name,
+                None => hidden_const(self, "$index"),
+            };
+            let count = if needs_count {
+                match count_local {
+                    Some(name) => Some(name),
+                    None => Some(hidden_const(self, "$count")),
+                }
+            } else {
+                None
+            };
+            for (position, source_name, value) in computed {
+                let index_read = o::variable(index.clone(), None);
+                let expr = match value.as_str() {
+                    "$first" => index_read.identical(num(0.0)),
+                    "$last" => index_read.identical(
+                        o::variable(count.clone().unwrap_or_default(), None).minus(num(1.0)),
+                    ),
+                    "$even" => index_read.modulo(num(2.0)).identical(num(0.0)),
+                    _ => index_read.modulo(num(2.0)).not_identical(num(0.0)),
+                };
+                self.var_counter += 1;
+                vars[position] = LoopVar {
+                    local_name: format!("{}_r{}", source_name, self.var_counter),
+                    source_name,
+                    inline: Some(expr),
+                    context_prop: None,
+                    ctx_key: Some(value),
+                };
+            }
         }
         (vars, prelude)
     }
@@ -5796,6 +7093,9 @@ impl TemplateDefinitionBuilder {
             self.loop_vars.push(LoopVar {
                 source_name: cl.name.clone(),
                 local_name,
+                inline: None,
+                context_prop: None,
+                ctx_key: None,
             });
         }
 
@@ -5922,6 +7222,9 @@ impl TemplateDefinitionBuilder {
             self.loop_vars.push(LoopVar {
                 source_name: decl.name.clone(),
                 local_name,
+                inline: None,
+                context_prop: None,
+                ctx_key: None,
             });
         } else {
             // Unused in this view: the value runs as a bare statement (for its side effects / the
@@ -6010,6 +7313,7 @@ impl TemplateDefinitionBuilder {
         // Secondary views (`@placeholder`/`@loading`/`@error`), each a one-slot `ɵɵdomTemplate`,
         // allocated before the `ɵɵdefer` op (Angular ingests their views ahead of the defer op).
         let mut placeholder: Option<(usize, Expr, usize, usize)> = None;
+        let mut placeholder_targets: Option<DeferViewTargets> = None;
         let mut loading: Option<(usize, Expr, usize, usize)> = None;
         let mut error: Option<(usize, Expr, usize, usize)> = None;
         // Slot/view allocation order is LOADING, then PLACEHOLDER, then ERROR (Angular
@@ -6027,6 +7331,7 @@ impl TemplateDefinitionBuilder {
             let (r, d, v) =
                 self.build_deferred_view(f, ph.children.clone(), placeholder_child_i18n);
             placeholder = Some((s, r, d, v));
+            placeholder_targets = Some(self.last_defer_view_targets.clone());
         }
         if let Some(er) = &deferred.error {
             let s = self.allocate_data_slot();
@@ -6082,6 +7387,14 @@ impl TemplateDefinitionBuilder {
         // interned timing-config const indices; `enableTimerScheduling` becomes the
         // `ɵɵdeferEnableTimerScheduling` import when any timing config is present (else `null`); the
         // trailing `flags` arg is always `null` here (basic block).
+        // `ɵɵenableIncrementalHydrationRuntime()` once per view, immediately before the first defer op
+        // that has hydrate triggers (Angular `insert_incremental_hydration_runtime.ts`).
+        let has_hydrate = !deferred.hydrate_triggers.defined_in_order().is_empty();
+        if has_hydrate && !self.hydration_runtime_emitted {
+            self.creation_code
+                .push(instruction(R3::EnableIncrementalHydrationRuntime, vec![]));
+            self.hydration_runtime_emitted = true;
+        }
         let mut defer_params = vec![
             num(defer_slot as f64),
             num(main_slot as f64),
@@ -6109,14 +7422,16 @@ impl TemplateDefinitionBuilder {
             } else {
                 o::null_expr()
             },
-            o::null_expr(), // flags (TDeferDetailsFlags) — always null for a basic defer block.
+            // `TDeferDetailsFlags.HasHydrateTriggers` (1) when the block has any hydrate trigger
+            // (`ingest.ts` `calcDeferBlockFlags`), else null.
+            if has_hydrate { num(1.0) } else { o::null_expr() },
         ];
         trim_trailing_nulls(&mut defer_params);
         self.creation_code.push(instruction(R3::Defer, defer_params));
 
-        // Trigger instructions (regular `on` triggers only; prefetch/hydrate are a separate
-        // subsystem). Default to `ɵɵdeferOnIdle()` when no concrete trigger is given.
-        self.emit_defer_triggers(&deferred.triggers);
+        // Trigger instructions: hydrate, then main, then prefetch, then the idle default
+        // (`ingest.ts` `ingestDeferBlock`).
+        self.emit_defer_triggers(deferred, placeholder_targets.as_ref());
 
         // A `when <cond>` trigger is an UPDATE op (`ɵɵdeferWhen(<cond>)`), not a create-block `on`
         // trigger: the binding cursor advances to the defer op's slot, then `ɵɵdeferWhen` re-evaluates
@@ -6150,37 +7465,75 @@ impl TemplateDefinitionBuilder {
         }
     }
 
-    /// Emit the create-block trigger instructions for a defer block's regular trigger set, defaulting
-    /// to `ɵɵdeferOnIdle()` ONLY when no concrete trigger is present (`ingest.ts`: the idle fallback
-    /// is suppressed when any concrete `on` OR `when` trigger exists, since `when` is a real trigger
-    /// even though it reifies as a separate `ɵɵdeferWhen` UPDATE op).
-    fn emit_defer_triggers(&mut self, triggers: &DeferredBlockTriggers) {
-        let mut emitted_concrete = false;
-        for trigger in triggers.defined_in_order() {
-            let (reference, args): (R3, Vec<Expr>) = match &trigger.kind {
-                DeferredTriggerKind::Idle { timeout } => (
-                    R3::DeferOnIdle,
-                    timeout.map(|t| vec![num(t)]).unwrap_or_default(),
-                ),
-                DeferredTriggerKind::Immediate => (R3::DeferOnImmediate, vec![]),
-                DeferredTriggerKind::Timer { delay } => (R3::DeferOnTimer, vec![num(*delay)]),
-                DeferredTriggerKind::Hover { .. } => (R3::DeferOnHover, vec![]),
-                DeferredTriggerKind::Interaction { .. } => (R3::DeferOnInteraction, vec![]),
-                DeferredTriggerKind::Viewport { .. } => (R3::DeferOnViewport, vec![]),
-                // `when` reifies as a `ɵɵdeferWhen` UPDATE op (emitted separately), but it IS a
-                // concrete trigger, so it suppresses the idle fallback. `never` is hydrate-only.
-                DeferredTriggerKind::When { .. } => {
-                    emitted_concrete = true;
-                    continue;
-                }
-                DeferredTriggerKind::Never => continue,
-            };
-            emitted_concrete = true;
-            self.creation_code.push(instruction(reference, args));
-        }
-        if !emitted_concrete {
+    /// Emit the create-block trigger instructions of a defer block (Angular `ingestDeferBlock` +
+    /// `ingestDeferTriggers`): the hydrate triggers, then the main triggers, then the prefetch
+    /// triggers, each group in Angular's kind order (idle, immediate, timer, hover, interaction,
+    /// viewport, never). When the main group has no concrete trigger (`on` or `when`), a default
+    /// `ɵɵdeferOnIdle()` is appended last.
+    fn emit_defer_triggers(&mut self, deferred: &DeferredBlock, placeholder: Option<&DeferViewTargets>) {
+        self.emit_defer_trigger_group(&deferred.hydrate_triggers, DeferOpModifier::Hydrate, placeholder);
+        let main_concrete =
+            self.emit_defer_trigger_group(&deferred.triggers, DeferOpModifier::Main, placeholder);
+        self.emit_defer_trigger_group(&deferred.prefetch_triggers, DeferOpModifier::Prefetch, placeholder);
+        if !main_concrete {
             self.creation_code.push(instruction(R3::DeferOnIdle, vec![]));
         }
+    }
+
+    /// Emit one trigger group's `ɵɵdeferOn*` / `ɵɵdeferPrefetchOn*` / `ɵɵdeferHydrateOn*` create ops in
+    /// Angular's kind order. Returns whether the group holds a concrete trigger (`on` or `when`).
+    /// `when` reifies as a `ɵɵdeferWhen` UPDATE op (emitted separately) but still counts as concrete.
+    fn emit_defer_trigger_group(
+        &mut self,
+        triggers: &DeferredBlockTriggers,
+        modifier: DeferOpModifier,
+        placeholder: Option<&DeferViewTargets>,
+    ) -> bool {
+        let mut ordered = triggers.defined_in_order();
+        ordered.sort_by_key(|t| defer_trigger_rank(&t.kind));
+        let mut concrete = false;
+        for trigger in ordered {
+            let (reference, args): (R3, Vec<Expr>) = match &trigger.kind {
+                DeferredTriggerKind::When { .. } => {
+                    concrete = concrete || modifier == DeferOpModifier::Main;
+                    continue;
+                }
+                // `never` is a hydrate-only trigger (`ɵɵdeferHydrateNever()`).
+                DeferredTriggerKind::Never => {
+                    if modifier == DeferOpModifier::Hydrate {
+                        self.creation_code.push(instruction(R3::DeferHydrateNever, vec![]));
+                    }
+                    continue;
+                }
+                DeferredTriggerKind::Idle { timeout } => (
+                    defer_on_instruction(modifier, "Idle"),
+                    timeout.map(|t| vec![num(t)]).unwrap_or_default(),
+                ),
+                DeferredTriggerKind::Immediate => {
+                    (defer_on_instruction(modifier, "Immediate"), vec![])
+                }
+                DeferredTriggerKind::Timer { delay } => {
+                    (defer_on_instruction(modifier, "Timer"), vec![num(*delay)])
+                }
+                DeferredTriggerKind::Hover { .. } => (
+                    defer_on_instruction(modifier, "Hover"),
+                    self.defer_trigger_args(modifier, &trigger.kind, placeholder),
+                ),
+                DeferredTriggerKind::Interaction { .. } => (
+                    defer_on_instruction(modifier, "Interaction"),
+                    self.defer_trigger_args(modifier, &trigger.kind, placeholder),
+                ),
+                DeferredTriggerKind::Viewport { .. } => (
+                    defer_on_instruction(modifier, "Viewport"),
+                    self.defer_trigger_args(modifier, &trigger.kind, placeholder),
+                ),
+            };
+            if modifier == DeferOpModifier::Main {
+                concrete = true;
+            }
+            self.creation_code.push(instruction(reference, args));
+        }
+        concrete
     }
 
     /// Build a `@defer` secondary/main view as a hoisted, named DOM-only embedded view, returning
@@ -6198,6 +7551,7 @@ impl TemplateDefinitionBuilder {
             .with_dom_only(true)
             .with_deferred_deps(self.deferred_deps.clone());
         let mut nested = TemplateDefinitionBuilder::new(&nested_input);
+        nested.foreign_components = self.foreign_components.clone();
         nested.is_root = false;
         nested.view_level = self.view_level + 1;
         nested.var_counter = self.var_counter;
@@ -6207,6 +7561,8 @@ impl TemplateDefinitionBuilder {
         // interns its consts at their global indices, so its instructions carry global const indices
         // and no re-intern (which would renumber them) is needed.
         nested.const_pool = std::rc::Rc::clone(&self.const_pool);
+        nested.view_seq = self.const_pool.borrow_mut().alloc_view_seq();
+        nested.ancestor_vars = self.ancestor_vars_for_child();
         // When the defer block is inside an `i18n` region, thread the sub-template continuation so
         // the view brackets its content in `ɵɵi18nStart(0, msg, subIdx)` … `ɵɵi18nEnd()` and folds
         // its text/element children into the i18n placeholder ops (see `build_deferred_block`).
@@ -6214,6 +7570,15 @@ impl TemplateDefinitionBuilder {
         let tmpl_fn = nested.build_template_function(&nested_input);
         let decls = nested.data_index;
         let vars = nested.binding_slots;
+        self.last_defer_view_targets = DeferViewTargets {
+            first_slot: nested.first_target_slot,
+            refs: nested
+                .local_refs
+                .iter()
+                .filter(|r| r.plain && r.host_slot < HOST_SLOT_PLACEHOLDER)
+                .map(|r| (r.name.clone(), r.host_slot))
+                .collect(),
+        };
         self.var_counter = nested.var_counter;
         self.hoisted_fns.append(&mut nested.hoisted_fns);
         self.hoisted_fns
@@ -6283,6 +7648,34 @@ impl Visitor for TemplateDefinitionBuilder {
     fn visit_deferred_block(&mut self, deferred: &DeferredBlock) {
         self.build_deferred_block(deferred);
     }
+
+    fn visit_boundary_block(&mut self, block: &BoundaryBlock) {
+        self.build_boundary_block(block);
+    }
+}
+
+/// `isUnsafeObjectKey` (`render3/util.ts`): an object-literal key is quoted iff it has `-` or `.`.
+fn is_unsafe_object_key(key: &str) -> bool {
+    key.contains('-') || key.contains('.')
+}
+
+/// Whether an interpolation is a bare `{{x}}`: one expression and no literal text (Angular
+/// `collapse_singleton_interpolations.ts`: two strings, both empty).
+fn is_singleton_interpolation(value: &AstNode) -> bool {
+    matches!(
+        &value.kind,
+        AstExprKind::Interpolation { strings, expressions }
+            if expressions.len() == 1 && strings.iter().all(|s| s.is_empty())
+    )
+}
+
+/// Upper-cases the first character (`propertyName.charAt(0).toUpperCase() + slice(1)`).
+fn capitalize_first(name: &str) -> String {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
 }
 
 /// Whether an event-handler expression AST references `$event`.
@@ -6314,15 +7707,18 @@ fn bare_read_name(node: &AstNode) -> Option<&str> {
 /// `ɵɵrepeaterCreate` argument: the single root element/template tag of a control-flow block body,
 /// or `null` when the body has zero or multiple non-trivial roots, or a root that is not an element
 /// (a single text node, etc.). Mirrors `ingestControlFlowInsertionPoint` (`ingest.ts`): comment /
-/// `@let` nodes are skipped; an `ng-template` tag is not passed (it would enable directive matching).
-fn single_root_tag(children: &[Node]) -> Expr {
+/// `@let` nodes are skipped; an `ng-template` tag is not passed (it would enable directive matching),
+/// and a namespaced root tag is passed without its namespace prefix.
+fn single_root_tag(children: &[Node], foreign: &[ForeignComponentRef]) -> Expr {
     let mut root: Option<&str> = None;
     for child in children {
         match child {
             // Skipped: they don't anchor a DOM insertion point.
             Node::LetDeclaration(_) => continue,
+            // `child instanceof t.Element && unit.job.getForeignComponent(child) === null`: a foreign
+            // component root is not a plain element, so the body has no inferable tag.
             Node::Element(el) => {
-                if root.is_some() {
+                if root.is_some() || foreign.iter().any(|f| f.name == el.name) {
                     return o::null_expr();
                 }
                 root = Some(&el.name);
@@ -6342,8 +7738,17 @@ fn single_root_tag(children: &[Node]) -> Expr {
         }
     }
     match root {
-        Some(tag) if tag != "ng-template" => str_lit(tag),
-        _ => o::null_expr(),
+        // The namespace is stripped (`:svg:svg` -> `svg`): content projection matches the plain tag
+        // name (`ingestControlFlowInsertionPoint` splits `rawTagName` with `splitNsName`).
+        Some(tag) => {
+            let plain = crate::ml_parser::split_ns_name(tag).1;
+            if plain == "ng-template" {
+                o::null_expr()
+            } else {
+                str_lit(&plain)
+            }
+        }
+        None => o::null_expr(),
     }
 }
 
@@ -6374,14 +7779,25 @@ fn attribute_sanitizer(
         SecurityContext::Script => Some(R3::SanitizeScript),
         SecurityContext::Url => Some(R3::SanitizeUrl),
         SecurityContext::ResourceUrl => Some(R3::SanitizeResourceUrl),
+        SecurityContext::AttributeNoBinding => Some(R3::ValidateAttribute),
         SecurityContext::None => None,
     }
 }
 
-fn update_order_rank(input: &BoundAttribute) -> u8 {
+fn update_order_rank(input: &BoundAttribute, dom_only: bool) -> u8 {
     use crate::expression::ast::BindingType;
     let is_interp = matches!(input.value.kind, AstExprKind::Interpolation { .. });
-    match input.kind {
+    // A DomOnly `[aria-x]` property is specialized to an Attribute op before ordering
+    // (`binding_specialization.ts`), so it ranks with the attribute bindings.
+    let kind = if dom_only
+        && matches!(input.kind, BindingType::Property)
+        && is_aria_attribute(&input.name)
+    {
+        BindingType::Attribute
+    } else {
+        input.kind
+    };
+    match kind {
         // A whole-element `[style]="exp"` / `[class]="exp"` binding (a `Property` whose name is
         // exactly `style`/`class`) is a StyleMap / ClassMap — Angular's `UPDATE_ORDERING` groups 0/1,
         // ahead of the per-key StyleProp/ClassProp groups.
@@ -6389,8 +7805,16 @@ fn update_order_rank(input: &BoundAttribute) -> u8 {
         BindingType::Property | BindingType::TwoWay if input.name == "class" => 1,
         BindingType::Style => 2,
         BindingType::Class => 3,
+        // `collapse_singleton_interpolations.ts` runs before `ordering.ts` and rewrites an Attribute
+        // `{{x}}` (no literal text, one expression) into the bare expression, so only a real
+        // interpolation (`a{{x}}`) is in the interpolated-attribute group.
         BindingType::Attribute => {
-            if is_interp {
+            let is_singleton = matches!(
+                &input.value.kind,
+                AstExprKind::Interpolation { strings, expressions }
+                    if expressions.len() == 1 && strings.iter().all(String::is_empty)
+            );
+            if is_interp && !is_singleton {
                 4
             } else {
                 7
@@ -6412,6 +7836,57 @@ fn update_order_rank(input: &BoundAttribute) -> u8 {
 /// `$`-prefixed magic var). Drives `variable_optimization`-style elision of unused loop locals.
 /// Walks every binding expression in the body (bound text, inputs, outputs) and recurses into
 /// nested control-flow blocks, since a nested block's bindings still resolve against this scope.
+/// Whether this VIEW's own bindings read `name`: the expressions evaluated in the view that owns
+/// `node` (text, element/template inputs and outputs, control-flow conditions and loop collections).
+/// Unlike [`node_references`] it does not descend into the bodies of nested embedded views, which read
+/// their own bindings (an inherited variable is re-declared in each view that reads it).
+fn view_body_references(node: &Node, name: &str) -> bool {
+    match node {
+        Node::BoundText(bt) => expr_references_implicit(&bt.value, name),
+        Node::Element(el) => {
+            el.inputs.iter().any(|i| expr_references_implicit(&i.value, name))
+                || el.outputs.iter().any(|o| expr_references_implicit(&o.handler, name))
+                || el.children.iter().any(|c| view_body_references(c, name))
+        }
+        Node::Component(c) => c.children.iter().any(|ch| view_body_references(ch, name)),
+        Node::Template(t) => {
+            t.inputs.iter().any(|i| expr_references_implicit(&i.value, name))
+                || t.outputs.iter().any(|o| expr_references_implicit(&o.handler, name))
+                || t.template_attrs.iter().any(|a| match a {
+                    crate::template::r3_ast::TemplateAttr::Bound(b) => {
+                        expr_references_implicit(&b.value, name)
+                    }
+                    crate::template::r3_ast::TemplateAttr::Text(_) => false,
+                })
+        }
+        Node::IfBlock(b) => b.branches.iter().any(|br| {
+            br.expression
+                .as_ref()
+                .is_some_and(|e| expr_references_implicit(e, name))
+        }),
+        Node::SwitchBlock(b) => {
+            expr_references_implicit(&b.expression, name)
+                || b.groups.iter().any(|g| {
+                    g.cases.iter().any(|c| {
+                        c.expression
+                            .as_ref()
+                            .is_some_and(|e| expr_references_implicit(e, name))
+                    })
+                })
+        }
+        Node::ForLoopBlock(b) => {
+            // `track $index` / `track <item>` of a nested `@for` collapse to the shared
+            // `ɵɵrepeaterTrack*` helpers (`build_track_fn`), so they do not read this view's locals.
+            let track_reads = b.track_by.as_ref().is_some_and(|t| {
+                let optimized = matches!(bare_read_name(&t.ast).as_deref(), Some(n) if n == "$index" || n == b.item.name);
+                !optimized && expr_references_implicit(&t.ast, name)
+            });
+            expr_references_implicit(&b.expression.ast, name) || track_reads
+        }
+        _ => false,
+    }
+}
+
 fn for_body_references(children: &[Node], name: &str) -> bool {
     children.iter().any(|node| node_references(node, name))
 }
@@ -6427,6 +7902,12 @@ fn node_references(node: &Node, name: &str) -> bool {
         Node::Template(t) => {
             t.inputs.iter().any(|i| expr_references_implicit(&i.value, name))
                 || t.outputs.iter().any(|o| expr_references_implicit(&o.handler, name))
+                || t.template_attrs.iter().any(|a| match a {
+                    crate::template::r3_ast::TemplateAttr::Bound(b) => {
+                        expr_references_implicit(&b.value, name)
+                    }
+                    crate::template::r3_ast::TemplateAttr::Text(_) => false,
+                })
                 || for_body_references(&t.children, name)
         }
         Node::IfBlock(b) => b.branches.iter().any(|br| {
@@ -6893,6 +8374,118 @@ fn remap_pipe_slots_in_stmt(stmt: &mut Stmt, slots: &[usize]) {
 /// Rewrite every placeholder slot literal `>= placeholder` reachable from `stmt`, mapping its
 /// ordinal (`literal - placeholder`) through `resolve`. Shared by pipe-slot finalisation and
 /// local-ref-slot finalisation (which differ only in their placeholder base + resolver).
+/// Replace every `ReadVar { name }` in `expr` by `with` (or just count them when `with` is `None`),
+/// returning how many were found. Used to inline a boundary state read (`bnd_rN`) that is read once,
+/// or to materialise it in a `const` when it is read more than once, without lowering the `when`
+/// expression a second time (lowering has side effects on the constant pool and the pipe state).
+fn replace_read_var(expr: &mut Expr, name: &str, with: Option<&Expr>) -> usize {
+    use o::ExprKind as K;
+    if let K::ReadVar { name: n } = &expr.kind {
+        if n == name {
+            if let Some(w) = with {
+                *expr = w.clone();
+            }
+            return 1;
+        }
+        return 0;
+    }
+    let mut count = 0;
+    {
+        let mut recur = |e: &mut Expr| count += replace_read_var(e, name, with);
+        match &mut expr.kind {
+            K::Literal(_)
+            | K::ReadVar { .. }
+            | K::WrappedNode(_)
+            | K::RegExpLiteral { .. }
+            | K::TemplateLiteralElement(_)
+            | K::External { .. }
+            | K::Function { .. }
+            | K::DynamicImport { .. } => {}
+            K::Typeof(e) | K::Void(e) | K::Not(e) | K::Parenthesized(e) | K::Spread(e) => recur(e),
+            K::Unary { expr: inner, .. } => recur(inner),
+            K::Invoke { callee, args, .. } => {
+                recur(callee);
+                args.iter_mut().for_each(&mut recur);
+            }
+            K::TaggedTemplate { tag, template } => {
+                recur(tag);
+                recur(template);
+            }
+            K::New { class_expr, args } => {
+                recur(class_expr);
+                args.iter_mut().for_each(&mut recur);
+            }
+            K::TemplateLiteral { expressions, .. } | K::LocalizedString { expressions, .. } => {
+                expressions.iter_mut().for_each(&mut recur);
+            }
+            K::Conditional {
+                condition,
+                true_case,
+                false_case,
+            } => {
+                recur(condition);
+                recur(true_case);
+                if let Some(f) = false_case {
+                    recur(f);
+                }
+            }
+            K::Binary { lhs, rhs, .. } => {
+                recur(lhs);
+                recur(rhs);
+            }
+            K::ReadProp { receiver, .. } => recur(receiver),
+            K::ReadKey { receiver, index, .. } => {
+                recur(receiver);
+                recur(index);
+            }
+            K::LiteralArray(entries) | K::Comma(entries) => entries.iter_mut().for_each(&mut recur),
+            K::LiteralMap { entries, .. } => {
+                for entry in entries {
+                    match entry {
+                        o::LiteralMapEntry::Property { value, .. } => recur(value),
+                        o::LiteralMapEntry::Spread { expression } => recur(expression),
+                    }
+                }
+            }
+            K::Arrow { body, .. } => {
+                if let o::ArrowBody::Expr(e) = body {
+                    recur(e);
+                }
+            }
+        }
+    }
+    count
+}
+
+/// Drop the default `0` projection slot index from a two-argument `ɵɵprojection(slot, 0)` (Angular trims a
+/// trailing default argument of the instruction), recursing into hoisted view functions and `if` blocks.
+fn trim_default_projection_index(stmts: &mut [Stmt]) {
+    for stmt in stmts {
+        match &mut stmt.kind {
+            StmtKind::Expression(expr) => {
+                if let o::ExprKind::Invoke { callee, args, .. } = &mut expr.kind {
+                    if callee_wire_name(callee) == Some(R3::Projection.name())
+                        && args.len() == 2
+                        && args[1].is_equivalent(&num(0.0))
+                    {
+                        args.pop();
+                    }
+                }
+            }
+            StmtKind::DeclareFunction { statements, .. } => trim_default_projection_index(statements),
+            StmtKind::If {
+                true_case,
+                false_case,
+                ..
+            } => {
+                trim_default_projection_index(true_case);
+                trim_default_projection_index(false_case);
+            }
+            _ => {}
+        }
+    }
+}
+
 fn remap_placeholder_slots_in_stmt(
     stmt: &mut Stmt,
     placeholder: usize,
@@ -6942,7 +8535,9 @@ fn remap_placeholder_slots_in_expr(
     match &mut expr.kind {
         K::Literal(o::LiteralValue::Number(n)) => {
             let v = *n as usize;
-            if *n >= placeholder as f64 && v >= placeholder {
+            // Only the placeholder's own window is rewritten: each placeholder base owns
+            // `PLACEHOLDER_WINDOW` values, so the bases above it never match this one.
+            if v >= placeholder && v < placeholder + PLACEHOLDER_WINDOW {
                 let ordinal = v - placeholder;
                 *n = resolve(ordinal) as f64;
             }
@@ -7048,6 +8643,35 @@ mod tests {
 
     fn t_span() -> ParseSourceSpan {
         ParseSourceSpan { start: 0, end: 0 }
+    }
+
+    /// Parse a template string and run the real HTML -> r3 transform and template builder over it
+    /// (the same path `RealTemplateBuilder` takes), returning the emitted root view function plus its
+    /// hoisted nested-view functions. Used to prove a golden's template input lowers to its expected
+    /// instructions without the harness (which only compares full `ɵɵdefine*` goldens).
+    fn compile_template_html(src: &str, name: &str, dom_only: bool) -> String {
+        compile_template_html_with_foreign(src, name, dom_only, Vec::new())
+    }
+
+    /// As [`compile_template_html`], with the component's `foreignImports` in scope.
+    fn compile_template_html_with_foreign(
+        src: &str,
+        name: &str,
+        dom_only: bool,
+        foreign: Vec<ForeignComponentRef>,
+    ) -> String {
+        use crate::template::template_transform::{html_ast_to_render3_ast, Render3ParseOptions};
+        let parsed = crate::ml_parser::parse(src, "test.html");
+        assert!(parsed.errors.is_empty(), "html parse errors: {:?}", parsed.errors);
+        let mut bp = crate::template::template_transform::BindingParser::new();
+        let r3 = html_ast_to_render3_ast(&parsed.root_nodes, &mut bp, Render3ParseOptions::default());
+        assert!(r3.errors.is_empty(), "r3 transform errors: {:?}", r3.errors);
+        let input = TemplateCompilationInput::new(name, r3.nodes)
+            .with_dom_only(dom_only)
+            .with_foreign_components(foreign);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        emit_with_hoisted(&builder, &func)
     }
 
     /// Emit the root view function PLUS its hoisted nested-view functions concatenated, mirroring
@@ -7160,7 +8784,7 @@ mod tests {
     fn control_property_binding_emits_control_create_and_control() {
         // `<input [formField]="x">` — `formField` is an eligible CONTROL property
         // (`specializeControlProperties`). The create block gains a `ɵɵcontrolCreate()` right after
-        // the element op; the update block gains a `ɵɵcontrol()` right after the `ɵɵproperty` op.
+        // the element start op; the update block gains a `ɵɵcontrol()` right after the `ɵɵproperty` op.
         let nodes = element_with_input("input", "formField", BindingType::Property, prop_read("x"));
         let input = TemplateCompilationInput::new("Test_Template", nodes).with_dom_only(false);
         let mut builder = TemplateDefinitionBuilder::new(&input);
@@ -7168,10 +8792,13 @@ mod tests {
 
         assert!(out.contains("\u{0275}\u{0275}controlCreate()"), "got: {out}");
         assert!(out.contains("\u{0275}\u{0275}control()"), "got: {out}");
-        // The control-create op follows the element create op (ɵɵelement(0,...) then controlCreate).
-        let el_idx = out.find("\u{0275}\u{0275}element(0").expect("element op");
+        // The control-create op sits between `ɵɵelementStart(0,…)` and `ɵɵelementEnd()` (Angular
+        // keeps the start/end pair, so `empty_elements` cannot merge it into `ɵɵelement`).
+        let el_idx = out.find("\u{0275}\u{0275}elementStart(0").expect("elementStart op");
         let cc_idx = out.find("\u{0275}\u{0275}controlCreate(").expect("controlCreate op");
-        assert!(cc_idx > el_idx, "controlCreate must follow element: {out}");
+        let end_idx = out.find("\u{0275}\u{0275}elementEnd(").expect("elementEnd op");
+        assert!(el_idx < cc_idx && cc_idx < end_idx, "elementStart, controlCreate, elementEnd: {out}");
+        assert!(!out.contains("\u{0275}\u{0275}element(0"), "element must not be merged: {out}");
         // The control op follows the property op in the update block.
         let prop_idx = out.find("\u{0275}\u{0275}property(\"formField\"").expect("property op");
         let ctrl_idx = out.find("\u{0275}\u{0275}control(").expect("control op");
@@ -7219,6 +8846,223 @@ mod tests {
 
         assert!(out.contains("\u{0275}\u{0275}classMap(ctx.x)"), "got: {out}");
         assert!(!out.contains("\u{0275}\u{0275}domProperty"), "got: {out}");
+    }
+
+    #[test]
+    fn class_interpolation_lowers_to_interpolate_inside_class_map() {
+        // `<div class="foo foo-{{ x }}">` is a whole-element class binding whose value is an
+        // interpolation. Angular (`interpolate.ts`) wraps it as `ɵɵclassMap(ɵɵinterpolate1("foo foo-", ctx.x))`,
+        // NOT a string concatenation. (`binding_slots` compliance golden.)
+        let nodes = element_with_input("div", "class", BindingType::Property, interpolation_ab());
+        let input = TemplateCompilationInput::new("Test_Template", nodes);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let out = emit_expression(&func);
+
+        assert!(
+            out.contains("ɵɵclassMap(i0.ɵɵinterpolate2(\"\", ctx.a, \" \", ctx.b))")
+                || out.contains("ɵɵclassMap(ɵɵinterpolate2(\"\", ctx.a, \" \", ctx.b))"),
+            "got: {out}"
+        );
+        assert!(!out.contains("+ ctx.b"), "got: {out}");
+    }
+
+    #[test]
+    fn ng_template_let_variables_read_context_properties_through_consts() {
+        use crate::template::r3_ast::Variable;
+        // `<ng-template let-item let-i="index">{{ i }} {{ item }}</ng-template>`: each `let-` variable
+        // is `const <name>_rN = ctx.<prop>;` at the head of the embedded view's update block, and the
+        // body reads that local (Angular `generate_variables.ts`), not `ctx.<name>` off the component.
+        let read = |name: &str| {
+            AstNode::new(
+                ParseSpan::new(0, 0),
+                AbsoluteSourceSpan::new(0, 0),
+                AstExprKind::PropertyRead {
+                    name_span: AbsoluteSourceSpan::new(0, 0),
+                    receiver: Box::new(AstNode::new(
+                        ParseSpan::new(0, 0),
+                        AbsoluteSourceSpan::new(0, 0),
+                        AstExprKind::ImplicitReceiver,
+                    )),
+                    name: name.to_string(),
+                },
+            )
+        };
+        let child_interp = AstNode::new(
+            ParseSpan::new(0, 0),
+            AbsoluteSourceSpan::new(0, 0),
+            AstExprKind::Interpolation {
+                strings: vec!["".to_string(), " ".to_string(), "".to_string()],
+                expressions: vec![read("i"), read("item")],
+            },
+        );
+        let var = |name: &str, value: &str| Variable {
+            name: name.to_string(),
+            value: value.to_string(),
+            source_span: t_span(),
+            key_span: t_span(),
+            value_span: None,
+        };
+        let nodes = vec![Node::Template(Template {
+            tag_name: Some("ng-template".to_string()),
+            attributes: vec![],
+            inputs: vec![],
+            outputs: vec![],
+            directives: vec![],
+            template_attrs: vec![],
+            children: vec![Node::BoundText(BoundText {
+                value: child_interp,
+                source_span: t_span(),
+                i18n: None,
+            })],
+            references: vec![],
+            variables: vec![var("item", "$implicit"), var("i", "index")],
+            is_self_closing: false,
+            source_span: t_span(),
+            start_source_span: t_span(),
+            end_source_span: None,
+            i18n: None,
+        })];
+        let input = TemplateCompilationInput::new("MyComponent_Template", nodes);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let out = emit_with_hoisted(&builder, &func);
+
+        assert!(out.contains("const item_r1 = ctx.$implicit;"), "got: {out}");
+        assert!(out.contains("const i_r2 = ctx.index;"), "got: {out}");
+        assert!(out.contains("i_r2, \" \", item_r1"), "reads must use the locals, got: {out}");
+        assert!(!out.contains("ctx_r"), "no ancestor context read expected, got: {out}");
+    }
+
+    #[test]
+    fn chain_statements_breaks_runs_at_max_chain_length() {
+        // Angular `chaining.ts`: at most `MAX_CHAIN_LENGTH` (256) instructions per chain. 257 compatible
+        // `ɵɵelement` calls form a chain of 256 followed by a new chain of 1.
+        let stmts: Vec<Stmt> = (0..257)
+            .map(|i| instruction(R3::Element, vec![num(i as f64)]))
+            .collect();
+        let chained = chain_statements(stmts);
+        assert_eq!(chained.len(), 2, "expected two chained statements");
+    }
+
+    #[test]
+    fn empty_class_binding_is_extracted_as_name_without_instruction() {
+        // `<div [class.color]>` (no value): Angular extracts `color` into the element's bindings const group
+        // (`attribute_extraction.ts`) and removes the op (`remove_empty_bindings.ts`), so the element is
+        // `ɵɵelement(0, "div", 0)` (DomOnly: `ɵɵdomElement`) with no `ɵɵclassProp`.
+        let empty = AstNode::new(
+            ParseSpan::new(0, 0),
+            AbsoluteSourceSpan::new(0, 0),
+            AstExprKind::EmptyExpr,
+        );
+        let nodes = element_with_input("div", "color", BindingType::Class, empty);
+        let input = TemplateCompilationInput::new("Test_Template", nodes);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let out = emit_expression(&func);
+
+        assert!(out.contains("ɵɵdomElement(0, \"div\", 0)"), "got: {out}");
+        assert!(!out.contains("ɵɵclassProp"), "got: {out}");
+    }
+
+    #[test]
+    fn dom_only_aria_property_reifies_to_attribute() {
+        // DomOnly `[aria-readonly]="x"` is specialized to an Attribute op by Angular's
+        // `binding_specialization.ts` (`isAriaAttribute`), so it emits `ɵɵattribute("aria-readonly", ctx.x)`
+        // and not `ɵɵdomProperty`. A non-aria DomOnly property keeps `ɵɵdomProperty`.
+        let nodes = element_with_input("input", "aria-readonly", BindingType::Property, prop_read("x"));
+        let input = TemplateCompilationInput::new("Test_Template", nodes);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let out = emit_expression(&func);
+
+        assert!(out.contains("ɵɵattribute(\"aria-readonly\", ctx.x)"), "got: {out}");
+        assert!(!out.contains("ɵɵdomProperty"), "got: {out}");
+    }
+
+    #[test]
+    fn singleton_attribute_interpolation_is_ordered_with_plain_attributes() {
+        // `[attr.title]="a" attr.id="{{b}}"`: Angular's `collapse_singleton_interpolations` turns the
+        // `{{b}}` into a bare expression before `ordering.ts`, so both are non-interpolated attribute
+        // ops and keep source order (`ɵɵattribute("title", …)("id", …)`), not interpolated-first.
+        let mut nodes = element_with_input("button", "title", BindingType::Attribute, prop_read("a"));
+        if let Node::Element(el) = &mut nodes[0] {
+            el.inputs.push(BoundAttribute {
+                name: "id".to_string(),
+                kind: BindingType::Attribute,
+                security_context: SecurityContext::None,
+                value: AstNode::new(
+                    ParseSpan::new(0, 0),
+                    AbsoluteSourceSpan::new(0, 0),
+                    AstExprKind::Interpolation {
+                        strings: vec![String::new(), String::new()],
+                        expressions: vec![prop_read("b")],
+                    },
+                ),
+                unit: None,
+                source_span: t_span(),
+                key_span: t_span(),
+                value_span: None,
+                i18n: None,
+            });
+        }
+        let input = TemplateCompilationInput::new("Test_Template", nodes);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let out = emit_expression(&func);
+
+        // The two attribute ops chain into one `ɵɵattribute("title", …)("id", …)` call.
+        let title = out.find("\"title\"").expect("title attribute op");
+        let id = out.find("\"id\"").expect("id attribute op");
+        assert!(title < id, "got: {out}");
+    }
+
+    #[test]
+    fn property_interpolation_lowers_to_interpolate_instruction() {
+        // `[title]="a{{ x }}"`-style interpolation: Angular emits `ɵɵproperty("title", ɵɵinterpolate1(…))`
+        // (`interpolate.ts`), not `ɵɵproperty("title", "a" + ctx.x)`.
+        let nodes = element_with_input("div", "title", BindingType::Property, interpolation_ab());
+        let input = TemplateCompilationInput::new("Test_Template", nodes).with_dom_only(false);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let out = emit_expression(&func);
+
+        assert!(out.contains("ɵɵproperty(\"title\", i0.ɵɵinterpolate2(\"\", ctx.a, \" \", ctx.b))")
+            || out.contains("ɵɵproperty(\"title\", ɵɵinterpolate2(\"\", ctx.a, \" \", ctx.b))"), "got: {out}");
+        assert!(!out.contains("+ ctx.b"), "got: {out}");
+    }
+
+    #[test]
+    fn two_way_property_lowers_to_two_way_property_and_listener() {
+        // `[(ngModel)]="x"` reifies to `ɵɵtwoWayProperty("ngModel", ctx.x)` in the update block and a
+        // `ɵɵtwoWayListener("ngModelChange", fn)` whose body is `ɵɵtwoWayBindingSet(ctx.x, $event) ||
+        // (ctx.x = $event); return $event;` (Angular `ingest.ts` `makeTwoWayListenerHandlerOps`,
+        // `reify.ts`, `transform_two_way_binding_set.ts`).
+        let mut nodes = element_with_input("input", "ngModel", BindingType::TwoWay, prop_read("x"));
+        if let Node::Element(el) = &mut nodes[0] {
+            el.outputs.push(BoundEvent {
+                name: "ngModelChange".to_string(),
+                kind: ParsedEventType::TwoWay,
+                handler: prop_read("x"),
+                target: None,
+                phase: None,
+                source_span: t_span(),
+                handler_span: t_span(),
+                key_span: t_span(),
+            });
+        }
+        let input = TemplateCompilationInput::new("Test_Template", nodes);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let out = emit_expression(&func);
+
+        assert!(out.contains("ɵɵtwoWayProperty(\"ngModel\", ctx.x)"), "got: {out}");
+        assert!(out.contains("ɵɵtwoWayListener(\"ngModelChange\", function"), "got: {out}");
+        assert!(
+            out.contains("ɵɵtwoWayBindingSet(ctx.x, $event) || (ctx.x = $event)"),
+            "got: {out}"
+        );
+        assert!(!out.contains("ɵɵproperty(\"ngModel\""), "got: {out}");
     }
 
     #[test]
@@ -7504,6 +9348,325 @@ mod tests {
     }
 
     #[test]
+    fn inherited_context_variable_is_redeclared_through_next_context() {
+        // `<ng-template let-item><ng-template>{{ item }}</ng-template></ng-template>`: the inner view
+        // reads the outer view's `item`. Angular (`generate_variables.ts`) walks up with one
+        // `ɵɵnextContext()` and declares `const item_rN = ɵɵnextContext().$implicit;` in the inner
+        // update block, instead of reading `ctx.item` off the component.
+        let read = |name: &str| {
+            AstNode::new(
+                ParseSpan::new(0, 0),
+                AbsoluteSourceSpan::new(0, 0),
+                AstExprKind::PropertyRead {
+                    name_span: AbsoluteSourceSpan::new(0, 0),
+                    receiver: Box::new(AstNode::new(
+                        ParseSpan::new(0, 0),
+                        AbsoluteSourceSpan::new(0, 0),
+                        AstExprKind::ImplicitReceiver,
+                    )),
+                    name: name.to_string(),
+                },
+            )
+        };
+        let interp = AstNode::new(
+            ParseSpan::new(0, 0),
+            AbsoluteSourceSpan::new(0, 0),
+            AstExprKind::Interpolation {
+                strings: vec!["".to_string(), "".to_string()],
+                expressions: vec![read("item")],
+            },
+        );
+        let template = |children: Vec<Node>, variables: Vec<Variable>| {
+            Template {
+                tag_name: Some("ng-template".to_string()),
+                attributes: vec![],
+                inputs: vec![],
+                outputs: vec![],
+                directives: vec![],
+                template_attrs: vec![],
+                children,
+                references: vec![],
+                variables,
+                is_self_closing: false,
+                source_span: t_span(),
+                start_source_span: t_span(),
+                end_source_span: None,
+                i18n: None,
+            }
+        };
+        let inner = Node::Template(template(
+            vec![Node::BoundText(BoundText {
+                value: interp,
+                source_span: t_span(),
+                i18n: None,
+            })],
+            vec![],
+        ));
+        let item_var = Variable {
+            name: "item".to_string(),
+            value: "$implicit".to_string(),
+            source_span: t_span(),
+            key_span: t_span(),
+            value_span: None,
+        };
+        let outer = Node::Template(template(vec![inner], vec![item_var]));
+        let input = TemplateCompilationInput::new("MyComponent_Template", vec![outer]);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let all = emit_with_hoisted(&builder, &func);
+        assert!(all.contains("nextContext().$implicit"), "got: {all}");
+        assert!(!all.contains("ctx.item") && !all.contains(".item"), "got: {all}");
+    }
+
+    #[test]
+    fn projection_slot_indices_follow_view_allocation_order() {
+        // `<ng-template><ng-content select="a"></ng-content></ng-template><ng-content select="b"></ng-content>`:
+        // Angular's `generateProjectionDefs` walks `job.units` (the root view first), so the root's `b` slot
+        // takes index 0 (elided as the default `ɵɵprojection(slot)`) and the template's `a` slot takes 1.
+        use crate::template::r3_ast::Content;
+        let content = |selector: &str| {
+            Node::Content(Content {
+                selector: selector.to_string(),
+                attributes: vec![],
+                children: vec![],
+                is_self_closing: true,
+                source_span: t_span(),
+                start_source_span: t_span(),
+                end_source_span: None,
+                i18n: None,
+            })
+        };
+        let template = Node::Template(Template {
+            tag_name: Some("ng-template".to_string()),
+            attributes: vec![],
+            inputs: vec![],
+            outputs: vec![],
+            directives: vec![],
+            template_attrs: vec![],
+            children: vec![content("a")],
+            references: vec![],
+            variables: vec![],
+            is_self_closing: false,
+            source_span: t_span(),
+            start_source_span: t_span(),
+            end_source_span: None,
+            i18n: None,
+        });
+        let input = TemplateCompilationInput::new("Test_Template", vec![template, content("b")]);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let all = emit_with_hoisted(&builder, &func);
+        assert!(all.contains("projection(1)"), "root slot must take index 0: {all}");
+        assert!(all.contains("projection(0, 1)"), "nested slot must take index 1: {all}");
+    }
+
+    #[test]
+    fn ng_non_bindable_element_brackets_its_subtree_with_disable_and_enable_bindings() {
+        // `<div ngNonBindable><span></span></div>`: Angular `nonbindable.ts` inserts `ɵɵdisableBindings()`
+        // right after the element start and `ɵɵenableBindings()` right before its end.
+        let span = Element {
+            name: "span".to_string(),
+            attributes: vec![],
+            inputs: vec![],
+            outputs: vec![],
+            directives: vec![],
+            children: vec![],
+            references: vec![],
+            is_self_closing: false,
+            source_span: t_span(),
+            start_source_span: t_span(),
+            end_source_span: None,
+            is_void: false,
+            i18n: None,
+        };
+        let div = Element {
+            name: "div".to_string(),
+            attributes: vec![TextAttribute {
+                name: "ngNonBindable".to_string(),
+                value: String::new(),
+                source_span: t_span(),
+                key_span: None,
+                value_span: None,
+                i18n: None,
+            }],
+            inputs: vec![],
+            outputs: vec![],
+            directives: vec![],
+            children: vec![Node::Element(span)],
+            references: vec![],
+            is_self_closing: false,
+            source_span: t_span(),
+            start_source_span: t_span(),
+            end_source_span: None,
+            is_void: false,
+            i18n: None,
+        };
+        let input = TemplateCompilationInput::new("Test_Template", vec![Node::Element(div)])
+            .with_dom_only(false);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let out = emit_expression(&builder.build_template_function(&input));
+        let start = out.find("elementStart(0, \"div\")").expect("div start");
+        let disable = out.find("disableBindings()").expect("disable");
+        let enable = out.find("enableBindings()").expect("enable");
+        let end = out.find("elementEnd()").expect("end");
+        assert!(start < disable && disable < enable && enable < end, "got: {out}");
+    }
+
+    #[test]
+    fn ng_non_bindable_attribute_is_not_an_element_const() {
+        // `<div ngNonBindable></div>` ⇒ `ɵɵelement(0, "div")`: the marker attribute is consumed by the
+        // non-bindable handling (Angular `binding_specialization.ts`) and never enters the consts.
+        let element = Element {
+            name: "div".to_string(),
+            attributes: vec![TextAttribute {
+                name: "ngNonBindable".to_string(),
+                value: String::new(),
+                source_span: t_span(),
+                key_span: None,
+                value_span: None,
+                i18n: None,
+            }],
+            inputs: vec![],
+            outputs: vec![],
+            directives: vec![],
+            children: vec![],
+            references: vec![],
+            is_self_closing: false,
+            source_span: t_span(),
+            start_source_span: t_span(),
+            end_source_span: None,
+            is_void: false,
+            i18n: None,
+        };
+        let input = TemplateCompilationInput::new("Test_Template", vec![Node::Element(element)])
+            .with_dom_only(false);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let out = emit_expression(&builder.build_template_function(&input));
+        assert!(out.contains("elementStart(0, \"div\")") || out.contains("element(0, \"div\")"), "got: {out}");
+        assert!(builder.const_pool().is_empty(), "ngNonBindable must not be a const");
+    }
+
+    #[test]
+    fn ng_container_lowers_to_element_container_instructions() {
+        // `<ng-container><span></span></ng-container>` and an empty `<ng-container></ng-container>`:
+        // Angular's `ng_container.ts` turns the element into a container op, reified to
+        // `ɵɵelementContainerStart` / `ɵɵelementContainerEnd`, and an empty one to `ɵɵelementContainer`.
+        let element = |name: &str, children: Vec<Node>| Element {
+            name: name.to_string(),
+            attributes: vec![],
+            inputs: vec![],
+            outputs: vec![],
+            directives: vec![],
+            children,
+            references: vec![],
+            is_self_closing: false,
+            source_span: t_span(),
+            start_source_span: t_span(),
+            end_source_span: None,
+            is_void: false,
+            i18n: None,
+        };
+        let with_children = vec![Node::Element(element(
+            "ng-container",
+            vec![Node::Element(element("span", vec![]))],
+        ))];
+        let input =
+            TemplateCompilationInput::new("Test_Template", with_children).with_dom_only(false);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let out = emit_expression(&func);
+        assert!(out.contains("elementContainerStart(0)"), "got: {out}");
+        assert!(out.contains("elementContainerEnd()"), "got: {out}");
+        assert!(!out.contains("\"ng-container\""), "got: {out}");
+
+        let empty = vec![Node::Element(element("ng-container", vec![]))];
+        let input = TemplateCompilationInput::new("Test_Template", empty).with_dom_only(false);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let out = emit_expression(&func);
+        assert!(out.contains("elementContainer(0)"), "got: {out}");
+
+        // DOM-only components (`isStandalone && !hasDirectiveDependencies`) use the `dom` family.
+        let dom = vec![Node::Element(element("ng-container", vec![]))];
+        let input = TemplateCompilationInput::new("Test_Template", dom).with_dom_only(true);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let out = emit_expression(&func);
+        assert!(out.contains("domElementContainer(0)"), "got: {out}");
+    }
+
+    #[test]
+    fn element_consts_follow_angular_view_allocation_order() {
+        // `<ng-template id="tpl"><span title="s"></span></ng-template><p lang="en"></p>`. Angular's
+        // `collectElementConsts` walks the views in allocation order (the root view first, then the
+        // `<ng-template>` body), so the root's `[id, tpl]` and `[lang, en]` arrays take indices 0 and
+        // 1 and the body's `[title, s]` array takes 2 (not 1, as it would if the body were interned
+        // in the middle of the root walk).
+        let attr = |name: &str, value: &str| TextAttribute {
+            name: name.to_string(),
+            value: value.to_string(),
+            source_span: t_span(),
+            key_span: None,
+            value_span: None,
+            i18n: None,
+        };
+        let element = |name: &str, attributes: Vec<TextAttribute>, children: Vec<Node>| Element {
+            name: name.to_string(),
+            attributes,
+            inputs: vec![],
+            outputs: vec![],
+            directives: vec![],
+            children,
+            references: vec![],
+            is_self_closing: false,
+            source_span: t_span(),
+            start_source_span: t_span(),
+            end_source_span: None,
+            is_void: false,
+            i18n: None,
+        };
+        let nodes = vec![
+            Node::Template(Template {
+                tag_name: Some("ng-template".to_string()),
+                attributes: vec![attr("id", "tpl")],
+                inputs: vec![],
+                outputs: vec![],
+                directives: vec![],
+                template_attrs: vec![],
+                children: vec![Node::Element(element(
+                    "span",
+                    vec![attr("title", "s")],
+                    vec![],
+                ))],
+                references: vec![],
+                variables: vec![],
+                is_self_closing: false,
+                source_span: t_span(),
+                start_source_span: t_span(),
+                end_source_span: None,
+                i18n: None,
+            }),
+            Node::Element(element("p", vec![attr("lang", "en")], vec![])),
+        ];
+        let input = TemplateCompilationInput::new("Test_Template", nodes);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let consts = builder.const_pool().to_const_array().unwrap();
+        let out = emit_expression(&consts);
+        let (tpl, en, s) = (
+            out.find("\"tpl\"").expect("tpl const"),
+            out.find("\"en\"").expect("en const"),
+            out.find("\"s\"").expect("s const"),
+        );
+        assert!(tpl < en && en < s, "const order must follow view allocation: {out}");
+        assert_eq!(builder.const_pool().entries().len(), 3, "got: {out}");
+        // The body's `<span>` is hoisted with its attrs index (2) baked in, and no placeholder leaks.
+        let all = emit_with_hoisted(&builder, &func);
+        assert!(all.contains("\"span\", 2"), "got: {all}");
+        assert!(!all.contains("5000000000"), "placeholder leaked: {all}");
+    }
+
+    #[test]
     fn element_with_static_attrs_interns_const() {
         let nodes = vec![Node::Element(Element {
             name: "div".to_string(),
@@ -7546,6 +9709,34 @@ mod tests {
     use crate::template::r3_ast::{BoundAttribute, BoundEvent};
 
     /// `{{ name }}` — implicit-receiver property read of `name`.
+    /// `serializer.ts` `visitUnary`: prefix operators are written in front (with a separating space
+    /// when the operand starts with the same character), postfix updates after the operand.
+    #[test]
+    fn ast_to_source_serializes_unary_prefix_and_postfix() {
+        use crate::expression::ast::{UnaryOperator as UO};
+        let span = || ParseSpan::new(0, 0);
+        let abs = || AbsoluteSourceSpan::new(0, 0);
+        let x = || prop_read("x");
+        let minus_minus_x = AstNode::create_minus(span(), abs(), AstNode::create_minus(span(), abs(), x()));
+        assert_eq!(ast_to_source(&minus_minus_x), "- -x");
+        assert_eq!(ast_to_source(&AstNode::create_plus(span(), abs(), x())), "+x");
+        assert_eq!(
+            ast_to_source(&AstNode::create_prefix_update(span(), abs(), UO::Increment, x())),
+            "++x"
+        );
+        assert_eq!(
+            ast_to_source(&AstNode::create_postfix_update(span(), abs(), UO::Decrement, x())),
+            "x--"
+        );
+        let prefix_in_prefix = AstNode::create_prefix_update(
+            span(),
+            abs(),
+            UO::Decrement,
+            AstNode::create_prefix_update(span(), abs(), UO::Decrement, x()),
+        );
+        assert_eq!(ast_to_source(&prefix_in_prefix), "-- --x");
+    }
+
     fn prop_read(name: &str) -> AstNode {
         let implicit = AstNode::new(
             ParseSpan::new(0, 0),
@@ -7840,6 +10031,53 @@ mod tests {
         assert!(builder.const_pool().is_empty(), "const pool not empty");
         assert!(out.contains("\u{0275}\u{0275}domElement(0, \"div\")"), "got: {out}");
         assert!(!out.contains("\u{0275}\u{0275}domElement(0, \"div\", 0)"), "got: {out}");
+    }
+
+    #[test]
+    fn singleton_class_and_style_interpolations_collapse_to_the_expression() {
+        // `<div class="{{x}}">` ⇒ `ɵɵclassMap(ctx.x)` (Angular `collapse_singleton_interpolations.ts`
+        // runs before var counting, so the binding reserves its two base slots, not `2 + 1`).
+        let singleton = AstNode::new(
+            ParseSpan::new(0, 0),
+            AbsoluteSourceSpan::new(0, 0),
+            AstExprKind::Interpolation {
+                strings: vec![String::new(), String::new()],
+                expressions: vec![prop_read("x")],
+            },
+        );
+        let nodes = element_with_input("div", "class", BindingType::Property, singleton);
+        let input = TemplateCompilationInput::new("Test_Template", nodes);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let out = emit_expression(&builder.build_template_function(&input));
+        assert!(out.contains("\u{0275}\u{0275}classMap(ctx.x)"), "got: {out}");
+        assert!(!out.contains("interpolate"), "got: {out}");
+        assert_eq!(builder.vars(), 2, "vars = {}", builder.vars());
+    }
+
+    #[test]
+    fn style_and_class_names_are_hyphenated_and_lose_important() {
+        // `[style.borderImage]="w"` ⇒ `ɵɵstyleProp("border-image", ctx.w)` (Angular `naming.ts`
+        // `normalizeStylePropName`), and a custom property keeps its name.
+        let nodes = element_with_input("div", "borderImage", BindingType::Style, prop_read("w"));
+        let input = TemplateCompilationInput::new("Test_Template", nodes);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let out = emit_expression(&builder.build_template_function(&input));
+        assert!(out.contains("\"border-image\""), "got: {out}");
+        assert!(!out.contains("borderImage"), "got: {out}");
+
+        let nodes = element_with_input("div", "--myVar", BindingType::Style, prop_read("w"));
+        let input = TemplateCompilationInput::new("Test_Template", nodes);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let out = emit_expression(&builder.build_template_function(&input));
+        assert!(out.contains("\"--myVar\""), "got: {out}");
+
+        // `[class.active!important]` loses its `!important` suffix (`stripImportant`).
+        let nodes = element_with_input("div", "active!important", BindingType::Class, prop_read("x"));
+        let input = TemplateCompilationInput::new("Test_Template", nodes);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let out = emit_expression(&builder.build_template_function(&input));
+        assert!(out.contains("\"active\""), "got: {out}");
+        assert!(!out.contains("important"), "got: {out}");
     }
 
     #[test]
@@ -8373,6 +10611,50 @@ mod tests {
         assert!(out.contains("\u{0275}\u{0275}repeaterTrackByIdentity"), "got: {out}");
         // The update block emits `ɵɵrepeater(<collection>)`; the collection resolves against `ctx`.
         assert!(out.contains("\u{0275}\u{0275}repeater(ctx.xs)"), "got: {out}");
+    }
+
+    #[test]
+    fn for_block_computed_variables_read_index_and_count_locals() {
+        // `@for (x of xs; track x) { {{ $first }} {{ $last }} }`: Angular `ingestForBlock` makes
+        // `$first` / `$last` inline expressions over the index / count locals (`ɵ$index === 0`,
+        // `ɵ$index === ɵ$count - 1`), declaring `const $index_rN = ctx.$index` and `const $count_rN =
+        // ctx.$count` at the head of the update block, instead of reading `ctx.$first` / `ctx.$last`.
+        let item = Variable {
+            name: "x".to_string(),
+            value: "$implicit".to_string(),
+            source_span: t_span(),
+            key_span: t_span(),
+            value_span: None,
+        };
+        let text = |name: &str| {
+            Node::BoundText(BoundText {
+                value: prop_read(name),
+                source_span: t_span(),
+                i18n: None,
+            })
+        };
+        let block = ForLoopBlock {
+            item,
+            expression: AstWithSource::new(prop_read("xs"), None, String::new(), 0, vec![]),
+            track_by: Some(AstWithSource::new(prop_read("x"), None, String::new(), 0, vec![])),
+            track_keyword_span: None,
+            context_variables: vec![],
+            children: vec![text("$first"), text("$last")],
+            empty: None,
+            main_block_span: t_span(),
+            spans: block_spans(),
+            i18n: None,
+        };
+        let input = TemplateCompilationInput::new("Test_Template", vec![Node::ForLoopBlock(block)]);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let out = emit_with_hoisted(&builder, &func);
+
+        assert!(!out.contains("ctx.$first") && !out.contains("ctx.$last"), "got: {out}");
+        assert!(out.contains("const $index_r1 = ctx.$index;"), "got: {out}");
+        assert!(out.contains("const $count_r2 = ctx.$count;"), "got: {out}");
+        assert!(out.contains("$index_r1 === 0"), "got: {out}");
+        assert!(out.contains("$index_r1 === $count_r2 - 1"), "got: {out}");
     }
 
     #[test]
@@ -9176,6 +11458,7 @@ mod tests {
                 start_source_span: t_span(),
                 end_source_span: None,
             },
+            defined_name: None,
             i18n: None,
         });
         let input = TemplateCompilationInput::new("MyApp_Template", vec![defer]);
@@ -9193,6 +11476,165 @@ mod tests {
             !out.contains("\u{0275}\u{0275}deferOnIdle("),
             "ɵɵdeferOnIdle must not be emitted when a when-trigger exists, got: {out}"
         );
+    }
+
+    #[test]
+    fn defer_target_triggers_resolve_placeholder_and_local_ref_slots() {
+        use crate::template::r3_ast::{
+            BlockSpans, DeferredBlock, DeferredBlockPlaceholder, DeferredBlockTriggers,
+            DeferredTrigger, DeferredTriggerKind, Reference, TriggerKey, TriggerSpans,
+        };
+        // `<button #go></button>` is the defer owner's element; the placeholder is `<span></span>`.
+        // Angular `resolveDeferTargetNames`: `on hover` (no reference) targets the placeholder's first
+        // element (`ɵɵdeferOnHover(0, -1)`); `on interaction(go)` targets the owner's `#go` element, one
+        // view up from nothing (`ɵɵdeferOnInteraction(<slot>)`, steps 0), and a viewport trigger with
+        // options keeps its options object as a plain literal.
+        let trig = |kind: DeferredTriggerKind| DeferredTrigger {
+            kind,
+            spans: TriggerSpans {
+                name_span: None,
+                source_span: t_span(),
+                prefetch_span: None,
+                when_or_on_source_span: None,
+                hydrate_span: None,
+            },
+        };
+        let element = |name: &str, references: Vec<Reference>| Element {
+            name: name.to_string(),
+            attributes: vec![],
+            inputs: vec![],
+            outputs: vec![],
+            directives: vec![],
+            children: vec![],
+            references,
+            is_self_closing: false,
+            source_span: t_span(),
+            start_source_span: t_span(),
+            end_source_span: None,
+            is_void: false,
+            i18n: None,
+        };
+        let mut main = DeferredBlockTriggers::default();
+        main.hover = Some(trig(DeferredTriggerKind::Hover { reference: None }));
+        main.push_order(TriggerKey::Hover);
+        main.interaction = Some(trig(DeferredTriggerKind::Interaction {
+            reference: Some("go".to_string()),
+        }));
+        main.push_order(TriggerKey::Interaction);
+        let block = Node::DeferredBlock(DeferredBlock {
+            children: vec![],
+            triggers: main,
+            prefetch_triggers: DeferredBlockTriggers::default(),
+            hydrate_triggers: DeferredBlockTriggers::default(),
+            placeholder: Some(DeferredBlockPlaceholder {
+                children: vec![Node::Element(element("span", vec![]))],
+                minimum_time: None,
+                spans: BlockSpans {
+                    name_span: t_span(),
+                    source_span: t_span(),
+                    start_source_span: t_span(),
+                    end_source_span: None,
+                },
+                i18n: None,
+            }),
+            loading: None,
+            error: None,
+            main_block_span: t_span(),
+            spans: BlockSpans {
+                name_span: t_span(),
+                source_span: t_span(),
+                start_source_span: t_span(),
+                end_source_span: None,
+            },
+            defined_name: None,
+            i18n: None,
+        });
+        let go_ref = Reference {
+            name: "go".to_string(),
+            value: String::new(),
+            source_span: t_span(),
+            key_span: t_span(),
+            value_span: None,
+        };
+        // The owner element with `#go` comes BEFORE the defer block, so its host slot is known.
+        let nodes = vec![Node::Element(element("button", vec![go_ref])), block];
+        let input = TemplateCompilationInput::new("MyApp_Template", nodes);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let out = emit_with_hoisted(&builder, &func);
+        // The owner `button` is slot 0 (its `#go` ref slot is 1), the defer main view / placeholder take
+        // the following slots; the placeholder `span` is its own view's slot 0.
+        assert!(out.contains("\u{0275}\u{0275}deferOnHover(0, -1)"), "got: {out}");
+        assert!(out.contains("\u{0275}\u{0275}deferOnInteraction(0)"), "got: {out}");
+        assert!(!out.contains("deferOnHover()"), "got: {out}");
+    }
+
+    #[test]
+    fn defer_triggers_follow_angular_group_and_kind_order_with_hydrate_runtime() {
+        use crate::template::r3_ast::{
+            BlockSpans, DeferredBlock, DeferredBlockTriggers, DeferredTrigger, DeferredTriggerKind,
+            TriggerKey, TriggerSpans,
+        };
+        let trig = |kind: DeferredTriggerKind| DeferredTrigger {
+            kind,
+            spans: TriggerSpans {
+                name_span: None,
+                source_span: t_span(),
+                prefetch_span: None,
+                when_or_on_source_span: None,
+                hydrate_span: None,
+            },
+        };
+        // Main: `on timer(500ms); on idle` (source order), so Angular's kind order emits idle first.
+        let mut main = DeferredBlockTriggers::default();
+        main.timer = Some(trig(DeferredTriggerKind::Timer { delay: 500.0 }));
+        main.push_order(TriggerKey::Timer);
+        main.idle = Some(trig(DeferredTriggerKind::Idle { timeout: None }));
+        main.push_order(TriggerKey::Idle);
+        // Hydrate: `hydrate on immediate`.
+        let mut hydrate = DeferredBlockTriggers::default();
+        hydrate.immediate = Some(trig(DeferredTriggerKind::Immediate));
+        hydrate.push_order(TriggerKey::Immediate);
+        let block = |triggers, hydrate_triggers| {
+            Node::DeferredBlock(DeferredBlock {
+                children: vec![],
+                triggers,
+                prefetch_triggers: DeferredBlockTriggers::default(),
+                hydrate_triggers,
+                placeholder: None,
+                loading: None,
+                error: None,
+                main_block_span: t_span(),
+                spans: BlockSpans {
+                    name_span: t_span(),
+                    source_span: t_span(),
+                    start_source_span: t_span(),
+                    end_source_span: None,
+                },
+                defined_name: None,
+                i18n: None,
+            })
+        };
+        // Two sibling hydrating defers: the runtime activator is emitted once, before the first defer.
+        let nodes = vec![block(main.clone(), hydrate.clone()), block(main, hydrate)];
+        let input = TemplateCompilationInput::new("MyApp_Template", nodes);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let out = emit_with_hoisted(&builder, &func);
+
+        assert_eq!(out.matches("\u{0275}\u{0275}enableIncrementalHydrationRuntime()").count(), 1, "got: {out}");
+        let activator = out.find("enableIncrementalHydrationRuntime()").unwrap();
+        let first_defer = out.find("\u{0275}\u{0275}defer(").unwrap();
+        assert!(activator < first_defer, "got: {out}");
+        // The defer op carries `TDeferDetailsFlags.HasHydrateTriggers` (1) as its trailing argument.
+        let defer_call = &out[first_defer..];
+        let defer_call = &defer_call[..defer_call.find(");").unwrap()];
+        assert!(defer_call.ends_with(", 1"), "hydrate flag missing, got: {defer_call}");
+        // Hydrate triggers come before the main group, and within the main group idle precedes timer.
+        let hydrate_at = out.find("deferHydrateOnImmediate()").unwrap();
+        let idle_at = out.find("deferOnIdle()").unwrap();
+        let timer_at = out.find("deferOnTimer(500)").unwrap();
+        assert!(hydrate_at < idle_at && idle_at < timer_at, "got: {out}");
     }
 
     #[test]
@@ -9452,13 +11894,13 @@ mod tests {
         let func = builder.build_template_function(&input);
         let out = emit_expression(&func);
 
-        // `projectionDef($c0$)` references the SHARED-pool selector array (Angular
+        // `projectionDef(_c0)` references the SHARED-pool selector array (Angular
         // `generateProjectionDefs` → `getConstLiteral(asLiteral(parsed), true)`), NOT a `consts:`
         // index. The default slot emits `ɵɵprojection(0)` (index elided) and the named slot
         // `ɵɵprojection(1, 1)`. `ɵɵprojection` is NOT in Angular's `CHAIN_COMPATIBILITY` map, so the
         // two adjacent projection create ops stay as SEPARATE statements (faithful to Angular's
         // `content_projection` goldens, which emit `ɵɵprojection(0); ɵɵprojection(1, 1);` un-chained).
-        assert!(out.contains("\u{0275}\u{0275}projectionDef($c0$)"), "got: {out}");
+        assert!(out.contains("\u{0275}\u{0275}projectionDef(_c0)"), "got: {out}");
         assert!(out.contains("\u{0275}\u{0275}projection(0)"), "got: {out}");
         assert!(out.contains("\u{0275}\u{0275}projection(1, 1)"), "got: {out}");
         assert!(!out.contains("\u{0275}\u{0275}projection(0)(1, 1)"), "got: {out}");
@@ -9470,7 +11912,7 @@ mod tests {
             builder.const_pool().entries()
         );
         let hoisted = crate::output::emitter::emit_statements(builder.hoisted_functions());
-        assert!(hoisted.contains("$c0$"), "missing shared const decl, got: {hoisted}");
+        assert!(hoisted.contains("_c0"), "missing shared const decl, got: {hoisted}");
         assert!(hoisted.contains("\"header\""), "got hoisted: {hoisted}");
     }
 
@@ -9606,5 +12048,421 @@ mod tests {
         assert!(out.contains("return ctx.exp;"), "got: {out}");
         // Legacy `[@trig]` → update-block `ɵɵdomProperty("@trig", ctx.exp2)`.
         assert!(out.contains("\u{0275}\u{0275}domProperty(\"@trig\", ctx.exp2)"), "got: {out}");
+    }
+
+    /// Strip the `i0.` / `$r3$.` module prefixes so emitted text compares with a golden's shape.
+    fn golden_shape(out: &str) -> String {
+        out.replace("i0.", "").replace("$r3$.", "")
+    }
+
+    fn fancy_button_foreign() -> Vec<ForeignComponentRef> {
+        vec![ForeignComponentRef {
+            name: "FancyButton".to_string(),
+            component: o::variable("frameworkImport", None)
+                .call_fn(vec![o::variable("FancyButton", None)], false),
+        }]
+    }
+
+    /// `ingestControlFlowInsertionPoint`: a foreign component root is not a plain element, so the
+    /// surrounding `@if` branch passes `null` as its content-projection tag (golden
+    /// `foreign_component.js` `TestCmpConditional_Conditional_0_Template`: `conditionalCreate(0, …, 1, 0)`).
+    #[test]
+    fn foreign_root_passes_no_control_flow_tag() {
+        let foreign = fancy_button_foreign();
+        let root = Node::Element(Element {
+            name: "FancyButton".to_string(),
+            attributes: vec![],
+            inputs: vec![],
+            outputs: vec![],
+            directives: vec![],
+            children: vec![],
+            references: vec![],
+            is_self_closing: true,
+            source_span: t_span(),
+            start_source_span: t_span(),
+            end_source_span: None,
+            is_void: false,
+            i18n: None,
+        });
+        assert_eq!(
+            emit_expression(&single_root_tag(std::slice::from_ref(&root), &foreign)).trim(),
+            "null;"
+        );
+        // Without the foreign registration the same element is an ordinary root tag.
+        assert_eq!(
+            emit_expression(&single_root_tag(std::slice::from_ref(&root), &[])).trim(),
+            "(\"FancyButton\");"
+        );
+    }
+
+    /// `resolve_sanitizers.ts` with the DOM security schema (`dom_security_schema.ts`): a bound
+    /// property gets the sanitizer of its element's context. `a[href]` is URL, `link[href]` is
+    /// RESOURCE_URL, `innerHTML` is HTML, and `img[src]` is no longer sanitized in the NEW schema.
+    #[test]
+    fn bound_properties_get_schema_sanitizers() {
+        let url = compile_template_html("<a [href]=\"u\"></a>", "C_Template", false);
+        assert!(url.contains("\u{0275}\u{0275}sanitizeUrl"), "got: {url}");
+
+        let res = compile_template_html("<link [href]=\"u\">", "C_Template", false);
+        assert!(res.contains("\u{0275}\u{0275}sanitizeResourceUrl"), "got: {res}");
+
+        let html = compile_template_html("<div [innerHTML]=\"h\"></div>", "C_Template", false);
+        assert!(html.contains("\u{0275}\u{0275}sanitizeHtml"), "got: {html}");
+
+        let img = compile_template_html("<img [src]=\"u\">", "C_Template", false);
+        assert!(!img.contains("sanitize"), "got: {img}");
+    }
+
+    /// `[attr.href]` is looked up as an attribute (`isAttribute = true`) on the element, so an anchor
+    /// gets `ɵɵattribute("href", …, ɵɵsanitizeUrl)`, and a namespaced `<a>` inside `<svg>` uses the
+    /// SVG table (`xlink:href` is URL there).
+    #[test]
+    fn attribute_bindings_and_namespaced_elements_get_schema_sanitizers() {
+        let attr = compile_template_html("<a [attr.href]=\"u\"></a>", "C_Template", false);
+        assert!(attr.contains("\u{0275}\u{0275}attribute(\"href\""), "got: {attr}");
+        assert!(attr.contains("\u{0275}\u{0275}sanitizeUrl"), "got: {attr}");
+
+        let svg = compile_template_html(
+            "<svg><a [attr.xlink:href]=\"u\"></a></svg>",
+            "C_Template",
+            false,
+        );
+        assert!(svg.contains("\u{0275}\u{0275}sanitizeUrl"), "got: {svg}");
+    }
+
+    /// `generate_variables.ts` prepends the scope's variables to `view.create`, and the foreign
+    /// component's inputs are read in the creation block (`ɵɵforeignComponent(…, () => ({label:
+    /// ctx_r0.title}))`). The nested view's `ɵɵnextContext(2)` must therefore be declared in the create
+    /// block, before the foreign instruction, and NOT in the update block (golden
+    /// `foreign_component.js` `TestCmpConditional_Conditional_0_Conditional_0_Template`).
+    #[test]
+    fn nested_foreign_input_reads_context_in_creation_block() {
+        let src = "@if (outer) { @if (inner) { <FancyButton [label]=\"title\" /> } }";
+        let out = compile_template_html_with_foreign(src, "TestCmpConditional_Template", false, fancy_button_foreign());
+        let inner_start = out
+            .find("function TestCmpConditional_Conditional_0_Conditional_0_Template")
+            .unwrap_or_else(|| panic!("no inner view: {out}"));
+        let inner = &out[inner_start..];
+        let inner = &inner[..inner.find("\n}\n").unwrap_or(inner.len())];
+        let ctx_decl = inner.find("nextContext(2)").unwrap_or_else(|| panic!("no nextContext(2): {inner}"));
+        let fc = inner.find("foreignComponent(").unwrap_or_else(|| panic!("no foreignComponent: {inner}"));
+        let rf2 = inner.find("rf & 2").unwrap_or(inner.len());
+        assert!(ctx_decl < fc, "context must be read before the foreign instruction: {inner}");
+        assert!(ctx_decl < rf2 && fc < rf2, "context must live in the creation block: {inner}");
+        assert!(!inner[rf2..].contains("nextContext"), "no update-block context read: {inner}");
+    }
+
+    /// Golden `components_and_directives/standalone/foreign_component.js` (`TestCmp`): a foreign element
+    /// is one `ɵɵforeignComponent(slot, constIndex, () => ({ … }))` with no update block; the component
+    /// reference is the `consts` entry, and `unsafe-*` keys are quoted.
+    #[test]
+    fn foreign_component_matches_golden_instructions() {
+        let out = golden_shape(&compile_template_html_with_foreign(
+            "\n    <FancyButton class=\"btn-cls\" unsafe-attr=\"value\" [label]=\"title\" [unsafe-input]=\"title\" />\n  ",
+            "TestCmp_Template",
+            true,
+            fancy_button_foreign(),
+        ));
+        assert!(
+            out.contains("ɵɵforeignComponent(0, 0, () => ({"),
+            "got: {out}"
+        );
+        assert!(out.contains("\"unsafe-attr\": \"value\""), "got: {out}");
+        assert!(out.contains("\"unsafe-input\": ctx.title"), "got: {out}");
+        assert!(!out.contains("ɵɵforeignContent"), "got: {out}");
+        assert!(!out.contains("ɵɵadvance"), "no update block: {out}");
+    }
+
+    /// Golden `foreign_component.js` (`TestCmpChildren`): each `@content` block is a template created
+    /// before the foreign component, read back through `ɵɵforeignContent` into a local named after the
+    /// block; the default children become a `Children` view; the props end with those locals.
+    #[test]
+    fn foreign_component_content_blocks_and_children() {
+        let out = golden_shape(&compile_template_html_with_foreign(
+            "\n    <FancyButton [label]=\"title\">\n      @content (icon) {\n        <span>Icon!</span>\n      }\n      @content (description) {\n        <span>Description text</span>\n      }\n      <span>Other children</span>\n    </FancyButton>\n  ",
+            "TestCmpChildren_Template",
+            true,
+            fancy_button_foreign(),
+        ));
+        assert!(
+            out.contains("ɵɵdomTemplate(0, TestCmpChildren_Icon_0_Template, 2, 0)(1, TestCmpChildren_Description_1_Template, 2, 0)(2, TestCmpChildren_Children_2_Template, 2, 0);"),
+            "got: {out}"
+        );
+        assert!(out.contains("const icon_r1 = ɵɵforeignContent(0, 0);"), "got: {out}");
+        assert!(out.contains("const description_r2 = ɵɵforeignContent(1, 0);"), "got: {out}");
+        assert!(out.contains("const children_r3 = ɵɵforeignContent(2, 0);"), "got: {out}");
+        assert!(
+            out.contains("ɵɵforeignComponent(3, 0, () => ({\n\t\t\tlabel: ctx.title,\n\t\t\ticon: icon_r1,\n\t\t\tdescription: description_r2,\n\t\t\tchildren: children_r3\n\t\t}));")
+                || out.contains("ɵɵforeignComponent(3, 0, () => ({ label: ctx.title, icon: icon_r1, description: description_r2, children: children_r3 }));")
+                || (out.contains("icon: icon_r1") && out.contains("children: children_r3") && out.contains("ɵɵforeignComponent(3, 0,")),
+            "got: {out}"
+        );
+    }
+
+    /// Golden `foreign_component.js` (`TestCmpRenderProps`): a `@content` block with `let` variables is
+    /// read through `ɵɵforeignContentFn` and its variables are the render arguments (`ctx[0]`, `ctx[1]`).
+    #[test]
+    fn foreign_component_render_props_read_context_arguments() {
+        let out = golden_shape(&compile_template_html_with_foreign(
+            "\n    <FancyButton [label]=\"title\">\n      @content (items; let item, index) {\n        <span>#{{index}}: {{item}}</span>\n      }\n    </FancyButton>\n  ",
+            "TestCmpRenderProps_Template",
+            true,
+            fancy_button_foreign(),
+        ));
+        assert!(out.contains("ɵɵdomTemplate(0, TestCmpRenderProps_Items_0_Template, 2, 2);"), "got: {out}");
+        assert!(out.contains("const items_r3 = ɵɵforeignContentFn(0, 0);"), "got: {out}");
+        assert!(out.contains("ɵɵforeignComponent(1, 0, () => ({"), "got: {out}");
+        assert!(out.contains("const item_r1 = ctx[0];"), "got: {out}");
+        assert!(out.contains("const index_r2 = ctx[1];"), "got: {out}");
+    }
+
+    /// Golden `r3_view_compiler_boundaries/basic.js`: boundary container, primary and `@error` branches,
+    /// and the `error === null` selector; no `when` so the boundary state is read once (inline).
+    #[test]
+    fn boundary_basic_matches_golden_instructions() {
+        let out = golden_shape(&compile_template_html(
+            "\n    @boundary {\n      Main Content\n    } @error {\n      Fallback Content\n    }\n  ",
+            "TestComponent_Template",
+            true,
+        ));
+        assert!(out.contains("ɵɵboundaryCreate(0);"), "got: {out}");
+        assert!(
+            out.contains("ɵɵconditionalBranchCreate(1, TestComponent_Primary_1_Template, 1, 0)(2, TestComponent_Error_2_Template, 1, 0);"),
+            "got: {out}"
+        );
+        assert!(
+            out.contains("ɵɵboundaryUpdate(0, ɵɵgetBoundary(0).error === null ? 1 : 2, 1);"),
+            "got: {out}"
+        );
+        assert!(out.contains("function TestComponent_Primary_1_Template(rf, ctx) {"), "got: {out}");
+        assert!(out.contains("ɵɵtext(0, \" Fallback Content \");"), "got: {out}");
+    }
+
+    /// Golden `error_declaration.js`: `@error (let err)` reads `ctx.$error` inline in the branch view.
+    #[test]
+    fn boundary_error_declaration_reads_error_context_variable() {
+        let out = golden_shape(&compile_template_html(
+            "\n    @boundary {\n      Main Content\n    } @error (let err) {\n      Error: {{err.message}}\n    }\n  ",
+            "TestComponent_Template",
+            true,
+        ));
+        assert!(
+            out.contains("ɵɵconditionalBranchCreate(1, TestComponent_Primary_1_Template, 1, 0)(2, TestComponent_Error_2_Template, 1, 1);"),
+            "got: {out}"
+        );
+        assert!(out.contains("ɵɵtextInterpolate1(\" Error: \", ctx.$error.message, \" \");"), "got: {out}");
+    }
+
+    /// Golden `retry_alias.js` / `retry_implicit.js`: a listener re-reads `$reset` off the restored
+    /// view (`ɵɵresetView($ctx.$reset())`).
+    #[test]
+    fn boundary_retry_listener_resets_through_restored_view() {
+        let out = golden_shape(&compile_template_html(
+            "\n    @boundary {\n      Main Content\n    } @error (let err, retry = $reset) {\n      <button (click)=\"retry()\">Retry</button>\n    }\n  ",
+            "TestComponent_Template",
+            true,
+        ));
+        assert!(out.contains("const $restored_1$ = ɵɵrestoreView($s_2$);"), "got: {out}");
+        assert!(out.contains("return ɵɵresetView($restored_1$.$reset());"), "got: {out}");
+        assert!(!out.contains("ctx.$reset()"), "got: {out}");
+    }
+
+    /// Golden `when_condition.js` / `multiple_error_blocks.js`: a `when` reads the boundary state more
+    /// than once, so it is materialised as `const bnd_rN = ɵɵgetBoundary(0)`; the unconditional
+    /// `@error` is the fallback, and with none the fallback is `-1`.
+    #[test]
+    fn boundary_when_conditions_chain_and_materialise_state() {
+        let out = golden_shape(&compile_template_html(
+            "\n    @boundary {\n      Main Content\n    } @error (let err; when err.message === '404') {\n      Not Found\n    } @error (let err) {\n      Generic Error\n    }\n  ",
+            "TestComponent_Template",
+            true,
+        ));
+        assert!(
+            out.contains("ɵɵconditionalBranchCreate(1, TestComponent_Primary_1_Template, 1, 0)(2, TestComponent_Error_2_Template, 1, 0)(3, TestComponent_Error_3_Template, 1, 0);"),
+            "got: {out}"
+        );
+        assert!(out.contains("const bnd_r1 = ɵɵgetBoundary(0);"), "got: {out}");
+        assert!(
+            out.contains("ɵɵboundaryUpdate(0, bnd_r1.error === null ? 1 : bnd_r1.error.message === \"404\" ? 2 : 3, 1);"),
+            "got: {out}"
+        );
+
+        let no_fallback = golden_shape(&compile_template_html(
+            "\n    @boundary {\n      Main Content\n    } @error (let err; when err.message === '404') {\n      Not Found\n    }\n  ",
+            "TestComponent_Template",
+            true,
+        ));
+        assert!(
+            no_fallback.contains("ɵɵboundaryUpdate(0, bnd_r1.error === null ? 1 : bnd_r1.error.message === \"404\" ? 2 : -1, 1);"),
+            "got: {no_fallback}"
+        );
+    }
+
+    /// `i18n_parser.ts` `visitBlock`: a `@boundary` inside an i18n block is a `boundary` block
+    /// placeholder (its content is part of the message), and its `@error` is an `error` placeholder.
+    /// The message therefore carries the boundary's text (`Main`/`Fallback`) and both placeholders.
+    #[test]
+    fn boundary_inside_i18n_block_contributes_placeholders() {
+        let nodes = {
+            let parsed = crate::ml_parser::parse(
+                "<div i18n>@boundary {\n  Main\n} @error {\n  Fallback\n}</div>",
+                "test.html",
+            );
+            let mut bp = crate::template::template_transform::BindingParser::new();
+            let r3 = crate::template::template_transform::html_ast_to_render3_ast(
+                &parsed.root_nodes,
+                &mut bp,
+                crate::template::template_transform::Render3ParseOptions::default(),
+            );
+            r3.nodes
+        };
+        let div = match &nodes[0] {
+            Node::Element(e) => e.clone(),
+            other => panic!("expected element, got {other:?}"),
+        };
+        let mut builder = I18nCollector::new();
+        builder.visit_children(&div.children);
+        let names: Vec<String> = builder
+            .nodes
+            .iter()
+            .filter_map(|n| match n {
+                crate::i18n::Node::BlockPlaceholder(b) => Some(b.name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, vec!["boundary".to_string(), "error".to_string()]);
+    }
+
+    /// `boundary_conditions.ts` lowers each `when` expression once; a pipe inside it must reserve its
+    /// slot and constant-pool entry exactly once, however many times the boundary state is read.
+    #[test]
+    fn boundary_when_expression_with_pipe_is_lowered_once() {
+        let out = golden_shape(&compile_template_html(
+            "\n    @boundary {\n      Main\n    } @error (let err; when (err.message | uppercase) === 'X') {\n      Fallback\n    }\n  ",
+            "TestComponent_Template",
+            true,
+        ));
+        assert_eq!(out.matches("pipe(").count(), 1, "pipe lowered more than once: {out}");
+        assert_eq!(out.matches("pipeBind1(").count(), 1, "pipe bind lowered more than once: {out}");
+        assert!(out.contains("const bnd_r1 = ɵɵgetBoundary(0);"), "got: {out}");
+    }
+
+    /// A boundary state read only once (no `when` alias reads it) stays inline: no `const bnd_rN`.
+    #[test]
+    fn boundary_state_read_once_stays_inline() {
+        let out = golden_shape(&compile_template_html(
+            "\n    @boundary {\n      Main\n    } @error {\n      Fallback\n    }\n  ",
+            "TestComponent_Template",
+            true,
+        ));
+        assert!(!out.contains("bnd_r"), "got: {out}");
+        assert!(out.contains("ɵɵboundaryUpdate(0, ɵɵgetBoundary(0).error === null ? 1 : 2, 1);"), "got: {out}");
+    }
+
+    /// Golden `nested.js`: an inner boundary inside a primary branch advances to its own slot and
+    /// names its branch views after the enclosing branch (`_Primary_1_Primary_2_Template`).
+    #[test]
+    fn boundary_nested_names_views_and_advances() {
+        let out = golden_shape(&compile_template_html(
+            "\n    @boundary {\n      Outer Main\n      @boundary {\n        Inner Main\n      } @error {\n        Inner Fallback\n      }\n    } @error {\n      Outer Fallback\n    }\n  ",
+            "TestComponent_Template",
+            true,
+        ));
+        assert!(out.contains("function TestComponent_Primary_1_Primary_2_Template(rf, ctx) {"), "got: {out}");
+        assert!(out.contains("function TestComponent_Primary_1_Error_3_Template(rf, ctx) {"), "got: {out}");
+        assert!(out.contains("ɵɵboundaryCreate(1);"), "got: {out}");
+        assert!(
+            out.contains("ɵɵadvance();\n\t\ti0.ɵɵboundaryUpdate(1, ɵɵgetBoundary(1).error === null ? 2 : 3, 2);")
+                || out.contains("ɵɵadvance();\n\t\tɵɵboundaryUpdate(1, ɵɵgetBoundary(1).error === null ? 2 : 3, 2);"),
+            "got: {out}"
+        );
+    }
+
+    /// `ingestControlFlowInsertionPoint`: a namespaced single root (`<svg>` is `:svg:svg` in the r3
+    /// AST) passes its plain tag name, so the branch's `ɵɵconditionalCreate` gets `"svg"` (golden
+    /// `if_namespaced_root_node`). `ng-template` and multi-root bodies still pass `null`.
+    /// `emitNamespaceChanges` (`phases/namespace.ts`): the svg/math element switches the namespace
+    /// instruction, and the HTML `p` switches back. Mirrors `svg_template.js`.
+    #[test]
+    fn svg_subtree_emits_namespace_switches_and_strips_prefix() {
+        let out = compile_template_html(
+            "<div><svg><circle></circle></svg><p>test</p></div>",
+            "MyComponent_Template",
+            false,
+        );
+        let pos = |needle: &str| {
+            out.find(needle)
+                .unwrap_or_else(|| panic!("missing `{needle}` in:\n{out}"))
+        };
+        // div (HTML), then SVG switch before the svg element, then HTML before the trailing p.
+        let div = pos("\u{0275}\u{0275}elementStart(0, \"div\")");
+        let ns_svg = pos("\u{0275}\u{0275}namespaceSVG()");
+        let svg = pos("\u{0275}\u{0275}elementStart(1, \"svg\")");
+        let ns_html = pos("\u{0275}\u{0275}namespaceHTML()");
+        let p = pos("\u{0275}\u{0275}elementStart(3, \"p\")");
+        assert!(div < ns_svg && ns_svg < svg && svg < ns_html && ns_html < p, "got: {out}");
+        // The circle is already in SVG, so no second switch is emitted before it.
+        assert_eq!(out.matches("namespaceSVG()").count(), 1, "got: {out}");
+        // Namespace prefixes are stripped from the tag (`:svg:circle` -> `circle`).
+        assert!(!out.contains(":svg:"), "got: {out}");
+        assert!(out.contains("\u{0275}\u{0275}element(2, \"circle\")"), "got: {out}");
+    }
+
+    /// MathML (`mathml_template.js`): `ɵɵnamespaceMathML()` before `math`, `ɵɵnamespaceHTML()` after.
+    #[test]
+    fn mathml_subtree_emits_mathml_namespace() {
+        let out = compile_template_html("<div><math><infinity></infinity></math><p>t</p></div>", "C_Template", false);
+        assert!(out.contains("\u{0275}\u{0275}namespaceMathML()"), "got: {out}");
+        assert!(out.contains("\u{0275}\u{0275}elementStart(1, \"math\")"), "got: {out}");
+        assert!(out.contains("\u{0275}\u{0275}element(2, \"infinity\")"), "got: {out}");
+        assert!(out.contains("\u{0275}\u{0275}namespaceHTML()"), "got: {out}");
+    }
+
+    /// A template with no namespaced element emits no namespace instruction at all.
+    #[test]
+    fn html_only_template_emits_no_namespace_instruction() {
+        let out = compile_template_html("<div><p>x</p></div>", "C_Template", false);
+        assert!(!out.contains("namespace"), "got: {out}");
+    }
+
+    /// `phases/namespace.ts` runs per unit: an embedded view whose root is `<svg>` starts in HTML and
+    /// so emits its own `ɵɵnamespaceSVG()` (`svg_embedded_view_template.js`). The `ng-template` inside
+    /// the svg keeps its plain `ng-template` tag (`ingestTemplate` strips the prefix).
+    #[test]
+    fn svg_embedded_view_root_emits_namespace_in_child_view() {
+        let out = compile_template_html(
+            "<svg><ng-template [ngIf]=\"x\"><text>Hello</text></ng-template></svg>",
+            "C_Template",
+            false,
+        );
+        // One switch in the root view (before `svg`), one in the embedded view (before `text`).
+        assert_eq!(out.matches("namespaceSVG()").count(), 2, "got: {out}");
+        assert!(out.contains("\u{0275}\u{0275}elementStart(0, \"text\")"), "got: {out}");
+        assert!(out.contains("\"ng-template\""), "got: {out}");
+        assert!(!out.contains(":svg:"), "got: {out}");
+    }
+
+    #[test]
+    fn control_flow_root_tag_strips_namespace() {
+        let svg = Node::Element(Element {
+            name: ":svg:svg".to_string(),
+            attributes: vec![],
+            inputs: vec![],
+            outputs: vec![],
+            directives: vec![],
+            children: vec![],
+            references: vec![],
+            is_self_closing: false,
+            source_span: t_span(),
+            start_source_span: t_span(),
+            end_source_span: None,
+            is_void: false,
+            i18n: None,
+        });
+        let tag = single_root_tag(std::slice::from_ref(&svg), &[]);
+        assert_eq!(emit_expression(&tag).trim(), "(\"svg\");");
+
+        let two_roots = vec![svg.clone(), svg];
+        assert_eq!(emit_expression(&single_root_tag(&two_roots, &[])).trim(), "null;");
     }
 }

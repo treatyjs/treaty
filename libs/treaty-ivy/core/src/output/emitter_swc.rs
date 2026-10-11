@@ -300,6 +300,8 @@ fn exponent_base_needs_parens(parent_op: BinaryOperator, base: &o::Expr) -> bool
         return false;
     }
     match &base.kind {
+        // `++x ** 2` and `x++ ** 2` are UpdateExpressions, which the grammar allows as a `**` base.
+        ExprKind::Unary { op, .. } if op.is_update() => false,
         ExprKind::Not(_) | ExprKind::Unary { .. } | ExprKind::Typeof(_) | ExprKind::Void(_) => true,
         ExprKind::Parenthesized(inner) => exponent_base_needs_parens(parent_op, inner),
         _ => false,
@@ -631,13 +633,28 @@ impl Printer {
                 self.push("!");
                 self.print_expr(inner, Prec::Unary);
             }
-            ExprKind::Unary { op, expr, .. } => {
-                self.push(match op {
-                    UnaryOperator::Plus => "+",
-                    UnaryOperator::Minus => "-",
-                });
-                self.print_expr(expr, Prec::Unary);
-            }
+            ExprKind::Unary { op, expr, is_prefix, .. } => match op {
+                UnaryOperator::Plus => {
+                    self.push("+");
+                    self.print_expr(expr, Prec::Unary);
+                }
+                UnaryOperator::Minus => {
+                    self.push("-");
+                    self.print_expr(expr, Prec::Unary);
+                }
+                // `++x` / `--x` bind like other prefix unaries; `x++` / `x--` need a left operand
+                // that binds at least as tightly as a member access (ESTree UpdateExpression).
+                UnaryOperator::Increment | UnaryOperator::Decrement => {
+                    let text = if *op == UnaryOperator::Increment { "++" } else { "--" };
+                    if *is_prefix {
+                        self.push(text);
+                        self.print_expr(expr, Prec::Unary);
+                    } else {
+                        self.print_expr(expr, Prec::Postfix);
+                        self.push(text);
+                    }
+                }
+            },
             ExprKind::Typeof(inner) => {
                 self.push("typeof ");
                 self.print_expr(inner, Prec::Unary);
@@ -947,7 +964,7 @@ impl Printer {
 
     fn print_object_entry(&mut self, entry: &LiteralMapEntry) {
         match entry {
-            LiteralMapEntry::Property { key, value, quoted } => {
+            LiteralMapEntry::Property { key, value, quoted, .. } => {
                 let ident_key = !*quoted && is_valid_ident_name(key);
                 // SHORTHAND: `{ child }` when an unquoted identifier key equals a same-named variable
                 // value. `oxc_codegen` emits this regardless of the AST `shorthand` flag (it compares
@@ -1062,6 +1079,8 @@ fn expr_prec(expr: &o::Expr) -> Prec {
         // `new X(args)` binds like a member/call; `new X` without args is also Postfix here since
         // our IR always carries an args vec.
         ExprKind::New { .. } => Prec::Postfix,
+        // A postfix update (`x++` / `x--`) binds as a postfix expression; every other unary is prefix.
+        ExprKind::Unary { is_prefix: false, op, .. } if op.is_update() => Prec::Postfix,
         ExprKind::Not(_) | ExprKind::Unary { .. } | ExprKind::Typeof(_) | ExprKind::Void(_) => {
             Prec::Unary
         }
@@ -1311,4 +1330,67 @@ fn serialize_i18n_template_part(
         }
     }
     create_cooked_raw_string(&meta_block, message_part)
+}
+
+#[cfg(test)]
+mod update_expression_tests {
+    use super::*;
+    use crate::output::emitter as oxc_emitter;
+
+    fn var(name: &str) -> o::Expr {
+        o::variable(name, None)
+    }
+
+    /// The expression statement text without its trailing `;\n`.
+    fn js_text(e: &o::Expr) -> String {
+        emit_expression(e).trim_end_matches(";\n").to_string()
+    }
+
+    /// The swc printer and the oxc emitter must agree byte-for-byte on `++` / `--` (prefix and
+    /// postfix), including member and keyed targets.
+    #[test]
+    fn increment_and_decrement_match_oxc_for_prefix_and_postfix() {
+        let cases: Vec<(o::Expr, &str)> = vec![
+            (o::unary_with_prefix(UnaryOperator::Increment, var("x"), None, true), "++x"),
+            (o::unary_with_prefix(UnaryOperator::Increment, var("x"), None, false), "x++"),
+            (o::unary_with_prefix(UnaryOperator::Decrement, var("x"), None, true), "--x"),
+            (o::unary_with_prefix(UnaryOperator::Decrement, var("x"), None, false), "x--"),
+            (
+                o::unary_with_prefix(UnaryOperator::Increment, var("obj").prop("n"), None, false),
+                "obj.n++",
+            ),
+            (
+                o::unary_with_prefix(UnaryOperator::Decrement, var("arr").key(o::literal(
+                    LiteralValue::Number(0.0),
+                    None,
+                )), None, true),
+                "--arr[0]",
+            ),
+        ];
+        for (expr, expected) in cases {
+            assert_eq!(js_text(&expr), expected);
+            assert_eq!(oxc_emitter::emit_expression(&expr).trim_end_matches(";\n"), expected, "oxc disagrees for {expected}");
+        }
+    }
+
+    #[test]
+    fn postfix_update_binds_tighter_than_binary_operators() {
+        // `x++ + 1` needs no parens; `(-x)++` is not a valid target so never reaches the printer.
+        let sum = o::Expr::bare(ExprKind::Binary {
+            op: BinaryOperator::Plus,
+            lhs: Box::new(o::unary_with_prefix(UnaryOperator::Increment, var("x"), None, false)),
+            rhs: Box::new(o::literal(LiteralValue::Number(1.0), None)),
+        });
+        assert_eq!(js_text(&sum), "x++ + 1");
+    }
+
+    #[test]
+    fn update_expression_is_allowed_as_exponent_base() {
+        let pow = o::Expr::bare(ExprKind::Binary {
+            op: BinaryOperator::Exponentiation,
+            lhs: Box::new(o::unary_with_prefix(UnaryOperator::Increment, var("a"), None, false)),
+            rhs: Box::new(o::literal(LiteralValue::Number(2.0), None)),
+        });
+        assert_eq!(js_text(&pow), "a++ ** 2");
+    }
 }

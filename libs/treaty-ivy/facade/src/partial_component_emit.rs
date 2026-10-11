@@ -19,7 +19,7 @@
 
 use crate::output_ast::{self as o, Expr, ExternalReference, LiteralValue};
 use crate::view::compiler::{
-    ChangeDetectionStrategy, OrderedMap, QueryPredicate, R3DirectiveMetadata, R3HostDirectiveMetadata,
+    ChangeDetection, OrderedMap, QueryPredicate, R3DirectiveMetadata, R3HostDirectiveMetadata,
     R3HostMetadata, R3InputMetadata, R3QueryMetadata, R3TemplateDependencyKind, ViewEncapsulation,
 };
 
@@ -56,7 +56,9 @@ pub struct PartialComponentInputs<'a> {
     /// Whether `template_html` came from an INLINE `template:` (`isInline: true`) rather than an
     /// external `templateUrl` (the resolved content, no `isInline` field — matching ng-packagr).
     pub is_inline: bool,
-    pub change_detection: ChangeDetectionStrategy,
+    /// The component's change detection (the source's explicit choice or the OnPush default, as resolved by the
+    /// source front-end). `Eager` is written as `i0.ChangeDetectionStrategy.Eager`.
+    pub change_detection: ChangeDetection,
     pub encapsulation: ViewEncapsulation,
     /// Inline component style strings — RAW (unscoped); scoping happens at link time.
     pub styles: &'a [String],
@@ -367,16 +369,20 @@ fn dependencies_array(dependencies: &[PartialDependency]) -> Expr {
 
 /// `changeDetection: i0.ChangeDetectionStrategy.X` — emitted EXPLICITLY for the component's strategy.
 ///
-/// Both `OnPush` and `Default` are emitted explicitly (rather than omitting `Default`) so the partial
+/// `OnPush`, `Default` and `Eager` are all emitted explicitly (rather than omitting `Default`) so the partial
 /// declaration round-trips through the linker to the SAME AOT `ɵɵdefineComponent` the direct Full
 /// emit produces, regardless of the linker's version-dependent default. The linker assumes OnPush for
 /// a placeholder/v22 declaration when `changeDetection` is ABSENT; emitting the strategy verbatim
 /// pins the AOT result (an explicit `Default` → omitted on the AOT def; an explicit `OnPush` →
-/// `changeDetection: 0`), exactly matching the source AOT path's "omit Default, emit OnPush".
-fn change_detection_field(strategy: ChangeDetectionStrategy) -> Option<(String, bool, Expr)> {
-    let name = match strategy {
-        ChangeDetectionStrategy::OnPush => "OnPush",
-        ChangeDetectionStrategy::Default => "Default",
+/// `changeDetection: 0`; an explicit `Eager` → `changeDetection: 1`), matching the source AOT path's emit rule.
+/// An unresolved expression (`ChangeDetection::Expr`) is carried through verbatim.
+fn change_detection_field(change_detection: &ChangeDetection) -> Option<(String, bool, Expr)> {
+    use crate::view::compiler::ChangeDetectionStrategy;
+    let name = match change_detection {
+        ChangeDetection::Strategy(ChangeDetectionStrategy::OnPush) => "OnPush",
+        ChangeDetection::Strategy(ChangeDetectionStrategy::Default) => "Default",
+        ChangeDetection::Eager => "Eager",
+        ChangeDetection::Expr(expr) => return Some(field("changeDetection", expr.clone())),
     };
     Some(field(
         "changeDetection",
@@ -391,6 +397,7 @@ fn encapsulation_field(encapsulation: ViewEncapsulation) -> Option<(String, bool
         ViewEncapsulation::Emulated => return None,
         ViewEncapsulation::None => "None",
         ViewEncapsulation::ShadowDom => "ShadowDom",
+        ViewEncapsulation::ExperimentalIsolatedShadowDom => "ExperimentalIsolatedShadowDom",
     };
     Some(field(
         "encapsulation",
@@ -441,7 +448,7 @@ pub fn emit_ng_declare_component(
         fields.push(field("animations", animations.clone()));
     }
 
-    if let Some(cd) = change_detection_field(inputs.change_detection) {
+    if let Some(cd) = change_detection_field(&inputs.change_detection) {
         fields.push(cd);
     }
     if let Some(enc) = encapsulation_field(inputs.encapsulation) {

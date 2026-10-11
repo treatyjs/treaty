@@ -76,7 +76,7 @@
 .moon/docker
 
 # Vendored Angular reference (render3 port spec source)
-/tools/angular-ref/
+/tools/angular-ref
 
 # Migration build logs
 baseline-cargo-build.log

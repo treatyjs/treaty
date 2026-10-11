@@ -914,6 +914,13 @@ impl<R: LocalResolver> Converter<'_, R> {
 
             // Call: `f(args)`.
             EK::Call { receiver, args, .. } => {
+                // `$any(expr)` is a type-cast builtin with no runtime effect: Angular's `any_cast.ts`
+                // (`deleteAnyCasts`) replaces the call with its argument. `this.$any(…)` is a real call.
+                if let (EK::PropertyRead { receiver: root, name, .. }, [inner]) = (&receiver.kind, args.as_slice()) {
+                    if name == "$any" && matches!(root.kind, EK::ImplicitReceiver) {
+                        return self.convert(inner);
+                    }
+                }
                 let callee = self.convert(receiver);
                 let args = args.iter().map(|a| self.convert(a)).collect();
                 callee.call_fn(args, false)
@@ -969,6 +976,7 @@ impl<R: LocalResolver> Converter<'_, R> {
                                 key: key.clone(),
                                 value,
                                 quoted: *quoted,
+                                leading_comments: Vec::new(),
                             },
                             LiteralMapKey::Spread { .. } => {
                                 o::LiteralMapEntry::Spread { expression: value }
@@ -1013,14 +1021,21 @@ impl<R: LocalResolver> Converter<'_, R> {
                 binary_expr(op, lhs, rhs)
             }
 
-            // Unary `+x` / `-x`.
-            EK::Unary { operator, expr } => {
+            // Unary `+x` / `-x` / `++x` / `--x` / `x++` / `x--` (`convertAst` with
+            // `UNARY_OPERATORS`; `isPrefix` is forwarded to `UnaryOperatorExpr`).
+            EK::Unary {
+                operator,
+                expr,
+                is_prefix,
+            } => {
                 let inner = self.convert(expr);
                 let op = match operator {
                     EUnary::Plus => OUnary::Plus,
                     EUnary::Minus => OUnary::Minus,
+                    EUnary::Increment => OUnary::Increment,
+                    EUnary::Decrement => OUnary::Decrement,
                 };
-                o::unary(op, inner, None)
+                o::unary_with_prefix(op, inner, None, *is_prefix)
             }
 
             // PrefixNot `!x`.
@@ -1108,7 +1123,12 @@ impl<R: LocalResolver> Converter<'_, R> {
                 let body = self.convert(body);
                 self.in_child_operation -= 1;
                 self.arrow_params.truncate(scope_base);
-                let inline_arrow = o::arrow_fn(params, ArrowBody::Expr(Box::new(body)), None);
+                // `convertAst` types the arrow as `DYNAMIC_TYPE` (Angular main, 2026-10-10).
+                let inline_arrow = o::arrow_fn(
+                    params,
+                    ArrowBody::Expr(Box::new(body)),
+                    Some(dynamic_type()),
+                );
 
                 // Hoist into a const-pool `ɵɵarrowFunction` factory when this is the
                 // outermost arrow of a property/interpolation binding and the arrow only
@@ -1342,9 +1362,19 @@ impl<R: LocalResolver> Converter<'_, R> {
                         });
                     }
                 }
-                o::LiteralMapEntry::Property { key, value, quoted } => {
+                o::LiteralMapEntry::Property {
+                    key,
+                    value,
+                    quoted,
+                    leading_comments,
+                } => {
                     if value.is_constant() {
-                        derived.push(o::LiteralMapEntry::Property { key, value, quoted });
+                        derived.push(o::LiteralMapEntry::Property {
+                            key,
+                            value,
+                            quoted,
+                            leading_comments,
+                        });
                     } else {
                         let idx = args.len();
                         let param = pure_param(idx);
@@ -1353,6 +1383,7 @@ impl<R: LocalResolver> Converter<'_, R> {
                             key,
                             value: param,
                             quoted,
+                            leading_comments,
                         });
                     }
                 }
@@ -1616,6 +1647,17 @@ mod tests {
             argument_span: ab(),
         });
         assert_eq!(emit(&n), "ctx.fn(ctx.a);\n");
+    }
+
+    #[test]
+    fn any_cast_call_is_replaced_by_its_argument() {
+        // $any(a) -> ctx.a (Angular any_cast.ts deleteAnyCasts); this.$any(a) stays a call.
+        let n = node(EK::Call {
+            receiver: Box::new(prop("$any")),
+            args: vec![prop("a")],
+            argument_span: ab(),
+        });
+        assert_eq!(emit(&n), "ctx.a;\n");
     }
 
     #[test]

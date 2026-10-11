@@ -171,6 +171,7 @@ pub fn create_deferred_block(
         triggers,
         prefetch_triggers,
         hydrate_triggers,
+        defined_name,
     } = parse_primary_triggers(ast, binding_parser, &mut errors, placeholder.as_ref());
 
     // The `defer` block has a main span encompassing all of the connected branches.
@@ -201,6 +202,7 @@ pub fn create_deferred_block(
             start_source_span: to_r3_span(&ast.start_source_span),
             end_source_span: last_end_source_span.as_ref().map(to_r3_span),
         },
+        defined_name,
         i18n: None,
     };
 
@@ -406,6 +408,7 @@ struct PrimaryTriggers {
     triggers: t::DeferredBlockTriggers,
     prefetch_triggers: t::DeferredBlockTriggers,
     hydrate_triggers: t::DeferredBlockTriggers,
+    defined_name: Option<String>,
 }
 
 fn parse_primary_triggers(
@@ -417,6 +420,7 @@ fn parse_primary_triggers(
     let mut triggers = t::DeferredBlockTriggers::default();
     let mut prefetch_triggers = t::DeferredBlockTriggers::default();
     let mut hydrate_triggers = t::DeferredBlockTriggers::default();
+    let mut defined_name: Option<String> = None;
 
     for param in &ast.parameters {
         let expr = &param.expression;
@@ -435,6 +439,8 @@ fn parse_primary_triggers(
             parse_on_trigger(param, binding_parser, &mut hydrate_triggers, errors, placeholder);
         } else if is_hydrate_never(expr) {
             parse_never_trigger(param, &mut hydrate_triggers, errors);
+        } else if is_name_parameter(expr) {
+            parse_name_parameter(param, &mut defined_name, errors);
         } else {
             errors.push(MlParseError::new(
                 param.source_span.clone(),
@@ -454,7 +460,58 @@ fn parse_primary_triggers(
         triggers,
         prefetch_triggers,
         hydrate_triggers,
+        defined_name,
     }
+}
+
+/// `NAME_PARAMETER_PATTERN = /^name\s+/` — a `name` parameter (`@defer (name foo)`).
+fn is_name_parameter(expr: &str) -> bool {
+    let Some(rest) = expr.strip_prefix("name") else {
+        return false;
+    };
+    rest.chars().next().is_some_and(char::is_whitespace)
+}
+
+/// Parses a `name <identifier>` parameter of a `@defer` block, storing the name in `defined_name`.
+/// Port of the `NAME_PARAMETER_PATTERN` branch of `parsePrimaryTriggers`
+/// (`render3/r3_deferred_blocks.ts`).
+fn parse_name_parameter(
+    param: &HtmlBlockParameter,
+    defined_name: &mut Option<String>,
+    errors: &mut Vec<MlParseError>,
+) {
+    if defined_name.is_some() {
+        errors.push(MlParseError::new(
+            param.source_span.clone(),
+            "Cannot specify multiple name parameters".to_string(),
+        ));
+        return;
+    }
+    // JS `expression.slice(5).trim()`: drop `name` and the whitespace after it.
+    let name: String = param.expression.chars().skip(5).collect::<String>().trim().to_string();
+    if name.starts_with('\'') || name.starts_with('"') || name.ends_with('\'') || name.ends_with('"') {
+        errors.push(MlParseError::new(
+            param.source_span.clone(),
+            "Block names cannot be quoted in @defer blocks".to_string(),
+        ));
+    } else if !is_plain_identifier(&name) {
+        errors.push(MlParseError::new(
+            param.source_span.clone(),
+            format!("Invalid block name \"{name}\""),
+        ));
+    } else {
+        *defined_name = Some(name);
+    }
+}
+
+/// `/^[a-zA-Z_$][a-zA-Z0-9_$]*$/` — the identifier form accepted for a `@defer` block name.
+fn is_plain_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '$' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
 }
 
 // ---------------------------------------------------------------------------
@@ -1550,6 +1607,48 @@ mod tests {
         assert_eq!(never.kind, t::DeferredTriggerKind::Never);
         assert!(never.spans.hydrate_span.is_some());
         assert!(never.spans.when_or_on_source_span.is_none());
+    }
+
+    #[test]
+    fn parses_defer_name_parameter() {
+        // `name <identifier>` sets `definedName` (r3_deferred_blocks.ts NAME_PARAMETER_PATTERN).
+        let src = "@defer (on idle; name myBlock) {x}";
+        let (defer, connected) = defer_and_connected(src);
+        let parser = ExprParser::default();
+        let mut transform = no_transform();
+        let result = create_deferred_block(&defer, &connected, &mut transform, &parser);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(result.node.defined_name.as_deref(), Some("myBlock"));
+    }
+
+    #[test]
+    fn defer_name_parameter_without_name_is_none() {
+        let (defer, connected) = defer_and_connected("@defer (on idle) {x}");
+        let parser = ExprParser::default();
+        let mut transform = no_transform();
+        let result = create_deferred_block(&defer, &connected, &mut transform, &parser);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(result.node.defined_name, None);
+    }
+
+    #[test]
+    fn defer_name_parameter_errors() {
+        let parser = ExprParser::default();
+        let cases = [
+            ("@defer (name 'quoted') {x}", "Block names cannot be quoted in @defer blocks"),
+            ("@defer (name 1abc) {x}", "Invalid block name \"1abc\""),
+            ("@defer (name a; name b) {x}", "Cannot specify multiple name parameters"),
+        ];
+        for (src, expected) in cases {
+            let (defer, connected) = defer_and_connected(src);
+            let mut transform = no_transform();
+            let result = create_deferred_block(&defer, &connected, &mut transform, &parser);
+            assert!(
+                result.errors.iter().any(|e| e.msg == expected),
+                "src {src}: errors {:?}",
+                result.errors
+            );
+        }
     }
 
     #[test]

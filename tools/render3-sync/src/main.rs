@@ -4,25 +4,25 @@
 //!   * `map` — print the symbol->module map as JSON (the maintained pillar-1 table).
 //!   * `exports <ts-file>` — parse a TS file under the vendored Angular ref and print its exported
 //!     symbol names + the Rust modules each maps to.
-//!   * `baseline [--repo-root <dir>] [--ref <label>] [--out <file>]` — (re)record the export
-//!     fingerprint of every symbol-map reference source at the current `angular-ref` into a
-//!     baseline artifact (default `tools/render3-sync/baseline.json`).
-//!   * `drift [--repo-root <dir>] [--baseline <file>] [--ref <label>] [--out <file>]` — re-fingerprint
-//!     the live references and diff against the recorded baseline, printing the [`DriftReport`]
-//!     (Added/Removed/Modified exports + derived PortTasks) as JSON. Exits 1 on drift.
-//!   * `codegen-verify [--repo-root <dir>] [--out <file>]` — for each Mechanical symbol-map row,
-//!     emit Rust from the vendored TS and diff it against the committed Rust under
-//!     `libs/treaty-ivy/*`, printing a [`VerifyReport`]. Exits 1 if any row is out of sync.
+//!   * `baseline [--repo-root D] [--ref SHA] [--out F]` — record the export-fingerprint baseline of
+//!     every mapped reference source at the pinned Angular commit (default `--ref` is the commit in
+//!     `tools/render3-sync/ANGULAR_REF`). Fails loudly if the reference root is missing or empty.
+//!   * `drift [--repo-root D] [--baseline F] [--ref SHA] [--out F]` — re-fingerprint the live
+//!     references and diff against the recorded baseline, printing the [`DriftReport`] as JSON. Also
+//!     reports every compiler file that is neither mapped nor out of scope. Exits 1 on any drift.
+//!   * `codegen-verify [--repo-root D] [--out F]` — verify each Mechanical symbol-map row against the
+//!     committed Rust under `libs/treaty-ivy/*`, printing a [`VerifyReport`]. Exits 1 if any row
+//!     blocks the check; rows marked `pending` are reported but do not block.
 //!
 //! These commands read the LIVE filesystem read-only via [`render3_sync::FsReader`]; they never
-//! modify the `libs/treaty-ivy/*` ports. See `migration/RENDER3-SYNC-PLAN.md`.
+//! modify the `libs/treaty-ivy/*` ports. See `tools/render3-sync/README.md`.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use render3_sync::sync::{self, Baseline, FsReader};
 use render3_sync::symbol_map::{self, MODULE_MAP};
-use render3_sync::ts;
+use render3_sync::sync::{self, Baseline, FsReader};
+use render3_sync::{pinned_angular_sha, ts};
 
 /// The default baseline artifact path, relative to the located repo root.
 const DEFAULT_BASELINE: &str = "tools/render3-sync/baseline.json";
@@ -49,9 +49,10 @@ const USAGE: &str = "render3-sync — keep the Rust render3 port 1:1 with Angula
      usage:\n  \
      render3-sync map                                  print the symbol->module map as JSON\n  \
      render3-sync exports <ts-file>                    list exported symbols of a TS file + Rust owners\n  \
-     render3-sync baseline [--repo-root D] [--ref R] [--out F]\n                                                   record the export-fingerprint baseline\n  \
-     render3-sync drift    [--repo-root D] [--baseline F] [--ref R] [--out F]\n                                                   diff live refs vs baseline -> DriftReport (exit 1 on drift)\n  \
-     render3-sync codegen-verify [--repo-root D] [--out F]\n                                                   verify mechanical tables vs committed Rust (exit 1 on drift)";
+     render3-sync baseline [--repo-root D] [--ref SHA] [--out F]\n                                                   record the export-fingerprint baseline (default SHA: ANGULAR_REF)\n  \
+     render3-sync drift    [--repo-root D] [--baseline F] [--ref SHA] [--out F]\n                                                   diff live refs vs baseline -> DriftReport (exit 1 on drift)\n  \
+     render3-sync codegen-verify [--repo-root D] [--out F]\n                                                   verify mechanical tables vs committed Rust (exit 1 on blocking drift)\n\
+     populate the reference first: tools/render3-sync/populate-angular-ref.sh";
 
 /// Serialize the static symbol->module map to JSON on stdout.
 fn print_map() {
@@ -66,15 +67,17 @@ fn cmd_exports(args: &[String]) -> ExitCode {
         eprintln!("render3-sync: `exports` requires a path to a .ts file");
         return ExitCode::FAILURE;
     };
+    // Owners are resolved within the file, so the path is made relative to the compiler src root.
+    let rel = path
+        .split_once(symbol_map::ANGULAR_COMPILER_SRC_ROOT)
+        .map(|(_, rest)| rest.trim_start_matches('/'))
+        .unwrap_or(path.as_str());
     match std::fs::read_to_string(path) {
         Ok(src) => {
             let exports = ts::exported_symbols(&src);
             println!("{path}: {} exported symbols", exports.len());
             for sym in &exports {
-                let owners = symbol_map::rust_modules_for_symbol(&sym.name);
-                let owners: Vec<&str> = owners.iter().map(|m| m.rust_file).collect();
-                let owned =
-                    if owners.is_empty() { "<unmapped>".to_string() } else { owners.join(", ") };
+                let owned = symbol_map::describe_export_home(rel, &sym.name);
                 println!("  {:<40} {:?}  ->  {owned}", sym.name, sym.kind);
             }
             ExitCode::SUCCESS
@@ -106,7 +109,11 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
-        let val = || args.get(i + 1).cloned().ok_or_else(|| format!("{flag} requires a value"));
+        let val = || {
+            args.get(i + 1)
+                .cloned()
+                .ok_or_else(|| format!("{flag} requires a value"))
+        };
         match flag {
             "--repo-root" => o.repo_root = Some(PathBuf::from(val()?)),
             "--baseline" => o.baseline = Some(PathBuf::from(val()?)),
@@ -153,7 +160,7 @@ fn cmd_baseline(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     };
     let reader = FsReader::new(&root);
-    let angular_ref = opts.angular_ref.as_deref().unwrap_or("current");
+    let angular_ref = opts.angular_ref.as_deref().unwrap_or(pinned_angular_sha());
 
     let baseline = match sync::record_baseline(&reader, angular_ref) {
         Ok(b) => b,
@@ -206,7 +213,10 @@ fn cmd_drift(args: &[String]) -> ExitCode {
         Ok(text) => match serde_json::from_str(&text) {
             Ok(b) => b,
             Err(e) => {
-                eprintln!("render3-sync drift: parsing {}: {e}", baseline_path.display());
+                eprintln!(
+                    "render3-sync drift: parsing {}: {e}",
+                    baseline_path.display()
+                );
                 return ExitCode::FAILURE;
             }
         },
@@ -220,7 +230,7 @@ fn cmd_drift(args: &[String]) -> ExitCode {
     };
 
     let reader = FsReader::new(&root);
-    let current_ref = opts.angular_ref.as_deref().unwrap_or("current");
+    let current_ref = opts.angular_ref.as_deref().unwrap_or(pinned_angular_sha());
     let report = match sync::diff_baseline(&reader, &baseline, current_ref) {
         Ok(r) => r,
         Err(e) => {
@@ -249,10 +259,14 @@ fn cmd_drift(args: &[String]) -> ExitCode {
         ExitCode::SUCCESS
     } else {
         eprintln!(
-            "render3-sync: DRIFT — {} file(s), {} port task(s)",
+            "render3-sync: DRIFT — {} changed file(s), {} port task(s), {} unclassified compiler file(s)",
             report.files.len(),
-            report.tasks.len()
+            report.tasks.len(),
+            report.unclassified_files.len()
         );
+        for f in &report.unclassified_files {
+            eprintln!("  unclassified: {f} (map it or add an OUT_OF_SCOPE_FILES entry)");
+        }
         ExitCode::FAILURE
     }
 }
@@ -294,21 +308,36 @@ fn cmd_codegen_verify(args: &[String]) -> ExitCode {
     if let Some(out) = opts.out
         && let Err(e) = std::fs::write(&out, &json)
     {
-        eprintln!("render3-sync codegen-verify: writing {}: {e}", out.display());
+        eprintln!(
+            "render3-sync codegen-verify: writing {}: {e}",
+            out.display()
+        );
         return ExitCode::FAILURE;
     }
 
+    for e in report.pending() {
+        if let render3_sync::VerifyStatus::Pending { reason, .. } = &e.status {
+            eprintln!(
+                "render3-sync: PENDING (not blocking) {} -> {}: {reason}",
+                e.ts_file, e.rust_file
+            );
+        }
+    }
     let out_of_sync = report.out_of_sync();
     if out_of_sync.is_empty() {
         eprintln!(
-            "render3-sync: IN SYNC — {} mechanical table(s) match the committed Rust",
-            report.entries.len()
+            "render3-sync: OK — {} mechanical row(s) checked, {} pending",
+            report.entries.len(),
+            report.pending().len()
         );
         ExitCode::SUCCESS
     } else {
-        eprintln!("render3-sync: {} mechanical row(s) OUT OF SYNC:", out_of_sync.len());
+        eprintln!(
+            "render3-sync: {} mechanical row(s) BLOCKING:",
+            out_of_sync.len()
+        );
         for e in out_of_sync {
-            eprintln!("  {} -> {}", e.ts_file, e.rust_file);
+            eprintln!("  {} -> {}: {:?}", e.ts_file, e.rust_file, e.status);
         }
         ExitCode::FAILURE
     }
@@ -320,10 +349,19 @@ mod tests {
 
     #[test]
     fn parse_opts_reads_all_flags() {
-        let args: Vec<String> = ["--repo-root", "/r", "--baseline", "b.json", "--out", "o.json", "--ref", "v22"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let args: Vec<String> = [
+            "--repo-root",
+            "/r",
+            "--baseline",
+            "b.json",
+            "--out",
+            "o.json",
+            "--ref",
+            "v22",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
         let o = parse_opts(&args).unwrap();
         assert_eq!(o.repo_root, Some(PathBuf::from("/r")));
         assert_eq!(o.baseline, Some(PathBuf::from("b.json")));

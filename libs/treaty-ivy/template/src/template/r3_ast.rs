@@ -77,6 +77,10 @@ pub enum Node {
     ForLoopBlockEmpty(ForLoopBlockEmpty),
     IfBlock(IfBlock),
     IfBlockBranch(IfBlockBranch),
+    // `@boundary` / `@error` / `@content` (Angular `r3_boundaries.ts` / `r3_content_blocks.ts`).
+    BoundaryBlock(BoundaryBlock),
+    BoundaryErrorBlock(BoundaryErrorBlock),
+    ContentBlock(ContentBlock),
 }
 
 impl Node {
@@ -112,6 +116,9 @@ impl Node {
             Node::ForLoopBlockEmpty(n) => &n.spans.source_span,
             Node::IfBlock(n) => &n.spans.source_span,
             Node::IfBlockBranch(n) => &n.spans.source_span,
+            Node::BoundaryBlock(n) => &n.spans.source_span,
+            Node::BoundaryErrorBlock(n) => &n.spans.source_span,
+            Node::ContentBlock(n) => &n.spans.source_span,
         }
     }
 }
@@ -389,6 +396,44 @@ pub struct BlockSpans {
 }
 
 // ---------------------------------------------------------------------------
+// @boundary / @error / @content (`render3/r3_boundaries.ts`, `render3/r3_content_blocks.ts`).
+// ---------------------------------------------------------------------------
+
+/// `t.BoundaryBlock` — a `@boundary { … } @error { … }` block. `error_blocks` are the connected
+/// `@error` branches in source order; `main_block_span` is the span of the primary block alone.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BoundaryBlock {
+    pub children: Vec<Node>,
+    pub error_blocks: Vec<BoundaryErrorBlock>,
+    pub main_block_span: ParseSourceSpan,
+    pub spans: BlockSpans,
+    pub i18n: Option<I18nMeta>,
+}
+
+/// `t.BoundaryErrorBlock` — one `@error (let e, retry = $reset; when cond) { … }` branch.
+/// `context_variables` always starts with the implicit `$error` and `$reset` variables; `expression`
+/// is the `when` condition (`None` for an unconditional `@error`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct BoundaryErrorBlock {
+    pub children: Vec<Node>,
+    pub context_variables: Vec<Variable>,
+    pub expression: Option<AstNode>,
+    pub spans: BlockSpans,
+    pub i18n: Option<I18nMeta>,
+}
+
+/// `t.ContentBlock` — a `@content(name; let a, b)` block inside a foreign component's element.
+/// `variables` map positionally onto the arguments of the render call (see `ingest.ts`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ContentBlock {
+    pub name: String,
+    pub variables: Vec<Variable>,
+    pub children: Vec<Node>,
+    pub spans: BlockSpans,
+    pub i18n: Option<I18nMeta>,
+}
+
+// ---------------------------------------------------------------------------
 // @if
 // ---------------------------------------------------------------------------
 
@@ -611,6 +656,8 @@ pub struct DeferredBlock {
     pub error: Option<DeferredBlockError>,
     pub main_block_span: ParseSourceSpan,
     pub spans: BlockSpans,
+    /// The `name` parameter of the block (`@defer (name foo)`), if any. Mirrors `definedName`.
+    pub defined_name: Option<String>,
     pub i18n: Option<I18nMeta>,
 }
 
@@ -874,6 +921,23 @@ pub trait Visitor {
         }
     }
 
+    /// `visitBoundaryBlock`: children, then each `@error` branch.
+    fn visit_boundary_block(&mut self, block: &BoundaryBlock) {
+        self.visit_all(&block.children);
+        for error_block in &block.error_blocks {
+            self.visit_boundary_error_block(error_block);
+        }
+    }
+    /// `visitBoundaryErrorBlock`: context variables, then children.
+    fn visit_boundary_error_block(&mut self, block: &BoundaryErrorBlock) {
+        self.visit_all_variables(&block.context_variables);
+        self.visit_all(&block.children);
+    }
+    /// `visitContentBlock`: children.
+    fn visit_content_block(&mut self, block: &ContentBlock) {
+        self.visit_all(&block.children);
+    }
+
     fn visit_unknown_block(&mut self, block: &UnknownBlock) {}
     fn visit_let_declaration(&mut self, decl: &LetDeclaration) {}
 
@@ -948,6 +1012,9 @@ pub fn dispatch<V: Visitor + ?Sized>(node: &Node, visitor: &mut V) {
         Node::ForLoopBlockEmpty(n) => visitor.visit_for_loop_block_empty(n),
         Node::IfBlock(n) => visitor.visit_if_block(n),
         Node::IfBlockBranch(n) => visitor.visit_if_block_branch(n),
+        Node::BoundaryBlock(n) => visitor.visit_boundary_block(n),
+        Node::BoundaryErrorBlock(n) => visitor.visit_boundary_error_block(n),
+        Node::ContentBlock(n) => visitor.visit_content_block(n),
     }
 }
 
@@ -1133,6 +1200,7 @@ mod tests {
             error: None,
             main_block_span: span(),
             spans: block_spans(),
+            defined_name: None,
             i18n: None,
         };
 

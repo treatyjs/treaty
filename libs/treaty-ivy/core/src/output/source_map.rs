@@ -258,7 +258,7 @@ fn encode_vlq(out: &mut String, value: i64) {
 pub fn decode_mappings(mappings: &str) -> Option<Vec<(u32, u32, u32, u32, u32)>> {
     let mut out = Vec::new();
     let mut gen_line: i64 = 0;
-    let mut gen_col: i64 = 0;
+    let mut gen_col: i64;
     let mut src_index: i64 = 0;
     let mut src_line: i64 = 0;
     let mut src_col: i64 = 0;

@@ -1,6 +1,358 @@
 {
-  "angular_ref": "current",
+  "angular_ref": "78d2a67d922b2a2af29d50aed587bc78a99a5450",
   "files": {
+    "chars.ts": {
+      "exists": true,
+      "symbols": {
+        "$$": 8389576005921347359,
+        "$0": 12189666633410628240,
+        "$7": 18421412137710562003,
+        "$9": 14882789166548233011,
+        "$A": 8899419691684786568,
+        "$AMPERSAND": 10218570842842382358,
+        "$AT": 17882997289147824557,
+        "$BACKSLASH": 14917364468663852841,
+        "$BANG": 10738286185199230342,
+        "$BAR": 13223366900710334692,
+        "$BSPACE": 16997105734708066502,
+        "$BT": 9041261878900338221,
+        "$CARET": 7965439929053373804,
+        "$COLON": 17015679883260494712,
+        "$COMMA": 15748441783472040011,
+        "$CR": 13214274740158698891,
+        "$DQ": 28953031595380388,
+        "$E": 13867662237976069256,
+        "$EOF": 17960528020788495362,
+        "$EQ": 9203611653658221275,
+        "$F": 13984176473105017807,
+        "$FF": 11127298977841047999,
+        "$GT": 16406630269298628041,
+        "$HASH": 4224311910578910478,
+        "$LBRACE": 11920167407975265491,
+        "$LBRACKET": 10765204443991486880,
+        "$LF": 3066590543819551447,
+        "$LPAREN": 6219708906971589054,
+        "$LT": 17247689813094072928,
+        "$MINUS": 7088460994161710617,
+        "$NBSP": 3688989735846824788,
+        "$PERCENT": 17616736947765297919,
+        "$PERIOD": 10076188260030128737,
+        "$PIPE": 4582503737067490845,
+        "$PLUS": 16084972080315284589,
+        "$QUESTION": 14236666862543318147,
+        "$RBRACE": 11818968772301314343,
+        "$RBRACKET": 6122693651012708108,
+        "$RPAREN": 7897324890051443601,
+        "$SEMICOLON": 16203560206987744391,
+        "$SLASH": 15895991477087992030,
+        "$SPACE": 3480458934504078273,
+        "$SQ": 13214626774746139754,
+        "$STAR": 11347869603332110400,
+        "$TAB": 9503682131162576964,
+        "$TILDA": 18292887294864172735,
+        "$VTAB": 382896821040087049,
+        "$X": 5852675529742300620,
+        "$Z": 16809961097110611109,
+        "$_": 13142486198129188703,
+        "$a": 7482658436973496951,
+        "$b": 3074865136763759589,
+        "$e": 9435591983679482201,
+        "$f": 13436548492861281457,
+        "$n": 5966146056230706576,
+        "$r": 14902896715089284976,
+        "$t": 16789472745601920512,
+        "$u": 4843594422276804244,
+        "$v": 1435510064976830864,
+        "$x": 12271242271089744151,
+        "$z": 9801630855763595127,
+        "isAsciiHexDigit": 17860736065243932959,
+        "isAsciiLetter": 3316609565001302436,
+        "isDigit": 16326749870355099893,
+        "isNewLine": 9051078727918934590,
+        "isOctalDigit": 14925676908265618954,
+        "isQuote": 11970367603016081796,
+        "isWhitespace": 2038667676390751528
+      }
+    },
+    "combined_visitor.ts": {
+      "exists": true,
+      "symbols": {
+        "CombinedRecursiveAstVisitor": 18037267745718994396
+      }
+    },
+    "compiler.ts": {
+      "exists": true,
+      "symbols": {
+        "AbstractEmitterVisitor": 11040838124216647459,
+        "ArrayType": 2557662463817008534,
+        "ArrowFunctionExpr": 2213463632742269229,
+        "BinaryOperator": 8175377110644668716,
+        "BinaryOperatorExpr": 10903363714673937963,
+        "BindingParser": 14242397839660650517,
+        "BindingPropertyName": 15914216684708354452,
+        "BuiltinType": 10832318387168478344,
+        "BuiltinTypeName": 3521542533502727947,
+        "CUSTOM_ELEMENTS_SCHEMA": 1303539444823274648,
+        "ChangeDetectionStrategy": 13057114452794330361,
+        "ClassPropertyMapping": 3679028419369901344,
+        "ClassPropertyName": 17262067782022190925,
+        "CombinedRecursiveAstVisitor": 3606003399094851336,
+        "CommaExpr": 4647319369407440591,
+        "CommentTriviaType": 17633798538333829461,
+        "CompileClassMetadataFn": 9855629677813373371,
+        "CompilerConfig": 1855762532536669762,
+        "CompilerFacadeImpl": 12026420787974395988,
+        "ConditionalExpr": 2397065658115690104,
+        "ConstantPool": 18161059767489883779,
+        "DYNAMIC_TYPE": 10746165936278743323,
+        "DeclareComponentTemplateInfo": 12406837549672247474,
+        "DeclareFunctionStmt": 3885626767777351095,
+        "DeclareVarStmt": 1053685843659191352,
+        "DomSchemaChecker": 7660263231554154707,
+        "DynamicImportExpr": 14492768959071866728,
+        "EmitterVisitorContext": 9641795061331633552,
+        "Expression": 7689681518873068971,
+        "ExpressionIdentifier": 7805170994005093312,
+        "ExpressionStatement": 14833446642852130864,
+        "ExpressionType": 10106548454164510611,
+        "ExpressionVisitor": 8270199793346589147,
+        "ExternalExpr": 8374897567509993757,
+        "ExternalReference": 12578088022802819231,
+        "FactoryTarget": 14711395383073374832,
+        "ForwardRefHandling": 11586871502818222830,
+        "FunctionExpr": 9246064207392212442,
+        "IfStmt": 3706384725029691568,
+        "IndexerComponentInfo": 14163744114375802387,
+        "IndexerVisitor": 12984174992452837666,
+        "IndexingContext": 12832601378607350340,
+        "InputOrOutput": 6973508602020751355,
+        "InstantiateExpr": 1634420131075826608,
+        "InvokeFunctionExpr": 2993817180068043474,
+        "JSDocComment": 18393656303313850945,
+        "JitEvaluator": 7479997350116405297,
+        "LEGACY_OPTIONAL_CHAINING_DEFAULT": 14129267678611692489,
+        "LeadingComment": 11530094076002987802,
+        "LexerRange": 16758553803725419950,
+        "LexerTokenType": 2800829962671171110,
+        "LiteralArrayExpr": 7701660832859243338,
+        "LiteralExpr": 13835271766414469299,
+        "LiteralMapExpr": 1203588346065778525,
+        "LiteralMapPropertyAssignment": 9624413574002479702,
+        "LiteralMapSpreadAssignment": 5099931108152902492,
+        "LocalizedString": 9764755506949743395,
+        "MapType": 16959241206328768825,
+        "MatchSource": 406776249651859291,
+        "MaybeForwardRefExpression": 14893372462190382739,
+        "NONE_TYPE": 12332904053513470692,
+        "NO_ERRORS_SCHEMA": 16085946773221162322,
+        "NotExpr": 7938596077832113821,
+        "OutOfBandDiagnosticCategory": 16533233623547639330,
+        "OutOfBandDiagnosticRecorder": 17120425847285707188,
+        "ParenthesizedExpr": 883771993656269922,
+        "ParseTemplateOptions": 14158750771600377560,
+        "ParseTreeResult": 1797946035695572165,
+        "ParsedHostBindings": 12120804172712605516,
+        "ParsedTemplate": 35807352533362146,
+        "QueryFlags": 824254232429371354,
+        "R3ClassDebugInfo": 15856670361729748709,
+        "R3ClassMetadata": 5331051296827327831,
+        "R3ClassMetadataCtorParameter": 3367872000843964624,
+        "R3CompiledExpression": 7068686061402512307,
+        "R3DependencyMetadata": 7163476484905813978,
+        "R3FactoryMetadata": 2121322320225319121,
+        "R3HmrMetadata": 228097379889703236,
+        "R3HmrNamespaceDependency": 16947110691488612861,
+        "R3Identifiers": 7232017638046781798,
+        "R3InjectorMetadata": 10067874918627629355,
+        "R3NgModuleMetadata": 6374713321505576772,
+        "R3NgModuleMetadataGlobal": 8230940586473349963,
+        "R3NgModuleMetadataKind": 978925739943161014,
+        "R3PipeMetadata": 1766357941764263571,
+        "R3Reference": 125899879887462535,
+        "R3SelectorScopeMode": 2186104085463862114,
+        "ReadKeyExpr": 11460886480844932171,
+        "ReadPropExpr": 12458126240906036687,
+        "ReadVarExpr": 13521908415364158425,
+        "RegularExpressionLiteralExpr": 9971545900386889223,
+        "ReturnStatement": 3666181360514347940,
+        "STRING_TYPE": 15022610294313544557,
+        "SchemaMetadata": 2591702640880648147,
+        "SourceMap": 5199351053157357198,
+        "SpreadElementExpr": 9679713805968119921,
+        "Statement": 13459532186106899318,
+        "StatementVisitor": 2200753860860828260,
+        "StmtModifier": 9500462571799258218,
+        "TaggedTemplateLiteralExpr": 6076402844855060581,
+        "TcbExpr": 4642895959978030289,
+        "TcbGenericContextBehavior": 17562002135419712552,
+        "TemplateLiteralElementExpr": 4866500295110146997,
+        "TemplateLiteralExpr": 15865187964813910029,
+        "TmplAstBlockNode": 12358058598331681383,
+        "TmplAstBoundAttribute": 16073230014372381022,
+        "TmplAstBoundDeferredTrigger": 13327090847274571783,
+        "TmplAstBoundEvent": 4989641136459831534,
+        "TmplAstBoundText": 4814365368925519417,
+        "TmplAstBoundaryBlock": 13761256068431235577,
+        "TmplAstBoundaryErrorBlock": 589027835051050411,
+        "TmplAstComponent": 10172177446228768641,
+        "TmplAstContent": 17872115372331279259,
+        "TmplAstContentBlock": 3020679767249094100,
+        "TmplAstDeferredBlock": 9508884255146929158,
+        "TmplAstDeferredBlockError": 2062527794875225712,
+        "TmplAstDeferredBlockLoading": 16405157798110398954,
+        "TmplAstDeferredBlockPlaceholder": 6306630061162187411,
+        "TmplAstDeferredBlockTriggers": 18292469898895800711,
+        "TmplAstDeferredTrigger": 18027711918833544535,
+        "TmplAstDirective": 11582225632242383047,
+        "TmplAstElement": 9300740126258348154,
+        "TmplAstForLoopBlock": 83053747723937712,
+        "TmplAstForLoopBlockEmpty": 17838786821371044801,
+        "TmplAstHostElement": 4880074846447015732,
+        "TmplAstHoverDeferredTrigger": 4370858472641538273,
+        "TmplAstIcu": 11846480669820311353,
+        "TmplAstIdleDeferredTrigger": 1614934533914045937,
+        "TmplAstIfBlock": 15530089151552782290,
+        "TmplAstIfBlockBranch": 4308689181297722010,
+        "TmplAstImmediateDeferredTrigger": 13806757624941938160,
+        "TmplAstInteractionDeferredTrigger": 15799746382335074583,
+        "TmplAstLetDeclaration": 9743405207803511533,
+        "TmplAstNeverDeferredTrigger": 12966503965044522833,
+        "TmplAstNode": 12507059907200808894,
+        "TmplAstRecursiveVisitor": 12153994356660891044,
+        "TmplAstReference": 384572871156571767,
+        "TmplAstSwitchBlock": 4897063559878033455,
+        "TmplAstSwitchBlockCase": 8366306866594069843,
+        "TmplAstSwitchBlockCaseGroup": 11945633579600820394,
+        "TmplAstSwitchExhaustiveCheck": 5569234480603463538,
+        "TmplAstTemplate": 15353743249958016932,
+        "TmplAstText": 15997080595988559209,
+        "TmplAstTextAttribute": 7200129623945319523,
+        "TmplAstTimerDeferredTrigger": 12365703707279538656,
+        "TmplAstUnknownBlock": 14089743287610641265,
+        "TmplAstVariable": 11535159450542995206,
+        "TmplAstViewportDeferredTrigger": 18373573811445297713,
+        "TmplAstVisitor": 1480957654474610464,
+        "TransplantedType": 13588076326452154407,
+        "TreeError": 10485131162920847841,
+        "Type": 15141729748988399629,
+        "TypeModifier": 6783651436398541784,
+        "TypeVisitor": 9614921471311449577,
+        "TypeofExpr": 14198074229746732839,
+        "UnaryOperator": 16365798669580714368,
+        "UnaryOperatorExpr": 15571863051607993927,
+        "Version": 17587166920017624727,
+        "ViewEncapsulation": 16333287399394397444,
+        "VoidExpr": 17700308182409124684,
+        "WrappedNodeExpr": 11185715059604772493,
+        "compileClassDebugInfo": 3814251660728300561,
+        "compileClassMetadata": 9206281633098748107,
+        "compileComponentClassMetadata": 11677773417512485242,
+        "compileComponentDeclareClassMetadata": 14039297172274564570,
+        "compileComponentFromMetadata": 13300723990873226120,
+        "compileDeclareClassMetadata": 7630668377543265989,
+        "compileDeclareComponentFromMetadata": 16094761072166027894,
+        "compileDeclareDirectiveFromMetadata": 5919957810654172864,
+        "compileDeclareFactoryFunction": 14770782016367804122,
+        "compileDeclareInjectableFromMetadata": 15057912263664829340,
+        "compileDeclareInjectorFromMetadata": 223038457868820077,
+        "compileDeclareNgModuleFromMetadata": 14664721892444796970,
+        "compileDeclarePipeFromMetadata": 13179494404654673337,
+        "compileDeclareServiceFromMetadata": 498725299254571402,
+        "compileDeferResolverFunction": 13518193708483468756,
+        "compileDirectiveFromMetadata": 14518432413991555682,
+        "compileFactoryFunction": 13351828365873765064,
+        "compileHmrInitializer": 7904065907271838035,
+        "compileHmrUpdateCallback": 1120536040243337895,
+        "compileInjector": 8616762709978171050,
+        "compileNgModule": 6234884651324964813,
+        "compileOpaqueAsyncClassMetadata": 13315329771778914540,
+        "compilePipeFromMetadata": 131297566873109755,
+        "core": 861027079397864862,
+        "createCssSelectorFromNode": 13393902849124401045,
+        "createMayBeForwardRefExpression": 4299258587859308683,
+        "devOnlyGuardedExpression": 18177417647249742828,
+        "emitDistinctChangesOnlyDefaultValue": 13993621875710344279,
+        "encapsulateStyle": 5284303959091495371,
+        "escapeRegExp": 7632011908767178915,
+        "generateIndexerAnalysis": 2563638216342586623,
+        "generateTypeCheckBlock": 1960118099027201351,
+        "getIndexerTemplateIdentifiers": 17413783161687877568,
+        "getSafePropertyAccessString": 11055241823627397608,
+        "isUnsafeObjectKey": 2118836407384308419,
+        "jsDocComment": 4586548866565159617,
+        "leadingComment": 18166238480160327162,
+        "literal": 9523325096332405796,
+        "literalMap": 3002550160948823882,
+        "makeBindingParser": 15374712690665815591,
+        "outputAst": 17009591004289601136,
+        "parseHostBindings": 5344060691378906064,
+        "parseTemplate": 13320749967397863766,
+        "preserveWhitespacesDefault": 9087556026098748990,
+        "publishFacade": 3610346484588322034,
+        "tmplAstVisitAll": 5966455749361237680,
+        "verifyHostBindings": 13311304941460519368
+      }
+    },
+    "compiler_facade_interface.ts": {
+      "exists": true,
+      "symbols": {
+        "ChangeDetectionStrategy": 16720190371155753112,
+        "CompilerFacade": 10312742682508079981,
+        "CoreEnvironment": 4743569897492745349,
+        "ExportedCompilerFacade": 12050523132763590099,
+        "FactoryTarget": 18162823611000963325,
+        "LegacyInputPartialMapping": 5292670543488131894,
+        "OpaqueValue": 16196904181628561665,
+        "ParseSourceSpan": 1976552481705541552,
+        "Provider": 8574112224337011970,
+        "R3ComponentMetadataFacade": 11814726568675091772,
+        "R3DeclareComponentFacade": 8274775241507020789,
+        "R3DeclareDependencyMetadataFacade": 5795413069009271188,
+        "R3DeclareDirectiveDependencyFacade": 18309147686937215218,
+        "R3DeclareDirectiveFacade": 5738007447517960430,
+        "R3DeclareFactoryFacade": 15143790849117247171,
+        "R3DeclareInjectableFacade": 1307876902279504106,
+        "R3DeclareInjectorFacade": 2189056472009038710,
+        "R3DeclareNgModuleDependencyFacade": 5839191910601740055,
+        "R3DeclareNgModuleFacade": 203113173353084326,
+        "R3DeclarePipeDependencyFacade": 9470693686600293749,
+        "R3DeclarePipeFacade": 12701593299515566334,
+        "R3DeclareQueryMetadataFacade": 3909486813075417749,
+        "R3DeclareServiceFacade": 4981737315097549147,
+        "R3DeclareTemplateDependencyFacade": 7858606102321039372,
+        "R3DependencyMetadataFacade": 14012586962663754163,
+        "R3DirectiveMetadataFacade": 4064005013893608043,
+        "R3FactoryDefMetadataFacade": 11148228770213291017,
+        "R3HostDirectiveMetadataFacade": 13758677393156852810,
+        "R3InjectableMetadataFacade": 18402095017102413414,
+        "R3InjectorMetadataFacade": 13873709441007815839,
+        "R3NgModuleMetadataFacade": 354436791525676528,
+        "R3PipeMetadataFacade": 16612133822422519643,
+        "R3QueryMetadataFacade": 3317656593296245490,
+        "R3ServiceMetadataFacade": 9233809214667537661,
+        "R3TemplateDependencyFacade": 474631102736092185,
+        "R3TemplateDependencyKind": 3736988931249778220,
+        "ResourceLoader": 3438981674878223915,
+        "Type": 12397713790369600281,
+        "ViewEncapsulation": 8251458036978742775
+      }
+    },
+    "config.ts": {
+      "exists": true,
+      "symbols": {
+        "CompilerConfig": 14165947089578829408,
+        "preserveWhitespacesDefault": 12261643004347141199
+      }
+    },
+    "constant_pool.ts": {
+      "exists": true,
+      "symbols": {
+        "ConstantPool": 5636561558789520195,
+        "ExpressionKeyFn": 17509998353084244476,
+        "GenericKeyFn": 17480962676701171164,
+        "SharedConstantDefinition": 3627774848637161145
+      }
+    },
     "core.ts": {
       "exists": true,
       "symbols": {
@@ -27,6 +379,16 @@
         "parseSelectorToR3Selector": 15030534147199168395
       }
     },
+    "directive_matching.ts": {
+      "exists": true,
+      "symbols": {
+        "CssSelector": 8524598193477320303,
+        "SelectorContext": 15384557445151338622,
+        "SelectorListContext": 5396015556184615998,
+        "SelectorMatcher": 7854403511889419531,
+        "SelectorlessMatcher": 536067229095425629
+      }
+    },
     "expression_parser/ast.ts": {
       "exists": true,
       "symbols": {
@@ -37,7 +399,7 @@
         "ArrowFunction": 18170752910535140715,
         "ArrowFunctionIdentifierParameter": 3377061838997241628,
         "ArrowFunctionParameter": 3531416623934176624,
-        "AssignmentOperation": 557766980183288561,
+        "AssignmentOperation": 2353139350642417499,
         "AstVisitor": 4896194813151097302,
         "Binary": 6885746766207481299,
         "BindingPipe": 13247707576669733010,
@@ -81,9 +443,10 @@
         "TemplateLiteralElement": 2465269508553096880,
         "ThisReceiver": 17266740757257827528,
         "TypeofExpression": 9949058441459549939,
-        "Unary": 7490930770756142528,
+        "Unary": 16694970178122470030,
         "VariableBinding": 13468973581912471036,
-        "VoidExpression": 10062932876427833023
+        "VoidExpression": 10062932876427833023,
+        "unwrapWriteTarget": 10699811587716287105
       }
     },
     "expression_parser/lexer.ts": {
@@ -105,6 +468,12 @@
         "Parser": 3108244034356352165,
         "SplitInterpolation": 10334645319536021579,
         "TemplateBindingParseResult": 17729945157146032247
+      }
+    },
+    "expression_parser/serializer.ts": {
+      "exists": true,
+      "symbols": {
+        "serialize": 9886684685895903553
       }
     },
     "i18n/digest.ts": {
@@ -140,10 +509,39 @@
         "Visitor": 7837078308565598722
       }
     },
+    "i18n/i18n_html_parser.ts": {
+      "exists": true,
+      "symbols": {
+        "I18NHtmlParser": 13735170420611848592
+      }
+    },
+    "i18n/i18n_parser.ts": {
+      "exists": true,
+      "symbols": {
+        "I18nMessageFactory": 15569731830872535189,
+        "VisitNodeFn": 5454617953691458636,
+        "createI18nMessageFactory": 4454373642865943738
+      }
+    },
+    "i18n/serializers/placeholder.ts": {
+      "exists": true,
+      "symbols": {
+        "PlaceholderRegistry": 9827589367635475412
+      }
+    },
+    "injectable_compiler_2.ts": {
+      "exists": true,
+      "symbols": {
+        "R3InjectableMetadata": 15981567328819639812,
+        "compileInjectable": 10783823236842127398,
+        "createInjectableType": 3944503940290145026,
+        "delegateToFactory": 14356119674906821405
+      }
+    },
     "jit_compiler_facade.ts": {
       "exists": true,
       "symbols": {
-        "CompilerFacadeImpl": 4490409558698847778,
+        "CompilerFacadeImpl": 892068802521095473,
         "publishFacade": 12807720915005334530
       }
     },
@@ -154,18 +552,26 @@
         "Block": 4396515524253817771,
         "BlockParameter": 1016721380613286620,
         "Comment": 9760426583530317760,
-        "Component": 5217146026919637917,
+        "Component": 437386097525723180,
         "Directive": 10677568388110007383,
-        "Element": 12696256412156097855,
+        "Element": 2076440512142611074,
         "Expansion": 9679352897100185580,
         "ExpansionCase": 1754490469512691720,
         "LetDeclaration": 694967121339381381,
-        "Node": 4512417860993777872,
+        "Node": 10025441936845569907,
         "NodeWithI18n": 7206480101210551862,
-        "RecursiveVisitor": 10778182741599053228,
+        "RecursiveVisitor": 16315488007224142160,
+        "StartTagComment": 18412134583594267196,
         "Text": 15611353297201352108,
-        "Visitor": 16359147719300880805,
+        "Visitor": 12835466430682711063,
         "visitAll": 4763627632896097682
+      }
+    },
+    "ml_parser/entities.ts": {
+      "exists": true,
+      "symbols": {
+        "NAMED_ENTITIES": 17290206990258973425,
+        "NGSP_UNICODE": 16033008828287588071
       }
     },
     "ml_parser/html_parser.ts": {
@@ -179,6 +585,16 @@
       "symbols": {
         "HtmlTagDefinition": 13846617157413162710,
         "getHtmlTagDefinition": 1087901009228697092
+      }
+    },
+    "ml_parser/html_whitespaces.ts": {
+      "exists": true,
+      "symbols": {
+        "PRESERVE_WS_ATTR_NAME": 10310238335742996692,
+        "WhitespaceVisitor": 1962152679302039140,
+        "removeWhitespaces": 4189613312421324446,
+        "replaceNgsp": 6456164362890140860,
+        "visitAllWithSiblings": 14755606250154891895
       }
     },
     "ml_parser/lexer.ts": {
@@ -242,31 +658,33 @@
         "ExpansionCaseValueToken": 6476756222220201263,
         "ExpansionFormEndToken": 14092588530006090217,
         "ExpansionFormStartToken": 18261914153914059361,
+        "InElementCommentToken": 11346075449901112384,
         "IncompleteBlockOpenToken": 16841434169826795691,
         "IncompleteComponentOpenToken": 6594589505259780247,
         "IncompleteLetToken": 3835116229424667846,
         "IncompleteTagOpenToken": 13439855209248680098,
-        "InterpolatedAttributeToken": 7686910958177076232,
+        "InterpolatedAttributeToken": 6543212364929989812,
         "InterpolatedTextToken": 5492990623634365107,
         "InterpolationToken": 4546420312037970757,
         "LetEndToken": 4695874650678081136,
         "LetStartToken": 6545345277084886382,
         "LetValueToken": 1658732363055166044,
+        "ProcessingInstructionToken": 17474256020533829732,
         "TagCloseToken": 11562558637777437263,
         "TagOpenEndToken": 7863262556168603533,
         "TagOpenEndVoidToken": 13947914890174190894,
         "TagOpenStartToken": 4996016313744327864,
         "TextToken": 11517114900274267700,
-        "Token": 7648437857690930912,
+        "Token": 798308517778392019,
         "TokenBase": 6023769041053793832,
-        "TokenType": 3484224767540288842
+        "TokenType": 10648164650656857248
       }
     },
     "output/abstract_emitter.ts": {
       "exists": true,
       "symbols": {
-        "AbstractEmitterVisitor": 14623618055247611945,
-        "EmitterVisitorContext": 3552012126654819990,
+        "AbstractEmitterVisitor": 14425751645616621203,
+        "EmitterVisitorContext": 16033536691494880299,
         "escapeIdentifier": 18292545112552985630
       }
     },
@@ -274,6 +692,14 @@
       "exists": true,
       "symbols": {
         "AbstractJsEmitterVisitor": 13468393434627186050
+      }
+    },
+    "output/map_util.ts": {
+      "exists": true,
+      "symbols": {
+        "MapEntry": 7879264590507585314,
+        "MapLiteral": 12195219676282581932,
+        "mapLiteral": 18426838385775167674
       }
     },
     "output/output_ast.ts": {
@@ -291,7 +717,7 @@
         "CookedRawString": 6412211027387878904,
         "DYNAMIC_TYPE": 9321955644174396093,
         "DeclareFunctionStmt": 18442395512384779293,
-        "DeclareVarStmt": 13125710033506625374,
+        "DeclareVarStmt": 16468732617801989567,
         "DynamicImportExpr": 13944526505058430552,
         "Expression": 4383726440438121853,
         "ExpressionStatement": 15197877612383081319,
@@ -315,7 +741,7 @@
         "LiteralExpr": 1762545584546348746,
         "LiteralMapEntry": 1997247857941832254,
         "LiteralMapExpr": 5615001645109995095,
-        "LiteralMapPropertyAssignment": 3041500841537140175,
+        "LiteralMapPropertyAssignment": 2293186675744277173,
         "LiteralMapSpreadAssignment": 15101467887688325005,
         "LiteralPiece": 4492153373909302450,
         "LocalizedString": 5317706150163795023,
@@ -347,8 +773,8 @@
         "TypeModifier": 14794068535525699525,
         "TypeVisitor": 9476006658938746618,
         "TypeofExpr": 3457224625613749224,
-        "UnaryOperator": 4376250885265852035,
-        "UnaryOperatorExpr": 12568983479449268665,
+        "UnaryOperator": 1898825280016540257,
+        "UnaryOperatorExpr": 18403143490810699161,
         "VoidExpr": 12350745431067348459,
         "WrappedNodeExpr": 3253894660822200510,
         "areAllEquivalent": 8834195154828642272,
@@ -374,6 +800,127 @@
         "variable": 11494692672105789019
       }
     },
+    "output/source_map.ts": {
+      "exists": true,
+      "symbols": {
+        "SourceMap": 9793979802928802908,
+        "SourceMapGenerator": 8144659985722367012,
+        "toBase64String": 17137527797811026134
+      }
+    },
+    "parse_util.ts": {
+      "exists": true,
+      "symbols": {
+        "CompileIdentifierMetadata": 12426412765828318609,
+        "ParseError": 17097771918671137960,
+        "ParseErrorLevel": 2375612580318474781,
+        "ParseLocation": 1175065398899178048,
+        "ParseSourceFile": 15048954660646337528,
+        "ParseSourceSpan": 13081377878163524493,
+        "identifierName": 9042600950829866248,
+        "r3JitTypeSourceSpan": 11376041213503505934,
+        "sanitizeIdentifier": 5694425150789008009
+      }
+    },
+    "property_mapping.ts": {
+      "exists": true,
+      "symbols": {
+        "BindingPropertyName": 17890556564707210687,
+        "ClassPropertyMapping": 15817206957312041651,
+        "ClassPropertyName": 17107905853478551156,
+        "InputOrOutput": 4442858853900156739
+      }
+    },
+    "render3/partial/api.ts": {
+      "exists": true,
+      "symbols": {
+        "LegacyInputPartialMapping": 5053170890867513115,
+        "R3DeclareClassMetadata": 16357082534833909589,
+        "R3DeclareClassMetadataAsync": 7140210524808913540,
+        "R3DeclareComponentMetadata": 1239785600920512296,
+        "R3DeclareDependencyMetadata": 14126504184253919631,
+        "R3DeclareDirectiveDependencyMetadata": 5456297781423708996,
+        "R3DeclareDirectiveMetadata": 9190895976146985210,
+        "R3DeclareFactoryMetadata": 17481115906570139509,
+        "R3DeclareHostDirectiveMetadata": 16526746229483650873,
+        "R3DeclareInjectableMetadata": 2117951311086708431,
+        "R3DeclareInjectorMetadata": 17758803516736693493,
+        "R3DeclareNgModuleDependencyMetadata": 15534630100055193560,
+        "R3DeclareNgModuleMetadata": 2635990196621128518,
+        "R3DeclarePipeDependencyMetadata": 1895774640393591484,
+        "R3DeclarePipeMetadata": 410968564745010893,
+        "R3DeclareQueryMetadata": 5359438753109736300,
+        "R3DeclareServiceMetadata": 16016033464918284017,
+        "R3DeclareTemplateDependencyMetadata": 15938591153673139909,
+        "R3PartialDeclaration": 3645377897680865279
+      }
+    },
+    "render3/partial/class_metadata.ts": {
+      "exists": true,
+      "symbols": {
+        "compileComponentDeclareClassMetadata": 9324449894512316109,
+        "compileDeclareClassMetadata": 6242696347979965896
+      }
+    },
+    "render3/partial/component.ts": {
+      "exists": true,
+      "symbols": {
+        "DeclareComponentTemplateInfo": 2876908760114971172,
+        "compileDeclareComponentFromMetadata": 7974708080480399905
+      }
+    },
+    "render3/partial/directive.ts": {
+      "exists": true,
+      "symbols": {
+        "compileDeclareDirectiveFromMetadata": 5323736660145643648,
+        "createDirectiveDefinitionMap": 5240483718954337605
+      }
+    },
+    "render3/partial/factory.ts": {
+      "exists": true,
+      "symbols": {
+        "compileDeclareFactoryFunction": 9976568779724965680
+      }
+    },
+    "render3/partial/injectable.ts": {
+      "exists": true,
+      "symbols": {
+        "compileDeclareInjectableFromMetadata": 17651088346455005437
+      }
+    },
+    "render3/partial/injector.ts": {
+      "exists": true,
+      "symbols": {
+        "compileDeclareInjectorFromMetadata": 12242617951230498101
+      }
+    },
+    "render3/partial/ng_module.ts": {
+      "exists": true,
+      "symbols": {
+        "compileDeclareNgModuleFromMetadata": 2314179830524393276
+      }
+    },
+    "render3/partial/pipe.ts": {
+      "exists": true,
+      "symbols": {
+        "compileDeclarePipeFromMetadata": 15749155982536433249
+      }
+    },
+    "render3/partial/service.ts": {
+      "exists": true,
+      "symbols": {
+        "compileDeclareServiceFromMetadata": 9009343612137884327
+      }
+    },
+    "render3/partial/util.ts": {
+      "exists": true,
+      "symbols": {
+        "compileDependencies": 9640128527862296856,
+        "compileDependency": 6580532502608815543,
+        "toOptionalLiteralArray": 7896408464957367269,
+        "toOptionalLiteralMap": 6707107390111671663
+      }
+    },
     "render3/r3_ast.ts": {
       "exists": true,
       "symbols": {
@@ -382,10 +929,13 @@
         "BoundDeferredTrigger": 9290804978699847732,
         "BoundEvent": 15514350810529839820,
         "BoundText": 1461958182713200761,
+        "BoundaryBlock": 1899672070954697602,
+        "BoundaryErrorBlock": 4832740021615567878,
         "Comment": 1821291287388964779,
         "Component": 11626873061822702231,
         "Content": 10583299953939075039,
-        "DeferredBlock": 10388230115177629653,
+        "ContentBlock": 8057299657296298876,
+        "DeferredBlock": 1985594343489483490,
         "DeferredBlockError": 16636733670934040749,
         "DeferredBlockLoading": 7108229600163073935,
         "DeferredBlockPlaceholder": 14576477447916560657,
@@ -406,7 +956,7 @@
         "LetDeclaration": 2957132324265365771,
         "NeverDeferredTrigger": 13698534182080567948,
         "Node": 9578302281973133078,
-        "RecursiveVisitor": 8740913199871560616,
+        "RecursiveVisitor": 16676984096454111444,
         "Reference": 5784760124262208986,
         "SwitchBlock": 3534801520718789172,
         "SwitchBlockCase": 8516398261036833814,
@@ -419,24 +969,50 @@
         "UnknownBlock": 8601067424729635401,
         "Variable": 15936938170887519584,
         "ViewportDeferredTrigger": 2028859061849731762,
-        "Visitor": 8281278944631958059,
+        "Visitor": 18203873464702596782,
         "visitAll": 3933265093580110506
+      }
+    },
+    "render3/r3_boundaries.ts": {
+      "exists": true,
+      "symbols": {
+        "createBoundaryBlock": 18026648724188318756,
+        "isConnectedBoundaryErrorBlock": 15001151581612892001
+      }
+    },
+    "render3/r3_class_metadata_compiler.ts": {
+      "exists": true,
+      "symbols": {
+        "CompileClassMetadataFn": 6555888703272118809,
+        "R3ClassMetadata": 15663785512930907794,
+        "R3ClassMetadataCtorParameter": 11804543489819370146,
+        "compileClassMetadata": 16545159287328692827,
+        "compileComponentClassMetadata": 17654556330826149455,
+        "compileComponentMetadataAsyncResolver": 2776612540790363096,
+        "compileCtorParameters": 15329317552605651519,
+        "compileOpaqueAsyncClassMetadata": 152435873797910330
+      }
+    },
+    "render3/r3_content_blocks.ts": {
+      "exists": true,
+      "symbols": {
+        "createContentBlock": 17211173936036027701
       }
     },
     "render3/r3_control_flow.ts": {
       "exists": true,
       "symbols": {
         "createForLoop": 14407264873688896849,
-        "createIfBlock": 17421141558652640097,
+        "createIfBlock": 2260460582914021141,
         "createSwitchBlock": 11730084973316061672,
         "isConnectedForLoopBlock": 3244862864389511473,
-        "isConnectedIfLoopBlock": 3346454080939452991
+        "isConnectedIfLoopBlock": 14895223034985631297
       }
     },
     "render3/r3_deferred_blocks.ts": {
       "exists": true,
       "symbols": {
-        "createDeferredBlock": 11374549784685733078,
+        "createDeferredBlock": 11647950509379356256,
         "isConnectedDeferLoopBlock": 18039047174167610156
       }
     },
@@ -458,17 +1034,17 @@
         "R3DependencyMetadata": 5810047234874005656,
         "R3ExpressionFactoryMetadata": 4615186721074364769,
         "R3FactoryDelegateType": 524266307524403631,
-        "R3FactoryMetadata": 2350211833250431933,
-        "compileFactoryFunction": 13942269251664370991,
+        "R3FactoryMetadata": 7615391187723382969,
+        "compileFactoryFunction": 16671114548080061146,
         "createFactoryType": 13253609300759223330,
-        "isDelegatedFactoryMetadata": 11191455282396673235,
-        "isExpressionFactoryMetadata": 12655483811109906545
+        "isDelegatedFactoryMetadata": 3746324718675016571,
+        "isExpressionFactoryMetadata": 12007996674561113895
       }
     },
     "render3/r3_identifiers.ts": {
       "exists": true,
       "symbols": {
-        "Identifiers": 2028417810674726522
+        "Identifiers": 5709075222018480710
       }
     },
     "render3/r3_injector_compiler.ts": {
@@ -482,7 +1058,7 @@
     "render3/r3_module_compiler.ts": {
       "exists": true,
       "symbols": {
-        "R3NgModuleMetadata": 12442275452203446622,
+        "R3NgModuleMetadata": 8260580360459141198,
         "R3NgModuleMetadataGlobal": 1204539265534839522,
         "R3NgModuleMetadataIsolated": 1621889016091808658,
         "R3NgModuleMetadataKind": 16328251399291552576,
@@ -512,21 +1088,20 @@
       "exists": true,
       "symbols": {
         "ForwardRefHandling": 1923673302025002847,
+        "IDENTIFIER_PATTERN": 3299620659499918303,
+        "LET_PATTERN": 6338389033942849020,
         "MaybeForwardRefExpression": 7310112090150360299,
         "R3CompiledExpression": 15996136515347423193,
         "R3Reference": 5071458703867999093,
         "convertFromMaybeForwardRefExpression": 13498994035819911629,
         "createMayBeForwardRefExpression": 653770109144599288,
         "devOnlyGuardedExpression": 4931254546845343624,
-        "generateForwardRef": 12117950902269352746,
+        "generateForwardRef": 15688856754851379283,
         "getSafePropertyAccessString": 6292604722745773345,
-        "guardedExpression": 13983444195448147847,
         "isUnsafeObjectKey": 1288436000524554633,
         "jitOnlyGuardedExpression": 7162511302303186080,
-        "prepareSyntheticListenerFunctionName": 13681433056680401212,
-        "prepareSyntheticListenerName": 9400220633317626445,
-        "prepareSyntheticPropertyName": 15770515414247131,
-        "refsToArray": 8379758150012718327,
+        "parseLetParameters": 5372436864112152741,
+        "refsToArray": 7666770534571327056,
         "tsIgnoreComment": 4105102630648822280,
         "typeWithParameters": 16850790372664564884,
         "wrapReference": 4760855133380200373
@@ -538,7 +1113,7 @@
         "DeclarationListEmitMode": 6322418788089849239,
         "DeferBlockDepsEmitMode": 890513144673090038,
         "R3ComponentDeferMetadata": 477591293473618253,
-        "R3ComponentMetadata": 7417295797088850689,
+        "R3ComponentMetadata": 9906269701882054139,
         "R3DeferPerBlockDependency": 722345332085435154,
         "R3DeferPerComponentDependency": 9451123224061065952,
         "R3DeferResolverFunctionMetadata": 3220013666683714965,
@@ -553,19 +1128,19 @@
         "R3QueryMetadata": 15595066723609774900,
         "R3TemplateDependency": 15110954834555107782,
         "R3TemplateDependencyKind": 3736988931249778220,
-        "R3TemplateDependencyMetadata": 1534132706409112991
+        "R3TemplateDependencyMetadata": 10059318060319533291
       }
     },
     "render3/view/compiler.ts": {
       "exists": true,
       "symbols": {
         "ParsedHostBindings": 16708369580338454535,
-        "compileComponentFromMetadata": 7963977913311376279,
-        "compileDeferResolverFunction": 5951064473277326837,
+        "compileComponentFromMetadata": 7499974882557879211,
+        "compileDeferResolverFunction": 9990141527367568810,
         "compileDirectiveFromMetadata": 17052308640953142596,
         "createComponentType": 13062812663085445746,
         "createDirectiveType": 16047489626013234933,
-        "createHostDirectivesMappingArray": 993340688437710620,
+        "createHostDirectivesMappingArray": 6365704017225192922,
         "encapsulateStyle": 17030309724813392348,
         "parseHostBindings": 11218794706926278761,
         "verifyHostBindings": 6708453319017261999
@@ -574,31 +1149,72 @@
     "render3/view/config.ts": {
       "exists": true,
       "symbols": {
-        "getTemplateSourceLocationsEnabled": 336665146804174184,
-        "setEnableTemplateSourceLocations": 1286147696090290945
+        "ENABLE_TEMPLATE_SOURCE_LOCATIONS": 6717066232611133074
+      }
+    },
+    "render3/view/i18n/get_msg_utils.ts": {
+      "exists": true,
+      "symbols": {
+        "createGoogleGetMsgStatements": 11912279749490552438,
+        "serializeI18nMessageForGetMsg": 10614233033557511444
+      }
+    },
+    "render3/view/i18n/icu_serializer.ts": {
+      "exists": true,
+      "symbols": {
+        "serializeIcuNode": 18375977084311433006
+      }
+    },
+    "render3/view/i18n/localize_utils.ts": {
+      "exists": true,
+      "symbols": {
+        "createLocalizeStatements": 6635128809077369073,
+        "serializeI18nMessageForLocalize": 13070064415124591606
+      }
+    },
+    "render3/view/i18n/meta.ts": {
+      "exists": true,
+      "symbols": {
+        "I18nMeta": 17997398313377823264,
+        "I18nMetaVisitor": 10419011173139970094,
+        "i18nMetaToJSDoc": 13627318226456140562,
+        "parseI18nMeta": 18293662792944804389
+      }
+    },
+    "render3/view/i18n/util.ts": {
+      "exists": true,
+      "symbols": {
+        "I18N_ATTR": 10489464147157209474,
+        "I18N_ATTR_PREFIX": 17395368194119297130,
+        "I18N_ICU_VAR_PREFIX": 3011574508707197957,
+        "formatI18nPlaceholderName": 3990167416096768954,
+        "formatI18nPlaceholderNamesInMap": 14257926973589238442,
+        "hasI18nAttrs": 2573299563018628542,
+        "icuFromI18nMessage": 16945752815042556137,
+        "isI18nAttribute": 17714160917279467601,
+        "placeholdersToParams": 5804802574252131338
       }
     },
     "render3/view/query_generation.ts": {
       "exists": true,
       "symbols": {
         "QueryFlags": 17459368282721006688,
-        "createContentQueriesFunction": 2003431271655173662,
-        "createViewQueriesFunction": 17473029004355633943,
-        "getQueryPredicate": 4677145689945952877
+        "createContentQueriesFunction": 4982013931465551728,
+        "createViewQueriesFunction": 5492940184840950259
       }
     },
     "render3/view/t2_api.ts": {
       "exists": true,
       "symbols": {
-        "BoundTarget": 278158264865385995,
+        "BoundTarget": 10794042167300294836,
         "ConflictingHostDirectiveBinding": 8538299525791182414,
         "DirectiveMeta": 7135787122593710911,
         "DirectiveOwner": 4260985253999990371,
-        "ForeignComponentMeta": 5507713857486719554,
+        "ForeignComponentMeta": 669697561094567758,
         "LegacyAnimationTriggerNames": 13422542240200314599,
         "MatchSource": 18139652764313968631,
-        "ReferenceTarget": 3799767545949424259,
-        "ScopedNode": 6885693427038255574,
+        "ReferenceTarget": 599669727310232083,
+        "ScopedNode": 4546784068625726180,
         "Target": 15588981203266375799,
         "TargetBinder": 1921547006216034186,
         "TemplateEntity": 4682365658636263350
@@ -607,8 +1223,8 @@
     "render3/view/t2_binder.ts": {
       "exists": true,
       "symbols": {
-        "DirectiveMatcher": 12570467722022817007,
-        "R3TargetBinder": 6257751501763073861,
+        "DirectiveMatcher": 268642057574246225,
+        "R3TargetBinder": 14154594204976186998,
         "findMatchingDirectivesAndPipes": 4706426040159020910
       }
     },
@@ -622,15 +1238,375 @@
         "parseTemplate": 10712271427945231833
       }
     },
+    "render3/view/util.ts": {
+      "exists": true,
+      "symbols": {
+        "CONTEXT_NAME": 9209533108918932352,
+        "DefinitionMap": 8727003689201941356,
+        "RENDER_FLAGS": 13148001224416637054,
+        "TEMPORARY_NAME": 8670796841413673886,
+        "asLiteral": 199507124238264461,
+        "conditionallyCreateDirectiveBindingLiteral": 15989688261782156419,
+        "createCssSelectorFromNode": 1643659115701115946,
+        "temporaryAllocator": 5586009645234099987
+      }
+    },
+    "schema/dom_element_schema_registry.ts": {
+      "exists": true,
+      "symbols": {
+        "DomElementSchemaRegistry": 11233366143804081394,
+        "SCHEMA": 13430432007203638252,
+        "_ATTR_TO_PROP": 13562055313984839063
+      }
+    },
+    "schema/dom_security_schema.ts": {
+      "exists": true,
+      "symbols": {
+        "MATH_ML_NAMESPACE": 8194152591462850220,
+        "SECURITY_SCHEMA": 17385830212812241157,
+        "SVG_NAMESPACE": 5015472413564681486,
+        "SecurityContext": 15675731489054441669,
+        "checkSecurityContext": 12597524837752209088
+      }
+    },
+    "schema/element_schema_registry.ts": {
+      "exists": true,
+      "symbols": {
+        "ElementSchemaRegistry": 3595467379403757324
+      }
+    },
+    "schema/trusted_types_sinks.ts": {
+      "exists": true,
+      "symbols": {
+        "isTrustedTypesSink": 10954180710428400278
+      }
+    },
+    "service_compiler.ts": {
+      "exists": true,
+      "symbols": {
+        "R3ServiceMetadata": 1712891831816062156,
+        "compileService": 16710514061769058432
+      }
+    },
+    "shadow_css.ts": {
+      "exists": true,
+      "symbols": {
+        "CssRule": 1402344937613559816,
+        "ShadowCss": 17922916410855405688,
+        "namespaceCssVariables": 1104198873833772195,
+        "processRules": 8821187556812212675,
+        "repeatGroups": 15334239557703836405
+      }
+    },
+    "style_url_resolver.ts": {
+      "exists": true,
+      "symbols": {
+        "isStyleUrlResolvable": 2438089220625452515
+      }
+    },
+    "template/pipeline/ir/index.ts": {
+      "exists": true,
+      "symbols": {}
+    },
+    "template/pipeline/ir/src/enums.ts": {
+      "exists": true,
+      "symbols": {
+        "AnimationBindingKind": 14846652863388923600,
+        "AnimationKind": 7850986824191150037,
+        "BindingKind": 13224016103742964823,
+        "DeferOpModifierKind": 5663323300286712448,
+        "DeferTriggerKind": 7570416746624845838,
+        "ExpressionKind": 8025328210665620304,
+        "I18nContextKind": 372029293215802847,
+        "I18nExpressionFor": 5766910045618117326,
+        "I18nParamResolutionTime": 10092107471885694017,
+        "I18nParamValueFlags": 18015466405167975956,
+        "Namespace": 4802500475378086974,
+        "OpKind": 10520581618958508378,
+        "SemanticVariableKind": 3718343869265067475,
+        "TDeferDetailsFlags": 4616881450986384417,
+        "TemplateKind": 11044770279968637137,
+        "VariableFlags": 10220182620385607055
+      }
+    },
+    "template/pipeline/ir/src/expression.ts": {
+      "exists": true,
+      "symbols": {
+        "ArrowFunctionExpr": 379940469237013805,
+        "AssignTemporaryExpr": 14261737442293053517,
+        "BoundaryStateExpr": 17630745544731453331,
+        "ConditionalCaseExpr": 15254083829355844744,
+        "ConstCollectedExpr": 10830655594947817666,
+        "ContextExpr": 17099477946215153235,
+        "ContextLetReferenceExpr": 10866300065307434035,
+        "EmptyExpr": 12052510795831679808,
+        "Expression": 15371252512657536615,
+        "ExpressionTransform": 18122330447492162892,
+        "ForeignContentExpr": 341278393540334045,
+        "GetCurrentViewExpr": 8696154556916585620,
+        "LexicalReadExpr": 10383751564766846749,
+        "NextContextExpr": 11098818313881815580,
+        "PipeBindingExpr": 7551538330421093969,
+        "PipeBindingVariadicExpr": 5915989832591295927,
+        "PureFunctionExpr": 5637641097834516522,
+        "PureFunctionParameterExpr": 6863151486620307466,
+        "ReadTemporaryExpr": 2158954633856743673,
+        "ReadVariableExpr": 2898830752674463909,
+        "ReferenceExpr": 10238819303701976044,
+        "ResetViewExpr": 7020354688698468503,
+        "RestoreViewExpr": 2996869851502414535,
+        "SafeKeyedReadExpr": 9092339803939831208,
+        "SafeNavigationMigrationExpr": 9047479962702118082,
+        "SafePropertyReadExpr": 8147526550166666902,
+        "SafeTernaryExpr": 4954551110551215020,
+        "SlotLiteralExpr": 9531445214991184068,
+        "StoreLetExpr": 8606925392823101444,
+        "TrackContextExpr": 4684612220048727158,
+        "TwoWayBindingSetExpr": 1226322614903398561,
+        "VisitorContextFlag": 9586480321136040387,
+        "isIrExpression": 4963035459336796833,
+        "isStringLiteral": 6815496731733602896,
+        "transformExpressionsInExpression": 14616480227940587399,
+        "transformExpressionsInOp": 8201968901012796028,
+        "transformExpressionsInStatement": 14642777715629537541,
+        "visitExpressionsInOp": 11717708413124592857
+      }
+    },
+    "template/pipeline/ir/src/handle.ts": {
+      "exists": true,
+      "symbols": {
+        "SlotHandle": 1057552398074904954
+      }
+    },
+    "template/pipeline/ir/src/operations.ts": {
+      "exists": true,
+      "symbols": {
+        "Op": 3590070021935132607,
+        "OpList": 7225854804719639210,
+        "XrefId": 8693534693636495505
+      }
+    },
+    "template/pipeline/ir/src/ops/create.ts": {
+      "exists": true,
+      "symbols": {
+        "AnimationListenerOp": 3596853751526553219,
+        "AnimationOp": 16883843648074539972,
+        "AnimationStringOp": 3930366471806844450,
+        "BoundaryCreateOp": 17662452018276979635,
+        "BoundaryErrorCreateOp": 7311765415741404699,
+        "ConditionalBranchCreateOp": 12146778092682939663,
+        "ConditionalCreateOp": 15096595089515115047,
+        "ConstIndex": 10903437736435285239,
+        "ContainerEndOp": 7999763796804789528,
+        "ContainerOp": 12836691212652439056,
+        "ContainerStartOp": 2052661651037606814,
+        "ContentOp": 12901118236164122247,
+        "ControlCreateOp": 17590109110269274690,
+        "CreateOp": 5873269511386932826,
+        "DeclareLetOp": 6591154537530305239,
+        "DeferOnOp": 17118078471115783545,
+        "DeferOp": 13203913174502696514,
+        "DeferTrigger": 11610401860984867635,
+        "DisableBindingsOp": 1402110351000771387,
+        "ElementEndOp": 260915190985848414,
+        "ElementOp": 9347059007987607834,
+        "ElementOpBase": 3912079038815659886,
+        "ElementOrContainerOpBase": 2262756945533077978,
+        "ElementOrContainerOps": 6165373615969537324,
+        "ElementSourceLocation": 11816532151049606525,
+        "ElementStartOp": 5833278155506347686,
+        "EnableBindingsOp": 5050917992060886265,
+        "EnableIncrementalHydrationRuntimeOp": 835766192385737239,
+        "ExtractedAttributeOp": 3578404975508097290,
+        "ForeignComponentOp": 14130664811045173696,
+        "I18nAttributesOp": 15904222147753906277,
+        "I18nContextOp": 1353644107674475285,
+        "I18nEndOp": 2412076503218958171,
+        "I18nMessageOp": 1256325040433801914,
+        "I18nOp": 16887024672784078840,
+        "I18nOpBase": 3913701627175606447,
+        "I18nParamValue": 11260315767373374442,
+        "I18nStartOp": 4676686799606465628,
+        "IcuEndOp": 12835720672309358537,
+        "IcuPlaceholderOp": 13440703736076303575,
+        "IcuStartOp": 6151309497431843298,
+        "ListenerOp": 10318733436329754893,
+        "LocalRef": 16402992331702685118,
+        "NamespaceOp": 8498933302580510338,
+        "PipeOp": 9625265921028509361,
+        "ProjectionDefOp": 14224397831328431436,
+        "ProjectionOp": 11849941808886741676,
+        "RepeaterCreateOp": 1668279935733339179,
+        "RepeaterVarNames": 7956993481493981824,
+        "SourceLocationOp": 2259561976669836648,
+        "TemplateOp": 14000232798931899763,
+        "TextOp": 9099786481505090896,
+        "TwoWayListenerOp": 3562534751586663839,
+        "createAnimationListenerOp": 5284641701374151377,
+        "createAnimationOp": 4210904539689051057,
+        "createAnimationStringOp": 2311877507696440139,
+        "createBoundaryCreateOp": 13181922243857551382,
+        "createBoundaryErrorCreateOp": 75726148990608313,
+        "createConditionalBranchCreateOp": 6514468326123807406,
+        "createConditionalCreateOp": 4234952387340766078,
+        "createContentOp": 9435558145246833938,
+        "createControlCreateOp": 16003372571730217803,
+        "createDeclareLetOp": 8465286187608103558,
+        "createDeferOnOp": 4000527707026610777,
+        "createDeferOp": 13650964834149161083,
+        "createDisableBindingsOp": 2876228772640702736,
+        "createElementEndOp": 9460894762367872938,
+        "createElementStartOp": 4763954761623807031,
+        "createEnableBindingsOp": 8137102240215626025,
+        "createEnableIncrementalHydrationRuntimeOp": 3319914661423446834,
+        "createExtractedAttributeOp": 11801636838132830740,
+        "createForeignComponentOp": 10008202684108243909,
+        "createI18nAttributesOp": 11983023058198886090,
+        "createI18nContextOp": 9914955342173555883,
+        "createI18nEndOp": 733952667085733134,
+        "createI18nMessageOp": 14842795684276481209,
+        "createI18nStartOp": 4265654509808623402,
+        "createIcuEndOp": 1075816671291352948,
+        "createIcuPlaceholderOp": 11076174835882199240,
+        "createIcuStartOp": 5787251026950983247,
+        "createListenerOp": 11925608057671878176,
+        "createNamespaceOp": 12352837049463157138,
+        "createPipeOp": 17455530583029774030,
+        "createProjectionDefOp": 5721083467659122064,
+        "createProjectionOp": 16379972441983036959,
+        "createRepeaterCreateOp": 258222216088344740,
+        "createSourceLocationOp": 14774344178031429887,
+        "createTemplateOp": 3852933011011281434,
+        "createTextOp": 9658861487182408657,
+        "createTwoWayListenerOp": 1929922078328762314,
+        "isElementOrContainerOp": 1300570679019194312
+      }
+    },
+    "template/pipeline/ir/src/ops/host.ts": {
+      "exists": true,
+      "symbols": {
+        "DomPropertyOp": 5684269047110227991,
+        "createDomPropertyOp": 13054977525224015728
+      }
+    },
+    "template/pipeline/ir/src/ops/shared.ts": {
+      "exists": true,
+      "symbols": {
+        "ListEndOp": 1918558158385842186,
+        "NEW_OP": 7799919834242992361,
+        "StatementOp": 11222182162776475809,
+        "VariableOp": 2083853373381176714,
+        "createStatementOp": 2782688485470401234,
+        "createVariableOp": 7869537751620837427
+      }
+    },
+    "template/pipeline/ir/src/ops/update.ts": {
+      "exists": true,
+      "symbols": {
+        "AdvanceOp": 8732570589475577657,
+        "AnimationBindingOp": 191511393772921937,
+        "AttributeOp": 13886336165468298291,
+        "BindingOp": 8327988142196420685,
+        "BoundaryOp": 2100944128879999454,
+        "ClassMapOp": 1888293269155030991,
+        "ClassPropOp": 3873100850457788582,
+        "ConditionalOp": 16981067625402305222,
+        "ControlOp": 1472504256059222191,
+        "DeferWhenOp": 6155071166407705367,
+        "I18nApplyOp": 1748121286013684657,
+        "I18nExpressionOp": 2634556404565553100,
+        "InterpolateTextOp": 6542000612739961007,
+        "Interpolation": 16175296734305290130,
+        "PropertyOp": 4462347792383650115,
+        "RepeaterOp": 12556161506061729790,
+        "StoreLetOp": 7909378194616103957,
+        "StyleMapOp": 13158110059373136433,
+        "StylePropOp": 11144027644836724391,
+        "TwoWayPropertyOp": 11156036745508395937,
+        "UpdateOp": 17836478660748001161,
+        "createAdvanceOp": 1504844606853712761,
+        "createAnimationBindingOp": 7774090037484056964,
+        "createAttributeOp": 876228995478095397,
+        "createBindingOp": 1101968194219799994,
+        "createBoundaryOp": 9202456279013866204,
+        "createClassMapOp": 16940711267646093448,
+        "createClassPropOp": 14945383490328772210,
+        "createConditionalOp": 12750147399192063516,
+        "createControlOp": 8174035890994631648,
+        "createDeferWhenOp": 16883127189726014675,
+        "createI18nApplyOp": 9268155614859858804,
+        "createI18nExpressionOp": 6883089765423387974,
+        "createInterpolateTextOp": 15293155127892387259,
+        "createPropertyOp": 11067737060188228944,
+        "createRepeaterOp": 10873229796578271247,
+        "createStoreLetOp": 4510193805647513948,
+        "createStyleMapOp": 17593602352279534923,
+        "createStylePropOp": 177710417818400319,
+        "createTwoWayPropertyOp": 17555800305376318496
+      }
+    },
+    "template/pipeline/ir/src/traits.ts": {
+      "exists": true,
+      "symbols": {
+        "ConsumesSlot": 1588692981637651234,
+        "ConsumesSlotOpTrait": 16485133219755946322,
+        "ConsumesVarsTrait": 16810135668700760523,
+        "DependsOnSlotContext": 6490831014813328366,
+        "DependsOnSlotContextOpTrait": 15920634954501067878,
+        "TRAIT_CONSUMES_SLOT": 15454044379752321536,
+        "TRAIT_CONSUMES_VARS": 14876814006478709140,
+        "TRAIT_DEPENDS_ON_SLOT_CONTEXT": 3656097850990222480,
+        "UsesVarOffset": 17525058333799937684,
+        "UsesVarOffsetTrait": 3682530590015864344,
+        "hasConsumesSlotTrait": 8675697332964546799,
+        "hasConsumesVarsTrait": 16088923915980418995,
+        "hasDependsOnSlotContextTrait": 14392446590959937630,
+        "hasUsesVarOffsetTrait": 16476535895624697869
+      }
+    },
+    "template/pipeline/ir/src/variable.ts": {
+      "exists": true,
+      "symbols": {
+        "AliasVariable": 11644530390715752506,
+        "BoundaryStateVariable": 8521515349385830261,
+        "CTX_REF": 6787478636106330521,
+        "ContextVariable": 18170654169823064590,
+        "IdentifierVariable": 8333993501165744499,
+        "SavedViewVariable": 14134973214029883490,
+        "SemanticVariable": 15047006054187966884,
+        "SemanticVariableBase": 6017737063931888601
+      }
+    },
+    "template/pipeline/src/compilation.ts": {
+      "exists": true,
+      "symbols": {
+        "CompilationJob": 14495905010598644996,
+        "CompilationJobKind": 10831173748820442239,
+        "CompilationUnit": 17145648947891664621,
+        "ComponentCompilationJob": 10757459213811957250,
+        "HostBindingCompilationJob": 6755459098796550069,
+        "HostBindingCompilationUnit": 1064142939024651257,
+        "TemplateCompilationMode": 828535846023264290,
+        "ViewCompilationUnit": 5220364955094533410
+      }
+    },
     "template/pipeline/src/conversion.ts": {
       "exists": true,
       "symbols": {
         "BINARY_OPERATORS": 10071621513329001015,
         "LiteralType": 10921042358458850221,
-        "keyForNamespace": 4120521623281117684,
+        "UNARY_OPERATORS": 14464516517456988294,
         "literalOrArrayLiteral": 14610614522273586707,
         "namespaceForKey": 2107122579565658138,
         "prefixWithNamespace": 5546972034858050245
+      }
+    },
+    "template/pipeline/src/emit.ts": {
+      "exists": true,
+      "symbols": {
+        "emitHostBindingFunction": 12016890295067528133,
+        "emitTemplateFn": 12920048387737797684,
+        "transform": 3673511583522599059
       }
     },
     "template/pipeline/src/ingest.ts": {
@@ -638,12 +1614,572 @@
       "symbols": {
         "HostBindingInput": 11839470809771029034,
         "ingestComponent": 2379298244897227851,
-        "ingestDomProperty": 4547876576291577679,
-        "ingestHostAttribute": 1254571255878982414,
-        "ingestHostBinding": 7724232353360443866,
-        "ingestHostEvent": 440892698026225462,
-        "isI18nRootNode": 6645503306615601078,
-        "isSingleI18nIcu": 258544928287039384
+        "ingestHostBinding": 837939169986613680,
+        "isI18nRootNode": 6645503306615601078
+      }
+    },
+    "template/pipeline/src/instruction.ts": {
+      "exists": true,
+      "symbols": {
+        "advance": 8619532198528274467,
+        "animation": 3611951769366136718,
+        "animationListener": 3631800742648886040,
+        "animationString": 8887651374594428460,
+        "ariaProperty": 13859148996185279073,
+        "arrowFunction": 104539938881656515,
+        "attachSourceLocation": 15736575138324852014,
+        "attribute": 8255529058526654934,
+        "boundary": 14576978862212045477,
+        "boundaryCreate": 206680710101886384,
+        "classMap": 4754595854939490633,
+        "classProp": 10627057364846258850,
+        "conditional": 961319701580399589,
+        "conditionalBranchCreate": 15927672170923036822,
+        "conditionalCreate": 14469326755330657982,
+        "control": 16711164895150867498,
+        "controlCreate": 2595241917598378797,
+        "declareLet": 6884313810654093358,
+        "defer": 13364122029773111999,
+        "deferOn": 2739524448972598407,
+        "deferWhen": 13806527534659924648,
+        "disableBindings": 3056366262627377587,
+        "domElement": 9226264538875927893,
+        "domElementContainer": 9676108146105974651,
+        "domElementContainerEnd": 11283371783176496211,
+        "domElementContainerStart": 9139004080358755385,
+        "domElementEnd": 6659728896010997729,
+        "domElementStart": 9127146247870883311,
+        "domListener": 3233598565125972764,
+        "domProperty": 3630066971226980080,
+        "domTemplate": 395127515891643547,
+        "element": 6876145658086488483,
+        "elementContainer": 6779368579536999361,
+        "elementContainerEnd": 17364745467928386139,
+        "elementContainerStart": 12618076653531168535,
+        "elementEnd": 16825435565662256727,
+        "elementStart": 10864966942825509877,
+        "enableBindings": 13789341844695351031,
+        "enableIncrementalHydrationRuntime": 17663130532144445813,
+        "foreignComponent": 6379883699433819070,
+        "foreignContent": 6624921744521390919,
+        "getBoundary": 12052368419200308314,
+        "getCurrentView": 8644255218209155797,
+        "i18n": 17048880008245894189,
+        "i18nApply": 3273043169203873674,
+        "i18nAttributes": 3046600912919441818,
+        "i18nEnd": 8319936729380019077,
+        "i18nExp": 15928220902132886895,
+        "i18nStart": 14723021534889029591,
+        "listener": 15873033108057492530,
+        "namespaceHTML": 8306285742226930291,
+        "namespaceMath": 10835447221802152642,
+        "namespaceSVG": 7017622987257845179,
+        "nextContext": 15728054870853146791,
+        "pipe": 14577390646779797815,
+        "pipeBind": 18006878435661781812,
+        "pipeBindV": 16235274908474238944,
+        "projection": 15457097324138158519,
+        "projectionDef": 8352683493640201889,
+        "property": 15069600135328205492,
+        "pureFunction": 16916332670277539920,
+        "readContextLet": 3874035046034912013,
+        "reference": 14590422942559719591,
+        "repeater": 11659095245833627555,
+        "repeaterCreate": 11292926146064705402,
+        "resetView": 5225057300848875404,
+        "restoreView": 14017504629238465978,
+        "storeLet": 4028109040806996880,
+        "styleMap": 9295053389409604205,
+        "styleProp": 3117928237321496686,
+        "syntheticHostProperty": 8640927975806264439,
+        "template": 6969666979343794091,
+        "text": 1928060405357654105,
+        "textInterpolate": 18397974355113842861,
+        "twoWayBindingSet": 10934338868343258011,
+        "twoWayListener": 15447153591330247633,
+        "twoWayProperty": 10534151671137226833
+      }
+    },
+    "template/pipeline/src/namespaces.ts": {
+      "exists": true,
+      "symbols": {
+        "MATH_ML_NAMESPACE": 8194152591462850220,
+        "SVG_NAMESPACE": 5015472413564681486
+      }
+    },
+    "template/pipeline/src/phases/any_cast.ts": {
+      "exists": true,
+      "symbols": {
+        "deleteAnyCasts": 16766359803504004300
+      }
+    },
+    "template/pipeline/src/phases/apply_i18n_expressions.ts": {
+      "exists": true,
+      "symbols": {
+        "applyI18nExpressions": 4431272721555432398
+      }
+    },
+    "template/pipeline/src/phases/assign_i18n_slot_dependencies.ts": {
+      "exists": true,
+      "symbols": {
+        "assignI18nSlotDependencies": 1391634883203047528
+      }
+    },
+    "template/pipeline/src/phases/attach_source_locations.ts": {
+      "exists": true,
+      "symbols": {
+        "attachSourceLocations": 2170776243278823550
+      }
+    },
+    "template/pipeline/src/phases/attribute_extraction.ts": {
+      "exists": true,
+      "symbols": {
+        "extractAttributes": 10903851256857662985
+      }
+    },
+    "template/pipeline/src/phases/binding_specialization.ts": {
+      "exists": true,
+      "symbols": {
+        "specializeBindings": 4213667132968967372
+      }
+    },
+    "template/pipeline/src/phases/boundary_conditions.ts": {
+      "exists": true,
+      "symbols": {
+        "generateBoundaryConditions": 6878897150751459160
+      }
+    },
+    "template/pipeline/src/phases/chaining.ts": {
+      "exists": true,
+      "symbols": {
+        "chain": 2636003766528726587
+      }
+    },
+    "template/pipeline/src/phases/collapse_singleton_interpolations.ts": {
+      "exists": true,
+      "symbols": {
+        "collapseSingletonInterpolations": 1506915306196825084
+      }
+    },
+    "template/pipeline/src/phases/conditionals.ts": {
+      "exists": true,
+      "symbols": {
+        "generateConditionalExpressions": 13460974104414489362
+      }
+    },
+    "template/pipeline/src/phases/const_collection.ts": {
+      "exists": true,
+      "symbols": {
+        "collectElementConsts": 10510450997486587743
+      }
+    },
+    "template/pipeline/src/phases/control_directives.ts": {
+      "exists": true,
+      "symbols": {
+        "specializeControlProperties": 17745225335845184231
+      }
+    },
+    "template/pipeline/src/phases/convert_animations.ts": {
+      "exists": true,
+      "symbols": {
+        "convertAnimations": 10645227377426135114
+      }
+    },
+    "template/pipeline/src/phases/convert_i18n_bindings.ts": {
+      "exists": true,
+      "symbols": {
+        "convertI18nBindings": 15912611877936913671
+      }
+    },
+    "template/pipeline/src/phases/create_i18n_contexts.ts": {
+      "exists": true,
+      "symbols": {
+        "createI18nContexts": 7078286044501413406
+      }
+    },
+    "template/pipeline/src/phases/deduplicate_text_bindings.ts": {
+      "exists": true,
+      "symbols": {
+        "deduplicateTextBindings": 5281784130414698396
+      }
+    },
+    "template/pipeline/src/phases/defer_configs.ts": {
+      "exists": true,
+      "symbols": {
+        "configureDeferInstructions": 9595211566987018507
+      }
+    },
+    "template/pipeline/src/phases/defer_resolve_targets.ts": {
+      "exists": true,
+      "symbols": {
+        "resolveDeferTargetNames": 17103249430487929172
+      }
+    },
+    "template/pipeline/src/phases/empty_elements.ts": {
+      "exists": true,
+      "symbols": {
+        "collapseEmptyInstructions": 1002228513853232262
+      }
+    },
+    "template/pipeline/src/phases/expand_safe_reads.ts": {
+      "exists": true,
+      "symbols": {
+        "expandSafeReads": 3095971184379640139
+      }
+    },
+    "template/pipeline/src/phases/extract_i18n_messages.ts": {
+      "exists": true,
+      "symbols": {
+        "extractI18nMessages": 16069943132177765860
+      }
+    },
+    "template/pipeline/src/phases/generate_advance.ts": {
+      "exists": true,
+      "symbols": {
+        "generateAdvance": 7706797699179362374
+      }
+    },
+    "template/pipeline/src/phases/generate_arrow_functions.ts": {
+      "exists": true,
+      "symbols": {
+        "generateArrowFunctions": 16163439690571538402
+      }
+    },
+    "template/pipeline/src/phases/generate_local_let_references.ts": {
+      "exists": true,
+      "symbols": {
+        "generateLocalLetReferences": 10429372285678880374
+      }
+    },
+    "template/pipeline/src/phases/generate_projection_def.ts": {
+      "exists": true,
+      "symbols": {
+        "generateProjectionDefs": 7869884447449476472
+      }
+    },
+    "template/pipeline/src/phases/generate_variables.ts": {
+      "exists": true,
+      "symbols": {
+        "generateVariables": 1730475809858409681
+      }
+    },
+    "template/pipeline/src/phases/has_const_expression_collection.ts": {
+      "exists": true,
+      "symbols": {
+        "collectConstExpressions": 571982014736158863
+      }
+    },
+    "template/pipeline/src/phases/host_style_property_parsing.ts": {
+      "exists": true,
+      "symbols": {
+        "parseHostStyleProperties": 1459249242027535907
+      }
+    },
+    "template/pipeline/src/phases/i18n_const_collection.ts": {
+      "exists": true,
+      "symbols": {
+        "collectI18nConsts": 6262304177057357550
+      }
+    },
+    "template/pipeline/src/phases/i18n_text_extraction.ts": {
+      "exists": true,
+      "symbols": {
+        "convertI18nText": 12409041731895207429
+      }
+    },
+    "template/pipeline/src/phases/insert_incremental_hydration_runtime.ts": {
+      "exists": true,
+      "symbols": {
+        "insertIncrementalHydrationRuntime": 3180783946687684736
+      }
+    },
+    "template/pipeline/src/phases/local_refs.ts": {
+      "exists": true,
+      "symbols": {
+        "liftLocalRefs": 17512111173116031057
+      }
+    },
+    "template/pipeline/src/phases/namespace.ts": {
+      "exists": true,
+      "symbols": {
+        "emitNamespaceChanges": 4485165870783101692
+      }
+    },
+    "template/pipeline/src/phases/naming.ts": {
+      "exists": true,
+      "symbols": {
+        "nameFunctionsAndVariables": 18014375472897352348
+      }
+    },
+    "template/pipeline/src/phases/next_context_merging.ts": {
+      "exists": true,
+      "symbols": {
+        "mergeNextContextExpressions": 12587775542913733053
+      }
+    },
+    "template/pipeline/src/phases/ng_container.ts": {
+      "exists": true,
+      "symbols": {
+        "generateNgContainerOps": 10750896040886608928
+      }
+    },
+    "template/pipeline/src/phases/nonbindable.ts": {
+      "exists": true,
+      "symbols": {
+        "disableBindings": 11712646865744315426
+      }
+    },
+    "template/pipeline/src/phases/ordering.ts": {
+      "exists": true,
+      "symbols": {
+        "orderOps": 6641415682164562200
+      }
+    },
+    "template/pipeline/src/phases/parse_extracted_styles.ts": {
+      "exists": true,
+      "symbols": {
+        "hyphenate": 1436895069644873419,
+        "parse": 4927982651317036583,
+        "parseExtractedStyles": 13180651514889937675
+      }
+    },
+    "template/pipeline/src/phases/phase_remove_content_selectors.ts": {
+      "exists": true,
+      "symbols": {
+        "removeContentSelectors": 4538822762821656308
+      }
+    },
+    "template/pipeline/src/phases/pipe_creation.ts": {
+      "exists": true,
+      "symbols": {
+        "createPipes": 13388277440949312349
+      }
+    },
+    "template/pipeline/src/phases/pipe_variadic.ts": {
+      "exists": true,
+      "symbols": {
+        "createVariadicPipes": 16833770295481620415
+      }
+    },
+    "template/pipeline/src/phases/propagate_i18n_blocks.ts": {
+      "exists": true,
+      "symbols": {
+        "propagateI18nBlocks": 13197852166296469233
+      }
+    },
+    "template/pipeline/src/phases/pure_function_extraction.ts": {
+      "exists": true,
+      "symbols": {
+        "extractPureFunctions": 15187892515644626314
+      }
+    },
+    "template/pipeline/src/phases/pure_literal_structures.ts": {
+      "exists": true,
+      "symbols": {
+        "generatePureLiteralStructures": 3832478453599402652
+      }
+    },
+    "template/pipeline/src/phases/regular_expression_optimization.ts": {
+      "exists": true,
+      "symbols": {
+        "optimizeRegularExpressions": 14570434965277585785
+      }
+    },
+    "template/pipeline/src/phases/reify.ts": {
+      "exists": true,
+      "symbols": {
+        "reify": 4136735460597560016
+      }
+    },
+    "template/pipeline/src/phases/remove_empty_bindings.ts": {
+      "exists": true,
+      "symbols": {
+        "removeEmptyBindings": 3789768815906018292
+      }
+    },
+    "template/pipeline/src/phases/remove_i18n_contexts.ts": {
+      "exists": true,
+      "symbols": {
+        "removeI18nContexts": 14696414274574363073
+      }
+    },
+    "template/pipeline/src/phases/remove_illegal_let_references.ts": {
+      "exists": true,
+      "symbols": {
+        "removeIllegalLetReferences": 1774960836518753435
+      }
+    },
+    "template/pipeline/src/phases/remove_unused_i18n_attrs.ts": {
+      "exists": true,
+      "symbols": {
+        "removeUnusedI18nAttributesOps": 5211401676498549003
+      }
+    },
+    "template/pipeline/src/phases/resolve_boundaries.ts": {
+      "exists": true,
+      "symbols": {
+        "resolveBoundaries": 16648795757702410438
+      }
+    },
+    "template/pipeline/src/phases/resolve_contexts.ts": {
+      "exists": true,
+      "symbols": {
+        "resolveContexts": 10162626256906790294
+      }
+    },
+    "template/pipeline/src/phases/resolve_defer_deps_fns.ts": {
+      "exists": true,
+      "symbols": {
+        "resolveDeferDepsFns": 4576608609682407025
+      }
+    },
+    "template/pipeline/src/phases/resolve_dollar_event.ts": {
+      "exists": true,
+      "symbols": {
+        "resolveDollarEvent": 14792809739902438986
+      }
+    },
+    "template/pipeline/src/phases/resolve_foreign_content.ts": {
+      "exists": true,
+      "symbols": {
+        "resolveForeignContent": 1662896679563840767
+      }
+    },
+    "template/pipeline/src/phases/resolve_i18n_attr_sanitizers.ts": {
+      "exists": true,
+      "symbols": {
+        "resolveI18nAttrSanitizers": 5858501519350304068
+      }
+    },
+    "template/pipeline/src/phases/resolve_i18n_element_placeholders.ts": {
+      "exists": true,
+      "symbols": {
+        "resolveI18nElementPlaceholders": 11420220546421680890
+      }
+    },
+    "template/pipeline/src/phases/resolve_i18n_expression_placeholders.ts": {
+      "exists": true,
+      "symbols": {
+        "resolveI18nExpressionPlaceholders": 10755710722902666022
+      }
+    },
+    "template/pipeline/src/phases/resolve_names.ts": {
+      "exists": true,
+      "symbols": {
+        "resolveNames": 3247470226956638383
+      }
+    },
+    "template/pipeline/src/phases/resolve_sanitizers.ts": {
+      "exists": true,
+      "symbols": {
+        "resolveSanitizers": 8510416344287991209
+      }
+    },
+    "template/pipeline/src/phases/safe_navigation_migration.ts": {
+      "exists": true,
+      "symbols": {
+        "removeSafeNavigationMigration": 2903468108804443724
+      }
+    },
+    "template/pipeline/src/phases/save_restore_view.ts": {
+      "exists": true,
+      "symbols": {
+        "saveAndRestoreView": 5906793264364381050
+      }
+    },
+    "template/pipeline/src/phases/slot_allocation.ts": {
+      "exists": true,
+      "symbols": {
+        "allocateSlots": 12737582549202436604
+      }
+    },
+    "template/pipeline/src/phases/store_let_optimization.ts": {
+      "exists": true,
+      "symbols": {
+        "optimizeStoreLet": 17861281341507619033
+      }
+    },
+    "template/pipeline/src/phases/strip_nonrequired_parentheses.ts": {
+      "exists": true,
+      "symbols": {
+        "stripNonrequiredParentheses": 8594969268189621017
+      }
+    },
+    "template/pipeline/src/phases/style_binding_specialization.ts": {
+      "exists": true,
+      "symbols": {
+        "specializeStyleBindings": 15177947237799547862
+      }
+    },
+    "template/pipeline/src/phases/temporary_variables.ts": {
+      "exists": true,
+      "symbols": {
+        "generateTemporaryVariables": 16143715425793563833
+      }
+    },
+    "template/pipeline/src/phases/track_fn_optimization.ts": {
+      "exists": true,
+      "symbols": {
+        "optimizeTrackFns": 4422647001011401251
+      }
+    },
+    "template/pipeline/src/phases/track_variables.ts": {
+      "exists": true,
+      "symbols": {
+        "generateTrackVariables": 5481522952405530489
+      }
+    },
+    "template/pipeline/src/phases/transform_two_way_binding_set.ts": {
+      "exists": true,
+      "symbols": {
+        "transformTwoWayBindingSet": 16980497757447876292
+      }
+    },
+    "template/pipeline/src/phases/var_counting.ts": {
+      "exists": true,
+      "symbols": {
+        "countVariables": 2096491410800287980
+      }
+    },
+    "template/pipeline/src/phases/variable_optimization.ts": {
+      "exists": true,
+      "symbols": {
+        "optimizeVariables": 10221207379550881723
+      }
+    },
+    "template/pipeline/src/phases/wrap_icus.ts": {
+      "exists": true,
+      "symbols": {
+        "wrapI18nIcus": 15584572886853603917
+      }
+    },
+    "template/pipeline/src/util/attributes.ts": {
+      "exists": true,
+      "symbols": {
+        "isAriaAttribute": 12310115296091618966
+      }
+    },
+    "template/pipeline/src/util/elements.ts": {
+      "exists": true,
+      "symbols": {
+        "createOpXrefMap": 7173286123849147641
+      }
+    },
+    "template_parser/binding_parser.ts": {
+      "exists": true,
+      "symbols": {
+        "BindingParser": 12015951809103048873,
+        "HostListeners": 15911826362155800811,
+        "HostProperties": 11793584034997908211,
+        "calcPossibleSecurityContexts": 11452109269640639690
+      }
+    },
+    "template_parser/template_preparser.ts": {
+      "exists": true,
+      "symbols": {
+        "PreparsedElement": 4098820561381213121,
+        "PreparsedElementType": 11597399240460310409,
+        "preparseElement": 9157420606975512596
       }
     }
   }

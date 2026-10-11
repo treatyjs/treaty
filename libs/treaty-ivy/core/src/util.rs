@@ -95,3 +95,152 @@ pub fn type_with_parameters(ty: Expr, num_params: u32) -> Type {
 pub fn ts_ignore_comment() -> LeadingComment {
     o::leading_comment("@ts-ignore", true, true)
 }
+
+/// `util.ts` `IDENTIFIER_PATTERN = /^[$A-Z_][0-9A-Z_$]*$/i`: whether `name` is a valid JavaScript
+/// identifier for the purposes of `let` parameters and variable names. ASCII only, case-insensitive
+/// (the regex has no `u` flag). The empty string is not an identifier.
+pub fn is_identifier_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) if first == '$' || first == '_' || first.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|c| c == '$' || c == '_' || c.is_ascii_alphanumeric())
+}
+
+/// `util.ts` `LET_PATTERN = /^let\s+([\S\s]*)/`: when `expression` starts with the keyword `let`
+/// followed by at least one whitespace character, returns the captured remainder (the leading
+/// whitespace run is consumed, as the greedy `\s+` does). Returns `None` otherwise.
+pub fn match_let_pattern(expression: &str) -> Option<&str> {
+    let rest = expression.strip_prefix("let")?;
+    let trimmed = rest.trim_start_matches(char::is_whitespace);
+    if trimmed.len() == rest.len() {
+        // No whitespace followed `let` (e.g. `letter`, or a bare `let`): not a `let` parameter.
+        return None;
+    }
+    Some(trimmed)
+}
+
+/// `util.ts` `namespaceCssVariable(varName)`: namespaces a CSS variable name. `--global--x` opts out
+/// of namespacing (`--x`); any other `--x` becomes `--%NS%x`, which the component's style scoping
+/// later replaces with the component's namespace. The single-hyphen `--global-` error is commented
+/// out upstream (`g3-only`), so it is not raised here either.
+pub fn namespace_css_variable(var_name: &str) -> String {
+    match var_name.strip_prefix("--global--") {
+        Some(rest) => format!("--{rest}"),
+        None => format!("--%NS%{}", &var_name["--".len()..]),
+    }
+}
+
+/// Port of `hyphenate` (`template/pipeline/src/phases/parse_extracted_styles.ts`): a `-` goes between
+/// a lower-case letter and the upper-case letter after it, then the whole name is lower-cased, so
+/// `backgroundColor` becomes `background-color`.
+pub fn hyphenate(value: &str) -> String {
+    let chars: Vec<char> = value.chars().collect();
+    let mut out = String::with_capacity(chars.len() + 2);
+    for (i, &c) in chars.iter().enumerate() {
+        if i > 0 && c.is_ascii_uppercase() && chars[i - 1].is_ascii_lowercase() {
+            out.push('-');
+        }
+        out.push(c.to_ascii_lowercase());
+    }
+    out
+}
+
+/// Port of `normalizeStylePropName` (`template/pipeline/src/phases/naming.ts`): a CSS custom property
+/// (`--x`) keeps its name, any other style property name is hyphenated.
+pub fn normalize_style_prop_name(name: &str) -> String {
+    if name.starts_with("--") {
+        name.to_string()
+    } else {
+        hyphenate(name)
+    }
+}
+
+/// Port of `stripImportant` (`template/pipeline/src/phases/naming.ts`): drops everything from a
+/// `!important` suffix on a style or class name.
+pub fn strip_important(name: &str) -> &str {
+    match name.find("!important") {
+        Some(index) => &name[..index],
+        None => name,
+    }
+}
+
+#[cfg(test)]
+mod style_prop_name_tests {
+    use super::{hyphenate, normalize_style_prop_name, strip_important};
+
+    #[test]
+    fn hyphenates_camel_case_style_names_and_keeps_custom_properties() {
+        assert_eq!(hyphenate("borderImage"), "border-image");
+        assert_eq!(hyphenate("WIDTH"), "width");
+        assert_eq!(normalize_style_prop_name("boxShadow"), "box-shadow");
+        assert_eq!(normalize_style_prop_name("--myVar"), "--myVar");
+    }
+
+    #[test]
+    fn strips_important_suffix() {
+        assert_eq!(strip_important("width!important"), "width");
+        assert_eq!(strip_important("color"), "color");
+    }
+}
+
+#[cfg(test)]
+mod namespace_css_variable_tests {
+    use super::namespace_css_variable;
+
+    #[test]
+    fn namespaces_a_plain_variable() {
+        assert_eq!(namespace_css_variable("--foo"), "--%NS%foo");
+        assert_eq!(namespace_css_variable("--my-color"), "--%NS%my-color");
+    }
+
+    #[test]
+    fn global_double_hyphen_opts_out_of_namespacing() {
+        assert_eq!(namespace_css_variable("--global--mycolor"), "--mycolor");
+    }
+
+    #[test]
+    fn single_hyphen_global_is_namespaced_as_a_plain_variable() {
+        // The `--global-` single-hyphen form throws upstream only in the g3-internal build, so the
+        // public behaviour is to namespace it like any other variable.
+        assert_eq!(namespace_css_variable("--global-x"), "--%NS%global-x");
+    }
+}
+
+#[cfg(test)]
+mod let_and_identifier_tests {
+    use super::*;
+
+    #[test]
+    fn identifier_pattern_accepts_js_identifiers() {
+        assert!(is_identifier_name("foo"));
+        assert!(is_identifier_name("$bar"));
+        assert!(is_identifier_name("_baz9"));
+        assert!(is_identifier_name("Qux_$1"));
+    }
+
+    #[test]
+    fn identifier_pattern_rejects_non_identifiers() {
+        assert!(!is_identifier_name(""));
+        assert!(!is_identifier_name("9lives"));
+        assert!(!is_identifier_name("a-b"));
+        assert!(!is_identifier_name("a b"));
+        assert!(!is_identifier_name("café"));
+    }
+
+    #[test]
+    fn let_pattern_captures_remainder_after_whitespace() {
+        assert_eq!(match_let_pattern("let  foo = $index"), Some("foo = $index"));
+        assert_eq!(match_let_pattern("let\tbar"), Some("bar"));
+        assert_eq!(match_let_pattern("let "), Some(""));
+    }
+
+    #[test]
+    fn let_pattern_requires_keyword_then_whitespace() {
+        assert_eq!(match_let_pattern("letter"), None);
+        assert_eq!(match_let_pattern("let"), None);
+        assert_eq!(match_let_pattern(" let x"), None);
+        assert_eq!(match_let_pattern("x = let y"), None);
+    }
+}

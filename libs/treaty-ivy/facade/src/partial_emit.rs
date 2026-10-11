@@ -979,10 +979,9 @@ mod tests {
         // documented differences remain (see notes), neither a round-trip break:
         //   * `minVersion`: Angular bumps it to "17.1.0" for model() inputs; we stamp the family-wide
         //     "14.0.0" (the linker accepts both — `is_placeholder_version` keys on the version).
-        //   * top-level `isSignal: true`: this compiler derives `base.is_signal` from signal inputs,
-        //     so it emits `isSignal` (and the AOT define emits `signals: true`) where real Angular —
-        //     which sets the directive-level signal flag only for signal-based components — omits it.
-        //     It is round-trip-consistent (relinked AOT == direct AOT).
+        //   * top-level `isSignal`: the directive-level flag is the explicit `signals` option only (ngtsc's
+        //     `isSignal`, `directive/src/shared.ts`), so a model()-only directive emits no top-level
+        //     `isSignal`, as the real golden does. The per-input `isSignal` above is unaffected.
         let src = "import { Directive, model } from '@angular/core';\n\
                    @Directive({})\n\
                    export class TestDir { counter = model(0); name = model.required<string>(); }";
@@ -999,6 +998,22 @@ mod tests {
             ),
             "inputs map field shape diverges from the real ng-packagr golden; got:\n{}",
             esm
+        );
+        // A decorator `@Input({required: true})` carries `isRequired: true` into the partial
+        // declaration (`R3InputMetadata.required`); a bare `@Input()` stays `false`.
+        let src = "import { Directive, Input } from '@angular/core';\n\
+                   @Directive({})\n\
+                   export class TestDir { @Input({required: true}) name: string; @Input() other: string; }";
+        let esm_required = partial_pipeline(src).code.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            esm_required.contains("name: { classPropertyName: \"name\", publicName: \"name\", isSignal: false, isRequired: true"),
+            "@Input({{required: true}}) must set isRequired; got:\n{}",
+            esm_required
+        );
+        assert!(
+            esm_required.contains("other: { classPropertyName: \"other\", publicName: \"other\", isSignal: false, isRequired: false"),
+            "a bare @Input must keep isRequired false; got:\n{}",
+            esm_required
         );
         // The `model()` two-way output (`<name>Change`) shape, exactly as Angular emits it.
         assert!(
@@ -1289,6 +1304,52 @@ mod tests {
         assert!(relinked.errors.is_empty(), "relink errors: {:?}", relinked.errors);
         assert!(relinked.code.contains("\u{0275}\u{0275}defineComponent"), "no defineComponent after link");
         assert_no_residual_declare(&relinked.code);
+    }
+
+    #[test]
+    fn component_partial_change_detection_truth_table() {
+        // The partial declaration's `changeDetection` member, and what it links to, for each source option with the
+        // modernizer `on_push` flag off and on. An explicit `Eager` declares `ChangeDetectionStrategy.Eager` and
+        // links to `changeDetection: 1`; `Default` declares `Default` and is omitted once linked.
+        use crate::decorators::registry::ModernizeOptions;
+        let cases: [(&str, bool, &str, Option<&str>); 7] = [
+            ("", false, "Default", None),
+            ("", true, "OnPush", Some("changeDetection: 0")),
+            ("changeDetection: ChangeDetectionStrategy.OnPush, ", false, "OnPush", Some("changeDetection: 0")),
+            ("changeDetection: ChangeDetectionStrategy.Default, ", false, "Default", None),
+            ("changeDetection: ChangeDetectionStrategy.Default, ", true, "Default", None),
+            ("changeDetection: ChangeDetectionStrategy.Eager, ", false, "Eager", Some("changeDetection: 1")),
+            ("changeDetection: ChangeDetectionStrategy.Eager, ", true, "Eager", Some("changeDetection: 1")),
+        ];
+        for (option, on_push, member, linked) in cases {
+            let src = format!(
+                "import {{ Component, ChangeDetectionStrategy }} from '@angular/core';\n@Component({{ selector: 'app-x', {option}template: '<div>{{{{x}}}}</div>' }})\nexport class X {{ x = 1; }}"
+            );
+            let opts = CompileOptions {
+                emit_partial_component: true,
+                modernize: ModernizeOptions { on_push, ..Default::default() },
+                ..CompileOptions::default()
+            };
+            let compiled = compile_component_source_with_options(&src, opts);
+            assert!(compiled.errors.is_empty(), "compile errors: {:?}", compiled.errors);
+            let partial = emit_partial(&compiled.code);
+            let f = flat(&partial.code);
+            let expected_member = format!("changeDetection: i0.ChangeDetectionStrategy.{member}");
+            assert!(f.contains(&expected_member), "option `{option}`, on_push={on_push}: {f}");
+            let relinked = link_partial(&partial.code, "x.ts");
+            assert!(relinked.errors.is_empty(), "relink errors: {:?}", relinked.errors);
+            let linked_flat = flat(&relinked.code);
+            match linked {
+                Some(token) => assert!(
+                    linked_flat.contains(token),
+                    "option `{option}`, on_push={on_push}: linked output lacks `{token}`: {linked_flat}"
+                ),
+                None => assert!(
+                    !linked_flat.contains("changeDetection"),
+                    "option `{option}`, on_push={on_push}: linked output must omit changeDetection: {linked_flat}"
+                ),
+            }
+        }
     }
 
     #[test]
