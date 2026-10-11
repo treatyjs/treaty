@@ -2406,7 +2406,12 @@ impl BindingParser {
                 TemplateBinding::Variable { key, value, .. } => {
                     parsed_variables.push(ParsedVariable {
                         name: key.source.clone(),
-                        value: value.map(|v| v.source).unwrap_or_default(),
+                        // `binding_parser.ts` `parseInlineTemplateBinding`: a microsyntax `let item`
+                        // (no `= value`) reads the context's `$implicit`, like `let-item`.
+                        value: value
+                            .map(|v| v.source)
+                            .filter(|source| !source.is_empty())
+                            .unwrap_or_else(|| "$implicit".to_string()),
                         source_span: prop_span.clone(),
                         key_span: prop_span.clone(),
                         value_span: None,
@@ -2541,6 +2546,26 @@ mod tests {
             .map(|v| (v.name.as_str(), v.value.as_str()))
             .collect();
         assert_eq!(pairs, vec![("item", "$implicit"), ("i", "index")]);
+    }
+
+    #[test]
+    fn microsyntax_let_without_value_defaults_to_implicit_context_property() {
+        // `*ngFor="let outer of items"`: the `let outer` binding has no `= value`, so the desugared
+        // template variable reads the context's `$implicit` (Angular `parseInlineTemplateBinding`).
+        let nodes = parse_html(r#"<ul *ngFor="let outer of items; let i = index"><li>x</li></ul>"#);
+        let mut bp = BindingParser::new();
+        let result = html_ast_to_render3_ast(&nodes, &mut bp, Render3ParseOptions::default());
+
+        let template = match &result.nodes[0] {
+            t::Node::Template(t) => t,
+            other => panic!("expected Template, got {other:?}"),
+        };
+        let pairs: Vec<(&str, &str)> = template
+            .variables
+            .iter()
+            .map(|v| (v.name.as_str(), v.value.as_str()))
+            .collect();
+        assert_eq!(pairs, vec![("outer", "$implicit"), ("i", "index")]);
     }
 
     #[test]

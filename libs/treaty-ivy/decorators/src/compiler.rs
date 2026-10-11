@@ -952,9 +952,9 @@ struct HostPureState {
     /// deferred var-counting pass does.
     var_cursor: usize,
     /// Hoisted factories, de-duped structurally: `(factory_body, minted_name)`. Holds both
-    /// pure-literal factories (`$cN$`) and arrow factories (`$arrowFnN$`).
+    /// pure-literal factories (`_cN`) and arrow factories (`$arrowFnN$`).
     interned: Vec<(Expr, String)>,
-    /// Counter seeding the minted `$cN$` pure-literal factory reference names.
+    /// Counter seeding the minted `_cN` pure-literal factory reference names (Angular `CONSTANT_PREFIX`).
     next_const: usize,
     /// Counter seeding the minted `$arrowFnN$` arrow factory reference names (a separate Angular
     /// namespace — `getSharedFunctionReference` vs `getSharedConstant`).
@@ -1033,7 +1033,7 @@ impl crate::expression_converter::PipeSlotAllocator for HostPureFunctions {
             return Some(name.clone());
         }
         // Arrow factories and pure-literal factories live in independent reference namespaces
-        // (`getSharedFunctionReference` → `$arrowFnN$`, `getSharedConstant` → `$cN$`).
+        // (`getSharedFunctionReference` → `$arrowFnN$`, `getSharedConstant` → `_cN`).
         let name = if is_arrow {
             let n = state.next_arrow;
             state.next_arrow = n + 1;
@@ -1041,7 +1041,7 @@ impl crate::expression_converter::PipeSlotAllocator for HostPureFunctions {
         } else {
             let n = state.next_const;
             state.next_const = n + 1;
-            format!("$c{n}$")
+            format!("_c{n}")
         };
         state.interned.push((factory.clone(), name.clone()));
         Some(name)
@@ -1152,11 +1152,123 @@ fn lower_host_listener_value(
     (converted, references_event)
 }
 
+/// `calcPossibleSecurityContexts` (`binding_parser.ts`): the security contexts a property or attribute
+/// can take over the elements a selector can match. With no selector (`None`) every element name in
+/// the DOM schema is possible (`allKnownElementNames`), and a selector without an element name matches
+/// every element too, less any element named by a `:not(...)`.
+fn possible_security_contexts(
+    selector: Option<&str>,
+    prop: &str,
+    is_attribute: bool,
+) -> Vec<SecurityContext> {
+    use treaty_ivy_template::dom_security_schema::{
+        security_context_for_element, ALL_KNOWN_ELEMENT_NAMES,
+    };
+    let all_known = || ALL_KNOWN_ELEMENT_NAMES.iter().map(|e| e.to_string()).collect::<Vec<_>>();
+    let mut out = Vec::new();
+    match selector {
+        None => {
+            for element in all_known() {
+                out.push(security_context_for_element(&element, prop, is_attribute));
+            }
+        }
+        Some(selector) => {
+            for css in parse_css_selectors(selector) {
+                let elements = match &css.element {
+                    Some(element) => vec![element.clone()],
+                    None => all_known(),
+                };
+                // `:not(elem)` removes an element name only for a pure element `:not` selector.
+                let not_elements: Vec<&str> = css
+                    .not_selectors
+                    .iter()
+                    .filter(|n| n.attrs.is_empty() && n.class_names.is_empty())
+                    .filter_map(|n| n.element.as_deref())
+                    .collect();
+                for element in elements.iter().filter(|e| !not_elements.contains(&e.as_str())) {
+                    out.push(security_context_for_element(element, prop, is_attribute));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `calcHostBindingSecurityContexts` (`template/pipeline/src/ingest.ts`): the contexts of a host
+/// property (or host attribute) binding. Host bindings can run on a concrete host whose element name
+/// differs from the directive's selector, so the concrete host's contexts win whenever they disagree
+/// with the declaring selector.
+fn host_binding_security_contexts(
+    selector: &str,
+    name: &str,
+    is_attribute: bool,
+) -> Vec<SecurityContext> {
+    use treaty_ivy_template::dom_security_schema::mapped_prop_name;
+    let declaring = possible_security_contexts(Some(selector), name, is_attribute);
+    let concrete = possible_security_contexts(None, mapped_prop_name(name), is_attribute);
+    let concrete_non_none: Vec<SecurityContext> = concrete
+        .iter()
+        .filter(|c| **c != SecurityContext::None)
+        .cloned()
+        .collect();
+    let has_concrete_none = concrete_non_none.len() != concrete.len();
+    if has_concrete_none && !concrete_non_none.is_empty() {
+        return concrete;
+    }
+    if concrete_non_none.iter().any(|c| !declaring.contains(c)) {
+        return concrete;
+    }
+    declaring
+        .into_iter()
+        .filter(|c| *c != SecurityContext::None)
+        .collect()
+}
+
+/// `isAriaAttribute` (`util/attributes.ts`): an `aria-` name longer than its prefix.
+fn is_aria_host_attribute(name: &str) -> bool {
+    name.starts_with("aria-") && name.len() > "aria-".len()
+}
+
+/// The sanitizer a host binding is wrapped in (`resolve_sanitizers.ts`): a composite URL context (URL
+/// and/or RESOURCE_URL with a NONE alternative, or both) is resolved at runtime by
+/// `ɵɵsanitizeUrlOrResourceUrl`; otherwise the single non-NONE context picks its sanitizer.
+fn host_sanitizer(contexts: &[SecurityContext]) -> Option<R3> {
+    let has_url = contexts.contains(&SecurityContext::Url);
+    let has_resource = contexts.contains(&SecurityContext::ResourceUrl);
+    let has_none = contexts.contains(&SecurityContext::None);
+    let only_url_contexts = contexts
+        .iter()
+        .all(|c| matches!(c, SecurityContext::Url | SecurityContext::ResourceUrl | SecurityContext::None));
+    if only_url_contexts && ((has_url || has_resource) && has_none || (has_url && has_resource)) {
+        return Some(R3::SanitizeUrlOrResourceUrl);
+    }
+    // `getOnlySecurityContext`: an ambiguous set (more than one non-NONE context) is an error in
+    // Angular; here the first non-NONE context is used, as the classic TDB did.
+    let only = if contexts.len() < 2 {
+        contexts.first().cloned().unwrap_or(SecurityContext::None)
+    } else {
+        contexts
+            .iter()
+            .find(|c| **c != SecurityContext::None)
+            .cloned()
+            .unwrap_or(SecurityContext::None)
+    };
+    match only {
+        SecurityContext::Html => Some(R3::SanitizeHtml),
+        SecurityContext::Style => Some(R3::SanitizeStyle),
+        SecurityContext::Script => Some(R3::SanitizeScript),
+        SecurityContext::Url => Some(R3::SanitizeUrl),
+        SecurityContext::ResourceUrl => Some(R3::SanitizeResourceUrl),
+        SecurityContext::AttributeNoBinding => Some(R3::ValidateAttribute),
+        SecurityContext::None => None,
+    }
+}
+
 impl HostBindingsBuilder for DefaultHostBindingsBuilder {
     fn build(
         &mut self,
         host: &mut R3HostMetadata,
-        _selector: &str,
+        selector: &str,
         name: &str,
         legacy_optional_chaining: bool,
         definition_map: &mut DefinitionMap,
@@ -1377,10 +1489,13 @@ impl HostBindingsBuilder for DefaultHostBindingsBuilder {
             host_vars += 1;
             update_stmts.extend(spill);
             let stmt = if let Some(attr) = prop.strip_prefix("attr.") {
-                host_instruction(
-                    R3::Attribute,
-                    vec![o::literal(LiteralValue::String(attr.to_string()), None), value],
-                )
+                let contexts = host_binding_security_contexts(selector, attr, true);
+                let mut params =
+                    vec![o::literal(LiteralValue::String(attr.to_string()), None), value.clone()];
+                if let Some(sanitizer) = host_sanitizer(&contexts) {
+                    params.push(o::import_expr(sanitizer.reference(), None));
+                }
+                host_instruction(R3::Attribute, params)
             } else if prop.starts_with('@') {
                 // Legacy synthetic (animation) host property. The bound name keeps the `@` prefix
                 // verbatim — `ɵɵsyntheticHostProperty("@myAnim", …)` — matching Angular's
@@ -1391,10 +1506,23 @@ impl HostBindingsBuilder for DefaultHostBindingsBuilder {
                     vec![o::literal(LiteralValue::String(prop.clone()), None), value],
                 )
             } else {
-                host_instruction(
-                    R3::DomProperty,
-                    vec![o::literal(LiteralValue::String(prop.clone()), None), value],
-                )
+                // Host bindings are DomOnly (`ingestHostBinding`). A DomOnly `[aria-x]` property is specialized
+                // to an Attribute op (`binding_specialization.ts`), otherwise `reifyDomProperty` remaps the name
+                // (`tabindex` → `tabIndex`). Either way the op carries the security sanitizer of the property.
+                let contexts = host_binding_security_contexts(selector, prop, false);
+                let (reference, name) = if is_aria_host_attribute(prop) {
+                    (R3::Attribute, prop.clone())
+                } else {
+                    (
+                        R3::DomProperty,
+                        treaty_ivy_template::view::template::remap_dom_property(prop).to_string(),
+                    )
+                };
+                let mut params = vec![o::literal(LiteralValue::String(name), None), value.clone()];
+                if let Some(sanitizer) = host_sanitizer(&contexts) {
+                    params.push(o::import_expr(sanitizer.reference(), None));
+                }
+                host_instruction(reference, params)
             };
             update_stmts.push(stmt);
         }
@@ -2369,7 +2497,7 @@ fn compile_declaration_list(list: Expr, mode: DeclarationListEmitMode) -> Expr {
 // used in the `dependencies` array.
 // ---------------------------------------------------------------------------
 
-use crate::expression::ast::{AstNode, AstVisitor, BindingPipeType, ExprKind as AstExprKind};
+use crate::expression::ast::{AstNode, AstVisitor, BindingPipeType, ExprKind as AstExprKind, SecurityContext};
 
 /// Walk the component template AST and return one class-reference [`Expr`] per distinct pipe
 /// referenced by name in a binding expression, in first-use order.
@@ -3112,6 +3240,41 @@ mod tests {
     }
 
     #[test]
+    fn host_dom_property_gets_its_security_sanitizer_and_dom_name() {
+        // `host: { '[innerHTML]': 'h', '[tabindex]': '1' }`: `innerHTML` is HTML on every element, so it is
+        // wrapped in `ɵɵsanitizeHtml`; `tabindex` reifies to the DOM name `tabIndex` (DomOnly host).
+        let mut meta = directive_meta("D", "[d]");
+        meta.host.properties.insert("innerHTML".to_string(), "h".to_string());
+        meta.host.properties.insert("tabindex".to_string(), "1".to_string());
+        let mut hb = DefaultHostBindingsBuilder;
+        let compiled = compile_directive_from_metadata(&meta, &mut hb);
+        let js = emit_expression(&compiled.expression);
+        assert!(js.contains("ɵɵdomProperty(\"innerHTML\", ctx.h, i0.ɵɵsanitizeHtml)"), "got: {js}");
+        assert!(js.contains("\"tabIndex\""), "tabindex must reify to tabIndex: {js}");
+
+        // A DomOnly `[aria-readonly]` host property is specialized to an attribute (`binding_specialization.ts`).
+        let mut meta = directive_meta("D", "[d]");
+        meta.host.properties.insert("aria-readonly".to_string(), "r".to_string());
+        let mut hb = DefaultHostBindingsBuilder;
+        let compiled = compile_directive_from_metadata(&meta, &mut hb);
+        let js = emit_expression(&compiled.expression);
+        assert!(js.contains("ɵɵattribute(\"aria-readonly\", ctx.r)"), "aria must be an attribute: {js}");
+    }
+
+    #[test]
+    fn host_property_bindings_chain_into_one_instruction() {
+        // `host: { '[title]': 't', '[id]': 'i' }` ⇒ `ɵɵdomProperty("title", ctx.t)("id", ctx.i)`: consecutive
+        // host instructions fold into one chained call (Angular `chainOperationsInList`).
+        let mut meta = directive_meta("D", "[d]");
+        meta.host.properties.insert("title".to_string(), "t".to_string());
+        meta.host.properties.insert("id".to_string(), "i".to_string());
+        let mut hb = DefaultHostBindingsBuilder;
+        let compiled = compile_directive_from_metadata(&meta, &mut hb);
+        let js = emit_expression(&compiled.expression);
+        assert!(js.contains("ɵɵdomProperty(\"title\", ctx.t)(\"id\", ctx.i)"), "not chained: {js}");
+    }
+
+    #[test]
     fn host_class_and_style_property_reify_to_class_map_and_style_map() {
         // `host: { '[class]': 'c', '[style]': 's' }` is a whole-element ClassMap / StyleMap (`ɵɵclassMap(ctx.c)`,
         // `ɵɵstyleMap(ctx.s)`), each reserving two host vars (`style_binding_specialization.ts`), not a
@@ -3133,7 +3296,7 @@ mod tests {
     fn host_property_array_literal_extracts_pure_function() {
         // `host: { '[id]': '["red", id]' }` — a literal array host-binding value runs Angular's
         // host-bindings `generatePureLiteralStructures`: the array is extracted into a hoisted
-        // factory const and the binding becomes `ɵɵdomProperty("id", ɵɵpureFunction1(1, $c0$, ctx.id))`
+        // factory const and the binding becomes `ɵɵdomProperty("id", ɵɵpureFunction1(1, _c0, ctx.id))`
         // with `hostVars: 3` (1 regular binding + 1+1 pure-function slots).
         let mut meta = directive_meta("D", "[d]");
         meta.host.properties.insert("id".to_string(), "[\"red\", id]".to_string());
@@ -3141,7 +3304,7 @@ mod tests {
         let compiled = compile_directive_from_metadata(&meta, &mut hb);
         let js = emit_expression(&compiled.expression);
 
-        assert!(js.contains("ɵɵpureFunction1(1, $c0$, ctx.id)"), "missing pureFunction call: {js}");
+        assert!(js.contains("ɵɵpureFunction1(1, _c0, ctx.id)"), "missing pureFunction call: {js}");
         assert!(
             js.contains("hostVars: 3") || js.contains("hostVars:3"),
             "expected hostVars: 3: {js}"
@@ -3150,7 +3313,7 @@ mod tests {
         assert!(!js.contains("ɵɵdomProperty(\"id\", [\"red\""), "literal not extracted: {js}");
         // The factory const is hoisted as a sibling statement (ConstantPool.statements).
         let stmts = crate::output::emitter::emit_statements(&compiled.statements);
-        assert!(stmts.contains("$c0$"), "factory const not hoisted: {stmts}");
+        assert!(stmts.contains("_c0"), "factory const not hoisted: {stmts}");
         assert!(stmts.contains("[\"red\", a0]"), "factory body wrong: {stmts}");
     }
 

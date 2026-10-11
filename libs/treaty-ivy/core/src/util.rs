@@ -132,6 +132,59 @@ pub fn namespace_css_variable(var_name: &str) -> String {
     }
 }
 
+/// Port of `hyphenate` (`template/pipeline/src/phases/parse_extracted_styles.ts`): a `-` goes between
+/// a lower-case letter and the upper-case letter after it, then the whole name is lower-cased, so
+/// `backgroundColor` becomes `background-color`.
+pub fn hyphenate(value: &str) -> String {
+    let chars: Vec<char> = value.chars().collect();
+    let mut out = String::with_capacity(chars.len() + 2);
+    for (i, &c) in chars.iter().enumerate() {
+        if i > 0 && c.is_ascii_uppercase() && chars[i - 1].is_ascii_lowercase() {
+            out.push('-');
+        }
+        out.push(c.to_ascii_lowercase());
+    }
+    out
+}
+
+/// Port of `normalizeStylePropName` (`template/pipeline/src/phases/naming.ts`): a CSS custom property
+/// (`--x`) keeps its name, any other style property name is hyphenated.
+pub fn normalize_style_prop_name(name: &str) -> String {
+    if name.starts_with("--") {
+        name.to_string()
+    } else {
+        hyphenate(name)
+    }
+}
+
+/// Port of `stripImportant` (`template/pipeline/src/phases/naming.ts`): drops everything from a
+/// `!important` suffix on a style or class name.
+pub fn strip_important(name: &str) -> &str {
+    match name.find("!important") {
+        Some(index) => &name[..index],
+        None => name,
+    }
+}
+
+#[cfg(test)]
+mod style_prop_name_tests {
+    use super::{hyphenate, normalize_style_prop_name, strip_important};
+
+    #[test]
+    fn hyphenates_camel_case_style_names_and_keeps_custom_properties() {
+        assert_eq!(hyphenate("borderImage"), "border-image");
+        assert_eq!(hyphenate("WIDTH"), "width");
+        assert_eq!(normalize_style_prop_name("boxShadow"), "box-shadow");
+        assert_eq!(normalize_style_prop_name("--myVar"), "--myVar");
+    }
+
+    #[test]
+    fn strips_important_suffix() {
+        assert_eq!(strip_important("width!important"), "width");
+        assert_eq!(strip_important("color"), "color");
+    }
+}
+
 #[cfg(test)]
 mod namespace_css_variable_tests {
     use super::namespace_css_variable;

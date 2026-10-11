@@ -190,11 +190,72 @@ pub struct ConstantPool {
     /// present the definition emits `consts: () => { …initializers…; return [ … ]; }` instead of
     /// the inline `consts: [ … ]` literal array.
     initializers: Vec<Stmt>,
+    /// Element / `<ng-template>` attribute arrays requested during the walk and not yet placed in
+    /// [`Self::entries`]. Angular's `collectElementConsts` adds them after every other const, in
+    /// view-allocation order (see [`TemplateDefinitionBuilder::finalize_pending_consts`]); the walk
+    /// instead returns a placeholder index that the root view rewrites once the walk is complete.
+    pending: Vec<PendingConst>,
+    /// Last view sequence number handed out by [`Self::alloc_view_seq`] (the root view is `0`).
+    last_view_seq: usize,
+    /// `<ng-content>` slots requested during the walk, awaiting their Angular `projectionSlotIndex`
+    /// (see [`TemplateDefinitionBuilder::finalize_projection_indices`]).
+    pending_projections: Vec<PendingProjection>,
 }
+
+/// An `<ng-content>` slot awaiting its projection slot index.
+#[derive(Debug, Clone)]
+struct PendingProjection {
+    view_seq: usize,
+    content_seq: usize,
+    selector: String,
+}
+
+/// An element / `<ng-template>` attribute array awaiting its final position in the const pool.
+#[derive(Debug, Clone)]
+struct PendingConst {
+    /// Allocation order of the view that owns the element (depth-first pre-order, like Angular's
+    /// `ComponentCompilationJob.units`).
+    view_seq: usize,
+    /// Position of the element among its view's element / template ops (document order).
+    op_seq: usize,
+    value: Expr,
+}
+
+/// Sentinel base for a not-yet-placed element attribute const. A walk-time index for a pending
+/// attribute array is `PENDING_CONST_PLACEHOLDER + request_id` and is rewritten to the final
+/// `consts:` index by [`TemplateDefinitionBuilder::finalize_pending_consts`]. Above every other
+/// placeholder base in this file, so no other remap can mistake it for its own value.
+const PENDING_CONST_PLACEHOLDER: usize = 5_000_000_000;
 
 impl ConstantPool {
     pub fn new() -> Self {
         ConstantPool::default()
+    }
+
+    /// Allocate the next view sequence number (one per nested view, in allocation order).
+    pub fn alloc_view_seq(&mut self) -> usize {
+        self.last_view_seq += 1;
+        self.last_view_seq
+    }
+
+    /// Record an `<ng-content>` slot and return the placeholder for its projection slot index.
+    fn push_pending_projection(&mut self, view_seq: usize, content_seq: usize, selector: String) -> usize {
+        self.pending_projections.push(PendingProjection {
+            view_seq,
+            content_seq,
+            selector,
+        });
+        PROJECTION_INDEX_PLACEHOLDER + self.pending_projections.len() - 1
+    }
+
+    /// Record an element attribute array for later placement and return its placeholder index.
+    fn push_pending(&mut self, view_seq: usize, op_seq: usize, value: Expr) -> usize {
+        self.pending.push(PendingConst {
+            view_seq,
+            op_seq,
+            value,
+        });
+        PENDING_CONST_PLACEHOLDER + self.pending.len() - 1
     }
 
     /// Intern an expression, returning its index. De-dupes structurally-equivalent entries
@@ -442,7 +503,7 @@ impl PipeSlotAllocator for BuilderPipes<'_> {
         } else {
             let n = state.next_const_name;
             state.next_const_name = n + 1;
-            format!("$c{n}$")
+            format!("_c{n}")
         };
         state.interned_factories.push((factory.clone(), name.clone()));
         Some(name)
@@ -477,6 +538,28 @@ struct LoopVar {
     /// with this key; `None` keeps the loop-variable default (`$implicit`, or the special `$index`-style
     /// name).
     ctx_key: Option<String>,
+}
+
+/// A `@for` / `<ng-template>` context variable declared by an ENCLOSING embedded view that a nested
+/// view reads (Angular's `scope` chain in `generate_variables.ts`). The nested view re-declares it in
+/// its update block by walking up with `ɵɵnextContext()` to `owner_level`.
+#[derive(Debug, Clone)]
+struct AncestorVar {
+    /// The nesting level of the view that declares the variable (`TemplateDefinitionBuilder::view_level`).
+    owner_level: usize,
+    var: LoopVar,
+}
+
+/// Whether a loop variable is a plain context-object read (`const x_rN = ctx.<key>`), the only kind a
+/// nested view can re-declare from an ancestor's context. Computed (`$first`/`$last`/…) and inline /
+/// context-property aliases stay with the view that declares them.
+fn is_plain_context_var(v: &LoopVar) -> bool {
+    v.inline.is_none()
+        && v.context_prop.is_none()
+        && !v.local_name.is_empty()
+        && v.ctx_key
+            .as_deref()
+            .is_some_and(|key| !matches!(key, "$first" | "$last" | "$even" | "$odd"))
 }
 
 impl LoopVar {
@@ -519,6 +602,34 @@ struct LocalRef {
     /// The pre-assigned generated local identifier (`user_r<id>`), minted when the host element is
     /// built so the `&self` expression resolver can hand it back without mutating the var counter.
     local_name: String,
+    /// The data slot of the element / `<ng-template>` that hosts the `#ref` (Angular `op.handle`, the
+    /// target a `@defer` trigger names). `HOST_SLOT_PLACEHOLDER + ordinal` until the host is reached.
+    host_slot: usize,
+    /// Whether the reference has no export target (`#ref`, not `#ref="exportAs"`). Only these are
+    /// `@defer` trigger targets (Angular `resolveDeferTargetNames`: `ref.target === ''`).
+    plain: bool,
+}
+
+/// Placeholder base for a not-yet-known host element slot of a local ref (see [`LocalRef::host_slot`]).
+/// Above the other placeholder bases in this file so no other remap can mistake it for its own value;
+/// [`TemplateDefinitionBuilder::finalize_host_slots`] rewrites it before any other remap runs.
+const HOST_SLOT_PLACEHOLDER: usize = 6_000_000_000;
+
+/// Base of the `<ng-content>` projection slot index placeholders (see
+/// [`TemplateDefinitionBuilder::finalize_projection_indices`]).
+const PROJECTION_INDEX_PLACEHOLDER: usize = 7_000_000_000;
+
+/// The number of values each placeholder base owns (`base .. base + PLACEHOLDER_WINDOW`). Real slots and
+/// const indices are far smaller, so a window keeps the placeholder bases from matching one another.
+const PLACEHOLDER_WINDOW: usize = 500_000_000;
+
+/// The `@defer` trigger targets a placeholder / main view exposes to its owner (Angular
+/// `resolveDeferTargetNames`' `Scope` of the view): the first element-like op's slot (the default
+/// target of a trigger with no reference) and the plain local refs with their host slots.
+#[derive(Debug, Clone, Default)]
+struct DeferViewTargets {
+    first_slot: Option<usize>,
+    refs: Vec<(String, usize)>,
 }
 
 /// A [`LocalResolver`] that roots the implicit receiver at `ctx` (like [`crate::expression_converter::CtxResolver`])
@@ -569,6 +680,9 @@ fn resolve_local_ref(
 /// `const ctx_r<level> = ɵɵnextContext();` of the update block.
 struct NestedViewResolver<'a> {
     vars: &'a [LoopVar],
+    /// Ancestor context variables this view reads (re-declared in its update block, see
+    /// [`AncestorVar`]); a read resolves to the local the update block declares for it.
+    ancestor_reads: &'a [AncestorVar],
     /// The shared-context identifier for this view (`ctx_r<level>`).
     ctx_name: String,
     /// Set when the implicit receiver was consulted (an ancestor read occurred).
@@ -589,6 +703,9 @@ impl LocalResolver for NestedViewResolver<'_> {
     fn maybe_resolve_local(&self, name: &str) -> Option<Expr> {
         if let Some(v) = self.vars.iter().find(|v| v.source_name == name) {
             return Some(v.read_expr());
+        }
+        if let Some(a) = self.ancestor_reads.iter().find(|a| a.var.source_name == name) {
+            return Some(a.var.read_expr());
         }
         resolve_local_ref(name, self.local_refs, self.used_local_refs)
     }
@@ -2419,7 +2536,7 @@ fn pipe_insertion_index(creation: &[Stmt], target_slot: usize) -> Option<usize> 
 /// DOM-property name remapping applied by `reifyDomProperty` (`reify.ts` `DOM_PROPERTY_REMAPPING`):
 /// in DomOnly mode a handful of attribute-style binding names map to their DOM-property spelling
 /// (`class` → `className`, `for` → `htmlFor`, …). Names not in the table pass through unchanged.
-fn remap_dom_property(name: &str) -> &str {
+pub fn remap_dom_property(name: &str) -> &str {
     match name {
         "class" => "className",
         "for" => "htmlFor",
@@ -2651,7 +2768,7 @@ pub struct TemplateDefinitionBuilder {
     /// Shared constant-pool entries hoisted to the top level as `const $cN$ = <value>;` declarations
     /// (Angular `ConstantPool.getConstLiteral` → `pool.statements`). Distinct from the per-template
     /// `consts:` array: these are the de-duped, view-global literals an instruction references BY NAME
-    /// (e.g. `ɵɵprojectionDef($c0$)` parsed-selector arrays). Each entry is `(value_expr, name)`; a
+    /// (e.g. `ɵɵprojectionDef(_c0)` parsed-selector arrays). Each entry is `(value_expr, name)`; a
     /// structurally-equivalent value reuses its existing name (Angular returns the SAME reference).
     /// Surfaced alongside [`Self::hoisted_functions`] so they print before the `ɵɵdefineComponent`.
     shared_consts: Vec<(Expr, String)>,
@@ -2678,6 +2795,26 @@ pub struct TemplateDefinitionBuilder {
     /// Per-update-block counter seeding temporary-variable spill names (`tmp_<level>_0`,
     /// `tmp_<level>_1`, …). Reset per view (a fresh builder starts at 0).
     temp_counter: usize,
+    /// This view's allocation sequence number in the component (root `0`; see
+    /// [`ConstantPool::alloc_view_seq`]). Keys the element attribute consts this view requests.
+    view_seq: usize,
+    /// Number of element / `<ng-template>` attribute consts this view has requested so far (its
+    /// element-op ordinal), used as the within-view key for [`PendingConst::op_seq`].
+    attr_const_seq: usize,
+    /// Number of `<ng-content>` slots this view has reached so far (its within-view projection order).
+    content_seq: usize,
+    /// The data slot of the first element-like op (element, container, `<ng-template>`, control-flow
+    /// anchor) created in this view: the default target of a `@defer` trigger with no reference.
+    first_target_slot: Option<usize>,
+    /// The `@defer` targets of the view most recently built by [`Self::build_deferred_view`] (its
+    /// first element slot and plain local refs), read by the owner to resolve its triggers.
+    last_defer_view_targets: DeferViewTargets,
+    /// Context variables of every ENCLOSING embedded view, nearest owner first (Angular's `scope`
+    /// chain). Set by the parent when it builds this view.
+    ancestor_vars: Vec<AncestorVar>,
+    /// The subset of [`Self::ancestor_vars`] this view's own bindings read, in the same order. Set
+    /// before the walk; the update block re-declares each one (see `ancestor_context_prelude`).
+    ancestor_reads: Vec<AncestorVar>,
     /// Template local references (`#user`) declared on elements/templates in THIS view, in
     /// declaration order. A read of one of these names in a same-view update binding lowers to a
     /// generated `const $name$ = ɵɵreference(slot)` local; reads in a listener handler likewise read
@@ -2727,11 +2864,6 @@ pub struct TemplateDefinitionBuilder {
     /// whether the prepended `ɵɵprojectionDef(...)` needs to be emitted in the no-specific-selector
     /// case.
     has_default_projection: bool,
-    /// The number of `<ng-content>` projection slots reached so far in this view. Angular's
-    /// `generateProjectionDefs` assigns every projection op a *unique ascending* `projectionSlotIndex`
-    /// (`op.projectionSlotIndex = projectionSlotIndex++`) — independent of selector dedup — so the
-    /// N-th `<ng-content>` (0-based) carries index N (`ɵɵprojection(slot, N)`, the `0` case elided).
-    projection_count: usize,
     /// Compilation mode for THIS view: `true` → Angular's `DomOnly` instruction family
     /// (`ɵɵdomElement*`/`ɵɵdomListener`/`ɵɵdomProperty`), `false` → the `Full` family
     /// (`ɵɵelement*`/`ɵɵlistener`/`ɵɵproperty`). Set from [`TemplateCompilationInput::dom_only`] and
@@ -2838,6 +2970,13 @@ impl TemplateDefinitionBuilder {
             is_root: true,
             view_level: 0,
             temp_counter: 0,
+            view_seq: 0,
+            attr_const_seq: 0,
+            content_seq: 0,
+            first_target_slot: None,
+            last_defer_view_targets: DeferViewTargets::default(),
+            ancestor_vars: Vec::new(),
+            ancestor_reads: Vec::new(),
             local_refs: Vec::new(),
             used_local_refs: std::cell::RefCell::new(Vec::new()),
             needs_next_context: std::cell::Cell::new(false),
@@ -2847,7 +2986,6 @@ impl TemplateDefinitionBuilder {
             ng_content_selectors: Vec::new(),
             all_projection_selectors: Vec::new(),
             has_default_projection: false,
-            projection_count: 0,
             dom_only: input.dom_only,
             i18n_child_view: None,
             i18n_block_ctx: None,
@@ -2883,7 +3021,7 @@ impl TemplateDefinitionBuilder {
             state.next_const_name = n + 1;
             n
         };
-        let name = format!("$c{n}$");
+        let name = format!("_c{n}");
         self.shared_consts.push((value.clone(), name.clone()));
         self.hoisted_fns.push(Stmt::with_modifiers(
             StmtKind::DeclareVar {
@@ -2971,6 +3109,7 @@ impl TemplateDefinitionBuilder {
             let ctx_name = self.next_context_var_name();
             let resolver = NestedViewResolver {
                 vars: &self.loop_vars,
+                ancestor_reads: &self.ancestor_reads,
                 ctx_name,
                 needs: &self.needs_next_context,
                 local_refs: &self.local_refs,
@@ -3031,13 +3170,15 @@ impl TemplateDefinitionBuilder {
     /// pre-pass (`preregister_local_ref`) already minted the generated local + a placeholder slot;
     /// fill in the real slot now that the host is reached (patch the first still-placeholder entry of
     /// this name). Falls back to pushing a fresh entry for a ref the pre-pass did not see.
-    fn register_local_ref(&mut self, name: &str, slot: usize) {
+    fn register_local_ref(&mut self, name: &str, slot: usize, host_slot: usize, plain: bool) {
         if let Some(entry) = self
             .local_refs
             .iter_mut()
             .find(|r| r.name == name && r.slot >= LOCAL_REF_SLOT_PLACEHOLDER)
         {
             entry.slot = slot;
+            entry.host_slot = host_slot;
+            entry.plain = plain;
         } else {
             self.var_counter += 1;
             let local_name = local_ref_var_name(name, self.var_counter);
@@ -3045,6 +3186,8 @@ impl TemplateDefinitionBuilder {
                 name: name.to_string(),
                 slot,
                 local_name,
+                host_slot,
+                plain,
             });
         }
     }
@@ -3054,7 +3197,7 @@ impl TemplateDefinitionBuilder {
     /// declared LATER emit `ɵɵreference(placeholder)`; the real slot is filled by
     /// [`Self::register_local_ref`] when the host is reached, and patched into handler bodies by
     /// [`Self::finalize_local_refs`].
-    fn preregister_local_ref(&mut self, name: &str) {
+    fn preregister_local_ref(&mut self, name: &str, plain: bool) {
         let ordinal = self.local_refs.len();
         self.var_counter += 1;
         let local_name = local_ref_var_name(name, self.var_counter);
@@ -3062,12 +3205,298 @@ impl TemplateDefinitionBuilder {
             name: name.to_string(),
             slot: LOCAL_REF_SLOT_PLACEHOLDER + ordinal,
             local_name,
+            host_slot: HOST_SLOT_PLACEHOLDER + ordinal,
+            plain,
         });
     }
 
     /// Patch every placeholder local-ref slot literal (`LOCAL_REF_SLOT_PLACEHOLDER + ordinal`) in the
     /// creation block (listener handler bodies) to the real `ɵɵreference(slot)` slot recorded for that
     /// ordinal in `self.local_refs`. Needed when a handler reads a `#ref` declared after it.
+    /// The context variables a child view inherits from this view and its ancestors (nearest owner
+    /// first): this view's own plain loop variables, then the ones it inherited.
+    fn ancestor_vars_for_child(&self) -> Vec<AncestorVar> {
+        self.loop_vars
+            .iter()
+            .filter(|v| is_plain_context_var(v) && self.view_level >= 1)
+            .map(|v| AncestorVar {
+                owner_level: self.view_level,
+                var: v.clone(),
+            })
+            .chain(self.ancestor_vars.iter().cloned())
+            .collect()
+    }
+
+    /// Which inherited context variables this view's own bindings read (its `ancestor_reads`). A name
+    /// its own loop variables declare shadows the inherited one, and the nearest owner wins.
+    fn compute_ancestor_reads(&self, nodes: &[Node]) -> Vec<AncestorVar> {
+        let mut reads: Vec<AncestorVar> = Vec::new();
+        for anc in &self.ancestor_vars {
+            let name = anc.var.source_name.as_str();
+            if self.loop_vars.iter().any(|v| v.source_name == name)
+                || reads.iter().any(|r| r.var.source_name == name)
+            {
+                continue;
+            }
+            if nodes.iter().any(|n| view_body_references(n, name)) {
+                reads.push(anc.clone());
+            }
+        }
+        reads
+    }
+
+    /// The update-block declarations for [`Self::ancestor_reads`] (Angular `generate_variables.ts`
+    /// scope walk). For each owner, nearest first, `ɵɵnextContext(hops)` walks from the previous
+    /// owner's context: each call moves the runtime context pointer, so the hops are relative. A
+    /// single read is inlined (`const x_r1 = ɵɵnextContext().$implicit`); several reads of one owner
+    /// share one `const ctx_r<owner> = ɵɵnextContext(hops)`. Returns the statements and the level the
+    /// context pointer is left at.
+    fn ancestor_context_prelude(&self) -> (Vec<Stmt>, usize) {
+        let mut stmts: Vec<Stmt> = Vec::new();
+        let mut prev = self.view_level;
+        let reads = &self.ancestor_reads;
+        let mut i = 0;
+        while i < reads.len() {
+            let level = reads[i].owner_level;
+            let mut j = i;
+            while j < reads.len() && reads[j].owner_level == level {
+                j += 1;
+            }
+            let hops = prev - level;
+            let call = |hops: usize| {
+                let args = if hops <= 1 { vec![] } else { vec![num(hops as f64)] };
+                o::import_expr(R3::NextContext.reference(), None).call_fn(args, false)
+            };
+            let group = &reads[i..j];
+            if group.len() == 1 {
+                let key = group[0].var.ctx_key.clone().unwrap_or_default();
+                stmts.push(Stmt::with_modifiers(
+                    StmtKind::DeclareVar {
+                        name: group[0].var.local_name.clone(),
+                        value: Some(call(hops).prop(key)),
+                        ty: None,
+                    },
+                    StmtModifier::FINAL,
+                ));
+            } else {
+                let ctx_name = format!("ctx_r{level}");
+                stmts.push(Stmt::with_modifiers(
+                    StmtKind::DeclareVar {
+                        name: ctx_name.clone(),
+                        value: Some(call(hops)),
+                        ty: None,
+                    },
+                    StmtModifier::FINAL,
+                ));
+                for a in group {
+                    let key = a.var.ctx_key.clone().unwrap_or_default();
+                    stmts.push(Stmt::with_modifiers(
+                        StmtKind::DeclareVar {
+                            name: a.var.local_name.clone(),
+                            value: Some(o::variable(ctx_name.clone(), None).prop(key)),
+                            ty: None,
+                        },
+                        StmtModifier::FINAL,
+                    ));
+                }
+            }
+            prev = level;
+            i = j;
+        }
+        (stmts, prev)
+    }
+
+    /// Record `slot` as this view's first element-like target (see [`Self::first_target_slot`]).
+    fn note_first_target_slot(&mut self, slot: usize) {
+        if self.first_target_slot.is_none() {
+            self.first_target_slot = Some(slot);
+        }
+    }
+
+    /// Resolve a `@defer` trigger target to `(slot expression, view steps)` (Angular
+    /// `resolveDeferTargetNames`). A trigger with no reference targets the placeholder's first
+    /// element-like op, one view up (`-1`). A named trigger looks in the placeholder's plain refs
+    /// first (`-1`), then in this view's plain refs (`0`, the owner is the placeholder's parent).
+    /// A ref declared later in this view is a forward reference: its slot is a
+    /// [`HOST_SLOT_PLACEHOLDER`] resolved by [`Self::finalize_host_slots`].
+    fn defer_trigger_target(
+        &self,
+        reference: Option<&str>,
+        placeholder: Option<&DeferViewTargets>,
+    ) -> Option<(Expr, i64)> {
+        match reference {
+            None => placeholder?
+                .first_slot
+                .map(|slot| (num(slot as f64), -1)),
+            Some(name) => {
+                if let Some((_, host)) = placeholder.and_then(|ph| ph.refs.iter().find(|(n, _)| n == name)) {
+                    return Some((num(*host as f64), -1));
+                }
+                let ordinal = self.local_refs.iter().position(|r| r.plain && r.name == name)?;
+                let host = self.local_refs[ordinal].host_slot;
+                let slot = if host >= HOST_SLOT_PLACEHOLDER {
+                    num((HOST_SLOT_PLACEHOLDER + ordinal) as f64)
+                } else {
+                    num(host as f64)
+                };
+                Some((slot, 0))
+            }
+        }
+    }
+
+    /// Target and options arguments of one `ɵɵdeferOn*` / `ɵɵdeferPrefetchOn*` / `ɵɵdeferHydrateOn*`
+    /// op (Angular `reify.ts` `DeferOn` case): hover and interaction take `(targetSlot[, steps])`,
+    /// viewport takes `(targetSlot, steps | null, options?)`, a hydrate trigger takes no target and a
+    /// hydrate viewport takes only its options.
+    fn defer_trigger_args(
+        &mut self,
+        modifier: DeferOpModifier,
+        kind: &DeferredTriggerKind,
+        placeholder: Option<&DeferViewTargets>,
+    ) -> Vec<Expr> {
+        let (reference, options, viewport) = match kind {
+            DeferredTriggerKind::Hover { reference } | DeferredTriggerKind::Interaction { reference } => {
+                (reference.as_deref(), None, false)
+            }
+            DeferredTriggerKind::Viewport { reference, options } => {
+                (reference.as_deref(), options.as_ref(), true)
+            }
+            _ => return Vec::new(),
+        };
+        if modifier == DeferOpModifier::Hydrate {
+            return match (viewport, options) {
+                (true, Some(opts)) => vec![self.lower_defer_options(opts)],
+                _ => Vec::new(),
+            };
+        }
+        let target = self.defer_trigger_target(reference, placeholder);
+        let steps = target.as_ref().map(|(_, steps)| *steps);
+        let mut args = vec![target.map(|(slot, _)| slot).unwrap_or_else(o::null_expr)];
+        if viewport {
+            match steps {
+                Some(st) if st != 0 => args.push(num(st as f64)),
+                _ if options.is_some() => args.push(o::null_expr()),
+                _ => {}
+            }
+            if let Some(opts) = options {
+                args.push(self.lower_defer_options(opts));
+            }
+        } else if let Some(st) = steps.filter(|st| *st != 0) {
+            args.push(num(st as f64));
+        }
+        args
+    }
+
+    /// A `@defer` trigger's options object as a plain object literal. Angular passes `trigger.options`
+    /// through as written (it is not hoisted into a pure function), so each property value is lowered
+    /// on its own and the map itself is never extracted.
+    fn lower_defer_options(&mut self, options: &AstNode) -> Expr {
+        use crate::expression::ast::{ExprKind, LiteralMapKey};
+        let ExprKind::LiteralMap { keys, values } = &options.kind else {
+            return self.lower_expr(options);
+        };
+        let mut props: Vec<(String, bool, Expr)> = Vec::with_capacity(keys.len());
+        for (key, value) in keys.iter().zip(values.iter()) {
+            if let LiteralMapKey::Property { key, quoted, .. } = key {
+                let lowered = self.lower_expr(value);
+                props.push((key.clone(), *quoted, lowered));
+            }
+        }
+        o::literal_map(props, None)
+    }
+
+    /// Patch every [`HOST_SLOT_PLACEHOLDER`] (a forward `@defer` target ref whose host was not reached
+    /// yet) in this view's creation block to the host element slot, and record the resolved slots on
+    /// the refs. Runs after the walk, when every ref in the view has been registered.
+    fn finalize_host_slots(&mut self) {
+        let hosts: Vec<usize> = self.local_refs.iter().map(|r| r.host_slot).collect();
+        let resolve = move |ordinal: usize| match hosts.get(ordinal) {
+            Some(&host) if host < HOST_SLOT_PLACEHOLDER => host,
+            _ => ordinal,
+        };
+        let mut creation = std::mem::take(&mut self.creation_code);
+        for stmt in &mut creation {
+            remap_placeholder_slots_in_stmt(stmt, HOST_SLOT_PLACEHOLDER, &resolve);
+        }
+        self.creation_code = creation;
+        let resolved: Vec<usize> = (0..self.local_refs.len()).map(|i| resolve(i)).collect();
+        for (r, host) in self.local_refs.iter_mut().zip(resolved) {
+            if r.host_slot >= HOST_SLOT_PLACEHOLDER {
+                r.host_slot = host;
+            }
+        }
+    }
+
+    /// Rank every `<ng-content>` slot in Angular's `generateProjectionDefs` order and rewrite its placeholder
+    /// index, then rebuild the `ɵɵprojectionDef` selector list in that same order. Angular walks `job.units`
+    /// (view allocation order, depth-first) and each unit's ops, so a root `<ng-content>` after a nested
+    /// `<ng-template>` still takes the lower index. Runs on the root only, after the whole walk.
+    fn finalize_projection_indices(&mut self) {
+        let pending = std::mem::take(&mut self.const_pool.borrow_mut().pending_projections);
+        if pending.is_empty() {
+            return;
+        }
+        let mut order: Vec<usize> = (0..pending.len()).collect();
+        order.sort_by_key(|&i| (pending[i].view_seq, pending[i].content_seq));
+        let mut rank = vec![0usize; pending.len()];
+        for (position, &i) in order.iter().enumerate() {
+            rank[i] = position;
+        }
+        self.all_projection_selectors = order.iter().map(|&i| pending[i].selector.clone()).collect();
+        let resolve = move |id: usize| rank.get(id).copied().unwrap_or(id);
+        let remap = |stmts: &mut Vec<Stmt>| {
+            for stmt in stmts.iter_mut() {
+                remap_placeholder_slots_in_stmt(stmt, PROJECTION_INDEX_PLACEHOLDER, &resolve);
+            }
+        };
+        remap(&mut self.creation_code);
+        remap(&mut self.create_prelude);
+        remap(&mut self.update_code);
+        remap(&mut self.hoisted_fns);
+        trim_default_projection_index(&mut self.creation_code);
+        trim_default_projection_index(&mut self.create_prelude);
+        trim_default_projection_index(&mut self.hoisted_fns);
+    }
+
+    /// Place every element / `<ng-template>` attribute const requested during the walk, in Angular's
+    /// `collectElementConsts` order, and rewrite the walk's placeholder indices to the final ones.
+    ///
+    /// Angular adds these consts LAST (after local refs, i18n consts and const expressions), walking
+    /// `job.units` in allocation order (depth-first pre-order over the view tree) and each unit's ops
+    /// in document order, de-duplicating against the consts already present (`addConst`). The walk
+    /// visits nested views in the middle of the root's own ops, so without this pass a nested view's
+    /// attribute array would take an index ahead of the root's later elements. Non-element consts
+    /// (local refs, i18n, defer configs) are already in [`ConstantPool::entries`] in walk order, which
+    /// is their Angular order, so the attribute consts are simply appended in view order.
+    ///
+    /// Runs on the root only, after the whole walk: every nested view's functions have been hoisted
+    /// into [`Self::hoisted_fns`] by then, so the placeholders are rewritten in all of them.
+    fn finalize_pending_consts(&mut self) {
+        let pending = std::mem::take(&mut self.const_pool.borrow_mut().pending);
+        if pending.is_empty() {
+            return;
+        }
+        let mut order: Vec<usize> = (0..pending.len()).collect();
+        order.sort_by_key(|&i| (pending[i].view_seq, pending[i].op_seq));
+        let mut resolved = vec![0usize; pending.len()];
+        {
+            let mut pool = self.const_pool.borrow_mut();
+            for i in order {
+                resolved[i] = pool.intern(pending[i].value.clone());
+            }
+        }
+        let resolve = move |id: usize| resolved.get(id).copied().unwrap_or(id);
+        let remap = |stmts: &mut Vec<Stmt>| {
+            for stmt in stmts.iter_mut() {
+                remap_placeholder_slots_in_stmt(stmt, PENDING_CONST_PLACEHOLDER, &resolve);
+            }
+        };
+        remap(&mut self.creation_code);
+        remap(&mut self.create_prelude);
+        remap(&mut self.update_code);
+        remap(&mut self.hoisted_fns);
+    }
+
     fn finalize_local_refs(&mut self) {
         let slots: Vec<usize> = self.local_refs.iter().map(|r| r.slot).collect();
         if slots.is_empty() {
@@ -3282,6 +3711,7 @@ impl TemplateDefinitionBuilder {
 
         // Capture the node list for in-view `@let`-usage queries during the walk.
         self.current_nodes = Some(nodes.clone());
+        self.ancestor_reads = self.compute_ancestor_reads(&nodes);
 
         // Angular runs `liftLocalRefs` (which interns each element/template's `#ref` const) BEFORE
         // `collectElementConsts` (the attribute consts) — so EVERY local-ref const precedes every
@@ -3292,7 +3722,7 @@ impl TemplateDefinitionBuilder {
         // handler reads a ref declared LATER can resolve it.
         self.prepass_local_ref_consts(&nodes);
 
-        // Then, for the ROOT view, pre-intern every DESCENDANT view's local-ref consts (breadth-first
+        // Then, for the ROOT view, pre-intern every DESCENDANT view's local-ref consts (depth-first
         // by view level) so the WHOLE template's local-ref consts precede every Template/attribute
         // const — Angular's `liftLocalRefs` runs across all views before `collectElementConsts`. A
         // nested view's ref const is otherwise interned only when that view is built (after the root
@@ -3320,6 +3750,13 @@ impl TemplateDefinitionBuilder {
             self.build_i18n_child_view(&child, &nodes);
         } else {
             self.visit_all(&nodes);
+        }
+        if self.is_root {
+            self.finalize_projection_indices();
+        }
+        self.finalize_host_slots();
+        if self.is_root {
+            self.finalize_pending_consts();
         }
 
         // Assign the deferred var (change-detection) offsets for every pipe / arrow / pure-function
@@ -3423,13 +3860,16 @@ impl TemplateDefinitionBuilder {
         //   2. embedded-view loop-variable `const`s (`const x_r1 = ctx.$implicit;`).
         // Both precede the chained binding instructions.
         let mut update_body: Vec<Stmt> = Vec::new();
-        if self.needs_next_context.get() {
-            let ctx_name = self.next_context_var_name();
-            // `ɵɵnextContext(n)` — the hop count is the number of view levels walked up. The bare
-            // `ɵɵnextContext()` (Angular elides the `1` argument) covers the common single-level case.
-            let hops = self.view_level; // each level resolves to the immediately-enclosing view here.
+        // The component context is walked to from the view itself, unless an inherited (ancestor)
+        // variable is read: then the ancestor walk moves the context pointer first, and the component
+        // context is walked to from wherever it stopped (Angular's `nextContext` calls chain).
+        let (ancestor_stmts, ancestor_level) = self.ancestor_context_prelude();
+        let inherited = !ancestor_stmts.is_empty();
+        let component_ctx_name = self.next_context_var_name();
+        let component_walk = |hops: usize| {
+            let ctx_name = component_ctx_name.clone();
             let args = if hops <= 1 { vec![] } else { vec![num(hops as f64)] };
-            update_body.push(Stmt::with_modifiers(
+            Stmt::with_modifiers(
                 StmtKind::DeclareVar {
                     name: ctx_name,
                     value: Some(
@@ -3438,9 +3878,18 @@ impl TemplateDefinitionBuilder {
                     ty: None,
                 },
                 StmtModifier::FINAL,
-            ));
+            )
+        };
+        if self.needs_next_context.get() && !inherited {
+            // `ɵɵnextContext(n)` — the hop count is the number of view levels walked up. The bare
+            // `ɵɵnextContext()` (Angular elides the `1` argument) covers the common single-level case.
+            update_body.push(component_walk(self.view_level));
         }
         update_body.extend(std::mem::take(&mut self.update_prelude));
+        update_body.extend(ancestor_stmts);
+        if self.needs_next_context.get() && inherited {
+            update_body.push(component_walk(ancestor_level));
+        }
         // Template local references read by this view's own update bindings materialise as
         // `const <name>_r<id> = ɵɵreference(slot)` at the head of the variable block, before the
         // bindings consume them (`generate_variables.ts` `Reference`). Emitted in first-use order.
@@ -3544,7 +3993,16 @@ impl TemplateDefinitionBuilder {
         template_names: &[String],
     ) -> Option<usize> {
         let entries = self.serialize_attrs_entries(attributes, binding_names, template_names)?;
-        Some(self.const_pool.borrow_mut().intern(o::literal_arr(entries, None)))
+        // Angular's `collectElementConsts` runs after every other const producer and walks the
+        // views in allocation order, so the array is only queued here; the root places it (and
+        // rewrites this placeholder) in `finalize_pending_consts`.
+        let op_seq = self.attr_const_seq;
+        self.attr_const_seq += 1;
+        Some(self.const_pool.borrow_mut().push_pending(
+            self.view_seq,
+            op_seq,
+            o::literal_arr(entries, None),
+        ))
     }
 
     /// Build the raw serialized-attributes array contents (`Vec<Expr>`) without interning, or `None`
@@ -3660,9 +4118,16 @@ impl TemplateDefinitionBuilder {
         };
         let is_default = selector == "*";
         // Angular's `generateProjectionDefs` assigns each `<ng-content>` op a *unique ascending*
-        // `projectionSlotIndex` (0-based, in create-block order), regardless of selector dedup.
-        let projection_index = self.projection_count;
-        self.projection_count += 1;
+        // `projectionSlotIndex` in `job.units` order (view allocation order, then op order). The walk visits
+        // nested views in the middle of the root's ops, so the index is a placeholder that the root ranks
+        // in `finalize_projection_indices`.
+        let content_seq = self.content_seq;
+        self.content_seq += 1;
+        let projection_index = self.const_pool.borrow_mut().push_pending_projection(
+            self.view_seq,
+            content_seq,
+            selector.clone(),
+        );
         // Record EVERY slot's selector in create order (with dups + wildcards) for the
         // `ɵɵprojectionDef` argument (Angular `generateProjectionDefs`).
         self.all_projection_selectors.push(selector.clone());
@@ -3715,10 +4180,8 @@ impl TemplateDefinitionBuilder {
             params.push(num(fb_decls as f64));
             params.push(num(fb_vars as f64));
         } else {
+            // A `0` projection index is trimmed once it is ranked (`finalize_projection_indices`).
             trim_trailing_nulls(&mut params);
-            if params.len() == 2 && params[1].is_equivalent(&num(0.0)) {
-                params.pop();
-            }
         }
         self.creation_code.push(instruction(R3::Projection, params));
     }
@@ -3967,8 +4430,19 @@ impl TemplateDefinitionBuilder {
     /// (`"a{{exp}}b"`) is wrapped in the matching `ɵɵinterpolateN(...)` (Angular `interpolate.ts`
     /// reifies `StyleProp`/`ClassProp` interpolation through the value-interpolation family); a
     /// non-interpolation value is passed through as already lowered.
-    fn style_class_binding_value(&mut self, value: &AstNode, already_lowered: Expr) -> Expr {
+    fn style_class_binding_value(
+        &mut self,
+        value: &AstNode,
+        already_lowered: Expr,
+        collapses_singleton: bool,
+    ) -> Expr {
         match &value.kind {
+            AstExprKind::Interpolation { expressions, .. }
+                if collapses_singleton && is_singleton_interpolation(value) =>
+            {
+                // Angular `collapse_singleton_interpolations.ts`: `{{x}}` is just `x`.
+                self.lower_expr(&expressions[0])
+            }
             AstExprKind::Interpolation { strings, expressions } => {
                 // Lower each interpolation expression against this view's scope, in order, then
                 // collate them with the literal string affixes into the `ɵɵinterpolateN` arg list.
@@ -3993,12 +4467,13 @@ impl TemplateDefinitionBuilder {
 
     fn build_element_inner(&mut self, element: &Element) {
         let slot = self.allocate_data_slot();
+        self.note_first_target_slot(slot);
         // Each `#ref` on the element reserves one extra data slot (Angular `liftLocalRefs`:
         // `numSlotsUsed += localRefs.length`). The `ɵɵreference(slot)` slot for ref `k` is
         // `element_slot + 1 + k`. Register each ref so same-view / handler reads resolve to it.
         for r in &element.references {
             let ref_slot = self.allocate_data_slot();
-            self.register_local_ref(&r.name, ref_slot);
+            self.register_local_ref(&r.name, ref_slot, slot, r.value.is_empty());
         }
 
         // Collect the names that go under `AttributeMarker.Bindings` (`3`). Faithful to Angular's
@@ -4085,7 +4560,10 @@ impl TemplateDefinitionBuilder {
                     synthetic_static_props.push(a.name.clone());
                     false
                 } else {
-                    true
+                    // `ngNonBindable` marks the element non-bindable and is removed from its attributes
+                    // (Angular `binding_specialization.ts`: the Attribute binding is dropped, the target
+                    // element gets `nonBindable = true`), so it never reaches the element's const array.
+                    a.name != "ngNonBindable"
                 }
             })
             .cloned()
@@ -4130,24 +4608,31 @@ impl TemplateDefinitionBuilder {
 
         // `element`/`elementStart` reify to `(slot, tag, attributes, localRefs, span)`; the
         // trailing `null` attributes / localRefs args are trimmed (Angular `instruction.ts`).
-        let mut params = vec![
-            num(slot as f64),
-            str_lit(&local_name),
-            attrs_index.map(|i| num(i as f64)).unwrap_or_else(o::null_expr),
+        // The container family takes no tag argument (`elementContainerStart(slot, attrs?, refs?)`).
+        let is_container = element.name == "ng-container";
+        let mut params = vec![num(slot as f64)];
+        if !is_container {
+            params.push(str_lit(&local_name));
+        }
+        params.push(attrs_index.map(|i| num(i as f64)).unwrap_or_else(o::null_expr));
+        params.push(
             local_refs_index
                 .map(|i| num(i as f64))
                 .unwrap_or_else(o::null_expr),
-        ];
+        );
         trim_trailing_nulls(&mut params);
 
         // Creation: the element itself, then its listeners. Angular's `reify` phase picks the
         // DOM-only element family (`ɵɵdomElementStart`/`ɵɵdomElementEnd`/`ɵɵdomElement`) when the
         // component compiles in `DomOnly` mode (standalone, no directive dependencies), and the
         // classic `Full` family (`ɵɵelementStart`/`ɵɵelementEnd`/`ɵɵelement`) otherwise.
-        let (start_ref, single_ref) = if self.dom_only {
-            (R3::DomElementStart, R3::DomElement)
-        } else {
-            (R3::ElementStart, R3::Element)
+        // An `<ng-container>` is a container op (`phases/ng_container.ts` transmutes its `ElementStart` /
+        // `ElementEnd` into `ContainerStart` / `ContainerEnd`), reified to the `elementContainer*` family.
+        let (start_ref, single_ref) = match (self.dom_only, is_container) {
+            (true, false) => (R3::DomElementStart, R3::DomElement),
+            (false, false) => (R3::ElementStart, R3::Element),
+            (true, true) => (R3::DomElementContainerStart, R3::DomElementContainer),
+            (false, true) => (R3::ElementContainerStart, R3::ElementContainer),
         };
         // `emitNamespaceChanges` (`phases/namespace.ts`): a namespace-switch instruction precedes the
         // element's start op whenever its namespace differs from the one active in this view.
@@ -4160,6 +4645,13 @@ impl TemplateDefinitionBuilder {
             self.creation_code.push(instruction(start_ref, params));
         } else {
             self.creation_code.push(instruction(single_ref, params));
+        }
+        // An `ngNonBindable` element brackets its subtree in `ɵɵdisableBindings()` … `ɵɵenableBindings()`
+        // (Angular `phases/nonbindable.ts`: the disable op follows the element start, the enable op
+        // precedes the element end).
+        let non_bindable = element.attributes.iter().any(|a| a.name == "ngNonBindable");
+        if non_bindable && needs_end {
+            self.creation_code.push(instruction(R3::DisableBindings, vec![]));
         }
 
         // `ɵɵcontrolCreate()` for each control-eligible binding on this element. Angular's
@@ -4247,11 +4739,15 @@ impl TemplateDefinitionBuilder {
             let children = element.children.clone();
             self.visit_all(&children);
         }
+        if non_bindable && needs_end {
+            self.creation_code.push(instruction(R3::EnableBindings, vec![]));
+        }
         if needs_end {
-            let end_ref = if self.dom_only {
-                R3::DomElementEnd
-            } else {
-                R3::ElementEnd
+            let end_ref = match (self.dom_only, is_container) {
+                (true, false) => R3::DomElementEnd,
+                (false, false) => R3::ElementEnd,
+                (true, true) => R3::DomElementContainerEnd,
+                (false, true) => R3::ElementContainerEnd,
             };
             self.creation_code.push(instruction(end_ref, vec![]));
         }
@@ -4800,17 +5296,24 @@ impl TemplateDefinitionBuilder {
             return;
         }
 
-        // Number of interpolation expressions contributing extra var slots.
-        let interp_extra = match &input.value.kind {
-            AstExprKind::Interpolation { expressions, .. } => expressions.len(),
-            _ => 0,
-        };
-
         // A whole-element `[class]="exp"` / `[style]="exp"` binding (a `Property` whose name is
         // exactly `class`/`style`) is specialized to a `ClassMap`/`StyleMap` op
         // (`style_binding_specialization.ts`).
         let is_style_or_class_map = matches!(input.kind, BindingType::Property | BindingType::TwoWay)
             && (input.name == "class" || input.name == "style");
+        // `collapse_singleton_interpolations.ts` (before var counting) rewrites a `{{x}}`-only value of a
+        // StyleProp / StyleMap / ClassMap op into the bare expression, so it reserves no interpolation slots.
+        let collapses = matches!(input.kind, BindingType::Style) || is_style_or_class_map;
+
+        // Number of interpolation expressions contributing extra var slots.
+        let interp_extra = match &input.value.kind {
+            AstExprKind::Interpolation { expressions, .. }
+                if !(collapses && is_singleton_interpolation(&input.value)) =>
+            {
+                expressions.len()
+            }
+            _ => 0,
+        };
 
         // Reserve var slots per Angular `varsUsedByOp`: property/attribute = 1 (+N), class/style
         // (ClassProp/StyleProp AND ClassMap/StyleMap) = 2 (+N).
@@ -4876,7 +5379,7 @@ impl TemplateDefinitionBuilder {
                 // A `class="foo-{{x}}"` / `[style]="a{{x}}"` interpolation reifies its value through
                 // `ɵɵinterpolateN(...)` (Angular `interpolate.ts`, `ClassMap`/`StyleMap` interpolation),
                 // not a raw string concatenation. A non-interpolation value passes through unchanged.
-                let value = self.style_class_binding_value(&input.value, lowered);
+                let value = self.style_class_binding_value(&input.value, lowered, true);
                 self.update_code.push(instruction(reference, vec![value]));
             }
             BindingType::TwoWay => {
@@ -4895,7 +5398,7 @@ impl TemplateDefinitionBuilder {
                 // (Angular `interpolate.ts`; a singleton `{{x}}` becomes `ɵɵinterpolate(x)`), not a raw
                 // string concatenation. Attribute singletons are collapsed instead (see `update_order_rank`).
                 let lowered = if matches!(input.value.kind, AstExprKind::Interpolation { .. }) {
-                    self.style_class_binding_value(&input.value, lowered)
+                    self.style_class_binding_value(&input.value, lowered, false)
                 } else {
                     lowered
                 };
@@ -4938,16 +5441,22 @@ impl TemplateDefinitionBuilder {
             BindingType::Class => {
                 // A `[class.x]="a{{exp}}b"` interpolation reifies its value through
                 // `ɵɵinterpolateN("a", exp, "b")` (Angular `interpolate.ts` `ClassProp` interpolation),
-                // not a raw string concat. A non-interpolation value passes through unchanged.
-                let value = self.style_class_binding_value(&input.value, lowered);
+                // not a raw string concat. A non-interpolation value passes through unchanged. The name
+                // loses any `!important` suffix (Angular `naming.ts` `ClassProp`).
+                let value = self.style_class_binding_value(&input.value, lowered, false);
+                let name = treaty_ivy_core::util::strip_important(&input.name).to_string();
                 self.update_code
-                    .push(instruction(R3::ClassProp, vec![str_lit(&input.name), value]));
+                    .push(instruction(R3::ClassProp, vec![str_lit(&name), value]));
             }
             BindingType::Style => {
                 // As `ClassProp` above: a `[style.x]="a{{exp}}b"` value is wrapped in
                 // `ɵɵinterpolateN(...)`. A `style.x.unit` carries the unit as a trailing argument.
-                let value = self.style_class_binding_value(&input.value, lowered);
-                let mut params = vec![str_lit(&input.name), value];
+                let value = self.style_class_binding_value(&input.value, lowered, true);
+                // Angular `naming.ts` `StyleProp`: the name is hyphenated (CSS custom properties are kept)
+                // and loses any `!important` suffix.
+                let name = treaty_ivy_core::util::strip_important(&treaty_ivy_core::util::normalize_style_prop_name(&input.name))
+                    .to_string();
+                let mut params = vec![str_lit(&name), value];
                 if let Some(unit) = &input.unit {
                     params.push(str_lit(unit));
                 }
@@ -5329,11 +5838,12 @@ impl TemplateDefinitionBuilder {
     /// [`R3::TemplateRefExtractor`] is appended as the `localRefExtractor`.
     fn build_template(&mut self, template: &Template) {
         let slot = self.allocate_data_slot();
+        self.note_first_target_slot(slot);
         // Each `#ref` on the host reserves one extra data slot (`liftLocalRefs`:
         // `numSlotsUsed += localRefs.length`).
         for r in &template.references {
             let ref_slot = self.allocate_data_slot();
-            self.register_local_ref(&r.name, ref_slot);
+            self.register_local_ref(&r.name, ref_slot, slot, r.value.is_empty());
         }
         // A `<ng-template>`'s own `[prop]` inputs are collected — like an element's — under the
         // `AttributeMarker.Bindings` group of its const attrs (Angular `serializeAttributes`), so
@@ -5398,16 +5908,28 @@ impl TemplateDefinitionBuilder {
         let mut template_vars: Vec<LoopVar> = Vec::new();
         let mut template_prelude: Vec<Stmt> = Vec::new();
         for var in &template.variables {
+            // Angular's `variable_optimization` drops a variable nothing reads (before naming). A
+            // variable read only by a nested view stays in scope for it, and that view re-declares it
+            // (`ancestor_context_prelude`), so this view declares it only when its own bindings read it.
+            if !for_body_references(&template.children, &var.name) {
+                continue;
+            }
             self.var_counter += 1;
             let local_name = format!("{}_r{}", var.name, self.var_counter);
-            template_prelude.push(Stmt::with_modifiers(
-                StmtKind::DeclareVar {
-                    name: local_name.clone(),
-                    value: Some(o::variable(CONTEXT_NAME, None).prop(var.value.clone())),
-                    ty: None,
-                },
-                StmtModifier::FINAL,
-            ));
+            if template
+                .children
+                .iter()
+                .any(|n| view_body_references(n, &var.name))
+            {
+                template_prelude.push(Stmt::with_modifiers(
+                    StmtKind::DeclareVar {
+                        name: local_name.clone(),
+                        value: Some(o::variable(CONTEXT_NAME, None).prop(var.value.clone())),
+                        ty: None,
+                    },
+                    StmtModifier::FINAL,
+                ));
+            }
             template_vars.push(LoopVar {
                 source_name: var.name.clone(),
                 local_name,
@@ -5503,7 +6025,7 @@ impl TemplateDefinitionBuilder {
                 Node::Element(el) => {
                     self.local_refs_index(&el.references);
                     for r in &el.references {
-                        self.preregister_local_ref(&r.name);
+                        self.preregister_local_ref(&r.name, r.value.is_empty());
                     }
                     self.prepass_local_ref_consts(&el.children);
                 }
@@ -5512,7 +6034,7 @@ impl TemplateDefinitionBuilder {
                     // is a separate child view, so we do NOT recurse into its children here.
                     self.local_refs_index(&tmpl.references);
                     for r in &tmpl.references {
-                        self.preregister_local_ref(&r.name);
+                        self.preregister_local_ref(&r.name, r.value.is_empty());
                     }
                 }
                 _ => {}
@@ -5521,8 +6043,8 @@ impl TemplateDefinitionBuilder {
     }
 
     /// Pre-intern the local-reference consts of every DESCENDANT view (control-flow / `<ng-template>`
-    /// / loop bodies), BREADTH-FIRST by view level, into the component-global const pool — AFTER this
-    /// (root) view's own refs and BEFORE the main walk interns any Template/attribute const. Angular's
+    /// / loop bodies), depth-first pre-order over the view tree, into the component-global const pool
+    /// — AFTER this (root) view's own refs and BEFORE the main walk interns any Template/attribute const. Angular's
     /// `liftLocalRefs` runs across the WHOLE template before `collectElementConsts`, so EVERY view's
     /// local-ref consts (root view first, then each child view in creation order) precede every
     /// attribute/`[Template,...]` const in the pool. Our per-view prepass only interns the current
@@ -5535,15 +6057,14 @@ impl TemplateDefinitionBuilder {
     /// and it is const-only: no slot pre-registration / generated-local side effects (those stay
     /// per-view in `prepass_local_ref_consts`).
     fn prepass_descendant_local_ref_consts(&mut self, root_nodes: &[Node]) {
-        // BFS queue of child-view node lists, seeded with the root view's immediate child views.
-        let mut queue: std::collections::VecDeque<Vec<Node>> = std::collections::VecDeque::new();
-        Self::collect_child_view_bodies(root_nodes, &mut queue);
-        while let Some(view_nodes) = queue.pop_front() {
-            // Intern THIS child view's local-ref consts in create (pre-order) order, recursing into
-            // same-view element children but NOT into deeper views (those are enqueued separately so
-            // the breadth-first, view-level ordering is preserved).
+        // Angular's `job.units` is the view allocation order: depth-first pre-order over the view
+        // tree (`ingestTemplate` allocates a child view, then ingests its children before the next
+        // sibling). Intern each child view's refs, then its own descendants, before its next sibling.
+        let mut bodies: std::collections::VecDeque<Vec<Node>> = std::collections::VecDeque::new();
+        Self::collect_child_view_bodies(root_nodes, &mut bodies);
+        for view_nodes in bodies {
             self.intern_view_local_ref_consts(&view_nodes);
-            Self::collect_child_view_bodies(&view_nodes, &mut queue);
+            self.prepass_descendant_local_ref_consts(&view_nodes);
         }
     }
 
@@ -5672,6 +6193,8 @@ impl TemplateDefinitionBuilder {
         // instruction is the GLOBAL `consts:` index — no post-hoc re-intern (which would renumber the
         // nested consts and leave the instructions pointing at the wrong entry).
         nested.const_pool = std::rc::Rc::clone(&self.const_pool);
+        nested.view_seq = self.const_pool.borrow_mut().alloc_view_seq();
+        nested.ancestor_vars = self.ancestor_vars_for_child();
         nested.i18n_child_view = i18n_child_view;
         // An embedded view is never the root: its hoisted descendant fns bubble up to the root
         // (below) rather than being inlined into this view body, so each is emitted exactly once.
@@ -5692,14 +6215,12 @@ impl TemplateDefinitionBuilder {
         // DOWN into the nested view so a `<ng-content>` reached inside it continues the global
         // numbering, then copy the advanced state back UP so the root's prepended projectionDef sees
         // all of them.
-        nested.projection_count = self.projection_count;
         nested.all_projection_selectors = std::mem::take(&mut self.all_projection_selectors);
         nested.has_default_projection = self.has_default_projection;
         let tmpl_fn = nested.build_template_function(&nested_input);
         let decls = nested.data_index;
         let vars = nested.binding_slots;
         self.var_counter = nested.var_counter;
-        self.projection_count = nested.projection_count;
         self.all_projection_selectors = std::mem::take(&mut nested.all_projection_selectors);
         self.has_default_projection = nested.has_default_projection;
         // The const pool is SHARED (same `Rc<RefCell<ConstantPool>>`): the nested view already
@@ -5757,8 +6278,22 @@ impl TemplateDefinitionBuilder {
         let mut branch_slots: Vec<usize> = Vec::with_capacity(block.branches.len());
         let anchor_slot = self.data_index;
 
+        // Any pipe in a branch condition is consumed by the conditional anchor op (`addPipeToCreationBlock`).
+        // The conditions are lowered BEFORE the branches take their slots: Angular's slot allocation puts
+        // those `ɵɵpipe` ops right after the first branch's create op, ahead of the later branches.
+        self.current_target_slot = anchor_slot;
+        let lowered_conditions: Vec<Option<Expr>> = block
+            .branches
+            .iter()
+            .map(|branch| branch.expression.as_ref().map(|cond| self.lower_expr(cond)))
+            .collect();
+
         for (i, branch) in block.branches.iter().enumerate() {
             let slot = self.allocate_data_slot();
+            self.note_first_target_slot(slot);
+            if i == 0 {
+                self.assign_positional_pipe_slots_for(slot);
+            }
             branch_slots.push(slot);
             let fn_name = format!("{}_Conditional_{}_Template", self.base_name, slot);
             // When this `@if` chain sits inside an `i18n` block, each branch body becomes an i18n
@@ -5810,13 +6345,10 @@ impl TemplateDefinitionBuilder {
             self.allocate_binding_slots(1);
         }
 
-        // Any pipe in a branch condition is consumed by the conditional anchor op (`addPipeToCreationBlock`).
-        self.current_target_slot = anchor_slot;
-        for (idx, branch) in block.branches.iter().enumerate().rev() {
-            let Some(cond) = &branch.expression else {
+        for (idx, cond_expr) in lowered_conditions.into_iter().enumerate().rev() {
+            let Some(cond_expr) = cond_expr else {
                 continue; // default handled above.
             };
-            let cond_expr = self.lower_expr(cond);
             let slot_lit = num(branch_slots[idx] as f64);
             test = cond_expr.conditional(slot_lit, Some(test));
         }
@@ -6377,6 +6909,12 @@ impl TemplateDefinitionBuilder {
             if !for_body_references(&block.children, &source_name) {
                 continue;
             }
+            // Declared in this body only when its own bindings read it; a variable read only by a
+            // nested view is re-declared there (`ancestor_context_prelude`).
+            let declared_here = block
+                .children
+                .iter()
+                .any(|n| view_body_references(n, &source_name));
             if matches!(ctx_value.as_str(), "$first" | "$last" | "$even" | "$odd") {
                 // A computed variable has no const of its own: it is an inline expression over the
                 // index (and count) local, filled in below.
@@ -6392,20 +6930,22 @@ impl TemplateDefinitionBuilder {
             }
             self.var_counter += 1;
             let local_name = format!("{}_r{}", source_name, self.var_counter);
-            // `const <local> = ctx.<property>;`
-            prelude.push(Stmt::with_modifiers(
-                StmtKind::DeclareVar {
-                    name: local_name.clone(),
-                    value: Some(o::variable(CONTEXT_NAME, None).prop(ctx_value.clone())),
-                    ty: None,
-                },
-                StmtModifier::FINAL,
-            ));
-            if ctx_value == "$index" && index_local.is_none() {
-                index_local = Some(local_name.clone());
-            }
-            if ctx_value == "$count" && count_local.is_none() {
-                count_local = Some(local_name.clone());
+            if declared_here {
+                // `const <local> = ctx.<property>;`
+                prelude.push(Stmt::with_modifiers(
+                    StmtKind::DeclareVar {
+                        name: local_name.clone(),
+                        value: Some(o::variable(CONTEXT_NAME, None).prop(ctx_value.clone())),
+                        ty: None,
+                    },
+                    StmtModifier::FINAL,
+                ));
+                if ctx_value == "$index" && index_local.is_none() {
+                    index_local = Some(local_name.clone());
+                }
+                if ctx_value == "$count" && count_local.is_none() {
+                    count_local = Some(local_name.clone());
+                }
             }
             vars.push(LoopVar {
                 source_name,
@@ -6773,6 +7313,7 @@ impl TemplateDefinitionBuilder {
         // Secondary views (`@placeholder`/`@loading`/`@error`), each a one-slot `ɵɵdomTemplate`,
         // allocated before the `ɵɵdefer` op (Angular ingests their views ahead of the defer op).
         let mut placeholder: Option<(usize, Expr, usize, usize)> = None;
+        let mut placeholder_targets: Option<DeferViewTargets> = None;
         let mut loading: Option<(usize, Expr, usize, usize)> = None;
         let mut error: Option<(usize, Expr, usize, usize)> = None;
         // Slot/view allocation order is LOADING, then PLACEHOLDER, then ERROR (Angular
@@ -6790,6 +7331,7 @@ impl TemplateDefinitionBuilder {
             let (r, d, v) =
                 self.build_deferred_view(f, ph.children.clone(), placeholder_child_i18n);
             placeholder = Some((s, r, d, v));
+            placeholder_targets = Some(self.last_defer_view_targets.clone());
         }
         if let Some(er) = &deferred.error {
             let s = self.allocate_data_slot();
@@ -6889,7 +7431,7 @@ impl TemplateDefinitionBuilder {
 
         // Trigger instructions: hydrate, then main, then prefetch, then the idle default
         // (`ingest.ts` `ingestDeferBlock`).
-        self.emit_defer_triggers(deferred);
+        self.emit_defer_triggers(deferred, placeholder_targets.as_ref());
 
         // A `when <cond>` trigger is an UPDATE op (`ɵɵdeferWhen(<cond>)`), not a create-block `on`
         // trigger: the binding cursor advances to the defer op's slot, then `ɵɵdeferWhen` re-evaluates
@@ -6928,11 +7470,11 @@ impl TemplateDefinitionBuilder {
     /// triggers, each group in Angular's kind order (idle, immediate, timer, hover, interaction,
     /// viewport, never). When the main group has no concrete trigger (`on` or `when`), a default
     /// `ɵɵdeferOnIdle()` is appended last.
-    fn emit_defer_triggers(&mut self, deferred: &DeferredBlock) {
-        self.emit_defer_trigger_group(&deferred.hydrate_triggers, DeferOpModifier::Hydrate);
+    fn emit_defer_triggers(&mut self, deferred: &DeferredBlock, placeholder: Option<&DeferViewTargets>) {
+        self.emit_defer_trigger_group(&deferred.hydrate_triggers, DeferOpModifier::Hydrate, placeholder);
         let main_concrete =
-            self.emit_defer_trigger_group(&deferred.triggers, DeferOpModifier::Main);
-        self.emit_defer_trigger_group(&deferred.prefetch_triggers, DeferOpModifier::Prefetch);
+            self.emit_defer_trigger_group(&deferred.triggers, DeferOpModifier::Main, placeholder);
+        self.emit_defer_trigger_group(&deferred.prefetch_triggers, DeferOpModifier::Prefetch, placeholder);
         if !main_concrete {
             self.creation_code.push(instruction(R3::DeferOnIdle, vec![]));
         }
@@ -6945,6 +7487,7 @@ impl TemplateDefinitionBuilder {
         &mut self,
         triggers: &DeferredBlockTriggers,
         modifier: DeferOpModifier,
+        placeholder: Option<&DeferViewTargets>,
     ) -> bool {
         let mut ordered = triggers.defined_in_order();
         ordered.sort_by_key(|t| defer_trigger_rank(&t.kind));
@@ -6972,13 +7515,18 @@ impl TemplateDefinitionBuilder {
                 DeferredTriggerKind::Timer { delay } => {
                     (defer_on_instruction(modifier, "Timer"), vec![num(*delay)])
                 }
-                DeferredTriggerKind::Hover { .. } => (defer_on_instruction(modifier, "Hover"), vec![]),
-                DeferredTriggerKind::Interaction { .. } => {
-                    (defer_on_instruction(modifier, "Interaction"), vec![])
-                }
-                DeferredTriggerKind::Viewport { .. } => {
-                    (defer_on_instruction(modifier, "Viewport"), vec![])
-                }
+                DeferredTriggerKind::Hover { .. } => (
+                    defer_on_instruction(modifier, "Hover"),
+                    self.defer_trigger_args(modifier, &trigger.kind, placeholder),
+                ),
+                DeferredTriggerKind::Interaction { .. } => (
+                    defer_on_instruction(modifier, "Interaction"),
+                    self.defer_trigger_args(modifier, &trigger.kind, placeholder),
+                ),
+                DeferredTriggerKind::Viewport { .. } => (
+                    defer_on_instruction(modifier, "Viewport"),
+                    self.defer_trigger_args(modifier, &trigger.kind, placeholder),
+                ),
             };
             if modifier == DeferOpModifier::Main {
                 concrete = true;
@@ -7013,6 +7561,8 @@ impl TemplateDefinitionBuilder {
         // interns its consts at their global indices, so its instructions carry global const indices
         // and no re-intern (which would renumber them) is needed.
         nested.const_pool = std::rc::Rc::clone(&self.const_pool);
+        nested.view_seq = self.const_pool.borrow_mut().alloc_view_seq();
+        nested.ancestor_vars = self.ancestor_vars_for_child();
         // When the defer block is inside an `i18n` region, thread the sub-template continuation so
         // the view brackets its content in `ɵɵi18nStart(0, msg, subIdx)` … `ɵɵi18nEnd()` and folds
         // its text/element children into the i18n placeholder ops (see `build_deferred_block`).
@@ -7020,6 +7570,15 @@ impl TemplateDefinitionBuilder {
         let tmpl_fn = nested.build_template_function(&nested_input);
         let decls = nested.data_index;
         let vars = nested.binding_slots;
+        self.last_defer_view_targets = DeferViewTargets {
+            first_slot: nested.first_target_slot,
+            refs: nested
+                .local_refs
+                .iter()
+                .filter(|r| r.plain && r.host_slot < HOST_SLOT_PLACEHOLDER)
+                .map(|r| (r.name.clone(), r.host_slot))
+                .collect(),
+        };
         self.var_counter = nested.var_counter;
         self.hoisted_fns.append(&mut nested.hoisted_fns);
         self.hoisted_fns
@@ -7098,6 +7657,16 @@ impl Visitor for TemplateDefinitionBuilder {
 /// `isUnsafeObjectKey` (`render3/util.ts`): an object-literal key is quoted iff it has `-` or `.`.
 fn is_unsafe_object_key(key: &str) -> bool {
     key.contains('-') || key.contains('.')
+}
+
+/// Whether an interpolation is a bare `{{x}}`: one expression and no literal text (Angular
+/// `collapse_singleton_interpolations.ts`: two strings, both empty).
+fn is_singleton_interpolation(value: &AstNode) -> bool {
+    matches!(
+        &value.kind,
+        AstExprKind::Interpolation { strings, expressions }
+            if expressions.len() == 1 && strings.iter().all(|s| s.is_empty())
+    )
 }
 
 /// Upper-cases the first character (`propertyName.charAt(0).toUpperCase() + slice(1)`).
@@ -7210,6 +7779,7 @@ fn attribute_sanitizer(
         SecurityContext::Script => Some(R3::SanitizeScript),
         SecurityContext::Url => Some(R3::SanitizeUrl),
         SecurityContext::ResourceUrl => Some(R3::SanitizeResourceUrl),
+        SecurityContext::AttributeNoBinding => Some(R3::ValidateAttribute),
         SecurityContext::None => None,
     }
 }
@@ -7266,6 +7836,57 @@ fn update_order_rank(input: &BoundAttribute, dom_only: bool) -> u8 {
 /// `$`-prefixed magic var). Drives `variable_optimization`-style elision of unused loop locals.
 /// Walks every binding expression in the body (bound text, inputs, outputs) and recurses into
 /// nested control-flow blocks, since a nested block's bindings still resolve against this scope.
+/// Whether this VIEW's own bindings read `name`: the expressions evaluated in the view that owns
+/// `node` (text, element/template inputs and outputs, control-flow conditions and loop collections).
+/// Unlike [`node_references`] it does not descend into the bodies of nested embedded views, which read
+/// their own bindings (an inherited variable is re-declared in each view that reads it).
+fn view_body_references(node: &Node, name: &str) -> bool {
+    match node {
+        Node::BoundText(bt) => expr_references_implicit(&bt.value, name),
+        Node::Element(el) => {
+            el.inputs.iter().any(|i| expr_references_implicit(&i.value, name))
+                || el.outputs.iter().any(|o| expr_references_implicit(&o.handler, name))
+                || el.children.iter().any(|c| view_body_references(c, name))
+        }
+        Node::Component(c) => c.children.iter().any(|ch| view_body_references(ch, name)),
+        Node::Template(t) => {
+            t.inputs.iter().any(|i| expr_references_implicit(&i.value, name))
+                || t.outputs.iter().any(|o| expr_references_implicit(&o.handler, name))
+                || t.template_attrs.iter().any(|a| match a {
+                    crate::template::r3_ast::TemplateAttr::Bound(b) => {
+                        expr_references_implicit(&b.value, name)
+                    }
+                    crate::template::r3_ast::TemplateAttr::Text(_) => false,
+                })
+        }
+        Node::IfBlock(b) => b.branches.iter().any(|br| {
+            br.expression
+                .as_ref()
+                .is_some_and(|e| expr_references_implicit(e, name))
+        }),
+        Node::SwitchBlock(b) => {
+            expr_references_implicit(&b.expression, name)
+                || b.groups.iter().any(|g| {
+                    g.cases.iter().any(|c| {
+                        c.expression
+                            .as_ref()
+                            .is_some_and(|e| expr_references_implicit(e, name))
+                    })
+                })
+        }
+        Node::ForLoopBlock(b) => {
+            // `track $index` / `track <item>` of a nested `@for` collapse to the shared
+            // `ɵɵrepeaterTrack*` helpers (`build_track_fn`), so they do not read this view's locals.
+            let track_reads = b.track_by.as_ref().is_some_and(|t| {
+                let optimized = matches!(bare_read_name(&t.ast).as_deref(), Some(n) if n == "$index" || n == b.item.name);
+                !optimized && expr_references_implicit(&t.ast, name)
+            });
+            expr_references_implicit(&b.expression.ast, name) || track_reads
+        }
+        _ => false,
+    }
+}
+
 fn for_body_references(children: &[Node], name: &str) -> bool {
     children.iter().any(|node| node_references(node, name))
 }
@@ -7281,6 +7902,12 @@ fn node_references(node: &Node, name: &str) -> bool {
         Node::Template(t) => {
             t.inputs.iter().any(|i| expr_references_implicit(&i.value, name))
                 || t.outputs.iter().any(|o| expr_references_implicit(&o.handler, name))
+                || t.template_attrs.iter().any(|a| match a {
+                    crate::template::r3_ast::TemplateAttr::Bound(b) => {
+                        expr_references_implicit(&b.value, name)
+                    }
+                    crate::template::r3_ast::TemplateAttr::Text(_) => false,
+                })
                 || for_body_references(&t.children, name)
         }
         Node::IfBlock(b) => b.branches.iter().any(|br| {
@@ -7830,6 +8457,35 @@ fn replace_read_var(expr: &mut Expr, name: &str, with: Option<&Expr>) -> usize {
     count
 }
 
+/// Drop the default `0` projection slot index from a two-argument `ɵɵprojection(slot, 0)` (Angular trims a
+/// trailing default argument of the instruction), recursing into hoisted view functions and `if` blocks.
+fn trim_default_projection_index(stmts: &mut [Stmt]) {
+    for stmt in stmts {
+        match &mut stmt.kind {
+            StmtKind::Expression(expr) => {
+                if let o::ExprKind::Invoke { callee, args, .. } = &mut expr.kind {
+                    if callee_wire_name(callee) == Some(R3::Projection.name())
+                        && args.len() == 2
+                        && args[1].is_equivalent(&num(0.0))
+                    {
+                        args.pop();
+                    }
+                }
+            }
+            StmtKind::DeclareFunction { statements, .. } => trim_default_projection_index(statements),
+            StmtKind::If {
+                true_case,
+                false_case,
+                ..
+            } => {
+                trim_default_projection_index(true_case);
+                trim_default_projection_index(false_case);
+            }
+            _ => {}
+        }
+    }
+}
+
 fn remap_placeholder_slots_in_stmt(
     stmt: &mut Stmt,
     placeholder: usize,
@@ -7879,7 +8535,9 @@ fn remap_placeholder_slots_in_expr(
     match &mut expr.kind {
         K::Literal(o::LiteralValue::Number(n)) => {
             let v = *n as usize;
-            if *n >= placeholder as f64 && v >= placeholder {
+            // Only the placeholder's own window is rewritten: each placeholder base owns
+            // `PLACEHOLDER_WINDOW` values, so the bases above it never match this one.
+            if v >= placeholder && v < placeholder + PLACEHOLDER_WINDOW {
                 let ordinal = v - placeholder;
                 *n = resolve(ordinal) as f64;
             }
@@ -8690,6 +9348,325 @@ mod tests {
     }
 
     #[test]
+    fn inherited_context_variable_is_redeclared_through_next_context() {
+        // `<ng-template let-item><ng-template>{{ item }}</ng-template></ng-template>`: the inner view
+        // reads the outer view's `item`. Angular (`generate_variables.ts`) walks up with one
+        // `ɵɵnextContext()` and declares `const item_rN = ɵɵnextContext().$implicit;` in the inner
+        // update block, instead of reading `ctx.item` off the component.
+        let read = |name: &str| {
+            AstNode::new(
+                ParseSpan::new(0, 0),
+                AbsoluteSourceSpan::new(0, 0),
+                AstExprKind::PropertyRead {
+                    name_span: AbsoluteSourceSpan::new(0, 0),
+                    receiver: Box::new(AstNode::new(
+                        ParseSpan::new(0, 0),
+                        AbsoluteSourceSpan::new(0, 0),
+                        AstExprKind::ImplicitReceiver,
+                    )),
+                    name: name.to_string(),
+                },
+            )
+        };
+        let interp = AstNode::new(
+            ParseSpan::new(0, 0),
+            AbsoluteSourceSpan::new(0, 0),
+            AstExprKind::Interpolation {
+                strings: vec!["".to_string(), "".to_string()],
+                expressions: vec![read("item")],
+            },
+        );
+        let template = |children: Vec<Node>, variables: Vec<Variable>| {
+            Template {
+                tag_name: Some("ng-template".to_string()),
+                attributes: vec![],
+                inputs: vec![],
+                outputs: vec![],
+                directives: vec![],
+                template_attrs: vec![],
+                children,
+                references: vec![],
+                variables,
+                is_self_closing: false,
+                source_span: t_span(),
+                start_source_span: t_span(),
+                end_source_span: None,
+                i18n: None,
+            }
+        };
+        let inner = Node::Template(template(
+            vec![Node::BoundText(BoundText {
+                value: interp,
+                source_span: t_span(),
+                i18n: None,
+            })],
+            vec![],
+        ));
+        let item_var = Variable {
+            name: "item".to_string(),
+            value: "$implicit".to_string(),
+            source_span: t_span(),
+            key_span: t_span(),
+            value_span: None,
+        };
+        let outer = Node::Template(template(vec![inner], vec![item_var]));
+        let input = TemplateCompilationInput::new("MyComponent_Template", vec![outer]);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let all = emit_with_hoisted(&builder, &func);
+        assert!(all.contains("nextContext().$implicit"), "got: {all}");
+        assert!(!all.contains("ctx.item") && !all.contains(".item"), "got: {all}");
+    }
+
+    #[test]
+    fn projection_slot_indices_follow_view_allocation_order() {
+        // `<ng-template><ng-content select="a"></ng-content></ng-template><ng-content select="b"></ng-content>`:
+        // Angular's `generateProjectionDefs` walks `job.units` (the root view first), so the root's `b` slot
+        // takes index 0 (elided as the default `ɵɵprojection(slot)`) and the template's `a` slot takes 1.
+        use crate::template::r3_ast::Content;
+        let content = |selector: &str| {
+            Node::Content(Content {
+                selector: selector.to_string(),
+                attributes: vec![],
+                children: vec![],
+                is_self_closing: true,
+                source_span: t_span(),
+                start_source_span: t_span(),
+                end_source_span: None,
+                i18n: None,
+            })
+        };
+        let template = Node::Template(Template {
+            tag_name: Some("ng-template".to_string()),
+            attributes: vec![],
+            inputs: vec![],
+            outputs: vec![],
+            directives: vec![],
+            template_attrs: vec![],
+            children: vec![content("a")],
+            references: vec![],
+            variables: vec![],
+            is_self_closing: false,
+            source_span: t_span(),
+            start_source_span: t_span(),
+            end_source_span: None,
+            i18n: None,
+        });
+        let input = TemplateCompilationInput::new("Test_Template", vec![template, content("b")]);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let all = emit_with_hoisted(&builder, &func);
+        assert!(all.contains("projection(1)"), "root slot must take index 0: {all}");
+        assert!(all.contains("projection(0, 1)"), "nested slot must take index 1: {all}");
+    }
+
+    #[test]
+    fn ng_non_bindable_element_brackets_its_subtree_with_disable_and_enable_bindings() {
+        // `<div ngNonBindable><span></span></div>`: Angular `nonbindable.ts` inserts `ɵɵdisableBindings()`
+        // right after the element start and `ɵɵenableBindings()` right before its end.
+        let span = Element {
+            name: "span".to_string(),
+            attributes: vec![],
+            inputs: vec![],
+            outputs: vec![],
+            directives: vec![],
+            children: vec![],
+            references: vec![],
+            is_self_closing: false,
+            source_span: t_span(),
+            start_source_span: t_span(),
+            end_source_span: None,
+            is_void: false,
+            i18n: None,
+        };
+        let div = Element {
+            name: "div".to_string(),
+            attributes: vec![TextAttribute {
+                name: "ngNonBindable".to_string(),
+                value: String::new(),
+                source_span: t_span(),
+                key_span: None,
+                value_span: None,
+                i18n: None,
+            }],
+            inputs: vec![],
+            outputs: vec![],
+            directives: vec![],
+            children: vec![Node::Element(span)],
+            references: vec![],
+            is_self_closing: false,
+            source_span: t_span(),
+            start_source_span: t_span(),
+            end_source_span: None,
+            is_void: false,
+            i18n: None,
+        };
+        let input = TemplateCompilationInput::new("Test_Template", vec![Node::Element(div)])
+            .with_dom_only(false);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let out = emit_expression(&builder.build_template_function(&input));
+        let start = out.find("elementStart(0, \"div\")").expect("div start");
+        let disable = out.find("disableBindings()").expect("disable");
+        let enable = out.find("enableBindings()").expect("enable");
+        let end = out.find("elementEnd()").expect("end");
+        assert!(start < disable && disable < enable && enable < end, "got: {out}");
+    }
+
+    #[test]
+    fn ng_non_bindable_attribute_is_not_an_element_const() {
+        // `<div ngNonBindable></div>` ⇒ `ɵɵelement(0, "div")`: the marker attribute is consumed by the
+        // non-bindable handling (Angular `binding_specialization.ts`) and never enters the consts.
+        let element = Element {
+            name: "div".to_string(),
+            attributes: vec![TextAttribute {
+                name: "ngNonBindable".to_string(),
+                value: String::new(),
+                source_span: t_span(),
+                key_span: None,
+                value_span: None,
+                i18n: None,
+            }],
+            inputs: vec![],
+            outputs: vec![],
+            directives: vec![],
+            children: vec![],
+            references: vec![],
+            is_self_closing: false,
+            source_span: t_span(),
+            start_source_span: t_span(),
+            end_source_span: None,
+            is_void: false,
+            i18n: None,
+        };
+        let input = TemplateCompilationInput::new("Test_Template", vec![Node::Element(element)])
+            .with_dom_only(false);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let out = emit_expression(&builder.build_template_function(&input));
+        assert!(out.contains("elementStart(0, \"div\")") || out.contains("element(0, \"div\")"), "got: {out}");
+        assert!(builder.const_pool().is_empty(), "ngNonBindable must not be a const");
+    }
+
+    #[test]
+    fn ng_container_lowers_to_element_container_instructions() {
+        // `<ng-container><span></span></ng-container>` and an empty `<ng-container></ng-container>`:
+        // Angular's `ng_container.ts` turns the element into a container op, reified to
+        // `ɵɵelementContainerStart` / `ɵɵelementContainerEnd`, and an empty one to `ɵɵelementContainer`.
+        let element = |name: &str, children: Vec<Node>| Element {
+            name: name.to_string(),
+            attributes: vec![],
+            inputs: vec![],
+            outputs: vec![],
+            directives: vec![],
+            children,
+            references: vec![],
+            is_self_closing: false,
+            source_span: t_span(),
+            start_source_span: t_span(),
+            end_source_span: None,
+            is_void: false,
+            i18n: None,
+        };
+        let with_children = vec![Node::Element(element(
+            "ng-container",
+            vec![Node::Element(element("span", vec![]))],
+        ))];
+        let input =
+            TemplateCompilationInput::new("Test_Template", with_children).with_dom_only(false);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let out = emit_expression(&func);
+        assert!(out.contains("elementContainerStart(0)"), "got: {out}");
+        assert!(out.contains("elementContainerEnd()"), "got: {out}");
+        assert!(!out.contains("\"ng-container\""), "got: {out}");
+
+        let empty = vec![Node::Element(element("ng-container", vec![]))];
+        let input = TemplateCompilationInput::new("Test_Template", empty).with_dom_only(false);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let out = emit_expression(&func);
+        assert!(out.contains("elementContainer(0)"), "got: {out}");
+
+        // DOM-only components (`isStandalone && !hasDirectiveDependencies`) use the `dom` family.
+        let dom = vec![Node::Element(element("ng-container", vec![]))];
+        let input = TemplateCompilationInput::new("Test_Template", dom).with_dom_only(true);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let out = emit_expression(&func);
+        assert!(out.contains("domElementContainer(0)"), "got: {out}");
+    }
+
+    #[test]
+    fn element_consts_follow_angular_view_allocation_order() {
+        // `<ng-template id="tpl"><span title="s"></span></ng-template><p lang="en"></p>`. Angular's
+        // `collectElementConsts` walks the views in allocation order (the root view first, then the
+        // `<ng-template>` body), so the root's `[id, tpl]` and `[lang, en]` arrays take indices 0 and
+        // 1 and the body's `[title, s]` array takes 2 (not 1, as it would if the body were interned
+        // in the middle of the root walk).
+        let attr = |name: &str, value: &str| TextAttribute {
+            name: name.to_string(),
+            value: value.to_string(),
+            source_span: t_span(),
+            key_span: None,
+            value_span: None,
+            i18n: None,
+        };
+        let element = |name: &str, attributes: Vec<TextAttribute>, children: Vec<Node>| Element {
+            name: name.to_string(),
+            attributes,
+            inputs: vec![],
+            outputs: vec![],
+            directives: vec![],
+            children,
+            references: vec![],
+            is_self_closing: false,
+            source_span: t_span(),
+            start_source_span: t_span(),
+            end_source_span: None,
+            is_void: false,
+            i18n: None,
+        };
+        let nodes = vec![
+            Node::Template(Template {
+                tag_name: Some("ng-template".to_string()),
+                attributes: vec![attr("id", "tpl")],
+                inputs: vec![],
+                outputs: vec![],
+                directives: vec![],
+                template_attrs: vec![],
+                children: vec![Node::Element(element(
+                    "span",
+                    vec![attr("title", "s")],
+                    vec![],
+                ))],
+                references: vec![],
+                variables: vec![],
+                is_self_closing: false,
+                source_span: t_span(),
+                start_source_span: t_span(),
+                end_source_span: None,
+                i18n: None,
+            }),
+            Node::Element(element("p", vec![attr("lang", "en")], vec![])),
+        ];
+        let input = TemplateCompilationInput::new("Test_Template", nodes);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let consts = builder.const_pool().to_const_array().unwrap();
+        let out = emit_expression(&consts);
+        let (tpl, en, s) = (
+            out.find("\"tpl\"").expect("tpl const"),
+            out.find("\"en\"").expect("en const"),
+            out.find("\"s\"").expect("s const"),
+        );
+        assert!(tpl < en && en < s, "const order must follow view allocation: {out}");
+        assert_eq!(builder.const_pool().entries().len(), 3, "got: {out}");
+        // The body's `<span>` is hoisted with its attrs index (2) baked in, and no placeholder leaks.
+        let all = emit_with_hoisted(&builder, &func);
+        assert!(all.contains("\"span\", 2"), "got: {all}");
+        assert!(!all.contains("5000000000"), "placeholder leaked: {all}");
+    }
+
+    #[test]
     fn element_with_static_attrs_interns_const() {
         let nodes = vec![Node::Element(Element {
             name: "div".to_string(),
@@ -9054,6 +10031,53 @@ mod tests {
         assert!(builder.const_pool().is_empty(), "const pool not empty");
         assert!(out.contains("\u{0275}\u{0275}domElement(0, \"div\")"), "got: {out}");
         assert!(!out.contains("\u{0275}\u{0275}domElement(0, \"div\", 0)"), "got: {out}");
+    }
+
+    #[test]
+    fn singleton_class_and_style_interpolations_collapse_to_the_expression() {
+        // `<div class="{{x}}">` ⇒ `ɵɵclassMap(ctx.x)` (Angular `collapse_singleton_interpolations.ts`
+        // runs before var counting, so the binding reserves its two base slots, not `2 + 1`).
+        let singleton = AstNode::new(
+            ParseSpan::new(0, 0),
+            AbsoluteSourceSpan::new(0, 0),
+            AstExprKind::Interpolation {
+                strings: vec![String::new(), String::new()],
+                expressions: vec![prop_read("x")],
+            },
+        );
+        let nodes = element_with_input("div", "class", BindingType::Property, singleton);
+        let input = TemplateCompilationInput::new("Test_Template", nodes);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let out = emit_expression(&builder.build_template_function(&input));
+        assert!(out.contains("\u{0275}\u{0275}classMap(ctx.x)"), "got: {out}");
+        assert!(!out.contains("interpolate"), "got: {out}");
+        assert_eq!(builder.vars(), 2, "vars = {}", builder.vars());
+    }
+
+    #[test]
+    fn style_and_class_names_are_hyphenated_and_lose_important() {
+        // `[style.borderImage]="w"` ⇒ `ɵɵstyleProp("border-image", ctx.w)` (Angular `naming.ts`
+        // `normalizeStylePropName`), and a custom property keeps its name.
+        let nodes = element_with_input("div", "borderImage", BindingType::Style, prop_read("w"));
+        let input = TemplateCompilationInput::new("Test_Template", nodes);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let out = emit_expression(&builder.build_template_function(&input));
+        assert!(out.contains("\"border-image\""), "got: {out}");
+        assert!(!out.contains("borderImage"), "got: {out}");
+
+        let nodes = element_with_input("div", "--myVar", BindingType::Style, prop_read("w"));
+        let input = TemplateCompilationInput::new("Test_Template", nodes);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let out = emit_expression(&builder.build_template_function(&input));
+        assert!(out.contains("\"--myVar\""), "got: {out}");
+
+        // `[class.active!important]` loses its `!important` suffix (`stripImportant`).
+        let nodes = element_with_input("div", "active!important", BindingType::Class, prop_read("x"));
+        let input = TemplateCompilationInput::new("Test_Template", nodes);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let out = emit_expression(&builder.build_template_function(&input));
+        assert!(out.contains("\"active\""), "got: {out}");
+        assert!(!out.contains("important"), "got: {out}");
     }
 
     #[test]
@@ -10455,6 +11479,97 @@ mod tests {
     }
 
     #[test]
+    fn defer_target_triggers_resolve_placeholder_and_local_ref_slots() {
+        use crate::template::r3_ast::{
+            BlockSpans, DeferredBlock, DeferredBlockPlaceholder, DeferredBlockTriggers,
+            DeferredTrigger, DeferredTriggerKind, Reference, TriggerKey, TriggerSpans,
+        };
+        // `<button #go></button>` is the defer owner's element; the placeholder is `<span></span>`.
+        // Angular `resolveDeferTargetNames`: `on hover` (no reference) targets the placeholder's first
+        // element (`ɵɵdeferOnHover(0, -1)`); `on interaction(go)` targets the owner's `#go` element, one
+        // view up from nothing (`ɵɵdeferOnInteraction(<slot>)`, steps 0), and a viewport trigger with
+        // options keeps its options object as a plain literal.
+        let trig = |kind: DeferredTriggerKind| DeferredTrigger {
+            kind,
+            spans: TriggerSpans {
+                name_span: None,
+                source_span: t_span(),
+                prefetch_span: None,
+                when_or_on_source_span: None,
+                hydrate_span: None,
+            },
+        };
+        let element = |name: &str, references: Vec<Reference>| Element {
+            name: name.to_string(),
+            attributes: vec![],
+            inputs: vec![],
+            outputs: vec![],
+            directives: vec![],
+            children: vec![],
+            references,
+            is_self_closing: false,
+            source_span: t_span(),
+            start_source_span: t_span(),
+            end_source_span: None,
+            is_void: false,
+            i18n: None,
+        };
+        let mut main = DeferredBlockTriggers::default();
+        main.hover = Some(trig(DeferredTriggerKind::Hover { reference: None }));
+        main.push_order(TriggerKey::Hover);
+        main.interaction = Some(trig(DeferredTriggerKind::Interaction {
+            reference: Some("go".to_string()),
+        }));
+        main.push_order(TriggerKey::Interaction);
+        let block = Node::DeferredBlock(DeferredBlock {
+            children: vec![],
+            triggers: main,
+            prefetch_triggers: DeferredBlockTriggers::default(),
+            hydrate_triggers: DeferredBlockTriggers::default(),
+            placeholder: Some(DeferredBlockPlaceholder {
+                children: vec![Node::Element(element("span", vec![]))],
+                minimum_time: None,
+                spans: BlockSpans {
+                    name_span: t_span(),
+                    source_span: t_span(),
+                    start_source_span: t_span(),
+                    end_source_span: None,
+                },
+                i18n: None,
+            }),
+            loading: None,
+            error: None,
+            main_block_span: t_span(),
+            spans: BlockSpans {
+                name_span: t_span(),
+                source_span: t_span(),
+                start_source_span: t_span(),
+                end_source_span: None,
+            },
+            defined_name: None,
+            i18n: None,
+        });
+        let go_ref = Reference {
+            name: "go".to_string(),
+            value: String::new(),
+            source_span: t_span(),
+            key_span: t_span(),
+            value_span: None,
+        };
+        // The owner element with `#go` comes BEFORE the defer block, so its host slot is known.
+        let nodes = vec![Node::Element(element("button", vec![go_ref])), block];
+        let input = TemplateCompilationInput::new("MyApp_Template", nodes);
+        let mut builder = TemplateDefinitionBuilder::new(&input);
+        let func = builder.build_template_function(&input);
+        let out = emit_with_hoisted(&builder, &func);
+        // The owner `button` is slot 0 (its `#go` ref slot is 1), the defer main view / placeholder take
+        // the following slots; the placeholder `span` is its own view's slot 0.
+        assert!(out.contains("\u{0275}\u{0275}deferOnHover(0, -1)"), "got: {out}");
+        assert!(out.contains("\u{0275}\u{0275}deferOnInteraction(0)"), "got: {out}");
+        assert!(!out.contains("deferOnHover()"), "got: {out}");
+    }
+
+    #[test]
     fn defer_triggers_follow_angular_group_and_kind_order_with_hydrate_runtime() {
         use crate::template::r3_ast::{
             BlockSpans, DeferredBlock, DeferredBlockTriggers, DeferredTrigger, DeferredTriggerKind,
@@ -10779,13 +11894,13 @@ mod tests {
         let func = builder.build_template_function(&input);
         let out = emit_expression(&func);
 
-        // `projectionDef($c0$)` references the SHARED-pool selector array (Angular
+        // `projectionDef(_c0)` references the SHARED-pool selector array (Angular
         // `generateProjectionDefs` → `getConstLiteral(asLiteral(parsed), true)`), NOT a `consts:`
         // index. The default slot emits `ɵɵprojection(0)` (index elided) and the named slot
         // `ɵɵprojection(1, 1)`. `ɵɵprojection` is NOT in Angular's `CHAIN_COMPATIBILITY` map, so the
         // two adjacent projection create ops stay as SEPARATE statements (faithful to Angular's
         // `content_projection` goldens, which emit `ɵɵprojection(0); ɵɵprojection(1, 1);` un-chained).
-        assert!(out.contains("\u{0275}\u{0275}projectionDef($c0$)"), "got: {out}");
+        assert!(out.contains("\u{0275}\u{0275}projectionDef(_c0)"), "got: {out}");
         assert!(out.contains("\u{0275}\u{0275}projection(0)"), "got: {out}");
         assert!(out.contains("\u{0275}\u{0275}projection(1, 1)"), "got: {out}");
         assert!(!out.contains("\u{0275}\u{0275}projection(0)(1, 1)"), "got: {out}");
@@ -10797,7 +11912,7 @@ mod tests {
             builder.const_pool().entries()
         );
         let hoisted = crate::output::emitter::emit_statements(builder.hoisted_functions());
-        assert!(hoisted.contains("$c0$"), "missing shared const decl, got: {hoisted}");
+        assert!(hoisted.contains("_c0"), "missing shared const decl, got: {hoisted}");
         assert!(hoisted.contains("\"header\""), "got hoisted: {hoisted}");
     }
 

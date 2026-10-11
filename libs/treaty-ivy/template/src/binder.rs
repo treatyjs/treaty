@@ -2798,7 +2798,7 @@ mod tests {
     /// inside an `@error (when …)` expression is recorded as used (it was skipped before this port).
     #[test]
     fn boundary_error_when_expression_pipes_are_bound() {
-        use crate::template::r3_ast::{BoundaryBlock, BoundaryErrorBlock, BlockSpans};
+        use crate::template::r3_ast::{BoundaryBlock, BoundaryErrorBlock};
         let pipe = AstNode::new(
             ParseSpan::new(0, 0),
             AbsoluteSourceSpan::new(0, 0),

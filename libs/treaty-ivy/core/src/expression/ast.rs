@@ -45,6 +45,10 @@ pub enum SecurityContext {
     Script,
     Url,
     ResourceUrl,
+    /// `ATTRIBUTE_NO_BINDING` (Angular value 6): an attribute that may be security-sensitive depending on
+    /// the concrete element it lands on (`iframe[allow]`, SVG `animate[attributeName]`). Reified to
+    /// `ɵɵvalidateAttribute`, which checks the value at runtime.
+    AttributeNoBinding,
 }
 
 // ---------------------------------------------------------------------------
